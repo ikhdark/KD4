@@ -89,8 +89,8 @@ pub struct ThreadItem {
     pub recency_at: Option<String>,
 }
 
-#[derive(Default)]
-struct HeadTailSummary {
+#[derive(Clone, Default)]
+pub(crate) struct HeadTailSummary {
     saw_session_meta: bool,
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
@@ -393,8 +393,10 @@ pub async fn get_threads_in_root(
     }
 
     if sort_key == ThreadSortKey::RecencyAt {
-        return get_threads_in_root_by_summary(root, page_size, cursor, sort_key, config, false)
-            .await;
+        return get_threads_in_root_by_summary(
+            root, page_size, cursor, sort_key, config, false, None,
+        )
+        .await;
     }
 
     let anchor = cursor.cloned();
@@ -441,25 +443,26 @@ pub async fn get_threads_in_root_ascending(
     sort_key: ThreadSortKey,
     config: ThreadListConfig<'_>,
 ) -> io::Result<ThreadsPage> {
-    get_threads_in_root_by_summary(root, page_size, cursor, sort_key, config, true).await
+    get_threads_in_root_by_summary(root, page_size, cursor, sort_key, config, true, None).await
 }
 
-async fn get_threads_in_root_by_summary(
+pub(crate) async fn get_threads_in_root_by_summary(
     root: PathBuf,
     page_size: usize,
     cursor: Option<&Cursor>,
     sort_key: ThreadSortKey,
     config: ThreadListConfig<'_>,
     ascending: bool,
+    matching_threads: Option<&std::collections::HashSet<ThreadId>>,
 ) -> io::Result<ThreadsPage> {
-    if !root.exists() {
+    if matching_threads.is_some_and(std::collections::HashSet::is_empty) || !root.exists() {
         return Ok(ThreadsPage::default());
     }
 
     let provider_matcher = config
         .model_providers
         .and_then(|filters| ProviderMatcher::new(filters, config.default_provider));
-    if sort_key == ThreadSortKey::CreatedAt {
+    if sort_key == ThreadSortKey::CreatedAt && matching_threads.is_none() {
         return match config.layout {
             ThreadListLayout::NestedByDate => {
                 traverse_directories_for_paths_created(
@@ -521,6 +524,9 @@ async fn get_threads_in_root_by_summary(
         else {
             continue;
         };
+        if matching_threads.is_some_and(|ids| item.thread_id.is_none_or(|id| !ids.contains(&id))) {
+            continue;
+        }
         let Some(key) = thread_item_sort_key(&item, sort_key) else {
             continue;
         };
@@ -1325,6 +1331,12 @@ async fn read_head_summary(
     head_limit: usize,
     default_provider: &str,
 ) -> io::Result<HeadTailSummary> {
+    if let Some(summary) = crate::metadata::cached_rollout_read(path, default_provider)
+        .await
+        .and_then(|read| read.summary)
+    {
+        return Ok(summary);
+    }
     let mut summary = HeadTailSummary::default();
     let mut settings_reducer = PersistedThreadSettingsReducer::default();
     let mut metadata_accumulator = RolloutMetadataAccumulator::default();
@@ -1427,7 +1439,15 @@ async fn read_head_summary(
         .finish(path, default_provider, parse_errors)
         .await
         .map_err(io::Error::other)?;
-    crate::metadata::cache_extraction_outcome(extraction_cache_guard, outcome).await;
+    crate::metadata::cache_rollout_read(
+        extraction_cache_guard,
+        crate::metadata::CachedRolloutRead {
+            outcome: Some(outcome),
+            summary: Some(summary.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
 
     Ok(summary)
 }

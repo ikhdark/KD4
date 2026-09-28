@@ -253,6 +253,34 @@ text("after await");
 }
 
 #[tokio::test]
+async fn async_timer_exit_completes_a_pending_root_and_commits_valid_writes() {
+    let service = InProcessCodeModeSession::new();
+    let response = tokio::time::timeout(Duration::from_secs(5), execute(
+        &service,
+        ExecuteRequest {
+            source: "await new Promise(() => setTimeout(async () => { await Promise.resolve(); text('before'); store('async-exit', 'saved'); exit(); text('after'); }, 1)); text('after await');".to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )).await.expect("exit must finish without a follow-up wait or termination");
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            output_loss: None,
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "before".to_string()
+            }],
+            error_text: None,
+        }
+    );
+    assert_eq!(
+        result_text(&execute(&service, execute_request("text(load('async-exit'));")).await),
+        "saved"
+    );
+}
+
+#[tokio::test]
 async fn timer_throwing_exit_sentinel_remains_an_error() {
     let service = InProcessCodeModeSession::new();
     let response = execute(
@@ -589,13 +617,13 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
 }
 
 #[tokio::test]
-async fn oversized_store_rejects_all_writes_from_the_cell() {
+async fn oversized_store_preserves_earlier_valid_writes() {
     let session = InProcessCodeModeSession::new();
     let response = execute(
         &session,
         ExecuteRequest {
             source: format!(
-                r#"store("partial", "must-not-commit"); store("oversized", "x".repeat({}));"#,
+                r#"store("partial", "valid-evidence"); store("oversized", "x".repeat({}));"#,
                 MAX_SESSION_STORED_VALUE_BYTES + 1
             ),
             yield_time_ms: None,
@@ -616,7 +644,7 @@ async fn oversized_store_rejects_all_writes_from_the_cell() {
     let read_response = execute(
         &session,
         ExecuteRequest {
-            source: r#"text(String(load("partial")));"#.to_string(),
+            source: r#"text([load("partial"), load("oversized") ?? null]);"#.to_string(),
             yield_time_ms: None,
             ..execute_request("")
         },
@@ -628,7 +656,7 @@ async fn oversized_store_rejects_all_writes_from_the_cell() {
             output_loss: None,
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "undefined".to_string(),
+                text: r#"["valid-evidence",null]"#.to_string(),
             }],
             error_text: None,
         }

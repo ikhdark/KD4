@@ -13,6 +13,9 @@ use codex_tools::ToolExecutor;
 use codex_tools::ToolOutput;
 use codex_tools::ToolOutputOutcome;
 
+#[path = "evidence_benchmarks.rs"]
+mod evidence_benchmarks;
+
 // Controlled nested results cross the real JS runtime, broker and tool router.
 // Tests below never manufacture packet entries or required-terminal metadata.
 struct PacketTestTool {
@@ -43,7 +46,7 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
             let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
             let process_exit_code = args["process_exit_code"]
                 .as_i64()
-                .or_else(|| (args["cmd"] == "fixture-exit-101").then_some(101));
+                .or_else(|| args["cmd"].as_str()?.strip_prefix("fixture-exit-")?.parse::<i64>().ok());
             let process_running = args["process_running"] == true;
             if process_exit_code.is_some() || process_running {
                 return Ok(crate::tools::context::boxed_tool_output(
@@ -65,6 +68,7 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                         original_token_count: None,
                         hook_command: None,
                         raw_output_artifact: None,
+                        raw_output_truncated: false,
                         raw_output_reduction_notice: None,
                         repair_notice: None,
                         pending_deferred_completions: Vec::new(),
@@ -108,7 +112,13 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
             {
                 return Err(crate::FunctionCallError::RespondToModel(error.to_string()));
             }
-            let output = FunctionToolOutput::from_text("READ_RESULT_42".to_string(), Some(true));
+            let output = FunctionToolOutput::from_text(
+                args["text"]
+                    .as_str()
+                    .unwrap_or("READ_RESULT_42")
+                    .to_string(),
+                Some(true),
+            );
             let output = match args["outcome"].as_str() {
                 Some("blocked") => output.with_skip_disposition(
                     codex_tools::ToolOutputSkipDisposition::BlockingRequiredOperation,
@@ -139,22 +149,28 @@ impl PacketRuntime {
     }
 
     async fn with_nested_tool(name: &'static str) -> Self {
+        Self::with_tools(vec![Arc::new(PacketTestTool { name })], |_| {}).await
+    }
+
+    async fn with_tools(
+        nested: Vec<Arc<dyn crate::tools::registry::CoreToolRuntime>>,
+        configure: impl FnOnce(&mut crate::session::turn_context::TurnContext),
+    ) -> Self {
         let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
         session.services.code_mode_service = super::CodeModeService::new(Arc::new(
             codex_code_mode::InProcessCodeModeSessionProvider,
         ));
         turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeMode);
+        configure(&mut turn);
         let session = Arc::new(session);
-        let nested: Arc<dyn crate::tools::registry::CoreToolRuntime> =
-            Arc::new(PacketTestTool { name });
         let execute = super::execute_handler::CodeModeExecuteHandler::new(
             super::execute_spec::create_code_mode_tool(false, false, &[], &[]),
-            vec![nested.spec()],
+            nested.iter().map(|tool| tool.spec()).collect(),
             Vec::new(),
         )
         .unwrap();
         let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
-            crate::tools::registry::ToolRegistry::from_tools([nested]),
+            crate::tools::registry::ToolRegistry::from_tools(nested),
             Vec::new(),
         ));
         let step = crate::session::step_context::StepContext::for_test(Arc::new(turn))
@@ -298,6 +314,26 @@ fn packet_output_text(output: &dyn ToolOutput) -> String {
         panic!("exec projection must produce a custom tool output");
     };
     output.body.to_text().unwrap()
+}
+
+#[tokio::test]
+async fn checkpoint_metadata_retains_nonthrowing_nested_failures() {
+    for code in [0, 7] {
+        let runtime = PacketRuntime::with_nested_tool("exec_command").await;
+        let output = runtime.exec(&format!(
+            "const result = await tools.exec_command({{cmd:'fixture-exit-{code}'}}); text(result);"
+        )).await;
+        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+        let metadata = output.projection_metadata().unwrap();
+        assert_eq!(
+            metadata.essential_inline["contains_nested_failure"]
+                .as_bool()
+                .unwrap_or(false),
+            code != 0
+        );
+        assert!(packet_output_text(output.as_ref()).contains("COMPILER_DIAGNOSTIC"));
+        runtime.finish().await;
+    }
 }
 
 #[tokio::test]
@@ -820,6 +856,7 @@ fn nested_result_evidence(output: &str) -> CodeModeNestedResultEvidence {
         tool_name: "exec_command".to_string(),
         output: output.to_string(),
         output_truncated: false,
+        recovery: None,
     }
 }
 
@@ -1147,14 +1184,20 @@ fn failed_script_does_not_repeat_nested_results_it_already_printed() {
         "current_plan": {"plan": [{"step": "Validate the focused change", "status": "in_progress"}]},
         "message": "Plan updated",
     });
-    let retained = |tool: &str, value: &serde_json::Value| CodeModeNestedResultEvidence {
-        tool_name: tool.to_string(),
-        output: retained_nested_output(
+    let retained = |tool: &str, value: &serde_json::Value| {
+        let (json, json_truncated, _) = bounded_serialized_json(value);
+        let (output, output_truncated) = retained_nested_output(
             &codex_tools::ToolName::plain(tool),
             value,
-            bounded_serialized_json(value).0,
-        ),
-        ..nested_result_evidence("")
+            json,
+            json_truncated,
+        );
+        CodeModeNestedResultEvidence {
+            tool_name: tool.to_string(),
+            output,
+            output_truncated,
+            ..nested_result_evidence("")
+        }
     };
     // `text(result)` prints the escaped JSON; `text(result.output)` the text.
     let printed_forms = [
@@ -1275,6 +1318,7 @@ async fn terminated_packet_keeps_nested_results_and_omission_notice_after_printe
             },
             Some(10_000),
             Instant::now(),
+            false,
         )
         .unwrap();
         let visible = output.into_text();
@@ -1324,6 +1368,7 @@ async fn packet_composition_budgets_required_diagnostics_and_preserves_canonical
         },
         Some(200),
         Instant::now(),
+        false,
     )
     .unwrap();
 
@@ -1416,6 +1461,7 @@ async fn live_packet_drain_preserves_ordinals_for_outstanding_calls() {
         },
         Some(100),
         Instant::now(),
+        false,
     )
     .unwrap();
     assert_eq!(live.outcome_for_logging(), ToolOutputOutcome::Yielded);
@@ -1445,6 +1491,7 @@ async fn live_packet_drain_preserves_ordinals_for_outstanding_calls() {
         },
         Some(100),
         Instant::now(),
+        false,
     )
     .unwrap();
     assert!(super::code_mode_text_content(&terminal.body).contains("first failure"));
@@ -1496,6 +1543,7 @@ async fn command_receipts_share_the_script_budget_and_keep_latest_canonical_stat
         },
         Some(200),
         Instant::now(),
+        false,
     )
     .unwrap();
     let visible = super::code_mode_text_content(&output.body);

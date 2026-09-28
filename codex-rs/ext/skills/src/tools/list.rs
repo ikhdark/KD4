@@ -52,6 +52,10 @@ struct ListResponse {
     warnings: Vec<String>,
     warnings_omitted: usize,
     next_cursor: Option<String>,
+    /// Absent for ordinary listings; blocked means incomplete coverage, not end of discovery.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(default)]
+    discovery_blocked: bool,
 }
 
 #[derive(Clone)]
@@ -67,7 +71,7 @@ impl ToolExecutor<ToolCall> for ListTool {
     fn spec(&self) -> ToolSpec {
         skill_function_tool::<ListArgs, ListResponse>(
             TOOL_NAME,
-            "List a page of enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Returns opaque package and main-resource handles for skills.read. Pass next_cursor back as cursor to continue; restart from the first page if stale. An explicit first-page request retries failed discovery.",
+            "List a page of enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Returns opaque package and main-resource handles for skills.read. Pass next_cursor back as cursor to continue; restart from the first page if stale. An explicit first-page request retries failed discovery. discovery_blocked means the provider repeated a cursor: coverage is incomplete even without next_cursor. Retained skills remain readable; repair the provider and refresh its MCP connection before retrying discovery.",
         )
     }
 
@@ -92,9 +96,7 @@ impl ToolExecutor<ToolCall> for ListTool {
             let listed = |catalog: &crate::catalog::SkillCatalog| {
                 catalog
                     .entries
-                    .iter()
-                    .cloned()
-                    .filter(|entry| entry.enabled && entry.authority == authority)
+                    .iter().filter(|&entry| entry.enabled && entry.authority == authority).cloned()
                     .filter_map(listed_skill)
                     .collect::<Vec<_>>()
             };
@@ -125,7 +127,8 @@ impl ToolExecutor<ToolCall> for ListTool {
                     .await;
                 skills = listed(&catalog);
             }
-            let incomplete = catalog.continuation.is_some();
+            let discovery_blocked = catalog.discovery_blocked();
+            let incomplete = catalog.continuation.is_some() && !discovery_blocked;
             let (warnings, warnings_omitted) = bounded_warnings(catalog.warnings);
             let response = page_response(
                 skills,
@@ -133,6 +136,7 @@ impl ToolExecutor<ToolCall> for ListTool {
                 warnings_omitted,
                 start,
                 incomplete,
+                discovery_blocked,
                 budget,
             )?;
 
@@ -151,6 +155,7 @@ fn page_response(
     warnings_omitted: usize,
     start: usize,
     incomplete: bool,
+    discovery_blocked: bool,
     budget: usize,
 ) -> Result<ListResponse, FunctionCallError> {
     let count = skills.len();
@@ -158,6 +163,7 @@ fn page_response(
         skills: Vec::new(),
         warnings,
         warnings_omitted,
+        discovery_blocked,
         next_cursor: incomplete.then(|| {
             format!(
                 "{:016x}:{start}",

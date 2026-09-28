@@ -95,6 +95,24 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual(output["reused_records"], 1)
         self.assertEqual(output["paths"], ["src/b.rs"])
 
+    def test_equivalent_glob_paths_match_and_reuse_the_same_scope(self):
+        self.file("src/a.rs", "prompt")
+        state = None
+        query_id = None
+        for pattern in ["src/*.rs", "src\\*.rs", "./src/*.rs"]:
+            with self.subTest(pattern=pattern):
+                query = {"categories": [{"name": "prompts", "paths": [pattern],
+                                          "contains": "prompt", "verification": "path"}]}
+                output, state = inventory.inventory(self.root, query, state)
+                self.assertEqual(output["paths"], ["src/a.rs"])
+                self.assertTrue(output["ready_to_render"])
+                self.assertEqual(query["categories"][0]["paths"], [pattern])
+                if query_id is not None:
+                    self.assertEqual(output["query_id"], query_id)
+                    self.assertEqual(output["searched_records"], 0)
+                    self.assertEqual(output["reused_records"], 1)
+                query_id = output["query_id"]
+
     def test_candidate_needs_category_evidence_and_ambiguity_is_not_verified(self):
         self.file("src/a.rs", "not a match")
         query = {"categories": [{"name": "prompts", "paths": ["src/*.rs"], "contains": "PROMPT"}],
@@ -487,6 +505,51 @@ class SourceInventoryTests(unittest.TestCase):
                 inventory.main(["--root", str(self.root), "--query", str(query), "--state", str(state), "--report", str(report)])
         self.assertFalse(state.exists())
         self.assertEqual((self.root / "a.rs").read_text(), "prompt evidence")
+
+    def test_control_files_cannot_overlap_discovery_or_each_other(self):
+        outside = Path(self.temp.name)
+        for control in ("query", "state", "candidate", "same"):
+            with self.subTest(control=control):
+                query = self.root / "query.json" if control == "query" else outside / "query.json"
+                state = self.root / "state.json" if control in ("state", "candidate") else outside / "state.json"
+                definition = {"categories": [{"name": "json", "paths": ["./*.json"],
+                                                "verification": "path"}]}
+                if control == "candidate":
+                    definition["categories"][0]["paths"] = ["src/*.json"]
+                    definition["candidates"] = [{"path": "state.json", "category": "json"}]
+                if control == "same":
+                    state = query
+                query.write_text(json.dumps(definition), encoding="utf-8")
+                before = query.read_bytes()
+                with (mock.patch.object(inventory, "inventory", side_effect=AssertionError("must reject before scan")),
+                      contextlib.redirect_stderr(io.StringIO())):
+                    if control == "same":
+                        with self.assertRaises(SystemExit):
+                            inventory.main(["--root", str(self.root), "--query", str(query), "--state", str(state)])
+                    else:
+                        with self.assertRaisesRegex(ValueError, f"{'state' if control == 'candidate' else control} file overlaps selected sources"):
+                            inventory.main(["--root", str(self.root), "--query", str(query), "--state", str(state)])
+                self.assertEqual(query.read_bytes(), before)
+                if state != query:
+                    self.assertFalse(state.exists())
+
+    def test_control_files_outside_selection_or_in_pruned_trees_are_allowed(self):
+        self.file("src/catalog.json", '{"prompt":"body"}')
+        for pattern, controls in [("*.json", self.root / "target"),
+                                  ("src/*.json", self.root / "controls")]:
+            with self.subTest(pattern=pattern):
+                controls.mkdir()
+                query = controls / "query.json"
+                state = controls / "state.json"
+                query.write_text(json.dumps({"categories": [
+                    {"name": "json", "paths": [pattern], "verification": "path"}]}), encoding="utf-8")
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(inventory.main(["--root", str(self.root), "--query", str(query), "--state", str(state)]), 0)
+                summary = json.loads(stdout.getvalue())
+                self.assertEqual(summary["count"], 1)
+                self.assertEqual(summary["untracked_count"], 0)
+                self.assertTrue(summary["ready_to_render"])
+                self.assertTrue(state.is_file())
 
     def test_consumer_evidence_read_budget_and_legacy_render_rejection(self):
         self.file("prompts/runtime.md")

@@ -745,6 +745,63 @@ class StageNpmPackagesTests(unittest.TestCase):
                             build.run_npm_pack(staging, output)
                 self.assertEqual(list(ancestor_modules.iterdir()), [])
 
+    @unittest.skipUnless(os.name == "nt", "Windows x64 package smoke")
+    def test_paired_npm_smoke_launches_native_and_rejects_bad_packages(self) -> None:
+        binary = os.environ.get("CODEX_NPM_SMOKE_NATIVE")
+        if not binary:
+            self.skipTest("set CODEX_NPM_SMOKE_NATIVE to a built Windows x64 codex.exe")
+        build = stage.load_build_module()
+        version = subprocess.check_output([binary, "--version"], text=True).strip().removeprefix("codex-cli ")
+        main = self.root / "main"
+        native = self.root / "native"
+        main.mkdir()
+        native.mkdir()
+        build.stage_sources(main, version, "codex")
+        build.stage_sources(native, version, "codex-win32-x64")
+        payload = native / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe"
+        payload.parent.mkdir(parents=True)
+        shutil.copyfile(binary, payload)
+        main_tar = build.run_npm_pack(main, self.root / "main.tgz")
+        native_tar = build.run_npm_pack(native, self.root / "native.tgz")
+        build.smoke_test_npm_tarball(main_tar, native_tar)
+
+        manifest_path = native / "package.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = "999.0.0-wrong"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        wrong = build.run_npm_pack(native, self.root / "wrong.tgz")
+        with self.assertRaisesRegex(RuntimeError, "alias or version mismatch"):
+            build.smoke_test_npm_tarball(main_tar, wrong)
+        manifest["version"] = build.compute_platform_package_version(version, "win32-x64")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        payload.unlink()
+        missing = build.run_npm_pack(native, self.root / "missing.tgz")
+        with self.assertRaises(subprocess.CalledProcessError):
+            build.smoke_test_npm_tarball(main_tar, missing)
+
+    @unittest.skipUnless(os.name == "nt", "Windows package smoke orchestration")
+    def test_staging_requires_paired_smoke_before_committing_packages(self) -> None:
+        build = stage.load_build_module()
+        results = [stage.StagePackageResult(name, self.root / f"{name}.tgz", "")
+                   for name in ("codex", "codex-win32-x64")]
+        argv = ["stage", "--release-version", "1.2.3", "--package", "codex",
+                "--vendor-src", str(self.root), "--output-dir", str(self.root / "out")]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(stage.platform, "machine", return_value="AMD64"),
+            mock.patch.object(stage, "collect_native_component_sets", return_value=[]),
+            mock.patch.object(stage, "stage_packages", return_value=results),
+            mock.patch.object(stage, "commit_staged_packages", return_value=[]) as commit,
+            mock.patch.object(build, "smoke_test_npm_tarball", side_effect=RuntimeError("smoke failed")) as smoke,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "smoke failed"):
+                stage._main()
+            smoke.assert_called_once_with(results[0].pack_output, results[1].pack_output)
+            commit.assert_not_called()
+            smoke.side_effect = None
+            self.assertEqual(stage._main(), 0)
+            commit.assert_called_once()
+
     def test_parse_args_accepts_max_download_workers(self) -> None:
         argv = [
             "stage_npm_packages.py",
@@ -1417,11 +1474,12 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                stage.subprocess, "check_call", side_effect=FileNotFoundError
-            ),
+                archives, "run_owned", side_effect=FileNotFoundError
+            ) as run,
             self.assertRaisesRegex(RuntimeError, "zstd is required"),
         ):
             stage.extract_zstd_archive(archive_path, self.root / "out" / "codex")
+        run.assert_called_once()
 
     def test_failed_binary_extract_preserves_existing_vendor_binary(self) -> None:
         target = "x86_64-pc-windows-msvc"
@@ -1704,6 +1762,76 @@ def relative_files(root: Path) -> set[str]:
     return {
         path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()
     }
+
+
+class StageCacheWorkflowRegressionTests(unittest.TestCase):
+    def test_persistent_cache_can_be_reused_without_hiding_other_dirty_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            for command in (
+                ["git", "init", "--quiet"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+            ):
+                subprocess.run(command, cwd=root, capture_output=True, check=True)
+            sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            cache = root / "npm-cache"
+            owned = cache / "owner__repo" / "123"
+            owned.mkdir(parents=True)
+            (owned / "artifact").write_bytes(b"cached")
+            args = types.SimpleNamespace(
+                vendor_src=None,
+                output_dir=Path(directory) / "output",
+                workflow_url="https://github.com/owner/repo/actions/runs/123",
+                workflow_name=None,
+                github_repo="owner/repo",
+                packages=["codex-win32-x64"],
+                release_version="1.2.3",
+                cache_dir=cache,
+                max_download_workers=1,
+                vendor_copy_mode="auto",
+                keep_staging_dirs=False,
+                max_stage_workers=1,
+            )
+            validate = stage.ensure_source_matches_workflow
+
+            def check(expected, **kwargs):
+                validate(expected, repo_root=root, **kwargs)
+
+            with (
+                mock.patch.object(stage, "REPO_ROOT", root),
+                mock.patch.object(stage, "parse_args", return_value=args),
+                mock.patch.object(
+                    stage, "resolve_workflow_url", return_value=(args.workflow_url, sha)
+                ),
+                mock.patch.object(
+                    stage, "ensure_source_matches_workflow", side_effect=check
+                ),
+                mock.patch.object(stage, "install_native_components") as install,
+                mock.patch.object(stage, "stage_packages", return_value=[]),
+                mock.patch.object(stage, "commit_staged_packages", return_value=[]),
+            ):
+                self.assertEqual(stage._main(), 0)
+                self.assertEqual(stage._main(), 0)
+                self.assertEqual(install.call_count, 2)
+                install.reset_mock()
+                (cache / "unrelated.txt").write_text("user edit", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "uncommitted changes"):
+                    stage._main()
+                install.assert_not_called()
 
 
 if __name__ == "__main__":

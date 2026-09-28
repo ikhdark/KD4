@@ -12,7 +12,6 @@ use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -56,6 +55,7 @@ use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::select_initial;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_shell_command::shell_detect::detect_shell_type;
+use codex_tools::JsonToolOutput;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_output_truncation::approx_token_count;
@@ -426,6 +426,7 @@ impl ExecCommandHandler {
             )
             .await
             {
+                #[cfg(test)]
                 ValidationAdmission::Skip(skipped) => {
                     if matches!(
                         skipped.skip_disposition,
@@ -439,16 +440,22 @@ impl ExecCommandHandler {
                     )));
                 }
                 ValidationAdmission::Execute {
+                    #[cfg(test)]
                     authorization_revision,
                     is_validation,
+                    #[cfg(test)]
                     classification,
-                } => is_validation.then(|| ValidationLaunchPlan {
+                } => is_validation.then_some(ValidationLaunchPlan {
+                    #[cfg(test)]
                     classification,
+                    #[cfg(test)]
                     authorization_revision,
+                    #[cfg(test)]
                     explicitly_tagged: args.validation.is_some(),
                 }),
             }
         };
+        let effective_environment = manager.effective_environment(&context);
         let search_narrowing = if validation_launch.is_none() && !environment_is_remote {
             if let Some(native_cwd) = native_cwd.as_ref() {
                 let search_command = resolved_command.safety_command.clone();
@@ -470,7 +477,12 @@ impl ExecCommandHandler {
                 })?
                 .map_err(FunctionCallError::RespondToModel)?;
                 if let Some((_, search)) = search.as_mut() {
-                    observe_rg_search_scope_state_with_freshness(search, args.force_fresh).await;
+                    observe_rg_search_scope_state_with_freshness(
+                        search,
+                        args.force_fresh,
+                        &effective_environment,
+                    )
+                    .await;
                 }
                 search.map(|(root, search)| (root.to_string_lossy().into_owned(), search))
             } else {
@@ -622,7 +634,6 @@ impl ExecCommandHandler {
             context.turn.network,
         );
         let input_context = format!("prefix={prefix_rule:?}");
-        let effective_environment = manager.effective_environment(&context);
         let environment_hash = validation_environment_hash(&effective_environment);
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         let repository_epoch = session
@@ -735,10 +746,21 @@ impl ExecCommandHandler {
                 .await
         {
             if blocked.is_search_miss() {
-                return Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                    blocked.render_for_model(),
-                    Some(true),
-                )));
+                return Ok(boxed_tool_output(JsonToolOutput::new(serde_json::json!({
+                    "wall_time_seconds": 0.0,
+                    "exit_code": 1,
+                    "execution_state": "exited",
+                    "process_exited": true,
+                    "output_complete": true,
+                    "output_reduced": false,
+                    "raw_output_artifact_retention_limit_hit": false,
+                    "output": "",
+                    "replay": {
+                        "kind": "search_miss",
+                        "fingerprint": blocked.fingerprint,
+                        "message": blocked.render_for_model(),
+                    },
+                }))));
             }
             return Err(FunctionCallError::RespondToModel(
                 blocked.render_for_model(),
@@ -800,6 +822,7 @@ impl ExecCommandHandler {
                         original_token_count: None,
                         hook_command: Some(hook_command),
                         raw_output_artifact,
+                        raw_output_truncated: false,
                         raw_output_reduction_notice: None,
                         repair_notice,
                         pending_deferred_completions: Vec::new(),
@@ -940,6 +963,8 @@ impl ExecCommandHandler {
                 raw_output_artifact: preserved_artifact,
                 ..
             }) => {
+                let raw_output_truncated = output.aggregated_output.truncated
+                    || output.aggregated_output.truncated_after_lines.is_some();
                 let output_text = output.aggregated_output.text;
                 let finalized_artifact = finalize_sandbox_denial_artifact(
                     &raw_output_artifact,
@@ -994,6 +1019,7 @@ impl ExecCommandHandler {
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(finalized_artifact),
+                    raw_output_truncated,
                     raw_output_reduction_notice: None,
                     repair_notice,
                     pending_deferred_completions: Vec::new(),

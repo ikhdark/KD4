@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { spawnSync } = require("node:child_process");
+const { join } = require("node:path");
 
 const scriptArgs = process.argv.slice(2);
 if (scriptArgs.length === 0) {
@@ -9,9 +10,17 @@ if (scriptArgs.length === 0) {
 }
 
 const configuredPython = process.env.PYTHON;
+const virtualEnvPython = process.env.VIRTUAL_ENV
+  ? join(
+      process.env.VIRTUAL_ENV,
+      process.platform === "win32" ? "Scripts" : "bin",
+      process.platform === "win32" ? "python.exe" : "python",
+    )
+  : undefined;
 const candidates = configuredPython
   ? [[configuredPython, []]]
   : [
+      ...(virtualEnvPython ? [[virtualEnvPython, []]] : []),
       ["py", ["-3"]],
       ["python3", []],
       ["python", []],

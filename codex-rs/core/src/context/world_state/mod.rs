@@ -415,6 +415,7 @@ impl WorldState {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> WorldStateSnapshot {
         WorldStateSnapshot {
             sections: self

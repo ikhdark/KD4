@@ -80,10 +80,101 @@ pub(crate) async fn capture_revision(
     repo_root: &Path,
     paths: Vec<String>,
 ) -> StoreResult<WorkspaceRevision> {
-    let mut transaction = pool.begin().await?;
-    let revision = capture_revision_tx(&mut transaction, repo_root, paths, false).await?;
-    transaction.commit().await?;
-    Ok(revision)
+    capture_revision_with_policy(pool, repo_root, paths, false).await
+}
+
+pub(crate) async fn capture_source_revision(
+    pool: &SqlitePool,
+    repo_root: &Path,
+    paths: Vec<String>,
+) -> StoreResult<WorkspaceRevision> {
+    capture_revision_with_policy(pool, repo_root, paths, true).await
+}
+
+async fn capture_revision_with_policy(
+    pool: &SqlitePool,
+    repo_root: &Path,
+    paths: Vec<String>,
+    source_scopes: bool,
+) -> StoreResult<WorkspaceRevision> {
+    let repo_root = repo_root.to_path_buf();
+    let (repository, normalized) = tokio::task::spawn_blocking(move || {
+        let repository = repository_identity(&repo_root)?;
+        let normalized = normalize_paths(&repository.canonical_root, paths)?;
+        Ok::<_, StoreError>((repository, normalized))
+    })
+    .await
+    .map_err(|error| StoreError::CorruptData(format!("repository task failed: {error}")))??;
+    for _attempt in 0..3 {
+        let mut transaction = pool.begin().await?;
+        ensure_workspace_tx(&mut transaction, &repository).await?;
+        let generation: i64 = sqlx::query_scalar(
+            "UPDATE workspace_repositories SET capture_generation = capture_generation + 1
+             WHERE workspace_id = ? RETURNING capture_generation",
+        )
+        .bind(&repository.workspace_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let observed_epoch = current_epoch_tx(&mut transaction, &repository.workspace_id).await?;
+        let stored = load_workspace_entries_tx(&mut transaction, &repository.workspace_id).await?;
+        transaction.commit().await?;
+
+        let root = repository.canonical_root.clone();
+        let paths = normalized.clone();
+        let mut capture = tokio::task::spawn_blocking(move || {
+            if source_scopes {
+                collect_source_manifest_entries(&root, &paths)
+            } else {
+                collect_manifest_entries(&root, &paths, false)
+            }
+        })
+        .await
+        .map_err(|error| StoreError::CorruptData(format!("manifest task failed: {error}")))??;
+        if !source_scopes {
+            include_missing_observed_entries(
+                &stored,
+                &repository.canonical_root,
+                &normalized,
+                &mut capture.entries,
+            )
+            .await?;
+        }
+        #[cfg(test)]
+        if _attempt == 0 {
+            pause_test_workspace_capture().await;
+        }
+
+        // A newer scan or recorded mutation invalidates this observation, including across
+        // processes. Never publish an older scan over a newer one, or hash while holding
+        // the home-wide writer. A cancelled scan leaves only an unused generation.
+        let mut transaction = pool.begin().await?;
+        let unchanged = sqlx::query(
+            "UPDATE workspace_repositories SET capture_generation = capture_generation
+             WHERE workspace_id = ? AND capture_generation = ? AND epoch = ?",
+        )
+        .bind(&repository.workspace_id)
+        .bind(generation)
+        .bind(sqlite_epoch(observed_epoch)?)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            == 1;
+        if !unchanged {
+            transaction.rollback().await?;
+            continue;
+        }
+        let epoch = reconcile_entries_tx(
+            &mut transaction,
+            &repository,
+            &normalized,
+            &mut capture.entries,
+            true,
+        )
+        .await?;
+        transaction.commit().await?;
+        return revision(&repository, epoch, capture);
+    }
+    Err(StoreError::WorkspaceCaptureContended)
 }
 
 pub(crate) async fn capture_revision_tx(
@@ -103,7 +194,7 @@ pub(crate) async fn capture_revision_tx(
     ensure_workspace_tx(transaction, &repository).await?;
     // Acquire the SQLite writer lane before observing the filesystem. Every capture for a
     // workspace therefore scans in the same order in which its epoch can be published.
-    sqlx::query("UPDATE workspace_repositories SET epoch = epoch WHERE workspace_id = ?")
+    sqlx::query("UPDATE workspace_repositories SET capture_generation = capture_generation + 1 WHERE workspace_id = ?")
         .bind(&repository.workspace_id)
         .execute(&mut **transaction)
         .await?;
@@ -116,8 +207,14 @@ pub(crate) async fn capture_revision_tx(
     .map_err(|error| StoreError::CorruptData(format!("manifest task failed: {error}")))??;
     #[cfg(test)]
     pause_test_workspace_capture().await;
-    let epoch =
-        reconcile_entries_tx(transaction, &repository, &normalized, &mut capture.entries).await?;
+    let epoch = reconcile_entries_tx(
+        transaction,
+        &repository,
+        &normalized,
+        &mut capture.entries,
+        false,
+    )
+    .await?;
     revision(&repository, epoch, capture)
 }
 
@@ -519,6 +616,79 @@ fn collect_manifest_entries(
     })
 }
 
+fn collect_source_manifest_entries(root: &Path, paths: &[String]) -> StoreResult<ManifestCapture> {
+    let mut files = BTreeSet::new();
+    let mut directories = Vec::new();
+    for path in paths {
+        if is_unfollowed_directory(&absolute_repo_path(root, path))? {
+            directories.push(path);
+        } else {
+            // Explicitly named ignored inputs and products remain part of the contract.
+            files.insert(path.clone());
+        }
+    }
+    if !directories.is_empty() {
+        if root
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").symlink_metadata().is_ok())
+        {
+            let mut command = repository_overlay_command(
+                root,
+                &[
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                ],
+            );
+            for path in directories {
+                command.arg(if path == "." {
+                    ".".to_string()
+                } else {
+                    format!(":(literal){path}")
+                });
+            }
+            let output = command.output()?;
+            if !output.status.success() {
+                return Err(StoreError::InvalidScope(format!(
+                    "source manifest Git discovery failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            for raw_path in output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+            {
+                files.insert(git_relative_path_identity(raw_path)?);
+            }
+        } else {
+            for path in directories {
+                collect_repository_files_fallback(
+                    root,
+                    &absolute_repo_path(root, path),
+                    &mut files,
+                    &mut 0,
+                )?;
+            }
+        }
+    }
+    let entries = files
+        .into_iter()
+        .map(|path| snapshot_file(root, path))
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(ManifestCapture {
+        entries,
+        mode: WorkspaceCaptureMode::ExplicitPaths,
+        complete: true,
+        discovery_errors: Vec::new(),
+        ignored_path_count: 0,
+        excluded_path_count: 0,
+    })
+}
+
 fn repository_head_entry(root: &Path) -> WorkspaceManifestEntry {
     let content_hash = repository_overlay_command(root, &["rev-parse", "--verify", "HEAD"])
         .output()
@@ -912,37 +1082,23 @@ async fn reconcile_entries_tx(
     repository: &RepositoryIdentity,
     observed_paths: &[String],
     entries: &mut Vec<WorkspaceManifestEntry>,
+    already_expanded: bool,
 ) -> StoreResult<u64> {
     let repository_wide = observed_paths
         .iter()
         .any(|path| path == REPOSITORY_WIDE_PATH);
-    let stored_rows = sqlx::query(
-        "SELECT path, content_hash, existed FROM workspace_paths WHERE workspace_id = ?",
-    )
-    .bind(&repository.workspace_id)
-    .fetch_all(&mut **transaction)
-    .await?;
-    let mut stored_by_key: StoredWorkspaceEntries = BTreeMap::new();
-    for row in stored_rows {
-        let path = row.get::<String, _>("path");
-        stored_by_key
-            .entry(path_comparison_key(&path))
-            .or_default()
-            .push((
-                path,
-                row.get::<Option<String>, _>("content_hash"),
-                row.get::<i64, _>("existed") != 0,
-            ));
-    }
+    let stored_by_key = load_workspace_entries_tx(transaction, &repository.workspace_id).await?;
     let repository_wide_baseline =
         repository_wide && stored_by_key.contains_key(REPOSITORY_WIDE_PATH);
-    include_missing_observed_entries(
-        &stored_by_key,
-        &repository.canonical_root,
-        observed_paths,
-        entries,
-    )
-    .await?;
+    if !already_expanded {
+        include_missing_observed_entries(
+            &stored_by_key,
+            &repository.canonical_root,
+            observed_paths,
+            entries,
+        )
+        .await?;
+    }
     let current = current_epoch_tx(transaction, &repository.workspace_id).await?;
     let mut drift = Vec::new();
     for entry in entries.iter() {
@@ -992,6 +1148,28 @@ async fn reconcile_entries_tx(
 }
 
 type StoredWorkspaceEntries = BTreeMap<String, Vec<(String, Option<String>, bool)>>;
+
+async fn load_workspace_entries_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+) -> StoreResult<StoredWorkspaceEntries> {
+    let rows = sqlx::query(
+        "SELECT path, content_hash, existed FROM workspace_paths WHERE workspace_id = ?",
+    )
+    .bind(workspace_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut stored: StoredWorkspaceEntries = BTreeMap::new();
+    for row in rows {
+        let path = row.get::<String, _>("path");
+        stored.entry(path_comparison_key(&path)).or_default().push((
+            path,
+            row.get("content_hash"),
+            row.get::<i64, _>("existed") != 0,
+        ));
+    }
+    Ok(stored)
+}
 
 async fn include_missing_observed_entries(
     stored_by_key: &StoredWorkspaceEntries,

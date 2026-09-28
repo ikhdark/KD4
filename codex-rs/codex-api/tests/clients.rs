@@ -510,6 +510,94 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
 }
 
 #[tokio::test]
+async fn responses_requests_serialize_numeric_reasoning_effort() -> Result<()> {
+    for (configured, expected) in [
+        (None, None),
+        (Some("none"), Some(serde_json::json!("none"))),
+        (Some("minimal"), Some(serde_json::json!("minimal"))),
+        (Some("low"), Some(serde_json::json!("low"))),
+        (Some("medium"), Some(serde_json::json!("medium"))),
+        (Some("high"), Some(serde_json::json!("high"))),
+        (Some("xhigh"), Some(serde_json::json!("xhigh"))),
+        (Some("max"), Some(serde_json::json!("max"))),
+        (Some("ultra"), Some(serde_json::json!("ultra"))),
+        (Some("0"), Some(serde_json::json!(0))),
+        (Some("64"), Some(serde_json::json!(64))),
+        (Some("064"), Some(serde_json::json!(64))),
+        (
+            Some("18446744073709551615"),
+            Some(serde_json::json!(u64::MAX)),
+        ),
+        (Some("future"), Some(serde_json::json!("future"))),
+        (Some("-1"), Some(serde_json::json!("-1"))),
+        (Some("1.5"), Some(serde_json::json!("1.5"))),
+        (
+            Some("18446744073709551616"),
+            Some(serde_json::json!("18446744073709551616")),
+        ),
+    ] {
+        let effort = configured
+            .map(|value| serde_json::from_value(serde_json::json!(value)))
+            .transpose()?;
+        // Configuration and app-server protocol values remain strings; only the
+        // model API request uses numbers for unsigned numeric effort values.
+        assert_eq!(
+            serde_json::to_value(&effort)?,
+            serde_json::json!(configured)
+        );
+        let request = ResponsesApiRequest {
+            model: "gpt-test".into(),
+            instructions: String::new(),
+            input: Vec::new().into(),
+            tools: None,
+            tool_choice: "auto".into(),
+            parallel_tool_calls: false,
+            reasoning: Some(codex_api::Reasoning {
+                effort,
+                summary: None,
+                context: None,
+            }),
+            store: false,
+            stream: true,
+            stream_options: None,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+        let websocket_request = codex_api::ResponsesWsRequest::ResponseCreate(
+            codex_api::ResponseCreateWsRequest::from(&request),
+        );
+        let websocket_body = serde_json::to_value(websocket_request)?;
+        assert_eq!(
+            websocket_body["reasoning"].get("effort"),
+            expected.as_ref(),
+            "WebSocket effort for {configured:?}"
+        );
+
+        let state = RecordingState::default();
+        let client = ResponsesClient::new(
+            RecordingTransport::new(state.clone()),
+            provider("openai"),
+            Arc::new(NoAuth),
+        );
+        let _stream = client
+            .stream_request(request, ResponsesOptions::default())
+            .await?;
+        let requests = state.take_stream_requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(request_body_bytes(&requests[0]))?;
+        assert_eq!(
+            body["reasoning"].get("effort"),
+            expected.as_ref(),
+            "HTTP effort for {configured:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn streaming_client_adds_auth_headers() -> Result<()> {
     let state = RecordingState::default();
     let transport = RecordingTransport::new(state.clone());

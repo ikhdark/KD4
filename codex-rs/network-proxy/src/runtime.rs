@@ -20,6 +20,7 @@ use crate::reasons::REASON_NOT_ALLOWED_LOCAL;
 use crate::state::NetworkProxyConstraintError;
 use crate::state::NetworkProxyConstraints;
 use crate::state::validate_policy_against_constraints;
+use crate::upstream::UpstreamClient;
 use anyhow::Context;
 use anyhow::Result;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -232,6 +233,7 @@ pub struct NetworkProxyState {
     credential_broker: CredentialBroker,
     audit_metadata: NetworkProxyAuditMetadata,
     execution_attributions: Arc<Mutex<HashMap<String, ExecutionAttribution>>>,
+    http_upstream: Arc<Mutex<Option<UpstreamClient>>>,
     environment_id: Option<Arc<str>>,
     execution_id: Option<Arc<str>>,
 }
@@ -267,6 +269,7 @@ impl Clone for NetworkProxyState {
             credential_broker: self.credential_broker.clone(),
             audit_metadata: self.audit_metadata.clone(),
             execution_attributions: self.execution_attributions.clone(),
+            http_upstream: self.http_upstream.clone(),
             environment_id: self.environment_id.clone(),
             execution_id: self.execution_id.clone(),
         }
@@ -322,9 +325,25 @@ impl NetworkProxyState {
             blocked_request_observer: Arc::new(RwLock::new(blocked_request_observer)),
             audit_metadata,
             execution_attributions: Arc::new(Mutex::new(HashMap::new())),
+            http_upstream: Arc::new(Mutex::new(None)),
             environment_id: None,
             execution_id: None,
         }
+    }
+
+    pub(crate) fn upstream_client(
+        &self,
+        allow_upstream: bool,
+        allow_local: bool,
+    ) -> UpstreamClient {
+        UpstreamClient::cached(
+            &mut self
+                .http_upstream
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            allow_upstream,
+            allow_local,
+        )
     }
 
     pub(crate) fn register_execution(

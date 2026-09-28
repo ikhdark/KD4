@@ -32,7 +32,7 @@ pub(super) fn acquire_setup_mutex() -> Result<SetupMutexGuard> {
     acquire_named_setup_mutex(SETUP_MUTEX_NAME)
 }
 
-fn acquire_named_setup_mutex(name: &str) -> Result<SetupMutexGuard> {
+pub(super) fn acquire_named_setup_mutex(name: &str) -> Result<SetupMutexGuard> {
     let name = to_wide(OsStr::new(name));
     // SAFETY: name is a terminated UTF-16 buffer retained for the call, and the optional
     // security attributes are null.

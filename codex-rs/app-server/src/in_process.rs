@@ -1030,8 +1030,15 @@ mod tests {
             }
         }
         let loader = Arc::new(BlockingLoader::default());
-        let client = start_test_client_with_loader(SessionSource::Cli, 1, loader.clone()).await;
+        let mut client = start_test_client_with_loader(SessionSource::Cli, 1, loader.clone()).await;
         let sender = client.sender();
+        // Drain the startup notification before testing in-flight request capacity.
+        drop(
+            timeout(Duration::from_secs(5), sender.client_tx.reserve())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
         let request = |id| ClientRequest::ThreadStart {
             request_id: RequestId::Integer(id),
             params: ThreadStartParams::default(),
@@ -1071,19 +1078,26 @@ mod tests {
             .expect("transport")
             .expect_err("loader error delivered to original waiter");
         assert!(error.message.contains("intentional loader failure"));
-        let response = timeout(
-            Duration::from_secs(5),
-            sender.request(ClientRequest::ConfigRequirementsRead {
+        let response = timeout(Duration::from_secs(5), async {
+            let response = sender.request(ClientRequest::ThreadLoadedList {
                 request_id: RequestId::Integer(1),
-                params: None,
-            }),
-        )
+                params: codex_app_server_protocol::ThreadLoadedListParams::default(),
+            });
+            tokio::pin!(response);
+            loop {
+                tokio::select! {
+                    result = &mut response => break result,
+                    event = client.next_event() => assert!(event.is_some()),
+                }
+            }
+        })
         .await
         .expect("request after error completes")
         .expect("transport")
         .expect("capacity and request ID released");
-        let _: ConfigRequirementsReadResponse =
+        let response: codex_app_server_protocol::ThreadLoadedListResponse =
             serde_json::from_value(response).expect("real handler response");
+        assert!(response.data.is_empty());
         client.shutdown().await.expect("shutdown");
         assert_eq!(
             loader.calls.load(Ordering::SeqCst),

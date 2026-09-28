@@ -138,6 +138,7 @@ fn nested_poll_bound(nested_deadline: Option<std::time::Instant>) -> Option<Inst
 
 struct CollectedOutput {
     bytes: Vec<u8>,
+    truncated: bool,
     wake_reason: ToolLifecycleWakeReason,
 }
 
@@ -307,12 +308,9 @@ async fn exec_server_params_for_request(
     tty: bool,
 ) -> Result<codex_exec_server::ExecParams, UnifiedExecError> {
     let (env_policy, env) = exec_server_env_for_request(request).await?;
-    // Sandbox retries reuse the unified-exec ID but start a distinct executor process.
-    let exec_server_process_id = if request.exec_server_sandbox.is_some() {
-        format!("{process_id}-{}", Uuid::new_v4())
-    } else {
-        process_id.to_string()
-    };
+    // Threads sharing an executor and retries can reuse a public handle while
+    // the executor still retains its previous process.
+    let exec_server_process_id = format!("{process_id}-{}", Uuid::new_v4());
     Ok(codex_exec_server::ExecParams {
         process_id: exec_server_process_id.into(),
         argv: request.command.clone(),
@@ -1042,6 +1040,17 @@ impl UnifiedExecProcessManager {
             request.process_id,
         );
         let request_started_at = Instant::now();
+        let mut task_validation = crate::agent::task_validation::TaskValidation::start(
+            &context.session,
+            &context.turn,
+            &context.call_id,
+            &request.hook_command,
+            &request.command_for_safety,
+            request.normalization_cwd.as_deref(),
+            request.validation.as_ref(),
+        )
+        .await
+        .map_err(UnifiedExecError::process_failed)?;
         let mut cancelled = false;
         // Finish an accepted event and its legacy dispatch before cancellation
         // takes ownership of the command's terminal transition.
@@ -1063,6 +1072,7 @@ impl UnifiedExecProcessManager {
                 context,
                 &mut registration,
                 &event_delivery,
+                &mut task_validation,
             ) => result,
         };
         if let Some((cwd, transcript, started_at)) = registration.pending_startup_completion.take()
@@ -1135,6 +1145,17 @@ impl UnifiedExecProcessManager {
                 mark_exec_process_exited();
             }
         }
+        if let Some(validation) = task_validation {
+            let exit_code = result
+                .as_ref()
+                .ok()
+                .filter(|output| output.process_exited && !cancelled)
+                .and_then(|output| output.exit_code);
+            validation
+                .finish(exit_code)
+                .await
+                .map_err(UnifiedExecError::process_failed)?;
+        }
         finish_exited_process_result(
             registration.primary_process.as_ref(),
             result,
@@ -1155,6 +1176,7 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         registration: &mut PendingProcessRegistration,
         event_delivery: &tokio::sync::Mutex<()>,
+        task_validation: &mut Option<crate::agent::task_validation::TaskValidation>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
         let mut tool_history_error = None;
@@ -1179,6 +1201,13 @@ impl UnifiedExecProcessManager {
         let process = match launch {
             UnifiedExecLaunch::Process(process) => process,
             UnifiedExecLaunch::KnownDelta(hit) => {
+                // Cached output is not an execution owned by this attempt.
+                if let Some(validation) = task_validation.take() {
+                    validation
+                        .finish(None)
+                        .await
+                        .map_err(UnifiedExecError::process_failed)?;
+                }
                 let started_at = Instant::now();
                 let event_ctx = ToolEventCtx::new(
                     context.session.as_ref(),
@@ -1257,6 +1286,7 @@ impl UnifiedExecProcessManager {
                     original_token_count: Some(hit.original_token_count()),
                     hook_command: Some(request.hook_command.clone()),
                     raw_output_artifact: Some(hit.raw_output_artifact().clone()),
+                    raw_output_truncated: false,
                     raw_output_reduction_notice: None,
                     repair_notice: None,
                     pending_deferred_completions: Vec::new(),
@@ -1341,6 +1371,7 @@ impl UnifiedExecProcessManager {
                         .map(|_| known_delta_executor_started_at),
                     !request.tty && request.validation_launch.is_some(),
                     validation_process.then_some(known_delta_executor_started_at),
+                    task_validation.take(),
                 )
                 .await;
             store_result?;
@@ -1386,8 +1417,9 @@ impl UnifiedExecProcessManager {
             quiet_period,
             &mut None,
         )
-        .await
-        .bytes;
+        .await;
+        let raw_output_truncated = collected.truncated;
+        let collected = collected.bytes;
         if cancellation_token.is_cancelled() || process.has_exited() {
             mark_exec_process_exited();
         }
@@ -1609,6 +1641,7 @@ impl UnifiedExecProcessManager {
                     .flatten(),
                 None => process.raw_output_artifact().await,
             },
+            raw_output_truncated,
             raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
@@ -1875,6 +1908,7 @@ impl UnifiedExecProcessManager {
         )
         .await;
         wait.0.wake_reason = collected.wake_reason;
+        let raw_output_truncated = collected.truncated;
         let collected = collected.bytes;
         let wall_time = Instant::now().saturating_duration_since(start);
 
@@ -1972,6 +2006,7 @@ impl UnifiedExecProcessManager {
                     .flatten(),
                 None => process.raw_output_artifact().await,
             },
+            raw_output_truncated,
             raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
@@ -2121,6 +2156,7 @@ impl UnifiedExecProcessManager {
             original_token_count: Some(0),
             hook_command: Some(handles.hook_command),
             raw_output_artifact: handles.process.raw_output_artifact().await,
+            raw_output_truncated: false,
             raw_output_reduction_notice: None,
             repair_notice: Some(notice),
             pending_deferred_completions: Vec::new(),
@@ -2197,6 +2233,7 @@ impl UnifiedExecProcessManager {
         known_delta_executor_started_at: Option<Instant>,
         validation_launch: bool,
         validation_started_at: Option<Instant>,
+        task_validation: Option<crate::agent::task_validation::TaskValidation>,
     ) -> Result<(), UnifiedExecError> {
         let command_execution_id = context
             .session
@@ -2305,6 +2342,7 @@ impl UnifiedExecProcessManager {
             tool_dispatch_timing,
             network_approval,
             validation_started_at,
+            task_validation,
         );
         registration.commit().await;
         Ok(())
@@ -2359,7 +2397,7 @@ impl UnifiedExecProcessManager {
         .map_err(|err| match err {
             UnifiedExecError::SandboxDenied { output, .. } => {
                 ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                    output: Box::new(output),
+                    output,
                     network_policy_decision: None,
                 }))
             }
@@ -2666,6 +2704,7 @@ impl UnifiedExecProcessManager {
             additional_permissions_uri: request.additional_permissions_uri.clone(),
             justification: request.justification.clone(),
             exec_approval_requirement,
+            #[cfg(test)]
             validation_launch: request.validation_launch.clone(),
             known_delta_hit: request
                 .known_delta
@@ -3008,6 +3047,9 @@ impl UnifiedExecProcessManager {
         };
 
         let guard = output_buffer.lock().await;
+        let truncated = guard.pending_output().is_some_and(|collected| {
+            collected.omitted_bytes() > 0 || collected.lagged_chunks() > 0
+        });
         let output = guard
             .pending_output()
             .map(|collected| {
@@ -3021,6 +3063,7 @@ impl UnifiedExecProcessManager {
             .unwrap_or_default();
         CollectedOutput {
             bytes: output,
+            truncated,
             wake_reason,
         }
     }

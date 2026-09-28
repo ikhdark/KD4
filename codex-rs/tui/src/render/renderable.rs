@@ -131,7 +131,7 @@ impl<'a> Renderable for Line<'a> {
 
 impl<'a> Renderable for Paragraph<'a> {
     fn render_scrolled(&self, area: Rect, buf: &mut Buffer, rows: u16) -> bool {
-        Widget::render(&self.clone().scroll((rows, 0)), area, buf);
+        Widget::render(self.clone().scroll((rows, 0)), area, buf);
         true
     }
 

@@ -7,6 +7,8 @@ import json
 import os
 import shutil
 import stat
+import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -15,15 +17,27 @@ from functools import lru_cache
 from pathlib import Path
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
-from urllib.request import urlopen
-import time
 from scripts.process_owner import check_operation
+from scripts.process_owner import run_owned
 
 from .targets import TargetSpec
 
 
 DOWNLOAD_TIMEOUT_SECS = 60
 HASH_CHUNK_BYTES = 8 * 1024 * 1024
+
+_DOWNLOAD_SCRIPT = """
+import shutil
+import sys
+from urllib.request import urlopen
+
+try:
+    with urlopen(sys.argv[1], timeout=float(sys.argv[3])) as response:
+        with open(sys.argv[2], "wb") as output:
+            shutil.copyfileobj(response, output)
+except OSError as error:
+    sys.exit(str(error))
+"""
 
 
 _FETCHED_EXECUTABLES: dict[
@@ -278,6 +292,7 @@ def verify_archive(
 
 
 def download_archive(url: str, archive_path: Path) -> None:
+    check_operation()
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     temp_file = tempfile.NamedTemporaryFile(
         prefix=f"{archive_path.name}.",
@@ -286,19 +301,32 @@ def download_archive(url: str, archive_path: Path) -> None:
         delete=False,
     )
     temp_path = Path(temp_file.name)
+    temp_file.close()
     try:
-        with temp_file as out:
-            deadline = time.monotonic() + DOWNLOAD_TIMEOUT_SECS
-            check_operation()
-            with urlopen(url, timeout=min(5, DOWNLOAD_TIMEOUT_SECS)) as response:
-                while True:
-                    check_operation()
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("dependency transfer deadline expired")
-                    chunk = response.read(HASH_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    out.write(chunk)
+        # Own the blocking DNS/connect/header/body work, not just the read loop.
+        # run_owned stops and joins the worker before we remove its partial file.
+        try:
+            completed = run_owned(
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    _DOWNLOAD_SCRIPT,
+                    url,
+                    str(temp_path),
+                    str(DOWNLOAD_TIMEOUT_SECS),
+                ],
+                timeout=DOWNLOAD_TIMEOUT_SECS,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError("dependency transfer deadline expired") from error
+        if completed.returncode:
+            raise RuntimeError(
+                f"Dependency download failed for {url}: {completed.stderr.strip()}"
+            )
+        check_operation()
         temp_path.replace(archive_path)
     finally:
         temp_path.unlink(missing_ok=True)

@@ -3,15 +3,47 @@
 from pathlib import Path
 import json
 import hashlib
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+from contextvars import Context
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from codex_package import cargo as cargo_module
 from codex_package import cli
 from codex_package.cargo import SourceBuildOutputs
+from codex_package.test_layout import write_pe
+
+
+class CliEntrypointTest(unittest.TestCase):
+    def test_help_from_any_cwd_with_or_without_safe_path(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        script = repo / "scripts" / "build_codex_package.py"
+        with tempfile.TemporaryDirectory() as directory:
+            for cwd in (repo, Path(directory)):
+                for safe_path in (False, True):
+                    with self.subTest(cwd=cwd, safe_path=safe_path):
+                        env = dict(os.environ)
+                        env.pop("PYTHONPATH", None)
+                        env.pop("PYTHONSAFEPATH", None)
+                        if safe_path:
+                            env["PYTHONSAFEPATH"] = "1"
+                        result = subprocess.run(
+                            [sys.executable, "-B", str(script), "--help"],
+                            cwd=cwd,
+                            env=env,
+                            text=True,
+                            capture_output=True,
+                            timeout=15,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn("--target", result.stdout)
+                        self.assertIn("--package-dir", result.stdout)
 
 
 class CliPerformanceFlagsTest(unittest.TestCase):
@@ -58,7 +90,7 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 "rg.exe",
             ]:
                 path = target_dir / name
-                path.write_text("bin", encoding="utf-8")
+                write_pe(path)
                 path.chmod(0o755)
             archive_a = root / "a.zip"
             archive_b = root / "b.zip"
@@ -151,12 +183,12 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 codex_command_runner_bin=None,
                 codex_windows_sandbox_setup_bin=None,
             )
-            outputs.entrypoint_bin.write_text("bin", encoding="utf-8")
+            write_pe(outputs.entrypoint_bin)
             outputs.entrypoint_bin.chmod(0o755)
-            outputs.code_mode_host_bin.write_text("host", encoding="utf-8")
+            write_pe(outputs.code_mode_host_bin)
             outputs.code_mode_host_bin.chmod(0o755)
             rg = out / "rg"
-            rg.write_text("rg", encoding="utf-8")
+            write_pe(rg)
             rg.chmod(0o755)
 
             with (
@@ -217,12 +249,12 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 codex_command_runner_bin=None,
                 codex_windows_sandbox_setup_bin=None,
             )
-            outputs.entrypoint_bin.write_text("bin", encoding="utf-8")
+            write_pe(outputs.entrypoint_bin)
             outputs.entrypoint_bin.chmod(0o755)
-            outputs.code_mode_host_bin.write_text("host", encoding="utf-8")
+            write_pe(outputs.code_mode_host_bin)
             outputs.code_mode_host_bin.chmod(0o755)
             rg = out / "rg"
-            rg.write_text("rg", encoding="utf-8")
+            write_pe(rg)
             rg.chmod(0o755)
 
             with (
@@ -290,7 +322,7 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                 outputs.codex_windows_sandbox_setup_bin,
                 out / "rg.exe",
             ]:
-                path.write_text("bin", encoding="utf-8")
+                write_pe(path)
 
             with (
                 mock.patch.object(
@@ -340,6 +372,76 @@ class CliPerformanceFlagsTest(unittest.TestCase):
 
 
 class CliPreflightTest(unittest.TestCase):
+    def test_non_pe_ripgrep_fails_before_starting_cargo(self):
+        with tempfile.TemporaryDirectory() as temp:
+            rg = Path(temp) / "rg.exe"
+            rg.write_text("not a Windows executable")
+            with mock.patch.object(cli, "resolve_source_outputs") as source:
+                with self.assertRaisesRegex(
+                    RuntimeError, "Invalid PE executable for ripgrep"
+                ):
+                    cli.resolve_package_inputs(
+                        request_args(rg_bin=rg),
+                        cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
+                        cli.PACKAGE_VARIANTS["codex"],
+                    )
+                source.assert_not_called()
+
+    def test_build_lease_protects_staging_but_not_archive_generation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = cli.TARGET_SPECS["x86_64-pc-windows-msvc"]
+            files = [root / f"input-{i}.exe" for i in range(5)]
+            for path in files:
+                write_pe(path)
+            inputs = cli.PackageInputs(*files)
+            archive = root / "package.zip"
+            args = request_args(
+                target=spec.target,
+                variant="codex",
+                package_dir=root / "package",
+                cargo="cargo",
+                archive_output=[archive],
+                rg_bin=files[2],
+            )
+
+            def acquire():
+                with cargo_module.package_build_lease(spec, "release"):
+                    pass
+
+            def build(staging, *args, **kwargs):
+                with self.assertRaisesRegex(RuntimeError, "already locked"):
+                    Context().run(acquire)
+                (staging / "bin").mkdir()
+                (staging / "bin" / "snapshot").write_bytes(b"independent snapshot")
+
+            def archive_snapshot(staging, archive_path, **kwargs):
+                Context().run(acquire)
+                self.assertEqual(
+                    (staging / "bin" / "snapshot").read_bytes(), b"independent snapshot"
+                )
+                create_staged_archive(staging, archive_path)
+
+            with (
+                mock.patch.object(cli, "parse_args", return_value=args),
+                mock.patch.object(
+                    cargo_module,
+                    "cargo_package_target_dir",
+                    return_value=root / "target",
+                ),
+                mock.patch.object(
+                    cli, "resolve_package_inputs", return_value=("1.2.3", inputs)
+                ),
+                mock.patch.object(
+                    cli, "source_tree_fingerprint", return_value={"status": "test"}
+                ),
+                mock.patch.object(cli, "build_package_dir", side_effect=build),
+                mock.patch.object(cli, "validate_package_dir"),
+                mock.patch.object(cli, "write_archive", side_effect=archive_snapshot),
+            ):
+                self.assertEqual(cli.main(), 0)
+            self.assertEqual(archive.read_bytes(), b"archive")
+
     def test_release_manifests_use_installer_asset_name_and_digest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

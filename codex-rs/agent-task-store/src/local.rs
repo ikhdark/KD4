@@ -1245,6 +1245,54 @@ LIMIT 1
                 "validation command summary cannot be empty".to_string(),
             ));
         }
+        let previous = self.get_validation_call_impl(call.call_id.clone()).await?;
+        if let Some(previous) = previous.as_ref() {
+            if previous.attempt_id != call.attempt_id {
+                return Err(StoreError::ValidationCallOwnership {
+                    call_ids: vec![call.call_id],
+                });
+            }
+            if previous == &call {
+                return Ok(());
+            }
+            if previous.status.is_terminal()
+                || !call.status.is_terminal()
+                || previous.command_summary != call.command_summary
+                || call.recorded_at < previous.recorded_at
+            {
+                return Err(StoreError::ValidationCallImmutable(call.call_id));
+            }
+        } else if call.status != crate::ValidationCallStatus::Running {
+            return Err(StoreError::ValidationCallImmutable(call.call_id));
+        }
+        let input_paths = match &previous {
+            Some(previous) => previous.evidence.input_paths.clone(),
+            None => call.evidence.input_paths.clone(),
+        };
+        let input_capture = if let Some(paths) = input_paths.as_ref()
+            && (call.status == crate::ValidationCallStatus::Running
+                || call.status == crate::ValidationCallStatus::Succeeded)
+            && previous
+                .as_ref()
+                .is_none_or(|previous| !previous.status.is_terminal())
+        {
+            if paths.is_empty() || !stored_covered_paths_are_normalized(paths) {
+                return Err(StoreError::InvalidScope(
+                    "validation input paths must be normalized and nonempty".to_string(),
+                ));
+            }
+            let context = validation_context(&self.pool, call.attempt_id).await?;
+            Some(
+                crate::workspace::capture_source_revision(
+                    &self.pool,
+                    &context.repo_root,
+                    paths.clone(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         let mut transaction = self.pool.begin().await?;
         lock_attempt_tx(&mut transaction, call.attempt_id).await?;
         let attempt = load_attempt_tx(&mut transaction, call.attempt_id).await?;
@@ -1285,10 +1333,27 @@ LIMIT 1
                 return Err(StoreError::ValidationCallImmutable(call.call_id));
             }
             call.evidence.start_epoch = existing.evidence.start_epoch;
+            call.evidence.input_paths = existing.evidence.input_paths.clone();
+            call.evidence.start_manifest_hash = existing.evidence.start_manifest_hash.clone();
+            call.evidence.end_manifest_hash = None;
             // Sealing an attempt revokes proof eligibility, not the host's
             // ability to acknowledge completion of an operation it already owns.
             let end_epoch = if !attempt_is_active {
                 None
+            } else if input_paths.is_some() {
+                match input_capture {
+                    Some(Ok(revision)) => {
+                        call.evidence.end_manifest_hash = Some(revision.manifest_hash);
+                        Some(revision.epoch)
+                    }
+                    Some(Err(error)) => {
+                        call.evidence.output_summary = Some(format!(
+                            "Process completed; validation evidence is unavailable: {error}"
+                        ));
+                        None
+                    }
+                    None => None,
+                }
             } else if call.status == crate::ValidationCallStatus::Succeeded {
                 let mut capture = transaction.begin().await?;
                 match capture_complete_repository_revision_tx(&mut capture, attempt.assignment_id)
@@ -1359,10 +1424,20 @@ LIMIT 1
                     call.command_summary
                 )));
             }
-            call.evidence.start_epoch =
-                capture_complete_repository_revision_tx(&mut transaction, attempt.assignment_id)
-                    .await?
-                    .epoch;
+            if let Some(capture) = input_capture {
+                let revision = capture?;
+                call.evidence.start_epoch = revision.epoch;
+                call.evidence.start_manifest_hash = Some(revision.manifest_hash);
+            } else {
+                call.evidence.start_manifest_hash = None;
+                call.evidence.start_epoch = capture_complete_repository_revision_tx(
+                    &mut transaction,
+                    attempt.assignment_id,
+                )
+                .await?
+                .epoch;
+            }
+            call.evidence.end_manifest_hash = None;
             call.evidence.end_epoch = None;
             call.evidence.lease_expires_at = Some(
                 comparison_now() + chrono::Duration::seconds(crate::MAX_VALIDATION_LEASE_SECONDS),
@@ -1535,6 +1610,26 @@ LIMIT 1
                 "receipt summary cannot be empty".to_string(),
             ));
         }
+        let mut current_input_hashes = std::collections::HashMap::new();
+        if draft.status == AgentStatusClaim::Completed && !host_legacy_outcome {
+            for call_id in &draft.validation_call_ids {
+                if let Some(call) = self.get_validation_call_impl(call_id.clone()).await?
+                    && call.attempt_id == attempt_id
+                    && validation_call_has_successful_result(&call)
+                    && let Some(paths) = call.evidence.input_paths
+                    && !current_input_hashes.contains_key(&paths)
+                {
+                    let context = validation_context(&self.pool, attempt_id).await?;
+                    let current = crate::workspace::capture_source_revision(
+                        &self.pool,
+                        &context.repo_root,
+                        paths.clone(),
+                    )
+                    .await?;
+                    current_input_hashes.insert(paths, current.manifest_hash);
+                }
+            }
+        }
         let handoff_action = if draft.status == AgentStatusClaim::Completed && !host_legacy_outcome
         {
             self.prepare_receipt_handoff_action(attempt_id).await?
@@ -1651,7 +1746,18 @@ LIMIT 1
             if completion_proof {
                 validation_summaries.insert(call.command_summary);
                 if let Some(end_epoch) = call.evidence.end_epoch {
-                    successful_call_epochs.push((call_id.clone(), end_epoch));
+                    if let Some(paths) = call.evidence.input_paths.as_ref() {
+                        if draft.status == AgentStatusClaim::Completed
+                            && current_input_hashes.get(paths)
+                                != call.evidence.end_manifest_hash.as_ref()
+                        {
+                            return Err(StoreError::EvidenceSuperseded {
+                                call_ids: vec![call_id.clone()],
+                            });
+                        }
+                    } else {
+                        successful_call_epochs.push((call_id.clone(), end_epoch));
+                    }
                     successful_calls.insert(call_id.as_str(), end_epoch);
                 }
             }
@@ -1821,13 +1927,14 @@ LIMIT 1
                 .map(|scope| scope.path.clone())
                 .collect::<Vec<_>>();
             let revision =
-                crate::workspace::capture_revision(&self.pool, &context.repo_root, paths).await?;
+                crate::workspace::capture_source_revision(&self.pool, &context.repo_root, paths)
+                    .await?;
             return Ok(Some(ReceiptHandoffAction::Publish(IsolationHandoff {
                 assignment_id: context.assignment.assignment_id,
                 source_workspace_id: revision.workspace_id,
                 source_repository_root: Some(context.repo_root.to_string_lossy().into_owned()),
                 source_epoch: revision.epoch,
-                source_manifest_hash: revision.manifest_hash,
+                source_manifest_hash: format!("source-v1:{}", revision.manifest_hash),
                 covered_manifest: revision.files,
                 state: IsolationHandoffState::Ready,
                 integrator_assignment_id: None,
@@ -1883,16 +1990,37 @@ LIMIT 1
                     context.assignment.assignment_id
                 )));
             }
-            let paths = handoff
-                .covered_manifest
+            let paths = target_assignment
+                .write_scope
                 .iter()
                 .map(|entry| entry.path.clone())
                 .collect::<Vec<_>>();
             let canonical_root = row.get::<String, _>("canonical_root");
-            let current =
-                crate::workspace::capture_revision(&self.pool, Path::new(&canonical_root), paths)
-                    .await?;
-            if current.manifest_hash != handoff.source_manifest_hash {
+            let (current, expected_hash) =
+                if let Some(hash) = handoff.source_manifest_hash.strip_prefix("source-v1:") {
+                    (
+                        crate::workspace::capture_source_revision(
+                            &self.pool,
+                            Path::new(&canonical_root),
+                            paths,
+                        )
+                        .await?,
+                        hash,
+                    )
+                } else {
+                    // Persisted handoffs retain their original capture policy, but still
+                    // rescan the complete original scope to detect added files.
+                    (
+                        crate::workspace::capture_revision(
+                            &self.pool,
+                            Path::new(&canonical_root),
+                            paths,
+                        )
+                        .await?,
+                        handoff.source_manifest_hash.as_str(),
+                    )
+                };
+            if current.manifest_hash != expected_hash {
                 return Err(StoreError::IsolationHandoffSuperseded(*target));
             }
             integrated_targets.push(*target);
@@ -4577,7 +4705,14 @@ fn validation_call_has_successful_result(call: &ValidationCall) -> bool {
         return false;
     };
     call.status == ValidationCallStatus::Succeeded
-        && call.evidence.end_epoch == Some(call.evidence.start_epoch)
+        && if call.evidence.input_paths.is_some() {
+            call.evidence.start_manifest_hash.is_some()
+                && call.evidence.end_epoch.is_some()
+                && call.evidence.start_manifest_hash == call.evidence.end_manifest_hash
+                && call.evidence.input_paths.as_ref() == Some(&result.covered_paths)
+        } else {
+            call.evidence.end_epoch == Some(call.evidence.start_epoch)
+        }
         && result.call_id == call.call_id
         && result.status == StoredValidationTerminalStatus::Succeeded
         && !result.argv.is_empty()

@@ -303,19 +303,12 @@ const REQUEST_SETTING_FIELDS: [&str; 6] = [
 
 type RequestSettingDigests = [Option<[u8; 32]>; REQUEST_SETTING_FIELDS.len()];
 
-/// Digests each request setting exactly as dispatched; an omitted setting has
-/// no digest.
-fn request_setting_digests(
-    encoded_request: &[u8],
-    cancellation: &CancellationToken,
-) -> serde_json::Result<RequestSettingDigests> {
-    ensure_measurement_not_cancelled(Some(cancellation))?;
-    let fields: BTreeMap<&str, &RawValue> = serde_json::from_slice(encoded_request)?;
-    Ok(REQUEST_SETTING_FIELDS.map(|field| {
-        fields
-            .get(field)
-            .map(|value| Sha256::digest(value.get().as_bytes()).into())
-    }))
+/// Preserve explicit JSON null separately from an omitted setting.
+fn present_raw_setting<'de, D>(deserializer: D) -> std::result::Result<Option<&'de RawValue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <&RawValue>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone)]
@@ -471,12 +464,14 @@ impl ModelRequestMeasurements {
         provenance: &PromptProvenanceSidecar,
         base_instructions: &str,
     ) -> serde_json::Result<Self> {
-        Self::for_responses_request_cancellable(
+        let encoded = serde_json::to_vec(request)?;
+        Self::for_responses_request_from_encoded_cancellable(
             request,
             provenance,
             base_instructions,
             /*cancellation*/ None,
-            /*logical_request_bytes*/ None,
+            &encoded,
+            encoded.len() as u64,
         )
     }
 
@@ -560,18 +555,41 @@ impl ModelRequestMeasurements {
             input: Vec<&'a RawValue>,
             #[serde(borrow)]
             tools: Option<Vec<&'a RawValue>>,
+            #[serde(default, borrow, deserialize_with = "present_raw_setting")]
+            model: Option<&'a RawValue>,
+            #[serde(default, borrow, deserialize_with = "present_raw_setting")]
+            reasoning: Option<&'a RawValue>,
+            #[serde(default, borrow, deserialize_with = "present_raw_setting")]
+            text: Option<&'a RawValue>,
+            #[serde(default, borrow, deserialize_with = "present_raw_setting")]
+            tool_choice: Option<&'a RawValue>,
+            #[serde(default, borrow, deserialize_with = "present_raw_setting")]
+            parallel_tool_calls: Option<&'a RawValue>,
+            #[serde(default, borrow, deserialize_with = "present_raw_setting")]
+            service_tier: Option<&'a RawValue>,
         }
 
         ensure_measurement_not_cancelled(cancellation)?;
         let encoded: EncodedResponsesRequest<'_> = serde_json::from_slice(encoded_request)?;
+        let setting_digests = Some([
+            encoded.model,
+            encoded.reasoning,
+            encoded.text,
+            encoded.tool_choice,
+            encoded.parallel_tool_calls,
+            encoded.service_tier,
+        ].map(|value| value.map(|value| Sha256::digest(value.get().as_bytes()).into())));
         if encoded.input.len() != request.input.len()
             || encoded.tools.as_ref().map(Vec::len)
                 != request.tools.as_deref().map(<[serde_json::Value]>::len)
         {
-            return Err(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "encoded transport request is an incremental projection",
-            )));
+            // Incremental transport still supplies settings. Measure the logical
+            // input without parsing the dispatched body again.
+            let mut measurements = Self::for_responses_request_cancellable(
+                request, provenance, base_instructions, cancellation, None,
+            )?;
+            measurements.request_setting_digests = setting_digests;
+            return Ok(measurements);
         }
         let embedded_base_index = (!base_instructions.is_empty()
             && request.instructions.is_empty()
@@ -629,7 +647,7 @@ impl ModelRequestMeasurements {
                 b"tool_schema_array_envelope",
             );
         }
-        Self::from_context(
+        let mut measurements = Self::from_context(
             logical_request_bytes,
             context,
             tool_schema_breakdown,
@@ -638,7 +656,9 @@ impl ModelRequestMeasurements {
                 .iter()
                 .map(|item| Sha256::digest(item.get().as_bytes()).into())
                 .collect(),
-        )
+        )?;
+        measurements.request_setting_digests = setting_digests;
+        Ok(measurements)
     }
 
     fn from_context(
@@ -792,6 +812,8 @@ impl ModelRequestMeasurements {
             .collect::<Vec<_>>();
         self.fixed_prefix_reuse_eligible = baseline.as_ref().is_some_and(|previous| {
             previous.prompt_cache_key.as_deref() == prompt_cache_key
+                && previous.request_setting_digests.is_some()
+                && self.request_setting_digests.is_some()
                 && self.changed_request_settings.is_empty()
                 && previous.ordered_fixed_hashes == ordered_fixed_hashes
                 && previous.fixed_prefix_item_count == self.fixed_prefix_item_count
@@ -1225,13 +1247,6 @@ fn measure_responses_request_after_dispatch(
                     )?,
                 };
                 measurements.wire_request_bytes = wire_request_bytes;
-                // Incremental transport bodies still carry their settings, so
-                // this reads the dispatched bytes even when input measurement
-                // fell back to the logical request.
-                measurements.request_setting_digests =
-                    encoded_request.as_deref().and_then(|encoded| {
-                        request_setting_digests(encoded, &blocking_cancellation).ok()
-                    });
                 measurements.tool_output_budget_drop_count = selected_budget_drops.count;
                 measurements.tool_output_budget_dropped_token_count = selected_budget_drops.tokens;
                 Ok::<_, serde_json::Error>(measurements)

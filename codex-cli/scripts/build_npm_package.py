@@ -495,15 +495,41 @@ def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
     return output_path
 
 
-def smoke_test_npm_tarball(tarball_path: Path) -> None:
+def smoke_test_npm_tarball(
+    tarball_path: Path, native_tarball: Path | None = None
+) -> None:
     with tarfile.open(tarball_path, "r:gz") as tarball:
         manifest = tarball.extractfile("package/package.json")
         if manifest is None:
             raise RuntimeError(f"npm tarball has no package.json: {tarball_path}")
         packed = json.load(manifest)
     package_name = packed["name"]
+    native_args = []
+    if native_tarball is not None:
+        platform_key = subprocess.check_output(
+            [resolve_tool("node"), "-p", "process.platform + '-' + process.arch"],
+            text=True,
+        ).strip()
+        if platform_key != "win32-x64":
+            raise RuntimeError("The paired native smoke requires Windows x64")
+        target = packed["codexNativeTargets"][platform_key]
+        with tarfile.open(native_tarball, "r:gz") as archive:
+            manifest = archive.extractfile("package/package.json")
+            if manifest is None:
+                raise RuntimeError("Native tarball has no package.json")
+            native = json.load(manifest)
+        expected = f"npm:{native['name']}@{native['version']}"
+        if packed["optionalDependencies"].get(target["package"]) != expected:
+            raise RuntimeError("Main/native tarball alias or version mismatch")
+        if native.get("os") != ["win32"] or native.get("cpu") != ["x64"]:
+            raise RuntimeError("Native tarball is not Windows x64")
+        native_args = [f"{target['package']}@{native_tarball.resolve().as_uri()}"]
     with tempfile.TemporaryDirectory(prefix="codex-npm-smoke-") as smoke_dir_str:
         smoke_dir = Path(smoke_dir_str)
+        env = os.environ.copy()
+        env["NPM_CONFIG_CACHE"] = str(smoke_dir / "npm-cache")
+        env["CODEX_HOME"] = str(smoke_dir / "codex-home")
+        Path(env["CODEX_HOME"]).mkdir()
         subprocess.run(
             [
                 resolve_tool("npm"),
@@ -514,15 +540,21 @@ def smoke_test_npm_tarball(tarball_path: Path) -> None:
                 str(smoke_dir),
                 "--force",
                 "--ignore-scripts",
-                "--omit=optional",
+                "--include=optional" if native_tarball is not None else "--omit=optional",
+                *(["--offline"] if native_tarball is not None else []),
+                "--no-audit",
+                "--no-fund",
                 "--no-package-lock",
-                str(tarball_path),
+                str(tarball_path.resolve()),
+                *native_args,
             ],
             cwd=smoke_dir,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            env=env,
+            timeout=120,
         )
         installed = smoke_dir / "node_modules" / package_name
         if not (installed / "package.json").is_file():
@@ -534,6 +566,17 @@ def smoke_test_npm_tarball(tarball_path: Path) -> None:
             launchers = {package_name: launchers}
         for launcher in launchers.values():
             subprocess.run(["node", "--check", str(installed / launcher)], check=True)
+        if native_tarball is not None:
+            launcher = smoke_dir / "node_modules" / ".bin" / "codex.cmd"
+            for argument in ("--version", "--help"):
+                output = subprocess.check_output(
+                    [str(launcher), argument], cwd=smoke_dir, env=env,
+                    text=True, timeout=30,
+                )
+                if argument == "--version" and output.strip() != f"codex-cli {packed['version']}":
+                    raise RuntimeError(f"Unexpected installed CLI version: {output!r}")
+                if argument == "--help" and "Usage:" not in output:
+                    raise RuntimeError(f"Installed CLI did not return help: {output!r}")
 
 
 if __name__ == "__main__":

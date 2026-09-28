@@ -3,6 +3,18 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::path::PathBuf;
 
+#[cfg(windows)]
+#[path = "setup_payload_transport.rs"]
+mod transport;
+#[cfg(windows)]
+pub use transport::SETUP_PAYLOAD_FILE_ARG;
+#[cfg(windows)]
+pub use transport::SETUP_PAYLOAD_STDIN_ARG;
+#[cfg(windows)]
+pub use transport::read_setup_payload;
+#[cfg(windows)]
+pub use transport::write_setup_payload;
+
 /// Versioned payload exchanged between the sandbox setup orchestrator and helper.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SetupPayload {

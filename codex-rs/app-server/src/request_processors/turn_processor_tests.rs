@@ -491,8 +491,8 @@ fn map_additional_context_preserves_client_order() {
 fn additional_context_estimate_caps_escaped_utf8_values() {
     for (value, expected_value_bytes) in [
         ("<&é>".to_string(), 15),
-        ("&".repeat(4_000), 16_384),
-        ("é".repeat(10_000), 16_384),
+        ("&".repeat(4_000), 4_000),
+        ("é".repeat(10_000), 4_000),
     ] {
         let entry = additional_context_entry(value.clone());
         assert_eq!(
@@ -503,6 +503,39 @@ fn additional_context_estimate_caps_escaped_utf8_values() {
             .expect("one capped value is within the aggregate budget");
         assert_eq!(mapped["source"].value, value);
     }
+}
+
+#[test]
+fn additional_context_admits_multiple_values_that_fit_after_rendering() {
+    use codex_context_fragments::AdditionalContextUserFragment;
+    use codex_context_fragments::ContextualUserFragment;
+
+    let values = (0..8)
+        .map(|index| {
+            (
+                format!("source-{index}"),
+                additional_context_entry("&".repeat(4_096)),
+            )
+        })
+        .collect::<IndexMap<_, _>>();
+    let rendered = values
+        .iter()
+        .map(|(key, entry)| {
+            AdditionalContextUserFragment::new(key.clone(), entry.value.clone())
+                .into_response_input_item()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        serde_json::to_vec(&rendered).unwrap().len()
+            < MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES
+    );
+    let mapped = map_additional_context(Some(values)).expect("bounded rendered values fit");
+    assert_eq!(mapped.len(), 8);
+    assert!(
+        mapped
+            .values()
+            .all(|entry| entry.value == "&".repeat(4_096))
+    );
 }
 
 #[test]

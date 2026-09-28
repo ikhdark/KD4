@@ -140,8 +140,15 @@ struct ExtractionCacheKey {
 
 #[derive(Default)]
 struct ExtractionCache {
-    entries: HashMap<ExtractionCacheKey, ExtractionOutcome>,
+    entries: HashMap<ExtractionCacheKey, CachedRolloutRead>,
     order: VecDeque<ExtractionCacheKey>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CachedRolloutRead {
+    pub outcome: Option<ExtractionOutcome>,
+    pub summary: Option<crate::list::HeadTailSummary>,
+    pub manifests: Option<crate::ToolManifestDictionary>,
 }
 
 fn extraction_cache() -> &'static Mutex<ExtractionCache> {
@@ -159,7 +166,7 @@ async fn extraction_cache_key(
         path: rollout_path.to_path_buf(),
         physical_path,
         len: metadata.len(),
-        modified: metadata.modified().ok(),
+        modified: Some(metadata.modified().ok()?),
         default_provider: default_provider.to_string(),
     })
 }
@@ -177,10 +184,7 @@ pub(crate) async fn extraction_cache_guard(
     }
 }
 
-pub(crate) async fn cache_extraction_outcome(
-    guard: ExtractionCacheGuard,
-    outcome: ExtractionOutcome,
-) {
+pub(crate) async fn cache_rollout_read(guard: ExtractionCacheGuard, read: CachedRolloutRead) {
     let Some(key) = guard.key else {
         return;
     };
@@ -193,6 +197,16 @@ pub(crate) async fn cache_extraction_outcome(
     let mut cache = extraction_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut combined = cache.entries.remove(&key).unwrap_or_default();
+    if read.outcome.is_some() {
+        combined.outcome = read.outcome;
+    }
+    if read.summary.is_some() {
+        combined.summary = read.summary;
+    }
+    if read.manifests.is_some() {
+        combined.manifests = read.manifests;
+    }
     cache.entries.retain(|candidate, _| {
         candidate.path != key.path || candidate.default_provider != key.default_provider
     });
@@ -200,7 +214,7 @@ pub(crate) async fn cache_extraction_outcome(
         candidate.path != key.path || candidate.default_provider != key.default_provider
     });
     cache.order.push_back(key.clone());
-    cache.entries.insert(key, outcome);
+    cache.entries.insert(key, combined);
     while cache.order.len() > EXTRACTION_CACHE_CAPACITY {
         if let Some(evicted) = cache.order.pop_front() {
             cache.entries.remove(&evicted);
@@ -212,11 +226,33 @@ async fn cached_extraction_outcome(
     rollout_path: &Path,
     default_provider: &str,
 ) -> Option<ExtractionOutcome> {
+    cached_rollout_read(rollout_path, default_provider)
+        .await?
+        .outcome
+}
+
+pub(crate) async fn cached_rollout_read(
+    rollout_path: &Path,
+    default_provider: &str,
+) -> Option<CachedRolloutRead> {
     let key = extraction_cache_key(rollout_path, default_provider).await?;
     let cache = extraction_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     cache.entries.get(&key).cloned()
+}
+
+pub(crate) async fn take_cached_manifests(
+    rollout_path: &Path,
+) -> Option<crate::ToolManifestDictionary> {
+    let key = extraction_cache_key(rollout_path, "").await?;
+    extraction_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .get_mut(&key)?
+        .manifests
+        .take()
 }
 
 #[derive(Default)]
@@ -250,26 +286,26 @@ impl RolloutMetadataAccumulator {
             self.metadata = Some(builder.build(default_provider));
             self.reducer = Some(ThreadMetadataRolloutReducer::default());
         }
-        if let RolloutItem::SessionMeta(meta_line) = &item {
-            if !self.saw_first_session_meta {
-                self.saw_first_session_meta = true;
-                if let Some(builder) = builder_from_session_meta(meta_line, rollout_path) {
-                    self.parent_thread_id = builder.parent_thread_id;
-                    let mut canonical = builder.build(default_provider);
-                    if let Some(projected) = self.metadata.take() {
-                        // Before the first SessionMeta, only these non-setting
-                        // fields can change. The reducer retains settings in order.
-                        canonical.title = projected.title;
-                        canonical.preview = projected.preview;
-                        canonical.first_user_message = projected.first_user_message;
-                        canonical.tokens_used = projected.tokens_used;
-                        if self.persisted_recency_at {
-                            canonical.recency_at = projected.recency_at;
-                        }
+        if let RolloutItem::SessionMeta(meta_line) = &item
+            && !self.saw_first_session_meta
+        {
+            self.saw_first_session_meta = true;
+            if let Some(builder) = builder_from_session_meta(meta_line, rollout_path) {
+                self.parent_thread_id = builder.parent_thread_id;
+                let mut canonical = builder.build(default_provider);
+                if let Some(projected) = self.metadata.take() {
+                    // Before the first SessionMeta, only these non-setting
+                    // fields can change. The reducer retains settings in order.
+                    canonical.title = projected.title;
+                    canonical.preview = projected.preview;
+                    canonical.first_user_message = projected.first_user_message;
+                    canonical.tokens_used = projected.tokens_used;
+                    if self.persisted_recency_at {
+                        canonical.recency_at = projected.recency_at;
                     }
-                    self.metadata = Some(canonical);
-                    self.has_metadata_builder = true;
                 }
+                self.metadata = Some(canonical);
+                self.has_metadata_builder = true;
             }
         }
         if codex_state::latest_rollout_recency_at(std::slice::from_ref(&item)).is_some() {
@@ -531,11 +567,21 @@ pub(crate) async fn backfill_sessions_until(
                         "failed to extract rollout {}: {err}",
                         rollout.path.display()
                     );
-                    // Opening already retries transient failures, so an empty, torn, or
-                    // unknown-format file fails identically on every pass; retrying it would
-                    // hold the backfill, and with it every startup gate, pending forever.
-                    stats.failed = stats.failed.saturating_add(1);
-                    true
+                    // Exhausting the short open retries does not make a sharing violation
+                    // permanent. Only content failures may advance the durable watermark.
+                    let retryable = err
+                        .chain()
+                        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                        .any(|cause| {
+                            !matches!(
+                                cause.kind(),
+                                std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+                            )
+                        });
+                    if !retryable {
+                        stats.failed = stats.failed.saturating_add(1);
+                    }
+                    !retryable
                 }
             };
             if settled {

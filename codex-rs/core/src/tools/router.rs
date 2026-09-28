@@ -248,7 +248,20 @@ impl ToolRouter {
             || !turn.config.code_mode.excluded_tool_namespaces.is_empty()
         {
             // Direct calls need activated schemas in the API tools array.
-            return self.tool_schema_snapshot(&turn.activated_deferred_tools());
+            let mut activated = turn.activated_deferred_tools();
+            if crate::tools::effective_tool_mode(turn)
+                == codex_protocol::openai_models::ToolMode::CodeModeOnly
+            {
+                activated.retain(|tool| {
+                    tool.namespace.as_ref().is_some_and(|namespace| {
+                        turn.config
+                            .code_mode
+                            .excluded_tool_namespaces
+                            .contains(namespace)
+                    })
+                });
+            }
+            return self.tool_schema_snapshot(&activated);
         }
         // Activated schemas travel in appended history, never ahead of it.
         let mut state = turn

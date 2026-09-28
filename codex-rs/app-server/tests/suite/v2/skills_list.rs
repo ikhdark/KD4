@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
@@ -34,7 +35,6 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
-use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -689,6 +689,8 @@ async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
 async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
+    // Keep the effective root set stable while adding a skill to the cached root.
+    std::fs::create_dir_all(cwd.path().join(".codex/skills"))?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())

@@ -127,7 +127,7 @@ model = "gpt-5.4-mini"
     .await??;
     let response: ThreadStartResponse = to_response(response)?;
 
-    assert_eq!(response.model, "openai.gpt-6-astra");
+    assert_eq!(response.model, "openai.gpt-6-sol");
     Ok(())
 }
 
@@ -325,6 +325,15 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
+    for model in [
+        "openai.gpt-6-sol",
+        "openai.gpt-6-luna",
+        "openai.gpt-5.6-sol",
+    ] {
+        let response = start_thread_with_model(&mut mcp, model, true).await?;
+        assert_eq!(response.model, model);
+    }
+
     let unsupported_with_fallback = start_thread_with_model(
         &mut mcp,
         "gpt-5.4-mini",
@@ -350,8 +359,38 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
             supported_with_fallback.model,
             unsupported_without_fallback.model,
         ],
-        vec!["openai.gpt-6-astra", "openai.gpt-5.4", "gpt-5.4-mini"]
+        vec!["openai.gpt-6-sol", "openai.gpt-5.4", "gpt-5.4-mini"]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_bedrock_runtime_prefers_global_cross_region_models() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "model_provider = \"amazon-bedrock-runtime\"\n",
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    for model in [
+        "global.openai.gpt-6-sol",
+        "us.openai.gpt-6-sol",
+        "global.openai.gpt-6-luna",
+        "us.openai.gpt-6-luna",
+        "global.openai.gpt-5.6-sol",
+        "us.openai.gpt-5.6-sol",
+    ] {
+        let response = start_thread_with_model(&mut mcp, model, true).await?;
+        assert_eq!(response.model, model);
+    }
+    let response = start_thread_with_model(&mut mcp, "openai.gpt-6-sol", true).await?;
+    assert_eq!(response.model, "global.openai.gpt-6-sol");
+    let response = start_thread_with_model(&mut mcp, "openai.gpt-6-sol", false).await?;
+    assert_eq!(response.model, "openai.gpt-6-sol");
     Ok(())
 }
 

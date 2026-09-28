@@ -53,6 +53,7 @@ struct WsStream {
     rx_message: WsIngressReceiver,
     rx_failure: Option<oneshot::Receiver<WsIngressFailure>>,
     pending_failure: Option<WsError>,
+    handshake_etag_emitted: bool,
     pump_task: tokio::task::JoinHandle<()>,
 }
 
@@ -247,6 +248,7 @@ impl WsStream {
             rx_message,
             rx_failure: Some(rx_failure),
             pending_failure: None,
+            handshake_etag_emitted: false,
             pump_task,
         }
     }
@@ -452,11 +454,18 @@ impl ResponsesWebsocketConnection {
                         Err(err)
                     } else {
                         for event in metadata.initial_events() {
+                            let is_etag = matches!(&event, ResponseEvent::ModelsEtag(_));
+                            if is_etag && ws_stream.handshake_etag_emitted {
+                                continue;
+                            }
                             if tx_event.send(Ok(event)).await.is_err() {
                                 break 'response Err(ApiError::Stream(
                                     "response event consumer dropped".to_string(),
                                 ));
                             }
+                            // Handshake catalog metadata belongs to the connection,
+                            // not every response served by that connection.
+                            ws_stream.handshake_etag_emitted |= is_etag;
                         }
 
                         run_websocket_response_stream(
@@ -1175,6 +1184,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                handshake_etag_emitted: false,
                 pump_task,
             },
             Duration::from_secs(1),
@@ -1213,6 +1223,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                handshake_etag_emitted: false,
                 pump_task,
             },
             Duration::from_secs(1),
@@ -1325,6 +1336,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                handshake_etag_emitted: false,
                 pump_task,
             },
             Duration::from_secs(60),
@@ -1430,6 +1442,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                handshake_etag_emitted: false,
                 pump_task,
             },
             Duration::from_secs(60),
@@ -1486,6 +1499,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                handshake_etag_emitted: false,
                 pump_task,
             },
             Duration::from_secs(60),
@@ -1617,6 +1631,7 @@ mod tests {
             rx_message,
             rx_failure: Some(rx_failure),
             pending_failure: None,
+            handshake_etag_emitted: false,
             pump_task,
         };
 
@@ -1661,6 +1676,7 @@ mod tests {
             rx_message,
             rx_failure: Some(rx_failure),
             pending_failure: None,
+            handshake_etag_emitted: false,
             pump_task: tokio::spawn(async {}),
         };
 
@@ -1720,6 +1736,7 @@ mod tests {
                     rx_message,
                     rx_failure: Some(rx_failure),
                     pending_failure: None,
+                    handshake_etag_emitted: false,
                     pump_task,
                 },
                 Duration::from_secs(1),
@@ -1792,6 +1809,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                handshake_etag_emitted: false,
                 pump_task: tokio::spawn(std::future::pending()),
             };
             let (tx_event, mut rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(2);
@@ -1849,6 +1867,7 @@ mod tests {
                 rx_message,
                 rx_failure: None,
                 pending_failure: None,
+                handshake_etag_emitted: false,
                 pump_task: tokio::spawn(std::future::pending()),
             };
             let (tx_event, mut rx_event) = mpsc::channel(2);
@@ -1914,6 +1933,7 @@ mod tests {
                     rx_message,
                     rx_failure: None,
                     pending_failure: None,
+                    handshake_etag_emitted: false,
                     pump_task,
                 },
                 Duration::from_secs(1),
@@ -1969,6 +1989,7 @@ mod tests {
                     rx_message,
                     rx_failure: None,
                     pending_failure: None,
+                    handshake_etag_emitted: false,
                     pump_task,
                 },
                 Duration::from_millis(1250),

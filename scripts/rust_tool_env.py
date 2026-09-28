@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-
 
 SCCACHE_CACHE_SIZE_ENV_VAR = "CODEX_SCCACHE_CACHE_SIZE"
 DEFAULT_SCCACHE_CACHE_SIZE = "80G"
@@ -78,6 +78,43 @@ def is_sccache_wrapper(value: str) -> bool:
 def sccache_cache_size(env: Mapping[str, str]) -> str:
     override = (env.get(SCCACHE_CACHE_SIZE_ENV_VAR) or "").strip()
     return override or DEFAULT_SCCACHE_CACHE_SIZE
+
+
+def prepare_shared_sccache(
+    *, env: Mapping[str, str] | None = None, cwd: str | Path | None = None
+) -> None:
+    """Start the shared compiler cache before entering a command's job.
+
+    Never restart an existing server: other lanes may still be using it.
+    Failure is fatal rather than letting Cargo auto-start a server inside the
+    job that will be terminated as soon as this lane's command finishes.
+    """
+    environment = os.environ if env is None else env
+    wrapper = environment.get("RUSTC_WRAPPER", "")
+    if not is_sccache_wrapper(wrapper):
+        return
+    executable = shutil.which(wrapper, path=environment.get("PATH")) or wrapper
+    result = subprocess.run(
+        [executable, "--start-server"],
+        env=environment,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    # --show-stats succeeds with synthetic empty stats even without a server.
+    # --start-server is safe under concurrent lane startup: only the first
+    # caller can bind the address; a live server is never stopped or reset.
+    if result.returncode == 2 and any(
+        message in result.stderr
+        for message in ("Address in use", "Address already in use")
+    ):
+        return
+    result.check_returncode()
 
 
 def windows_lld_link_fallbacks(

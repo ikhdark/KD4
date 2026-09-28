@@ -69,6 +69,55 @@ fn missing_stabilized_context_update_returns_a_fatal_error() {
     };
     assert!(message.contains("did not carry its context candidate"));
 }
+
+#[tokio::test]
+async fn registered_new_context_resets_the_next_sampling_request() {
+    let server = responses::start_mock_server().await;
+    let home = tempfile::tempdir().unwrap();
+    let mut provider = built_in_model_providers(None)["openai"].clone();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = false;
+    provider.request_max_retries = Some(0);
+    let (session, turn, _) = crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+        CodexAuth::from_api_key("test-key"), vec![], home.path(), |config| {
+            config.model_provider = provider;
+            config.features.enable(Feature::TokenBudget).unwrap();
+            config.token_budget = Some(crate::config::TokenBudgetConfig::default());
+            for feature in [Feature::CodeMode, Feature::CodeModeHost, Feature::EnableRequestCompression] {
+                config.features.disable(feature).unwrap();
+            }
+            config.model_context_window = Some(1_000_000);
+            config.model_auto_compact_token_limit = Some(900_000);
+            config.developer_instructions = Some("PERSISTENT_WORLD_CONSTRAINT".into());
+        },
+    ).await;
+    let before = session.state.lock().await.auto_compact_window_ids();
+    let requests = responses::mount_sse_sequence(&server, vec![
+        responses::sse(vec![responses::ev_function_call("reset", "new_context", "{}"), responses::ev_completed("first")]),
+        responses::sse(vec![responses::ev_assistant_message("final", "fresh window ready"), responses::ev_completed("second")]),
+    ]).await;
+    let result = run_turn(
+        Arc::clone(&session), Arc::clone(&turn), Arc::new(ExtensionData::new("fresh-window")),
+        vec![TurnInput::UserInput {content: vec![UserInput::Text {text: "OLD_CONVERSATION_SENTINEL".into(), text_elements: vec![]}], client_id: None}],
+        None, &mut LogicalGenerationBudget::default(), CancellationToken::new(),
+    ).await.unwrap();
+    assert_eq!(result.last_agent_message.as_deref(), Some("fresh window ready"));
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 2);
+    assert!(captured[0].body_contains_text("OLD_CONVERSATION_SENTINEL"));
+    assert!(!captured[1].body_contains_text("OLD_CONVERSATION_SENTINEL"));
+    assert!(captured[1].function_call_output_text("reset").is_none());
+    assert!(captured[1].body_contains_text("PERSISTENT_WORLD_CONSTRAINT"));
+    assert!(captured[1].body_contains_text(&turn.cwd().to_string_lossy()));
+    let after = session.state.lock().await.auto_compact_window_ids();
+    assert_ne!(before.window_id, after.window_id);
+    assert_eq!(after.first_window_id, before.first_window_id);
+    assert_eq!(after.previous_window_id, Some(before.window_id));
+    assert!(!session.new_context_window_requested().await);
+    assert!(captured[1].body_contains_text(&format!("Current context window id: {}", after.window_id)));
+    assert!(captured[1].body_contains_text(&format!("Previous context window id: {}", before.window_id)));
+    session.services.code_mode_service.shutdown().await.unwrap();
+}
 use wiremock::Mock;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
@@ -1979,9 +2028,9 @@ fn verified_turn_contract_after_agent_abort_preserves_completed_output_metadata(
 }
 
 #[test]
-fn logical_generation_budget_allows_64_regular_and_one_terminal_generation() {
+fn logical_generation_budget_allows_regular_limit_and_one_terminal_generation() {
     let mut budget = LogicalGenerationBudget::default();
-    for _ in 0..64 {
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
         assert_eq!(
             budget.admit(/*terminal_requested*/ false),
             LogicalGenerationAdmission::Regular
@@ -2000,7 +2049,14 @@ fn logical_generation_budget_allows_64_regular_and_one_terminal_generation() {
 #[test]
 fn productive_work_and_owned_polling_preserve_generation_capacity() {
     let mut budget = LogicalGenerationBudget::default();
-    for _ in 0..64 {
+    for _ in 0..8 {
+        for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+            assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+        }
+        budget.observe_progress(true, false);
+        assert!(budget.has_regular_generation_capacity());
+    }
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
     }
     budget.observe_progress(true, false);
@@ -2008,7 +2064,7 @@ fn productive_work_and_owned_polling_preserve_generation_capacity() {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
         budget.observe_progress(false, true);
     }
-    for _ in 0..64 {
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
         budget.observe_progress(false, false);
     }
@@ -2029,7 +2085,8 @@ fn validation_failure_at_generation_limit_keeps_repair_tools_available() -> Resu
 async fn validation_failure_at_generation_limit_keeps_repair_tools_available_impl() -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
-    let mut sequence = (0..63)
+    let limit = MAX_REGULAR_LOGICAL_GENERATIONS as usize;
+    let mut sequence = (0..limit - 1)
         .map(|index| {
             let mut completed = responses::ev_completed(&format!("thinking-{index}"));
             completed["response"]["end_turn"] = serde_json::json!(false);
@@ -2084,20 +2141,20 @@ async fn validation_failure_at_generation_limit_keeps_repair_tools_available_imp
         Some("Repair validated.")
     );
     let sent = requests.requests();
-    assert_eq!(sent.len(), 67);
+    assert_eq!(sent.len(), limit + 3);
     assert!(
-        sent[64]
+        sent[limit]
             .function_call_output_text("validation-failed")
             .unwrap()
             .contains("repair-required")
     );
     assert!(
-        sent[66]
+        sent[limit + 2]
             .function_call_output_text("validated")
             .unwrap()
             .contains("validation-passed")
     );
-    for request in &sent[64..] {
+    for request in &sent[limit..] {
         assert!(!request.body_json()["tools"].as_array().unwrap().is_empty());
         assert!(!request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE));
     }
@@ -2129,7 +2186,7 @@ async fn forced_terminal_budget_boundary_warns_without_changing_history() {
     .expect("forced-terminal boundary emits a warning");
     assert_eq!(
         warning.message,
-        "This turn reached 64 generations without new evidence. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."
+        format!("This turn reached {MAX_REGULAR_LOGICAL_GENERATIONS} generations without new evidence. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume.")
     );
 }
 
@@ -2517,7 +2574,7 @@ async fn generation_budget_exhaustion_emits_one_status_affecting_error() {
     };
     assert_eq!(
         error.message,
-        "This turn exhausted its allowance of 64 generations without new evidence and one final summary. Work is suspended before all requested work completed. Send another message to resume."
+        format!("This turn exhausted its allowance of {MAX_REGULAR_LOGICAL_GENERATIONS} generations without new evidence and one final summary. Work is suspended before all requested work completed. Send another message to resume.")
     );
     assert!(error.affects_turn_status());
     assert_eq!(
@@ -3121,18 +3178,50 @@ fn turn_execution_resets_for_every_accepted_context_change() {
     assert!(resets_turn_execution(&mailbox_item));
 }
 
-#[test]
-fn legacy_explicit_skill_items_share_one_hard_budget() {
+#[tokio::test]
+async fn skill_context_recovery_is_lazy_and_fails_closed() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let fragment = RenderedContextFragment::new("user", "small skill".into());
+    let (items, recovery) = build_bounded_skill_context_items([&fragment]);
+    assert_eq!(response_input_texts(&items), ["small skill"]);
+    assert!(recovery.is_none());
+    let fragment = RenderedContextFragment::new("user", "large skill ".repeat(10_000));
+    let (_, recovery) = build_bounded_skill_context_items([&fragment]);
+    std::fs::create_dir_all(&turn.config.codex_home).unwrap();
+    std::fs::write(turn.config.codex_home.join("tool-output"), "blocked").unwrap();
+    let original = session.clone_history().await.raw_items().to_vec();
+    assert!(matches!(persist_skill_context_recovery(&session, recovery.unwrap()).await,
+        Err(CodexErr::Fatal(message)) if message.contains("could not preserve complete selected skill")));
+    assert_eq!(session.clone_history().await.raw_items(), original);
+}
+
+#[tokio::test]
+async fn legacy_explicit_skill_items_share_one_hard_budget() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
     let max_bytes = codex_utils_string::approx_bytes_for_tokens(
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
     );
-    let items = build_bounded_skill_context_items(&[
+    let fragments = [
         RenderedContextFragment::new(
             "user",
             format!("legacy-skill-budget-first:{}", "x".repeat(max_bytes)),
         ),
         RenderedContextFragment::new("user", "legacy-skill-budget-second".to_string()),
-    ]);
+    ];
+    let (mut items, recovery) = build_bounded_skill_context_items(&fragments);
+    assert!(!turn.config.codex_home.join("tool-output").exists(), "planning must not persist artifacts");
+    let receipt = persist_skill_context_recovery(&session, recovery.unwrap()).await.unwrap();
+    let receipt_text = response_input_texts(std::slice::from_ref(&receipt))[0];
+    let metadata: serde_json::Value = serde_json::from_str(&receipt_text[receipt_text.find('{').unwrap()..=receipt_text.rfind('}').unwrap()]).unwrap();
+    let bytes = crate::tools::command_output_artifact::read_complete_canonical_snapshot(
+        &turn.config.codex_home, &session.thread_id.to_string(), metadata["artifact_id"].as_str().unwrap(), 1024 * 1024,
+    ).await.unwrap();
+    let recovered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    for (index, fragment) in fragments.iter().enumerate() {
+        assert_eq!(recovered["items"][index]["text"], fragment.render());
+        assert_eq!(recovered["items"][index]["role"], fragment.role());
+    }
+    items.push(receipt);
     let texts = response_input_texts(&items);
 
     assert!(texts.iter().map(|text| text.len()).sum::<usize>() <= max_bytes);
@@ -3148,8 +3237,9 @@ fn legacy_explicit_skill_items_share_one_hard_budget() {
     );
 }
 
-#[test]
-fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
+#[tokio::test]
+async fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
     let max_bytes = codex_utils_string::approx_bytes_for_tokens(
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
     );
@@ -3164,7 +3254,8 @@ fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
     let first = skill("first", "x".repeat(max_bytes - first_overhead - 20));
     let second = skill("second", "second skill instructions".to_string());
 
-    let items = build_bounded_skill_context_items([&first, &second]);
+    let (mut items, recovery) = build_bounded_skill_context_items([&first, &second]);
+    items.push(persist_skill_context_recovery(&session, recovery.unwrap()).await.unwrap());
 
     assert_eq!(items.len(), 2);
     assert!(
@@ -3362,7 +3453,8 @@ async fn generation_budget_survives_reentry_and_terminal_directive_is_request_lo
 -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
-    let mut sequence = (0..62)
+    let limit = MAX_REGULAR_LOGICAL_GENERATIONS as usize;
+    let mut sequence = (0..limit - 2)
         .map(|i| {
             let id = format!("regular-{i}");
             let mut completed = responses::ev_completed(&id);
@@ -3468,8 +3560,8 @@ else:
     .await?;
     assert_eq!(
         requests.requests().len(),
-        63,
-        "reentry follows 63 generations"
+        limit - 1,
+        "reentry precedes the regular generation limit"
     );
     // Queue input while Stop holds the first run_turn at its completion boundary.
     // The hook ends that invocation, so RegularTask must drain and reenter it.
@@ -3499,24 +3591,24 @@ else:
     );
     assert_eq!(
         requests.requests().len(),
-        65,
-        "one task admits 64 regular requests and one terminal request across reentry"
+        limit + 1,
+        "one task admits the regular limit and one terminal request across reentry"
     );
-    assert!(requests.requests()[63].body_contains_text("queued reentry input"));
+    assert!(requests.requests()[limit - 1].body_contains_text("queued reentry input"));
 
     test.submit_turn("start a fresh turn").await?;
     let sent = requests.requests();
     assert_eq!(
         sent.len(),
-        66,
+        limit + 2,
         "the terminal request cannot trigger another generation"
     );
     for (index, request) in sent.iter().enumerate() {
-        let terminal = index == 64;
+        let terminal = index == limit;
         assert_eq!(
             request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE),
             terminal,
-            "the terminal instruction must appear only in request 64, observed request {index}"
+            "the terminal instruction must appear only at the limit, observed request {index}"
         );
         assert_eq!(
             request.body_json()["tools"]
@@ -3799,8 +3891,8 @@ async fn repeated_failed_read_preserves_a_different_required_action_impl() -> Re
     // Missing-artifact errors do not claim to be permanent, so they remain
     // retryable. Their repeated cycle still exercises convergence without
     // permission to disable a different required action.
-    for index in 1..=3 {
-        let failure = requests[index]
+    for (index, request) in requests.iter().enumerate().take(4).skip(1) {
+        let failure = request
             .function_call_output_text(&format!("repeat-{index}"))
             .expect("repeated artifact lookup failure");
         assert!(
@@ -7970,4 +8062,111 @@ async fn audit_reports_17_19_failed_prefix_does_not_admit_deferred_tools() {
         "failed persistence must never poll the handler"
     );
     assert!(release_tx.send(()).is_err());
+}
+#[test]
+fn audit_post_tool_stop_preserves_result_without_followup_and_resets_next_turn() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("audit_post_tool_stop", || async {
+        core_test_support::require_network!();
+        for direct in [false, true] {
+            let server = responses::start_mock_server().await;
+            let tool_response = |id: &str| {
+                responses::sse(vec![
+                    responses::ev_response_created(id),
+                    responses::ev_function_call(
+                        id,
+                        "shell_command",
+                        &serde_json::json!({
+                            "command": "echo completed-evidence", "timeout_ms": 10000
+                        })
+                        .to_string(),
+                    ),
+                    responses::ev_completed(id),
+                ])
+            };
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![tool_response("first"), tool_response("second")],
+            )
+            .await;
+            let test = test_codex().with_pre_build_hook(|home| {
+                let script = home.join("stop_after_tool.py");
+                fs::write(&script, "import json,sys,pathlib\njson.load(sys.stdin)\nwith pathlib.Path(__file__).with_name('post-hook-runs').open('a') as log: log.write('ran\\n')\nprint(json.dumps({'continue':False,'stopReason':'inspection complete'}))\n").unwrap();
+                fs::write(home.join("hooks.json"), serde_json::json!({"hooks":{"PostToolUse":[{"matcher":"Bash","hooks":[{
+                    "type":"command", "command":format!("python3 \"{}\"", script.display()),
+                    "commandWindows":format!("python \"{}\"", script.display())
+                }]}]}}).to_string()).unwrap();
+            }).with_config(move |config| {
+                config.features.disable(Feature::UnifiedExec).unwrap();
+                config.features.set_enabled(Feature::DirectRuntime, direct).unwrap();
+                trust_discovered_hooks(config);
+            }).build(&server).await?;
+            let first = test
+                .submit_turn_and_capture_completion("Run the command, then obey the hook")
+                .await?;
+            assert!(first.error.is_none(), "{first:?}");
+            assert_eq!(
+                requests.requests().len(),
+                1,
+                "a stop must not generate a repair turn"
+            );
+            let second = test
+                .submit_turn_and_capture_completion("Run a new command in a new turn")
+                .await?;
+            assert!(second.error.is_none(), "{second:?}");
+            let requests = requests.requests();
+            assert_eq!(requests.len(), 2, "the next user turn is independent");
+            assert_eq!(
+                fs::read_to_string(test.codex_home_path().join("post-hook-runs"))?
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+                vec!["ran".to_string(), "ran".to_string()],
+                "both turns must execute the tool and its post hook"
+            );
+            let preserved = requests[1]
+                .function_call_output_text("first")
+                .expect("completed output survives into the next turn");
+            assert!(preserved.contains("completed-evidence"), "{preserved}");
+            assert!(
+                !preserved.contains("inspection complete"),
+                "the stop must not replace tool evidence"
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn audit_stdin_finalizer_policy_delivers_large_response() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("audit_stdin_finalizer_policy", || async {
+        core_test_support::require_network!();
+        let server = responses::start_mock_server().await;
+        let answer = "finished result ".repeat(4_000);
+        let requests = responses::mount_sse_sequence(
+            &server,
+            vec![responses::sse(vec![
+                responses::ev_assistant_message("answer", &answer),
+                responses::ev_completed("done"),
+            ])],
+        )
+        .await;
+        let test = test_codex().with_config(|config| {
+            let policy: codex_config::config_toml::ConfigToml = toml::from_str("after_agent_policy = 'mutating_finalizer_stdin_v1'").unwrap();
+            config.after_agent_policy = policy.after_agent_policy;
+            let path = config.codex_home.join("received.json");
+            config.notify = Some(vec![if cfg!(windows) { "python" } else { "python3" }.into(), "-c".into(),
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.stdin.read(),encoding='utf-8')".into(), path.to_string_lossy().into_owned()]);
+        }).build(&server).await?;
+        let completion = test
+            .submit_turn_and_capture_completion("Finish the response")
+            .await?;
+        assert!(completion.error.is_none(), "{completion:?}");
+        assert_eq!(requests.requests().len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+            test.codex_home_path().join("received.json"),
+        )?)?;
+        assert_eq!(payload["last-assistant-message"], answer);
+        assert_eq!(payload["type"], "agent-turn-complete");
+        Ok(())
+    })
 }

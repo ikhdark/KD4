@@ -4,8 +4,6 @@ mod setup_mutex;
 
 use anyhow::Context;
 use anyhow::Result;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use codex_windows_sandbox::LocalSid;
 use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
@@ -27,8 +25,11 @@ use codex_windows_sandbox::resolve_sid;
 use codex_windows_sandbox::sandbox_bin_dir;
 use codex_windows_sandbox::sandbox_dir;
 use codex_windows_sandbox::sandbox_secrets_dir;
+use codex_windows_sandbox::setup_protocol::SETUP_PAYLOAD_STDIN_ARG;
 use codex_windows_sandbox::setup_protocol::SetupMode;
 use codex_windows_sandbox::setup_protocol::SetupPayload as Payload;
+use codex_windows_sandbox::setup_protocol::read_setup_payload;
+use codex_windows_sandbox::setup_protocol::write_setup_payload;
 use codex_windows_sandbox::string_from_sid_bytes;
 use codex_windows_sandbox::sync_persistent_deny_read_acls;
 use codex_windows_sandbox::to_wide;
@@ -70,7 +71,6 @@ const WRITE_ROOT_ALLOW_MASK: u32 =
 mod sandbox_users;
 mod setup_runtime_bin;
 use read_acl_mutex::acquire_read_acl_mutex;
-use read_acl_mutex::read_acl_mutex_exists;
 use sandbox_users::commit_setup_marker;
 use sandbox_users::prepare_setup_marker;
 use sandbox_users::provision_sandbox_users;
@@ -144,12 +144,11 @@ fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> 
     let mut read_payload = payload.clone();
     read_payload.mode = SetupMode::ReadAclsOnly;
     read_payload.refresh_only = true;
-    let payload_json = serde_json::to_vec(&read_payload)?;
-    let payload_b64 = BASE64.encode(payload_json);
+    let payload_file = write_setup_payload(&read_payload)?;
     let exe = std::env::current_exe().context("locate setup helper")?;
     Command::new(&exe)
-        .arg(payload_b64)
-        .stdin(Stdio::null())
+        .arg(SETUP_PAYLOAD_STDIN_ARG)
+        .stdin(payload_file.into_file())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
@@ -387,24 +386,11 @@ pub fn main() -> Result<()> {
 }
 
 fn real_main() -> Result<()> {
-    let mut args = std::env::args().collect::<Vec<_>>();
-    if args.len() != 2 {
-        return Err(anyhow::Error::new(SetupFailure::new(
-            SetupErrorCode::HelperRequestArgsFailed,
-            "expected payload argument",
-        )));
-    }
-    let payload_b64 = args.remove(1);
-    let payload_json = BASE64.decode(payload_b64).map_err(|err| {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let payload = read_setup_payload(&args, std::io::stdin().lock()).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperRequestArgsFailed,
-            format!("failed to decode payload b64: {err}"),
-        ))
-    })?;
-    let payload: Payload = serde_json::from_slice(&payload_json).map_err(|err| {
-        anyhow::Error::new(SetupFailure::new(
-            SetupErrorCode::HelperRequestArgsFailed,
-            format!("failed to parse payload json: {err}"),
+            format!("failed to read setup payload: {err:#}"),
         ))
     })?;
     if payload.version != SETUP_VERSION {
@@ -470,8 +456,7 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
         prepare_setup_marker(&payload.codex_home, &payload.real_user)?;
     }
     match payload.mode {
-        SetupMode::ReadAclsOnly => run_read_acl_only(payload, log, false),
-        SetupMode::ReadAclsOnlyStrict => run_read_acl_only(payload, log, true),
+        SetupMode::ReadAclsOnly | SetupMode::ReadAclsOnlyStrict => run_read_acl_only(payload, log),
         SetupMode::ProvisionOnly => run_provision_only(payload, log, sbx_dir),
         SetupMode::Full => run_setup_full(payload, log, sbx_dir),
     }?;
@@ -487,21 +472,8 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
     Ok(())
 }
 
-fn run_read_acl_only(
-    payload: &Payload,
-    log: &mut dyn Write,
-    fail_if_already_running: bool,
-) -> Result<()> {
-    let _read_acl_guard = match acquire_read_acl_mutex()? {
-        Some(guard) => guard,
-        None => {
-            if fail_if_already_running {
-                anyhow::bail!("read ACL helper already running");
-            }
-            log_line(log, "read ACL helper already running; skipping")?;
-            return Ok(());
-        }
-    };
+fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
+    let _read_acl_guard = acquire_read_acl_mutex()?;
     log_line(log, "read-acl-only mode: applying read ACLs")?;
     let sandbox_group_sid = resolve_sandbox_users_group_sid()?;
     let sandbox_group = sid_bytes_to_local_sid(&sandbox_group_sid)?;
@@ -781,33 +753,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
     if payload.read_roots.is_empty() {
         log_line(log, "no read roots to grant; skipping read ACL helper")?;
     } else {
-        match read_acl_mutex_exists() {
-            Ok(true) => {
-                log_line(log, "read ACL helper already running; skipping spawn")?;
-            }
-            Ok(false) => {
-                spawn_read_acl_helper(payload, log).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperReadAclHelperSpawnFailed,
-                        format!("spawn read ACL helper failed: {err}"),
-                    ))
-                })?;
-            }
-            Err(err) => {
-                log_line(
-                    log,
-                    &format!("read ACL mutex check failed: {err}; spawning anyway"),
-                )?;
-                spawn_read_acl_helper(payload, log).map_err(|spawn_err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperReadAclHelperSpawnFailed,
-                        format!(
-                            "spawn read ACL helper failed after mutex error {err}: {spawn_err}"
-                        ),
-                    ))
-                })?;
-            }
-        }
+        spawn_read_acl_helper(payload, log).map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperReadAclHelperSpawnFailed,
+                format!("spawn read ACL helper failed: {err}"),
+            ))
+        })?;
     }
 
     if refresh_only {

@@ -12,7 +12,7 @@ incremental = true
 [env]
 # Bound direct `cargo test` libtest fanout. An existing process environment
 # value or libtest's `--test-threads` flag can opt into a different limit.
-RUST_TEST_THREADS = { value = "2", force = false }
+RUST_TEST_THREADS = { value = "6", force = false }
 
 # Shared by x64 and ARM64. KD4 tooling links both with lld-link when installed
 # (scripts/rust_tool_env.py), and lld-link rejects link.exe-only arguments such

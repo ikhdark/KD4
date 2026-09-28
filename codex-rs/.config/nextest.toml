@@ -7,9 +7,9 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 # Report a flaky or hanging test on its first attempt. A retry would turn a
 # flake into a pass and double the time until a deterministic hang fails.
 retries = 0
-# Avoid saturating developer machines when Nextest is invoked directly.
+# Local 2/4/6-thread comparison favored six workers; retain narrower groups below.
 # NEXTEST_TEST_THREADS or --test-threads can opt into a different limit.
-test-threads = 2
+test-threads = 6
 
 [scripts.setup.windows-test-stack]
 command = ["python", "scripts/nextest_windows_stack.py"]
@@ -43,8 +43,8 @@ inherits = "local"
 [test-groups.login_callback_port]
 max-threads = 1
 
-# Each test launches its own subprocesses. The two-thread default never reaches
-# this cap; it bounds their combined load when NEXTEST_TEST_THREADS is raised.
+# Each test launches its own subprocesses. Keep their combined load below the
+# ordinary worker limit, including when NEXTEST_TEST_THREADS is raised.
 [test-groups.process_heavy]
 max-threads = 2
 

@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 import re
 import shutil
 import stat
@@ -1312,7 +1313,18 @@ def _main() -> int:
                         "native artifact workflow did not report a head SHA"
                     )
                 workflow_id = workflow_id_from_url(workflow_url)
-                ensure_source_matches_workflow(resolved_head_sha)
+                if args.cache_dir is not None:
+                    artifacts_temp_root = (
+                        args.cache_dir
+                        / github_repo_cache_key(github_repo)
+                        / workflow_id
+                    ).resolve()
+                ensure_source_matches_workflow(
+                    resolved_head_sha,
+                    owned_paths=[artifacts_temp_root]
+                    if artifacts_temp_root is not None
+                    else (),
+                )
                 print(f"Using native artifacts from {workflow_url}", flush=True)
                 if args.cache_dir is None:
                     artifacts_temp_root = Path(
@@ -1326,11 +1338,7 @@ def _main() -> int:
                         flush=True,
                     )
                 else:
-                    artifacts_temp_root = (
-                        args.cache_dir
-                        / github_repo_cache_key(github_repo)
-                        / workflow_id
-                    ).resolve()
+                    assert artifacts_temp_root is not None
                     artifacts_temp_root.mkdir(parents=True, exist_ok=True)
                     print(
                         f"Using persistent native artifact cache {artifacts_temp_root}",
@@ -1377,6 +1385,20 @@ def _main() -> int:
             args.keep_staging_dirs,
             args.max_stage_workers,
         )
+
+        staged_by_package = {result.package: result.pack_output for result in staged_results}
+        if (
+            os.name == "nt"
+            and platform.machine().lower() in {"amd64", "x86_64"}
+            and "codex" in staged_by_package
+        ):
+            native_package = next(
+                name for name, target in codex_platform_packages().items()
+                if target["platform_key"] == "win32-x64"
+            )
+            load_build_module().smoke_test_npm_tarball(
+                staged_by_package["codex"], staged_by_package[native_package]
+            )
 
         if resolved_head_sha:
             owned_paths = []

@@ -33,13 +33,17 @@ const READ_ROOTS_JSON_FLAG: &str = "--read-roots-json";
 const SANDBOX_LEVEL_FLAG: &str = "--windows-sandbox-level";
 const WRITE_ROOTS_JSON_FLAG: &str = "--write-roots-json";
 const WORKSPACE_ROOT_FLAG: &str = "--workspace-root";
+const ARGS_ENV_FLAG: &str = "--args-env";
+const ARGS_ENV_PREFIX: &str = "CODEX_WINDOWS_SANDBOX_ARGS_";
+const ENV_CHUNK_BYTES: usize = 8000;
+const MAX_WRAPPER_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_windows_sandbox_command_args_for_permission_profile(
     command: Vec<String>,
     command_cwd: &AbsolutePathBuf,
     workspace_roots: &[AbsolutePathBuf],
-    env_map: &HashMap<String, String>,
+    env_map: &mut HashMap<String, String>,
     permission_profile: &PermissionProfile,
     windows_sandbox_level: WindowsSandboxLevel,
     windows_sandbox_private_desktop: bool,
@@ -51,7 +55,7 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
     deny_read_paths_override: &[AbsolutePathBuf],
     deny_write_paths_override: &[AbsolutePathBuf],
     codex_home: &Path,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let permission_profile_json = serde_json::to_string(permission_profile)
         .unwrap_or_else(|err| panic!("failed to serialize permission profile: {err}"));
     let env_json = serde_json::to_string(env_map)
@@ -112,7 +116,77 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
     }
     args.push("--".to_string());
     args.extend(command);
-    args
+    transport_wrapper_args(args, env_map)
+}
+
+fn transport_wrapper_args(
+    args: Vec<String>,
+    env: &mut HashMap<String, String>,
+) -> Result<Vec<String>> {
+    let command_line_units: usize = args
+        .iter()
+        .map(|arg| crate::quote_windows_arg(arg).encode_utf16().count() + 1)
+        .sum();
+    if command_line_units <= 16_000 {
+        return Ok(args);
+    }
+    // The wrapper's stdin belongs to the command. Use its private child
+    // environment instead, with each variable below Windows' per-value limit.
+    // The inner env was serialized before these transport variables were added.
+    let json = serde_json::to_string(&args[1..])?;
+    if json.len() > MAX_WRAPPER_PAYLOAD_BYTES {
+        bail!("Windows sandbox wrapper payload exceeds {MAX_WRAPPER_PAYLOAD_BYTES} bytes");
+    }
+    let prefix = format!("{ARGS_ENV_PREFIX}{:032x}_", rand::random::<u128>());
+    let mut remaining = json.as_str();
+    let mut count = 0;
+    while !remaining.is_empty() {
+        let end = remaining.floor_char_boundary(ENV_CHUNK_BYTES.min(remaining.len()));
+        env.insert(format!("{prefix}{count}"), remaining[..end].to_string());
+        remaining = &remaining[end..];
+        count += 1;
+    }
+    Ok(vec![
+        CODEX_WINDOWS_SANDBOX_ARG1.into(),
+        ARGS_ENV_FLAG.into(),
+        prefix,
+        count.to_string(),
+    ])
+}
+
+fn decode_wrapper_args(
+    args: Vec<String>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<String>> {
+    let [flag, prefix, count] = args.as_slice() else {
+        return Ok(args);
+    };
+    if flag != ARGS_ENV_FLAG {
+        return Ok(args);
+    }
+    if !prefix.starts_with(ARGS_ENV_PREFIX)
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!("invalid Windows sandbox payload environment prefix");
+    }
+    let count = count
+        .parse::<usize>()
+        .context("invalid wrapper payload chunk count")?;
+    if count == 0 || count > MAX_WRAPPER_PAYLOAD_BYTES.div_ceil(ENV_CHUNK_BYTES - 3) {
+        bail!("invalid wrapper payload chunk count");
+    }
+    let mut json = String::new();
+    for index in 0..count {
+        let chunk = lookup(&format!("{prefix}{index}"))
+            .ok_or_else(|| anyhow!("missing Windows sandbox payload chunk {index}"))?;
+        if chunk.len() > ENV_CHUNK_BYTES || json.len() + chunk.len() > MAX_WRAPPER_PAYLOAD_BYTES {
+            bail!("Windows sandbox wrapper payload exceeds its size limit");
+        }
+        json.push_str(&chunk);
+    }
+    serde_json::from_str(&json).context("parse Windows sandbox wrapper payload")
 }
 
 fn push_json_arg<T: serde::Serialize>(args: &mut Vec<String>, flag: &str, value: &T) {
@@ -199,6 +273,7 @@ async fn run_windows_sandbox_wrapper_request(request: WindowsSandboxWrapperReque
 }
 
 fn parse_windows_sandbox_wrapper_args(args: Vec<String>) -> Result<WindowsSandboxWrapperRequest> {
+    let args = decode_wrapper_args(args, |key| std::env::var(key).ok())?;
     let mut args = args.into_iter();
     let mut codex_home = None;
     let mut command_cwd = None;

@@ -10,6 +10,9 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
+use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -34,7 +37,16 @@ use tokio::time::timeout;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::test]
-async fn thread_archive_requires_materialized_rollout() -> Result<()> {
+async fn thread_archive_without_turns_legacy() -> Result<()> {
+    thread_archive_without_turns(ThreadHistoryMode::Legacy).await
+}
+
+#[tokio::test]
+async fn thread_archive_without_turns_paginated() -> Result<()> {
+    thread_archive_without_turns(ThreadHistoryMode::Paginated).await
+}
+
+async fn thread_archive_without_turns(history_mode: ThreadHistoryMode) -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
@@ -49,6 +61,7 @@ async fn thread_archive_requires_materialized_rollout() -> Result<()> {
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
+            history_mode: Some(history_mode),
             ..Default::default()
         })
         .await?;
@@ -73,70 +86,7 @@ async fn thread_archive_requires_materialized_rollout() -> Result<()> {
         "thread id should not be discoverable before rollout materialization"
     );
 
-    // Archive should fail before the rollout is materialized.
-    let archive_id = mcp
-        .send_thread_archive_request(ThreadArchiveParams {
-            thread_id: thread.id.clone(),
-        })
-        .await?;
-    let archive_err: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(archive_id)),
-    )
-    .await??;
-    assert!(
-        archive_err
-            .error
-            .message
-            .contains("no rollout found for thread id"),
-        "unexpected archive error: {}",
-        archive_err.error.message
-    );
-    assert_eq!(
-        serde_json::from_value::<codex_app_server_protocol::ThreadErrorData>(
-            archive_err.error.data.expect("thread error data")
-        )?,
-        codex_app_server_protocol::ThreadErrorData {
-            reason: codex_app_server_protocol::ThreadErrorReason::NotFound,
-        }
-    );
-
-    // Materialize rollout via a real user turn and confirm archive succeeds.
-    let turn_start_id = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
-            client_user_message_id: None,
-            input: vec![UserInput::Text {
-                text: "materialize".to_string(),
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        })
-        .await?;
-    let turn_start_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
-    )
-    .await??;
-    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_response)?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    assert!(
-        rollout_path.exists(),
-        "expected rollout path {} to exist after first user message",
-        rollout_path.display()
-    );
-
-    let discovered_path =
-        find_thread_path_by_id_str(codex_home.path(), &thread.id, /*state_db_ctx*/ None)
-            .await?
-            .expect("expected rollout path for thread id to exist after materialization");
-    assert_paths_match_on_disk(&discovered_path, &rollout_path)?;
-
+    // Archiving materializes the empty rollout without creating a user turn.
     let archive_id = mcp
         .send_thread_archive_request(ThreadArchiveParams {
             thread_id: thread.id.clone(),
@@ -160,6 +110,22 @@ async fn thread_archive_requires_materialized_rollout() -> Result<()> {
     )?;
     assert_eq!(archived_notification.thread_id, thread.id);
 
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let read_resp = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: archived } = to_response(read_resp)?;
+    assert_eq!(archived.turns, Vec::new());
+    assert_eq!(archived.status, ThreadStatus::NotLoaded);
+    assert_eq!(archived.history_mode, history_mode);
+
     // Verify file moved.
     let archived_directory = codex_home.path().join(ARCHIVED_SESSIONS_SUBDIR);
     // The archived file keeps the original filename (rollout-...-<id>.jsonl).
@@ -175,7 +141,80 @@ async fn thread_archive_requires_materialized_rollout() -> Result<()> {
         "expected archived rollout path {} to exist",
         archived_rollout_path.display()
     );
+    assert_paths_match_on_disk(
+        archived.path.as_deref().expect("archived thread path"),
+        &archived_rollout_path,
+    )?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_archive_does_not_persist_ephemeral_threads() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(start_resp)?;
+    assert!(thread.path.is_none());
+    let archive_id = mcp
+        .send_thread_archive_request(ThreadArchiveParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let archive_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(archive_id)),
+    )
+    .await??;
+    assert_eq!(
+        serde_json::from_value::<codex_app_server_protocol::ThreadErrorData>(
+            archive_err.error.data.expect("thread error data")
+        )?,
+        codex_app_server_protocol::ThreadErrorData {
+            reason: codex_app_server_protocol::ThreadErrorReason::NotFound,
+        }
+    );
+    assert!(
+        find_thread_path_by_id_str(codex_home.path(), &thread.id, None)
+            .await?
+            .is_none()
+    );
+    assert!(
+        find_archived_thread_path_by_id_str(codex_home.path(), &thread.id, None)
+            .await?
+            .is_none()
+    );
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id,
+            include_turns: false,
+        })
+        .await?;
+    let read_resp = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread } = to_response(read_resp)?;
+    assert!(thread.ephemeral);
+    assert!(thread.path.is_none());
+    assert_ne!(thread.status, ThreadStatus::NotLoaded);
     Ok(())
 }
 

@@ -33,7 +33,7 @@ except ModuleNotFoundError:
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 PATH = "/v1/responses"
-DEFAULT_MAX_MESSAGE_BYTES = 256 * 1024
+DEFAULT_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 
 CALL_ID = "shell-command-call"
 FUNCTION_NAME = "shell_command"
@@ -56,8 +56,8 @@ CONFIG_SNIPPET_TEMPLATE = """Add this to your config.toml:
 [model_providers.localapi_ws]
 base_url = "{ws_uri}/v1"
 name = "localapi_ws"
-wire_api = "responses_websocket"
-env_key = "OPENAI_API_KEY_STAGING"
+wire_api = "responses"
+supports_websockets = true
 
 [profiles.localapi_ws]
 model = "gpt-5.2"
@@ -83,10 +83,6 @@ def _default_usage() -> dict[str, Any]:
 
 def _event_response_created(response_id: str) -> dict[str, Any]:
     return {"type": "response.created", "response": {"id": response_id}}
-
-
-def _event_response_done() -> dict[str, Any]:
-    return {"type": "response.done", "response": {"usage": _default_usage()}}
 
 
 def _event_response_completed(response_id: str) -> dict[str, Any]:
@@ -129,7 +125,7 @@ def _dump_json(payload: Any) -> str:
 REQUEST_1_EVENT_JSON = (
     _dump_json(_event_response_created("resp-1")),
     _dump_json(_event_function_call(CALL_ID, FUNCTION_NAME, FUNCTION_ARGS_JSON)),
-    _dump_json(_event_response_done()),
+    _dump_json(_event_response_completed("resp-1")),
 )
 
 REQUEST_2_EVENT_JSON = (
@@ -171,7 +167,7 @@ async def _recv_json(
     *,
     quiet: bool,
     log_json: str,
-) -> Any:
+) -> dict[str, Any]:
     msg = await websocket.recv()
     try:
         if isinstance(msg, bytes):
@@ -183,6 +179,10 @@ async def _recv_json(
         await websocket.close(code=1007, reason="invalid JSON")
         raise _ConnectionAbort from None
     _print_request(f"[{label}] recv", payload, quiet=quiet, log_json=log_json)
+    if not isinstance(payload, dict) or payload.get("type") != "response.create":
+        _log_conn("rejecting unexpected request type", quiet=quiet)
+        await websocket.close(code=1008, reason="expected response.create")
+        raise _ConnectionAbort
     return payload
 
 
@@ -225,21 +225,55 @@ async def _handle_connection(
 
     # Request 1: provoke a function call (mirrors `codex-rs/core/tests/suite/agent_websocket.rs`).
     try:
-        await _recv_json(
+        request = await _recv_json(
             websocket,
             "req1",
             quiet=quiet,
             log_json=log_json,
         )
+        warmups = 0
+        while request.get("generate") is False:
+            # Prewarm completes connection setup without consuming the tool turn.
+            warmups += 1
+            response_id = f"warm-{warmups}"
+            await _send_events(
+                websocket,
+                (
+                    _dump_json(_event_response_created(response_id)),
+                    _dump_json(_event_response_completed(response_id)),
+                ),
+                quiet=quiet,
+            )
+            request = await _recv_json(
+                websocket,
+                "req1",
+                quiet=quiet,
+                log_json=log_json,
+            )
         await _send_events(websocket, REQUEST_1_EVENT_JSON, quiet=quiet)
 
         # Request 2: expect appended tool output; send final assistant message.
-        await _recv_json(
+        request = await _recv_json(
             websocket,
             "req2",
             quiet=quiet,
             log_json=log_json,
         )
+        items = request.get("input")
+        if (
+            request.get("generate") is False
+            or not isinstance(items, list)
+            or not any(
+                isinstance(item, dict)
+                and item.get("type") == "function_call_output"
+                and item.get("call_id") == CALL_ID
+                and isinstance(item.get("output"), (str, list))
+                for item in items
+            )
+        ):
+            _log_conn("rejecting missing or invalid tool output", quiet=quiet)
+            await websocket.close(code=1008, reason=f"expected output for {CALL_ID}")
+            return False
         await _send_events(websocket, REQUEST_2_EVENT_JSON, quiet=quiet)
     except _ConnectionAbort:
         return False

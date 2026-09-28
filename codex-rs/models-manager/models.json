@@ -27,7 +27,7 @@
       "comp_hash": "3000",
       "default_reasoning_summary": "none",
       "display_name": "GPT-6-Astra",
-      "description": "Our most capable model for complex, demanding work.",
+      "description": "Frontier intelligence for the most demanding work.",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -249,6 +249,127 @@
       "base_instructions": ""
     },
     {
+      "slug": "gpt-6-luna",
+      "prefer_websockets": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text_and_image",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_image_detail_original": true,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
+      "multi_agent_reasoning_effort": null,
+      "use_responses_lite": true,
+      "include_skills_usage_instructions": false,
+      "include_apps_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "guardian": null,
+      "node_repl_auto_review_required": false,
+      "node_repl_disabled": false,
+      "requires_sandboxed_review": false,
+      "auto_review_model_override": null,
+      "model_specialty": null,
+      "context_window": 272000,
+      "max_context_window": 872000,
+      "auto_compact_token_limit": null,
+      "comp_hash": "3000",
+      "default_reasoning_summary": "none",
+      "display_name": "GPT-6-Luna",
+      "description": "Fast and affordable model for easier tasks.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "minimal_client_version": "0.155.0",
+      "supported_in_api": true,
+      "availability_nux": null,
+      "upgrade": null,
+      "priority": 3,
+      "model_messages": {
+        "approvals": {
+          "on_request": null,
+          "never": null,
+          "unless_trusted": null
+        }
+      },
+      "experimental_supported_tools": [
+        "send_user_message_async",
+        "clock"
+      ],
+      "available_in_plans": [
+        "business",
+        "edu",
+        "edu_plus",
+        "edu_pro",
+        "education",
+        "ent26",
+        "enterprise",
+        "enterprise_cbp_automation",
+        "enterprise_cbp_trial",
+        "enterprise_cbp_usage_based",
+        "finserv",
+        "free",
+        "free_workspace",
+        "go",
+        "hc",
+        "k12",
+        "plus",
+        "pro",
+        "prolite",
+        "quorum",
+        "sci",
+        "self_serve_business_prolite",
+        "self_serve_business_usage_based",
+        "team"
+      ],
+      "supports_search_tool": true,
+      "supports_experimental_context": false,
+      "default_service_tier": "priority",
+      "service_tiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "1.5x speed"
+        }
+      ],
+      "additional_speed_tiers": [
+        "fast"
+      ],
+      "supports_reasoning_summary_parameter": true,
+      "supports_reasoning_summaries": true,
+      "base_instructions": ""
+    },
+    {
       "slug": "gpt-5.6-sol",
       "prefer_websockets": true,
       "support_verbosity": true,
@@ -276,7 +397,7 @@
       "reasoning_summary_format": "experimental",
       "default_reasoning_summary": "none",
       "display_name": "GPT-5.6-Sol",
-      "description": "Latest frontier agentic coding model.",
+      "description": "Older coding model for complex work.",
       "default_reasoning_level": "high",
       "supported_reasoning_levels": [
         {
@@ -315,7 +436,10 @@
       "availability_nux": {
         "message": "Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting lower, then turn it up for harder jobs."
       },
-      "upgrade": null,
+      "upgrade": {
+        "model": "gpt-6-sol",
+        "migration_markdown": "Meet GPT-6 Sol\n\nOur latest Sol is more intelligent and more efficient so your usage limits go further. This model is a great daily driver for complex tasks, especially coding.\n"
+      },
       "priority": 6,
       "model_messages": {
         "instructions_variables": {
@@ -392,7 +516,7 @@
       "reasoning_summary_format": "experimental",
       "default_reasoning_summary": "none",
       "display_name": "GPT-5.6-Terra",
-      "description": "Balanced agentic coding model for everyday work.",
+      "description": "Older balanced model for straightforward work.",
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
@@ -429,7 +553,10 @@
       "minimal_client_version": "0.144.0",
       "supported_in_api": true,
       "availability_nux": null,
-      "upgrade": null,
+      "upgrade": {
+        "model": "gpt-6-sol",
+        "migration_markdown": "Meet GPT-6 Sol\n\nOur latest Sol is more intelligent and more efficient so your usage limits go further. This model is a great daily driver for complex tasks, especially coding.\n"
+      },
       "priority": 7,
       "model_messages": {
         "instructions_variables": {
@@ -506,7 +633,7 @@
       "reasoning_summary_format": "experimental",
       "default_reasoning_summary": "none",
       "display_name": "GPT-5.6-Luna",
-      "description": "Fast and affordable agentic coding model.",
+      "description": "Older fast and efficient model.",
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
@@ -539,7 +666,10 @@
       "minimal_client_version": "0.144.0",
       "supported_in_api": true,
       "availability_nux": null,
-      "upgrade": null,
+      "upgrade": {
+        "model": "gpt-6-luna",
+        "migration_markdown": "Meet GPT-6 Luna\n\nOur latest Luna is significantly more efficient, so your usage limits go even further. Reach for it for any job that doesn't require frontier intelligence.\n"
+      },
       "priority": 8,
       "model_messages": {
         "instructions_variables": {
@@ -616,7 +746,7 @@
       "reasoning_summary_format": "experimental",
       "default_reasoning_summary": "none",
       "display_name": "GPT-5.5",
-      "description": "Frontier model for complex coding, research, and real-world work.",
+      "description": "Legacy coding model.",
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
@@ -647,7 +777,10 @@
       "availability_nux": {
         "message": "GPT-5.5 is now available in Codex. It's our strongest agentic coding model yet, built to reason through large codebases, check assumptions with tools, and keep going until the work is done.\n\nLearn more: https://openai.com/index/introducing-gpt-5-5/\n\n"
       },
-      "upgrade": null,
+      "upgrade": {
+        "model": "gpt-6-sol",
+        "migration_markdown": "Meet GPT-6 Sol\n\nOur latest Sol is more intelligent and more efficient so your usage limits go further. This model is a great daily driver for complex tasks, especially coding.\n"
+      },
       "priority": 12,
       "model_messages": {
         "instructions_template": null,
@@ -754,7 +887,10 @@
       "minimal_client_version": "0.98.0",
       "supported_in_api": true,
       "availability_nux": null,
-      "upgrade": null,
+      "upgrade": {
+        "model": "gpt-6-sol",
+        "migration_markdown": "Meet GPT-6 Sol\n\nOur latest Sol is more intelligent and more efficient so your usage limits go further. This model is a great daily driver for complex tasks, especially coding.\n"
+      },
       "priority": 16,
       "model_messages": {
         "instructions_template": null,
@@ -858,7 +994,10 @@
       "minimal_client_version": "0.98.0",
       "supported_in_api": true,
       "availability_nux": null,
-      "upgrade": null,
+      "upgrade": {
+        "model": "gpt-6-luna",
+        "migration_markdown": "Meet GPT-6 Luna\n\nOur latest Luna is significantly more efficient, so your usage limits go even further. Reach for it for any job that doesn't require frontier intelligence.\n"
+      },
       "priority": 23,
       "model_messages": {
         "instructions_template": null,

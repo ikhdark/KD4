@@ -1113,18 +1113,75 @@ fn is_read_only_powershell_command(command: &[String]) -> bool {
         return false;
     };
     let script = command[command_position.saturating_add(1)..].join(" ");
-    if script.trim().is_empty()
-        || script.contains(['>', '<', '`', '&'])
-        || script.contains("$(")
-        || script.contains("::")
-    {
+    if script.trim().is_empty() {
         return false;
     }
 
-    script
-        .split([';', '|', '\n', '\r'])
-        .filter(|segment| !segment.trim().is_empty())
-        .all(powershell_segment_is_read_only)
+    powershell_statement_segments(&script).is_some_and(|segments| {
+        segments
+            .into_iter()
+            .filter(|segment| !segment.trim().is_empty())
+            .all(powershell_segment_is_read_only)
+    })
+}
+
+/// Splits a script at `;`, `|`, and line breaks outside single-quoted strings.
+///
+/// Single-quoted strings are verbatim in PowerShell, so search patterns such as
+/// `'a|b'` or `'mod::item'` cannot separate statements, redirect, or invoke
+/// code. Every other region keeps the conservative syntax screen. Double quotes
+/// are tracked only so an apostrophe inside them cannot open a verbatim region;
+/// their contents stay screened because they can expand subexpressions.
+/// Returns `None` for syntax the segment reader does not model: redirection,
+/// call operators, escapes, subexpressions, static member access, comments,
+/// here-strings, Unicode quote or line-separator characters, and unbalanced
+/// quotes.
+fn powershell_statement_segments(script: &str) -> Option<Vec<&str>> {
+    let mut segments = Vec::new();
+    let mut segment_start = 0;
+    let mut quote = None;
+    let mut previous = None;
+    for (index, ch) in script.char_indices() {
+        if matches!(
+            ch,
+            '\u{2018}'..='\u{201E}' | '\u{2028}' | '\u{2029}' | '\u{85}'
+        ) {
+            return None;
+        }
+        if quote == Some('\'') {
+            if ch == '\'' {
+                quote = None;
+            }
+            previous = None;
+            continue;
+        }
+        if quote.is_none() && previous == Some('@') && matches!(ch, '\'' | '"') {
+            return None;
+        }
+        match (quote, ch) {
+            (None, '\'') => {
+                quote = Some('\'');
+                previous = None;
+                continue;
+            }
+            (None, '"') => quote = Some('"'),
+            (Some(_), '"') => quote = None,
+            (None, '#') | (_, '>' | '<' | '`' | '&') => return None,
+            (_, '(') if previous == Some('$') => return None,
+            (_, ':') if previous == Some(':') => return None,
+            (_, ';' | '|' | '\n' | '\r') => {
+                segments.push(&script[segment_start..index]);
+                segment_start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+        previous = Some(ch);
+    }
+    if quote.is_some() {
+        return None;
+    }
+    segments.push(&script[segment_start..]);
+    Some(segments)
 }
 
 fn powershell_segment_is_read_only(segment: &str) -> bool {

@@ -2,6 +2,8 @@ mod auth;
 mod catalog;
 mod error;
 mod mantle;
+mod runtime;
+mod runtime_catalog;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,12 +36,20 @@ use auth::resolve_provider_auth;
 pub(crate) use catalog::static_model_catalog;
 use catalog::with_default_only_service_tier;
 use mantle::runtime_base_url;
+use runtime_catalog::static_runtime_model_catalog;
 
-/// Runtime provider for Amazon Bedrock's OpenAI-compatible Mantle endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BedrockEndpoint {
+    Mantle,
+    Runtime,
+}
+
+/// Runtime provider for Amazon Bedrock's OpenAI-compatible endpoints.
 #[derive(Clone, Debug)]
 pub(crate) struct AmazonBedrockModelProvider {
     pub(crate) info: ModelProviderInfo,
     pub(crate) aws: ModelProviderAwsAuthInfo,
+    endpoint: BedrockEndpoint,
     auth_manager: Option<Arc<AuthManager>>,
 }
 
@@ -48,6 +58,11 @@ impl AmazonBedrockModelProvider {
         provider_info: ModelProviderInfo,
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
+        let endpoint = if provider_info.is_amazon_bedrock_runtime() {
+            BedrockEndpoint::Runtime
+        } else {
+            BedrockEndpoint::Mantle
+        };
         let aws = provider_info
             .aws
             .clone()
@@ -58,6 +73,7 @@ impl AmazonBedrockModelProvider {
         Self {
             info: provider_info,
             aws,
+            endpoint,
             auth_manager,
         }
     }
@@ -82,23 +98,25 @@ impl AmazonBedrockModelProvider {
     }
 
     async fn api_provider(&self) -> Result<Provider> {
-        let managed_auth = self.managed_auth();
         let mut api_provider_info = self.info.clone();
-        api_provider_info.base_url =
-            Some(runtime_base_url(managed_auth.as_ref(), &self.aws).await?);
+        api_provider_info.base_url = self.runtime_base_url().await?;
         api_provider_info.to_api_provider(/*auth_mode*/ None)
     }
 
     async fn runtime_base_url(&self) -> Result<Option<String>> {
         let managed_auth = self.managed_auth();
-        Ok(Some(
-            runtime_base_url(managed_auth.as_ref(), &self.aws).await?,
-        ))
+        let base_url = match self.endpoint {
+            BedrockEndpoint::Mantle => runtime_base_url(managed_auth.as_ref(), &self.aws).await?,
+            BedrockEndpoint::Runtime => {
+                runtime::bedrock_runtime_base_url(managed_auth.as_ref(), &self.aws).await?
+            }
+        };
+        Ok(Some(base_url))
     }
 
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
         let managed_auth = self.managed_auth();
-        resolve_provider_auth(managed_auth.as_ref(), &self.aws).await
+        resolve_provider_auth(managed_auth.as_ref(), &self.aws, self.endpoint).await
     }
 }
 
@@ -159,14 +177,16 @@ impl ModelProvider for AmazonBedrockModelProvider {
         Box::pin(async move {
             let managed_auth = self.managed_auth();
             let method =
-                auth::resolve_auth_method(managed_auth.as_ref(), &self.aws)
-                    .await?;
+                auth::resolve_auth_method(managed_auth.as_ref(), &self.aws, self.endpoint).await?;
             let mut info = self.info.clone();
-            info.base_url = Some(mantle::base_url(method.region())?);
+            info.base_url = Some(match self.endpoint {
+                BedrockEndpoint::Mantle => mantle::base_url(method.region())?,
+                BedrockEndpoint::Runtime => runtime::base_url(method.region()),
+            });
             Ok(ResolvedModelProviderClientSetup {
                 auth: managed_auth.map(CodexAuth::BedrockApiKey),
                 api_provider: info.to_api_provider(None)?,
-                resolved_auth: ResolvedProviderAuth::new(method.into_provider()),
+                resolved_auth: ResolvedProviderAuth::new(method.into_provider(self.endpoint)),
             })
         })
     }
@@ -179,7 +199,13 @@ impl ModelProvider for AmazonBedrockModelProvider {
     ) -> SharedModelsManager {
         Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
-            config_model_catalog.map_or_else(static_model_catalog, with_default_only_service_tier),
+            config_model_catalog.map_or_else(
+                || match self.endpoint {
+                    BedrockEndpoint::Mantle => static_model_catalog(),
+                    BedrockEndpoint::Runtime => static_runtime_model_catalog(),
+                },
+                with_default_only_service_tier,
+            ),
         ))
     }
 }
@@ -187,6 +213,9 @@ impl ModelProvider for AmazonBedrockModelProvider {
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod error_tests;
+
+#[cfg(test)]
+mod runtime_provider_tests;
 
 #[cfg(test)]
 mod tests {

@@ -116,12 +116,13 @@ async fn main() -> anyhow::Result<()> {
 
     let poll_interval = Duration::from_millis(args.poll_ms);
     loop {
-        let rows = fetch_new_rows(&runtime, &filter, last_id).await?;
+        let (rows, scanned_id) = fetch_live_batch(&runtime, &filter, last_id).await?;
         let caught_up = rows.len() < LIVE_BATCH_SIZE;
         for row in rows {
             last_id = last_id.max(row.id);
             println!("{}", format_row(&row, args.compact));
         }
+        last_id = last_id.max(scanned_id);
         if caught_up {
             tokio::time::sleep(poll_interval).await;
         }
@@ -260,6 +261,23 @@ async fn fetch_new_rows(
         .query_logs(&query)
         .await
         .context("failed to fetch new logs")
+}
+
+async fn fetch_live_batch(
+    runtime: &LogReader,
+    filter: &LogFilter,
+    last_id: i64,
+) -> anyhow::Result<(Vec<LogRow>, i64)> {
+    // Capture BEFORE the filtered query: advancing past a later snapshot could
+    // skip concurrent arrivals. A full batch must keep its row-based cursor.
+    let high_water = runtime.max_log_id(&LogQuery::default()).await?;
+    let rows = fetch_new_rows(runtime, filter, last_id).await?;
+    let scanned_id = if rows.len() < LIVE_BATCH_SIZE {
+        high_water.max(last_id)
+    } else {
+        last_id
+    };
+    Ok((rows, scanned_id))
 }
 
 async fn fetch_max_id(runtime: &LogReader, filter: &LogFilter) -> anyhow::Result<i64> {
@@ -445,6 +463,33 @@ mod tests {
     async fn insert_fixture_logs(pool: &sqlx::SqlitePool, count: usize) {
         sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < ?) INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) SELECT 1, 0, 'INFO', 'fixture', 'arrival' FROM n")
             .bind(count as i64).execute(pool).await.expect("insert arrivals");
+    }
+
+    #[tokio::test]
+    async fn filtered_tail_advances_empty_scans_without_skipping_full_batches() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("logs.sqlite");
+        let pool = logs_fixture(&path).await;
+        insert_fixture_logs(&pool, 1000).await;
+        let reader = LogReader::open(&path).await.unwrap();
+        let mut filter =
+            build_filter(&Args::try_parse_from(["logs", "--search", "missing"]).unwrap()).unwrap();
+        let (rows, watermark) = fetch_live_batch(&reader, &filter, 0).await.unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(watermark, 1000);
+        insert_fixture_logs(&pool, LIVE_BATCH_SIZE + 1).await;
+        filter.search = Some("arrival".to_string());
+        let (rows, scanned) = fetch_live_batch(&reader, &filter, watermark).await.unwrap();
+        assert_eq!(rows.len(), LIVE_BATCH_SIZE);
+        assert_eq!(
+            scanned, watermark,
+            "full pages must not jump to the high watermark"
+        );
+        let last = rows.last().unwrap().id;
+        let (remaining, scanned) = fetch_live_batch(&reader, &filter, last).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, 1501);
+        assert_eq!(scanned, 1501);
     }
 
     #[tokio::test]

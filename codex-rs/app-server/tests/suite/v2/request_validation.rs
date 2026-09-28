@@ -220,22 +220,50 @@ async fn turn_steer_rejections_emit_analytics_for_preflight_and_queue_failures()
     assert_eq!(empty_turn_id_error.error.code, -32600);
     assert_rejected_steer_analytics(&server, "").await?;
 
-    let queue_overload_context = (0..384)
-        .map(|index| {
-            (
-                format!("source-{index}"),
-                json!({"value": "x".repeat(16 * 1024), "kind": "untrusted"}),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
+    // Queue admission requires a live turn; hold its model response until steering is tested.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(responses::sse(vec![responses::ev_completed("held")]))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&server)
+        .await;
+    let start_id = mcp
+        .send_raw_request(
+            "turn/start",
+            Some(json!({
+                "threadId": thread.id, "input": [{"type": "text", "text": "hold this turn"}]
+            })),
+        )
+        .await?;
+    let start_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let turn_id = start_response.result["turn"]["id"]
+        .as_str()
+        .expect("active turn ID")
+        .to_string();
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+
+    // Stay within the character limit while exceeding the serialized queue byte limit.
+    let queue_overload_text =
+        "\u{1f680}".repeat(codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS);
     let queue_overload_request_id = mcp
         .send_raw_request(
             "turn/steer",
             Some(json!({
                 "threadId": thread.id,
-                "expectedTurnId": "queue-overload",
-                "input": [{"type": "text", "text": "steer"}],
-                "additionalContext": queue_overload_context,
+                "expectedTurnId": turn_id,
+                "input": [{"type": "text", "text": queue_overload_text}],
             })),
         )
         .await?;
@@ -246,9 +274,26 @@ async fn turn_steer_rejections_emit_analytics_for_preflight_and_queue_failures()
     .await??;
     assert_eq!(
         queue_overload_error.error.code,
-        codex_app_server_protocol::OVERLOADED_ERROR_CODE
+        -32600
     );
-    assert_rejected_steer_analytics(&server, "queue-overload").await?;
+    assert_eq!(
+        queue_overload_error.error.data.as_ref().unwrap()["reason"],
+        "pendingInputLimitExceeded"
+    );
+    assert_rejected_steer_analytics(&server, &turn_id).await?;
+    let interrupt_id = mcp
+        .send_raw_request(
+            "turn/interrupt",
+            Some(json!({
+                "threadId": thread.id, "turnId": turn_id
+            })),
+        )
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(interrupt_id)),
+    )
+    .await??;
 
     Ok(())
 }

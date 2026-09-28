@@ -67,9 +67,6 @@ function Invoke-SccachePerfCommand {
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $sccache = Get-SccacheCommandPath
 Set-CodexRustSccacheEnvironment -RepoRoot $repoRoot
-if ($Action -eq "reset") {
-    Ensure-CodexRustSccacheServer -RepoRoot $repoRoot
-}
 
 switch ($Action) {
     "stats" {

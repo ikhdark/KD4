@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 from shutil import which
 from typing import Callable, Sequence
@@ -294,33 +295,93 @@ UV_RUN_SCRIPTS = ["uv", "run", "--frozen", "--project", "scripts"]
 # Several script owners intentionally use aggregate test modules instead of a
 # same-stem test file. Keep that routing explicit so changed PowerShell
 # helpers and shared Python utilities do not receive syntax-only validation.
+REPORT_REGRESSIONS = "scripts.test_report_script_regressions.ScriptReportRegressions"
+VALIDATION_REGRESSIONS = (
+    "scripts.test_report_script_regressions.Report26ValidationRegressions"
+)
 SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
+    "justfile": (
+        "scripts.test_root_maintenance",
+        "scripts.test_build_tooling",
+        "scripts.test_build_tooling_policy",
+        "scripts.test_build_tooling_performance",
+        "scripts.test_generate_config_proto",
+        "scripts.test_publish_local_codex",
+        "scripts.test_rust_test_runner",
+    ),
+    "codex-cli/bin/codex.js": ("scripts.test_build_tooling_policy",),
     "codex-cli/scripts/build_npm_package.py": ("scripts.test_stage_npm_packages",),
     "codex-rs/config/scripts/generate-proto.ps1": (
         "scripts.test_generate_config_proto",
     ),
     "codex-rs/scripts/nextest_windows_stack.py": ("scripts.test_build_tooling_policy",),
     "codex-rs/scripts/setup-windows.ps1": ("scripts.test_build_tooling",),
-    "scripts/app_server_schema_runtime_check.py": ("scripts.test_dev_environment",),
-    "scripts/build_codex_package.py": ("scripts.test_stage_npm_packages",),
+    "scripts/app_server_schema_runtime_check.py": (
+        "scripts.test_dev_environment",
+        f"{VALIDATION_REGRESSIONS}.test_finite_results_reach_schema_and_formatter_callers",
+        f"{VALIDATION_REGRESSIONS}.test_compatibility_keeps_fixed_baseline_across_unrelated_commit",
+        f"{VALIDATION_REGRESSIONS}.test_stable_cli_requires_baseline_before_validation_or_mutation",
+    ),
+    "scripts/atomic_json.py": (
+        f"{REPORT_REGRESSIONS}.test_atomic_output_preserves_hardlinked_source_and_checkpoint_on_failure",
+    ),
+    "scripts/build_tooling_test_support.py": (
+        "scripts.test_build_tooling",
+        "scripts.test_build_tooling_policy",
+        "scripts.test_build_tooling_performance",
+        "scripts.test_build_tooling_storage",
+        "scripts.test_root_maintenance",
+        "scripts.test_report_script_regressions",
+        "scripts.test_rust_test_runner",
+    ),
+    "scripts/build_codex_package.py": ("scripts.codex_package.test_cli",),
     "scripts/cargo-lane-patterns.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-lane-trash-cleanup.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-lane.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-workspace-analyzer.ps1": ("scripts.test_build_tooling_policy",),
+    "scripts/check_kd4_features.py": (
+        f"{REPORT_REGRESSIONS}.test_feature_lane_is_lazy_and_held_across_both_phases",
+    ),
     "scripts/common-rust-env.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/codex_package/rg": (
         "scripts.codex_package.test_dotslash",
         "scripts.codex_package.test_ripgrep",
     ),
-    "scripts/config_schema_check.py": ("scripts.test_dev_environment",),
-    "scripts/generated_output_lock.py": ("scripts.test_dev_environment",),
+    "scripts/codex_package/cargo.py": (
+        f"{REPORT_REGRESSIONS}.test_tool_contents_invalidate_identity_preserving_size_and_mtime",
+    ),
+    "scripts/codex_package/cli.py": (
+        f"{REPORT_REGRESSIONS}.test_publication_rolls_back_package_archive_and_sidecar",
+        f"{REPORT_REGRESSIONS}.test_activation_rollback_retains_old_outputs_without_copying",
+        f"{REPORT_REGRESSIONS}.test_cross_target_prebuilt_cannot_label_distributable_version",
+        f"{REPORT_REGRESSIONS}.test_missing_license_fails_before_build",
+    ),
+    "scripts/codex_package/layout.py": (
+        f"{REPORT_REGRESSIONS}.test_staged_bytes_must_match_inputs_observed_before_copy",
+    ),
+    "scripts/config_schema_check.py": (
+        "scripts.test_dev_environment",
+        f"{VALIDATION_REGRESSIONS}.test_finite_results_reach_schema_and_formatter_callers",
+    ),
+    "scripts/generated_output_lock.py": (
+        "scripts.test_dev_environment",
+        f"{VALIDATION_REGRESSIONS}.test_lock_waits_for_release_and_distinguishes_timeout_from_io_error",
+        f"{VALIDATION_REGRESSIONS}.test_lock_waiter_never_writes_to_an_empty_owned_file",
+    ),
     "scripts/dev_env_doctor.py": ("scripts.test_dev_environment",),
-    "scripts/format.py": ("scripts.test_build_tooling",),
+    "scripts/format.py": (
+        "scripts.test_build_tooling",
+        f"{VALIDATION_REGRESSIONS}.test_finite_results_reach_schema_and_formatter_callers",
+    ),
     "scripts/git_doctor.py": ("scripts.test_dev_environment",),
     "scripts/invoke-rust-perf-env.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/install/install.ps1": ("scripts.test_build_tooling_policy",),
     "scripts/just-shell.py": ("scripts.test_build_tooling",),
     "scripts/kd4_model_attempt_analysis.py": ("scripts.test_kd4_perf_snapshot",),
+    "scripts/kd4_turn_latency_audit.py": (
+        f"{REPORT_REGRESSIONS}.test_terminal_conflicts_are_order_independent_and_malformed_is_local",
+        "scripts.test_kd4_timing_analysis.SharedTimingAnalysisTest.test_rollout_status_prefers_structured_execution_results",
+    ),
     "scripts/publish-local-codex.ps1": (
         "scripts.test_publish_local_codex",
         "scripts.test_publish_local_codex_apply",
@@ -334,17 +395,37 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         "scripts.test_publish_local_codex_dry_run",
         "scripts.test_publish_local_codex_freshness",
     ),
-    "scripts/root_maintenance.py": ("scripts.test_build_tooling_policy",),
     "scripts/process_owner.py": ("scripts.test_report_script_regressions",),
-    "scripts/rust_build_status.py": ("scripts.test_build_tooling_storage",),
+    "scripts/root_maintenance.py": (
+        f"{REPORT_REGRESSIONS}.test_changed_tests_and_adjacent_production_across_owned_roots",
+        f"{REPORT_REGRESSIONS}.test_report_regressions_follow_their_changed_owners_once",
+    ),
+    "scripts/rust_build_status.py": (
+        "scripts.test_build_tooling_storage",
+        f"{REPORT_REGRESSIONS}.test_recent_overflow_survives_expired_base",
+    ),
     "scripts/rust_build_status_support.py": ("scripts.test_build_tooling_storage",),
     "scripts/run-python.js": ("scripts.test_build_tooling_policy",),
     "scripts/rust_packages.py": ("scripts.test_build_tooling_policy",),
+    "scripts/rust_test_runner.py": (
+        f"{REPORT_REGRESSIONS}.test_nextest_progress_counter_and_binary_identity",
+    ),
+    "scripts/rust_tool_env.py": ("scripts.test_process_owner",),
     "scripts/sccache-perf.ps1": ("scripts.test_build_tooling_performance",),
-    "scripts/stage_npm_packages.py": ("scripts.test_stage_npm_packages",),
+    "scripts/source_inventory.py": (
+        f"{REPORT_REGRESSIONS}.test_scan_budget_continues_without_rereading_completed_prefix",
+    ),
+    "scripts/stage_npm_packages.py": (
+        "scripts.test_stage_npm_packages",
+        f"{REPORT_REGRESSIONS}.test_npm_cancellation_restores_all_outputs_and_clears_journal",
+        f"{REPORT_REGRESSIONS}.test_npm_recovery_rejects_unowned_backup_before_mutation",
+    ),
     "scripts/stage_npm_archives.py": ("scripts.test_stage_npm_packages",),
     "scripts/tool_versions.py": ("scripts.test_build_tooling_storage",),
-    "scripts/vscode_runtime_proof.py": ("scripts.test_dev_environment",),
+    "scripts/vscode_runtime_proof.py": (
+        "scripts.test_dev_environment",
+        "scripts.test_process_owner",
+    ),
 }
 
 
@@ -522,7 +603,14 @@ def python_test_targets(modules: Sequence[str], changed: Sequence[str]) -> list[
     )
     if not selected and not changed:
         return python_unittest_targets()
-    return sorted(dict.fromkeys(selected))
+    selected = sorted(set(selected))
+    return [
+        target
+        for target in selected
+        if not any(
+            target.startswith(parent + ".") for parent in selected if parent != target
+        )
+    ]
 
 
 def changed_production_script_requires_test(path_text: str) -> bool:
@@ -619,12 +707,23 @@ def script_audit_context_issues() -> list[str]:
                 issues.append("justfile summary does not expose audit-scripts")
 
     unittest_targets = set(python_unittest_targets())
+    checked_selectors: set[str] = set()
     for source, modules in SCRIPT_TEST_MODULES.items():
         if not (REPO_ROOT / source).is_file():
             issues.append(f"stale script test route: {source}")
         for module in modules:
-            if module not in unittest_targets:
+            if module in unittest_targets:
+                continue
+            if not any(module.startswith(target + ".") for target in unittest_targets):
                 issues.append(f"missing script test module route: {source} -> {module}")
+            elif module not in checked_selectors:
+                checked_selectors.add(module)
+                loader = unittest.TestLoader()
+                suite = loader.loadTestsFromName(module)
+                if loader.errors or suite.countTestCases() == 0:
+                    issues.append(
+                        f"missing script test selector route: {source} -> {module}"
+                    )
 
     try:
         result = subprocess.run(

@@ -2,6 +2,32 @@ use super::*;
 use codex_utils_string::approx_token_count;
 use std::time::Duration;
 
+#[tokio::test]
+async fn active_history_protection_validates_segmented_artifacts() {
+    let home = tempfile::tempdir().unwrap();
+    let canonical = CanonicalToolResult::text("a".repeat(MAX_RAW_OUTPUT_ARTIFACT_BYTES) + "tail");
+    let artifact = create_canonical_output_artifact(home.path(), "thread", &canonical).await;
+    assert!(artifact.complete);
+    let id = artifact.artifact_id().unwrap();
+    let path = home.path().join("tool-output/thread").join(format!("{id}.log"));
+    let marker = active_tool_history_protection_path(&path);
+    assert!(protect_active_tool_history_artifact(
+        home.path(), "thread", &id, canonical.exact_bytes, "wrong digest"
+    ).await.is_err());
+    assert!(!marker.exists());
+    protect_active_tool_history_artifact(
+        home.path(), "thread", &id, canonical.exact_bytes, &canonical.sha256
+    ).await.unwrap();
+    assert!(marker.exists());
+    assert_eq!(read_complete_canonical_snapshot(
+        home.path(), "thread", &id, canonical.bytes.len()
+    ).await.unwrap(), canonical.bytes);
+    std::fs::write(logical_segment_path(&path, 1), b"fail").unwrap();
+    assert!(protect_active_tool_history_artifact(
+        home.path(), "thread", &id, canonical.exact_bytes, &canonical.sha256
+    ).await.is_err());
+}
+
 /// Loads an artifact's metadata and validated bytes the way a read does.
 async fn logical_artifact_for_test(
     codex_home: &Path,
@@ -3985,6 +4011,9 @@ async fn reclaim_releases_idle_directories_of_threads_without_rollouts_only() {
             thread_id.clone(),
             protected_artifact_for_thread(home, thread_id).await,
         );
+        let hook_dir = root.join(thread_id).join("hooks");
+        std::fs::create_dir_all(&hook_dir).expect("hook directory");
+        std::fs::write(hook_dir.join("evidence.txt"), "retained hook evidence").expect("hook output");
     }
     let shared_store = root.join("known-delta");
     std::fs::create_dir_all(&shared_store).expect("shared store");
@@ -4025,6 +4054,10 @@ async fn reclaim_releases_idle_directories_of_threads_without_rollouts_only() {
     assert!(!root.join(&unresumable).exists());
     for kept in [&active, &resumable, &lookup_failed] {
         assert!(artifacts[kept].exists(), "{kept} must keep its artifacts");
+        assert_eq!(
+            std::fs::read_to_string(root.join(kept).join("hooks/evidence.txt")).unwrap(),
+            "retained hook evidence"
+        );
     }
     assert!(shared_store.exists());
     // The index still counts the removed records until it reconciles.

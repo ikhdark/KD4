@@ -6,6 +6,8 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use codex_app_server_protocol::ClientResponsePayload;
+use codex_app_server_protocol::CommandExecOutputDeltaNotification;
+use codex_app_server_protocol::CommandExecOutputStream;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ProcessExitedNotification;
 use codex_app_server_protocol::ProcessKillParams;
@@ -37,7 +39,11 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::command_exec::OutputByteCap;
+use crate::command_exec::OutputDeliveryRelay;
 use crate::command_exec::StdinWriteRequest;
+use crate::command_exec::UndeliveredOutput;
+use crate::command_exec::accounted_output_delivery_bytes;
+use crate::command_exec::spawn_output_delivery_relay_with;
 use crate::command_exec::spawn_stdin_writer;
 use crate::command_exec::terminal_size_from_protocol;
 use crate::command_exec::validate_command_argv;
@@ -301,20 +307,18 @@ struct ProcessTerminalCleanup {
 }
 
 struct SpawnProcessOutputParams {
-    connection_id: ConnectionId,
     process_handle: String,
     output_rx: mpsc::Receiver<Vec<u8>>,
     stdio_timeout_rx: watch::Receiver<bool>,
-    outgoing: Arc<OutgoingMessageSender>,
-    stream: ProcessOutputStream,
+    delivery_relay: Option<OutputDeliveryRelay>,
+    stream: CommandExecOutputStream,
     stream_output: bool,
     output_bytes_cap: Option<usize>,
-    connection_cancellation: CancellationToken,
 }
 
 #[derive(Default)]
 struct ProcessOutputCapture {
-    text: String,
+    bytes: Vec<u8>,
     cap_reached: bool,
 }
 
@@ -633,27 +637,44 @@ async fn run_process(params: RunProcessParams) {
         "stdin streaming is not enabled for this process",
     );
 
+    let (delivery_relay, delivery_handle) = if stream_stdout_stderr {
+        let (relay, handle) = spawn_output_delivery_relay_with(
+            Arc::clone(&outgoing),
+            request_id.connection_id,
+            connection_cancellation.clone(),
+            |delta| {
+                ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
+                    process_handle: delta.process_id,
+                    stream: match delta.stream {
+                        CommandExecOutputStream::Stdout => ProcessOutputStream::Stdout,
+                        CommandExecOutputStream::Stderr => ProcessOutputStream::Stderr,
+                    },
+                    delta_base64: delta.delta_base64,
+                    cap_reached: delta.cap_reached,
+                })
+            },
+        );
+        (Some(relay), Some(handle))
+    } else {
+        (None, None)
+    };
     let stdout_handle = collect_spawn_process_output(SpawnProcessOutputParams {
-        connection_id: request_id.connection_id,
         process_handle: process_handle.clone(),
         output_rx: stdout_rx,
         stdio_timeout_rx: stdio_timeout_rx.clone(),
-        outgoing: Arc::clone(&outgoing),
-        stream: ProcessOutputStream::Stdout,
+        delivery_relay: delivery_relay.clone(),
+        stream: CommandExecOutputStream::Stdout,
         stream_output: stream_stdout_stderr,
         output_bytes_cap,
-        connection_cancellation: connection_cancellation.clone(),
     });
     let stderr_handle = collect_spawn_process_output(SpawnProcessOutputParams {
-        connection_id: request_id.connection_id,
         process_handle: process_handle.clone(),
         output_rx: stderr_rx,
         stdio_timeout_rx,
-        outgoing: Arc::clone(&outgoing),
-        stream: ProcessOutputStream::Stderr,
+        delivery_relay: delivery_relay.clone(),
+        stream: CommandExecOutputStream::Stderr,
         stream_output: stream_stdout_stderr,
         output_bytes_cap,
-        connection_cancellation: connection_cancellation.clone(),
     });
 
     let exit_code = loop {
@@ -719,6 +740,17 @@ async fn run_process(params: RunProcessParams) {
     let stdout = stdout_handle.await.unwrap_or_default();
     let stderr = stderr_handle.await.unwrap_or_default();
     timeout_handle.abort();
+    drop(delivery_relay);
+    let mut undelivered = match delivery_handle {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => UndeliveredOutput::default(),
+    };
+    // Queued relay failures precede the collector's rejected suffix. Decode once
+    // after joining them, so split UTF-8 and output order are preserved.
+    undelivered.append_tail(UndeliveredOutput {
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    });
 
     if let Some(cleanup) = terminal_cleanup {
         cleanup.sessions.lock().await.remove(&cleanup.process_key);
@@ -730,9 +762,9 @@ async fn run_process(params: RunProcessParams) {
             ServerNotification::ProcessExited(ProcessExitedNotification {
                 process_handle,
                 exit_code,
-                stdout: stdout.text,
+                stdout: bytes_to_string_smart(&undelivered.stdout),
                 stdout_cap_reached: stdout.cap_reached,
-                stderr: stderr.text,
+                stderr: bytes_to_string_smart(&undelivered.stderr),
                 stderr_cap_reached: stderr.cap_reached,
             }),
             &connection_cancellation,
@@ -744,15 +776,13 @@ fn collect_spawn_process_output(
     params: SpawnProcessOutputParams,
 ) -> tokio::task::JoinHandle<ProcessOutputCapture> {
     let SpawnProcessOutputParams {
-        connection_id,
         process_handle,
         mut output_rx,
         mut stdio_timeout_rx,
-        outgoing,
+        mut delivery_relay,
         stream,
         mut stream_output,
         output_bytes_cap,
-        connection_cancellation,
     } = params;
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
@@ -775,19 +805,23 @@ fn collect_spawn_process_output(
                 if capped_chunk.is_empty() && !cap_reached {
                     continue;
                 }
-                if !outgoing
-                    .send_server_notification_to_connection_bounded(
-                        connection_id,
-                        ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
-                            process_handle: process_handle.clone(),
-                            stream,
-                            delta_base64: STANDARD.encode(capped_chunk),
-                            cap_reached,
-                        }),
-                        &connection_cancellation,
-                    )
-                    .await
-                {
+                let delta_base64 = STANDARD.encode(capped_chunk);
+                let accounted_bytes =
+                    accounted_output_delivery_bytes(&delta_base64, &process_handle);
+                if delivery_relay.as_ref().is_none_or(|relay| {
+                    relay
+                        .enqueue(
+                            CommandExecOutputDeltaNotification {
+                                process_id: process_handle.clone(),
+                                stream,
+                                delta_base64,
+                                cap_reached,
+                            },
+                            accounted_bytes,
+                        )
+                        .is_err()
+                }) {
+                    delivery_relay = None;
                     stream_output = false;
                     buffer.extend_from_slice(capped_chunk);
                 }
@@ -796,7 +830,7 @@ fn collect_spawn_process_output(
             }
         }
         ProcessOutputCapture {
-            text: bytes_to_string_smart(&buffer),
+            bytes: buffer,
             cap_reached: cap.truncated(),
         }
     })

@@ -252,6 +252,10 @@ class BuildStatusSnapshot:
     quarantined_lanes: set[str] = field(default_factory=set)
     _lane_mtimes: dict[Path, float] = field(default_factory=dict, repr=False)
     _lane_sizes: dict[Path, tuple[int, int]] = field(default_factory=dict, repr=False)
+    _non_lane_sizes: dict[Path, tuple[int, int]] = field(
+        default_factory=dict, repr=False
+    )
+    _target_size: tuple[int, int] | None = field(default=None, repr=False)
 
     @classmethod
     def collect(
@@ -324,6 +328,39 @@ class BuildStatusSnapshot:
             self._lane_mtimes[path] = self._lane_mtime(path)
         return self._lane_mtimes[path]
 
+    def target_size(self) -> tuple[int, int]:
+        if self._target_size is not None:
+            return self._target_size
+        target_root = (self.repo_root / "codex-rs" / "target").resolve()
+        lane_root = cargo_lanes_root(self.repo_root).resolve()
+        sizes = {
+            path: (0, 0)
+            for path in self.lane_dirs
+            if path.resolve().is_relative_to(target_root)
+        }
+        partitions: dict[Path, tuple[int, int]] = {}
+        result = directory_size_bytes(
+            target_root,
+            subtree_sizes=sizes,
+            partition_sizes=partitions,
+            partition_exclude=lane_root,
+        )
+        self._lane_sizes.update(sizes)
+        self._non_lane_sizes[lane_root] = (
+            sum(size for size, _ in partitions.values()),
+            sum(errors for _, errors in partitions.values()),
+        )
+        self._target_size = result
+        return result
+
+    def non_lane_size(self, lane_root: Path, *, size_workers: int) -> tuple[int, int]:
+        lane_root = lane_root.resolve()
+        if lane_root not in self._non_lane_sizes:
+            self._non_lane_sizes[lane_root] = target_non_lane_size_bytes(
+                repo_root=self.repo_root, lane_root=lane_root, size_workers=size_workers
+            )
+        return self._non_lane_sizes[lane_root]
+
     def lane_sizes(
         self,
         paths: Sequence[Path],
@@ -353,7 +390,12 @@ def active_rust_processes_windows() -> list[RustProcess]:
     command = (
         "$selfPid = $PID; "
         f'Get-CimInstance Win32_Process -Filter "({WINDOWS_RUST_PROCESS_FILTER}) '
-        'AND ProcessId != $selfPid" | '
+        'AND ProcessId != $selfPid" -ErrorAction Stop | '
+        # CIM can retain a row after exit while its command line is already gone.
+        # Requery only ambiguous rows; a still-hidden process remains fail-closed.
+        'ForEach-Object { if ([string]::IsNullOrWhiteSpace($_.CommandLine)) { '
+        'Get-CimInstance Win32_Process -Filter "ProcessId=$($_.ProcessId)" -ErrorAction Stop '
+        '} else { $_ } } | '
         "Select-Object Name,ProcessId,CommandLine | ConvertTo-Json -Compress"
     )
     try:
@@ -683,6 +725,67 @@ def _auto_lane_base(command: Sequence[str]) -> str:
         base = packages[0]
     elif command:
         program = Path(command[0]).stem
+        # Normalize only Cargo's own display options, never arguments passed
+        # through to tests/programs or embedded plugin commands.
+        subcommand = _cargo_subcommand_index(command)
+        if (
+            program == "cargo"
+            and subcommand is not None
+            and command[subcommand]
+            in {
+                "build",
+                "b",
+                "check",
+                "c",
+                "test",
+                "t",
+                "clippy",
+                "doc",
+                "d",
+                "rustc",
+                "rustdoc",
+                "bench",
+                "run",
+                "r",
+            }
+        ):
+            normalized = []
+            tokens = iter(command)
+            for token in tokens:
+                if token == "--":
+                    normalized.extend([token, *tokens])
+                    break
+                if token in {"--quiet", "-q", "--verbose", "-v", "-vv"}:
+                    continue
+                if token == "--color":
+                    next(tokens, None)
+                    continue
+                if token.startswith("--color="):
+                    continue
+                normalized.append(token)
+                if token in {
+                    "--config",
+                    "-C",
+                    "-Z",
+                    "--manifest-path",
+                    "--target-dir",
+                    "--target",
+                    "--profile",
+                    "--features",
+                    "-F",
+                    "--bin",
+                    "--example",
+                    "--test",
+                    "--bench",
+                    "--jobs",
+                    "-j",
+                    "--message-format",
+                    "--exclude",
+                    "--package",
+                    "-p",
+                }:
+                    normalized.append(next(tokens, ""))
+            signature = " ".join(normalized).strip()
         digest = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:8]
         base = f"{program}-{digest}"
     else:
@@ -828,16 +931,19 @@ def reserve_cargo_lane(
         busy_reusable = False
         deferred_cold = False
         with cargo_lane_coordination_lock(root, timeout_seconds=lock_timeout_seconds):
-            candidates = _lane_reservation_candidates(
-                root, base_lane, prefer_warm=not explicit
-            )
-            # Existing directories alone are not evidence of reusable build work.
+            candidates = _lane_reservation_candidates(root, base_lane, prefer_warm=True)
+            # Profile names are configurable. Inspect only immediate, direct
+            # profile directories; their names alone do not prove reusable work.
             warm_paths = {
                 candidate.path
                 for candidate in candidates
-                if any(
-                    is_cargo_artifact_dir(candidate.path / profile)
-                    for profile in ("debug", "release", "dev-small")
+                if candidate.path.is_dir()
+                and not is_indirect_directory(candidate.path)
+                and any(
+                    profile.is_dir()
+                    and not is_indirect_directory(profile)
+                    and is_cargo_artifact_dir(profile)
+                    for profile in candidate.path.iterdir()
                 )
             }
             compatible_paths = {
@@ -850,6 +956,12 @@ def reserve_cargo_lane(
                 key=lambda candidate: (
                     candidate.path not in compatible_paths,
                     candidate.path not in warm_paths,
+                    # Cold placeholders keep deterministic base/overflow order.
+                    0
+                    if not explicit
+                    or candidate.path in warm_paths
+                    or candidate.name == base_lane
+                    else int(candidate.name.removeprefix(base_lane + "-")),
                 )
             )
             for candidate in candidates:
@@ -931,7 +1043,9 @@ def _require_reserved_target_dir(candidate: str, target_dir: Path) -> None:
         )
 
 
-def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
+def _cargo_watch_exec_with_target_dir(
+    command: str, target_dir: Path, *, working_dir: Path | None = None
+) -> str:
     separator = re.search(r"\s--(?=\s|$)", command)
     separator_index = separator.start() if separator else -1
     cargo_command = command if separator_index < 0 else command[:separator_index]
@@ -951,8 +1065,21 @@ def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
         candidate = next(
             value for value in target_match.groupdict().values() if value is not None
         )
-        _require_reserved_target_dir(candidate, target_dir)
+        _require_reserved_target_dir(
+            str((working_dir or Path.cwd()) / candidate), target_dir
+        )
     if target_matches:
+        # Freeze relative paths before cargo-watch changes its working directory.
+        target_arg = str(target_dir)
+        quoted_target = (
+            f'"{target_arg}"' if re.search(r"\s", target_arg) else target_arg
+        )
+        for match in reversed(target_matches):
+            command = (
+                command[: match.start()]
+                + f" --target-dir {quoted_target}"
+                + command[match.end() :]
+            )
         return command
     build_commands = {
         "b",
@@ -990,12 +1117,17 @@ def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
     return command + insertion
 
 
-def _cargo_subcommand_index(command: Sequence[str]) -> int | None:
-    index = 1
-    if index < len(command) and command[index].startswith("+"):
+def _cargo_subcommand_index(
+    command: Sequence[str],
+    *,
+    start_index: int = 1,
+    global_options_with_values: set[str] | None = None,
+) -> int | None:
+    index = start_index
+    if index == 1 and index < len(command) and command[index].startswith("+"):
         index += 1
-    global_options_with_values = {"--color", "--config", "-C", "-Z"}
-    global_long_options_with_values = {"--color", "--config"}
+    if global_options_with_values is None:
+        global_options_with_values = {"--color", "--config", "-C", "-Z"}
     while index < len(command):
         argument = command[index]
         if argument == "--":
@@ -1008,11 +1140,11 @@ def _cargo_subcommand_index(command: Sequence[str]) -> int | None:
             index += 2
             continue
         if any(
-            argument.startswith(f"{option}=")
-            for option in global_long_options_with_values
+            argument.startswith(f"{option}=") for option in global_options_with_values
         ) or any(
             argument.startswith(option) and argument != option
-            for option in {"-C", "-Z"}
+            for option in global_options_with_values
+            if len(option) == 2
         ):
             index += 1
             continue
@@ -1074,25 +1206,43 @@ def _cargo_command_with_target_dir(
         return result
     subcommand = result[subcommand_index]
     target_arg = str(target_dir)
-    tail = result[subcommand_index + 1 :]
     if subcommand == "nextest":
-        if not tail or tail[0] not in {"archive", "run", "list"}:
+        nextest_index = _cargo_subcommand_index(
+            result,
+            start_index=subcommand_index + 1,
+            global_options_with_values={
+                "--color",
+                "--manifest-path",
+                "--config-file",
+                "--user-config-file",
+                "--tool-config-file",
+                "-P",
+                "--profile",
+            },
+        )
+        if nextest_index is None:
             return result
+        if result[nextest_index] not in {"archive", "run", "r", "list", "bench", "b"}:
+            if result[nextest_index] in {"help", "show-config", "self"}:
+                return result
+            raise ValueError("Unsupported Cargo nextest command in a reserved lane")
         if _cargo_target_dir_is_present(
             result,
-            start_index=subcommand_index + 2,
+            start_index=nextest_index + 1,
             target_dir=target_dir,
         ):
             return result
         return [
-            *result[: subcommand_index + 2],
+            *result[: nextest_index + 1],
             "--target-dir",
             target_arg,
-            *result[subcommand_index + 2 :],
+            *result[nextest_index + 1 :],
         ]
     if subcommand == "watch":
         index = subcommand_index + 1
         has_exec = False
+        exec_arguments: list[tuple[int, str, str]] = []
+        working_dir = Path.cwd()
         value_options = {
             "-d",
             "--delay",
@@ -1152,29 +1302,35 @@ def _cargo_command_with_target_dir(
                 if index + 1 >= len(result):
                     raise ValueError("Cargo watch --exec/-x requires a command")
                 index += 1
-                result[index] = _cargo_watch_exec_with_target_dir(
-                    result[index], target_dir
-                )
+                exec_arguments.append((index, "", result[index]))
                 has_exec = True
             elif argument.startswith("--exec="):
-                result[index] = "--exec=" + _cargo_watch_exec_with_target_dir(
-                    argument.removeprefix("--exec="), target_dir
+                exec_arguments.append(
+                    (index, "--exec=", argument.removeprefix("--exec="))
                 )
                 has_exec = True
             elif argument.startswith("-x"):
-                result[index] = "-x" + _cargo_watch_exec_with_target_dir(
-                    argument[2:].removeprefix("="), target_dir
-                )
+                exec_arguments.append((index, "-x", argument[2:].removeprefix("=")))
                 has_exec = True
             elif argument in value_options:
                 if index + 1 >= len(result):
                     raise ValueError(f"Cargo watch {argument} requires a value")
                 index += 1
+                if argument in {"-C", "--workdir"}:
+                    working_dir = Path(result[index])
+            elif argument.startswith("--workdir="):
+                working_dir = Path(argument.removeprefix("--workdir="))
+            elif argument.startswith("-C"):
+                working_dir = Path(argument[2:].removeprefix("="))
             elif not argument.startswith("-"):
                 raise ValueError(
                     "Cargo watch positional commands cannot enforce a reserved target; use --exec/-x"
                 )
             index += 1
+        for exec_index, prefix, exec_command in exec_arguments:
+            result[exec_index] = prefix + _cargo_watch_exec_with_target_dir(
+                exec_command, target_dir, working_dir=working_dir
+            )
         if not has_exec:
             result[index:index] = [
                 "-x",
@@ -1475,11 +1631,21 @@ def cargo_build_context(
         if path.is_file():
             configs[name] = hashlib.sha256(path.read_bytes()).hexdigest()
     options = []
+    config_overrides = []
+    working_dir = Path.cwd()
     tokens = iter(command)
     for token in tokens:
         if token == "--":
             break
-        if token in ("--profile", "--target", "--features", "-F"):
+        if token == "-C":
+            working_dir /= next(tokens, "")
+        elif token.startswith("-C"):
+            working_dir /= token[2:]
+        elif token == "--config":
+            config_overrides.append(next(tokens, ""))
+        elif token.startswith("--config="):
+            config_overrides.append(token.split("=", 1)[1])
+        elif token in ("--profile", "--target", "--features", "-F"):
             options.extend(["--features" if token == "-F" else token, next(tokens, "")])
         elif token.startswith(("--profile=", "--target=", "--features=")):
             options.extend(token.split("=", 1))
@@ -1489,6 +1655,16 @@ def cargo_build_context(
             "--no-default-features",
         ) or token.startswith("+"):
             options.append(token)
+    for value in config_overrides:
+        options.extend(["--config", value])
+        if "=" not in value:
+            path = (working_dir / value).resolve()
+            # A missing/unreadable file still fails in Cargo; never claim it
+            # matches a previously recorded readable configuration.
+            try:
+                configs[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                configs[str(path)] = None
     # Named core targets and gates deliberately share one lane: each package
     # graph keeps its own feature-hashed artifacts there, so a different named
     # selection is not a different build setting and must not rank that lane
@@ -1572,8 +1748,8 @@ def run_in_cargo_lane(
             record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
             if requested_lane != "auto" and resolved_lane != requested_lane:
                 print(
-                    f"warning: requested Cargo lane {requested_lane!r} is busy; "
-                    f"using {resolved_lane!r}",
+                    f"using Cargo lane {resolved_lane!r} "
+                    f"for requested family {requested_lane!r}",
                     file=sys.stderr,
                 )
             previous_context = _read_lane_build_context(target_dir)
@@ -1623,6 +1799,7 @@ def run_in_cargo_lane(
                     exit_code = run_owned(
                         child_command,
                         env=child_env,
+                        prepare_sccache=True,
                         check=False,
                         stdout=sys.stdout,
                         stderr=sys.stderr,
@@ -1915,10 +2092,8 @@ def prunable_lane_dirs(
     size_candidates: list[Path] = []
     effective_max_total_lane_bytes = max_total_lane_bytes
     if max_total_target_bytes is not None:
-        non_lane_size_bytes, _errors = target_non_lane_size_bytes(
-            repo_root=repo_root,
-            lane_root=lane_root,
-            size_workers=size_workers,
+        non_lane_size_bytes, _errors = snapshot.non_lane_size(
+            lane_root, size_workers=size_workers
         )
         target_lane_budget = max(0, max_total_target_bytes - non_lane_size_bytes)
         effective_max_total_lane_bytes = (
@@ -2231,6 +2406,10 @@ def prune_stale_lanes_report(
         repo_root=repo_root,
         processes=processes,
     )
+    if dry_run and include_disk_report and snapshot.process_scan_error is None:
+        # Seed both budget selection and the final report from one observation.
+        # Actual deletion must report a new post-prune size instead.
+        snapshot.target_size()
     removed = prune_stale_lanes(
         repo_root=repo_root,
         processes=snapshot.processes,
@@ -2274,7 +2453,11 @@ def prune_stale_lanes_report(
         lines.append("no stray cargo target dirs detected")
     if include_disk_report:
         lines.extend(
-            target_disk_report_lines(repo_root=repo_root, warn_bytes=warn_bytes)
+            target_disk_report_lines(
+                repo_root=repo_root,
+                warn_bytes=warn_bytes,
+                snapshot=snapshot if dry_run else None,
+            )
         )
     return "\n".join(lines)
 

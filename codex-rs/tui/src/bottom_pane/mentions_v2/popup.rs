@@ -1,6 +1,9 @@
 use codex_file_search::FileMatch;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 
 use super::candidate::Candidate;
@@ -52,8 +55,13 @@ impl Popup {
         self.refresh_rows();
     }
 
-    pub(crate) fn set_file_matches(&mut self, query: &str, matches: Vec<FileMatch>) {
-        if self.file_search.set_matches(query, matches) {
+    pub(crate) fn set_file_matches(
+        &mut self,
+        query: &str,
+        matches: Vec<FileMatch>,
+        walk_complete: bool,
+    ) {
+        if self.file_search.set_matches(query, matches, walk_complete) {
             self.refresh_rows();
         }
     }
@@ -118,9 +126,27 @@ impl WidgetRef for Popup {
             buf,
             &self.rows,
             &self.state,
-            self.file_search.empty_message(),
+            if self.searches_files() {
+                self.file_search.empty_message()
+            } else {
+                "no matches"
+            },
             self.search_mode,
         );
+        if self.searches_files()
+            && self.file_search.is_incomplete()
+            && !self.rows.is_empty()
+            && area.height > 2
+        {
+            Line::from("  File search incomplete; narrow search root".dim()).render(
+                Rect {
+                    y: area.y + area.height - 2,
+                    height: 1,
+                    ..area
+                },
+                buf,
+            );
+        }
     }
 }
 
@@ -129,6 +155,7 @@ struct FileSearch {
     pending_query: String,
     display_query: String,
     waiting: bool,
+    walk_complete: bool,
     matches: Vec<FileMatch>,
 }
 
@@ -145,7 +172,7 @@ impl FileSearch {
         }
     }
 
-    fn set_matches(&mut self, query: &str, matches: Vec<FileMatch>) -> bool {
+    fn set_matches(&mut self, query: &str, matches: Vec<FileMatch>, walk_complete: bool) -> bool {
         if query != self.pending_query {
             return false;
         }
@@ -153,6 +180,7 @@ impl FileSearch {
         self.display_query = query.to_string();
         self.matches = matches.into_iter().take(MAX_POPUP_ROWS).collect();
         self.waiting = false;
+        self.walk_complete = walk_complete;
         true
     }
 
@@ -163,9 +191,15 @@ impl FileSearch {
     fn empty_message(&self) -> &'static str {
         if self.waiting {
             "loading..."
+        } else if self.is_incomplete() {
+            "File search incomplete; narrow search root"
         } else {
             "no matches"
         }
+    }
+
+    fn is_incomplete(&self) -> bool {
+        !self.pending_query.is_empty() && !self.waiting && !self.walk_complete
     }
 }
 
@@ -190,7 +224,11 @@ mod tests {
     fn set_matches_keeps_only_the_first_page_of_results() {
         let mut popup = Popup::new(Vec::new());
         popup.set_query("file");
-        popup.set_file_matches("file", (0..(MAX_POPUP_ROWS + 2)).map(file_match).collect());
+        popup.set_file_matches(
+            "file",
+            (0..(MAX_POPUP_ROWS + 2)).map(file_match).collect(),
+            true,
+        );
 
         assert_eq!(
             popup.file_search.matches,
@@ -202,7 +240,7 @@ mod tests {
     fn query_changes_hide_stale_files_until_current_results_arrive() {
         let mut popup = Popup::new(Vec::new());
         popup.set_query("alpha");
-        popup.set_file_matches("alpha", vec![file_match(0)]);
+        popup.set_file_matches("alpha", vec![file_match(0)], true);
         assert_eq!(popup.selected(), Some(Selection::File(file_match(0).path)));
 
         popup.set_query("beta");
@@ -212,15 +250,43 @@ mod tests {
         let mut buf = Buffer::empty(area);
         popup.render_ref(area, &mut buf);
         assert_eq!(buf[(2, 0)].symbol(), "l");
-        popup.set_file_matches("alpha", vec![file_match(1)]);
+        popup.set_file_matches("alpha", vec![file_match(1)], true);
         assert_eq!(popup.selected(), None);
 
-        popup.set_file_matches("beta", vec![file_match(2)]);
+        popup.set_file_matches("beta", vec![file_match(2)], true);
         assert_eq!(popup.selected(), Some(Selection::File(file_match(2).path)));
         popup.set_query("beta");
         assert_eq!(popup.selected(), Some(Selection::File(file_match(2).path)));
         popup.set_query("");
         assert_eq!(popup.selected(), None);
+    }
+
+    #[test]
+    fn incomplete_file_search_is_visible_with_and_without_matches() {
+        let mut popup = Popup::new(Vec::new());
+        popup.set_query("file");
+        let render = |popup: &Popup| {
+            let area = Rect::new(0, 0, 60, 10);
+            let mut buf = Buffer::empty(area);
+            popup.render_ref(area, &mut buf);
+            buf.content
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        };
+        for matches in [Vec::new(), vec![file_match(0)]] {
+            popup.set_file_matches("file", matches, false);
+            assert!(render(&popup).contains("File search incomplete; narrow search root"));
+        }
+        assert_eq!(popup.selected(), Some(Selection::File(file_match(0).path)));
+        popup.set_file_matches("file", Vec::new(), true);
+        let complete = render(&popup);
+        assert!(complete.contains("no matches"));
+        assert!(!complete.contains("incomplete"));
+        popup.set_query("other");
+        popup.set_file_matches("file", Vec::new(), false);
+        assert!(render(&popup).contains("loading..."));
+        assert!(!render(&popup).contains("incomplete"));
     }
 
     #[test]

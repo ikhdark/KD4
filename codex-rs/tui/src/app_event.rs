@@ -293,6 +293,7 @@ pub(crate) enum AppEvent {
     FileSearchResult {
         query: String,
         matches: Vec<FileMatch>,
+        walk_complete: bool,
     },
 
     /// Refresh account rate limits in the background.

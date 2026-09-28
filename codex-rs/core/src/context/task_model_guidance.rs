@@ -168,19 +168,20 @@ mod tests {
     }
 
     #[test]
-    fn guidance_keeps_tool_and_authorization_policy_with_the_base() {
+    fn guidance_leaves_tool_and_authorization_policy_to_the_base() {
         let rendered = TaskModelGuidance::default().render();
-        let base = include_str!("../../../protocol/src/prompts/base_instructions/default.md");
-        assert!(base.contains("Batch independent calls"));
-        assert!(base.contains("Do not request authorization already provided."));
         assert!(!rendered.contains("Batch independent"));
         assert!(!rendered.contains("Take state-changing actions"));
     }
 
+    // Ownership follows the marker, not the base prompt's wording: rewording
+    // the prompt must not require editing or rebuilding these core tests. The
+    // prompt's own wording contracts live in models-manager.
     #[test]
     fn shared_policy_has_one_owner_and_catalog_prompts_keep_fallback_coverage() {
-        let base = include_str!("../../../protocol/src/prompts/base_instructions/default.md");
-        let supplemental = TaskModelGuidance::for_base_instructions(base).render();
+        let supplemental =
+            TaskModelGuidance::for_base_instructions(TASK_MODEL_GUIDANCE_SHARED_POLICY_MARKER)
+                .render();
         let fallback =
             TaskModelGuidance::for_base_instructions("catalog supplied instructions").render();
         assert_eq!(fallback, TaskModelGuidance::default().render());
@@ -202,7 +203,6 @@ mod tests {
                 fallback.contains(required),
                 "missing fallback guidance: {required}"
             );
-            assert_eq!(base.matches(required).count(), 1, "base policy: {required}");
             assert!(
                 !supplemental.contains(required),
                 "duplicate policy: {required}"
@@ -220,16 +220,6 @@ mod tests {
             assert!(
                 !supplemental.contains(required),
                 "duplicate policy: {required}"
-            );
-        }
-        for required in [
-            "Reuse current reads, exact values, enumerations, agent results, and passing checks.",
-            "Refresh only evidence affected by changed inputs, contradictions, incompleteness, or explicit freshness requirements.",
-            "Retry a failed operation only when changed inputs, new evidence, a documented retry policy, or an explicit task requirement justify it",
-        ] {
-            assert!(
-                base.contains(required),
-                "missing base lifecycle rule: {required}"
             );
         }
     }

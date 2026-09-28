@@ -43,7 +43,6 @@ use codex_rollout::read_session_meta_line;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
-use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use wiremock::Mock;
@@ -679,13 +678,14 @@ async fn thread_fork_can_exclude_turns_and_skip_restored_token_usage() -> Result
     assert_eq!(thread.preview, "Saved user message");
     assert!(thread.turns.is_empty());
 
-    let note = timeout(
+    // thread/started is emitted after the optional restored-usage replay.
+    timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/tokenUsage/updated"),
+        mcp.read_stream_until_notification_message("thread/started"),
     )
-    .await;
+    .await??;
     assert!(
-        note.is_err(),
+        !mcp.pending_notification_methods().iter().any(|method| method == "thread/tokenUsage/updated"),
         "excludeTurns=true should not replay token usage"
     );
 

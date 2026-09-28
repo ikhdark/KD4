@@ -1,0 +1,1 @@
+{"artifacts":40,"baseline":{"iterations":50,"p50_us":16007.2,"p95_us":17521.1},"baseline_keeps_critical":false,"baseline_retained":9,"priority_keeps_critical":true,"priority_prototype":{"iterations":50,"p50_us":16417.3,"p95_us":18423.9},"priority_retained":9,"recovered_exact_bytes":5200}

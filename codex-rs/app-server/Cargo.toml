@@ -36,6 +36,7 @@ codex-builtin-extensions = { workspace = true }
 codex-cloud-config = { workspace = true }
 codex-config = { workspace = true }
 codex-connectors = { workspace = true }
+codex-context-fragments = { workspace = true }
 codex-core = { workspace = true }
 codex-core-plugins = { workspace = true }
 codex-home = { workspace = true }

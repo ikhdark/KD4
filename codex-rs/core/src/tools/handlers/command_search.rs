@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 #[cfg(windows)]
 use std::fs::File;
 use std::io;
@@ -122,7 +123,13 @@ pub(crate) fn classify_rg_search_with_repository(
     all_targets.dedup();
     let scope_identity = path_scope_identity(&all_targets);
     let parent_scope_identity = parent_scope_identity(&all_targets, &repository_root);
-    let state_paths = search_state_paths(&all_targets, &explicit_input_files, &repository_root);
+    // The miss ledger retains absence, not command output. Modes that emit
+    // output even without matches must run instead of replaying empty stdout.
+    let state_paths = if rg_commands.iter().any(|(_, roles)| roles.miss_has_output) {
+        Vec::new()
+    } else {
+        search_state_paths(&all_targets, &explicit_input_files, &repository_root)
+    };
     Ok(Some((
         repository_root,
         RgSearchNarrowing {
@@ -190,14 +197,84 @@ pub(crate) async fn observe_rg_search_scope_state(search: &mut RgSearchNarrowing
 pub(crate) async fn observe_rg_search_scope_state_with_freshness(
     search: &mut RgSearchNarrowing,
     force_fresh: bool,
+    environment: &HashMap<String, String>,
 ) {
+    let environment = environment.clone();
     observe_rg_search_scope_state_with(
         search,
         force_fresh,
         Arc::clone(&SEARCH_SNAPSHOT_WORKERS),
-        capture_search_scope_state,
+        move |paths, budget| {
+            capture_search_scope_state_with_environment(paths, budget, &environment)
+        },
     )
     .await;
+}
+
+fn capture_search_scope_state_with_environment(
+    paths: &[PathBuf],
+    budget: &mut SearchSnapshotBudget,
+    environment: &HashMap<String, String>,
+) -> Option<String> {
+    let mut recursive = false;
+    for path in paths {
+        budget.check().ok()?;
+        recursive |= path.is_dir();
+    }
+    // Explicit file operands bypass ignore rules. Do not invalidate them for
+    // changes to unrelated user configuration.
+    if !recursive {
+        return capture_search_scope_state(paths, budget);
+    }
+    let value = |name: &str| {
+        environment.iter().find_map(|(key, value)| {
+            let matches = if cfg!(windows) {
+                key.eq_ignore_ascii_case(name)
+            } else {
+                key == name
+            };
+            (matches && !value.is_empty()).then_some(value.as_str())
+        })
+    };
+    let home = value(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    let mut homes = vec![PathBuf::from(home)];
+    if cfg!(windows)
+        && let Some(home) = value("HOME")
+    {
+        homes.push(PathBuf::from(home));
+    }
+    homes.sort_unstable();
+    homes.dedup();
+    let mut dependencies = paths.to_vec();
+    for home in homes {
+        let xdg = value("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        if !home.is_absolute() || !xdg.is_absolute() {
+            return None;
+        }
+        // A Git config can redirect excludesFile or include further configs.
+        // Without a complete resolver, bypass reuse instead of keying only on
+        // the config itself. Missing configs are dependencies too.
+        for config in [home.join(".gitconfig"), xdg.join("git/config")] {
+            budget.check().ok()?;
+            match std::fs::symlink_metadata(&config) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => dependencies.push(config),
+                _ => return None,
+            }
+        }
+        let ignore = xdg.join("git/ignore");
+        budget.check().ok()?;
+        match std::fs::symlink_metadata(&ignore) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        dependencies.push(ignore);
+    }
+    dependencies.sort_unstable();
+    dependencies.dedup();
+    capture_search_scope_state(&dependencies, budget)
 }
 
 async fn observe_rg_search_scope_state_with(
@@ -207,7 +284,7 @@ async fn observe_rg_search_scope_state_with(
     mut capture: impl FnMut(&[PathBuf], &mut SearchSnapshotBudget) -> Option<String> + Send + 'static,
 ) {
     search.scope_state_identity = None;
-    if force_fresh || !search.can_record_miss {
+    if force_fresh || !search.can_record_miss || search.state_paths.is_empty() {
         return;
     }
     // Cache preparation is optional: never queue behind a slow scan. Keep the
@@ -296,6 +373,58 @@ fn search_state_paths(
     paths.sort_unstable();
     paths.dedup();
     paths
+}
+
+/// Reuse search replay's input discovery without snapshotting the filesystem
+/// or computing retry identities. Explicit file operands bypass ignore rules.
+pub(crate) fn rg_search_source_paths(argv: &[String], cwd: &Path) -> Option<Vec<(PathBuf, bool)>> {
+    let roles = RgArgumentRoles::parse(argv);
+    if !roles.searches {
+        return None;
+    }
+    let mut targets = if roles.path_indices.is_empty() {
+        vec![cwd.to_path_buf()]
+    } else {
+        roles
+            .path_indices
+            .iter()
+            .map(|index| cwd.join(&argv[*index]))
+            .collect()
+    };
+    targets.sort_unstable();
+    targets.dedup();
+    let mut paths = targets
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                path.is_dir() || (!path.is_file() && path.extension().is_none()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let directories = paths
+        .iter()
+        .filter(|(_, recursive)| *recursive)
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let inputs = roles
+        .input_files
+        .iter()
+        .map(|path| cwd.join(path))
+        .collect::<Vec<_>>();
+    let inputs = if directories.is_empty() {
+        inputs
+    } else {
+        let root = codex_git_utils::get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        search_state_paths(&directories, &inputs, &root)
+    };
+    paths.extend(
+        inputs
+            .into_iter()
+            .filter(|path| !targets.contains(path))
+            .map(|path| (path, false)),
+    );
+    Some(paths)
 }
 
 fn capture_search_scope_state(
@@ -601,6 +730,7 @@ struct RgArgumentRoles<'a> {
     input_files: Vec<&'a str>,
     searches: bool,
     follows_links: bool,
+    miss_has_output: bool,
     files_mode: bool,
     explicit_pattern: bool,
 }
@@ -615,6 +745,8 @@ impl<'a> RgArgumentRoles<'a> {
                 self.input_files.extend(value);
             }
             "-L" | "--follow" => self.follows_links = true,
+            "--json" | "--stats" | "--debug" | "--trace" | "--passthru" | "--include-zero"
+            | "--pre" => self.miss_has_output = true,
             "-h" | "--help" | "-V" | "--version" | "--type-list" | "--pcre2-version"
             | "--generate" => self.searches = false,
             _ => {}
@@ -627,6 +759,7 @@ impl<'a> RgArgumentRoles<'a> {
             input_files: Vec::new(),
             searches: true,
             follows_links: false,
+            miss_has_output: false,
             files_mode: false,
             explicit_pattern: false,
         };
@@ -677,6 +810,147 @@ impl<'a> RgArgumentRoles<'a> {
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn search_modes_with_output_on_miss_are_not_replayed_as_empty() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("file.txt"), "present\n").unwrap();
+        for flags in [
+            vec!["--json"],
+            vec!["--stats"],
+            vec!["--passthru"],
+            vec!["--count", "--include-zero"],
+            vec!["--debug"],
+            vec!["--trace"],
+        ] {
+            let mut command = vec!["rg".to_string(), "--no-config".to_string()];
+            command.extend(flags.iter().map(ToString::to_string));
+            command.extend(["absent".into(), "file.txt".into()]);
+            let output = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .current_dir(fixture.path())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{flags:?}");
+            assert!(
+                !output.stdout.is_empty() || !output.stderr.is_empty(),
+                "{flags:?}"
+            );
+            let mut search =
+                classify_rg_search_narrowing(&command, None, fixture.path(), fixture.path())
+                    .unwrap()
+                    .unwrap();
+            assert!(search.can_record_miss, "exit 1 is still successful absence");
+            observe_rg_search_scope_state(&mut search).await;
+            assert_eq!(search.scope_state_identity, None, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn global_ignore_dependencies_preserve_only_proven_search_evidence() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        let home = fixture.path().join("home");
+        let xdg = home.join(".config");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(xdg.join("git")).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo.join("src/file.txt"), "needle\n").unwrap();
+        let environment = HashMap::from([
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            ("USERPROFILE".into(), home.to_string_lossy().into_owned()),
+            ("XDG_CONFIG_HOME".into(), xdg.to_string_lossy().into_owned()),
+        ]);
+        let snapshot = |target: &str| {
+            let search = classify_rg_search_narrowing(
+                &[
+                    "rg".into(),
+                    "--no-config".into(),
+                    "needle".into(),
+                    target.into(),
+                ],
+                None,
+                &repo,
+                &repo,
+            )
+            .unwrap()
+            .unwrap();
+            capture_stable_search_scope_state(
+                &search.state_paths,
+                &mut SearchSnapshotBudget {
+                    remaining: SEARCH_SNAPSHOT_MAX_ENTRIES,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                    cancellation: CancellationToken::new(),
+                },
+                &mut |paths, budget| {
+                    capture_search_scope_state_with_environment(paths, budget, &environment)
+                },
+            )
+        };
+        let run_rg = || {
+            let output = std::process::Command::new("rg")
+                .args(["--no-config", "needle", "src"])
+                .current_dir(&repo)
+                .envs(&environment)
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("GIT_CONFIG_SYSTEM")
+                .output()
+                .unwrap();
+            assert!(output.stderr.is_empty(), "{output:?}");
+            (
+                output.status.code(),
+                String::from_utf8(output.stdout).unwrap(),
+            )
+        };
+        let initial = snapshot("src").expect("config-free directory can be cached");
+        assert_eq!(snapshot("src").as_ref(), Some(&initial));
+        std::fs::write(repo.join("unrelated.txt"), "irrelevant").unwrap();
+        assert_eq!(snapshot("src").as_ref(), Some(&initial));
+        let ignore = xdg.join("git/ignore");
+        std::fs::write(&ignore, "file.txt\n").unwrap();
+        let missed = snapshot("src").unwrap();
+        assert_ne!(
+            initial, missed,
+            "creating the default ignore invalidates evidence"
+        );
+        assert_eq!(run_rg(), (Some(1), String::new()));
+        let explicit_file = snapshot("src/file.txt").unwrap();
+        std::fs::write(&ignore, "different.txt\n").unwrap();
+        assert_ne!(snapshot("src").unwrap(), missed);
+        let (code, output) = run_rg();
+        assert_eq!(code, Some(0));
+        assert!(output.contains("needle"));
+        assert_eq!(snapshot("src/file.txt").unwrap(), explicit_file);
+        let redirected = home.join("external-ignore");
+        std::fs::write(&redirected, "file.txt\n").unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!(
+                "[core]\nexcludesFile = {}\n",
+                redirected.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot("src"),
+            None,
+            "unresolved external config must bypass reuse"
+        );
+        assert_eq!(run_rg(), (Some(1), String::new()));
+        std::fs::write(&redirected, "different.txt\n").unwrap();
+        assert_eq!(snapshot("src"), None);
+        assert_eq!(run_rg().0, Some(0));
+        assert_eq!(snapshot("src/file.txt").unwrap(), explicit_file);
+        std::fs::write(repo.join("src/file.txt"), "changed needle\n").unwrap();
+        assert_ne!(snapshot("src/file.txt").unwrap(), explicit_file);
+    }
 
     #[test]
     fn linked_worktree_snapshot_tracks_shared_exclude_and_gitdir_redirects() {

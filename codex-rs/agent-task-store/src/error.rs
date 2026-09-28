@@ -38,6 +38,8 @@ pub enum StoreError {
     DependencyBlocked { blockers: Vec<DependencyBlocker> },
     #[error("isolated handoff from assignment {0} changed after it was versioned")]
     IsolationHandoffSuperseded(AssignmentId),
+    #[error("workspace changed during repeated capture attempts; retry evidence collection")]
+    WorkspaceCaptureContended,
     #[error("only one immutable correction amendment is allowed for assignment {0}")]
     AmendmentLimitReached(AssignmentId),
     #[error("only worker assignments may create a correction attempt: {0}")]

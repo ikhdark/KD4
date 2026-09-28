@@ -56,16 +56,49 @@ def format_bytes(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
-def directory_size_bytes(path: Path, *, exclude: Path | None = None) -> tuple[int, int]:
+def directory_size_bytes(
+    path: Path,
+    *,
+    exclude: Path | None = None,
+    subtree_sizes: dict[Path, tuple[int, int]] | None = None,
+    partition_sizes: dict[Path, tuple[int, int]] | None = None,
+    partition_exclude: Path | None = None,
+) -> tuple[int, int]:
+    """Measure a tree, requested subtrees, and optional non-lane child partitions.
+
+    Partitions match target_non_lane_size_bytes: hardlinks are deduplicated per
+    immediate child, while root-level files are counted individually.
+    """
     if not path.exists():
         return 0, 0
 
-    total = 0
-    errors = 0
-    linked: set[tuple[int, int]] = set()
-    stack = [os.fspath(path.resolve())]
+    subtrees = {
+        os.path.normcase(os.fspath(child.resolve())): child
+        for child in (subtree_sizes or {})
+    }
+    totals = {scope: [0, 0] for scope in (None, *subtrees.values())}
+    linked = {scope: set() for scope in totals}
+    root = os.fspath(path.resolve())
+    excluded_partition = (
+        os.path.normcase(os.fspath(partition_exclude.resolve()))
+        if partition_exclude is not None
+        else None
+    )
+    stack = [(root, None, None)]
     while stack:
-        current = stack.pop()
+        current, subtree, partition = stack.pop()
+        if partition_sizes is not None:
+            if os.path.normcase(current) == excluded_partition:
+                partition = False
+            elif partition is None:
+                partition = ("partition", current)
+                totals[partition] = [0, 0]
+                linked[partition] = set()
+        if subtrees:
+            subtree = subtrees.get(os.path.normcase(current), subtree)
+        scopes = (None,) if subtree is None else (None, subtree)
+        if partition:
+            scopes += (partition,)
         try:
             with os.scandir(current) as entries:
                 for entry in entries:
@@ -75,26 +108,55 @@ def directory_size_bytes(path: Path, *, exclude: Path | None = None) -> tuple[in
                         if _is_reparse_point(entry):
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
+                            stack.append(
+                                (
+                                    entry.path,
+                                    subtree,
+                                    None
+                                    if current == root and partition is not False
+                                    else partition,
+                                )
+                            )
                         elif entry.is_file(follow_symlinks=False):
                             size = entry.stat(follow_symlinks=False).st_size
+                            key = None
                             if size >= HARDLINK_CHECK_MIN_BYTES:
                                 # scandir leaves st_ino/st_nlink zero on Windows.
                                 try:
-                                    identity = os.stat(entry.path, follow_symlinks=False)
+                                    identity = os.stat(
+                                        entry.path, follow_symlinks=False
+                                    )
                                 except OSError:
                                     identity = None
                                 if identity is not None and identity.st_nlink > 1:
                                     key = (identity.st_dev, identity.st_ino)
-                                    if key in linked:
+                            # A hardlink shared across lanes counts once globally
+                            # but once in each lane's independent size budget.
+                            for scope in scopes:
+                                if key is not None and not (
+                                    partition and scope == partition and current == root
+                                ):
+                                    if key in linked[scope]:
                                         continue
-                                    linked.add(key)
-                            total += size
+                                    linked[scope].add(key)
+                                totals[scope][0] += size
                     except OSError:
-                        errors += 1
+                        for scope in scopes:
+                            totals[scope][1] += 1
         except OSError:
-            errors += 1
-    return total, errors
+            for scope in scopes:
+                totals[scope][1] += 1
+    if subtree_sizes is not None:
+        subtree_sizes.update(
+            (child, (totals[child][0], totals[child][1])) for child in subtrees.values()
+        )
+    if partition_sizes is not None:
+        partition_sizes.update(
+            (Path(scope[1]), (values[0], values[1]))
+            for scope, values in totals.items()
+            if isinstance(scope, tuple)
+        )
+    return totals[None][0], totals[None][1]
 
 
 def _is_reparse_point(entry: os.DirEntry[str]) -> bool:
@@ -185,6 +247,7 @@ def target_disk_report_lines(
     *,
     repo_root: Path,
     warn_bytes: int = DEFAULT_TARGET_WARN_BYTES,
+    snapshot: BuildStatusSnapshot | None = None,
 ) -> list[str]:
     target_root = repo_root / "codex-rs" / "target"
     lines = [f"target root: {target_root}"]
@@ -192,7 +255,11 @@ def target_disk_report_lines(
         lines.append("target disk: missing")
         return lines
 
-    size_bytes, errors = directory_size_bytes(target_root)
+    size_bytes, errors = (
+        snapshot.target_size()
+        if snapshot is not None
+        else directory_size_bytes(target_root)
+    )
     lines.append(f"target disk: {format_bytes(size_bytes)}")
     lines.append(f"target warning threshold: {format_bytes(warn_bytes)}")
     if errors:
@@ -225,6 +292,13 @@ def build_doctor_report(
     snapshot: BuildStatusSnapshot | None = None,
     tool_lookup: Callable[[str], str | None] = shutil.which,
     env: Mapping[str, str] | None = None,
+    warn_bytes: int = DEFAULT_TARGET_WARN_BYTES,
+    keep_warm_per_base: int = DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
+    max_age_days: float | None = DEFAULT_PRUNE_MAX_AGE_DAYS,
+    max_lane_bytes: int | None = None,
+    max_total_lane_bytes: int | None = None,
+    max_total_target_bytes: int | None = None,
+    size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
 ) -> str:
     env = os.environ if env is None else env
     snapshot = snapshot or _runtime().BuildStatusSnapshot.collect(
@@ -283,12 +357,22 @@ def build_doctor_report(
             "active lanes: " + ", ".join(lane for lane in active_lanes if lane)
         )
 
-    lines.extend(target_disk_report_lines(repo_root=repo_root))
+    lines.extend(
+        target_disk_report_lines(
+            repo_root=repo_root, warn_bytes=warn_bytes, snapshot=snapshot
+        )
+    )
     lines.extend(
         lane_report_lines(
             repo_root=repo_root,
             processes=processes,
             snapshot=snapshot,
+            keep_warm_per_base=keep_warm_per_base,
+            max_age_days=max_age_days,
+            max_lane_bytes=max_lane_bytes,
+            max_total_lane_bytes=max_total_lane_bytes,
+            max_total_target_bytes=max_total_target_bytes,
+            size_workers=size_workers,
         )
     )
     return "\n".join(lines)
@@ -336,6 +420,12 @@ def lane_report_lines(
     repo_root: Path,
     processes: Sequence[RustProcess],
     snapshot: BuildStatusSnapshot | None = None,
+    keep_warm_per_base: int = DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
+    max_age_days: float | None = DEFAULT_PRUNE_MAX_AGE_DAYS,
+    max_lane_bytes: int | None = None,
+    max_total_lane_bytes: int | None = None,
+    max_total_target_bytes: int | None = None,
+    size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
 ) -> list[str]:
     snapshot = snapshot or _runtime().BuildStatusSnapshot.collect(
         repo_root=repo_root,
@@ -343,7 +433,9 @@ def lane_report_lines(
     )
     lane_root = _runtime().cargo_lanes_root(repo_root)
     # Match on-disk names case-insensitively, as stale detection does.
-    existing_by_folded = {path.name.casefold(): path.name for path in snapshot.lane_dirs}
+    existing_by_folded = {
+        path.name.casefold(): path.name for path in snapshot.lane_dirs
+    }
     active_existing = sorted(
         {
             existing_by_folded[name.casefold()]
@@ -360,7 +452,7 @@ def lane_report_lines(
     stale = snapshot.stale_lanes
     protected = _runtime().protected_warm_lane_names(
         stale,
-        keep_warm_per_base=DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
+        keep_warm_per_base=keep_warm_per_base,
         lane_mtime=snapshot.lane_mtime,
     )
     prune_refusal = None
@@ -370,6 +462,12 @@ def lane_report_lines(
                 repo_root=repo_root,
                 processes=snapshot.processes,
                 snapshot=snapshot,
+                keep_warm_per_base=keep_warm_per_base,
+                max_age_days=max_age_days,
+                max_lane_bytes=max_lane_bytes,
+                max_total_lane_bytes=max_total_lane_bytes,
+                max_total_target_bytes=max_total_target_bytes,
+                size_workers=size_workers,
             )
         )
     except (
@@ -410,8 +508,15 @@ def lane_report_lines(
         lines.append("prunable:")
         for path in sorted(prunable):
             lines.append(f"  {path.name}")
-        lines.append("safe prune suggestions:")
-        lines.append("  just target-prune")
+        if (
+            keep_warm_per_base == DEFAULT_PRUNE_KEEP_WARM_PER_BASE
+            and max_age_days == DEFAULT_PRUNE_MAX_AGE_DAYS
+            and max_lane_bytes is None
+            and max_total_lane_bytes is None
+            and max_total_target_bytes is None
+        ):
+            lines.append("safe prune suggestions:")
+            lines.append("  just target-prune")
     return lines
 
 
@@ -431,7 +536,17 @@ def target_optimize_report(
     snapshot = _runtime().BuildStatusSnapshot.collect(repo_root=repo_root)
     return "\n".join(
         [
-            build_doctor_report(repo_root=repo_root, snapshot=snapshot),
+            build_doctor_report(
+                repo_root=repo_root,
+                snapshot=snapshot,
+                warn_bytes=warn_bytes,
+                keep_warm_per_base=keep_warm_per_base,
+                max_age_days=max_age_days,
+                max_lane_bytes=max_lane_bytes,
+                max_total_lane_bytes=max_total_lane_bytes,
+                max_total_target_bytes=max_total_target_bytes,
+                size_workers=size_workers,
+            ),
             _runtime().prune_stale_lanes_report(
                 repo_root=repo_root,
                 snapshot=snapshot,

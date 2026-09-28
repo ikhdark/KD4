@@ -22,7 +22,8 @@ use tracing::info;
 
 pub(super) struct RemoteCompactV2Attempt {
     pub(super) trace_input_history: Option<Vec<ResponseItem>>,
-    pub(super) prompt_input: Vec<ResponseItem>,
+    pub(super) retained_input: Vec<ResponseItem>,
+    pub(super) retained_images: usize,
     pub(super) compaction_output: ResponseItem,
     pub(super) token_usage: Option<TokenUsage>,
     /// Keeps a session created for standalone compaction alive through lifecycle completion.
@@ -119,6 +120,13 @@ pub(super) async fn run_remote_compact_v2_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
+    let mut prompt_input = prompt.input.to_vec();
+    let Some(ResponseItem::CompactionTrigger {}) = prompt_input.pop() else {
+        unreachable!("remote compaction v2 prompt must end with its synthetic trigger");
+    };
+    // A checkpoint that cannot retain exact inputs must fail before spending a model request.
+    let (retained_input, retained_images) =
+        super::prepare_v2_retained_input(sess, &prompt_input).await?;
     let compaction_output_result = run_remote_compaction_request_v2(
         sess,
         turn_context.as_ref(),
@@ -133,13 +141,10 @@ pub(super) async fn run_remote_compact_v2_attempt(
         compaction_output,
         token_usage,
     } = compaction_output_result?;
-    let mut prompt_input = prompt.input.to_vec();
-    let Some(ResponseItem::CompactionTrigger {}) = prompt_input.pop() else {
-        unreachable!("remote compaction v2 prompt must end with its synthetic trigger");
-    };
     Ok(RemoteCompactV2Attempt {
         trace_input_history,
-        prompt_input,
+        retained_input,
+        retained_images,
         compaction_output,
         token_usage,
         owned_client_session,

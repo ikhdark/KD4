@@ -25,13 +25,14 @@ use crate::setup_error::SetupFailure;
 use crate::setup_error::clear_setup_error_report;
 use crate::setup_error::failure;
 use crate::setup_error::read_setup_error_report;
+use crate::setup_protocol::SETUP_PAYLOAD_FILE_ARG;
+use crate::setup_protocol::SETUP_PAYLOAD_STDIN_ARG;
 use crate::setup_protocol::SetupMode;
 use crate::setup_protocol::SetupPayload;
+use crate::setup_protocol::write_setup_payload;
 use crate::ssh_config_dependencies::ssh_config_dependency_paths;
 use anyhow::Result;
 use anyhow::anyhow;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
@@ -256,8 +257,7 @@ fn run_setup_refresh_inner(
         mode,
         refresh_only: true,
     };
-    let json = serde_json::to_vec(&payload)?;
-    let b64 = BASE64_STANDARD.encode(json);
+    let payload_file = write_setup_payload(&payload)?;
     let exe = find_setup_exe();
     let sbx_dir = sandbox_dir(request.codex_home);
     let log_path = current_log_file_path(&sbx_dir);
@@ -273,14 +273,17 @@ fn run_setup_refresh_inner(
     };
     // Refresh should never request elevation; ensure verb isn't set and we don't trigger UAC.
     let mut cmd = Command::new(&exe);
-    cmd.arg(&b64).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.arg(SETUP_PAYLOAD_STDIN_ARG)
+        .stdin(payload_file.reopen()?)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let cwd = std::env::current_dir().unwrap_or_else(|_| request.codex_home.to_path_buf());
     log_note(
         &format!(
             "setup refresh: spawning {} (cwd={}, payload_len={})",
             exe.display(),
             cwd.display(),
-            b64.len()
+            payload_file.as_file().metadata()?.len()
         ),
         Some(&sbx_dir),
     );
@@ -753,13 +756,12 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     use windows_sys::Win32::UI::Shell::SHELLEXECUTEINFOW;
     use windows_sys::Win32::UI::Shell::ShellExecuteExW;
     let exe = find_setup_exe();
-    let payload_json = serde_json::to_string(payload).map_err(|err| {
+    let payload_file = write_setup_payload(payload).map_err(|err| {
         failure(
             SetupErrorCode::OrchestratorPayloadSerializeFailed,
-            format!("failed to serialize elevation payload: {err}"),
+            format!("failed to prepare elevation payload: {err:#}"),
         )
     })?;
-    let payload_b64 = BASE64_STANDARD.encode(payload_json.as_bytes());
     let cleared_report = match clear_setup_error_report(codex_home) {
         Ok(()) => true,
         Err(err) => {
@@ -775,9 +777,9 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
 
     if !needs_elevation {
         let status = Command::new(&exe)
-            .arg(&payload_b64)
+            .arg(SETUP_PAYLOAD_STDIN_ARG)
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .stdin(Stdio::null())
+            .stdin(payload_file.reopen()?)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -807,7 +809,10 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     }
 
     let exe_w = crate::winutil::to_wide(&exe);
-    let params = quote_arg(&payload_b64);
+    let params = format!(
+        "{SETUP_PAYLOAD_FILE_ARG} {}",
+        quote_arg(&payload_file.path().to_string_lossy())
+    );
     let params_w = crate::winutil::to_wide(params);
     let verb_w = crate::winutil::to_wide("runas");
     // SAFETY: SHELLEXECUTEINFOW contains integer fields and nullable pointers, so zero is a valid

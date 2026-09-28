@@ -226,6 +226,7 @@ fn auto_load_secrets_lock_failure_does_not_fall_back_to_file() -> Result<()> {
         AuthKeyringBackendKind::Secrets,
         &tokens.server_name,
         &tokens.url,
+        None,
     )
     .expect_err("aggregate-store lock failure must abort Auto resolution");
 
@@ -429,6 +430,7 @@ fn secrets_store_lock_preserves_updates_for_different_servers() -> Result<()> {
         AuthKeyringBackendKind::Secrets,
         &first.server_name,
         &first.url,
+        None,
     )?
     .expect("first server tokens should remain stored");
     let loaded_second = load_oauth_tokens_from_keyring(
@@ -437,6 +439,7 @@ fn secrets_store_lock_preserves_updates_for_different_servers() -> Result<()> {
         AuthKeyringBackendKind::Secrets,
         &second.server_name,
         &second.url,
+        None,
     )?
     .expect("second server tokens should be stored");
     assert_tokens_match_without_expiry(&loaded_first, &first);
@@ -457,6 +460,17 @@ fn secrets_store_load_and_delete_observe_aggregate_lock() -> Result<()> {
         &tokens,
     )?;
 
+    let cache = codex_secrets::LocalSecretsReadCache::default();
+    let cached = load_oauth_tokens_from_keyring(
+        &keyring_store,
+        env.path(),
+        AuthKeyringBackendKind::Secrets,
+        &tokens.server_name,
+        &tokens.url,
+        Some(&cache),
+    )?
+    .expect("warm the credential read cache before lock contention");
+    assert_tokens_match_without_expiry(&cached, &tokens);
     let store_for_load = keyring_store.clone();
     let server_name = tokens.server_name.clone();
     let url = tokens.url.clone();
@@ -469,6 +483,7 @@ fn secrets_store_load_and_delete_observe_aggregate_lock() -> Result<()> {
                 AuthKeyringBackendKind::Secrets,
                 &server_name,
                 &url,
+                Some(&cache),
             )
         })?
         .expect("encrypted credentials should remain readable after contention");
@@ -495,6 +510,7 @@ fn secrets_store_load_and_delete_observe_aggregate_lock() -> Result<()> {
             AuthKeyringBackendKind::Secrets,
             &tokens.server_name,
             &tokens.url,
+            None,
         )?
         .is_none()
     );

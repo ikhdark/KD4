@@ -57,6 +57,21 @@ def _event_fields(value: Any) -> tuple[str, dict[str, Any]] | None:
     fields: dict[str, Any] = {}
     for layer in layers:
         for key, field_value in layer.items():
+            # Compare telemetry, not exporter envelopes or tracing metadata.
+            if key in ("fields", "attributes", "body") and isinstance(
+                field_value, dict
+            ):
+                continue
+            if key in (
+                "timestamp",
+                "level",
+                "target",
+                "span",
+                "spans",
+                "event.name",
+                "event_name",
+            ):
+                continue
             fields.setdefault(key, field_value)
     # Resolve aliases at each layer so a nested event.name cannot override a
     # top-level event_name (or vice versa).
@@ -69,8 +84,10 @@ def _event_fields(value: Any) -> tuple[str, dict[str, Any]] | None:
         None,
     )
     if event_name == "codex.model_attempt":
+        fields["event.name"] = event_name
         return "attempt", fields
     if event_name == "codex.model_context_component":
+        fields["event.name"] = event_name
         return "component", fields
     return None
 
@@ -461,6 +478,14 @@ def analyze(
             exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
             continue
 
+        retry_indexes = [attempt.get("retry_index") for attempt in attempts]
+        valid_retry_indexes = all(
+            type(index) is int and index >= 0 for index in retry_indexes
+        )
+        retry_coverage_complete = valid_retry_indexes and retry_indexes == list(
+            range(len(attempts))
+        )
+        reported_retries = max(retry_indexes) if valid_retry_indexes else None
         row = {
             "sampling_request_id": record["sampling_request_id"],
             "attempt_id": record.get("attempt_id"),
@@ -476,7 +501,14 @@ def analyze(
             "cached_input_token_count": record["cached_input_token_count"],
             "uncached_input_token_count": record["uncached_input_token_count"],
             "physical_attempt_count": len(attempts),
-            "retry_count": len(attempts) - 1,
+            "retry_count": reported_retries,
+            "observed_retry_count": len(attempts) - 1,
+            "retry_coverage_complete": retry_coverage_complete,
+            "missing_physical_attempt_count": (
+                reported_retries + 1 - len(set(retry_indexes))
+                if valid_retry_indexes
+                else None
+            ),
             "retry_overhead_us": retry_overhead_us,
             "terminal_decision_latency_us": terminal_decision_latency_us,
             "decision_latency_us": retry_overhead_us
@@ -492,6 +524,10 @@ def analyze(
 
     members_by_group: dict[tuple[Any, Any, Any, Any, Any], list[dict[str, Any]]] = {}
     for row in rows:
+        # Keep observed terminal evidence, but do not mix incomplete retry
+        # sequences into the clean latency distributions and correlations.
+        if not row["retry_coverage_complete"]:
+            continue
         key = (
             row["model"],
             row["transport"],
@@ -572,10 +608,23 @@ def analyze(
             "dispatch-to-first-actionable-output. It excludes every gap between "
             "attempts (retry backoff, reconnection) and pre-dispatch work: each "
             "attempt has its own clock, so those gaps are not observable and "
-            "retried requests are understated by an unknown amount"
+            "retried requests are understated by an unknown amount. Rows with "
+            "incomplete retry coverage retain observed evidence as lower bounds "
+            "but are excluded from grouped latency distributions and correlations"
         ),
-        "retriedLogicalRequests": sum(row["retry_count"] > 0 for row in rows),
-        "unmeasuredInterAttemptGaps": sum(row["retry_count"] for row in rows),
+        "retriedLogicalRequests": sum(
+            max(row["retry_count"] or 0, row["observed_retry_count"]) > 0
+            for row in rows
+        ),
+        "unmeasuredInterAttemptGaps": sum(
+            max(row["retry_count"] or 0, row["observed_retry_count"]) for row in rows
+        ),
+        "partialRetryCoverageRequests": sum(
+            not row["retry_coverage_complete"] for row in rows
+        ),
+        "cleanIncludedLogicalRequests": sum(
+            row["retry_coverage_complete"] for row in rows
+        ),
         "quantileMethod": "linear interpolation at (n - 1) * p on sorted samples",
         "sampleLimitations": (
             "Percentiles describe the observed samples, not population tail estimates. "
@@ -617,7 +666,9 @@ def render(analysis: dict[str, Any]) -> str:
         f"physical attempts: {analysis['totalPhysicalAttempts']}",
         f"included physical attempts: {analysis['includedPhysicalAttempts']}",
         f"logical requests: {analysis['totalLogicalRequests']}",
-        f"clean included requests: {analysis['includedLogicalRequests']}",
+        f"included observed requests: {analysis['includedLogicalRequests']}",
+        f"clean included requests: {analysis['cleanIncludedLogicalRequests']}",
+        f"partial retry coverage (excluded from grouped latency): {analysis['partialRetryCoverageRequests']}",
         (
             "unmeasured inter-attempt gaps (backoff/reconnect, excluded from "
             f"decision latency): {analysis['unmeasuredInterAttemptGaps']} across "

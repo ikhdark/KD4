@@ -16,16 +16,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
-try:
-    from scripts import tool_versions
-except ModuleNotFoundError:
+if __package__:
+    from . import tool_versions
+    from .process_owner import run_owned
+else:
     import tool_versions
+    from process_owner import run_owned
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_JSON = REPO_ROOT / "package.json"
 # Recipes run Rust tools here, where codex-rs/rust-toolchain.toml selects the toolchain.
 RUST_WORKSPACE = REPO_ROOT / "codex-rs"
+VERSION_TIMEOUT_SECONDS = 10
 
 
 class PackageJsonError(RuntimeError):
@@ -45,7 +48,7 @@ class ToolCheck:
 
 def run_version(command: Sequence[str], cwd: Path = REPO_ROOT) -> str | None:
     try:
-        completed = subprocess.run(
+        completed = run_owned(
             list(command),
             cwd=cwd,
             # A probe must not start installing a missing pinned toolchain.
@@ -55,7 +58,7 @@ def run_version(command: Sequence[str], cwd: Path = REPO_ROOT) -> str | None:
             stderr=subprocess.PIPE,
             encoding="utf-8",
             errors="replace",
-            timeout=10,
+            timeout=VERSION_TIMEOUT_SECONDS,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):

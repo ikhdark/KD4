@@ -18,6 +18,11 @@ from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from scripts.rust_tool_env import prepare_shared_sccache
+except ModuleNotFoundError:
+    from rust_tool_env import prepare_shared_sccache
+
 
 class Operation:
     def __init__(self, timeout=None):
@@ -143,6 +148,7 @@ class WindowsJob:
             raise ctypes.WinError(ctypes.get_last_error())
         limits = ExtendedLimits()
         limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        self.limits = limits
         if not self.api.SetInformationJobObject(
             self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
         ):
@@ -181,11 +187,19 @@ class WindowsJob:
             self.api.CloseHandle(self.handle)
             self.handle = None
 
+    def release(self):
+        self.limits.basic.flags = 0
+        if not self.api.SetInformationJobObject(
+            self.handle, 9, ctypes.byref(self.limits), ctypes.sizeof(self.limits)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
 
 @contextlib.contextmanager
-def owned_process(args, **kwargs):
+def owned_process(args, *, preserve_descendants_on_success=False, **kwargs):
     job = WindowsJob() if os.name == "nt" else None
     process = None
+    preserve = False
     try:
         kwargs.pop("start_new_session", None)
         flags = kwargs.pop("creationflags", 0)
@@ -204,11 +218,17 @@ def owned_process(args, **kwargs):
                 raise
             process._codex_owned_job = job
         yield process
+        # Git may start a persistent FSMonitor daemon. Only an explicitly opted-in,
+        # successful command may leave descendants; exceptions still clean up.
+        preserve = preserve_descendants_on_success and process.poll() == 0
     finally:
         deadline = time.monotonic() + 15
         try:
             if process is not None:
-                if job:
+                if preserve:
+                    if job:
+                        job.release()
+                elif job:
                     job.stop(deadline)
                 else:
                     try:
@@ -225,8 +245,19 @@ def owned_process(args, **kwargs):
                 job.close()
 
 
-def run_owned(args, *, timeout=None, check=False, capture_output=False, **kwargs):
+def run_owned(
+    args,
+    *,
+    timeout=None,
+    check=False,
+    capture_output=False,
+    prepare_sccache=False,
+    **kwargs,
+):
     check_operation()
+    if prepare_sccache:
+        prepare_shared_sccache(env=kwargs.get("env"), cwd=kwargs.get("cwd"))
+        check_operation()
     if capture_output:
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     with owned_process(args, **kwargs) as process:
@@ -277,7 +308,9 @@ def run_finite(
 
     `observe` receives decoded chunks before diagnostic-tail truncation. Full logs
     are deliberately not persisted; callers must reject truncated machine output.
-    A deadline covers both process exit and EOF (including inherited child pipes).
+    The deadline covers the primary command. Once it exits, owned descendants
+    are stopped before the remaining output is drained, so inherited pipes
+    cannot keep an already completed command waiting until its deadline.
     """
     if timeout <= 0 or output_limit <= 0:
         raise ValueError("timeout and output_limit must be positive")
@@ -290,11 +323,25 @@ def run_finite(
     reader = None
     process = None
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    observing = True
+
+    def consume(chunk):
+        nonlocal total, observing
+        if chunk:
+            total += len(chunk)
+            tail.extend(chunk)
+            del tail[:-output_limit]
+        if observe is not None and observing:
+            try:
+                observe(decoder.decode(chunk, final=not chunk))
+            except BaseException:
+                observing = False
+                raise
 
     def drain(pipe):
         try:
             while not stop.is_set():
-                chunk = pipe.read(8192)
+                chunk = pipe.read1(8192)
                 while not stop.is_set():
                     try:
                         chunks.put(chunk, timeout=0.05)
@@ -313,8 +360,7 @@ def run_finite(
         ) as process:
             reader = threading.Thread(target=drain, args=(process.stdout,), daemon=True)
             reader.start()
-            eof = False
-            while not eof or process.poll() is None:
+            while process.poll() is None:
                 check_operation()
                 if time.monotonic() - started >= timeout:
                     status, code = "timed_out", 124
@@ -323,14 +369,7 @@ def run_finite(
                     chunk = chunks.get(timeout=0.05)
                 except queue.Empty:
                     continue
-                if not chunk:
-                    eof = True
-                else:
-                    total += len(chunk)
-                    tail.extend(chunk)
-                    del tail[:-output_limit]
-                if observe is not None:
-                    observe(decoder.decode(chunk, final=eof))
+                consume(chunk)
             else:
                 code = process.wait()
                 status = "passed" if code == 0 else "failed"
@@ -349,11 +388,24 @@ def run_finite(
         )
         tail = bytearray(str(error).encode("utf-8")[-output_limit:])
     finally:
-        stop.set()
         if reader is not None:
-            reader.join(timeout=5)
-            if reader.is_alive():
-                raise CleanupFailed("owned output reader did not stop")
+            # owned_process has stopped the tree, including inherited pipe
+            # handles. Drain the bounded queue before stopping its producer;
+            # otherwise timeout/cancellation can discard the final diagnostic.
+            drain_deadline = time.monotonic() + 5
+            try:
+                while reader.is_alive() or not chunks.empty():
+                    if time.monotonic() >= drain_deadline:
+                        raise CleanupFailed("owned output reader did not stop")
+                    try:
+                        consume(chunks.get(timeout=0.05))
+                    except queue.Empty:
+                        continue
+            finally:
+                stop.set()
+                reader.join(timeout=max(0, drain_deadline - time.monotonic()))
+                if reader.is_alive():
+                    raise CleanupFailed("owned output reader did not stop")
     return FiniteResult(
         tuple(args),
         str(kwargs.get("cwd", os.getcwd())),
@@ -388,6 +440,11 @@ def main(argv=None):
         help="Windows: stop the command's tree once this process exits.",
     )
     parser.add_argument(
+        "--prepare-sccache",
+        action="store_true",
+        help="Initialize a configured shared sccache before the owned command.",
+    )
+    parser.add_argument(
         "--cleanup-failed-marker",
         type=Path,
         help="Write this file if the tree's exit cannot be confirmed.",
@@ -403,7 +460,12 @@ def main(argv=None):
                 target=_cancel_after_exit, args=(args.parent_pid, owned), daemon=True
             ).start()
         try:
-            return run_owned(command, stdout=sys.stdout, stderr=sys.stderr).returncode
+            return run_owned(
+                command,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+                prepare_sccache=args.prepare_sccache,
+            ).returncode
         except CleanupFailed:
             if args.cleanup_failed_marker is not None:
                 args.cleanup_failed_marker.write_text(

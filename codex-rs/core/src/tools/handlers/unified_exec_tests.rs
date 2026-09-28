@@ -452,6 +452,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         original_token_count: None,
         hook_command: Some("broken command".to_string()),
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: Some(existing_repair_notice.to_string()),
         pending_deferred_completions: Vec::new(),
@@ -538,6 +539,7 @@ fn terminal_powershell_nonterminating_error_exposes_recovery_hint_after_success(
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -744,6 +746,25 @@ async fn repeated_rg_miss_uses_workspace_identity_across_epoch_advance() {
         serde_json::Value::Null
     );
     let second = second.expect("a cached search miss is successful negative evidence");
+    let result = second.code_mode_result(&payload);
+    assert_eq!(result["output"].as_str().unwrap().trim(), "");
+    assert_eq!(result["exit_code"], 1);
+    assert_eq!(result["execution_state"], "exited");
+    assert_eq!(result["process_exited"], true);
+    assert_eq!(result["output_complete"], true);
+    assert_eq!(result["output_reduced"], false);
+    assert!(result.get("session_id").is_none());
+    assert!(result.get("session_capabilities").is_none());
+    assert_eq!(result["replay"]["kind"], "search_miss");
+    assert!(!result["replay"]["fingerprint"].as_str().unwrap().is_empty());
+    let codex_tools::ToolSpec::Function(spec) = ExecCommandHandler::default().spec() else {
+        panic!("exec_command must expose a function schema");
+    };
+    let schema = spec.output_schema.unwrap().into_value();
+    jsonschema::validator_for(&schema)
+        .unwrap()
+        .validate(&result)
+        .unwrap();
     assert_eq!(
         second.outcome_for_logging(),
         codex_tools::ToolOutputOutcome::Success
@@ -982,6 +1003,27 @@ async fn yielded_validation_records_full_lifetime_once(exit_code: i32) {
         counters.executed_validation_duration_ns >= 5_000_000_000,
         "{counters:?}"
     );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn unexecuted_powershell_branch_is_not_validation_evidence() {
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    let (session, turn) = (Arc::new(session), Arc::new(turn));
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "script_body": "if ($false) { cargo test --manifest-path nonexistent/Cargo.toml }; Write-Output branch-skipped",
+        }).to_string(),
+    };
+    let output = run_exec_command_for_test(&session, &turn, "unexecuted-validation", payload.clone()).await;
+    let result = output.code_mode_result(&payload);
+    assert_eq!(result["exit_code"], 0, "{result}");
+    assert!(result["output"].as_str().unwrap().contains("branch-skipped"));
+    assert!(result.get("validation").is_none(), "{result}");
+    let counters = turn.turn_timing_state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.executed_validation_count, 0);
+    assert_eq!(counters.executed_validation_duration_ns, 0);
 }
 
 #[tokio::test]
@@ -2568,6 +2610,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -2606,6 +2649,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -2645,6 +2689,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -2679,6 +2724,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         original_token_count: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -2748,6 +2794,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         original_token_count: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -2768,6 +2815,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         original_token_count: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
@@ -3123,7 +3171,7 @@ async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
     assert_eq!(code_mode["output_complete"], false);
     assert!(!text.contains("stdin-notice-0128"));
     let response =
-        serde_json::to_value(&completed.to_response_item("notice-write_stdin", &payload))
+        serde_json::to_value(completed.to_response_item("notice-write_stdin", &payload))
             .expect("model response");
     let direct: serde_json::Value =
         serde_json::from_str(response["output"].as_str().expect("direct output"))

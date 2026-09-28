@@ -395,6 +395,16 @@ impl AnyToolResult {
         self.result.requires_canonical_artifact()
     }
 
+    pub(crate) fn retained_canonical_artifact(&self) -> Option<(String, String)> {
+        let candidate = self.model_projection.as_ref()?.candidate.as_ref()?;
+        candidate.complete.then(|| {
+            (
+                candidate.artifact_id.clone(),
+                candidate.artifact_sha256.clone(),
+            )
+        })
+    }
+
     pub(crate) fn projected_source_dependencies(
         &self,
     ) -> Option<&std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>> {
@@ -747,7 +757,7 @@ fn apply_post_tool_use_outcome(
     // block decision cannot undo the call, so returning a failed tool result
     // would only invite the model to repeat the mutation. Likewise, context
     // from a rejecting hook must not influence the next sampling request.
-    if outcome.should_block {
+    if outcome.should_block || outcome.stop_reason.is_some() {
         return Vec::new();
     }
     if let Some(feedback_message) = outcome.feedback_message {
@@ -1176,6 +1186,11 @@ impl ToolRegistry {
         &self,
         mut invocation: ToolInvocation,
     ) -> Result<(ToolInvocation, Option<String>), FunctionCallError> {
+        if let Some(reason) = invocation.step_context.turn.post_tool_stop_reason.get() {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "Tool not run: PostToolUse hook stopped this turn: {reason}"
+            )));
+        }
         let original_name = invocation.tool_name.clone();
         if let Some(registered) = self.tools.get(&invocation.tool_name) {
             invocation = registered.runtime().prepare_invocation(invocation).await?;
@@ -1254,6 +1269,11 @@ impl ToolRegistry {
         mut invocation: ToolInvocation,
         dispatch_state: Arc<ToolDispatchState>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        if let Some(reason) = invocation.step_context.turn.post_tool_stop_reason.get() {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "Tool not run: PostToolUse hook stopped this turn: {reason}"
+            )));
+        }
         // Direct registry callers do not pass through ToolCallRuntime's prepare
         // phase. Resolve their executable before selecting its handler/schema.
         let original_name = invocation.tool_name.clone();
@@ -1441,6 +1461,7 @@ impl ToolRegistry {
                             .as_ref()
                             .and_then(|parsed| parsed.value().ok()),
                         invocation.step_context.turn.config.cwd.as_path(),
+                        Some(&invocation.step_context.environments),
                     )
                 });
         }
@@ -2202,6 +2223,7 @@ async fn prepare_model_projection(
                 &invocation.payload,
                 parsed_function_arguments.and_then(|parsed| parsed.value().ok()),
                 invocation.step_context.turn.config.cwd.as_path(),
+                Some(&invocation.step_context.environments),
             )
         },
     )
@@ -2748,10 +2770,8 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         original_response,
         materialization,
     } = input;
-    let successful = !matches!(
-        &outcome,
-        ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut
-    );
+    let successful = outcome == ToolOutputOutcome::Success
+        && essential_inline.get("contains_nested_failure") != Some(&Value::Bool(true));
     if !projection_eligible {
         return None;
     }

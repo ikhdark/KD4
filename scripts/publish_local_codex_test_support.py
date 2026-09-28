@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 from datetime import datetime, timezone
+from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
 import hashlib
 import json
@@ -9,7 +11,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
+
+from scripts.process_owner import owned_process
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
@@ -29,6 +34,46 @@ def powershell() -> str | None:
 
 def ps_single_quote(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
+
+
+@cache
+def native_codex_fixture_bytes(version: str = "9.9.9", exit_code: int = 0) -> bytes:
+    """Compile once per behavior, so identity checks use a real native probe."""
+    source = (
+        "using System; using System.Diagnostics; using System.IO; "
+        "using System.Threading; public class CodexFixture { "
+        "public static int Main(string[] args) { "
+        'if (args.Length == 1 && args[0] == "--wait") { Thread.Sleep(Timeout.Infinite); } '
+        'if (args.Length == 2 && args[0] == "--wait-with-child") { '
+        'var info = new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName, "--wait"); '
+        "info.UseShellExecute = false; info.CreateNoWindow = true; "
+        "using (var child = Process.Start(info)) { "
+        "File.WriteAllText(args[1], child.Id.ToString()); child.WaitForExit(); } return 0; } "
+        f"Console.WriteLine({json.dumps('codex ' + version)}); "
+        f"return {exit_code}; }} }}"
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        executable = Path(directory) / "codex.exe"
+        result = subprocess.run(
+            [
+                powershell(),
+                "-NoProfile",
+                "-Command",
+                (
+                    f"Add-Type -TypeDefinition {ps_single_quote(source)} "
+                    f"-OutputAssembly {ps_single_quote(executable)} "
+                    "-OutputType ConsoleApplication"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=RUN_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+        return executable.read_bytes()
 
 
 PUBLISH_ENV_VARS = (
@@ -62,8 +107,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         comspec = os.environ.get("ComSpec")
         if not comspec:
             self.skipTest("ComSpec is not available")
-        system_source_exe = Path(comspec)
-        self.source_exe_bytes = system_source_exe.read_bytes()
+        self.source_exe_bytes = native_codex_fixture_bytes()
         self.repo_temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.repo_temp.cleanup)
         self.source_exe = Path(self.repo_temp.name) / "fixture-codex.exe"
@@ -294,7 +338,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
                     "@echo off",
                     'if "%1"=="--version" exit /b 0',
                     f'if not exist "{codex.parent}" mkdir "{codex.parent}"',
-                    f'copy /y "%ComSpec%" "{codex}" >nul',
+                    f'copy /y "{self.source_exe}" "{codex}" >nul',
                     f'copy /y "{self.source_code_mode_host}" "{code_mode_host}" >nul',
                     f'copy /y "{self.source_windows_sandbox_setup}" "{sandbox_setup}" >nul',
                     f'copy /y "{self.source_command_runner}" "{command_runner}" >nul',
@@ -412,6 +456,50 @@ class PublishLocalCodexTestBase(unittest.TestCase):
 
     def assert_no_publish_temps(self, install_dir: Path) -> None:
         self.assertEqual(list(install_dir.glob(".codex-local-publish.*.tmp")), [])
+        for pattern in (
+            f".{install_dir.name}.bundle.*",
+            f".{install_dir.name}.rollback.*",
+            f".{install_dir.name}.codex-local-publish.transaction.json*",
+        ):
+            self.assertEqual(list(install_dir.parent.glob(pattern)), [], pattern)
+
+    @contextmanager
+    def running_codex(self, path: Path):
+        # The publisher may kill the fixture parent; the test owns its whole
+        # tree until teardown, including the deliberately still-running child.
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid_file = Path(directory) / "child.pid"
+            with owned_process(
+                [str(path), "--wait-with-child", str(child_pid_file)],
+                creationflags=CREATE_NO_WINDOW,
+            ) as process:
+                deadline = time.monotonic() + 10
+                while True:
+                    value = (
+                        child_pid_file.read_text() if child_pid_file.exists() else ""
+                    )
+                    if value.isdecimal():
+                        child_pid = int(value)
+                        break
+                    self.assertIsNone(
+                        process.poll(), "fixture exited before child startup"
+                    )
+                    self.assertLess(
+                        time.monotonic(), deadline, "fixture child did not start"
+                    )
+                    time.sleep(0.01)
+                yield process
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=15,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            self.assertNotIn(
+                f'"{child_pid}"', result.stdout, "fixture descendant survived"
+            )
 
     def install_matching_publish_helpers(
         self,
@@ -465,8 +553,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         timestamp: float | None = None,
         append_padding: bool = False,
     ) -> Path:
-        # Use %ComSpec% as a tiny executable stand-in. The production version
-        # probe closes redirected stdin, so cmd emits its banner and exits.
+        # Preserve native execution and a truthful --version response.
         path.write_bytes(self.source_exe_bytes)
         if append_padding:
             with path.open("ab") as handle:

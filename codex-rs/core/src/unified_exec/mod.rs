@@ -66,6 +66,7 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
 
 pub(crate) use errors::UnifiedExecError;
 pub(crate) use process::NoopSpawnLifecycle;
+#[cfg(test)]
 pub(crate) use process::SpawnLifecycle;
 pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;

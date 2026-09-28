@@ -308,6 +308,9 @@ fn request_from_client_request(request: ClientRequest) -> JSONRPCRequest {
         .expect("client request should convert to JSON-RPC")
 }
 
+#[path = "efficiency_benchmarks.rs"]
+mod efficiency_benchmarks;
+
 struct TracingHarness {
     _server: MockServer,
     _codex_home: TempDir,

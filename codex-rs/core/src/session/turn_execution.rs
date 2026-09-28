@@ -401,6 +401,9 @@ struct SamplingRequestSignalState {
     successful_replay_responses: BTreeMap<u64, ResponseInputItem>,
     successful_replay_evidence: BTreeMap<u64, SuccessfulReplayEvidence>,
     replayed_ordinals: BTreeSet<u64>,
+    /// Command executions whose command is provably read-only. Their non-zero
+    /// exits report observations, not failed recovery strategies.
+    read_only_observation_ordinals: BTreeSet<u64>,
     validation_ordinals: BTreeSet<u64>,
     validation_proof_ordinals: BTreeSet<u64>,
     test_validation_ordinals: BTreeSet<u64>,
@@ -549,6 +552,7 @@ impl SamplingRequestSignalCollector {
             validation_status_from_arguments(tool_name, &canonical.value);
         let final_verification = final_diff_status_from_arguments(tool_name, &canonical.value);
         let mutation = is_mutation_tool(tool_name);
+        let read_only_observation = is_read_only_command_observation(tool_name, &canonical.value);
         let replayable_action = structured_action.as_ref().is_some_and(|action| {
             matches!(
                 action.class,
@@ -636,6 +640,9 @@ impl SamplingRequestSignalCollector {
         }
         if mutation {
             state.mutation_ordinals.insert(ordinal);
+        }
+        if read_only_observation {
+            state.read_only_observation_ordinals.insert(ordinal);
         }
         if let Some(structured_action) = structured_action {
             state.structured_actions.insert(ordinal, structured_action);
@@ -807,6 +814,7 @@ impl SamplingRequestSignalCollector {
             validation_status_from_arguments(tool_name, &canonical.value);
         let final_verification = final_diff_status_from_arguments(tool_name, &canonical.value);
         let mutation = is_mutation_tool(tool_name);
+        let read_only_observation = is_read_only_command_observation(tool_name, &canonical.value);
         let evidence_identity = outcome
             .source_evidence
             .as_ref()
@@ -839,6 +847,9 @@ impl SamplingRequestSignalCollector {
         }
         if mutation {
             state.mutation_ordinals.insert(ordinal);
+        }
+        if read_only_observation {
+            state.read_only_observation_ordinals.insert(ordinal);
         }
         state.accumulate_code_mode_source_dependencies(cell_id, source_dependencies);
         state.outcomes.push(outcome);
@@ -902,6 +913,9 @@ impl SamplingRequestSignalCollector {
             .is_some_and(|canonical| final_diff_status_from_arguments(tool_name, &canonical.value));
         let mutation = payload.is_some_and(|_| is_mutation_tool(tool_name));
         let coordination = payload.is_some_and(|_| is_coordination_tool(tool_name));
+        let read_only_observation = canonical
+            .as_ref()
+            .is_some_and(|canonical| is_read_only_command_observation(tool_name, &canonical.value));
         let mut state = self
             .state
             .lock()
@@ -925,6 +939,9 @@ impl SamplingRequestSignalCollector {
         }
         if mutation {
             state.mutation_ordinals.insert(ordinal);
+        }
+        if read_only_observation {
+            state.read_only_observation_ordinals.insert(ordinal);
         }
         state.accumulate_code_mode_source_dependencies(cell_id, source_dependencies);
         state.outcomes.push(outcome);
@@ -1169,6 +1186,15 @@ impl SamplingRequestSignalCollector {
                 state.outcomes.len() == state.registered_count
                     && outcomes.iter().all(|outcome| outcome.is_failure_evidence())
             };
+            // A read-only command's non-zero exit (a search with no match, a
+            // read of an absent path) is an observation, not a failed recovery
+            // strategy, so it cannot advance the distinct-failure advisory.
+            let failure_only = failure_only
+                && !failures.iter().all(|outcome| {
+                    state
+                        .read_only_observation_ordinals
+                        .contains(&outcome.ordinal)
+                });
             let nested_only = failures.iter().all(|outcome| outcome.nested_in_code_mode);
             let mut fingerprints = failures
                 .iter()
@@ -2122,6 +2148,39 @@ fn validation_status_from_arguments(tool_name: &ToolName, arguments: &Value) -> 
         ),
         _ => (false, false, false),
     }
+}
+
+/// Whether a command execution is provably read-only, using the same classifier
+/// that decides workspace mutation. The native PowerShell parser is never
+/// reached: scripts are classified without `-NoProfile` and explicit shell
+/// wrappers are excluded, so this bookkeeping cannot block on a parser process.
+fn is_read_only_command_observation(tool_name: &ToolName, arguments: &Value) -> bool {
+    let powershell =
+        |script: String| vec!["powershell.exe".to_string(), "-Command".to_string(), script];
+    let command: Vec<String> = match command_invocation(tool_name, arguments) {
+        Some(CommandInvocation::Argv { program, args }) => {
+            let basename = program
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&program)
+                .to_ascii_lowercase();
+            if matches!(
+                basename.strip_suffix(".exe").unwrap_or(&basename),
+                "pwsh" | "powershell" | "cmd" | "bash" | "sh" | "zsh"
+            ) {
+                return false;
+            }
+            std::iter::once(program).chain(args).collect()
+        }
+        Some(CommandInvocation::PowerShellScript(script)) => powershell(script),
+        // A plain script runs in the session's default shell: PowerShell on Windows.
+        Some(CommandInvocation::Script(script)) if cfg!(windows) => powershell(script),
+        Some(CommandInvocation::Script(script)) => {
+            vec!["bash".to_string(), "-lc".to_string(), script]
+        }
+        None => return false,
+    };
+    !crate::turn_diff_tracker::command_may_mutate(&command)
 }
 
 fn final_diff_status_from_arguments(tool_name: &ToolName, arguments: &Value) -> bool {
@@ -6017,6 +6076,87 @@ mod tests {
         assert_eq!(
             control.evaluate_convergence(&baselines, &narrower_success, &settled),
             SamplingConvergenceDecision::default()
+        );
+    }
+
+    fn nested_command_failure_collector(
+        control: &TurnExecutionControl,
+        baselines: &SamplingRequestBaselines,
+        arguments: &Value,
+        output: &str,
+    ) -> SamplingRequestSignalCollector {
+        let collector = control.collector(baselines);
+        let cell = collector.register_deterministic_tool_call(
+            &ToolName::plain("exec"),
+            &ToolPayload::Custom {
+                input: format!("text(await tools.exec_command({arguments}))"),
+            },
+            "exec-cell",
+        );
+        collector.record_code_mode_result(CodeModeToolResult {
+            cell_id: "exec-cell",
+            tool_name: &ToolName::plain("exec_command"),
+            payload: &ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+            source_dependencies: None,
+            outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+            signal: None,
+            result: &json!({"exit_code": 1, "output": output}),
+            canonical_artifact_required: false,
+        });
+        collector.record_response_result(
+            cell.ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            None,
+            &successful_tool_response("exec-cell", output),
+            false,
+        );
+        collector
+    }
+
+    #[test]
+    fn read_only_command_misses_are_observations_not_failed_recovery_strategies() {
+        // Recorded exploration shapes that exit non-zero without failing a
+        // strategy: searches with no match and a read of an absent path.
+        let mut control = TurnExecutionControl::new();
+        let (baselines, settled) = unchanged_state(&control);
+        for arguments in [
+            json!({"cmd": "rg -n 'fn primitive_name|as_builtin' src/semantic.rs"}),
+            json!({"kind": "powershell_script", "script_body": "Get-Content next-env.d.ts; rg -n 'pwa-installs' src"}),
+            json!({"kind": "powershell_script", "script_body": "$ErrorActionPreference='Stop'; rg -n 'work::run|Vec<String>' src tests"}),
+        ] {
+            let collector = nested_command_failure_collector(&control, &baselines, &arguments, "");
+            assert_eq!(
+                control.evaluate_convergence(&baselines, &collector, &settled),
+                SamplingConvergenceDecision::default(),
+                "{arguments}"
+            );
+        }
+
+        // Commands that act beyond observation still earn the advisory.
+        let mut control = TurnExecutionControl::new();
+        let (baselines, settled) = unchanged_state(&control);
+        let directives = [
+            (json!({"cmd": "cargo build -p codex-core"}), "error[E0425]"),
+            (
+                json!({"cmd": "cargo build -p codex-core --locked"}),
+                "error[E0308]",
+            ),
+        ]
+        .map(|(arguments, output)| {
+            let collector =
+                nested_command_failure_collector(&control, &baselines, &arguments, output);
+            control
+                .evaluate_convergence(&baselines, &collector, &settled)
+                .directive
+        });
+        assert_eq!(directives[0], None);
+        assert!(
+            directives[1]
+                .as_deref()
+                .is_some_and(|directive| directive.starts_with("Failure-recovery advisory")),
+            "{directives:?}"
         );
     }
 

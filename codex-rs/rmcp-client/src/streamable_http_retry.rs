@@ -13,7 +13,7 @@ use tracing::warn;
 use crate::elicitation_client_service::ElicitationClientService;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
 use crate::http_client_adapter::is_retryable_http_status;
-use crate::oauth::OAuthPersistor;
+use crate::oauth::OAuthRuntime;
 
 use super::InitializeTimeoutError;
 use super::PendingTransport;
@@ -30,11 +30,12 @@ impl RmcpClient {
         timeout: Option<Duration>,
     ) -> Result<(
         Arc<RunningService<RoleClient, ElicitationClientService>>,
-        Option<OAuthPersistor>,
+        Option<OAuthRuntime>,
     )> {
         let should_retry = match &initial_transport {
             PendingTransport::Stdio { .. } => false,
-            PendingTransport::StreamableHttp { .. }
+            PendingTransport::DeferredHttp
+            | PendingTransport::StreamableHttp { .. }
             | PendingTransport::StreamableHttpWithOAuth { .. } => true,
         };
         let retry_deadline = timeout.map(|duration| Instant::now() + duration);
@@ -48,8 +49,10 @@ impl RmcpClient {
             .enumerate()
         {
             let transport = match pending_transport.take() {
-                Some(transport) => transport,
-                None => {
+                Some(transport) if !matches!(transport, PendingTransport::DeferredHttp) => {
+                    transport
+                }
+                _ => {
                     let remaining = remaining_initialize_timeout(timeout, retry_deadline)?;
                     match remaining {
                         Some(remaining) => time::timeout(
@@ -76,7 +79,15 @@ impl RmcpClient {
                     let Some(retry_delay_ms) = retry_delay_ms else {
                         return Err(error);
                     };
-                    let delay = Duration::from_millis(retry_delay_ms);
+                    let delay = error.chain().find_map(|source| {
+                        let error = source.downcast_ref::<HandshakeError>()?;
+                        match &error.source {
+                            rmcp::service::ClientInitializeError::TransportError { error, .. } =>
+                                error.error.downcast_ref::<StreamableHttpError<StreamableHttpClientAdapterError>>()
+                                    .and_then(retry_after_delay),
+                            _ => None,
+                        }
+                    }).unwrap_or_default().max(Duration::from_millis(retry_delay_ms));
                     warn!(
                         attempt = attempt + 1,
                         max_attempts = STREAMABLE_HTTP_RETRY_DELAYS_MS.len() + 1,
@@ -161,6 +172,18 @@ impl RmcpClient {
             | StreamableHttpError::UnexpectedServerResponse(_) => false,
             _ => false,
         }
+    }
+}
+
+pub(super) fn retry_after_delay(
+    error: &StreamableHttpError<StreamableHttpClientAdapterError>,
+) -> Option<Duration> {
+    match error {
+        StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+            retry_after,
+            ..
+        }) => retry_after.map(codex_http_client::RetryAfter::remaining_delay),
+        _ => None,
     }
 }
 

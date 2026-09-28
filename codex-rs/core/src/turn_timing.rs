@@ -553,6 +553,7 @@ impl TurnTimingSnapshot {
             suppressed_deterministic_continuation_count: profile
                 .counters
                 .suppressed_deterministic_continuation_count,
+            proven_avoided_model_requests: Some(profile.counters.proven_avoided_model_requests),
             residual_deterministic_generation_count: profile
                 .counters
                 .residual_deterministic_generation_count,
@@ -880,6 +881,7 @@ pub(crate) struct TimingCounters {
     pub(crate) generations_by_purpose: TurnTimingGenerationPurposeCounts,
     pub(crate) generations_by_disposition: TurnTimingGenerationDispositionCounts,
     pub(crate) suppressed_deterministic_continuation_count: u32,
+    pub(crate) proven_avoided_model_requests: u32,
     pub(crate) residual_deterministic_generation_count: Option<u32>,
     pub(crate) owner_drained_continuation_count: u32,
     pub(crate) executed_validation_count: u32,
@@ -2429,6 +2431,11 @@ impl TurnTimingState {
             state.counters.wait_only_generation_count.saturating_add(1);
     }
 
+    pub(crate) fn record_suppressed_model_handoff(&self) {
+        let mut state = self.state();
+        state.counters.proven_avoided_model_requests = state.counters.proven_avoided_model_requests.saturating_add(1);
+    }
+
     pub(crate) fn record_internally_drained_waits(&self, count: u32) {
         if count == 0 {
             return;
@@ -2619,8 +2626,8 @@ impl TurnTimingState {
             let digest = Sha256::digest(key.as_bytes());
             format!("{digest:x}")
         });
-        if state.completed_snapshot.is_some() {
-            if let Some(request) = state
+        if state.completed_snapshot.is_some()
+            && let Some(request) = state
                 .model_requests
                 .iter()
                 .find(|request| request.sampling_request_id.as_deref() == Some(sampling_request_id))
@@ -2634,7 +2641,6 @@ impl TurnTimingState {
                     "late model request cache identity"
                 );
             }
-        }
         state.refresh_completed_request_diagnostics();
     }
 

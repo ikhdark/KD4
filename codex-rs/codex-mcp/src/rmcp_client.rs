@@ -332,6 +332,7 @@ struct ManagedClientStartup {
     server: EffectiveMcpServer,
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
+    oauth_read_cache: std::sync::Weak<codex_rmcp_client::LocalSecretsReadCache>,
     tx_event: Sender<Event>,
     elicitation_requests: ElicitationRequestManager,
     codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
@@ -360,6 +361,7 @@ impl ManagedClientStartup {
             server,
             store_mode,
             keyring_backend_kind,
+            oauth_read_cache,
             tx_event,
             elicitation_requests,
             codex_apps_tools_cache_context,
@@ -405,7 +407,8 @@ impl ManagedClientStartup {
                         runtime_context,
                         runtime_auth_provider,
                     )
-                    .await?,
+                    .await?
+                    .with_oauth_read_cache(oauth_read_cache),
                 );
                 start_server_task(
                     server_name,
@@ -457,7 +460,13 @@ impl ManagedClientStartup {
                 );
             }
 
-            startup_complete.store(true, Ordering::Release);
+            // Ready-only catalog snapshots can omit this initial startup. Retire their
+            // revision on success, failure, or cancellation, including empty catalogs.
+            // Cached-to-live changes above and reconnects keep their existing owners.
+            if !startup_complete.swap(true, Ordering::AcqRel) && previously_exposed_tools.is_none()
+            {
+                tool_catalog_revision.fetch_add(1, Ordering::AcqRel);
+            }
             outcome
         }
         .in_current_span()
@@ -492,6 +501,7 @@ impl AsyncManagedClient {
         server: EffectiveMcpServer,
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
+        oauth_read_cache: std::sync::Weak<codex_rmcp_client::LocalSecretsReadCache>,
         cancel_token: CancellationToken,
         tx_event: Sender<Event>,
         elicitation_requests: ElicitationRequestManager,
@@ -533,6 +543,7 @@ impl AsyncManagedClient {
             server,
             store_mode,
             keyring_backend_kind,
+            oauth_read_cache,
             tx_event,
             elicitation_requests,
             codex_apps_tools_cache_context: codex_apps_tools_cache_context.clone(),
@@ -669,21 +680,31 @@ impl AsyncManagedClient {
             .map(|tools| filter_tools(tools, &self.tool_filter))
     }
 
-    pub(crate) async fn listed_tools(&self) -> Option<Vec<ToolInfo>> {
+    /// Returns tools and whether an uncached initial catalog is still pending.
+    pub(crate) async fn listed_tools(
+        &self,
+        wait_for_startup: bool,
+    ) -> (Option<Vec<ToolInfo>>, bool) {
         // Keep cache payloads raw; plugin provenance is resolved per-session at read time.
         let tools = if let Some(startup_tools) = self.cached_tools() {
             Some(startup_tools)
+        } else if !wait_for_startup && !self.startup_complete.load(Ordering::Acquire) {
+            return (None, true);
         } else {
             match self.client().await {
                 Ok(client) => Some(client.listed_tools()),
                 Err(_) => self.cached_tools(),
             }
-        }?;
-        Some(if self.is_codex_apps_mcp_server {
+        };
+        let Some(tools) = tools else {
+            return (None, false);
+        };
+        let tools = if self.is_codex_apps_mcp_server {
             prepare_codex_apps_tools_for_model(tools, &self.tool_plugin_provenance)
         } else {
             prepare_regular_mcp_tools_for_model(tools, &self.tool_plugin_provenance)
-        })
+        };
+        (Some(tools), false)
     }
 
     pub(crate) async fn tool_info(&self, tool_name: &str) -> Option<ToolInfo> {
@@ -1186,6 +1207,8 @@ async fn start_server_task(
         client_elicitation_capability,
         supports_openai_form_elicitation,
     );
+    let startup_budget = startup_timeout.unwrap_or(DEFAULT_STARTUP_TIMEOUT);
+    let startup_deadline = tokio::time::Instant::now() + startup_budget;
 
     let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event.clone());
     let send_progress = make_progress_sender(tx_event);
@@ -1219,39 +1242,47 @@ async fn start_server_task(
     let server_supports_tools_capability = initialize_result.capabilities.tools.is_some();
     let server_info = mcp_server_info_from_implementation(initialize_result.server_info);
     let server_instructions = initialize_result.instructions;
-    let tools = discover_tools_if_supported(server_supports_tools_capability, || async {
-        let list_start = Instant::now();
-        let fetch_ticket = codex_apps_tools_cache_context
-            .as_ref()
-            .map(|cache_context| cache_context.begin_fetch(CodexAppsToolsFetchSource::Startup));
-        let tools = list_tools_for_client_uncached(
-            &server_name,
-            is_codex_apps_mcp_server,
-            /*codex_apps_refresh_trigger*/ "initial",
-            &client,
-            tool_timeout,
-            server_instructions.as_deref(),
-        )
-        .await?;
-        let tools = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
-            (Some(cache_context), Some(fetch_ticket)) => {
-                cache_context
-                    .publish_if_newest_accepted(fetch_ticket, &server_info, tools)
-                    .await
+    let tools = tokio::time::timeout_at(
+        startup_deadline,
+        discover_tools_if_supported(server_supports_tools_capability, || async {
+            let list_start = Instant::now();
+            let fetch_ticket = codex_apps_tools_cache_context
+                .as_ref()
+                .map(|cache_context| cache_context.begin_fetch(CodexAppsToolsFetchSource::Startup));
+            let tools = list_tools_for_client_uncached(
+                &server_name,
+                is_codex_apps_mcp_server,
+                /*codex_apps_refresh_trigger*/ "initial",
+                &client,
+                tool_timeout,
+                server_instructions.as_deref(),
+            )
+            .await?;
+            let tools = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
+                (Some(cache_context), Some(fetch_ticket)) => {
+                    cache_context
+                        .publish_if_newest_accepted(fetch_ticket, &server_info, tools)
+                        .await
+                }
+                (None, None) => tools,
+                _ => unreachable!("Codex Apps fetch ticket requires cache context"),
+            };
+            if is_codex_apps_mcp_server {
+                emit_duration(
+                    MCP_TOOLS_LIST_DURATION_METRIC,
+                    list_start.elapsed(),
+                    &[("cache", "miss")],
+                );
             }
-            (None, None) => tools,
-            _ => unreachable!("Codex Apps fetch ticket requires cache context"),
-        };
-        if is_codex_apps_mcp_server {
-            emit_duration(
-                MCP_TOOLS_LIST_DURATION_METRIC,
-                list_start.elapsed(),
-                &[("cache", "miss")],
-            );
-        }
-        Ok(filter_tools(tools, &tool_filter))
-    })
+            Ok(filter_tools(tools, &tool_filter))
+        }),
+    )
     .await
+    .map_err(|error| {
+        StartupOutcomeError::from(anyhow::Error::new(error).context(format!(
+            "initial tools discovery exceeded startup_timeout_sec ({startup_budget:?})"
+        )))
+    })?
     .map_err(StartupOutcomeError::from)?;
     let tools = Arc::new(ArcSwap::from_pointee(tools));
 

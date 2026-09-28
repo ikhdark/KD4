@@ -2564,6 +2564,7 @@ fn wait_and_tool_output_counters_are_additive() {
     let counters = state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.wait_only_generation_count, 1);
     assert_eq!(counters.internally_drained_wait_count, 7);
+    assert_eq!(counters.proven_avoided_model_requests, Some(0));
     assert_eq!(counters.residual_deterministic_generation_count, Some(1));
     assert_eq!(counters.owner_drained_continuation_count, 1);
     assert_eq!(counters.executed_validation_count, 1);
@@ -2598,8 +2599,11 @@ fn optimization_activation_decision_counters_are_additive() {
     state.record_tool_router_rebuild();
     state.record_projection_source_dependencies_reuse();
     state.record_projection_source_dependencies_fallback();
+    state.record_suppressed_model_handoff();
+    state.record_suppressed_model_handoff();
 
     let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.proven_avoided_model_requests, Some(2));
     assert_eq!(counters.tool_router_reuse_count, 1);
     assert_eq!(counters.tool_router_rebuild_count, 1);
     assert_eq!(counters.projection_source_dependencies_reuse_count, 1);

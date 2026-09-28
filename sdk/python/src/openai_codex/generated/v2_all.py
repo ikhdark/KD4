@@ -42,6 +42,12 @@ class AccountLoginCompletedNotification(BaseModel):
     success: bool
 
 
+class AccountRoutingOverride(Enum):
+    no_constraint = "NO_CONSTRAINT"
+    us = "us"
+    us_cr = "us_cr"
+
+
 class AccountTokenUsageDailyBucket(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -1596,6 +1602,13 @@ class FuzzyFileSearchSessionUpdatedNotification(BaseModel):
             description="True only after scanning finishes without omitting paths. A completed notification with this still false indicates an incomplete traversal.",
         ),
     ] = False
+
+
+class GatewayOAuthStatus(Enum):
+    not_ready = "notReady"
+    started = "started"
+    succeeded = "succeeded"
+    failed = "failed"
 
 
 class GetAccountParams(BaseModel):
@@ -5501,6 +5514,17 @@ class WorkspaceMessageType(Enum):
     unknown = "unknown"
 
 
+class WorkspaceRouting(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    account_routing_override: Annotated[
+        AccountRoutingOverride, Field(alias="accountRoutingOverride")
+    ]
+    backend_origin: Annotated[str, Field(alias="backendOrigin")]
+    chatgpt_account_id: Annotated[str, Field(alias="chatgptAccountId")]
+
+
 class WriteStatus(Enum):
     ok = "ok"
     ok_overridden = "okOverridden"
@@ -6063,6 +6087,17 @@ class ModelListRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["model/list"], Field(title="Model/listRequestMethod")]
     params: ModelListParams
+
+
+class AccountGatewayOAuthReadRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["account/gatewayOAuth/read"], Field(title="Account/gatewayOAuth/readRequestMethod")
+    ]
+    params: None = None
 
 
 class ModelProviderCapabilitiesReadRequest(BaseModel):
@@ -6781,12 +6816,38 @@ class FunctionCallOutputContentItem(
     ]
 
 
+class GatewayOAuthReadResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    error: str | None = None
+    provider_id: Annotated[str, Field(alias="providerId")]
+    provider_name: Annotated[str, Field(alias="providerName")]
+    required: Annotated[
+        bool,
+        Field(
+            description="Whether the selected provider uses gateway OAuth, even when already signed in."
+        ),
+    ]
+    status: Annotated[
+        GatewayOAuthStatus | None,
+        Field(description="Null when the effective provider does not use gateway OAuth."),
+    ] = None
+
+
 class GetAccountResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     account: Account | None = None
     requires_openai_auth: Annotated[bool, Field(alias="requiresOpenaiAuth")]
+    workspace_routing: Annotated[
+        WorkspaceRouting | None,
+        Field(
+            alias="workspaceRouting",
+            description="Authoritative routing for the signed-in ChatGPT workspace, when available.",
+        ),
+    ] = None
 
 
 class HookMetadata(BaseModel):
@@ -8176,6 +8237,14 @@ class TurnTimingCounters(BaseModel):
     projection_source_dependencies_reuse_count: Annotated[
         int | None, Field(alias="projectionSourceDependenciesReuseCount", ge=0)
     ] = 0
+    proven_avoided_model_requests: Annotated[
+        int | None,
+        Field(
+            alias="provenAvoidedModelRequests",
+            description="Model handoffs suppressed at an instrumented runtime decision, not inferred from wait observations or receipts. Null denotes older telemetry.",
+            ge=0,
+        ),
+    ] = None
     proven_loop_activation_count: Annotated[
         int | None, Field(alias="provenLoopActivationCount", ge=0)
     ] = 0
@@ -9909,6 +9978,7 @@ class ClientRequest(
         | TurnInterruptRequest
         | BugCreateRequest
         | ModelListRequest
+        | AccountGatewayOAuthReadRequest
         | ModelProviderCapabilitiesReadRequest
         | ExperimentalFeatureListRequest
         | PermissionProfileListRequest
@@ -10004,6 +10074,7 @@ class ClientRequest(
         | TurnInterruptRequest
         | BugCreateRequest
         | ModelListRequest
+        | AccountGatewayOAuthReadRequest
         | ModelProviderCapabilitiesReadRequest
         | ExperimentalFeatureListRequest
         | PermissionProfileListRequest

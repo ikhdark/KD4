@@ -200,7 +200,7 @@ struct SpawnProcessOutputParams {
 }
 
 #[derive(Clone)]
-struct OutputDeliveryRelay {
+pub(crate) struct OutputDeliveryRelay {
     tx: mpsc::Sender<QueuedOutputDelivery>,
     byte_budget: Arc<Semaphore>,
 }
@@ -211,9 +211,9 @@ struct QueuedOutputDelivery {
 }
 
 #[derive(Default)]
-struct UndeliveredOutput {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct UndeliveredOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 impl UndeliveredOutput {
@@ -224,7 +224,7 @@ impl UndeliveredOutput {
         }
     }
 
-    fn append_tail(&mut self, tail: Self) {
+    pub(crate) fn append_tail(&mut self, tail: Self) {
         self.stdout.extend(tail.stdout);
         self.stderr.extend(tail.stderr);
     }
@@ -898,14 +898,28 @@ async fn run_command(params: RunCommandParams) {
         .await;
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "Queued deltas are encoded internally with the same base64 engine"
-)]
 fn spawn_output_delivery_relay(
     outgoing: Arc<OutgoingMessageSender>,
     connection_id: ConnectionId,
     cancellation: CancellationToken,
+) -> (OutputDeliveryRelay, tokio::task::JoinHandle<UndeliveredOutput>) {
+    spawn_output_delivery_relay_with(
+        outgoing,
+        connection_id,
+        cancellation,
+        ServerNotification::CommandExecOutputDelta,
+    )
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "Queued deltas are encoded internally with the same base64 engine"
+)]
+pub(crate) fn spawn_output_delivery_relay_with(
+    outgoing: Arc<OutgoingMessageSender>,
+    connection_id: ConnectionId,
+    cancellation: CancellationToken,
+    notification: fn(CommandExecOutputDeltaNotification) -> ServerNotification,
 ) -> (
     OutputDeliveryRelay,
     tokio::task::JoinHandle<UndeliveredOutput>,
@@ -923,7 +937,7 @@ fn spawn_output_delivery_relay(
                 delivery_failed = !outgoing
                     .send_server_notification_to_connection_bounded(
                         connection_id,
-                        ServerNotification::CommandExecOutputDelta(queued.notification.clone()),
+                        notification(queued.notification.clone()),
                         &cancellation,
                     )
                     .await;
@@ -943,7 +957,7 @@ fn spawn_output_delivery_relay(
 }
 
 impl OutputDeliveryRelay {
-    fn enqueue(
+    pub(crate) fn enqueue(
         &self,
         notification: CommandExecOutputDeltaNotification,
         accounted_payload_bytes: usize,
@@ -966,7 +980,7 @@ impl OutputDeliveryRelay {
     }
 }
 
-fn accounted_output_delivery_bytes(delta_base64: &str, process_id: &str) -> usize {
+pub(crate) fn accounted_output_delivery_bytes(delta_base64: &str, process_id: &str) -> usize {
     delta_base64
         .len()
         .saturating_add(process_id.len())

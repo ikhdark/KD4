@@ -224,7 +224,7 @@ fn watch_channel() -> (WatchSender, Receiver) {
     )
 }
 
-/// Coarsens the deepest retained paths until another distinct path fits.
+/// Coarsens dense sibling groups, then deeper paths until another path fits.
 ///
 /// Overflow is rare and already means an exact path list is too large. Keeping
 /// directory-level evidence is preferable to replacing every known change with
@@ -236,6 +236,31 @@ fn compress_changed_paths(paths: &mut BTreeSet<PathBuf>, capacity: usize) -> boo
     }
     if paths.len() < capacity {
         return true;
+    }
+
+    // Free space where changes are dense before broadening unrelated singletons.
+    let mut siblings = BTreeMap::<PathBuf, usize>::new();
+    for path in paths.iter() {
+        if let Some(parent) = path.parent() {
+            *siblings.entry(parent.to_path_buf()).or_default() += 1;
+        }
+    }
+    let mut groups = siblings
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .collect::<Vec<_>>();
+    groups.sort_by(|(a, a_count), (b, b_count)| b_count.cmp(a_count).then_with(|| a.cmp(b)));
+    for (parent, _) in groups {
+        // An earlier collapse may already cover this entire group.
+        if paths.iter().any(|path| parent.starts_with(path)) {
+            paths.retain(|path| path == &parent || !path.starts_with(&parent));
+        } else {
+            paths.retain(|path| !path.starts_with(&parent));
+            paths.insert(parent);
+        }
+        if paths.len() < capacity {
+            return true;
+        }
     }
 
     // Move paths into depth buckets once. Only the deepest bucket changes in
@@ -1230,6 +1255,8 @@ impl FileWatcher {
         let rescan = changes.rescan_required;
         let mut actual_watch_moves = Vec::new();
         let mut subscribers_to_notify = Vec::new();
+        let mut subscribers_to_rescan = BTreeSet::new();
+        let mut error_watches_to_rearm = BTreeSet::new();
         let mut relevant_paths = Vec::new();
         #[cfg(test)]
         let mut actual_watch_path_resolution_count = 0;
@@ -1238,18 +1265,26 @@ impl FileWatcher {
             let mut changed_paths = BTreeSet::new();
             let mut rescan_required = false;
             for (subscriber_watch, subscriber_watch_state) in &mut subscriber.watched_paths {
+                let watch_rescan = rescan
+                    || changes.error_roots.iter().any(|root| {
+                        event_may_affect_watch(subscriber_watch, subscriber_watch_state, root)
+                            || path_namespaces_overlap(root, &subscriber_watch_state.actual.path)
+                    });
+                if watch_rescan {
+                    subscribers_to_rescan.insert(*subscriber_id);
+                }
                 relevant_paths.clear();
                 if !rescan {
                     relevant_paths.extend(changes.paths.iter().filter(|event_path| {
                         event_may_affect_watch(subscriber_watch, subscriber_watch_state, event_path)
                     }));
-                    if relevant_paths.is_empty() {
+                    if relevant_paths.is_empty() && !watch_rescan {
                         continue;
                     }
                 }
                 // Lost events can hide a removed or replaced root, so a rescan
                 // re-resolves every watch rather than only fallback watches.
-                let stable_descendant_event = !rescan
+                let stable_descendant_event = !watch_rescan
                     && subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
                     && relevant_paths.iter().all(|event_path| {
                         is_strict_descendant(event_path, &subscriber_watch_state.matched.path)
@@ -1268,6 +1303,10 @@ impl FileWatcher {
                     }
                     actual_watch_path(&subscriber_watch.requested)
                 };
+                if watch_rescan {
+                    error_watches_to_rearm.insert(subscriber_watch_state.actual.path.clone());
+                    error_watches_to_rearm.insert(new_actual.path.clone());
+                }
                 for event_path in &relevant_paths {
                     let changed_path = changed_path_for_event(
                         subscriber_watch,
@@ -1297,7 +1336,7 @@ impl FileWatcher {
 
                 subscriber_watch_state.fallback |= fallback;
                 if subscriber_watch_state.actual == new_actual {
-                    if rescan || subscriber_watch_state.matched != new_matched {
+                    if watch_rescan || subscriber_watch_state.matched != new_matched {
                         subscriber_watch_state.last_exists = new_matched.path.exists();
                     }
                     subscriber_watch_state.matched = new_matched;
@@ -1356,11 +1395,13 @@ impl FileWatcher {
         // Overflow can discard the removal report for a root recreated before
         // this pass. Its logical path is unchanged, but its backend watch may
         // be gone. Re-arm each shared actual watch once before publishing rescan.
-        let roots_to_rearm = if rescan {
-            state.path_ref_counts.keys().cloned().collect::<Vec<_>>()
-        } else {
-            changes.lost_watch_roots.clone()
-        };
+        let mut roots_to_rearm = changes.lost_watch_roots.clone();
+        roots_to_rearm.extend(error_watches_to_rearm);
+        if rescan {
+            roots_to_rearm.extend(state.path_ref_counts.keys().cloned());
+        }
+        roots_to_rearm.sort_unstable();
+        roots_to_rearm.dedup();
         for root in &roots_to_rearm {
             // The backend drops a watch whose root is removed. When the root is
             // back before this pass, resolution keeps the watch where it was,
@@ -1386,10 +1427,9 @@ impl FileWatcher {
             }
         }
 
-        if rescan {
-            // Only after every watch is re-resolved and re-armed: a subscriber
-            // must not finish its rescan before the watches it relies on exist.
-            for subscriber in state.subscribers.values() {
+        // Publish only after affected watches are re-resolved and re-armed.
+        for (id, subscriber) in &state.subscribers {
+            if rescan || subscribers_to_rescan.contains(id) {
                 subscriber.tx.mark_rescan_required();
             }
         }
@@ -1513,9 +1553,11 @@ fn event_may_drop_watch_root(event: &Event) -> bool {
 struct ObservedChanges {
     /// Changed paths reported by the backend.
     paths: Vec<PathBuf>,
-    /// Paths whose previous object was removed or renamed away, or that a
-    /// backend error named; a backend watch rooted there may be gone.
+    /// Paths whose previous object was removed or renamed away; a backend
+    /// watch rooted there may be gone.
     lost_watch_roots: Vec<PathBuf>,
+    /// Backend errors naming roots whose subscribers must rescan.
+    error_roots: Vec<PathBuf>,
     /// Whether changes were lost, so every watch is re-resolved and every
     /// subscriber must rescan instead of relying on `paths`.
     rescan_required: bool,
@@ -1535,15 +1577,24 @@ impl ObservedChanges {
             }
             Err(err) => {
                 warn!("file watcher error requiring rescan: {err}");
-                // An error that stops a backend watch names that watch's root.
-                self.lost_watch_roots.extend(err.paths);
-                self.rescan_required = true;
+                // Unscoped/resource-wide failures cannot safely be localized.
+                if err.paths.is_empty()
+                    || err.paths.iter().any(|path| !path.is_absolute())
+                    || matches!(err.kind, notify::ErrorKind::MaxFilesWatch)
+                {
+                    self.rescan_required = true;
+                } else {
+                    self.error_roots.extend(err.paths);
+                }
             }
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.paths.is_empty() && self.lost_watch_roots.is_empty() && !self.rescan_required
+        self.paths.is_empty()
+            && self.lost_watch_roots.is_empty()
+            && self.error_roots.is_empty()
+            && !self.rescan_required
     }
 
     fn normalize(&mut self) {
@@ -1551,6 +1602,8 @@ impl ObservedChanges {
         self.paths.dedup();
         self.lost_watch_roots.sort_unstable();
         self.lost_watch_roots.dedup();
+        self.error_roots.sort_unstable();
+        self.error_roots.dedup();
     }
 }
 

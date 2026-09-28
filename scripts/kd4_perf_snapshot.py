@@ -64,9 +64,12 @@ class Scenario:
 @dataclass(frozen=True)
 class Sample:
     elapsed_ms: float
-    exit_code: int
+    exit_code: int | None
     stdout_bytes: int
     stderr_bytes: int
+    outcome: str = "completed"
+    stdout_path: str | None = None
+    stderr_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,21 @@ class ScenarioResult:
     @property
     def passed(self) -> bool:
         return self.status == "passed"
+
+
+class ScenarioAborted(RuntimeError):
+    def __init__(self, result: ScenarioResult):
+        super().__init__(result.reason)
+        self.result = result
+
+
+def _retain_output(output: BinaryIO, stream: str) -> str:
+    output.seek(0)
+    with tempfile.NamedTemporaryFile(
+        prefix="kd4-perf-", suffix=f".{stream}.log", delete=False
+    ) as retained:
+        shutil.copyfileobj(output, retained)
+    return retained.name
 
 
 def _percentile_from_ordered(ordered: Sequence[float], fraction: float) -> float:
@@ -179,6 +197,18 @@ def scenario_catalog(
             5,
             "validation",
         ),
+        "feature-check-static": Scenario(
+            "feature-check-static",
+            (
+                sys.executable,
+                "scripts/check_kd4_features.py",
+                "--static-only",
+                "--json",
+            ),
+            repo_root,
+            5,
+            "static-validation",
+        ),
         "installed-codex-version": Scenario(
             "installed-codex-version",
             (str(installed_codex), "--version"),
@@ -193,7 +223,7 @@ def scenario_catalog(
                 "core-test-fast",
                 "core_lib",
                 "-E",
-                "test(typed_agents_inherit_every_non_root_tool_class)",
+                "test(=agent::task_capabilities::tests::typed_agents_inherit_every_non_root_tool_class)",
             ),
             codex_rs,
             2,
@@ -232,7 +262,7 @@ def scenario_catalog(
 
 
 PROFILE_SCENARIOS = {
-    "quick": ("python-startup", "git-status", "feature-check"),
+    "quick": ("python-startup", "git-status", "feature-check-static"),
     "phase0": (
         "python-startup",
         "git-status",
@@ -264,6 +294,8 @@ def measure_scenario(
     count = scenario.default_iterations if iterations is None else iterations
     if count < 1:
         raise ValueError("iterations must be positive")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout must be positive")
     if not _executable_available(scenario.command[0], scenario.cwd):
         return ScenarioResult(
             name=scenario.name,
@@ -285,13 +317,16 @@ def measure_scenario(
 
     samples: list[Sample] = []
     reason: str | None = None
+    aborted: BaseException | None = None
     for _ in range(count):
         with (
             tempfile.TemporaryFile() as stdout_file,
             tempfile.TemporaryFile() as stderr_file,
         ):
+            exit_code = None
+            outcome = "completed"
+            started = time.perf_counter_ns()
             try:
-                started = time.perf_counter_ns()
                 completed = _run_scenario(
                     scenario.command,
                     cwd=scenario.cwd,
@@ -299,28 +334,35 @@ def measure_scenario(
                     stderr=stderr_file,
                     timeout=timeout_seconds,
                 )
-                elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                _stdout_bytes, stdout_tail = _output_size_and_tail(stdout_file)
-                _stderr_bytes, stderr_tail = _output_size_and_tail(stderr_file)
-                reason = _failure_reason(str(exc), stdout_tail, stderr_tail)
-                break
+                exit_code = completed.returncode
+                if exit_code != 0:
+                    reason = f"command exited {exit_code}"
+            except subprocess.TimeoutExpired as exc:
+                outcome, reason = "timeout", str(exc)
+            except OSError as exc:
+                outcome, reason = "launch-error", str(exc)
+            except (RuntimeError, KeyboardInterrupt) as exc:
+                outcome, reason, aborted = "aborted", str(exc) or "interrupted", exc
+            elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
             stdout_bytes, stdout_tail = _output_size_and_tail(stdout_file)
             stderr_bytes, stderr_tail = _output_size_and_tail(stderr_file)
+            stdout_path = stderr_path = None
+            if reason is not None:
+                stdout_path = _retain_output(stdout_file, "stdout")
+                stderr_path = _retain_output(stderr_file, "stderr")
+                reason = _failure_reason(reason, stdout_tail, stderr_tail)
         samples.append(
             Sample(
                 elapsed_ms=round(elapsed_ms, 3),
-                exit_code=completed.returncode,
+                exit_code=exit_code,
                 stdout_bytes=stdout_bytes,
                 stderr_bytes=stderr_bytes,
+                outcome=outcome,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
             )
         )
-        if completed.returncode != 0:
-            reason = _failure_reason(
-                f"command exited {completed.returncode}",
-                stdout_tail,
-                stderr_tail,
-            )
+        if reason is not None:
             break
 
     passed = len(samples) == count and all(sample.exit_code == 0 for sample in samples)
@@ -335,7 +377,7 @@ def measure_scenario(
     warm_p50_ms, warm_p95_ms = (
         _ordered_sample_statistics(warm)[:2] if warm else (None, None)
     )
-    return ScenarioResult(
+    result = ScenarioResult(
         name=scenario.name,
         category=scenario.category,
         required=scenario.required,
@@ -352,6 +394,9 @@ def measure_scenario(
         min_ms=min_ms,
         max_ms=max_ms,
     )
+    if aborted is not None:
+        raise ScenarioAborted(result) from aborted
+    return result
 
 
 def _git_text(repo_root: Path, *args: str) -> str | None:
@@ -487,20 +532,76 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _preflight_destination(path: Path) -> None:
+    if path.exists() and not path.is_file():
+        raise ValueError(f"report destination is not a file: {path}")
+    if path.is_file():
+        # Verify access without truncating an existing report.
+        with path.open("r+b"):
+            pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile(dir=path.parent):
+        pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     repo_root = args.repo_root.resolve()
     catalog = scenario_catalog(repo_root, install_dir=args.install_dir)
     names = tuple(args.scenario or PROFILE_SCENARIOS[args.profile])
+    attempt_analysis = human_report = None
+    try:
+        if args.iterations is not None and args.iterations < 1:
+            raise ValueError("iterations must be positive")
+        if args.timeout_seconds <= 0:
+            raise ValueError("timeout must be positive")
+        if args.model_attempt_report and not args.model_attempt_jsonl:
+            raise ValueError("--model-attempt-report requires --model-attempt-jsonl")
+        inputs = {path.resolve() for path in args.model_attempt_jsonl or ()}
+        destinations = [
+            path.resolve()
+            for path in (args.output, args.model_attempt_report)
+            if path is not None
+        ]
+        if len(set(destinations)) != len(destinations) or inputs.intersection(
+            destinations
+        ):
+            raise ValueError(
+                "report destinations must be distinct from each other and inputs"
+            )
+        if args.model_attempt_jsonl:
+            attempts, exclusions = kd4_model_attempt_analysis.load_jsonl(
+                args.model_attempt_jsonl
+            )
+            attempt_analysis = kd4_model_attempt_analysis.analyze(attempts, exclusions)
+            human_report = kd4_model_attempt_analysis.render(attempt_analysis)
+        for path in destinations:
+            _preflight_destination(path)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    environment = environment_metadata(
+        repo_root, hash_binary=args.hash_binary, install_dir=args.install_dir
+    )
     results: list[ScenarioResult] = []
+    abort_reason = None
     for name in names:
         if not args.json:
             print(f"[RUN] {name}", flush=True)
-        result = measure_scenario(
-            catalog[name],
-            iterations=args.iterations,
-            timeout_seconds=args.timeout_seconds,
-        )
+        try:
+            result = measure_scenario(
+                catalog[name],
+                iterations=args.iterations,
+                timeout_seconds=args.timeout_seconds,
+            )
+        except ScenarioAborted as exc:
+            results.append(exc.result)
+            abort_reason = str(exc)
+            break
+        except (OSError, RuntimeError, KeyboardInterrupt) as exc:
+            abort_reason = str(exc) or "interrupted"
+            break
         results.append(result)
         if not args.json:
             print(
@@ -508,6 +609,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"first_invocation={result.cold_ms}ms warm_p50={result.warm_p50_ms}ms "
                 f"warm_p95={result.warm_p95_ms}ms"
             )
+            if result.reason is not None:
+                print(result.reason)
+                for sample in result.samples:
+                    if sample.stdout_path is not None:
+                        print(f"full output: {sample.stdout_path} {sample.stderr_path}")
 
     failed = [result.name for result in results if result.status == "failed"]
     skipped = [result.name for result in results if result.status == "skipped"]
@@ -516,14 +622,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         for result in results
         if result.status == "skipped" and result.required
     ]
-    complete = not skipped_required
-    ok = not failed and (complete or args.allow_incomplete)
+    complete = abort_reason is None and not skipped_required
+    ok = abort_reason is None and not failed and (complete or args.allow_incomplete)
     payload = {
         "schemaVersion": 1,
         "profile": args.profile,
-        "environment": environment_metadata(
-            repo_root, hash_binary=args.hash_binary, install_dir=args.install_dir
-        ),
+        "environment": environment,
         "results": [asdict(result) for result in results],
         "failedScenarios": failed,
         "skippedScenarios": skipped,
@@ -532,24 +636,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         "incomplete": not complete,
         "allowIncomplete": args.allow_incomplete,
         "ok": ok,
+        "abortReason": abort_reason,
+        "pendingScenarios": list(names[len(results) :]),
     }
-    if args.model_attempt_jsonl:
-        attempts, exclusions = kd4_model_attempt_analysis.load_jsonl(
-            args.model_attempt_jsonl
-        )
-        attempt_analysis = kd4_model_attempt_analysis.analyze(attempts, exclusions)
+    # Save completed evidence before optional report rendering or console output.
+    if attempt_analysis is not None:
         payload["modelAttemptAnalysis"] = attempt_analysis
-        human_report = kd4_model_attempt_analysis.render(attempt_analysis)
+    if args.output is not None:
+        write_json_atomic(args.output, payload)
+    if human_report is not None:
         if args.model_attempt_report is not None:
             args.model_attempt_report.parent.mkdir(parents=True, exist_ok=True)
             args.model_attempt_report.write_text(human_report + "\n", encoding="utf-8")
         if not args.json:
             print(human_report)
-    if args.output is not None:
-        write_json_atomic(args.output, payload)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
-    return 0 if ok or args.allow_failures else 1
+    if abort_reason is not None and not args.json:
+        print(f"[ABORTED] {abort_reason}", file=sys.stderr)
+        for result in results:
+            for sample in result.samples:
+                if sample.outcome == "aborted" and sample.stdout_path is not None:
+                    print(f"full output: {sample.stdout_path} {sample.stderr_path}")
+    return 0 if abort_reason is None and (ok or args.allow_failures) else 1
 
 
 if __name__ == "__main__":

@@ -859,7 +859,7 @@ fn validate_source(source: &Source) -> Result<(), FunctionCallError> {
 }
 
 enum EvidenceLink {
-    Record(Record),
+    Record(Box<Record>),
     Source(Source),
     Evidence(Evidence),
 }
@@ -928,7 +928,7 @@ async fn read_evidence(
         };
         let selected_link = serde_json::from_value::<Record>(value.clone())
             .ok()
-            .map(EvidenceLink::Record)
+            .map(|record| EvidenceLink::Record(Box::new(record)))
             .or_else(|| {
                 serde_json::from_value::<Evidence>(value.clone())
                     .ok()
@@ -955,12 +955,12 @@ async fn read_evidence(
                     "inventory evidence must reference a classified record with supporting source evidence",
                 ));
             }
-            if let EvidenceLink::Record(selected_record) = &selected_link {
-                if selected_record.status != "classified" || selected_record.evidence.is_empty() {
-                    return Err(invalid(
-                        "inventory evidence must reference a classified record with supporting source evidence",
-                    ));
-                }
+            if let EvidenceLink::Record(selected_record) = &selected_link
+                && (selected_record.status != "classified" || selected_record.evidence.is_empty())
+            {
+                return Err(invalid(
+                    "inventory evidence must reference a classified record with supporting source evidence",
+                ));
             }
             record = Some(selected_link);
         }

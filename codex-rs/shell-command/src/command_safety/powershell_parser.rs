@@ -23,6 +23,7 @@ use std::sync::PoisonError;
 use std::sync::TryLockError;
 use std::sync::mpsc;
 use std::time::Duration;
+use std::time::Instant;
 
 const POWERSHELL_PARSER_SCRIPT: &str = include_str!("powershell_parser.ps1");
 const POWERSHELL_PARSER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -183,6 +184,21 @@ fn acquire_cached_parser<'a>(
     parser: &'a CachedParser,
     temporary_slot: &'a Mutex<()>,
 ) -> CachedParserAccess<'a> {
+    // Ordinary analyses finish quickly. Give the warm host a bounded opportunity
+    // to drain a burst before starting another host or failing closed on saturation.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match parser.try_lock() {
+            Ok(parser) => return CachedParserAccess::Shared(parser),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                return CachedParserAccess::Shared(poisoned.into_inner());
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(TryLockError::WouldBlock) => break,
+        }
+    }
     match parser.try_lock() {
         Ok(parser) => CachedParserAccess::Shared(parser),
         Err(TryLockError::Poisoned(poisoned)) => CachedParserAccess::Shared(poisoned.into_inner()),
@@ -864,6 +880,46 @@ mod tests {
                 parser.parse(script).unwrap(),
                 PowershellParseOutcome::Unsupported,
                 "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_literal_reads_reuse_the_healthy_parser() {
+        let Some(powershell) = try_find_powershell_executable_blocking() else {
+            return;
+        };
+        let executable = powershell.as_path().to_str().unwrap().to_owned();
+        assert!(matches!(
+            parse_with_powershell_ast(&executable, "Get-Content -LiteralPath 'warm.txt'"),
+            PowershellParseOutcome::Analysis(_)
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        #[expect(clippy::needless_collect, reason = "spawn all barrier participants before joining any thread")]
+        let handles = (0..8)
+            .map(|n| {
+                let executable = executable.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    parse_with_powershell_ast(
+                        &executable,
+                        &format!("Get-Content -LiteralPath 'read-{n}.txt'"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (n, handle) in handles.into_iter().enumerate() {
+            let PowershellParseOutcome::Analysis(analysis) = handle.join().unwrap() else {
+                panic!("literal read rejected");
+            };
+            assert_eq!(
+                analysis.commands,
+                vec![vec![
+                    "Get-Content".to_string(),
+                    "-LiteralPath".to_string(),
+                    format!("read-{n}.txt")
+                ]]
             );
         }
     }

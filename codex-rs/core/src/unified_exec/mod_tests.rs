@@ -191,6 +191,151 @@ async fn exec_command_with_tracker(
         .await
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn runtime_empty_poll_hands_off_to_stdin_without_waiting_for_its_deadline() {
+    use crate::session::step_context::StepContext;
+    use crate::tools::context::ToolCallSource;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::handlers::WriteStdinHandler;
+    use crate::tools::parallel::ToolCallRuntime;
+    use crate::tools::registry::CoreToolRuntime;
+    use crate::tools::registry::ToolRegistry;
+    use crate::tools::router::ToolCall;
+    use crate::tools::router::ToolRouter;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+    use tokio_util::sync::CancellationToken;
+
+    for nested in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (session, mut turn) = test_session_and_turn().await;
+        Arc::make_mut(&mut Arc::get_mut(&mut turn).expect("new test turn is uniquely owned").config).cwd =
+            AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+        let started = exec_command_with_tty(
+            &session, &turn,
+            "Write-Output 'runtime-poll-ready'; $value = [Console]::ReadLine(); Write-Output ('runtime-input:' + $value)",
+            2_000, Some(workspace.path().to_path_buf()), true,
+        ).await.unwrap();
+        let process_id = started.process_id.expect("process must wait for stdin");
+        let manager = &session.services.unified_exec_manager;
+        let interaction = manager.process_store.lock().await.processes[&process_id]
+            .process
+            .interaction_lock();
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([
+                Arc::new(WriteStdinHandler::default()) as Arc<dyn CoreToolRuntime>
+            ]),
+            Vec::new(),
+        ));
+        let runtime = ToolCallRuntime::new(
+            Arc::clone(&session),
+            StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let dispatch = |runtime: ToolCallRuntime,
+                        id: &str,
+                        chars: &str,
+                        yield_time_ms,
+                        cancellation| {
+            let call = ToolCall {
+                tool_name: codex_tools::ToolName::plain("write_stdin"), call_id: id.to_string(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({"session_id":process_id,"chars":chars,"yield_time_ms":yield_time_ms}).to_string(),
+                },
+            };
+            async move {
+                if nested {
+                    runtime
+                        .handle_tool_call_with_source(
+                            call,
+                            ToolCallSource::CodeMode {
+                                cell_id: "poll-cell".to_string(),
+                                parent_call_id: Some("outer".to_string()),
+                                runtime_tool_call_id: "runtime-poll".to_string(),
+                                nested_deadline: None,
+                                cancellation_cause: None,
+                            },
+                            cancellation,
+                        )
+                        .await
+                        .map(|result| result.response())
+                        .map_err(|error| error.to_string())
+                } else {
+                    runtime
+                        .handle_tool_call(call, cancellation)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            }
+        };
+        let cancellation = CancellationToken::new();
+        let mut poll_task = tokio::spawn(dispatch(
+            runtime.clone(),
+            "long-poll",
+            "",
+            30_000_u64,
+            cancellation.clone(),
+        ));
+        let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+            while interaction.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let input = tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch(
+                runtime,
+                "interactive-input",
+                "hello\r",
+                1_000_u64,
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+        let poll = tokio::time::timeout(Duration::from_secs(5), &mut poll_task).await;
+        if poll.is_err() {
+            cancellation.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(5), poll_task).await;
+        }
+        let retained_process = manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&process_id);
+        manager.terminate_all_processes().await;
+        admitted.expect("poll must enter the real process interaction before stdin is sent");
+        let input = input
+            .expect("stdin must not wait for the 30-second workspace poll lease")
+            .unwrap();
+        let poll = poll
+            .expect("the poll must yield to input")
+            .unwrap()
+            .unwrap();
+        let text = format!(
+            "{}{}{}",
+            String::from_utf8_lossy(&started.raw_output),
+            serde_json::to_string(&poll).unwrap(),
+            serde_json::to_string(&input).unwrap()
+        );
+        assert!(text.contains("runtime-poll-ready"), "{text}");
+        assert_eq!(text.matches("runtime-input:hello").count(), 1, "{text}");
+        assert!(
+            !retained_process,
+            "completed stdin interaction must retire the process"
+        );
+    }
+}
+
 struct BlockingTerminateExecProcess {
     process_id: ProcessId,
     terminate_started: watch::Sender<bool>,

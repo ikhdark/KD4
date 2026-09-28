@@ -207,13 +207,18 @@ fn inbound_app_event_record(event: &AppEvent) -> serde_json::Value {
                 "query": query,
             })
         }
-        AppEvent::FileSearchResult { query, matches } => {
+        AppEvent::FileSearchResult {
+            query,
+            matches,
+            walk_complete,
+        } => {
             json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "file_search_result",
                 "query": query,
                 "matches": matches.len(),
+                "walk_complete": walk_complete,
             })
         }
         AppEvent::PetPreviewLoaded { request_id, result } => {

@@ -4,6 +4,12 @@ import json
 import sys
 import datetime
 import os
+from pathlib import Path
+
+try:
+    from scripts.rollout_snapshot import read_rollout_records
+except ImportError:
+    from rollout_snapshot import read_rollout_records
 
 OUT_LIMIT = int(os.environ.get('NARR_OUT_LIMIT', '4000'))
 
@@ -44,7 +50,7 @@ def bounded(s, limit=OUT_LIMIT):
 
 
 def dump(path, out_path, start_idx=0):
-    rows = [json.loads(l) for l in open(path, encoding='utf-8')]
+    rows = [row for row, _ in read_rollout_records(Path(path))]
     w = open(out_path, 'w', encoding='utf-8')
     P = lambda *a: print(*a, file=w)
     prev_t = None
@@ -80,6 +86,8 @@ def dump(path, out_path, start_idx=0):
                         if isinstance(it, dict) and it.get('type') == 'message':
                             P(f'[{it.get("role")}]')
                             P(text_of(it.get('content')))
+                        elif isinstance(it, dict) and it.get('type') in ('custom_tool_call', 'function_call'):
+                            P(jd(it))
                         else:
                             P(bounded(jd(it), 3000))
                 else:
@@ -99,7 +107,7 @@ def dump(path, out_path, start_idx=0):
             elif sub in ('custom_tool_call', 'function_call'):
                 args = p.get('input') if sub == 'custom_tool_call' else p.get('arguments')
                 P(hdr + f' name={p.get("name")} call_id={p.get("call_id")}')
-                P('>>> ' + bounded(str(args), 6000))
+                P('>>> ' + str(args))
             elif sub in ('custom_tool_call_output', 'function_call_output'):
                 out = p.get('output')
                 outs = jd(out, 1) if isinstance(out, (dict, list)) else str(out)

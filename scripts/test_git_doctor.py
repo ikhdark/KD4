@@ -3,8 +3,13 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import shlex
 import subprocess
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from scripts import git_doctor
@@ -15,6 +20,31 @@ def completed(returncode: int, *, stdout: str = "", stderr: str = ""):
 
 
 class GitDoctorTest(unittest.TestCase):
+    def test_real_git_success_diagnostics_reach_the_human_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hook = (Path(directory) / "missing-fsmonitor").as_posix()
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                    "GIT_CONFIG_VALUE_0": hook,
+                    "GIT_OPTIONAL_LOCKS": "0",
+                },
+            ):
+                report = git_doctor.build_report(8)
+        self.assertEqual(report.status_return_code, 0)
+        self.assertFalse(report.status_failed)
+        self.assertTrue(report.status_error)
+        self.assertIn("missing-fsmonitor", report.status_error)
+        with (
+            mock.patch.object(git_doctor, "build_report", return_value=report),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.assertEqual(git_doctor.main([]), 0)
+        self.assertIn("succeeded with diagnostics", stdout.getvalue())
+        self.assertIn(report.status_error, stdout.getvalue())
+
     def test_config_failure_is_not_an_unset_setting(self):
         with mock.patch.object(
             git_doctor, "run_git", return_value=completed(128, stderr="bad config")
@@ -26,11 +56,12 @@ class GitDoctorTest(unittest.TestCase):
 
     def test_timed_status_discards_stdout(self):
         with mock.patch.object(
-            git_doctor.subprocess, "run", return_value=completed(0)
+            git_doctor, "run_owned", return_value=completed(0)
         ) as run:
             self.assertFalse(git_doctor.timed_status(1).failed)
         self.assertIs(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
         self.assertIs(run.call_args.kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(run.call_args.kwargs["timeout"], 1)
         self.assertEqual(
             run.call_args.args[0],
             ["git", "status", "--short", "--untracked-files=all"],
@@ -87,6 +118,79 @@ class GitDoctorTest(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertFalse(result.failed)
         self.assertIsNone(result.return_code)
+
+    def test_status_timeout_bounds_a_real_git_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+
+            def git(*args: str) -> None:
+                subprocess.run(
+                    ["git", *args],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+
+            git("init", "--quiet")
+            (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+            git("add", "tracked.txt")
+            started_marker = repo / ".git" / "fsmonitor-started"
+            hook = repo / ".git" / "slow-fsmonitor"
+            hook.write_text(
+                "#!/bin/sh\n"
+                f"printf started > {shlex.quote(started_marker.as_posix())}\n"
+                "sleep 3\n"
+                "printf 'token\\0/\\0'\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+            git("config", "core.fsmonitor", shlex.quote(hook.as_posix()))
+            started = time.monotonic()
+            with mock.patch.object(git_doctor, "REPO_ROOT", repo):
+                result = git_doctor.timed_status(0.5)
+            elapsed = time.monotonic() - started
+
+            self.assertTrue(started_marker.exists(), "the real hook must have started")
+            self.assertTrue(result.timed_out)
+            self.assertFalse(result.failed)
+            self.assertLess(elapsed, 2.0, "timeout must not wait for the 3s child")
+
+    def test_cleanup_failure_is_reported_as_a_failed_status(self) -> None:
+        with mock.patch.object(
+            git_doctor,
+            "run_owned",
+            side_effect=git_doctor.CleanupFailed("cleanup failed"),
+        ):
+            result = git_doctor.timed_status(1.0)
+        self.assertTrue(result.failed)
+        self.assertIn("cleanup failed", result.error)
+
+    @unittest.skipUnless(os.name == "nt", "Windows FSMonitor daemon lifecycle")
+    def test_successful_status_preserves_the_fsmonitor_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+
+            def git(*args: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=repo,
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                )
+
+            git("init", "--quiet").check_returncode()
+            (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+            git("add", "tracked.txt").check_returncode()
+            git("config", "core.fsmonitor", "true").check_returncode()
+            try:
+                with mock.patch.object(git_doctor, "REPO_ROOT", repo):
+                    result = git_doctor.timed_status(5)
+                self.assertEqual(result.return_code, 0)
+                self.assertEqual(git("fsmonitor--daemon", "status").returncode, 0)
+            finally:
+                git("fsmonitor--daemon", "stop")
 
     def test_git_boolean_spellings_are_equivalent(self) -> None:
         for value in ("true", "yes", "on", "1", "TRUE", " Yes "):

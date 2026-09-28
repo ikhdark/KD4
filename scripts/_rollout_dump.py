@@ -3,6 +3,12 @@ import json
 import sys
 import datetime
 import os
+from pathlib import Path
+
+try:
+    from scripts.rollout_snapshot import read_rollout_records
+except ImportError:
+    from rollout_snapshot import read_rollout_records
 
 
 def ts(o):
@@ -36,13 +42,12 @@ def text_of(content):
 
 
 def dump(path, out_path):
-    rows = []
-    for line in open(path, encoding='utf-8'):
-        rows.append(json.loads(line))
+    rows = [row for row, _ in read_rollout_records(Path(path))]
     w = open(out_path, 'w', encoding='utf-8')
     P = lambda *a: print(*a, file=w)
     prev_t = None
-    seen_manifest = False
+    seen_manifests = set()
+    cache_keys = {}
     prev_settings = None
     prev_turn_ctx = None
     for i, o in enumerate(rows):
@@ -74,28 +79,29 @@ def dump(path, out_path):
         elif typ == 'tool_manifest':
             P(hdr + f' hash={p.get("hash")} base={p.get("base_hash")}')
             m = p.get('manifest')
-            if m and not seen_manifest:
-                seen_manifest = True
+            manifest_id = p.get('hash') or jd(m)
+            if m and manifest_id not in seen_manifests:
+                seen_manifests.add(manifest_id)
                 mv = m.get('model_visible') or []
                 P(f'--- model_visible tools ({len(mv)}) ---')
                 for tdef in mv:
-                    P(f'## TOOL {tdef.get("name")} type={tdef.get("type")} format={jd(tdef.get("format"))[:300]}')
+                    P(f'## TOOL {tdef.get("name")} type={tdef.get("type")} format={jd(tdef.get("format"))}')
                     P(str(tdef.get('description')))
                     for k, v in tdef.items():
                         if k not in ('name', 'type', 'format', 'description'):
-                            P(f'   {k}: {jd(v)[:2000]}')
+                            P(f'   {k}: {jd(v)}')
                 reg = m.get('registered') or []
                 P(f'--- registered ({len(reg)}) ---')
                 for r in reg:
                     P(f'   {jd(r)}')
             elif m:
-                P(f'  (manifest again, {len(jd(m))} bytes)')
+                P(f'  (manifest already shown, {len(jd(m))} chars)')
             for k in ('added', 'removed'):
                 if p.get(k):
-                    P(f'  {k}: {jd(p.get(k))[:3000]}')
+                    P(f'  {k}: {jd(p.get(k))}')
             for k, v in p.items():
                 if k not in ('hash', 'base_hash', 'manifest', 'added', 'removed'):
-                    P(f'  {k}: {jd(v)[:2000]}')
+                    P(f'  {k}: {jd(v)}')
         elif typ == 'world_state':
             P(hdr + f' full={p.get("full")}')
             st = p.get('state', {})
@@ -190,6 +196,14 @@ def dump(path, out_path):
                                                              'fixedPrefixReuseEligible', 'nextStructuredActionChanged',
                                                              'unchangedRelevantState', 'physicalAttemptIds', 'retryCount',
                                                              'errorKind', 'error', 'status')}
+                            fingerprint = r.get('promptCacheKeyFingerprint')
+                            if isinstance(fingerprint, str):
+                                if fingerprint not in cache_keys:
+                                    cache_keys[fingerprint] = f'cache-key-{len(cache_keys) + 1}'
+                                    P(f'      {cache_keys[fingerprint]} fingerprint={fingerprint}')
+                                keep['promptCacheKey'] = cache_keys[fingerprint]
+                            else:
+                                keep['promptCacheKey'] = None
                             other = {k2: r.get(k2) for k2 in r if k2 not in keep and k2 not in ('relevantStateFingerprint', 'samplingRequestId', 'promptCacheKeyFingerprint')}
                             P(f'      {jd(keep)}  other={jd(other)[:1500]}')
                         tc = v.get('toolCalls') or []

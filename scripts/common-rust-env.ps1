@@ -223,19 +223,20 @@ function Test-CargoProgram {
 
 function Get-CargoSubcommandIndex {
     param(
-        [string[]]$CommandArgs
+        [string[]]$CommandArgs,
+        [int]$StartIndex = 1,
+        [string[]]$GlobalOptionsWithValue = @("--color", "--config", "-C", "-Z")
     )
 
     if ($CommandArgs.Count -lt 2 -or -not (Test-CargoProgram -Value $CommandArgs[0])) {
         return -1
     }
 
-    $index = 1
-    if ($CommandArgs[$index].StartsWith("+")) {
+    $index = $StartIndex
+    if ($index -eq 1 -and $index -lt $CommandArgs.Count -and $CommandArgs[$index].StartsWith("+")) {
         $index += 1
     }
 
-    $globalOptionsWithValue = @("--color", "--config", "-C", "-Z")
     while ($index -lt $CommandArgs.Count) {
         $arg = $CommandArgs[$index]
         if ($arg -eq "--") {
@@ -246,7 +247,10 @@ function Get-CargoSubcommandIndex {
         }
 
         $optionName = ($arg -split "=", 2)[0]
-        if ($globalOptionsWithValue -ccontains $optionName -and $arg -notmatch "=") {
+        if ($GlobalOptionsWithValue -ccontains $optionName -and $arg -notmatch "=") {
+            if ($index + 1 -ge $CommandArgs.Count) {
+                throw "Cargo option $arg requires a value."
+            }
             $index += 2
         }
         else {
@@ -271,7 +275,8 @@ function Format-CargoWatchExecTargetDir {
 function Assert-CargoTargetDirMatchesLane {
     param(
         [string]$Candidate,
-        [string]$TargetDir
+        [string]$TargetDir,
+        [string]$WorkingDir = (Get-Location -PSProvider FileSystem).ProviderPath
     )
 
     if ([string]::IsNullOrWhiteSpace($Candidate)) {
@@ -281,9 +286,8 @@ function Assert-CargoTargetDirMatchesLane {
         # Cargo joins a relative --target-dir onto its working directory,
         # which PowerShell takes from the current location; GetFullPath alone
         # would resolve against the unrelated process directory.
-        $location = (Get-Location -PSProvider FileSystem).ProviderPath
-        $candidatePath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($location, $Candidate))
-        $lanePath = [System.IO.Path]::GetFullPath($TargetDir)
+        $candidatePath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($WorkingDir, $Candidate)).TrimEnd('\', '/')
+        $lanePath = [System.IO.Path]::GetFullPath($TargetDir).TrimEnd('\', '/')
     }
     catch {
         throw "Cargo --target-dir '$Candidate' is not a valid path: $($_.Exception.Message)"
@@ -296,7 +300,8 @@ function Assert-CargoTargetDirMatchesLane {
 function Add-CargoWatchExecTargetDir {
     param(
         [string]$ExecCommand,
-        [string]$TargetDir
+        [string]$TargetDir,
+        [string]$WorkingDir = (Get-Location -PSProvider FileSystem).ProviderPath
     )
 
     if ([string]::IsNullOrWhiteSpace($ExecCommand)) {
@@ -324,9 +329,15 @@ function Add-CargoWatchExecTargetDir {
             "single_space",
             "bare_space"
         ) | ForEach-Object { $targetMatch.Groups[$_].Value } | Where-Object { $_.Length -gt 0 } | Select-Object -First 1
-        Assert-CargoTargetDirMatchesLane -Candidate $candidate -TargetDir $TargetDir
+        Assert-CargoTargetDirMatchesLane -Candidate $candidate -TargetDir $TargetDir -WorkingDir $WorkingDir
     }
     if ($targetMatches.Count -gt 0) {
+        # Freeze relative paths before cargo-watch changes its working directory.
+        $replacement = " --target-dir $(Format-CargoWatchExecTargetDir -TargetDir $TargetDir)"
+        for ($i = $targetMatches.Count - 1; $i -ge 0; $i--) {
+            $match = $targetMatches[$i]
+            $ExecCommand = $ExecCommand.Remove($match.Index, $match.Length).Insert($match.Index, $replacement)
+        }
         return $ExecCommand
     }
 
@@ -363,6 +374,8 @@ function Add-CargoWatchTargetDirArgument {
     )
 
     $updated = [System.Collections.Generic.List[string]]::new()
+    $execArguments = [System.Collections.Generic.List[object]]::new()
+    $workingDir = (Get-Location -PSProvider FileSystem).ProviderPath
     $hasExec = $false
     $valueOptions = @("-d", "--delay", "--env-file", "-E", "--env", "--features", "-i", "--ignore", "-B", "-L", "--use-shell", "-w", "--watch", "-C", "--workdir")
     for ($i = 0; $i -lt $CommandArgs.Count; $i++) {
@@ -395,36 +408,46 @@ function Add-CargoWatchTargetDirArgument {
             $i++
             if ($i -ge $CommandArgs.Count) { throw "Cargo watch --exec/-x requires a command." }
             if ($i -lt $CommandArgs.Count) {
-                [void]$updated.Add((Add-CargoWatchExecTargetDir -ExecCommand $CommandArgs[$i] -TargetDir $TargetDir))
+                [void]$execArguments.Add(@{ Index = $updated.Count; Prefix = ""; Command = $CommandArgs[$i] })
+                [void]$updated.Add($CommandArgs[$i])
             }
             continue
         }
         if ($arg.StartsWith("--exec=", [StringComparison]::Ordinal)) {
             $hasExec = $true
             $exec = $arg.Substring("--exec=".Length)
-            [void]$updated.RemoveAt($updated.Count - 1)
-            [void]$updated.Add("--exec=$(Add-CargoWatchExecTargetDir -ExecCommand $exec -TargetDir $TargetDir)")
+            [void]$execArguments.Add(@{ Index = $updated.Count - 1; Prefix = "--exec="; Command = $exec })
             continue
         }
         if ($arg.StartsWith("-x", [StringComparison]::Ordinal)) {
             $hasExec = $true
             $exec = $arg.Substring(2)
             if ($exec.StartsWith("=")) { $exec = $exec.Substring(1) }
-            [void]$updated.RemoveAt($updated.Count - 1)
-            [void]$updated.Add("-x$(Add-CargoWatchExecTargetDir -ExecCommand $exec -TargetDir $TargetDir)")
+            [void]$execArguments.Add(@{ Index = $updated.Count - 1; Prefix = "-x"; Command = $exec })
             continue
         }
         if ($arg -cin $valueOptions) {
             $i++
             if ($i -ge $CommandArgs.Count) { throw "Cargo watch $arg requires a value." }
             [void]$updated.Add($CommandArgs[$i])
+            if ($arg -cin @("-C", "--workdir")) { $workingDir = $CommandArgs[$i] }
             continue
+        }
+        if ($arg.StartsWith("--workdir=", [StringComparison]::Ordinal)) {
+            $workingDir = $arg.Substring("--workdir=".Length)
+        }
+        elseif ($arg.StartsWith("-C", [StringComparison]::Ordinal)) {
+            $workingDir = $arg.Substring(2).TrimStart('=')
         }
         if (-not $arg.StartsWith("-")) {
             throw "Cargo watch positional commands cannot enforce a reserved target; use --exec/-x."
         }
     }
 
+    $workingDir = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location -PSProvider FileSystem).ProviderPath, $workingDir))
+    foreach ($exec in $execArguments) {
+        $updated[$exec.Index] = $exec.Prefix + (Add-CargoWatchExecTargetDir -ExecCommand $exec.Command -TargetDir $TargetDir -WorkingDir $workingDir)
+    }
     if (-not $hasExec) {
         [void]$updated.Add("-x")
         [void]$updated.Add((Add-CargoWatchExecTargetDir -ExecCommand "check" -TargetDir $TargetDir))
@@ -510,12 +533,15 @@ function Add-CargoTargetDirArgument {
         return Add-CargoWatchTargetDirArgument -CommandArgs $CommandArgs -SubcommandIndex $subcommandIndex -TargetDir $TargetDir
     }
     if ($subcommand -eq "nextest") {
-        $nextestCommandIndex = $subcommandIndex + 1
-        if ($nextestCommandIndex -ge $CommandArgs.Count) {
+        $nextestCommandIndex = Get-CargoSubcommandIndex -CommandArgs $CommandArgs -StartIndex ($subcommandIndex + 1) -GlobalOptionsWithValue @("--color", "--manifest-path", "--config-file", "--user-config-file", "--tool-config-file", "-P", "--profile")
+        if ($nextestCommandIndex -lt 0) {
             return $CommandArgs
         }
-        if ($CommandArgs[$nextestCommandIndex] -notin @("archive", "run", "list")) {
-            return $CommandArgs
+        if ($CommandArgs[$nextestCommandIndex] -notin @("archive", "run", "r", "list", "bench", "b")) {
+            if ($CommandArgs[$nextestCommandIndex] -in @("help", "show-config", "self")) {
+                return $CommandArgs
+            }
+            throw "Unsupported Cargo nextest command in a reserved lane."
         }
         if (Test-CargoTargetDirArgumentPresent -CommandArgs $CommandArgs -StartIndex ($nextestCommandIndex + 1) -TargetDir $TargetDir) {
             return $CommandArgs

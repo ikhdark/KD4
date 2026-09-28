@@ -31,6 +31,7 @@ use tracing::info;
 
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+const MODEL_REFRESH_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// Remote endpoint used by the OpenAI-compatible model manager.
 ///
@@ -400,7 +401,7 @@ pub struct OpenAiModelsManager {
     state: RwLock<ModelState>,
     // Serialize cache loads and remote refreshes through publication and persistence.
     // Acquire before `state` or `etag_refresh`; readers do not need this gate.
-    refresh_gate: tokio::sync::Mutex<()>,
+    refresh_gate: tokio::sync::Mutex<Option<ModelsRefreshFailure>>,
     cache_manager: ModelsCacheManager,
     endpoint_client: SharedModelsEndpointClient,
     auth_manager: Option<Arc<AuthManager>>,
@@ -409,6 +410,13 @@ pub struct OpenAiModelsManager {
     etag_refresh: Mutex<EtagRefreshState>,
     etag_refresh_idle: Notify,
     model_catalog_activity: Arc<ModelCatalogActivity>,
+}
+
+#[derive(Debug)]
+struct ModelsRefreshFailure {
+    identity: String,
+    retry_at: Instant,
+    error: Arc<CodexErr>,
 }
 
 #[derive(Debug)]
@@ -535,7 +543,7 @@ impl OpenAiModelsManager {
         let remote_models = load_bundled_models_or_panic();
         Self {
             state: RwLock::new(ModelState::new(remote_models, None, active_cache_identity)),
-            refresh_gate: tokio::sync::Mutex::new(()),
+            refresh_gate: tokio::sync::Mutex::new(None),
             cache_manager,
             endpoint_client,
             auth_manager,
@@ -964,7 +972,7 @@ impl OpenAiModelsManager {
         http_client_factory: &HttpClientFactory,
         use_cache: bool,
     ) -> CoreResult<()> {
-        let _refresh = self.refresh_gate.lock().await;
+        let mut refresh = self.refresh_gate.lock().await;
         if use_cache {
             if self.memory_is_fresh().await {
                 return Ok(());
@@ -976,6 +984,15 @@ impl OpenAiModelsManager {
             }
         }
         let fetch_identity = self.ensure_current_cache_identity().await;
+        if use_cache
+            && let Some(failure) = refresh.as_ref()
+            && failure.identity == fetch_identity
+            && Instant::now() < failure.retry_at
+        {
+            // Catalog consumers surface an error, not a successful stale result.
+            // Keep the original error as the shared I/O error's source.
+            return Err(std::io::Error::other(Arc::clone(&failure.error)).into());
+        }
         let client_version = crate::client_version_to_whole();
         let current_etag = self.get_etag().await;
         let write_basis = match self
@@ -989,14 +1006,27 @@ impl OpenAiModelsManager {
                 None
             }
         };
-        match self
+        let result = match self
             .fetch_models(
                 http_client_factory,
                 current_etag.as_deref(),
                 &fetch_identity,
             )
-            .await?
+            .await
         {
+            Ok(result) => result,
+            Err(error) => {
+                let error = Arc::new(error);
+                *refresh = Some(ModelsRefreshFailure {
+                    identity: fetch_identity,
+                    retry_at: Instant::now() + MODEL_REFRESH_FAILURE_COOLDOWN,
+                    error: Arc::clone(&error),
+                });
+                return Err(std::io::Error::other(error).into());
+            }
+        };
+        *refresh = None;
+        match result {
             ModelsFetchResult::Modified { models, etag } => {
                 if !self.cache_manager.identity_is_current(&fetch_identity) {
                     self.ensure_current_cache_identity().await;
@@ -1424,12 +1454,7 @@ fn requested_model_is_available(
 fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
     let mut best: Option<ModelInfo> = None;
     for candidate in candidates {
-        let is_exact_match = model == candidate.slug;
-        let is_hyphenated_variant = !candidate.slug.is_empty()
-            && model
-                .strip_prefix(&candidate.slug)
-                .is_some_and(|suffix| suffix.starts_with('-'));
-        if !is_exact_match && !is_hyphenated_variant {
+        if !model_info::matches_model_slug(model, &candidate.slug) {
             continue;
         }
         let is_better_match = if let Some(current) = best.as_ref() {
@@ -1445,22 +1470,7 @@ fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option
 }
 
 fn find_model_by_namespaced_suffix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
-    // Retry metadata lookup for a single namespaced slug like `namespace/model-name`.
-    //
-    // This only strips one leading namespace segment and only when the namespace looks
-    // like a simple provider id to avoid broadly matching arbitrary aliases.
-    let (namespace, suffix) = model.split_once('/')?;
-    if suffix.contains('/') {
-        return None;
-    }
-    if namespace.is_empty()
-        || !namespace
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return None;
-    }
-    find_model_by_longest_prefix(suffix, candidates)
+    find_model_by_longest_prefix(model_info::namespaced_model_suffix(model)?, candidates)
 }
 
 pub(crate) fn construct_model_info_from_candidates(

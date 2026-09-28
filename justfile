@@ -8,9 +8,9 @@ rust_min_stack := "8388608" # 8 MiB
 rust_parallelism := "2" # Match codex-rs/.cargo/config.toml; standard env/CLI overrides still win.
 cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)
 export CARGO_BUILD_JOBS := cargo_build_jobs
-rust_test_threads := env_var_or_default("RUST_TEST_THREADS", rust_parallelism)
+rust_test_threads := env_var_or_default("RUST_TEST_THREADS", "6") # Measured libtest default, independent of compiler jobs.
 export RUST_TEST_THREADS := rust_test_threads
-nextest_test_threads := env_var_or_default("NEXTEST_TEST_THREADS", rust_parallelism)
+nextest_test_threads := env_var_or_default("NEXTEST_TEST_THREADS", "6") # Match nextest.toml; keep compiler/libtest limits independent.
 export NEXTEST_TEST_THREADS := nextest_test_threads
 python := "python"
 # One reserved Cargo lane shared by every named core test target and gate, so
@@ -86,40 +86,40 @@ app-server-test-client *args:
 _app-server-test-client-reserved *args:
     $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; cargo build --target-dir $target_dir -p codex-cli; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo run --target-dir $target_dir -p codex-app-server-test-client -- --codex-bin (Join-Path $target_dir "debug\codex.exe") @forwarded_args
 
-# Format the justfile and Rust code for the high-frequency local edit path.
+# Format the justfile and Rust code; --rust-package scopes Rust to one package.
 [script("python")]
-fmt:
+fmt *args:
     import runpy
     import sys
     script = r"{{ justfile_directory() }}/scripts/format.py"
-    sys.argv = [script, "--fast-local"]
+    sys.argv = [script, "--fast-local", *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
 # Check the high-frequency local formatter set without modifying files.
 [script("python")]
-fmt-check-fast:
+fmt-check-fast *args:
     import runpy
     import sys
     script = r"{{ justfile_directory() }}/scripts/format.py"
-    sys.argv = [script, "--check", "--fast-local"]
+    sys.argv = [script, "--check", "--fast-local", *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
 # Format the justfile, Rust, Prettier targets, Python SDK code, and Python scripts.
 [script("python")]
-fmt-full:
+fmt-full *args:
     import runpy
     import sys
     script = r"{{ justfile_directory() }}/scripts/format.py"
-    sys.argv = [script]
+    sys.argv = [script, *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
 # Check formatting without modifying files.
 [script("python")]
-fmt-check:
+fmt-check *args:
     import runpy
     import sys
     script = r"{{ justfile_directory() }}/scripts/format.py"
-    sys.argv = [script, "--check"]
+    sys.argv = [script, "--check", *sys.argv[1:]]
     runpy.run_path(script, run_name="__main__")
 
 [no-cd]
@@ -653,8 +653,9 @@ app-server-schema-protocol-check:
 app-server-schema-check *args:
     {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode check {args}
 
-# Explicitly regenerate app-server schemas under the repository generation lock.
+# Explicitly regenerate app-server schemas under their generation lock.
 # Stable regeneration requires CODEX_SCHEMA_COMPATIBILITY_BASELINE.
+# --experimental exports to dist/app-server-schema-experimental, not stable fixtures.
 [no-cd]
 app-server-schema-regenerate owner experimental="":
     {{ python }} "{{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py" --mode force --owner "{{ owner }}" -- {{ if experimental == "--experimental" { "--experimental" } else if experimental == "" { "" } else { error("app-server-schema-regenerate only accepts --experimental") } }}

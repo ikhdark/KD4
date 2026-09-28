@@ -3028,6 +3028,10 @@ pub struct TurnTimingCounters {
     /// independent of `generations_by_disposition`.
     #[serde(default)]
     pub suppressed_deterministic_continuation_count: u32,
+    /// Model handoffs suppressed at an instrumented runtime decision, not
+    /// inferred from wait observations or receipts. Null denotes older telemetry.
+    #[serde(default)]
+    pub proven_avoided_model_requests: Option<u32>,
     /// Residual deterministic generation requests proved by turn execution.
     /// Null means production execution control does not measure this counter.
     #[serde(default)]

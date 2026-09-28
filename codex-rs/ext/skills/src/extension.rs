@@ -119,6 +119,7 @@ where
             let catalog = self
                 .list_skills(
                     SkillListQuery {
+                        discovery_timeout: crate::provider::CONTEXT_DISCOVERY_TIMEOUT,
                         continuation: None,
                         turn_id: thread_store.level_id().to_string(),
                         executor_roots: Vec::new(),
@@ -155,6 +156,7 @@ where
             let catalog = self
                 .list_skills(
                     SkillListQuery {
+                        discovery_timeout: crate::provider::CONTEXT_DISCOVERY_TIMEOUT,
                         continuation: None,
                         turn_id: thread_store.level_id().to_string(),
                         executor_roots: Vec::new(),
@@ -197,6 +199,7 @@ where
                 .estimate_executor_catalog_snapshot(
                     &self.providers,
                     SkillListQuery {
+                        discovery_timeout: crate::provider::CONTEXT_DISCOVERY_TIMEOUT,
                         continuation: None,
                         turn_id: input.turn_id.to_string(),
                         executor_roots: input.ready_selected_capability_roots.to_vec(),
@@ -228,6 +231,7 @@ where
                 .executor_catalog_snapshot(
                     &self.providers,
                     SkillListQuery {
+                        discovery_timeout: crate::provider::CONTEXT_DISCOVERY_TIMEOUT,
                         continuation: None,
                         turn_id: input.turn_id.to_string(),
                         executor_roots: input.ready_selected_capability_roots.to_vec(),
@@ -295,6 +299,7 @@ where
             let config = thread_state.config();
             let host_snapshot = turn_store.get::<HostSkillsSnapshot>();
             let query = SkillListQuery {
+                discovery_timeout: crate::provider::CONTEXT_DISCOVERY_TIMEOUT,
                 continuation: None,
                 turn_id: input.turn_id.clone(),
                 executor_roots: Vec::new(),
@@ -311,6 +316,7 @@ where
                         .executor_catalog_snapshot(
                             &self.providers,
                             SkillListQuery {
+                                discovery_timeout: crate::provider::CONTEXT_DISCOVERY_TIMEOUT,
                                 continuation: None,
                                 turn_id: input.turn_id.clone(),
                                 executor_roots: input.ready_selected_capability_roots.clone(),

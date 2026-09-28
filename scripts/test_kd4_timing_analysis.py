@@ -67,6 +67,88 @@ def timing_profile() -> dict:
     }
 
 
+class TimingEvidenceRegressionsTest(unittest.TestCase):
+    def test_audit_conflicts_compare_full_profiles_not_only_milestones(self):
+        first = timing_profile()
+        second = copy.deepcopy(first)
+        second["exclusive"]["modelOnlyNs"] += 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            path.write_text("\n".join(json.dumps({
+                "timestamp": "2026-09-27T00:00:00Z", "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn", "timing": timing},
+            }) for timing in (first, second)), encoding="utf-8")
+            report = audit.analyze_session_path(path, Path(directory))
+        self.assertEqual(report["coverage"]["conflictingTerminalProfiles"], 1)
+        actions = report["firstUsefulActionAnalysis"]
+        self.assertEqual(actions["exclusions"]["conflictingTerminalProfiles"], 1)
+        self.assertEqual(actions["canonicalTurnCount"], 0)
+        self.assertEqual(report["runnerDiagnostics"]["coverage"]["validCompleteTimingProfiles"], 0)
+
+    def test_first_output_and_progress_require_assistant_provenance(self):
+        events = [
+            {"elapsedMs": index * 1000, "message": {"type": "response_item", "payload": {
+                "type": "message", "role": role, "content": [],
+            }}}
+            for index, role in enumerate(("developer", "user", "system", "assistant", "user"))
+        ]
+        before = analysis.analyze_runner_evidence({"schemaVersion": 1, "events": events[:3]})
+        self.assertIsNone(before["firstOutputMs"])
+        self.assertIsNone(before["lastProgress"])
+        report = analysis.analyze_runner_evidence({"schemaVersion": 1, "events": events})
+        self.assertEqual(report["firstOutputMs"], 3000)
+        self.assertEqual(report["lastProgress"]["elapsedMs"], 3000)
+        for message in (
+            {"method": "item/agentMessage/delta", "params": {"delta": "hello"}},
+            {"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "hello"}}},
+        ):
+            report = analysis.analyze_runner_evidence({"schemaVersion": 1, "events": [
+                {"elapsedMs": 42, "message": message},
+            ]})
+            self.assertEqual(report["firstOutputMs"], 42)
+
+    def test_builtin_rollout_calls_keep_identity_completion_and_pending_work(self):
+        items = [
+            {"type": "web_search_call", "id": "web", "status": "in_progress"},
+            {"type": "web_search_call", "id": "web", "status": "completed"},
+            {"type": "local_shell_call", "call_id": "shell", "status": "completed"},
+            {"type": "image_generation_call", "id": "image", "status": "in_progress"},
+        ]
+        report = analysis.analyze_runner_evidence({"schemaVersion": 1, "events": [
+            {"elapsedMs": (index + 1) * 1000, "message": {"type": "response_item", "payload": item}}
+            for index, item in enumerate(items)
+        ]})
+        self.assertEqual(report["directToolCount"], 3)
+        self.assertEqual(report["firstToolMs"], 1000)
+        self.assertEqual([call["id"] for call in report["pendingTools"]], ["image"])
+        self.assertEqual({call["tool"] for call in report["tools"]}, {
+            "web_search", "local_shell", "image_generation",
+        })
+        self.assertEqual(report["failures"], [])
+
+    def test_resumed_history_does_not_invalidate_complete_request_usage(self):
+        timing = timing_profile()
+        timing["modelRequests"] = timing["modelRequests"][:1]
+        timing["counters"]["modelRequestCount"] = 1
+        report = analysis.analyze_runner_evidence({"schemaVersion": 1, "events": [
+            {"message": {"method": "turn/completed", "params": {
+                "threadId": "thread", "turn": {"id": "turn", "status": "completed", "timing": timing},
+            }}},
+            {"message": {"method": "thread/tokenUsage/updated", "params": {
+                "threadId": "thread", "tokenUsage": {"total": {
+                    "inputTokens": 1100, "cachedInputTokens": 880,
+                    "outputTokens": 165, "reasoningOutputTokens": 55,
+                }},
+            }}},
+        ]})
+        self.assertTrue(report["tokens"]["complete"])
+        self.assertEqual(report["tokens"]["inputTokens"], 100)
+        self.assertEqual(report["cacheHitRate"], 0.8)
+        self.assertEqual(report["nativeCumulativeTokens"]["inputTokens"], 1100)
+        self.assertEqual(report["tokenReconciliation"]["residuals"]["inputTokens"], 1000)
+        self.assertFalse(report["tokenReconciliation"]["addedToRequestTotals"])
+
+
 class SharedTimingAnalysisTest(unittest.TestCase):
     def test_response_outputs_pair_by_call_id_without_crossing_turns_or_threads(self):
         events = []
@@ -728,6 +810,230 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         )
         self.assertIsNone(analysis.analyze_runner_evidence(evidence)["cacheHitRate"])
 
+    def test_replayed_requests_can_gain_usage_without_breaking_cache_reporting(self):
+        profile = timing_profile()
+        complete = dict(profile["modelRequests"][0], samplingRequestId="sampling-1")
+        pending = {key: value for key, value in complete.items() if key != "tokenUsage"}
+        for requests in ([pending, complete], [complete, pending]):
+            with self.subTest(requests=requests):
+                profile["modelRequests"] = requests
+                report = audit.analyze_session_path(
+                    None, Path.cwd(), runner_evidence=self.evidence(profile)
+                )["runnerDiagnostics"]
+                self.assertTrue(report["tokens"]["complete"])
+                self.assertEqual(report["tokens"]["inputTokens"], 100)
+                self.assertEqual(report["tokens"]["deduplicatedRequestRecords"], 1)
+                self.assertEqual(report["cacheHitRate"], 0.8)
+
+    def test_zero_request_turn_is_not_missing_usage_but_unknown_counts_are(self):
+        for count in (0, None, False, 1):
+            with self.subTest(count=count):
+                profile = timing_profile()
+                profile["modelRequests"] = profile["modelRequests"][:1]
+                evidence = self.evidence(profile)
+                zero = timing_profile()
+                zero["modelRequests"] = []
+                if count is not None:
+                    zero["counters"]["modelRequestCount"] = count
+                event = copy.deepcopy(evidence["events"][0])
+                event["message"]["params"]["turn"].update(
+                    id="zero", status="interrupted", timing=zero
+                )
+                evidence["events"].append(event)
+                report = analysis.analyze_runner_evidence(evidence)
+                known_zero = type(count) is int and count == 0
+                self.assertEqual(report["tokens"]["complete"], known_zero)
+                self.assertEqual(
+                    report["tokens"]["inputTokens"], 100 if known_zero else None
+                )
+                self.assertEqual(report["tokens"]["observedTotals"]["inputTokens"], 100)
+                self.assertEqual(
+                    report["tokenCoverage"]["missingTerminalTurnIds"],
+                    [] if known_zero else ["zero"],
+                )
+
+    def test_cumulative_reconciliation_requires_a_matching_pre_turn_baseline(self):
+        for baseline, extra, late in (
+            (1000, 0, False),
+            (0, 10, False),
+            (None, 10, False),
+            (1000, 0, True),
+        ):
+            with self.subTest(baseline=baseline, extra=extra, late=late):
+                profile = timing_profile()
+                profile["modelRequests"] = profile["modelRequests"][:1]
+                terminal = self.evidence(profile)["events"][0]
+                terminal["message"]["params"]["threadId"] = "thread"
+                base = baseline or 0
+
+                def usage(input_tokens, output, cached, reasoning):
+                    return {
+                        "message": {
+                            "method": "thread/tokenUsage/updated",
+                            "params": {
+                                "threadId": "thread",
+                                "tokenUsage": {
+                                    "total": {
+                                        "inputTokens": input_tokens,
+                                        "outputTokens": output,
+                                        "cachedInputTokens": cached,
+                                        "reasoningOutputTokens": reasoning,
+                                    }
+                                },
+                            },
+                        }
+                    }
+
+                start = {
+                    "message": {
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": "thread",
+                            "turn": {"id": "turn-1"},
+                        },
+                    }
+                }
+                initial = usage(base, 0, 0, 0)
+                events = (
+                    [start]
+                    if baseline is None
+                    else [start, initial]
+                    if late
+                    else [initial, start]
+                )
+                events.extend([terminal, usage(base + 100 + extra, 15, 80, 5)])
+                report = analysis.analyze_runner_evidence(
+                    {"schemaVersion": 1, "events": events}
+                )
+                comparable = baseline is not None and not late
+                complete = not (comparable and extra)
+                self.assertEqual(
+                    report["tokenReconciliation"]["populationComparable"], comparable
+                )
+                self.assertEqual(report["tokens"]["complete"], complete)
+                self.assertEqual(
+                    report["tokens"]["inputTokens"], 100 if complete else None
+                )
+                self.assertEqual(report["cacheHitRate"], 0.8 if complete else None)
+                if comparable:
+                    self.assertEqual(
+                        report["tokenReconciliation"]["residuals"]["inputTokens"], extra
+                    )
+
+    def test_failure_replays_are_scoped_and_counted_once(self):
+        events = []
+        for thread in ("parent", "child"):
+            events.extend(
+                [
+                    {
+                        "message": {
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": thread,
+                                "turnId": "turn",
+                                "item": {
+                                    "id": "call",
+                                    "type": "commandExecution",
+                                    "command": "python fail.py",
+                                    "status": "failed",
+                                    "exitCode": 2,
+                                },
+                            },
+                        }
+                    },
+                    {
+                        "message": {
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": thread,
+                                "turn": {"id": "turn", "status": "failed"},
+                            },
+                        }
+                    },
+                ]
+            )
+        report = analysis.analyze_runner_evidence(
+            {"schemaVersion": 1, "events": events + events}
+        )
+        self.assertEqual(len(report["tools"]), 2)
+        self.assertEqual(
+            [row["kind"] for row in report["failures"]],
+            ["tool_execution_failure", "turn_failed"] * 2,
+        )
+        self.assertEqual(report["pendingTools"], [])
+
+    def test_rollout_status_prefers_structured_execution_results(self):
+        cases = (
+            (
+                "python fail.py",
+                {"execution_state": "exited", "exit_code": 2, "output": ""},
+                "failed",
+            ),
+            (
+                "python ok.py",
+                {"execution_state": "exited", "exit_code": 0, "output": "Exit code: 2"},
+                "completed",
+            ),
+            (
+                "python slow.py",
+                {"execution_state": "running", "session_id": 7},
+                "running",
+            ),
+            (
+                'rg "foo|bar" src',
+                {"execution_state": "exited", "exit_code": 1, "output": ""},
+                "completed",
+            ),
+            (
+                'rg "foo|bar" src; python fail.py',
+                {"execution_state": "exited", "exit_code": 1, "output": ""},
+                "failed",
+            ),
+            ("python fail.py", "Exit code: 2", "failed"),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            for command, result, status in cases:
+                with self.subTest(command=command, status=status):
+                    path.write_text(
+                        "\n".join(
+                            json.dumps(row)
+                            for row in (
+                                {
+                                    "timestamp": "2026-09-26T00:00:00Z",
+                                    "type": "response_item",
+                                    "payload": {
+                                        "type": "function_call",
+                                        "call_id": "c",
+                                        "name": "exec_command",
+                                        "arguments": json.dumps({"cmd": command}),
+                                    },
+                                },
+                                {
+                                    "timestamp": "2026-09-26T00:00:01Z",
+                                    "type": "response_item",
+                                    "payload": {
+                                        "type": "function_call_output",
+                                        "call_id": "c",
+                                        "output": result
+                                        if isinstance(result, str)
+                                        else json.dumps(result),
+                                    },
+                                },
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    report = audit.analyze_session_path(path, Path(temp))
+                    self.assertEqual(
+                        report["behaviorSignals"]["failedToolCalls"],
+                        int(status == "failed"),
+                    )
+                    self.assertEqual(
+                        report["behaviorSignals"]["runningToolCalls"],
+                        int(status == "running"),
+                    )
+
     def evidence(self, timing=None):
         return {
             "schemaVersion": 1,
@@ -1000,6 +1306,10 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         for command, exit_code, output, failed in [
             ('rg -n "needle" src', 1, "", False),
             ('"C:\\tools\\rg.exe" needle src', 1, "", False),
+            ('rg "needle|other" src', 1, "", False),
+            ('rg "fn\\(" src', 1, "", False),
+            ("rg 'foo$|bar' src", 1, "", False),
+            ('rg "$(python fail.py)" src', 1, "", True),
             ("rg needle missing-file", 2, "file not found", True),
             ("rg needle src; python fail.py", 1, "", True),
             ("python fail.py", 1, "", True),
@@ -1193,11 +1503,11 @@ class SharedTimingAnalysisTest(unittest.TestCase):
         native_usage["inputTokens"] = 400
         report = analysis.analyze_runner_evidence(evidence)
         self.assertEqual(report["tokens"]["coverage"], 1)
-        self.assertFalse(report["tokens"]["complete"])
-        self.assertIsNone(report["tokens"]["inputTokens"])
+        self.assertTrue(report["tokens"]["complete"])
+        self.assertEqual(report["tokens"]["inputTokens"], 300)
         self.assertEqual(report["tokens"]["observedTotals"]["inputTokens"], 300)
         self.assertEqual(report["tokenReconciliation"]["residuals"]["inputTokens"], 100)
-        self.assertIsNone(report["tokens"]["providerTotals"])
+        self.assertEqual(report["tokens"]["providerTotals"]["inputTokens"], 300)
         native_usage["inputTokens"] = 300
         # A missing usage record in the rejected timing profile must remain
         # partial, even though every accepted timing profile has usage.

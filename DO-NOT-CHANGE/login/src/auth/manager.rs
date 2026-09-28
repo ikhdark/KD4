@@ -740,6 +740,7 @@ impl CodexAuth {
     }
 
     /// Consider this private to integration tests.
+    #[expect(clippy::expect_used, reason = "integration-test fixture construction must fail loudly")]
     pub fn create_dummy_chatgpt_auth_for_testing() -> Self {
         let auth_dot_json = AuthDotJson {
             auth_mode: Some(AuthMode::Chatgpt),

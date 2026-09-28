@@ -2,24 +2,102 @@
 
 from pathlib import Path
 import hashlib
+import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
+from scripts import publish_local_codex_test_support as support
 from scripts.publish_local_codex_test_support import PublishLocalCodexTestBase
 from scripts.publish_local_codex_test_support import clean_env
 from scripts.publish_local_codex_test_support import ps_single_quote
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
-CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RUN_TIMEOUT_SECONDS = 120
 FIXTURE_TIME = 946684900
 FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
+    def test_unrelated_executable_is_rejected_before_install(self) -> None:
+        install_dir = self.repo_root / "install"
+        install_dir.mkdir()
+        target = install_dir / "codex.exe"
+        target.write_bytes(b"existing target")
+        unrelated = self.repo_root / "unrelated.exe"
+        shutil.copy2(os.environ["COMSPEC"], unrelated)
+        result = self.run_script(
+            "-SkipBuild", "-SourceExe", str(unrelated), "-InstallDir", str(install_dir)
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(target.read_bytes(), b"existing target")
+        self.assertEqual(list(install_dir.iterdir()), [target])
+        self.assertFalse((install_dir.parent / "publisher-backups").exists())
+        self.assertNotIn("publishLock:", result.stdout)
+        self.assertNotIn("publishCommitted: true", result.stdout)
+        self.assert_no_publish_temps(install_dir)
+
+    def test_changed_publish_restart_failure_keeps_commit_and_returns_failure(
+        self,
+    ) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        start = source.index("function Restart-CodexDesktop {")
+        end = source.index("\nfunction ", start + 1)
+        isolated_script = self.repo_root / "publish-local-codex.ps1"
+        # Only the external Desktop action is substituted. Run the real
+        # transaction, commit, cleanup and terminal error handling unchanged.
+        isolated_script.write_text(
+            source[:start]
+            + "function Restart-CodexDesktop { throw 'fixture restart failure' }\n"
+            + source[end:],
+            encoding="utf-8",
+        )
+        shutil.copy2(SCRIPT.with_name("common-rust-env.ps1"), self.repo_root)
+        install_dir = self.repo_root / "install"
+        install_dir.mkdir()
+        target = install_dir / "codex.exe"
+        target.write_bytes(b"old installed codex")
+        with mock.patch.object(support, "SCRIPT", isolated_script):
+            result = self.run_script(
+                "-SkipBuild",
+                "-SourceExe",
+                str(self.source_exe),
+                "-InstallDir",
+                str(install_dir),
+                "-RestartDesktop",
+            )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("publishCommitted: true", result.stdout)
+        self.assertIn("restartFailed: true", result.stdout)
+        self.assertIn("fixture restart failure", result.stderr)
+        self.assertNotIn("rollback: requested", result.stdout)
+        self.assertEqual(target.read_bytes(), self.source_exe_bytes)
+        backups = list((install_dir.parent / "publisher-backups").glob("codex-*.exe"))
+        self.assertEqual(len(backups), 1, backups)
+        self.assertEqual(backups[0].read_bytes(), b"old installed codex")
+        self.assert_no_publish_temps(install_dir)
+
+    def test_cleanup_assertion_rejects_each_transaction_residue(self) -> None:
+        install_dir = self.repo_root / "install"
+        install_dir.mkdir()
+        for name in (
+            ".install.bundle.fixture",
+            ".install.rollback.fixture",
+            ".install.codex-local-publish.transaction.json",
+            ".install.codex-local-publish.transaction.json.tmp",
+        ):
+            with self.subTest(residue=name):
+                residue = install_dir.parent / name
+                residue.touch()
+                with self.assertRaises(AssertionError):
+                    self.assert_no_publish_temps(install_dir)
+                residue.unlink()
+        self.assert_no_publish_temps(install_dir)
+
     def test_manifest_source_mutation_is_rejected_before_install(self) -> None:
         install = Path(self.repo_temp.name) / "install"
         manifest = self.write_source_bundle_manifest(self.source_exe)
@@ -605,11 +683,7 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                 append_padding=True,
             )
 
-            process = subprocess.Popen(
-                [str(target), "/c", "ping -n 30 127.0.0.1 > nul"],
-                creationflags=CREATE_NO_WINDOW,
-            )
-            try:
+            with self.running_codex(target) as process:
                 result = self.run_script(
                     "-SkipBuild",
                     "-SourceExe",
@@ -635,10 +709,6 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                     fake_codex.read_bytes(),
                 )
                 self.assert_no_publish_temps(install_dir)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=5)
 
     def test_apply_closes_running_code_mode_host_before_replacing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -655,11 +725,7 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
             code_mode_host_target = install_dir / "codex-code-mode-host.exe"
             code_mode_host_target.write_bytes(self.source_exe_bytes)
 
-            process = subprocess.Popen(
-                [str(code_mode_host_target), "/c", "ping -n 30 127.0.0.1 > nul"],
-                creationflags=CREATE_NO_WINDOW,
-            )
-            try:
+            with self.running_codex(code_mode_host_target) as process:
                 result = self.run_script(
                     "-SkipBuild",
                     "-SourceExe",
@@ -686,10 +752,6 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                     self.source_code_mode_host_bytes,
                 )
                 self.assert_no_publish_temps(install_dir)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=5)
 
     def test_apply_allow_running_target_skips_close_and_replaces(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -704,11 +766,7 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                 append_padding=True,
             )
 
-            process = subprocess.Popen(
-                [str(target), "/c", "ping -n 30 127.0.0.1 > nul"],
-                creationflags=CREATE_NO_WINDOW,
-            )
-            try:
+            with self.running_codex(target) as process:
                 result = self.run_script(
                     "-SkipBuild",
                     "-AllowRunningTarget",
@@ -730,11 +788,23 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
                 )
                 self.assertIsNone(process.poll())
                 self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
-                self.assert_no_publish_temps(install_dir)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=5)
+                # Windows cannot delete the old image while it is running.
+                # The durable commit must survive until the next publisher
+                # finishes cleanup, rather than rolling back the new bundle.
+                journal = temp_path / ".install.codex-local-publish.transaction.json"
+                self.assertEqual(json.loads(journal.read_text())["Phase"], "Committed")
+                self.assertIn("deferred transaction cleanup", result.stdout)
+            result = self.run_script(
+                "-SkipBuild",
+                "-SourceExe",
+                str(fake_codex),
+                "-InstallDir",
+                str(install_dir),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("binaryChanged: false", result.stdout)
+            self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
+            self.assert_no_publish_temps(install_dir)
 
 
 if __name__ == "__main__":

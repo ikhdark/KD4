@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -161,6 +162,22 @@ class CopyFileForStagingTest(unittest.TestCase):
                 inputs,
             )
             metadata_path = package_dir / "codex-package.json"
+            with (
+                mock.patch.object(layout, "os", SimpleNamespace(name="nt")),
+                mock.patch.object(layout.platform, "machine", return_value="AMD64"),
+                mock.patch.object(
+                    layout.subprocess,
+                    "run",
+                    return_value=mock.Mock(stdout="codex 9.9.9"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "entrypoint version mismatch"),
+            ):
+                layout.validate_package_dir(
+                    package_dir,
+                    PACKAGE_VARIANTS["codex"],
+                    spec,
+                    expected_version="1.2.3",
+                )
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata["version"] = "9.9.9"
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
@@ -368,6 +385,13 @@ class CopyFileForStagingTest(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "Invalid PE executable"):
                         layout.validate_package_dir(package, variant, spec)
                     build()
+                    write_pe(package / relative, machine=0xAA64)
+                    refresh_inventory()
+                    with self.assertRaisesRegex(
+                        RuntimeError, "executable target mismatch"
+                    ):
+                        layout.validate_package_dir(package, variant, spec)
+                    build()
             nested = package / "bin" / "codex-package.json"
             nested.write_text("nested metadata")
             with self.assertRaisesRegex(RuntimeError, "inventory mismatch"):
@@ -383,12 +407,12 @@ class CopyFileForStagingTest(unittest.TestCase):
                 layout.validate_package_dir(package, variant, spec)
 
 
-def write_pe(path: Path) -> None:
+def write_pe(path: Path, *, machine: int = 0x8664) -> None:
     contents = bytearray(128)
     contents[:2] = b"MZ"
     struct.pack_into("<I", contents, 0x3C, 64)
     contents[64:68] = b"PE\0\0"
-    struct.pack_into("<H", contents, 68, 0x8664)
+    struct.pack_into("<H", contents, 68, machine)
     path.write_bytes(contents)
 
 

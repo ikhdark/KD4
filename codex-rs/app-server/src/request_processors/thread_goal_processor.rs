@@ -441,6 +441,35 @@ async fn finish_resume_goal(
     continuation.await;
 }
 
+pub(super) fn api_thread_goal_from_state(goal: codex_state::ThreadGoal) -> ThreadGoal {
+    ThreadGoal {
+        thread_id: goal.thread_id.to_string(),
+        objective: goal.objective,
+        status: api_thread_goal_status_from_state(goal.status),
+        token_budget: goal.token_budget,
+        tokens_used: goal.tokens_used,
+        time_used_seconds: goal.time_used_seconds,
+        created_at: goal.created_at.timestamp(),
+        updated_at: goal.updated_at.timestamp(),
+    }
+}
+
+fn api_thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
+    status.into()
+}
+
+fn goal_service_error(err: GoalServiceError) -> JSONRPCErrorError {
+    match err {
+        GoalServiceError::InvalidRequest(message) => invalid_request(message),
+        GoalServiceError::Internal(message) => internal_error(message),
+    }
+}
+
+fn parse_thread_id_for_request(thread_id: &str) -> Result<ThreadId, JSONRPCErrorError> {
+    ThreadId::from_string(thread_id)
+        .map_err(|err| invalid_request(format!("invalid thread id: {err}")))
+}
+
 #[cfg(test)]
 mod resume_finalization_tests {
     use super::*;
@@ -484,33 +513,4 @@ mod resume_finalization_tests {
         .await;
         assert_eq!(*order.lock().unwrap(), vec!["snapshot", "idle"]);
     }
-}
-
-pub(super) fn api_thread_goal_from_state(goal: codex_state::ThreadGoal) -> ThreadGoal {
-    ThreadGoal {
-        thread_id: goal.thread_id.to_string(),
-        objective: goal.objective,
-        status: api_thread_goal_status_from_state(goal.status),
-        token_budget: goal.token_budget,
-        tokens_used: goal.tokens_used,
-        time_used_seconds: goal.time_used_seconds,
-        created_at: goal.created_at.timestamp(),
-        updated_at: goal.updated_at.timestamp(),
-    }
-}
-
-fn api_thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
-    status.into()
-}
-
-fn goal_service_error(err: GoalServiceError) -> JSONRPCErrorError {
-    match err {
-        GoalServiceError::InvalidRequest(message) => invalid_request(message),
-        GoalServiceError::Internal(message) => internal_error(message),
-    }
-}
-
-fn parse_thread_id_for_request(thread_id: &str) -> Result<ThreadId, JSONRPCErrorError> {
-    ThreadId::from_string(thread_id)
-        .map_err(|err| invalid_request(format!("invalid thread id: {err}")))
 }

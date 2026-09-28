@@ -222,7 +222,10 @@ impl<T: HttpTransport> EndpointSession<T> {
                 let transport = &self.transport;
                 async move {
                     let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
-                    transport.stream(req).await
+                    // Bound establishment only; a healthy SSE body may outlive this deadline.
+                    tokio::time::timeout(self.provider.stream_idle_timeout, transport.stream(req))
+                        .await
+                        .map_err(|_| TransportError::Timeout)?
                 }
             },
         )

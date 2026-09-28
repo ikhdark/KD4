@@ -49,10 +49,9 @@ fn startup_restores_home_and_uses_current_binary() -> Result<(), Box<dyn std::er
     let alias_dir = std::env::split_paths(&std::env::var_os("PATH").ok_or("missing PATH")?)
         .next()
         .ok_or("missing alias directory")?;
-    let alias = alias_dir.join("apply_patch.bat");
-    let script = std::fs::read_to_string(&alias)?;
-    assert!(script.contains(&std::env::current_exe()?.display().to_string()));
-    assert!(alias_dir.join("applypatch.bat").is_file());
+    let alias = alias_dir.join("apply_patch.exe");
+    assert!(std::fs::read(&alias)? == std::fs::read(std::env::current_exe()?)?);
+    assert!(alias_dir.join("applypatch.exe").is_file());
 
     // An inherited, obsolete alias must not override the new startup alias.
     let stale = dir.path().join("stale");

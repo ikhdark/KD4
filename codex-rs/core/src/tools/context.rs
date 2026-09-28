@@ -56,6 +56,9 @@ std::thread_local! {
     static EXEC_COMMAND_RESPONSE_MATERIALIZATIONS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static BENCH_REPORT_OMISSION: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
 }
 
 pub use codex_tools::ToolOutput;
@@ -963,6 +966,8 @@ pub struct ExecCommandToolOutput {
     pub wall_time: Duration,
     /// Raw bytes returned for this unified exec call before any truncation.
     pub raw_output: Vec<u8>,
+    /// Loss while collecting this report, excluding output delivered by earlier polls.
+    pub raw_output_truncated: bool,
     pub truncation_policy: TruncationPolicy,
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<u32>,
@@ -1702,11 +1707,10 @@ impl ExecCommandToolOutput {
                 projected_text = candidate;
             }
         }
-        let artifact_has_more_bytes = self
-            .raw_output_artifact
-            .as_ref()
-            .and_then(RawOutputArtifact::retained_bytes)
-            .is_some_and(|bytes| bytes > self.raw_output.len() as u64);
+        let artifact_has_more_bytes = self.raw_output_truncated;
+        #[cfg(test)]
+        let artifact_has_more_bytes =
+            BENCH_REPORT_OMISSION.with(|value| value.get().unwrap_or(artifact_has_more_bytes));
         ProjectedModelOutput {
             reduced: summarized.is_some() || was_truncated || artifact_has_more_bytes,
             text: projected_text,
@@ -1842,3 +1846,7 @@ fn function_tool_response(
 #[cfg(test)]
 #[path = "context_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "context_benchmark_tests.rs"]
+mod benchmark_tests;

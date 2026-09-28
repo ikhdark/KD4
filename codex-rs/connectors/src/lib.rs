@@ -609,6 +609,10 @@ mod tests {
         LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "serializes tests that mutate the shared directory cache"
+    )]
     async fn workspace_pagination_is_complete_and_reused_without_granting_access()
     -> anyhow::Result<()> {
         let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
@@ -668,6 +672,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "serializes tests that mutate the shared directory cache"
+    )]
     async fn workspace_pagination_failure_preserves_complete_memory_and_disk_cache()
     -> anyhow::Result<()> {
         let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;

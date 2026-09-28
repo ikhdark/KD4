@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from unittest import mock
 
-from scripts import rust_test_runner
+from scripts import kd4_perf_snapshot, rust_test_runner
 from scripts.build_tooling_test_support import REPO_ROOT
 from scripts.rust_test_runner import (
     Manifest,
@@ -314,6 +314,24 @@ class RunnerTestCase(unittest.TestCase):
 
 
 class WallClockRunnerTest(RunnerTestCase):
+    def test_focused_benchmark_skips_discovery_and_helper_builds(self):
+        scenario = kd4_perf_snapshot.scenario_catalog()["focused-core-test"]
+        runner, executor = self.runner(
+            manifest=Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
+        )
+        runner.metadata.packages["codex-windows-sandbox"]["targets"].append(
+            {"name": "codex-windows-sandbox-setup", "kind": ["bin"]}
+        )
+
+        runner.run_target(scenario.command[2], scenario.command[3:])
+
+        self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+        self.assertEqual(executor.commands(["cargo", "build"]), [])
+        (command,) = executor.commands(["cargo", "nextest", "run"])
+        self.assertEqual(command[-2:], list(scenario.command[-2:]))
+        self.assertIn("--no-tests=fail", command)
+        self.assertFalse((self.target_dir / "debug").exists())
+
     def test_repository_retry_output_gate_avoids_discovery_and_helper_builds(self):
         manifest = Manifest.load(
             REPO_ROOT / "codex-rs" / ".config" / "kd4-rust-tests.toml"
@@ -350,7 +368,9 @@ class WallClockRunnerTest(RunnerTestCase):
             runs[0][runs[0].index("-E") + 1],
             " | ".join(f"test(={test})" for test in step.tests),
         )
-        self.assertEqual(runs[0][runs[0].index("--target-dir") + 1], str(self.target_dir))
+        self.assertEqual(
+            runs[0][runs[0].index("--target-dir") + 1], str(self.target_dir)
+        )
 
     def test_cache_disconnect_during_discovery_without_cargo_summary(self):
         transport = "sccache: caused by: error reading compile response from server\n"
@@ -362,11 +382,21 @@ class WallClockRunnerTest(RunnerTestCase):
         ):
             with self.subTest(verb=verb, suffix=suffix):
                 runner, _ = self.runner()
-                runner.executor = mock.Mock(side_effect=[
-                    subprocess.CompletedProcess([], 4294967295, "", transport + suffix),
-                    subprocess.CompletedProcess([], 0, "listed", ""),
-                ])
-                command = ["cargo", "nextest", verb, "--target-dir", str(self.target_dir)]
+                runner.executor = mock.Mock(
+                    side_effect=[
+                        subprocess.CompletedProcess(
+                            [], 4294967295, "", transport + suffix
+                        ),
+                        subprocess.CompletedProcess([], 0, "listed", ""),
+                    ]
+                )
+                command = [
+                    "cargo",
+                    "nextest",
+                    verb,
+                    "--target-dir",
+                    str(self.target_dir),
+                ]
                 with contextlib.redirect_stderr(io.StringIO()):
                     if retries:
                         result = runner._checked(
@@ -506,7 +536,9 @@ class WallClockRunnerTest(RunnerTestCase):
             with self.subTest(filters=filters):
                 runner, executor = self.runner(manifest=manifest)
                 runner.run_target("core_lib", filters)
-                self.assertEqual(len(executor.commands(["cargo", "nextest", "list"])), 1)
+                self.assertEqual(
+                    len(executor.commands(["cargo", "nextest", "list"])), 1
+                )
 
     def test_mixed_unknown_selection_keeps_fallback_helpers(self):
         data = copy.deepcopy(MANIFEST_DATA)
@@ -1760,6 +1792,224 @@ class RunTargetTest(RunnerTestCase):
 
 
 class RunGateTest(RunnerTestCase):
+    def test_failed_batch_retains_only_independently_proved_gates(self) -> None:
+        def step(*tests):
+            return {"target": "core_lib", "tests": list(tests), "helpers": []}
+
+        manifest = self.manifest(
+            gates={
+                "a": {"steps": [step("alpha")]},
+                "b": {"steps": [step("beta")]},
+                "both": {"steps": [step("alpha", "beta")]},
+            }
+        )
+        good = "PASS [0.01s] codex-core alpha\n"
+        bad = "FAIL [0.01s] codex-core beta\n"
+        cases = (
+            (good + bad, 100, {"a": ["alpha"]}),
+            (good, 0, {"a": ["alpha"]}),
+            (good + bad, 101, {}),
+            (good + good + bad, 100, {}),
+            (good.replace("codex-core", "wrong-binary") + bad, 100, {}),
+            (good + "FAIL [0.01s] codex-core alpha\n" + bad, 100, {}),
+        )
+        for output, status, expected in cases:
+            with self.subTest(output=output, status=status):
+                runner, _ = self.runner(manifest=manifest)
+                # Exercise real capture/log recovery and _checked's nonzero
+                # exit path, without compiling a fixture Rust workspace.
+                runner.executor = rust_test_runner._default_executor
+                command = [
+                    sys.executable,
+                    "-c",
+                    f"import sys; print({output!r}); sys.exit({status})",
+                ]
+                with (
+                    mock.patch.object(
+                        runner, "_gate_run_command", return_value=command
+                    ),
+                    self.assertRaises(RunnerError) as error,
+                ):
+                    runner.run_gates(["a", "b", "both"], quiet=True)
+                self.assertEqual(error.exception.completed_gates, expected)
+
+    def test_partial_proof_is_scoped_to_helpers_and_preserved_on_stop(self) -> None:
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {
+            "pure": {
+                "steps": [{"target": "core_lib", "tests": ["alpha"], "helpers": []}]
+            },
+            "with_helper": {
+                "steps": [
+                    {"target": "core_lib", "tests": ["alpha"], "helpers": ["codex"]}
+                ]
+            },
+        }
+        for outcome in ("failed", "cancelled", "timed_out", "cleanup_failed"):
+            with self.subTest(outcome=outcome):
+                runner, _ = self.runner(
+                    manifest=Manifest.from_data(data), executor=self.gate_executor({})
+                )
+                with (
+                    mock.patch.object(
+                        runner,
+                        "_checked",
+                        side_effect=[
+                            subprocess.CompletedProcess(
+                                [], 0, "PASS [0.01s] codex-core alpha", ""
+                            ),
+                            RunnerError("stopped", outcome=outcome),
+                        ],
+                    ) as checked,
+                    mock.patch.object(
+                        runner,
+                        "_build_helpers",
+                        return_value={"codex": self.helper_executable("codex")},
+                    ),
+                    self.assertRaises(RunnerError) as error,
+                ):
+                    runner.run_gates(["pure", "with_helper"], quiet=True)
+                self.assertEqual(error.exception.completed_gates, {"pure": ["alpha"]})
+                self.assertEqual(checked.call_count, 2)
+
+    def test_off_platform_helpers_do_not_block_gate_execution(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        step = data["gates"]["demo-gate"]["steps"][0]
+        step.pop("filter")
+        step["helpers"] = ["codex-command-runner"]
+        data["gates"] = {"portable": {"steps": [step]}}
+        executor = self.gate_executor(self.matching_listings())
+        runner, _ = self.runner(
+            executor=executor, manifest=Manifest.from_data(data), platform="linux"
+        )
+        self.assertEqual(runner.run_gates(["portable"]), {"portable": step["tests"]})
+        self.assertEqual(executor.commands(["cargo", "build"]), [])
+        self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
+
+    def test_failed_helper_build_still_runs_helper_free_gate_without_retry(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        steps = data["gates"]["demo-gate"]["steps"]
+        for step in steps:
+            step.pop("filter")
+        steps[0]["helpers"] = []
+        executor = FakeExecutor(listings=self.matching_listings())
+        runner, _ = self.runner(executor=executor, manifest=Manifest.from_data(data))
+        with self.assertRaisesRegex(RunnerError, "executable artifact") as failed:
+            runner.run_gate("demo-gate")
+        self.assertEqual(failed.exception.completed_gates, {})
+        self.assertEqual(len(executor.commands(["cargo", "build"])), 1)
+        runs = executor.commands(["cargo", "nextest", "run"])
+        self.assertEqual(len(runs), 1)
+        self.assertIn("--lib", runs[0])
+        self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+
+        for outcome in ("cancelled", "timed_out", "cleanup_failed"):
+            with self.subTest(outcome=outcome):
+                executor.calls.clear()
+                with (
+                    mock.patch.object(
+                        runner,
+                        "_build_helpers",
+                        side_effect=RunnerError("stop", outcome=outcome),
+                    ),
+                    self.assertRaises(RunnerError) as stopped,
+                ):
+                    runner.run_gate("demo-gate")
+                self.assertEqual(stopped.exception.outcome, outcome)
+                self.assertEqual(executor.calls, [])
+
+    def test_large_gate_failure_reports_delta_and_retains_inventory_and_command(self):
+        repository = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
+        tests = repository.gates["tui-large-widget"].steps[0].tests
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"]["demo-gate"]["steps"] = [
+            {"target": "core_lib", "tests": list(tests), "helpers": []}
+        ]
+        executor = FakeExecutor(default_listing=dict.fromkeys(tests[:-1], False))
+        runner, _ = self.runner(executor=executor, manifest=Manifest.from_data(data))
+        output = io.StringIO()
+        with (
+            contextlib.redirect_stderr(output),
+            self.assertRaises(RunnerError) as failed,
+        ):
+            runner.run_gate("demo-gate")
+        detail = str(failed.exception)
+        self.assertEqual(failed.exception.outcome, "not_executed")
+        self.assertIn(tests[-1], detail)
+        self.assertIn("missing(1)", detail)
+        self.assertLess(len(detail) + len(output.getvalue()), 10000)
+        proof_path = next(
+            Path(line.removeprefix("Full gate proof: "))
+            for line in detail.splitlines()
+            if line.startswith("Full gate proof: ")
+        )
+        proof = json.loads(proof_path.read_text())
+        self.assertEqual(
+            set(proof["expected"]), {f"codex-core {test}" for test in tests}
+        )
+        self.assertEqual(
+            set(proof["passed"]), {f"codex-core {test}" for test in tests[:-1]}
+        )
+        command_path = next(
+            Path(line.removeprefix("Full command: "))
+            for line in output.getvalue().splitlines()
+            if line.startswith("Full command: ")
+        )
+        (command,) = executor.commands(["cargo", "nextest", "run"])
+        self.assertEqual(command_path.read_text(), subprocess.list2cmdline(command))
+        self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+
+    def test_forwarded_target_deadline_reaches_metadata_helpers_and_execution(self):
+        for deadline in (
+            ["--command-timeout-seconds", "23.5"],
+            ["--command-timeout-seconds=23.5"],
+        ):
+            executor = self.gate_executor(self.matching_listings())
+
+            def construct(manifest, metadata, executor=executor, **kw):
+                return RustTestRunner(manifest, metadata, executor=executor, **kw)
+
+            with (
+                self.subTest(deadline=deadline),
+                mock.patch.object(Manifest, "load", return_value=self.manifest()),
+                mock.patch.object(
+                    rust_test_runner, "load_metadata", return_value=self.metadata()
+                ) as metadata,
+                mock.patch.object(
+                    rust_test_runner, "RustTestRunner", side_effect=construct
+                ),
+            ):
+                self.assertEqual(
+                    rust_test_runner.main(
+                        ["run-target", "core_all", *deadline, "-E", "test(beta)"]
+                    ),
+                    0,
+                )
+            metadata.assert_called_once_with(command_timeout_seconds=23.5)
+            self.assertTrue(executor.commands(["cargo", "build"]))
+            self.assertTrue(executor.commands(["cargo", "nextest", "run"]))
+            for call in executor.calls:
+                self.assertEqual(call["env"]["CODEX_RUST_TEST_TIMEOUT_SECS"], "23.5")
+                self.assertFalse(
+                    any(
+                        arg.startswith("--command-timeout-seconds")
+                        for arg in call["args"]
+                    )
+                )
+
+    def test_invalid_forwarded_deadline_does_not_start_metadata(self):
+        for value in (None, "0", "-1", "nan", "inf", "invalid"):
+            with (
+                self.subTest(value=value),
+                mock.patch.object(rust_test_runner, "load_metadata") as metadata,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                args = ["run-target", "core_all", "--command-timeout-seconds"]
+                if value is not None:
+                    args.append(value)
+                self.assertEqual(rust_test_runner.main(args), 2)
+                metadata.assert_not_called()
+
     def test_cli_deadline_covers_metadata_and_gate_commands(self) -> None:
         executor = self.gate_executor(self.matching_listings())
         runners = []
@@ -2228,7 +2478,9 @@ class RunGateTest(RunnerTestCase):
                 envs["all"][f"CARGO_BIN_EXE_{name}"],
                 str(executor.artifacts[name].resolve()),
             )
-        self.assertFalse(Path(envs["all"]["CARGO_BIN_EXE_codex-command-runner"]).exists())
+        self.assertFalse(
+            Path(envs["all"]["CARGO_BIN_EXE_codex-command-runner"]).exists()
+        )
 
     def test_compatible_steps_of_one_package_share_an_invocation(self) -> None:
         # Integration steps of one package with one helper set need only one
@@ -2689,6 +2941,8 @@ class RepositoryManifestTest(unittest.TestCase):
         expected_helpers["core_code_mode_mcp"] += [
             "test_stdio_server",
             "test_streamable_http_server",
+            "codex-windows-sandbox-setup",
+            "codex-command-runner",
         ]
         expected_helpers["core_exec_permissions"] += [
             "codex-windows-sandbox-setup",
@@ -2901,7 +3155,11 @@ class RunEnvironmentTest(RunnerTestCase):
         data["gates"] = {
             name: {
                 "steps": [
-                    {"target": "core_lib", "tests": ["tests::alpha"], "helpers": helpers}
+                    {
+                        "target": "core_lib",
+                        "tests": ["tests::alpha"],
+                        "helpers": helpers,
+                    }
                 ]
             }
             for name, helpers in (

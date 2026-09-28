@@ -63,8 +63,7 @@ impl ExecutorFileSystem for DelayedObservationFileSystem {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "injected observation failure",
-                )
-                .into());
+                ));
             }
             self.delay(
                 false,

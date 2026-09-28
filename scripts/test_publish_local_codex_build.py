@@ -12,6 +12,7 @@ import unittest
 
 from scripts.publish_local_codex_test_support import PublishLocalCodexTestBase
 from scripts.publish_local_codex_test_support import clean_env
+from scripts.publish_local_codex_test_support import native_codex_fixture_bytes
 from scripts.publish_local_codex_test_support import ps_single_quote
 
 
@@ -504,6 +505,134 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertNotIn("desktopLocalCliRouting:", result.stdout)
             self.assertFalse((install_dir / "codex.exe").exists())
 
+    def test_test_run_requires_successful_native_version_without_publishing(self):
+        self.init_repo_fixture()
+        install_dir = self.repo_root / "install"
+        for name, binary, succeeds in (
+            ("valid", self.source_exe_bytes, True),
+            ("invalid", b"not an executable", False),
+            ("nonzero", native_codex_fixture_bytes(exit_code=7), False),
+        ):
+            with self.subTest(case=name):
+                self.write_built_artifacts(
+                    codex_bytes=binary, timestamp=FRESH_SOURCE_TIME
+                )
+                self.write_build_stamp("local-release", FIXTURE_TIME)
+                result = self.run_script(
+                    "-TestRun", "-AutoSkipBuild", "-InstallDir", str(install_dir)
+                )
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode == 0, succeeds, output)
+                self.assertIn("buildCommand: <skipped>", result.stdout)
+                if not succeeds:
+                    self.assertIn("--version", result.stderr)
+                    self.assertNotIn("doctorCommand:", result.stdout)
+                else:
+                    self.assert_proof_value(
+                        result.stdout, "doctorCommand", "<skipped: -RunDoctor not set>"
+                    )
+                self.assertNotIn("publishLock:", result.stdout)
+                self.assertFalse(install_dir.exists(), output)
+
+    def test_manifest_version_mismatch_fails_before_publish_side_effects(self):
+        install_dir = self.repo_root / "install"
+        install_dir.mkdir()
+        target = install_dir / "codex.exe"
+        target.write_bytes(b"existing target")
+        self.source_exe.write_bytes(native_codex_fixture_bytes(version="1.2.3"))
+        result = self.run_script(
+            "-SkipBuild",
+            "-SourceExe",
+            str(self.source_exe),
+            "-InstallDir",
+            str(install_dir),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("version mismatch: expected 9.9.9", result.stderr)
+        self.assertEqual(target.read_bytes(), b"existing target")
+        self.assertEqual(list(install_dir.iterdir()), [target])
+        self.assertFalse((install_dir.parent / "publisher-backups").exists())
+        self.assertNotIn("publishLock:", result.stdout)
+        self.assertNotIn("desktopLocalCliRouting:", result.stdout)
+
+    def test_build_stamp_roundtrip_and_inert_environment_reuse_on_both_hosts(self):
+        self.init_repo_fixture()
+        fake_bin = self.repo_root / "bin"
+        fake_bin.mkdir()
+        calls = self.repo_root / "cargo-calls.txt"
+        self.write_fake_cargo(fake_bin, f'echo invoked>>"{calls}"')
+        env = clean_env()
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+        stamp = (
+            self.repo_root / "codex-rs/target/codex-local-publish-local-release.stamp"
+        )
+        original_shell = self.shell
+        try:
+            for shell in dict.fromkeys(
+                filter(None, (self.shell, shutil.which("pwsh")))
+            ):
+                with self.subTest(shell=shell):
+                    self.shell = shell
+                    stamp.unlink(missing_ok=True)
+                    calls.unlink(missing_ok=True)
+                    first = self.run_script(
+                        "-BuildOnly", "-AutoSkipBuild", "-NoSccache", env=env
+                    )
+                    self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+                    self.assertEqual(calls.read_text().splitlines(), ["invoked"])
+                    changed = {
+                        **env,
+                        "CARGO_TERM_COLOR": "always",
+                        "CARGO_TARGET_DIR": str(self.repo_root / "ignored-target"),
+                        "CODEX_SCCACHE_CACHE_SIZE": "17G",
+                        "RUSTC_WRAPPER": "ignored-wrapper",
+                        "CARGO_BUILD_RUSTC_WRAPPER": "ignored-wrapper",
+                        "RUSTC_WORKSPACE_WRAPPER": "ignored-wrapper",
+                        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER": "ignored-wrapper",
+                    }
+                    second = self.run_script(
+                        "-BuildOnly", "-AutoSkipBuild", "-NoSccache", env=changed
+                    )
+                    self.assertEqual(
+                        second.returncode, 0, second.stdout + second.stderr
+                    )
+                    self.assert_proof_value(second.stdout, "autoSkipBuild", "true")
+                    self.assertEqual(calls.read_text().splitlines(), ["invoked"])
+                    self.assertFalse((self.repo_root / "ignored-target").exists())
+                    relevant = self.run_script(
+                        "-BuildOnly",
+                        "-DryRun",
+                        "-AutoSkipBuild",
+                        "-NoSccache",
+                        env={**changed, "CARGO_PROFILE_LOCAL_RELEASE_OPT_LEVEL": "1"},
+                    )
+                    self.assertEqual(
+                        relevant.returncode, 0, relevant.stdout + relevant.stderr
+                    )
+                    self.assert_proof_value(relevant.stdout, "autoSkipBuild", "false")
+                    valid_stamp = json.loads(stamp.read_text(encoding="utf-8-sig"))
+                    for field in ("writtenAtUtc", "sourceNewestWriteUtc"):
+                        stamp.write_text(
+                            json.dumps({**valid_stamp, field: "invalid-date"}),
+                            encoding="utf-8",
+                        )
+                        rejected = self.run_script(
+                            "-BuildOnly",
+                            "-DryRun",
+                            "-AutoSkipBuild",
+                            "-NoSccache",
+                            env=changed,
+                        )
+                        self.assertEqual(
+                            rejected.returncode, 0, rejected.stdout + rejected.stderr
+                        )
+                        self.assert_proof_value(
+                            rejected.stdout, "autoSkipBuild", "false"
+                        )
+                        self.assertIn("build stamp legacy or invalid", rejected.stdout)
+        finally:
+            self.shell = original_shell
+
     def test_no_sccache_switch_disables_rustc_wrapper(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -518,11 +647,15 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 'if "%1"=="--config" type "%2"',
                 "echo rustcWrapperEnv=%RUSTC_WRAPPER%",
                 "echo cargoBuildRustcWrapperEnv=%CARGO_BUILD_RUSTC_WRAPPER%",
+                "echo workspaceWrapperEnv=%RUSTC_WORKSPACE_WRAPPER%",
+                "echo cargoWorkspaceWrapperEnv=%CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER%",
             )
             env = clean_env()
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
             env["RUSTC_WRAPPER"] = "sccache"
             env["CARGO_BUILD_RUSTC_WRAPPER"] = "sccache"
+            env["RUSTC_WORKSPACE_WRAPPER"] = "sccache"
+            env["CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"] = "sccache"
 
             result = self.run_script(
                 "-NoSccache",
@@ -545,11 +678,108 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn("cargoBuildRustcWrapperEnv=", result.stdout)
             self.assertNotIn("rustcWrapperEnv=sccache", result.stdout)
             self.assertNotIn("cargoBuildRustcWrapperEnv=sccache", result.stdout)
+            self.assertIn("workspaceWrapperEnv=", result.stdout)
+            self.assertIn("cargoWorkspaceWrapperEnv=", result.stdout)
+            self.assertNotIn("workspaceWrapperEnv=sccache", result.stdout)
+            self.assertNotIn("cargoWorkspaceWrapperEnv=sccache", result.stdout)
             self.assertIn("fake cargo --config ", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
             self.assertIn("[build]", result.stdout)
             self.assertIn('rustc-wrapper = ""', result.stdout)
+            self.assertIn('rustc-workspace-wrapper = ""', result.stdout)
             self.assert_no_publish_temps(install_dir)
+
+    def test_no_sccache_real_cargo_ignores_wrapper_config_and_restores_environment(
+        self,
+    ):
+        shell = shutil.which("pwsh")
+        if shell is None or shutil.which("cargo") is None:
+            self.skipTest(
+                "PowerShell 7 and Cargo required for real environment regression"
+            )
+        rust = self.repo_root / "codex-rs"
+        (rust / "Cargo.toml").write_text(
+            '[workspace]\nmembers=["cli","host","sandbox"]\nresolver="2"\n',
+            encoding="utf-8",
+        )
+        for directory, package, bins in (
+            ("cli", "codex-cli", ["codex"]),
+            ("host", "codex-code-mode-host", ["codex-code-mode-host"]),
+            (
+                "sandbox",
+                "codex-windows-sandbox",
+                ["codex-windows-sandbox-setup", "codex-command-runner"],
+            ),
+        ):
+            pkg = rust / directory
+            pkg.mkdir()
+            manifest = f'[package]\nname="{package}"\nversion="0.0.0"\nedition="2021"\n'
+            for binary in bins:
+                manifest += f'[[bin]]\nname="{binary}"\npath="{binary}.rs"\n'
+                (pkg / f"{binary}.rs").write_text(
+                    'fn main() { println!("fixture"); }\n', encoding="utf-8"
+                )
+            (pkg / "Cargo.toml").write_text(manifest, encoding="utf-8")
+        marker = self.repo_root / "wrapper-calls.txt"
+        wrapper = self.repo_root / "wrapper.cmd"
+        wrapper.write_text(
+            f'@echo off\r\necho invoked>>"{marker}"\r\n%*\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="utf-8",
+        )
+        cargo_home = self.repo_root / "cargo-home"
+        cargo_home.mkdir()
+        (cargo_home / "config.toml").write_text(
+            f"[build]\nrustc-wrapper = {json.dumps(str(wrapper))}\nrustc-workspace-wrapper = {json.dumps(str(wrapper))}\n",
+            encoding="utf-8",
+        )
+        env = {
+            key: value
+            for key, value in clean_env().items()
+            if not key.startswith("CARGO_")
+        }
+        env.update(CARGO_HOME=str(cargo_home), CARGO_NET_OFFLINE="true")
+        names = (
+            "RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        )
+        for inherited in (True, False):
+            with self.subTest(inherited=inherited):
+                for name in names:
+                    env.pop(name, None)
+                    if inherited:
+                        env[name] = str(wrapper)
+                command = rf"""
+$ErrorActionPreference = 'Stop'
+. {ps_single_quote(SCRIPT)} -ImportOnly -NoSccache
+Remove-Item Env:SCCACHE_BASEDIR -ErrorAction SilentlyContinue
+[Environment]::SetEnvironmentVariable('SCCACHE_CACHE_SIZE', '', 'Process')
+$env:CODEX_BUILD_TIMESTAMP = 'original-timestamp'
+$names = @('SCCACHE_BASEDIR', 'SCCACHE_CACHE_SIZE', 'CODEX_BUILD_TIMESTAMP', 'CARGO_TARGET_DIR', {", ".join(ps_single_quote(name) for name in names)})
+$before = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 'Process') }})
+Invoke-CodexBuild -RepoRoot {ps_single_quote(self.repo_root)} -Profile debug
+$after = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 'Process') }})
+@{{ before = $before; after = $after }} | ConvertTo-Json -Compress
+"""
+                result = subprocess.run(
+                    [shell, "-NoProfile", "-Command", command],
+                    cwd=self.repo_root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=RUN_TIMEOUT_SECONDS,
+                    check=False,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                state = json.loads(result.stdout.splitlines()[-1])
+                self.assertEqual(state["after"], state["before"])
+                self.assertEqual(state["before"][:3], [None, "", "original-timestamp"])
+                self.assertFalse(marker.exists(), result.stdout + result.stderr)
+                self.assertTrue(
+                    all(path.is_file() for path in self.built_artifact_paths("debug"))
+                )
 
     def test_environment_rustflags_cannot_replace_checked_in_target_flags(
         self,
@@ -704,7 +934,13 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 / "codex-local-publish-local-release.stamp"
             )
 
-            for mode in ((), ("-AutoSkipBuild",), ("-BuildOnly",), ("-TestRun",), ("-DryRun",)):
+            for mode in (
+                (),
+                ("-AutoSkipBuild",),
+                ("-BuildOnly",),
+                ("-TestRun",),
+                ("-DryRun",),
+            ):
                 with self.subTest(mode=mode):
                     install_dir = temp_path / ("install" + "".join(mode))
                     result = self.run_script(
@@ -916,7 +1152,9 @@ $fingerprints | ConvertTo-Json -Compress
                 {Path(line.strip()).resolve() for line in observed_dirs}, {codex_rs}
             )
 
-    def test_root_frozen_sources_affect_publish_fingerprint_and_dirty_flag(self) -> None:
+    def test_root_frozen_sources_affect_publish_fingerprint_and_dirty_flag(
+        self,
+    ) -> None:
         self.init_repo_fixture()
         repo = ps_single_quote(self.repo_root)
         source = self.repo_root / "DO-NOT-CHANGE" / "fixture" / "src" / "lib.rs"
@@ -938,7 +1176,14 @@ $states.cleanAgain = Get-GitBuildDirty -RepoRoot {repo}
 $states | ConvertTo-Json -Compress
 """
         result = subprocess.run(
-            [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
             text=True,
             capture_output=True,
             check=False,
@@ -984,7 +1229,14 @@ $states.publishInput = Get-GitBuildDirty -RepoRoot {repo}
 $states | ConvertTo-Json -Compress
 """
         result = subprocess.run(
-            [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
             text=True,
             capture_output=True,
             check=False,

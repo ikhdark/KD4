@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::runtime::StoredValueWrite;
 use crate::session_runtime::OutputItem;
 
 struct TestHost;
@@ -45,7 +46,7 @@ impl CellHost for TestHost {
 
     async fn commit_completion(
         &self,
-        _stored_value_writes: HashMap<String, StoredValue>,
+        _stored_value_writes: HashMap<String, StoredValueWrite>,
         event: CellEvent,
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
@@ -77,7 +78,7 @@ impl CellHost for RecordingHost {
 
     async fn commit_completion(
         &self,
-        _stored_value_writes: HashMap<String, StoredValue>,
+        _stored_value_writes: HashMap<String, StoredValueWrite>,
         event: CellEvent,
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
@@ -90,10 +91,39 @@ impl CellHost for RecordingHost {
     async fn closed(&self, _event: Option<CellEvent>) {}
 }
 
+fn claim_test_response(
+    result: Result<crate::delivery::Delivery<super::types::BufferedEvent>, CellError>,
+) -> Result<CellEvent, CellError> {
+    result.map(|delivery| delivery.claim().into_event())
+}
+
+struct TestResponseReceiver(
+    oneshot::Receiver<Result<crate::delivery::Delivery<super::types::BufferedEvent>, CellError>>,
+);
+
+impl TestResponseReceiver {
+    fn try_recv(&mut self) -> Result<Result<CellEvent, CellError>, oneshot::error::TryRecvError> {
+        self.0.try_recv().map(claim_test_response)
+    }
+}
+
+impl Future for TestResponseReceiver {
+    type Output = Result<Result<CellEvent, CellError>, oneshot::error::RecvError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.get_mut().0)
+            .poll(cx)
+            .map(|result| result.map(claim_test_response))
+    }
+}
+
 struct CellActorHarness {
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     handle: CellHandle,
-    initial_event_rx: oneshot::Receiver<Result<CellEvent, CellError>>,
+    initial_event_rx: TestResponseReceiver,
     task: tokio::task::JoinHandle<()>,
     _runtime_event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
 }
@@ -163,7 +193,7 @@ async fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
     CellActorHarness {
         event_tx,
         handle,
-        initial_event_rx,
+        initial_event_rx: TestResponseReceiver(initial_event_rx),
         task,
         _runtime_event_rx: runtime_event_rx,
     }
@@ -840,8 +870,63 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
 }
 
 #[tokio::test]
+async fn successful_unclaimed_yield_delivery_survives_drop_and_is_consumed_once() {
+    for terminate_instead_of_observe in [false, true] {
+        let host = Arc::new(RecordingHost::default());
+        let harness =
+            spawn_cell_actor_harness_with_host(ObserveMode::Decision, Arc::clone(&host)).await;
+        harness
+            .event_tx
+            .send(RuntimeEvent::ContentItem {
+                item: FunctionCallOutputContentItem::InputText {
+                    text: "retained evidence".to_string(),
+                },
+                admitted_bytes: 0,
+            })
+            .unwrap();
+        harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
+        harness
+            .event_tx
+            .send(RuntimeEvent::Notify {
+                id: None,
+                call_id: "after-send".to_string(),
+                text: "barrier".to_string(),
+            })
+            .unwrap();
+        wait_for_notification(&host).await;
+        // The actor has sent into the live channel; no receiver has consumed it.
+        assert!(!harness.initial_event_rx.0.is_empty());
+        drop(harness.initial_event_rx);
+        let expected = vec![OutputItem::Text {
+            text: "retained evidence".to_string(),
+        }];
+        if !terminate_instead_of_observe {
+            assert_eq!(
+                harness.handle.observe(ObserveMode::Decision).await,
+                Ok(CellEvent::ExplicitYield {
+                    content_items: expected.clone()
+                })
+            );
+        }
+        let termination = harness.handle.terminate();
+        drop(harness.event_tx);
+        assert_eq!(
+            termination.await,
+            Ok(CellEvent::Terminated {
+                content_items: if terminate_instead_of_observe {
+                    expected
+                } else {
+                    Vec::new()
+                },
+            })
+        );
+        harness.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn only_the_first_termination_claims_a_buffered_completion() {
-    let cell_state = CellState::new(CancellationToken::new());
+    let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let completion = CellEvent::Completed {
         output_loss: None,
         content_items: Vec::new(),
@@ -876,7 +961,7 @@ async fn only_the_first_termination_claims_a_buffered_completion() {
 
 #[tokio::test]
 async fn termination_claim_prevents_stored_value_commit() {
-    let cell_state = CellState::new(CancellationToken::new());
+    let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let termination = cell_state.request_termination();
     let mut commit_ran = false;
     let completion = CellEvent::Completed {
@@ -907,7 +992,7 @@ async fn termination_claim_prevents_stored_value_commit() {
 
 #[test]
 fn failed_completion_delivery_rebuffers_the_event() {
-    let cell_state = CellState::new(CancellationToken::new());
+    let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let event = CellEvent::Completed {
         output_loss: None,
         content_items: Vec::new(),
@@ -934,12 +1019,15 @@ fn failed_completion_delivery_rebuffers_the_event() {
         cell_state.route_observation(ObserveMode::YieldAfter(Duration::ZERO), response_tx),
         ObservationDelivery::Delivered
     ));
-    assert_eq!(response_rx.try_recv(), Ok(Ok(event)));
+    assert_eq!(
+        response_rx.try_recv().map(claim_test_response),
+        Ok(Ok(event))
+    );
 }
 
 #[test]
 fn buffered_initial_explicit_yield_precedes_buffered_completion_for_yield_observer() {
-    let cell_state = CellState::new(CancellationToken::new());
+    let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let completion = CellEvent::Completed {
         output_loss: Some(OutputLoss {
             discarded_items: 1,
@@ -971,7 +1059,7 @@ fn buffered_initial_explicit_yield_precedes_buffered_completion_for_yield_observ
         ObservationDelivery::Buffered
     ));
     assert_eq!(
-        response_rx.try_recv(),
+        response_rx.try_recv().map(claim_test_response),
         Ok(Ok(CellEvent::ExplicitYield {
             content_items: vec![OutputItem::Text {
                 text: "before".to_string(),
@@ -984,5 +1072,8 @@ fn buffered_initial_explicit_yield_precedes_buffered_completion_for_yield_observ
         cell_state.route_observation(ObserveMode::YieldAfter(Duration::ZERO), response_tx),
         ObservationDelivery::Delivered
     ));
-    assert_eq!(response_rx.try_recv(), Ok(Ok(completion)));
+    assert_eq!(
+        response_rx.try_recv().map(claim_test_response),
+        Ok(Ok(completion))
+    );
 }

@@ -1350,6 +1350,17 @@ impl ThreadRequestProcessor {
 
         let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
 
+        // Fresh persistent threads have no rollout until their first turn.
+        // Materialize them without creating a turn; ephemeral threads stay ephemeral.
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await
+            && !thread.config_snapshot().await.ephemeral
+        {
+            self.thread_store
+                .persist_thread(thread_id)
+                .await
+                .map_err(|err| thread_store_archive_error("archive", err))?;
+        }
+
         let mut archive_thread_ids = Vec::new();
         match self
             .thread_store
@@ -2984,6 +2995,11 @@ impl ThreadRequestProcessor {
             }
         };
 
+        // The per-thread RPC queue and core's registry lease serialize resume.
+        // Do not hold the global metadata permit across cold configuration/MCP
+        // startup; the response path reloads metadata before publishing it.
+        drop(_thread_list_state_permit);
+
         let ThreadResumeParams {
             thread_id: _,
             history,
@@ -3173,6 +3189,15 @@ impl ThreadRequestProcessor {
                     }
                 }
 
+                let _thread_list_state_permit = match self.acquire_thread_list_state_permit().await {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        self.rollback_failed_resumed_thread(
+                            thread_id, &codex_thread, was_already_running,
+                        ).await;
+                        return Err(error);
+                    }
+                };
                 let (mut thread, token_usage_snapshot) = match self
                     .load_thread_from_resume_source_or_send_internal(
                         thread_id,

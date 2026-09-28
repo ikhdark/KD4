@@ -34,6 +34,29 @@ struct ParsedEnvironmentSkill {
     dependencies: Option<SkillDependencies>,
     policy: Option<SkillPolicy>,
     warnings: Vec<String>,
+    retryable_errors: bool,
+}
+
+struct EnvironmentSkillLoadError {
+    message: String,
+    retryable: bool,
+}
+
+impl EnvironmentSkillLoadError {
+    fn invalid(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: error.to_string(),
+            retryable: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct LoadedSkillMetadata {
+    dependencies: Option<SkillDependencies>,
+    policy: Option<SkillPolicy>,
+    warnings: Vec<String>,
+    retryable_errors: bool,
 }
 
 /// URI-native metadata for one skill owned by an execution environment.
@@ -65,7 +88,7 @@ impl ParsedEnvironmentSkill {
     async fn load(
         file_system: &dyn ExecutorFileSystem,
         skill: &DiscoveredSkill,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, EnvironmentSkillLoadError> {
         let (contents, discovered_metadata) = match &skill.metadata {
             SkillMetadataDiscovery::Present(metadata_path) => {
                 let (contents, metadata) = tokio::join!(
@@ -76,7 +99,7 @@ impl ParsedEnvironmentSkill {
             }
             SkillMetadataDiscovery::Absent | SkillMetadataDiscovery::Probe(_) => (
                 read_skill_contents(file_system, &skill.path).await?,
-                (None, None, Vec::new()),
+                LoadedSkillMetadata::default(),
             ),
         };
         let ParsedSkillFrontmatter {
@@ -84,8 +107,13 @@ impl ParsedEnvironmentSkill {
             description,
             short_description,
         } = parse_skill_frontmatter_metadata_inner(&contents, || default_skill_name(&skill.path))
-            .map_err(|err| err.to_string())?;
-        let (dependencies, policy, warnings) = match &skill.metadata {
+            .map_err(EnvironmentSkillLoadError::invalid)?;
+        let LoadedSkillMetadata {
+            dependencies,
+            policy,
+            warnings,
+            retryable_errors,
+        } = match &skill.metadata {
             SkillMetadataDiscovery::Present(_) | SkillMetadataDiscovery::Absent => {
                 discovered_metadata
             }
@@ -102,6 +130,7 @@ impl ParsedEnvironmentSkill {
             dependencies,
             policy,
             warnings,
+            retryable_errors,
         })
     }
 }
@@ -110,6 +139,8 @@ impl ParsedEnvironmentSkill {
 pub struct EnvironmentSkillLoadOutcome {
     pub skills: Vec<EnvironmentSkillMetadata>,
     pub warnings: Vec<String>,
+    /// I/O prevented a complete observation; a later turn may retry without discarding siblings.
+    pub retryable_errors: bool,
 }
 
 /// Discovers skills without converting environment-owned paths to host paths.
@@ -137,6 +168,7 @@ pub async fn load_environment_skills_from_root(
     )
     .await;
     tracing::Span::current().record("skill_count", discovery.skills.len());
+    outcome.retryable_errors = discovery.retryable_errors;
     outcome.warnings.extend(discovery.warnings);
     if discovery.skills.is_empty() {
         return outcome;
@@ -174,11 +206,12 @@ pub async fn load_environment_skills_from_root(
     for (path, result) in skill_results {
         let result = result.and_then(|skill| {
             outcome.warnings.extend(skill.warnings);
+            outcome.retryable_errors |= skill.retryable_errors;
             let name = namespace_resolver
                 .for_skill(root, &skill.path_to_skills_md)
                 .qualify(&skill.base_name);
             validate_len(&name, MAX_QUALIFIED_NAME_LEN, "qualified name")
-                .map_err(|err| err.to_string())?;
+                .map_err(EnvironmentSkillLoadError::invalid)?;
 
             Ok(EnvironmentSkillMetadata {
                 path_to_skills_md: skill.path_to_skills_md,
@@ -194,9 +227,13 @@ pub async fn load_environment_skills_from_root(
                 outcome.skills.push(skill);
             }
             Ok(_) => {}
-            Err(message) => outcome.warnings.push(format!(
-                "Failed to load environment skill at {path}: {message}"
-            )),
+            Err(error) => {
+                outcome.retryable_errors |= error.retryable;
+                outcome.warnings.push(format!(
+                    "Failed to load environment skill at {path}: {}",
+                    error.message
+                ));
+            }
         }
     }
     outcome.skills.sort_by(|left, right| {
@@ -212,32 +249,37 @@ pub async fn load_environment_skills_from_root(
 async fn read_skill_contents(
     file_system: &dyn ExecutorFileSystem,
     skill_path: &PathUri,
-) -> Result<String, String> {
+) -> Result<String, EnvironmentSkillLoadError> {
     file_system
         .read_file_text(skill_path, /*sandbox*/ None)
         .await
-        .map_err(|err| format!("failed to read file: {err}"))
+        .map_err(|err| EnvironmentSkillLoadError {
+            message: format!("failed to read file: {err}"),
+            retryable: true,
+        })
 }
 
 async fn probe_skill_metadata(
     file_system: &dyn ExecutorFileSystem,
     metadata_path: &PathUri,
-) -> (Option<SkillDependencies>, Option<SkillPolicy>, Vec<String>) {
+) -> LoadedSkillMetadata {
     match file_system
         .get_metadata(metadata_path, /*sandbox*/ None)
         .await
     {
         Ok(metadata) if metadata.is_file => {}
-        Ok(_) => return (None, None, Vec::new()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return (None, None, Vec::new()),
+        Ok(_) => return LoadedSkillMetadata::default(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return LoadedSkillMetadata::default();
+        }
         Err(error) => {
-            return (
-                None,
-                None,
-                vec![format!(
+            return LoadedSkillMetadata {
+                warnings: vec![format!(
                     "ignoring {metadata_path}: failed to stat metadata: {error}"
                 )],
-            );
+                retryable_errors: true,
+                ..Default::default()
+            };
         }
     }
     read_skill_metadata(file_system, metadata_path).await
@@ -246,45 +288,45 @@ async fn probe_skill_metadata(
 async fn read_skill_metadata(
     file_system: &dyn ExecutorFileSystem,
     metadata_path: &PathUri,
-) -> (Option<SkillDependencies>, Option<SkillPolicy>, Vec<String>) {
+) -> LoadedSkillMetadata {
     let contents = match file_system
         .read_file_text(metadata_path, /*sandbox*/ None)
         .await
     {
         Ok(contents) => contents,
         Err(error) => {
-            return (
-                None,
-                None,
-                vec![format!(
+            return LoadedSkillMetadata {
+                warnings: vec![format!(
                     "ignoring {metadata_path}: failed to read metadata: {error}"
                 )],
-            );
+                retryable_errors: true,
+                ..Default::default()
+            };
         }
     };
     let parsed: SkillMetadataFile = match serde_yaml::from_str(&contents) {
         Ok(parsed) => parsed,
         Err(error) => {
-            return (
-                None,
-                None,
-                vec![format!(
+            return LoadedSkillMetadata {
+                warnings: vec![format!(
                     "ignoring {metadata_path}: invalid metadata: {error}"
                 )],
-            );
+                ..Default::default()
+            };
         }
     };
 
     let mut diagnostics = Vec::new();
     let dependencies = resolve_dependencies(&mut diagnostics, parsed.dependencies);
-    (
+    LoadedSkillMetadata {
         dependencies,
-        resolve_policy(parsed.policy),
-        diagnostics
+        policy: resolve_policy(parsed.policy),
+        warnings: diagnostics
             .into_iter()
             .map(|message| format!("{metadata_path}: {message}"))
             .collect(),
-    )
+        retryable_errors: false,
+    }
 }
 
 fn default_skill_name(path: &PathUri) -> String {

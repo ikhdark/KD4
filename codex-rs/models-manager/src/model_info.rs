@@ -66,6 +66,28 @@ pub(crate) fn clear_instruction_messages(model: &mut ModelInfo) {
     }
 }
 
+pub(crate) fn matches_model_slug(model: &str, slug: &str) -> bool {
+    model == slug
+        || (!slug.is_empty()
+            && model
+                .strip_prefix(slug)
+                .is_some_and(|suffix| suffix.starts_with('-')))
+}
+
+/// Strip only one namespace with a simple provider id, not arbitrary alias paths.
+pub(crate) fn namespaced_model_suffix(model: &str) -> Option<&str> {
+    let (namespace, suffix) = model.split_once('/')?;
+    if suffix.contains('/')
+        || namespace.is_empty()
+        || !namespace
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some(suffix)
+}
+
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");

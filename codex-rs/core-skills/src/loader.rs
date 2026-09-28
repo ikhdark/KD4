@@ -549,6 +549,7 @@ async fn load_skills_under_root(
         plugin_roots,
         mut namespace_roots,
         warnings,
+        ..
     } = discover_skills(
         fs,
         &PathUri::from_abs_path(root),

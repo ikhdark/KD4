@@ -163,6 +163,21 @@ enum AuthStatusCheck {
     Discover(HeaderMap),
 }
 
+/// A short-lived negative discovery cache owned by one server/runtime identity.
+/// Credential state is always checked first; failed discovery is never cached.
+#[derive(Default)]
+pub struct OAuthDiscoveryCache {
+    unsupported: tokio::sync::Mutex<Option<UnsupportedOAuthDiscovery>>,
+}
+
+struct UnsupportedOAuthDiscovery {
+    url: String,
+    headers: HeaderMap,
+    expires: tokio::time::Instant,
+}
+
+const UNSUPPORTED_OAUTH_DISCOVERY_TTL: Duration = Duration::from_secs(300);
+
 /// Determine the authentication status for a streamable HTTP MCP server.
 // Keep this compatibility entrypoint aligned with the HTTP-client variant below.
 #[allow(clippy::too_many_arguments)]
@@ -213,6 +228,36 @@ pub async fn determine_streamable_http_auth_status_with_http_client(
     keyring_backend_kind: AuthKeyringBackendKind,
     http_client: Arc<dyn HttpClient>,
 ) -> Result<McpAuthState> {
+    determine_streamable_http_auth_status_with_cache(
+        codex_home,
+        server_name,
+        url,
+        bearer_token_env_var,
+        http_headers,
+        env_http_headers,
+        store_mode,
+        keyring_backend_kind,
+        http_client,
+        None,
+    )
+    .await
+}
+
+/// Like the HTTP-client entrypoint, with optional reuse of successful negative
+/// discovery. The caller must scope the cache to an unchanged server and route.
+#[allow(clippy::too_many_arguments)]
+pub async fn determine_streamable_http_auth_status_with_cache(
+    codex_home: &Path,
+    server_name: &str,
+    url: &str,
+    bearer_token_env_var: Option<&str>,
+    http_headers: Option<HashMap<String, String>>,
+    env_http_headers: Option<HashMap<String, String>>,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+    http_client: Arc<dyn HttpClient>,
+    cache: Option<&OAuthDiscoveryCache>,
+) -> Result<McpAuthState> {
     let default_headers = match auth_status_before_discovery(
         codex_home,
         server_name,
@@ -228,16 +273,35 @@ pub async fn determine_streamable_http_auth_status_with_http_client(
         AuthStatusCheck::Complete(status) => return Ok(status),
         AuthStatusCheck::Discover(default_headers) => default_headers,
     };
-    determine_auth_status_from_discovery(
-        server_name,
+    let mut cached = match cache {
+        Some(cache) => Some(cache.unsupported.lock().await),
+        None => None,
+    };
+    if cached
+        .as_ref()
+        .and_then(|entry| entry.as_ref())
+        .is_some_and(|entry| {
+            entry.url == url
+                && entry.headers == default_headers
+                && tokio::time::Instant::now() < entry.expires
+        })
+    {
+        return Ok(McpAuthState::Unsupported);
+    }
+    let discovery = discover_streamable_http_oauth_with_headers_and_http_client(
         url,
-        discover_streamable_http_oauth_with_headers_and_http_client(
-            url,
-            default_headers,
-            http_client,
-        )
-        .await,
+        default_headers.clone(),
+        http_client,
     )
+    .await;
+    if let Some(cached) = cached.as_mut() {
+        **cached = matches!(&discovery, Ok(None)).then(|| UnsupportedOAuthDiscovery {
+            url: url.to_owned(),
+            headers: default_headers,
+            expires: tokio::time::Instant::now() + UNSUPPORTED_OAUTH_DISCOVERY_TTL,
+        });
+    }
+    determine_auth_status_from_discovery(server_name, url, discovery)
 }
 
 // These arguments mirror the persisted MCP configuration fields and are kept
@@ -347,15 +411,12 @@ async fn discover_streamable_http_oauth_with_headers(
     let default_headers = default_headers.clone();
     let http_client =
         tokio::task::spawn_blocking(move || DiscoveryHttpClient::new(default_headers)).await??;
-    let authorization_manager = AuthorizationManager::new_with_oauth_http_client(
+    discover_streamable_http_oauth_with_adapter(
         url,
-        Arc::new(
-            OAuthHttpClientAdapter::new(Arc::new(http_client), HeaderMap::new())
-                .with_buffered_responses(),
-        ),
+        OAuthHttpClientAdapter::new(Arc::new(http_client), HeaderMap::new())
+            .with_buffered_responses(),
     )
-    .await?;
-    discover_streamable_http_oauth_with_manager(&authorization_manager).await
+    .await
 }
 
 async fn discover_streamable_http_oauth_with_headers_and_http_client(
@@ -366,25 +427,40 @@ async fn discover_streamable_http_oauth_with_headers_and_http_client(
     // Discovery probes several well-known URLs in turn, and rmcp suggests 30s
     // for each. Apply the direct discovery client's per-probe bound so a server
     // that accepts connections but never answers cannot stall callers for minutes.
-    let authorization_manager = AuthorizationManager::new_with_oauth_http_client(
+    discover_streamable_http_oauth_with_adapter(
         url,
-        Arc::new(
-            OAuthHttpClientAdapter::new(http_client, default_headers)
-                .with_timeout_cap(DISCOVERY_TIMEOUT),
-        ),
+        OAuthHttpClientAdapter::new(http_client, default_headers)
+            .with_timeout_cap(DISCOVERY_TIMEOUT),
     )
-    .await?;
-    discover_streamable_http_oauth_with_manager(&authorization_manager).await
+    .await
 }
 
-async fn discover_streamable_http_oauth_with_manager(
-    authorization_manager: &AuthorizationManager,
+async fn discover_streamable_http_oauth_with_adapter(
+    url: &str,
+    adapter: OAuthHttpClientAdapter,
 ) -> Result<Option<StreamableHttpOAuthDiscovery>> {
+    // rmcp swallows failed metadata probes as NoAuthorizationSupport. Retain
+    // transport failures so they cannot become durable negative-cache entries.
+    let discovery_error = Arc::new(std::sync::Mutex::new(None));
+    let authorization_manager = AuthorizationManager::new_with_oauth_http_client(
+        url,
+        Arc::new(adapter.with_discovery_error(Arc::clone(&discovery_error))),
+    )
+    .await?;
     match authorization_manager.discover_metadata().boxed().await {
         Ok(metadata) => Ok(Some(StreamableHttpOAuthDiscovery {
             scopes_supported: normalize_scopes(metadata.scopes_supported),
         })),
-        Err(AuthError::NoAuthorizationSupport) => Ok(None),
+        Err(AuthError::NoAuthorizationSupport) => {
+            let error = discovery_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            match error {
+                Some(error) => Err(anyhow::anyhow!("OAuth discovery probe failed: {error}")),
+                None => Ok(None),
+            }
+        }
         Err(err) => Err(err.into()),
     }
 }
@@ -489,6 +565,124 @@ mod tests {
     #[derive(Default)]
     struct TimeoutRecordingHttpClient {
         timeouts_ms: std::sync::Mutex<Vec<Option<u64>>>,
+    }
+
+    #[tokio::test]
+    async fn negative_discovery_cache_respects_headers_expiry_and_live_credentials() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        let home = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback({
+            let calls = Arc::clone(&calls);
+            move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NOT_FOUND
+                }
+            }
+        });
+        let server = TestServer {
+            url: url.clone(),
+            handle: tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }),
+        };
+        let client = codex_exec_server::Environment::default_for_tests().get_http_client();
+        let cache = OAuthDiscoveryCache::default();
+        let status = |headers, cache| {
+            determine_streamable_http_auth_status_with_cache(
+                home.path(),
+                "cached",
+                &server.url,
+                None,
+                headers,
+                None,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct,
+                client.clone(),
+                cache,
+            )
+        };
+        assert_eq!(
+            status(None, Some(&cache)).await.unwrap(),
+            McpAuthState::Unsupported
+        );
+        let initial = calls.load(Ordering::SeqCst);
+        assert!(initial > 0);
+        let (first, second) = tokio::join!(status(None, Some(&cache)), status(None, Some(&cache)));
+        assert_eq!(first.unwrap(), McpAuthState::Unsupported);
+        assert_eq!(second.unwrap(), McpAuthState::Unsupported);
+        assert_eq!(calls.load(Ordering::SeqCst), initial);
+        let headers = Some(HashMap::from([("x-tenant".to_owned(), "other".to_owned())]));
+        assert_eq!(
+            status(headers.clone(), Some(&cache)).await.unwrap(),
+            McpAuthState::Unsupported
+        );
+        let after_header_change = calls.load(Ordering::SeqCst);
+        assert!(after_header_change > initial);
+        cache.unsupported.lock().await.as_mut().unwrap().expires = tokio::time::Instant::now();
+        assert_eq!(
+            status(headers.clone(), Some(&cache)).await.unwrap(),
+            McpAuthState::Unsupported
+        );
+        assert!(calls.load(Ordering::SeqCst) > after_header_change);
+        let before_explicit = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            status(headers.clone(), None).await.unwrap(),
+            McpAuthState::Unsupported
+        );
+        assert!(calls.load(Ordering::SeqCst) > before_explicit);
+        let before_credentials = calls.load(Ordering::SeqCst);
+        let tokens = serde_json::from_value::<crate::StoredOAuthTokens>(serde_json::json!({
+            "server_name":"cached", "url":server.url, "client_id":"client",
+            "token_response":{"access_token":"new-token","token_type":"bearer"}, "expires_at":null
+        }))
+        .unwrap();
+        crate::save_oauth_tokens(
+            home.path(),
+            "cached",
+            &tokens,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::Direct,
+        )
+        .unwrap();
+        assert_eq!(
+            status(headers, Some(&cache)).await.unwrap(),
+            McpAuthState::OAuth
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before_credentials);
+    }
+
+    #[tokio::test]
+    async fn failed_discovery_is_not_a_negative_cache_hit() {
+        let home = tempfile::tempdir().unwrap();
+        let client = Arc::new(TimeoutRecordingHttpClient::default());
+        let cache = OAuthDiscoveryCache::default();
+        let mut previous = 0;
+        for _ in 0..2 {
+            let result = determine_streamable_http_auth_status_with_cache(
+                home.path(),
+                "offline",
+                "http://127.0.0.1:1/mcp",
+                None,
+                None,
+                None,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct,
+                client.clone(),
+                Some(&cache),
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(cache.unsupported.lock().await.is_none());
+            let requests = client.timeouts_ms.lock().unwrap().len();
+            assert!(requests > previous);
+            previous = requests;
+        }
     }
 
     impl TimeoutRecordingHttpClient {

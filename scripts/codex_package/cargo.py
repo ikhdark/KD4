@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from functools import wraps
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -51,7 +52,17 @@ _build_leases = ContextVar("package_build_leases", default=frozenset())
 
 
 @contextmanager
-def package_build_lease(spec, profile):
+def package_build_lease(spec, profile, *, inputs=None):
+    if inputs is not None and all(
+        path is not None
+        and not (path.is_file() and path.stat().st_nlink > 1)
+        and not path.resolve().is_relative_to(
+            package_target_base(spec, profile).resolve()
+        )
+        for path in inputs
+    ):
+        yield None
+        return
     target = cargo_package_target_dir(spec, profile).resolve()
     held = _build_leases.get()
     if target in held:
@@ -72,7 +83,13 @@ def package_build_lease(spec, profile):
 def _leased_build(function):
     @wraps(function)
     def wrapped(spec, variant, **kwargs):
-        with package_build_lease(spec, kwargs["profile"]):
+        with package_build_lease(
+            spec,
+            kwargs["profile"],
+            inputs=tuple(
+                kwargs.get(name) for name in SourceBuildOutputs.__dataclass_fields__
+            ),
+        ):
             return function(spec, variant, **kwargs)
 
     return wrapped
@@ -173,6 +190,7 @@ def build_source_binaries(
 
     if binaries:
         # A failed or interrupted rebuild must not leave an older proof reusable.
+        previous_stamp = observation.get("stamp") or read_source_build_stamp(target_dir)
         source_build_stamp_path(target_dir).unlink(missing_ok=True)
         if "source" not in observation:
             observation["source"] = source_tree_fingerprint()
@@ -206,6 +224,7 @@ def build_source_binaries(
             source_before=observation["source"],
             recipe_before=observation["recipe"],
             reused_outputs=reused_outputs,
+            previous_stamp=previous_stamp,
             build_env=build_env,
             cargo=cargo,
             release_version=release_version,
@@ -403,9 +422,9 @@ def cargo_profile_output_dir(
     return target_dir / spec.target / cargo_profile_dirname(profile)
 
 
-def cargo_package_target_dir(spec: TargetSpec, profile: str) -> Path:
+def package_target_base(spec: TargetSpec, profile: str) -> Path:
     explicit = os.environ.get(PACKAGE_TARGET_DIR_ENV)
-    base = (
+    return (
         resolve_cargo_target_dir(explicit)
         if explicit is not None
         else (
@@ -415,6 +434,10 @@ def cargo_package_target_dir(spec: TargetSpec, profile: str) -> Path:
             / f"{spec.target}-{cargo_profile_dirname(profile)}"
         )
     )
+
+
+def cargo_package_target_dir(spec: TargetSpec, profile: str) -> Path:
+    base = package_target_base(spec, profile)
     env = cargo_build_env(spec, profile, target_dir=base)
     identity = effective_tool_contents(spec, env)
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
@@ -422,39 +445,122 @@ def cargo_package_target_dir(spec: TargetSpec, profile: str) -> Path:
 
 
 def effective_tool_contents(spec, env):
-    commands = {"rustc": env.get("RUSTC", "rustc")}
-    commands.update(
-        {
-            name: value
-            for name, value in env.items()
-            if value
-            and (
-                name in {"RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"}
-                or name.endswith("_LINKER")
-            )
-        }
-    )
     import tomllib
 
-    for path in cargo_config_paths(env):
+    build_tools = {}
+    linkers = {}
+    unavailable = {}
+    paths = cargo_config_paths(env)
+    for legacy, modern in zip(paths[::2], paths[1::2]):
+        # Cargo prefers `config` over `config.toml` in the same directory,
+        # and nearer configuration files override ancestors and CARGO_HOME.
+        path = legacy if legacy.is_file() else modern
         if not path.is_file():
             continue
         try:
             config = tomllib.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            commands[str(path)] = "<unresolved-config>"
+            unavailable[str(path)] = {"status": "unavailable"}
             continue
-        build = config.get("build", {})
+
+        def config_command(value, base=path.parent.parent):
+            if "/" in value or "\\" in value:
+                return str((base / value).resolve())
+            return value
+
         for name in ("rustc", "rustc-wrapper", "rustc-workspace-wrapper"):
-            if build.get(name):
-                commands[f"{path}:{name}"] = build[name]
+            value = config.get("build", {}).get(name)
+            if isinstance(value, str):
+                build_tools.setdefault(name, config_command(value))
         for target, values in config.get("target", {}).items():
             if isinstance(values, dict) and isinstance(values.get("linker"), str):
-                commands[f"{path}:{target}:linker"] = values["linker"]
-    return {
+                linkers.setdefault(target, config_command(values["linker"]))
+
+    commands = {}
+    for name, env_name, default in (
+        ("rustc", "RUSTC", "rustc"),
+        ("rustc-wrapper", "RUSTC_WRAPPER", ""),
+        ("rustc-workspace-wrapper", "RUSTC_WORKSPACE_WRAPPER", ""),
+    ):
+        value = env.get(
+            env_name, env.get(f"CARGO_BUILD_{env_name}", build_tools.get(name, default))
+        )
+        if value:
+            commands[env_name if name != "rustc" else name] = value
+
+    linker_name = cargo_target_linker_env_name(spec.target)
+    linker = env.get(linker_name, linkers.get(spec.target))
+    if linker is None:
+        matches = []
+        for target, command in linkers.items():
+            if not target.startswith("cfg("):
+                continue
+            matched = cfg_matches_target(target, spec)
+            if matched is None:
+                unavailable[target] = {"status": "unavailable"}
+            elif matched:
+                matches.append(command)
+        if len(matches) == 1:
+            linker = matches[0]
+        elif matches:
+            unavailable["linker"] = {"status": "unavailable"}
+    if linker:
+        commands[linker_name] = linker
+    return unavailable | {
         name: executable_content_identity(command, env)
         for name, command in commands.items()
     }
+
+
+def cfg_matches_target(expression: str, spec: TargetSpec) -> bool | None:
+    """Match built-in Windows cfg selectors; unknown predicates cannot prove reuse."""
+    facts = {
+        "target_arch": "aarch64" if spec.target.startswith("aarch64-") else "x86_64",
+        "target_os": "windows",
+        "target_family": "windows",
+        "target_env": "msvc",
+        "target_vendor": "pc",
+        "target_pointer_width": "64",
+        "target_endian": "little",
+    }
+    tokens = iter(
+        re.findall(r'"(?:[^"\\]|\\.)*"|[A-Za-z_][A-Za-z_0-9]*|\S', expression)
+    )
+    token = next(tokens, None)
+
+    def parse():
+        nonlocal token
+        name = token
+        token = next(tokens, None)
+        if token == "=":
+            value = json.loads(next(tokens))
+            token = next(tokens, None)
+            return facts[name] == value if name in facts else None
+        if token != "(":
+            return {"windows": True, "unix": False}.get(name)
+        token = next(tokens, None)
+        values = []
+        while token != ")":
+            values.append(parse())
+            if token != ",":
+                break
+            token = next(tokens, None)
+        if token != ")":
+            raise ValueError("invalid cfg selector")
+        token = next(tokens, None)
+        if name == "all":
+            return False if False in values else None if None in values else True
+        if name == "any":
+            return True if True in values else None if None in values else False
+        if name in {"cfg", "not"} and len(values) == 1:
+            return values[0] if name == "cfg" or values[0] is None else not values[0]
+        return None
+
+    try:
+        matched = parse()
+        return matched if token is None else None
+    except (ValueError, StopIteration, TypeError, RecursionError):
+        return None
 
 
 def cargo_target_dir() -> Path:
@@ -484,6 +590,10 @@ def cargo_build_env(
 ) -> dict[str, str]:
     env = dict(os.environ)
     env.pop("CARGO_TARGET_DIR", None)
+    # This is injected into tool processes per chat, not a compiler input.
+    # Remove it from execution as well as evidence, leaving arbitrary build
+    # script inputs covered by the full environment fingerprint.
+    env.pop("CODEX_THREAD_ID", None)
     env.setdefault("RUST_MIN_STACK", DEFAULT_RUST_MIN_STACK)
     if release_version is not None:
         env["CODEX_RELEASE_VERSION"] = release_version
@@ -571,9 +681,11 @@ def binaries_missing_for_reuse(
     if force_rebuild or not reuse_existing:
         return binaries
 
-    stamp = read_source_build_stamp(target_dir)
+    stamp = read_source_build_stamp(target_dir, variant=variant)
     if stamp is None:
         return binaries
+    if observation is not None:
+        observation["stamp"] = stamp
 
     stamp_outputs = stamp.get("outputs")
     if not isinstance(stamp_outputs, dict):
@@ -674,7 +786,9 @@ def source_build_stamp_path(target_dir: Path) -> Path:
     return target_dir / SOURCE_BUILD_STAMP
 
 
-def read_source_build_stamp(target_dir: Path) -> dict | None:
+def read_source_build_stamp(
+    target_dir: Path, *, variant: PackageVariant | None = None
+) -> dict | None:
     path = source_build_stamp_path(target_dir)
     if not path.is_file():
         return None
@@ -682,7 +796,18 @@ def read_source_build_stamp(target_dir: Path) -> dict | None:
         stamp = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return stamp if isinstance(stamp, dict) else None
+    if (
+        not isinstance(stamp, dict)
+        or not isinstance(stamp.get("outputs"), dict)
+        or not isinstance(stamp.get("entrypoints", {}), dict)
+    ):
+        return None
+    if variant is not None and "entrypoints" in stamp:
+        stamp["outputs"] = {
+            **stamp.get("outputs", {}),
+            "entrypoint_bin": stamp["entrypoints"].get(variant.name),
+        }
+    return stamp
 
 
 def write_source_build_stamp(
@@ -699,6 +824,7 @@ def write_source_build_stamp(
     source_before: dict | None = None,
     recipe_before: dict | None = None,
     reused_outputs: dict[str, dict] | None = None,
+    previous_stamp: dict | None = None,
 ) -> None:
     stamp = {
         "target": spec.target,
@@ -752,6 +878,46 @@ def write_source_build_stamp(
             "package cargo reuse disabled: build inputs changed or could not be verified"
         )
         return
+    entrypoints = {}
+    if (
+        previous_stamp is not None
+        and source_build_stamp_metadata_matches(
+            previous_stamp,
+            spec=spec,
+            profile=profile,
+            variant=variant,
+            recipe=stamp["build_recipe"],
+        )
+        and source_build_stamp_source_matches(previous_stamp, source=stamp["source"])
+    ):
+        for name, fingerprint in previous_stamp.get("entrypoints", {}).items():
+            if (
+                name == variant.name
+                and stamp["outputs"].get("entrypoint_bin") is not None
+            ):
+                continue
+            if (
+                isinstance(fingerprint, dict)
+                and isinstance(fingerprint.get("path"), str)
+                and source_output_matches_fingerprint(
+                    Path(fingerprint["path"]), fingerprint
+                )
+            ):
+                entrypoints[name] = fingerprint
+        for name, fingerprint in previous_stamp.get("outputs", {}).items():
+            if (
+                name != "entrypoint_bin"
+                and name not in stamp["outputs"]
+                and isinstance(fingerprint, dict)
+                and isinstance(fingerprint.get("path"), str)
+                and source_output_matches_fingerprint(
+                    Path(fingerprint["path"]), fingerprint
+                )
+            ):
+                stamp["outputs"][name] = fingerprint
+    if stamp["outputs"].get("entrypoint_bin") is not None:
+        entrypoints[variant.name] = stamp["outputs"]["entrypoint_bin"]
+    stamp["entrypoints"] = entrypoints
     path.parent.mkdir(parents=True, exist_ok=True)
     contents = json.dumps(stamp, sort_keys=True, indent=2) + "\n"
     file_descriptor, temporary_name = tempfile.mkstemp(
@@ -781,7 +947,7 @@ def source_build_stamp_matches(
     cargo: str = "cargo",
     release_version: str | None = None,
 ) -> bool:
-    stamp = read_source_build_stamp(target_dir)
+    stamp = read_source_build_stamp(target_dir, variant=variant)
     if stamp is None:
         return False
 
@@ -812,11 +978,7 @@ def source_build_stamp_metadata_matches(
     build_env: dict[str, str] | None = None,
     recipe: dict | None = None,
 ) -> bool:
-    if (
-        stamp.get("target") != spec.target
-        or stamp.get("profile") != profile
-        or stamp.get("variant") != variant.name
-    ):
+    if stamp.get("target") != spec.target or stamp.get("profile") != profile:
         return False
     recipe = (
         recipe
@@ -856,7 +1018,8 @@ def build_recipe_fingerprint(
             spec, profile, target_dir=target_dir, release_version=release_version
         )
     )
-    rustc = effective_env.get("RUSTC", "rustc")
+    tools = effective_tool_contents(spec, effective_env)
+    rustc = tools.get("rustc", {}).get("path", effective_env.get("RUSTC", "rustc"))
     # Build scripts and env!/option_env! can consume arbitrary variables.
     # Conservatively hash the full supplied environment, including absent vs
     # empty values, rather than treating an allowlist as Cargo freshness proof.
@@ -880,12 +1043,12 @@ def build_recipe_fingerprint(
     ]
 
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "target": spec.target,
         "profile": profile,
         "cargo": command_identity(cargo, "--version", "--verbose", env=effective_env),
         "rustc": command_identity(rustc, "-Vv", env=effective_env),
-        "tools": effective_tool_contents(spec, effective_env),
+        "tools": tools,
         "environment": environment,
         "effective_command_sha256": hashlib.sha256(
             "\0".join(effective_command).encode("utf-8")
@@ -983,14 +1146,45 @@ def command_identity(
     }
 
 
-def executable_content_identity(command, env, *, resolved=False):
+def executable_content_identity(command, env, *, resolved=False, _seen=frozenset()):
     executable = command if resolved else resolve_command(command, env=env)
     if executable is None or not Path(executable).is_file():
         return {"status": "unavailable", "path": command}
     path = Path(executable)
-    with path.open("rb") as handle:
-        content = hashlib.file_digest(handle, "sha256").hexdigest()
-    return {"path": str(path.resolve()), "sha256": content}
+    canonical = path.resolve()
+    if canonical in _seen or len(_seen) >= 16:
+        return {"status": "unavailable", "path": str(canonical)}
+    try:
+        with path.open("rb") as handle:
+            content = hashlib.file_digest(handle, "sha256").hexdigest()
+        identity = {"path": str(canonical), "sha256": content}
+        shim = path.with_suffix(".shim")
+        if path.suffix.lower() == ".exe" and shim.is_file():
+            dispatch = shim.read_bytes()
+            identity["shim_sha256"] = hashlib.sha256(dispatch).hexdigest()
+            fields = dict(
+                re.findall(
+                    r'^\s*(\w+)\s*=\s*"(.*)"\s*$',
+                    dispatch.decode("utf-8-sig"),
+                    re.MULTILINE,
+                )
+            )
+            target = Path(fields.get("path", ""))
+            if not target.is_absolute():
+                identity["status"] = "unavailable"
+                return identity
+            target_identity = executable_content_identity(
+                str(target), env, resolved=True, _seen=_seen | {canonical}
+            )
+            identity["shim_target"] = target_identity
+            # Argument-bearing launchers can load arbitrary scripts/configs.
+            # Their dispatch changes partition Cargo outputs, but opaque inputs
+            # must not authorize the fingerprint-only skip path.
+            if fields.get("args") or target_identity.get("status") == "unavailable":
+                identity["status"] = "unavailable"
+        return identity
+    except (OSError, UnicodeError):
+        return {"status": "unavailable", "path": str(canonical)}
 
 
 def files_fingerprint(paths: tuple[Path, ...]) -> dict[str, object]:
@@ -1023,9 +1217,6 @@ def source_tree_fingerprint() -> dict[str, str]:
             .decode("utf-8", "surrogateescape")
             .strip()
         )
-        index_tree = (
-            run_git_bytes(git, "write-tree").decode("utf-8", "surrogateescape").strip()
-        )
         tracked_diff = run_git_bytes(git, "diff", "--binary", "HEAD", "--", ".")
         untracked_names = run_git_bytes(
             git, "ls-files", "--others", "--exclude-standard", "-z", "--", "."
@@ -1052,7 +1243,6 @@ def source_tree_fingerprint() -> dict[str, str]:
     return {
         "status": "ok",
         "git_head": head,
-        "index_tree": index_tree,
         "working_tree_sha256": hashlib.sha256(tracked_diff).hexdigest(),
         "untracked_names_sha256": hashlib.sha256(untracked_names).hexdigest(),
         "untracked_contents_sha256": untracked_contents.hexdigest(),
@@ -1101,7 +1291,6 @@ def source_output_fingerprint(path: Path | None) -> dict | None:
     return {
         "path": str(path),
         "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
         "sha256": digest.hexdigest(),
     }
 
@@ -1133,7 +1322,6 @@ def source_output_matches_fingerprint(path: Path | None, fingerprint: object) ->
         for key, value in {
             "path": str(path),
             "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
         }.items()
     ):
         return False

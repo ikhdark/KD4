@@ -11,8 +11,9 @@ use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::HttpClient;
 use codex_login::CodexAuth;
 use codex_rmcp_client::McpAuthState;
+use codex_rmcp_client::OAuthDiscoveryCache;
 use codex_rmcp_client::OAuthProviderError;
-use codex_rmcp_client::determine_streamable_http_auth_status_with_http_client;
+use codex_rmcp_client::determine_streamable_http_auth_status_with_cache;
 use codex_rmcp_client::discover_streamable_http_oauth;
 use codex_rmcp_client::discover_streamable_http_oauth_with_http_client;
 use futures::FutureExt;
@@ -193,7 +194,32 @@ pub async fn compute_auth_statuses<'a, I>(
 where
     I: IntoIterator<Item = (&'a String, &'a EffectiveMcpServer)>,
 {
+    compute_auth_statuses_with_cache(
+        servers,
+        codex_home,
+        store_mode,
+        keyring_backend_kind,
+        auth,
+        runtime_context,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn compute_auth_statuses_with_cache<'a, I>(
+    servers: I,
+    codex_home: &Path,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+    auth: Option<&CodexAuth>,
+    runtime_context: &McpRuntimeContext,
+    discovery_cache: Option<&HashMap<String, codex_rmcp_client::OAuthDiscoveryCache>>,
+) -> HashMap<String, McpAuthStatusEntry>
+where
+    I: IntoIterator<Item = (&'a String, &'a EffectiveMcpServer)>,
+{
     let futures = servers.into_iter().map(|(name, server)| {
+        let cache = discovery_cache.and_then(|cache| cache.get(name));
         let name = name.clone();
         let codex_home = codex_home.to_path_buf();
         let config = server.configured_config().cloned();
@@ -222,6 +248,7 @@ where
                         keyring_backend_kind,
                         has_runtime_auth,
                         &runtime_context,
+                        cache,
                     )
                     .await
                     {
@@ -244,6 +271,7 @@ where
     join_all(futures).await.into_iter().collect()
 }
 
+#[expect(clippy::too_many_arguments, reason = "keeps per-server discovery inputs explicit without a parallel configuration type")]
 async fn compute_auth_status(
     server_name: &str,
     codex_home: &Path,
@@ -252,6 +280,7 @@ async fn compute_auth_status(
     keyring_backend_kind: AuthKeyringBackendKind,
     has_runtime_auth: bool,
     runtime_context: &McpRuntimeContext,
+    discovery_cache: Option<&OAuthDiscoveryCache>,
 ) -> Result<McpAuthState> {
     if !config.enabled {
         return Ok(McpAuthState::Unsupported);
@@ -279,7 +308,7 @@ async fn compute_auth_status(
                 .unwrap_or(crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT);
             tokio::time::timeout(
                 startup_timeout,
-                determine_streamable_http_auth_status_with_http_client(
+                determine_streamable_http_auth_status_with_cache(
                     codex_home,
                     server_name,
                     url,
@@ -289,6 +318,7 @@ async fn compute_auth_status(
                     store_mode,
                     keyring_backend_kind,
                     http_client,
+                    discovery_cache,
                 )
                 .boxed(),
             )

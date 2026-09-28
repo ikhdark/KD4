@@ -14,6 +14,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
+try:
+    from scripts.process_owner import CleanupFailed, run_owned
+except ImportError:  # Direct script execution places scripts/ on sys.path.
+    from process_owner import CleanupFailed, run_owned
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTEST_CACHE_DIRS = (Path(".pytest_cache"), Path("sdk/python/.pytest_cache"))
@@ -54,8 +59,9 @@ class GitStatusResult:
 def run_git(
     args: Sequence[str], *, timeout: float = 5.0, discard_stdout: bool = False
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return run_owned(
         ["git", *args],
+        preserve_descendants_on_success=True,
         cwd=REPO_ROOT,
         text=True,
         encoding="utf-8",
@@ -70,7 +76,7 @@ def run_git(
 def git_config(name: str) -> str | None:
     try:
         completed = run_git(["config", "--get", name])
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired, CleanupFailed) as exc:
         raise RepositoryProbeError(f"could not read Git config {name}: {exc}") from exc
     if (
         completed.returncode == 1
@@ -121,7 +127,7 @@ def timed_status(timeout: float) -> GitStatusResult:
         )
     except subprocess.TimeoutExpired as exc:
         return GitStatusResult(None, True, None, bounded_error(str(exc)))
-    except OSError as exc:
+    except (OSError, CleanupFailed) as exc:
         return GitStatusResult(time.monotonic() - started, False, None, str(exc))
     elapsed = time.monotonic() - started
     return GitStatusResult(
@@ -180,7 +186,7 @@ def recommendations(
 def build_report(timeout: float) -> GitDoctorReport:
     try:
         root_probe = run_git(["rev-parse", "--show-toplevel"])
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired, CleanupFailed) as exc:
         raise RepositoryProbeError(
             f"could not discover repository root: {exc}"
         ) from exc
@@ -202,6 +208,14 @@ def build_report(timeout: float) -> GitDoctorReport:
     elif status.failed:
         detail = f": {status.error}" if status.error else ""
         recs = (*recs, f"`git status --short --untracked-files=all` failed{detail}.")
+    elif status.error:
+        recs = (
+            *recs,
+            (
+                "`git status --short --untracked-files=all` succeeded with diagnostics: "
+                f"{status.error}"
+            ),
+        )
     return GitDoctorReport(
         repo_root=root,
         platform=platform.platform(),

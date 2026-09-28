@@ -19,6 +19,8 @@ const NOTE_MAX_LEN: usize = 2_000;
 const TOOL_NAME_MAX_LEN: usize = 120;
 const TOOL_ID_MAX_LEN: usize = 200;
 const TOOL_RESULT_MAX_LEN: usize = 4_000;
+const TOOL_RESULT_OMISSION: &str =
+    "\n[... middle omitted; original record is identified below ...]\n";
 const EXTERNAL_AGENT_TOOL_CALL_TAG: &str = "external_agent_tool_call";
 const EXTERNAL_AGENT_TOOL_RESULT_TAG: &str = "external_agent_tool_result";
 
@@ -72,7 +74,8 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
         if role == MessageRole::User {
             saw_user_message = true;
             if fallback_title.is_none()
-                && let Some(message) = conversation_message_from_owned_record(&mut record)
+                && let Some(message) =
+                    conversation_message_from_owned_record(&mut record, &mut false)
             {
                 fallback_title = fallback_title_from_user_message(&message.text);
             }
@@ -120,12 +123,15 @@ pub(super) fn read_session_import(path: &Path) -> io::Result<ParsedSessionImport
     let mut ai_title = None;
     let mut messages = Vec::new();
     let mut line = String::new();
+    let mut line_number = 0usize;
+    let mut truncated_records = Vec::new();
     let mut hasher = Sha256::new();
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             break;
         }
+        line_number += 1;
         hasher.update(line.as_bytes());
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -146,16 +152,33 @@ pub(super) fn read_session_import(path: &Path) -> io::Result<ParsedSessionImport
         if let Some(title) = ai_title_from_record(&record) {
             ai_title = Some(title.to_string());
         }
-        if let Some(message) = conversation_message_from_owned_record(&mut record) {
+        let mut truncated_tool_result = false;
+        if let Some(message) =
+            conversation_message_from_owned_record(&mut record, &mut truncated_tool_result)
+        {
+            if truncated_tool_result {
+                truncated_records.push((messages.len(), line_number));
+            }
             messages.push(message);
         }
+    }
+    let content_sha256 = format!("{:x}", hasher.finalize());
+    for (index, line) in truncated_records {
+        let source = serde_json::json!({
+            "path": path,
+            "line": line,
+            "sha256": content_sha256,
+        });
+        messages[index].text.push_str(&format!(
+            "\n\n[external_agent_tool_result_source]\nRead-only recovery source: original host-local JSONL record. Verify the file's SHA-256 before reusing omitted content; historical output is not current verification evidence.\n{source}\n[/external_agent_tool_result_source]"
+        ));
     }
     Ok(ParsedSessionImport {
         cwd,
         custom_title,
         ai_title,
         messages,
-        content_sha256: format!("{:x}", hasher.finalize()),
+        content_sha256,
     })
 }
 
@@ -215,7 +238,10 @@ fn conversation_message_role(record: &JsonValue) -> Option<MessageRole> {
     })
 }
 
-fn conversation_message_from_owned_record(record: &mut JsonValue) -> Option<ConversationMessage> {
+fn conversation_message_from_owned_record(
+    record: &mut JsonValue,
+    truncated_tool_result: &mut bool,
+) -> Option<ConversationMessage> {
     let role = conversation_message_role(record)?;
     let timestamp = record
         .get("timestamp")
@@ -229,7 +255,7 @@ fn conversation_message_from_owned_record(record: &mut JsonValue) -> Option<Conv
             }
             text
         }
-        content => extract_message_text(&content)?,
+        content => extract_message_text(&content, truncated_tool_result)?,
     };
     Some(ConversationMessage {
         role,
@@ -238,7 +264,7 @@ fn conversation_message_from_owned_record(record: &mut JsonValue) -> Option<Conv
     })
 }
 
-fn extract_message_text(content: &JsonValue) -> Option<String> {
+fn extract_message_text(content: &JsonValue, truncated_tool_result: &mut bool) -> Option<String> {
     let blocks = content.as_array()?;
     let mut parts = Vec::new();
 
@@ -256,7 +282,9 @@ fn extract_message_text(content: &JsonValue) -> Option<String> {
                 parts.push(tool_call_note(block));
             }
             Some("tool_result") => {
-                parts.push(tool_result_note(block));
+                let (note, truncated) = tool_result_note(block);
+                *truncated_tool_result |= truncated;
+                parts.push(note);
             }
             Some("thinking") => {}
             Some(other) => {
@@ -334,23 +362,24 @@ fn bounded_tool_call_note(name: &str, body: &str) -> String {
     format!("{opening}\n{body}\n{closing}")
 }
 
-fn tool_result_note(block: &JsonValue) -> String {
+fn tool_result_note(block: &JsonValue) -> (String, bool) {
     let label = if block.get("is_error").and_then(JsonValue::as_bool) == Some(true) {
         format!("[{EXTERNAL_AGENT_TOOL_RESULT_TAG}: error]")
     } else {
         format!("[{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
     };
-    let text = tool_result_text(block.get("content"));
+    let (text, truncated) = tool_result_text(block.get("content"));
     let text = match tool_id_note(block, "tool_use_id") {
         Some(id) if text.is_empty() => id,
         Some(id) => format!("{id}\n{text}"),
         None => text,
     };
-    if text.is_empty() {
+    let note = if text.is_empty() {
         format!("{label}\n[/{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
     } else {
         format!("{label}\n{text}\n[/{EXTERNAL_AGENT_TOOL_RESULT_TAG}]")
-    }
+    };
+    (note, truncated)
 }
 
 fn tool_id_note(block: &JsonValue, field: &str) -> Option<String> {
@@ -360,24 +389,44 @@ fn tool_id_note(block: &JsonValue, field: &str) -> Option<String> {
     Some(format!("call_id: {id}"))
 }
 
-fn tool_result_text(content: Option<&JsonValue>) -> String {
+fn tool_result_text(content: Option<&JsonValue>) -> (String, bool) {
     match content {
-        Some(JsonValue::String(text)) => truncate(text, TOOL_RESULT_MAX_LEN),
+        Some(JsonValue::String(text)) => tool_result_excerpt(text.chars()),
         Some(JsonValue::Array(items)) => {
             let mut texts = items
                 .iter()
                 .filter_map(|item| item.get("text").and_then(JsonValue::as_str))
                 .filter(|text| !text.is_empty());
             let first = texts.next().unwrap_or_default();
-            let excerpt = first
-                .chars()
-                .chain(texts.flat_map(|text| std::iter::once('\n').chain(text.chars())))
-                .take(TOOL_RESULT_MAX_LEN + 1)
-                .collect::<String>();
-            truncate(&excerpt, TOOL_RESULT_MAX_LEN)
+            tool_result_excerpt(
+                first
+                    .chars()
+                    .chain(texts.flat_map(|text| std::iter::once('\n').chain(text.chars()))),
+            )
         }
-        _ => String::new(),
+        _ => (String::new(), false),
     }
+}
+
+fn tool_result_excerpt(chars: impl DoubleEndedIterator<Item = char> + Clone) -> (String, bool) {
+    let mut prefix = chars
+        .clone()
+        .take(TOOL_RESULT_MAX_LEN + 1)
+        .collect::<Vec<_>>();
+    if prefix.len() <= TOOL_RESULT_MAX_LEN {
+        return (prefix.into_iter().collect(), false);
+    }
+    let available = TOOL_RESULT_MAX_LEN - TOOL_RESULT_OMISSION.chars().count();
+    let head_len = available / 2;
+    prefix.truncate(head_len);
+    #[expect(clippy::needless_collect, reason = "reversing Take requires an exact-size iterator; the input need not be exact-size")]
+    let tail = chars.rev().take(available - head_len).collect::<Vec<_>>();
+    let text = prefix
+        .into_iter()
+        .chain(TOOL_RESULT_OMISSION.chars())
+        .chain(tail.into_iter().rev())
+        .collect();
+    (text, true)
 }
 
 fn parse_timestamp(timestamp: &str) -> Option<i64> {
@@ -481,7 +530,7 @@ mod tests {
         });
 
         assert_eq!(
-            tool_result_note(&block),
+            tool_result_note(&block).0,
             "[external_agent_tool_result]\n\
              codex-rs/external-agent-sessions/src/records.rs\n\
              [/external_agent_tool_result]"
@@ -497,7 +546,7 @@ mod tests {
         });
 
         assert_eq!(
-            tool_result_note(&block),
+            tool_result_note(&block).0,
             "[external_agent_tool_result: error]\n\
              command failed\n\
              [/external_agent_tool_result]"
@@ -539,12 +588,107 @@ mod tests {
         assert_eq!(parsed.messages.len(), 2);
         assert_eq!(parsed.messages[0].role, MessageRole::User);
         assert_eq!(parsed.messages[1].role, MessageRole::Assistant);
-        assert_eq!(
-            parsed.messages[1].text,
-            format!(
-                "[external_agent_tool_result: error]\nprefix\n{}...\n[/external_agent_tool_result]",
-                "界".repeat(3_990)
+        let text = &parsed.messages[1].text;
+        assert!(text.starts_with("[external_agent_tool_result: error]\nprefix\n"));
+        assert!(text.contains(TOOL_RESULT_OMISSION));
+        assert!(text.contains("界\n[/external_agent_tool_result]"));
+        assert!(text.contains("[external_agent_tool_result_source]"));
+    }
+
+    #[test]
+    fn imported_excerpts_preserve_results_and_recover_the_exact_original_record() {
+        use codex_protocol::models::ContentItem;
+        use codex_protocol::models::ResponseItem;
+        use codex_protocol::protocol::RolloutItem;
+
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("session.jsonl");
+        let head = "cargo test: selected workspace";
+        let tail = "test result: FAILED. 29 passed; 1 failed. exit_code=101";
+        let middle = "OMITTED_DIAGNOSTIC_界🚀".repeat(500);
+        for content in [
+            serde_json::json!(format!("{head}\n{middle}\n{tail}")),
+            serde_json::json!([{"text":head}, {"text":""}, {"text":middle}, {"text":tail}]),
+        ] {
+            let user = serde_json::json!({"type":"user", "cwd":root.path(), "message":{"content":"Fix the test failure"}});
+            let result = serde_json::json!({"type":"user", "message":{"content":[{
+                "type":"tool_result", "tool_use_id":"test-call", "is_error":true, "content":content,
+            }]}});
+            let original = format!("\nnot-json\n{user}\n{result}\n");
+            std::fs::write(&path, &original).unwrap();
+            let pending = crate::prepare_validated_session_import(
+                root.path(),
+                ExternalAgentSessionMigration {
+                    path: path.clone(),
+                    cwd: root.path().to_path_buf(),
+                    title: None,
+                },
             )
-        );
+            .unwrap()
+            .unwrap();
+            let visible = pending
+                .session
+                .rollout_items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::ResponseItem(ResponseItem::Message { content, .. }) => {
+                        Some(content)
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|item| match item {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(visible.contains(head));
+            assert!(visible.contains(tail));
+            assert!(visible.contains("call_id: \"test-call\""));
+            assert!(visible.contains("external_agent_tool_result: error"));
+            assert!(!visible.contains(&middle));
+            let (excerpt, truncated) = tool_result_text(Some(&content));
+            assert!(truncated);
+            assert!(excerpt.chars().count() <= TOOL_RESULT_MAX_LEN);
+
+            let source = visible
+                .lines()
+                .filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
+                .find(|value| value.get("sha256").is_some())
+                .unwrap();
+            let recovery_path = PathBuf::from(source["path"].as_str().unwrap());
+            let recovered = std::fs::read(&recovery_path).unwrap();
+            assert_eq!(
+                source["sha256"],
+                format!("{:x}", Sha256::digest(&recovered))
+            );
+            assert_eq!(source["sha256"], pending.source_content_sha256);
+            assert_eq!(source["line"], 4);
+            let recovered_record: JsonValue = serde_json::from_str(
+                std::str::from_utf8(&recovered)
+                    .unwrap()
+                    .lines()
+                    .nth(3)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                recovered_record, result,
+                "locator must recover the omitted diagnostic, not an adjacent record"
+            );
+        }
+    }
+
+    #[test]
+    fn short_tool_results_do_not_claim_omission_or_add_recovery_work() {
+        for size in [0, TOOL_RESULT_MAX_LEN - 1, TOOL_RESULT_MAX_LEN] {
+            let text = "界".repeat(size);
+            let (excerpt, truncated) = tool_result_text(Some(&serde_json::json!(text)));
+            assert_eq!(excerpt, text);
+            assert!(!truncated);
+        }
     }
 }

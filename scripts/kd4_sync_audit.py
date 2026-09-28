@@ -15,8 +15,10 @@ from typing import Any, Sequence
 
 try:
     from scripts.atomic_json import write_json_atomic
+    from scripts.process_owner import run_owned
 except ImportError:  # Direct script execution places scripts/ on sys.path.
     from atomic_json import write_json_atomic
+    from process_owner import run_owned
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -57,12 +59,14 @@ class SyncAudit:
     upstream_ref: str
     upstream: str
     upstream_remote: str
-    upstream_remote_tip: str
-    upstream_ref_stale: bool
+    upstream_remote_tip: str | None
+    upstream_ref_stale: bool | None
+    upstream_remote_error: str | None
     merge_base: str
     ahead: int
     behind: int
     worktree: WorktreeState
+    active_operations: tuple[str, ...]
     merge_forecast: MergeForecast
     safe_for_in_place_sync: bool
     recommended_strategy: str
@@ -79,8 +83,9 @@ def _run_git(
     timeout_seconds: int,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
+    completed = run_owned(
         ["git", *args],
+        preserve_descendants_on_success=True,
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -134,39 +139,104 @@ def parse_worktree_status(status_text: str) -> WorktreeState:
 
 
 def parse_merge_forecast(completed: subprocess.CompletedProcess[str]) -> MergeForecast:
-    lines = [line.rstrip() for line in completed.stdout.splitlines()]
+    fields = completed.stdout.split("\0")
     result_tree = (
-        lines[0]
-        if lines and re.fullmatch(r"[0-9a-f]{40,64}", lines[0]) is not None
+        fields[0]
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[0]) is not None
         else None
     )
-    conflict_messages = tuple(line for line in lines if line.startswith("CONFLICT "))
-    first_blank = lines.index("") if "" in lines else len(lines)
-    candidate_paths = [
-        line
-        for line in lines[1:first_blank]
-        if line and line != result_tree and not line.startswith("Auto-merging ")
-    ]
-    conflict_paths = set(candidate_paths)
-    if completed.returncode == 0:
+    paths_end = fields.index("", 1) if "" in fields[1:] else len(fields)
+    conflict_paths = tuple(sorted(set(fields[1:paths_end])))
+    messages: list[str] = []
+    has_conflicts = False
+    malformed = False
+    cursor = paths_end + 1
+    # With -z, each message is: path count, paths, type, message, all NUL-delimited.
+    while cursor < len(fields) and fields[cursor]:
+        try:
+            path_count = int(fields[cursor])
+        except ValueError:
+            malformed = True
+            break
+        message_index = cursor + path_count + 2
+        if path_count < 0 or message_index >= len(fields):
+            malformed = True
+            break
+        has_conflicts |= fields[message_index - 1].startswith("CONFLICT")
+        messages.append(fields[message_index].rstrip("\n"))
+        cursor = message_index + 1
+    if malformed or result_tree is None:
+        status = "error"
+    elif completed.returncode == 0:
         status = "clean"
-    elif completed.returncode == 1 and conflict_messages:
+    elif completed.returncode == 1 and has_conflicts:
         status = "conflicts"
     else:
         status = "error"
-    messages = tuple(
-        line
-        for line in lines[first_blank + 1 :]
-        if line.startswith("Auto-merging ") or line.startswith("CONFLICT ")
-    )
+    if malformed:
+        messages.append("malformed git merge-tree message output")
     if completed.stderr.strip():
-        messages = (*messages, *completed.stderr.strip().splitlines())
+        messages.extend(completed.stderr.strip().splitlines())
     return MergeForecast(
         status=status,
         result_tree=result_tree,
-        conflict_paths=tuple(sorted(conflict_paths)),
-        messages=messages[:200],
+        conflict_paths=conflict_paths,
+        messages=tuple(messages[:200]),
         exit_code=completed.returncode,
+    )
+
+
+def active_git_operations(repo_root: Path, *, timeout_seconds: int) -> tuple[str, ...]:
+    git_dir = Path(
+        _git_text(
+            repo_root,
+            ["rev-parse", "--absolute-git-dir"],
+            timeout_seconds=timeout_seconds,
+        )
+    )
+    markers = (
+        ("rebase", "rebase-merge"),
+        ("rebase", "rebase-apply"),
+        ("merge", "MERGE_HEAD"),
+        ("cherry-pick", "CHERRY_PICK_HEAD"),
+        ("revert", "REVERT_HEAD"),
+        ("sequencer", "sequencer"),
+        ("bisect", "BISECT_LOG"),
+    )
+    return tuple(
+        sorted({name for name, marker in markers if (git_dir / marker).exists()})
+    )
+
+
+def validate_output_path(
+    repo_root: Path, output: Path, *, timeout_seconds: int
+) -> None:
+    root = Path(
+        _git_text(
+            repo_root, ["rev-parse", "--show-toplevel"], timeout_seconds=timeout_seconds
+        )
+    ).resolve()
+    # Atomic replacement changes the entry, not a final symlink's referent.
+    destination = output.parent.resolve() / output.name
+    try:
+        relative = destination.relative_to(root)
+    except ValueError:
+        return
+    ignored = _run_git(
+        root,
+        ["check-ignore", "--quiet", "--", relative.as_posix()],
+        timeout_seconds=timeout_seconds,
+        check=False,
+    )
+    if ignored.returncode == 0:
+        return
+    if ignored.returncode != 1:
+        raise RuntimeError(
+            f"could not check output destination: {ignored.stderr.strip()}"
+        )
+    raise RuntimeError(
+        "--output would change the audited worktree; choose an outside path "
+        "or an ignored, untracked destination"
     )
 
 
@@ -188,25 +258,31 @@ def audit_repository(
         raise RuntimeError(
             f"upstream ref must have <remote>/<branch> form: {upstream_ref!r}"
         )
-    remote_output = _git_text(
-        repo_root,
-        [
-            "ls-remote",
-            "--exit-code",
-            upstream_remote,
-            f"refs/heads/{upstream_branch}",
-        ],
-        timeout_seconds=timeout_seconds,
-    )
-    remote_fields = remote_output.split()
-    if len(remote_fields) != 2 or not re.fullmatch(
-        r"[0-9a-f]{40,64}", remote_fields[0]
-    ):
-        raise RuntimeError(
-            f"unexpected ls-remote output for {upstream_ref}: {remote_output!r}"
+    upstream_remote_tip = None
+    upstream_ref_stale = None
+    upstream_remote_error = None
+    try:
+        remote_output = _git_text(
+            repo_root,
+            [
+                "ls-remote",
+                "--exit-code",
+                upstream_remote,
+                f"refs/heads/{upstream_branch}",
+            ],
+            timeout_seconds=timeout_seconds,
         )
-    upstream_remote_tip = remote_fields[0]
-    upstream_ref_stale = upstream != upstream_remote_tip
+        remote_fields = remote_output.split()
+        if len(remote_fields) != 2 or not re.fullmatch(
+            r"[0-9a-f]{40,64}", remote_fields[0]
+        ):
+            raise RuntimeError(
+                f"unexpected ls-remote output for {upstream_ref}: {remote_output!r}"
+            )
+        upstream_remote_tip = remote_fields[0]
+        upstream_ref_stale = upstream != upstream_remote_tip
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        upstream_remote_error = str(exc)
     branch = (
         _git_text(
             repo_root,
@@ -235,9 +311,20 @@ def audit_repository(
             timeout_seconds=timeout_seconds,
         ).stdout
     )
+    active_operations = active_git_operations(
+        repo_root, timeout_seconds=timeout_seconds
+    )
     merge_completed = _run_git(
         repo_root,
-        ["merge-tree", "--write-tree", "--name-only", "--messages", head, upstream],
+        [
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--messages",
+            "-z",
+            head,
+            upstream,
+        ],
         timeout_seconds=timeout_seconds,
         check=False,
     )
@@ -246,6 +333,8 @@ def audit_repository(
     reasons: list[str] = []
     if worktree.dirty:
         reasons.append(f"active worktree has {worktree.changed_paths} changed path(s)")
+    if active_operations:
+        reasons.append(f"Git operation in progress: {', '.join(active_operations)}")
     if merge_forecast.status == "conflicts":
         reasons.append(
             f"trial merge reports {len(merge_forecast.conflict_paths)} conflict path(s)"
@@ -258,11 +347,14 @@ def audit_repository(
         reasons.append(f"branch has {ahead} fork commit(s) not in {upstream_ref}")
     if upstream_ref_stale:
         reasons.append(f"local {upstream_ref} is stale relative to {upstream_remote}")
+    if upstream_remote_error is not None:
+        reasons.append("remote freshness is unknown; local-only diagnostics follow")
 
     safe_for_in_place_sync = (
         not worktree.dirty
+        and not active_operations
         and merge_forecast.status == "clean"
-        and not upstream_ref_stale
+        and upstream_ref_stale is False
     )
     recommended_strategy = (
         "reviewed-in-place-merge"
@@ -270,7 +362,7 @@ def audit_repository(
         else "isolated-worktree-capability-by-capability"
     )
     return SyncAudit(
-        schema_version=1,
+        schema_version=2,
         captured_at=datetime.now(timezone.utc).isoformat(),
         repository=str(repo_root),
         branch=branch,
@@ -280,10 +372,12 @@ def audit_repository(
         upstream_remote=upstream_remote,
         upstream_remote_tip=upstream_remote_tip,
         upstream_ref_stale=upstream_ref_stale,
+        upstream_remote_error=upstream_remote_error,
         merge_base=merge_base,
         ahead=ahead,
         behind=behind,
         worktree=worktree,
+        active_operations=active_operations,
         merge_forecast=merge_forecast,
         safe_for_in_place_sync=safe_for_in_place_sync,
         recommended_strategy=recommended_strategy,
@@ -296,7 +390,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--upstream-ref", default=DEFAULT_UPSTREAM_REF)
     parser.add_argument("--timeout-seconds", type=int, default=120)
-    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Write JSON outside the checkout or to an ignored, untracked destination.",
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--strict",
@@ -309,6 +407,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.output is not None:
+            validate_output_path(
+                args.repo_root, args.output, timeout_seconds=args.timeout_seconds
+            )
         audit = audit_repository(
             args.repo_root,
             upstream_ref=args.upstream_ref,
@@ -322,23 +424,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
     payload = audit.to_json()
+    errors = []
+    if audit.upstream_remote_error is not None:
+        errors.append(audit.upstream_remote_error)
+        payload.update(ok=False, error=audit.upstream_remote_error)
     if args.output is not None:
-        write_json_atomic(args.output, payload)
+        try:
+            write_json_atomic(args.output, payload)
+        except (OSError, ValueError) as exc:
+            output_error = f"could not write audit output: {exc}"
+            errors.append(output_error)
+            payload.update(ok=False, error="; ".join(errors), output_error=output_error)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
+        freshness = (
+            audit.upstream_ref_stale
+            if audit.upstream_ref_stale is not None
+            else "unknown"
+        )
         print(
             "KD4 SYNC AUDIT: "
             f"ahead={audit.ahead} behind={audit.behind} "
             f"dirty={audit.worktree.changed_paths} "
             f"forecast={audit.merge_forecast.status}"
-            f" upstream_stale={audit.upstream_ref_stale}"
+            f" upstream_stale={freshness}"
         )
         print(f"Strategy: {audit.recommended_strategy}")
         for reason in audit.reasons:
             print(f"- {reason}")
         for path in audit.merge_forecast.conflict_paths:
             print(f"- conflict: {path}")
+        for error in errors:
+            print(f"AUDIT FAILED: {error}")
+    if errors:
+        return 2
     return 1 if args.strict and not audit.safe_for_in_place_sync else 0
 
 

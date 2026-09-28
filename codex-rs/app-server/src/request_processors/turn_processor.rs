@@ -39,8 +39,8 @@ const MAX_ADDITIONAL_CONTEXT_ENTRIES: usize = 64;
 const MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES: usize = 256;
 const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RAW_BYTES: usize = 128 * 1_024;
 const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES: usize = 128 * 1_024;
-// Context fragments cap each escaped value at approximately 4,000 tokens.
-const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize = 16 * 1_024;
+const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize =
+    codex_context_fragments::MAX_ADDITIONAL_CONTEXT_VALUE_BYTES;
 const ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES: usize = 96;
 
 fn validate_turn_interrupt_target(

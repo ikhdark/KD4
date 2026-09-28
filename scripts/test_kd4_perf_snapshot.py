@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import sys
@@ -15,6 +16,135 @@ from scripts import kd4_model_attempt_analysis
 
 
 class Kd4PerfSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        capture_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(capture_dir.cleanup)
+        patch = mock.patch.object(tempfile, "gettempdir", return_value=capture_dir.name)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_quick_is_static_only_and_full_validation_remains_explicit(self):
+        catalog = kd4_perf_snapshot.scenario_catalog()
+        quick = kd4_perf_snapshot.PROFILE_SCENARIOS["quick"]
+        self.assertNotIn("feature-check", quick)
+        self.assertIn("--static-only", catalog[quick[-1]].command)
+        self.assertIn("feature-check", kd4_perf_snapshot.PROFILE_SCENARIOS["phase0"])
+        self.assertNotIn("--static-only", catalog["feature-check"].command)
+
+    def test_preflight_errors_launch_nothing_and_preserve_reports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "existing.json"
+            output.write_text("previous evidence")
+            cases = [
+                ["--model-attempt-jsonl", str(root / "missing")],
+                ["--model-attempt-jsonl", str(root)],
+                ["--model-attempt-report", str(root / "report")],
+                ["--iterations", "0"],
+                ["--timeout-seconds", "0"],
+                ["--output", str(root)],
+                ["--model-attempt-jsonl", str(output)],
+                [
+                    "--model-attempt-jsonl",
+                    str(root / "missing"),
+                    "--model-attempt-report",
+                    str(output),
+                ],
+            ]
+            for flags in cases:
+                with (
+                    self.subTest(flags=flags),
+                    mock.patch.object(kd4_perf_snapshot, "measure_scenario") as measure,
+                    mock.patch.object(sys, "stderr", io.StringIO()),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    kd4_perf_snapshot.main(["--output", str(output), *flags])
+                self.assertEqual(raised.exception.code, 2)
+                measure.assert_not_called()
+                self.assertEqual(output.read_text(), "previous evidence")
+
+    def test_cleanup_abort_saves_completed_evidence_and_stops_even_if_allowed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "snapshot.json"
+            first = kd4_perf_snapshot.Scenario(
+                "python-startup",
+                (sys.executable, "-c", "print('done')"),
+                Path(temp),
+                1,
+                "test",
+            )
+            catalog = {
+                "python-startup": first,
+                "git-status": first,
+                "feature-check": first,
+            }
+            original = kd4_perf_snapshot._run_scenario
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append(command)
+                if len(calls) == 2:
+                    raise RuntimeError(
+                        "cleanup unconfirmed; remaining measurements aborted"
+                    )
+                return original(command, **kwargs)
+
+            with (
+                mock.patch.object(
+                    kd4_perf_snapshot, "scenario_catalog", return_value=catalog
+                ),
+                mock.patch.object(
+                    kd4_perf_snapshot, "environment_metadata", return_value={}
+                ),
+                mock.patch.object(kd4_perf_snapshot, "_run_scenario", side_effect=run),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                status = kd4_perf_snapshot.main(
+                    [
+                        "--scenario",
+                        "python-startup",
+                        "--scenario",
+                        "git-status",
+                        "--scenario",
+                        "feature-check",
+                        "--output",
+                        str(output),
+                        "--json",
+                        "--allow-failures",
+                        "--allow-incomplete",
+                    ]
+                )
+            payload = json.loads(output.read_text())
+            self.assertEqual(status, 1)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(payload["results"][0]["status"], "passed")
+            self.assertEqual(payload["results"][1]["samples"][0]["outcome"], "aborted")
+            self.assertEqual(payload["pendingScenarios"], ["feature-check"])
+            self.assertFalse(payload["complete"])
+            self.assertFalse(payload["ok"])
+            self.assertIn("cleanup unconfirmed", payload["abortReason"])
+
+    def test_human_abort_exposes_full_log_paths(self):
+        console = io.StringIO()
+        with (
+            mock.patch.object(
+                kd4_perf_snapshot, "environment_metadata", return_value={}
+            ),
+            mock.patch.object(
+                kd4_perf_snapshot,
+                "_run_scenario",
+                side_effect=RuntimeError("cleanup unconfirmed"),
+            ),
+            mock.patch.object(sys, "stdout", console),
+            mock.patch.object(sys, "stderr", io.StringIO()),
+        ):
+            status = kd4_perf_snapshot.main(["--scenario", "python-startup"])
+        self.assertEqual(status, 1)
+        paths = list(Path(tempfile.gettempdir()).glob("kd4-perf-*.log"))
+        self.assertEqual(len(paths), 2)
+        for path in paths:
+            self.assertIn(str(path), console.getvalue())
+
     @unittest.skipUnless(os.name == "nt", "Windows tree termination")
     def test_tree_cleanup_failure_aborts_remaining_measurements(self) -> None:
         scenario = kd4_perf_snapshot.Scenario(
@@ -54,7 +184,14 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             # regression cannot leave a persistent process behind.
             time.sleep(3)
             self.assertEqual(result.status, "failed")
-            self.assertEqual(result.samples, ())
+            self.assertEqual(len(result.samples), 1)
+            self.assertEqual(result.samples[0].outcome, "timeout")
+            self.assertIsNone(result.samples[0].exit_code)
+            self.assertGreaterEqual(result.samples[0].elapsed_ms, 900)
+            self.assertIsNone(result.p50_ms)
+            self.assertIn(
+                "descendant-ready", Path(result.samples[0].stdout_path).read_text()
+            )
             self.assertIn("descendant-ready", result.reason or "")
             self.assertFalse(marker.exists(), "timed-out descendant kept running")
 
@@ -260,6 +397,8 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertIsNotNone(result.cold_ms)
         self.assertIsNotNone(result.warm_p50_ms)
         self.assertGreater(result.samples[0].stdout_bytes, 0)
+        self.assertTrue(all(sample.stdout_path is None for sample in result.samples))
+        self.assertEqual(list(Path(tempfile.gettempdir()).glob("kd4-perf-*.log")), [])
 
     def test_scenario_streams_output_to_files_and_bounds_failure_diagnostics(
         self,
@@ -289,6 +428,8 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
 
         self.assertEqual(result.samples[0].stdout_bytes, len(stdout))
         self.assertEqual(result.samples[0].stderr_bytes, len(stderr))
+        self.assertEqual(Path(result.samples[0].stdout_path).read_bytes(), stdout)
+        self.assertEqual(Path(result.samples[0].stderr_path).read_bytes(), stderr)
         self.assertEqual(result.status, "failed")
         self.assertIn("command exited 7", result.reason or "")
         self.assertNotIn("prefix", result.reason or "")
@@ -354,7 +495,7 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
                 "core-test-fast",
                 "core_lib",
                 "-E",
-                "test(typed_agents_inherit_every_non_root_tool_class)",
+                "test(=agent::task_capabilities::tests::typed_agents_inherit_every_non_root_tool_class)",
             ),
         )
 
@@ -659,6 +800,81 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         self.assertEqual(diagnostics["conflicted_logical_request_attempts"], 2)
         self.assertEqual(diagnostics["duplicate_physical_attempt_collapsed"], 1)
         self.assertEqual(diagnostics["conflicting_physical_attempt_duplicate"], 1)
+
+    def test_attempt_duplicates_ignore_export_envelopes_not_measurements(self) -> None:
+        attempt = {
+            "event.name": "codex.model_attempt",
+            "sampling_request_id": "request",
+            "attempt_id": "attempt",
+            "retry_index": 0,
+            "outcome": "success",
+            "first_actionable_output_us": 5_000_000,
+        }
+        for wrapper in ("fields", "attributes", "body"):
+            with self.subTest(wrapper=wrapper), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "events.jsonl"
+                wrapped = {
+                    "timestamp": "2026-09-27T00:00:00Z",
+                    "level": "INFO",
+                    "target": "telemetry",
+                    wrapper: {**attempt, "event_name": attempt["event.name"]},
+                }
+                del wrapped[wrapper]["event.name"]
+                path.write_text(
+                    "\n".join(map(json.dumps, [attempt, wrapped])), encoding="utf-8"
+                )
+                records, exclusions = kd4_model_attempt_analysis.load_jsonl([path])
+                self.assertEqual(len(records), 1)
+                self.assertEqual(
+                    exclusions, {"duplicate_physical_attempt_collapsed": 1}
+                )
+                wrapped[wrapper]["first_actionable_output_us"] += 1
+                path.write_text(
+                    "\n".join(map(json.dumps, [attempt, wrapped])), encoding="utf-8"
+                )
+                records, exclusions = kd4_model_attempt_analysis.load_jsonl([path])
+                self.assertEqual(records, [])
+                self.assertEqual(
+                    exclusions["conflicting_physical_attempt_duplicate"], 1
+                )
+
+    def test_partial_retry_sequences_keep_evidence_out_of_clean_latency_groups(
+        self,
+    ) -> None:
+        for indexes in ([3], [0, 3], [None], [0, 0]):
+            with self.subTest(indexes=indexes), tempfile.TemporaryDirectory() as temp:
+                records = [
+                    {
+                        "event.name": "codex.model_attempt",
+                        "sampling_request_id": "request",
+                        "attempt_id": str(i),
+                        "retry_index": index,
+                        "outcome": "success" if i == len(indexes) - 1 else "failed",
+                        "dispatch_ready_us": 0,
+                        "first_actionable_output_us": 5_000_000,
+                        "completed_us": 6_000_000,
+                        "input_token_count": 100_000,
+                        "cached_input_token_count": 90_000,
+                        "uncached_input_token_count": 10_000,
+                    }
+                    for i, index in enumerate(indexes)
+                ]
+                path = Path(temp) / "events.jsonl"
+                path.write_text("\n".join(map(json.dumps, records)), encoding="utf-8")
+                loaded, exclusions = kd4_model_attempt_analysis.load_jsonl([path])
+                report = kd4_model_attempt_analysis.analyze(loaded, exclusions)
+                self.assertEqual(report["partialRetryCoverageRequests"], 1)
+                self.assertEqual(report["cleanIncludedLogicalRequests"], 0)
+                self.assertEqual(report["groups"], [])
+                self.assertEqual(report["rows"][0]["input_token_count"], 100_000)
+                self.assertFalse(report["rows"][0]["retry_coverage_complete"])
+                self.assertEqual(report["stableContext"]["providerCachedShare"], 0.9)
+                if indexes[-1] == 3:
+                    self.assertEqual(report["rows"][0]["retry_count"], 3)
+                    self.assertEqual(report["unmeasuredInterAttemptGaps"], 3)
+                self.assertIn(
+                    "partial retry coverage", kd4_model_attempt_analysis.render(report)
+                )
 
     def test_stable_context_components_join_to_every_physical_attempt(self) -> None:
         attempt = {

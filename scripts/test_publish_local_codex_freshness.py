@@ -20,6 +20,36 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
+    def test_auto_skip_build_ignores_cargo_display_color_but_not_compiler_flags(self):
+        self.init_repo_fixture()
+        self.write_built_artifacts(timestamp=FRESH_SOURCE_TIME)
+        env = {**clean_env(), "CARGO_TERM_COLOR": "never"}
+        self.write_build_stamp("local-release", FIXTURE_TIME, env=env)
+        with tempfile.TemporaryDirectory() as directory:
+            for changes, expected in (
+                ({"CARGO_TERM_COLOR": "always"}, "true"),
+                (
+                    {
+                        "CARGO_TERM_COLOR": "always",
+                        "CARGO_PROFILE_RELEASE_OPT_LEVEL": "1",
+                    },
+                    "false",
+                ),
+            ):
+                with self.subTest(changes=changes):
+                    result = self.run_script(
+                        "-DryRun",
+                        "-AutoSkipBuild",
+                        "-InstallDir",
+                        str(Path(directory) / "install"),
+                        env={**env, **changes},
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    self.assert_proof_value(result.stdout, "autoSkipBuild", expected)
+            self.assertFalse((Path(directory) / "install").exists())
+
     def test_audit_publish_unknown_timestamps_fail_closed_as_stale(self) -> None:
         command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
@@ -153,10 +183,14 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             install_dir.mkdir()
             source_timestamp = FRESH_SOURCE_TIME
             fake_codex = temp_path / "fake-codex.cmd"
-            fake_codex.write_text("@echo off\r\necho codex A\r\n", encoding="utf-8")
+            fake_codex.write_text(
+                "@echo off\r\necho codex 9.9.9\r\nrem artifact A\r\n", encoding="utf-8"
+            )
             os.utime(fake_codex, (source_timestamp, source_timestamp))
             target = install_dir / "codex.exe"
-            target.write_text("@echo off\r\necho codex B\r\n", encoding="utf-8")
+            target.write_text(
+                "@echo off\r\necho codex 9.9.9\r\nrem artifact B\r\n", encoding="utf-8"
+            )
             os.utime(target, (source_timestamp, source_timestamp))
 
             result = self.run_script(
@@ -491,29 +525,24 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             install_dir = Path(temp_dir) / "install"
             source_timestamp = FIXTURE_TIME + 100
             tracked = self.repo_root / "codex-rs" / "tracked-source.rs"
-            self.write_built_artifacts(timestamp=source_timestamp)
-            self.write_build_stamp("local-release", source_timestamp)
-            # Change a tracked input during the source version probe, after
-            # auto-skip has already accepted the stamp.
-            command = rf"""
-$global:Mutated = $false
-Set-PSBreakpoint -Command Write-VersionProofBlock -Action {{
-    if (-not $global:Mutated) {{
-        [IO.File]::WriteAllText({ps_single_quote(tracked)}, "changed-during-version-probe`n")
-        $global:Mutated = $true
-    }}
-}} | Out-Null
-& {ps_single_quote(SCRIPT)} -AutoSkipBuild -RepoRoot {ps_single_quote(self.repo_root)} `
-    -InstallDir {ps_single_quote(install_dir)}
-"""
-            result = subprocess.run(
+            # Mutate real inputs from the native version probe, independently
+            # of the publisher's internal call shape or debugger breakpoints.
+            binary = self.repo_root / "mutating-codex.exe"
+            source = (
+                "using System; using System.IO; public class Probe { "
+                "public static void Main() { "
+                f'File.WriteAllText({json.dumps(str(tracked))}, "changed-during-version-probe\\n"); '
+                'Console.WriteLine("codex 9.9.9"); } }'
+            )
+            compiled = subprocess.run(
                 [
                     self.shell,
                     "-NoProfile",
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
-                    command,
+                    f"Add-Type -TypeDefinition {ps_single_quote(source)} "
+                    f"-OutputAssembly {ps_single_quote(binary)} -OutputType ConsoleApplication",
                 ],
                 text=True,
                 capture_output=True,
@@ -521,6 +550,12 @@ Set-PSBreakpoint -Command Write-VersionProofBlock -Action {{
                 env=clean_env(),
                 timeout=120,
             )
+            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+            self.write_built_artifacts(
+                codex_bytes=binary.read_bytes(), timestamp=source_timestamp
+            )
+            self.write_build_stamp("local-release", source_timestamp)
+            result = self.run_script("-AutoSkipBuild", "-InstallDir", str(install_dir))
 
             self.assertNotEqual(
                 result.returncode,

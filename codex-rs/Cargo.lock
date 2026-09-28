@@ -1871,6 +1871,7 @@ dependencies = [
  "codex-cloud-config",
  "codex-config",
  "codex-connectors",
+ "codex-context-fragments",
  "codex-core",
  "codex-core-plugins",
  "codex-exec-server",

@@ -425,7 +425,7 @@ fn content_parts(content: Option<&Value>, raw_payload: &RawPayloadRef) -> Vec<Co
                     parts.push(payload_ref_part("malformed_text", raw_payload));
                 }
             }
-            Some("input_image") => parts.push(payload_ref_part("input_image", raw_payload)),
+            Some("input_image") => parts.extend(json_body(part, raw_payload).parts),
             Some(other) => parts.push(payload_ref_part(other, raw_payload)),
             None => parts.push(payload_ref_part("content", raw_payload)),
         }

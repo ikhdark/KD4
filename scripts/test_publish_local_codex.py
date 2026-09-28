@@ -242,16 +242,87 @@ if (-not (Test-Path -LiteralPath %s -PathType Leaf)) { exit 10 }
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_audit_publish_noop_routing_change_requires_doctor(self) -> None:
-        publish_script = publish_source_text()
-        noop_branch = publish_script.split("if (-not $binaryChanged) {", 1)[1].split(
-            "$publishedCodeModeHost = $false", 1
-        )[0]
-
-        self.assertIn(
-            "if ($DoctorOnNoop -or $desktopRoutingResult.Changed)", noop_branch
+    def run_noop_publish_branch(
+        self,
+        *,
+        run_doctor: bool = False,
+        routing_changed: bool = False,
+        doctor_on_noop: bool = False,
+        restart: bool = False,
+        restart_fails: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        noop_branch = (
+            publish_source_text()
+            .split("if (-not $binaryChanged) {", 1)[1]
+            .split("$publishedCodeModeHost = $false", 1)[0]
         )
-        self.assertIn("Invoke-DoctorForPublish -TargetPath $targetPath", noop_branch)
+        # Execute the actual routing/failure branch, but never import the publisher
+        # or invoke its external side effects against the installed application.
+        command = rf"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$binaryChanged = $false
+$desktopRoutingResult = [pscustomobject]@{{ Changed = ${str(routing_changed).lower()}; RestartRequired = $false }}
+$targetBeforeSha256 = $codeModeHostTargetBeforeSha256 = $windowsSandboxSetupTargetBeforeSha256 = $commandRunnerTargetBeforeSha256 = 'fixture-hash'
+$targetPath = 'fixture-cli'
+$LocalCodexHome = $LocalCodexSqliteHome = 'fixture-home'
+$RunDoctor = ${str(run_doctor).lower()}
+$DoctorOnNoop = ${str(doctor_on_noop).lower()}
+$RestartDesktop = ${str(restart).lower()}
+$ConfigureDesktopLocalCli = $true
+$restartFailure = $null
+$publishCommitted = $false
+function Write-ProofLine {{
+    param($Name, $Value)
+    Write-Output "$($Name): $Value"
+}}
+function Invoke-DoctorForPublish {{
+    param($TargetPath)
+    if ($TargetPath -ne 'fixture-cli') {{ throw 'wrong doctor target' }}
+    Write-Output 'doctor-called'
+}}
+function Restart-CodexDesktop {{
+    param($LocalCliPath, $LocalCodexHome, $LocalCodexSqliteHome)
+    if (-not $publishCommitted) {{ throw 'restart before publish commit' }}
+    if ($LocalCliPath -ne 'fixture-cli' -or $LocalCodexHome -ne 'fixture-home' -or $LocalCodexSqliteHome -ne 'fixture-home') {{ throw 'wrong restart routing' }}
+    Write-Output 'restart-called'
+    if (${str(restart_fails).lower()}) {{ throw 'fixture restart failure' }}
+}}
+if (-not $binaryChanged) {{
+{noop_branch}
+"""
+        return subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            env=clean_env(),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+    def test_audit_publish_noop_routing_change_requires_doctor(self) -> None:
+        for run_doctor, changed, forced, expected_calls in (
+            (False, True, False, 0),
+            (True, False, False, 0),
+            (True, True, False, 1),
+            (True, False, True, 1),
+        ):
+            with self.subTest(run_doctor=run_doctor, changed=changed, forced=forced):
+                result = self.run_noop_publish_branch(
+                    run_doctor=run_doctor,
+                    routing_changed=changed,
+                    doctor_on_noop=forced,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    result.stdout.splitlines().count("doctor-called"), expected_calls
+                )
+                self.assertIn("publishCommitted: true", result.stdout)
+                self.assertNotIn("restart-called", result.stdout)
 
     def test_cached_hash_reuses_verified_observation_without_nested_file_hash(
         self,
@@ -842,16 +913,24 @@ catch {{
         self.assertNotIn("desktopRestart: restarted", result.stdout)
 
     def test_noop_restart_failure_is_terminal_after_committed_publish(self) -> None:
-        publish_script = publish_source_text()
-        noop_branch = publish_script.split("if (-not $binaryChanged) {", 1)[1].split(
-            "$publishedCodeModeHost = $false", 1
-        )[0]
-
-        self.assertIn("Publish committed but Desktop restart failed", noop_branch)
-        self.assertLess(
-            noop_branch.index("Publish committed but Desktop restart failed"),
-            noop_branch.index("exit 0"),
-        )
+        for fails in (False, True):
+            with self.subTest(restart_fails=fails):
+                result = self.run_noop_publish_branch(
+                    restart=True, restart_fails=fails
+                )
+                self.assertEqual(result.stdout.splitlines().count("restart-called"), 1)
+                self.assertIn("publishCommitted: true", result.stdout)
+                self.assertNotIn("doctor-called", result.stdout)
+                if fails:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("restartFailed: true", result.stdout)
+                    self.assertIn(
+                        "Publish committed but Desktop restart failed", result.stderr
+                    )
+                    self.assertIn("fixture restart failure", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("restartFailed: false", result.stdout)
 
     def test_default_local_publish_target_is_not_openai_appdata_bin(self) -> None:
         publish_script = publish_source_text()

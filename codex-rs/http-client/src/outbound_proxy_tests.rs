@@ -565,10 +565,10 @@ fn system_proxy_resolution_is_single_flight() {
     started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("resolver should start");
-    assert!(matches!(
-        cache.try_lock(),
-        Err(std::sync::TryLockError::WouldBlock)
-    ));
+    assert!(
+        cache.try_lock().is_ok(),
+        "pending lookups must leave cached entries accessible"
+    );
     let waiter_cache = Arc::clone(&cache);
     let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
     let (finished_tx, finished_rx) = std::sync::mpsc::channel();

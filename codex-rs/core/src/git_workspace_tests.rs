@@ -1893,9 +1893,34 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
     let address = listener.local_addr().unwrap();
     let stage = Arc::new(AtomicUsize::new(0));
     let server_stage = Arc::clone(&stage);
+    let files = TempDir::new().unwrap();
+    for index in 0..8 {
+        std::fs::write(files.path().join(format!("file-{index}.txt")), format!("file-{index}\n"))
+            .unwrap();
+    }
+    let file_root = files.path().to_path_buf();
+    let multi_status = format!(
+        "# branch.oid abc123\0# branch.head main\0{}",
+        (0..8).rev().map(|index| format!("? file-{index}.txt\0")).collect::<String>()
+    );
+    let server_status = multi_status.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let requested_bytes = Arc::new(AtomicU64::new(0));
+    let peak_paths = Arc::new(AtomicUsize::new(0));
+    let cancelled_requests = Arc::new(AtomicUsize::new(0));
+    let blocked = Arc::new(tokio::sync::Notify::new());
+    let server_reads = Arc::clone(&reads);
+    let server_bytes = Arc::clone(&requested_bytes);
+    let server_peak = Arc::clone(&peak_paths);
+    let server_cancelled = Arc::clone(&cancelled_requests);
+    let server_blocked = Arc::clone(&blocked);
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut pending_reads: Vec<Message> = Vec::new();
+        let mut open_paths = BTreeSet::new();
+        let mut recreated = false;
+        let mut changed_during_read = false;
         while let Some(frame) = socket.next().await {
             let frame = frame.unwrap();
             if frame.is_close() {
@@ -1904,6 +1929,13 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
             let request: serde_json::Value = serde_json::from_slice(&frame.into_data()).unwrap();
             let current = server_stage.load(Ordering::SeqCst);
             let method = request["method"].as_str().unwrap();
+            // Flush replies abandoned by cancellation before the next capture.
+            if current == 0 && !pending_reads.is_empty() {
+                for response in pending_reads.drain(..).rev() {
+                    socket.send(response).await.unwrap();
+                }
+                open_paths.clear();
+            }
             let result = match method {
                 "initialize" => json!({"sessionId": "remote-evidence-test"}),
                 "initialized" => continue,
@@ -1913,15 +1945,31 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                 "fs/canonicalize" => json!({"path": request["params"]["path"]}),
                 "fs/getMetadata" => {
                     let path = request["params"]["path"].as_str().unwrap();
+                    let multi_file = path.rsplit('/').next().filter(|name| name.starts_with("file-"));
+                    if current == 0 && multi_file.is_some() {
+                        server_cancelled.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if current == 6 && multi_file.is_some() && !open_paths.remove(path) {
+                            open_paths.insert(path.to_string());
+                            server_peak.fetch_max(open_paths.len(), Ordering::SeqCst);
+                    }
                     let missing = (current == 2 && path.ends_with("/tracked.txt"))
                         || (current == 4 && path.ends_with("/.git"))
-                        || current == 5;
+                        || current == 5
+                        || (current == 10 && path.ends_with("/deleted.txt") && !recreated);
                     if missing || current == 3 {
                         socket.send(Message::Text(json!({"id": request["id"], "error": {"code": if current == 3 { -32000 } else { -32004 }, "message": "fixture metadata failure"}}).to_string().into())).await.unwrap();
                         continue;
                     }
-                    let file = path.ends_with("/tracked.txt");
-                    json!({"isDirectory": !file, "isFile": file, "isSymlink": false, "size": if file { 3 } else { 0 }, "createdAtMs": 0, "modifiedAtMs": 0})
+                    let file = path.ends_with("/tracked.txt") || multi_file.is_some();
+                    let size = if let Some(name) = multi_file {
+                        if current == 7 {
+                            WORKSPACE_GENERATION_MAX_DECLARED_BYTES / 2 + 1
+                        } else {
+                            std::fs::metadata(file_root.join(name)).unwrap().len()
+                        }
+                    } else if file { 3 } else { 0 };
+                    json!({"isDirectory": !file || current == 12, "isFile": file && current != 12, "isSymlink": file && current == 11, "size": size, "createdAtMs": 0, "modifiedAtMs": u64::from(current == 9 && changed_during_read)})
                 }
                 "process/start" => {
                     assert_eq!(request["params"]["argv"][0], "git");
@@ -1929,17 +1977,58 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                     json!({"processId": request["params"]["processId"]})
                 }
                 "process/read" => {
-                    let status = if current == 2 {
-                        "# branch.oid abc123\0# branch.head main\u{0}1 .D N... 100644 100644 000000 abc123 abc123 tracked.txt\0"
+                    let status = if current == 10 {
+                        format!("{server_status}1 .D N... 100644 100644 000000 abc123 abc123 deleted.txt\0")
+                    } else if current >= 6 {
+                        server_status.clone()
+                    } else if current == 2 {
+                        "# branch.oid abc123\0# branch.head main\u{0}1 .D N... 100644 100644 000000 abc123 abc123 tracked.txt\0".to_string()
                     } else {
-                        "# branch.oid abc123\0# branch.head main\0? tracked.txt\0"
+                        "# branch.oid abc123\0# branch.head main\0? tracked.txt\0".to_string()
                     };
                     json!({"chunks": [{"seq": 1, "stream": "stdout", "chunk": base64::engine::general_purpose::STANDARD.encode(status)}], "nextSeq": 4, "exited": true, "exitCode": 0, "closed": true, "failure": null, "sandboxDenied": false})
                 }
                 "fs/open" => json!({"handleId": request["params"]["handleId"]}),
                 "fs/readFileBounded" => {
-                    assert!(request["params"]["maxBytes"].as_u64().unwrap() >= 3);
-                    json!({"dataBase64": base64::engine::general_purpose::STANDARD.encode(if current == 0 { b"aaa" } else { b"bbb" })})
+                    let limit = request["params"]["maxBytes"].as_u64().unwrap();
+                    assert!(limit >= 3);
+                    if current >= 6 {
+                        server_reads.fetch_add(1, Ordering::SeqCst);
+                        server_bytes.fetch_add(limit, Ordering::SeqCst);
+                        if current == 7 {
+                            json!({"dataBase64": null})
+                        } else {
+                            let name = request["params"]["path"].as_str().unwrap().rsplit('/').next().unwrap();
+                            let contents = std::fs::read(file_root.join(name)).unwrap();
+                            assert_eq!(limit, contents.len() as u64);
+                            if current == 9 {
+                                std::fs::write(file_root.join(name), vec![b'x'; contents.len()]).unwrap();
+                                changed_during_read = true;
+                            }
+                            if current == 10 {
+                                recreated = true;
+                            }
+                            let result = json!({"dataBase64": base64::engine::general_purpose::STANDARD.encode(contents)});
+                            if current == 6 || current == 8 {
+                                pending_reads.push(Message::Text(json!({"id": request["id"], "result": result}).to_string().into()));
+                                if pending_reads.len() == REMOTE_WORKSPACE_CAPTURE_CONCURRENCY {
+                                    if current == 8 {
+                                        server_blocked.notify_one();
+                                    } else {
+                                        // A serial implementation stalls here. Reverse replies also
+                                        // ensure completion order cannot determine manifest order.
+                                        for response in pending_reads.drain(..).rev() {
+                                            socket.send(response).await.unwrap();
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            result
+                        }
+                    } else {
+                        json!({"dataBase64": base64::engine::general_purpose::STANDARD.encode(if current == 0 { b"aaa" } else { b"bbb" })})
+                    }
                 }
                 "fs/readBlock" => {
                     json!({"chunk": base64::engine::general_purpose::STANDARD.encode(if current == 0 { b"aaa" } else { b"bbb" }), "eof": true})
@@ -1973,6 +2062,8 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
     // A valid host directory must not supply the identity for this remote root.
     let host = TempDir::new().unwrap();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let remote_fs = selected.primary().unwrap().environment.get_filesystem();
+    let remote_root = PathUri::parse("file:///C:/remote-evidence").unwrap();
     let first = cache
         .workspace_evidence_for_environment(&selected, host.path(), host.path())
         .await
@@ -2031,7 +2122,62 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
             .unwrap()
             .unavailable
     );
+    stage.store(6, Ordering::SeqCst);
+    let parallel = timeout(
+        Duration::from_secs(5),
+        cache.workspace_evidence_for_environment(&selected, host.path(), host.path()),
+    ).await.expect("independent remote reads must overlap").identity.unwrap();
+    assert!(!parallel.unavailable);
+    assert_eq!(reads.load(Ordering::SeqCst), 8);
+    assert_eq!(peak_paths.load(Ordering::SeqCst), REMOTE_WORKSPACE_CAPTURE_CONCURRENCY);
+    let mut manifest = b"total_paths=8\n".to_vec();
+    for index in 0..8 {
+        let name = format!("file-{index}.txt");
+        let contents = std::fs::read(files.path().join(&name)).unwrap();
+        manifest.extend_from_slice(format!("{name}\0file\0{}\0{:x}\n", contents.len(), Sha256::digest(contents)).as_bytes());
+    }
+    let mut expected = Sha256::new();
+    expected.update(multi_status.as_bytes());
+    expected.update(manifest);
+    assert_eq!(parallel.worktree_identity, Some(format!("{:x}", expected.finalize())));
+
+    stage.store(7, Ordering::SeqCst);
+    requested_bytes.store(0, Ordering::SeqCst);
+    assert!(cache.workspace_evidence_for_environment(&selected, host.path(), host.path()).await.identity.unwrap().unavailable);
+    remote_fs.canonicalize(&remote_root, None).await.unwrap();
+    assert!(requested_bytes.load(Ordering::SeqCst) > 0);
+    assert!(requested_bytes.load(Ordering::SeqCst) <= WORKSPACE_GENERATION_MAX_DECLARED_BYTES);
+
+    stage.store(8, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    {
+        let capture = cache.workspace_evidence_for_environment(&selected, host.path(), host.path());
+        tokio::pin!(capture);
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = blocked.notified() => {}
+                result = &mut capture => panic!("capture completed before blocked replies: {result:?}"),
+            }
+        }).await.expect("bounded reads must start before cancellation");
+        assert_eq!(reads.load(Ordering::SeqCst), REMOTE_WORKSPACE_CAPTURE_CONCURRENCY);
+    }
+    stage.store(0, Ordering::SeqCst);
+    assert!(!cache.workspace_evidence_for_environment(&selected, host.path(), host.path()).await.identity.unwrap().unavailable);
+    remote_fs.canonicalize(&remote_root, None).await.unwrap();
+    assert_eq!(cancelled_requests.load(Ordering::SeqCst), 0, "cancelled readers must not request post-read metadata");
+
+    for rejected_stage in [9, 10, 11, 12] {
+        stage.store(rejected_stage, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        assert!(cache.workspace_evidence_for_environment(&selected, host.path(), host.path()).await.identity.unwrap().unavailable, "reject raced or unsupported capture at stage {rejected_stage}");
+        // Drain already-sent requests before changing the fixture's behavior.
+        remote_fs.canonicalize(&remote_root, None).await.unwrap();
+        if rejected_stage >= 11 {
+            assert_eq!(reads.load(Ordering::SeqCst), 0, "unsupported entries must not be read");
+        }
+    }
     server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

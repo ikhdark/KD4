@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.build_tooling_test_support import REPO_ROOT
 from scripts.build_tooling_test_support import load_toml
@@ -19,6 +20,19 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class BuildToolingPerformanceTest(unittest.TestCase):
+    def setUp(self):
+        lane_root = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_CARGO_LANES_ROOT": lane_root,
+                    # These environment tests do not exercise lane maintenance.
+                    "CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE": "1",
+                },
+            )
+        )
+
     def test_perf_env_disables_incremental_independently_of_wrapper(self):
         shell = pwsh_only()
         if shell is None:
@@ -73,7 +87,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 }
                 self.assertEqual(proofs["RESTORED"], names)
                 self.assertEqual(
-                    proofs["CHILD"], {"RUSTC_WRAPPER": wrapper, "CARGO_INCREMENTAL": "0"}
+                    proofs["CHILD"],
+                    {"RUSTC_WRAPPER": wrapper, "CARGO_INCREMENTAL": "0"},
                 )
 
     def test_perf_env_no_sccache_disables_incremental_and_uses_lane(self) -> None:
@@ -141,70 +156,76 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             "SCCACHE_BASEDIR",
             "SCCACHE_CACHE_SIZE",
         ]
-        for workspace_wrapper in (None, "", "sccache"):
-            for exit_code in (0, 7):
-                with self.subTest(wrapper=workspace_wrapper, exit_code=exit_code):
-                    env = os.environ.copy()
-                    env.update(dict.fromkeys(names, "inherited"))
-                    # Set this inside PowerShell to preserve absent versus empty.
-                    setup = (
-                        "Remove-Item Env:RUSTC_WORKSPACE_WRAPPER -ErrorAction SilentlyContinue"
-                        if workspace_wrapper is None
-                        else "$env:RUSTC_WORKSPACE_WRAPPER = "
-                        + ps_single_quote(workspace_wrapper)
-                    )
-                    child = (
-                        "import json,os,sys; print('CHILD='+json.dumps({k:os.environ.get(k) "
-                        "for k in "
-                        + repr(names)
-                        + "})); sys.exit("
-                        + str(exit_code)
-                        + ")"
-                    )
-                    entries = "; ".join(
-                        name + "=[Environment]::GetEnvironmentVariable('" + name + "')"
-                        for name in names
-                    )
-                    command = (
-                        setup
-                        + "; & "
-                        + ps_single_quote(script)
-                        + " -NoSccache -ProgramArgs @("
-                        + ps_single_quote(sys.executable)
-                        + ", '-c', "
-                        + ps_single_quote(child)
-                        + "); $childExit = $LASTEXITCODE; 'RESTORED=' + (@{"
-                        + entries
-                        + "} | ConvertTo-Json -Compress); exit $childExit"
-                    )
-                    result = subprocess.run(
-                        [shell, "-NoProfile", "-Command", command],
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                        creationflags=CREATE_NO_WINDOW,
-                    )
-                    self.assertEqual(result.returncode, exit_code, result.stderr)
-                    proofs = {
-                        line.split("=", 1)[0]: json.loads(line.split("=", 1)[1])
-                        for line in result.stdout.splitlines()
-                        if line.startswith(("CHILD=", "RESTORED="))
-                    }
-                    self.assertEqual(
-                        proofs["CHILD"],
-                        {
-                            "RUSTC_WRAPPER": "",
-                            "RUSTC_WORKSPACE_WRAPPER": "",
-                            "CARGO_INCREMENTAL": "0",
-                            "SCCACHE_BASEDIR": None,
-                            "SCCACHE_CACHE_SIZE": None,
-                        },
-                    )
-                    expected = dict.fromkeys(names, "inherited")
-                    expected["RUSTC_WORKSPACE_WRAPPER"] = workspace_wrapper
-                    self.assertEqual(proofs["RESTORED"], expected)
-                    self.assertIn("rustcWorkspaceWrapper=<empty>", result.stdout)
+        cases = [
+            (wrapper, code) for wrapper in (None, "", "sccache") for code in (0, 7)
+        ]
+        commands = []
+        for workspace_wrapper, exit_code in cases:
+            # Set this inside PowerShell to preserve absent versus empty.
+            setup = (
+                "Remove-Item Env:RUSTC_WORKSPACE_WRAPPER -ErrorAction SilentlyContinue"
+                if workspace_wrapper is None
+                else "$env:RUSTC_WORKSPACE_WRAPPER = "
+                + ps_single_quote(workspace_wrapper)
+            )
+            child = (
+                "import json,os,sys; print('CHILD='+json.dumps({k:os.environ.get(k) "
+                f"for k in {names!r}}})); sys.exit({exit_code})"
+            )
+            entries = "; ".join(
+                name + "=[Environment]::GetEnvironmentVariable('" + name + "')"
+                for name in names
+            )
+            commands.append(
+                setup
+                + "; & "
+                + ps_single_quote(script)
+                + " -NoSccache -ProgramArgs @("
+                + ps_single_quote(sys.executable)
+                + ", '-c', "
+                + ps_single_quote(child)
+                + "); 'EXIT=' + $LASTEXITCODE; 'RESTORED=' + (@{"
+                + entries
+                + "} | ConvertTo-Json -Compress)"
+            )
+        env = os.environ.copy()
+        env.update(dict.fromkeys(names, "inherited"))
+        result = subprocess.run(
+            [shell, "-NoProfile", "-Command", "; ".join(commands) + "; exit 0"],
+            check=False,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        proofs = [
+            json.loads(line.split("=", 1)[1])
+            for line in result.stdout.splitlines()
+            if line.startswith(("CHILD=", "EXIT=", "RESTORED="))
+        ]
+        self.assertEqual(len(proofs), 3 * len(cases), result.stdout)
+        for index, (workspace_wrapper, exit_code) in enumerate(cases):
+            with self.subTest(wrapper=workspace_wrapper, exit_code=exit_code):
+                child, code, restored = proofs[index * 3 : index * 3 + 3]
+                self.assertEqual(code, exit_code)
+                self.assertEqual(
+                    child,
+                    {
+                        "RUSTC_WRAPPER": "",
+                        "RUSTC_WORKSPACE_WRAPPER": "",
+                        "CARGO_INCREMENTAL": "0",
+                        "SCCACHE_BASEDIR": None,
+                        "SCCACHE_CACHE_SIZE": None,
+                    },
+                )
+                expected = dict.fromkeys(names, "inherited")
+                expected["RUSTC_WORKSPACE_WRAPPER"] = workspace_wrapper
+                self.assertEqual(restored, expected)
+        self.assertEqual(
+            result.stdout.count("rustcWorkspaceWrapper=<empty>"), len(cases)
+        )
 
     def test_perf_env_rejects_explicit_target_outside_reserved_lane(self) -> None:
         shell = pwsh_only()
@@ -847,7 +868,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("sccache --zero-stats failed with exit code 9", result.stderr)
         self.assertEqual(
             call_lines,
-            ["--show-stats", "--zero-stats"],
+            ["--zero-stats"],
         )
 
     def test_sccache_perf_reports_command_removed_after_lookup(self) -> None:
@@ -860,24 +881,14 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             fake_bin = temp_root / "bin"
             fake_bin.mkdir()
             calls = temp_root / "sccache-calls.txt"
-            (fake_bin / "sccache.cmd").write_text(
-                "\r\n".join(
-                    [
-                        "@echo off",
-                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
-                        'if "%1"=="--show-stats" (',
-                        "  echo Max cache size                       80 GiB",
-                        '  del "%~f0"',
-                        "  exit /b 0",
-                        ")",
-                        "exit /b 0",
-                        "",
-                    ]
-                ),
+            (fake_bin / "sccache.ps1").write_text(
+                'Add-Content -LiteralPath $env:FAKE_SCCACHE_CALLS -Value ($args -join " ")\n'
+                "Remove-Item -LiteralPath $PSCommandPath\n"
+                "$global:LASTEXITCODE = 0\n",
                 encoding="utf-8",
             )
             env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            env["PATH"] = str(fake_bin)
             env["FAKE_SCCACHE_CALLS"] = str(calls)
             script = REPO_ROOT / "scripts" / "sccache-perf.ps1"
 
@@ -902,7 +913,47 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("sccache --zero-stats failed to launch", result.stderr)
+        self.assertIn("sccache --show-stats failed to launch", result.stderr)
+
+    def test_sccache_perf_reset_does_not_restart_mismatched_server(self):
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            calls = root / "calls.txt"
+            (root / "sccache.cmd").write_text(
+                '@echo off\n>>"%FAKE_SCCACHE_CALLS%" echo(%*\n'
+                'if "%1"=="--show-stats" echo Max cache size 10 GiB\n'
+                "exit /b 0\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(REPO_ROOT / "scripts" / "sccache-perf.ps1"),
+                    "reset",
+                ],
+                env={
+                    **os.environ,
+                    "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_SCCACHE_CALLS": str(calls),
+                    "CODEX_SCCACHE_CACHE_SIZE": "80G",
+                },
+                text=True,
+                capture_output=True,
+                timeout=30,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                calls.read_text().splitlines(), ["--zero-stats", "--show-stats"]
+            )
+            self.assertIn("Max cache size 10 GiB", result.stdout)
 
     def test_justfile_bench_and_validation_fast_paths_are_explicit(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -938,10 +989,10 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             },
         )
 
-    def test_agents_root_only_instruction_layout_and_budget_are_explicit(
+    def test_agents_instruction_layout_and_budget_are_explicit(
         self,
     ) -> None:
-        expected_agent_files = ["AGENTS.md"]
+        expected_agent_files = ["AGENTS.md", "DO-NOT-CHANGE/AGENTS.md"]
         discovered_agent_files = subprocess.run(
             [
                 "git",
@@ -965,7 +1016,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             path for path in discovered_agent_files if (REPO_ROOT / path).is_file()
         )
         actual_eol_attributes = subprocess.run(
-            ["git", "check-attr", "eol", "--", *expected_agent_files],
+            ["git", "check-attr", "eol", "--", "AGENTS.md"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -975,7 +1026,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             creationflags=CREATE_NO_WINDOW,
             timeout=30,
         ).stdout.splitlines()
-        expected_eol_attributes = [f"{path}: eol: lf" for path in expected_agent_files]
+        expected_eol_attributes = ["AGENTS.md: eol: lf"]
 
         self.assertEqual(actual_agent_files, sorted(expected_agent_files))
         self.assertEqual(actual_eol_attributes, expected_eol_attributes)

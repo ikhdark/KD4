@@ -144,10 +144,11 @@ pub(super) async fn spawn_review_thread(
         deferred_tool_activations: Arc::new(std::sync::RwLock::new(
             crate::session::turn_context::DeferredToolActivationState::default(),
         )),
-        validation_authorization: Arc::clone(&parent_turn_context.validation_authorization),
+        validation_authorization: parent_turn_context.validation_authorization.clone(),
         turn_metadata_state,
         extension_data,
         pending_post_tool_contexts: Default::default(),
+        post_tool_stop_reason: Default::default(),
         turn_skills: TurnSkillsContext::new(parent_turn_context.turn_skills.snapshot.clone()),
         turn_timing_state: Arc::new(TurnTimingState::default()),
         tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),

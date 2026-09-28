@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -102,7 +103,7 @@ exit 0
     env["USERPROFILE"] = str(user_profile)
     env["GENERATED_FIXTURE"] = str(generated_fixture)
     env["CARGO_LANE_LOG"] = str(cargo_lane_log)
-    env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+    env["PATH"] = str(fake_bin)
     return ProtoFixture(
         script=script,
         checked_generated=checked_generated,
@@ -174,7 +175,15 @@ class GenerateConfigProtoTest(unittest.TestCase):
 
     def test_check_uses_default_cargo_home_and_lane_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            fixture = create_fixture(Path(temp_dir))
+            temp_path = Path(temp_dir)
+            host_protoc = write_lf(
+                temp_path / "host-bin" / "protoc.cmd", "@echo off\nexit /b 0\n"
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": str(host_protoc.parent) + os.pathsep + os.environ.get("PATH", "")},
+            ):
+                fixture = create_fixture(temp_path)
             generated_before = fixture.checked_generated.read_bytes()
             lock_before = fixture.cargo_lock.read_bytes()
 
@@ -191,6 +200,22 @@ class GenerateConfigProtoTest(unittest.TestCase):
             self.assertEqual(fixture.cargo_lock.read_bytes(), lock_before)
             self.assertNotIn(b"\r", generated_before)
             self.assertFalse(generated_before.startswith(b"\xef\xbb\xbf"))
+            self.assert_lane_args(fixture)
+
+    def test_path_protoc_precedes_vendored_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fixture = create_fixture(temp_path)
+            path_protoc = write_lf(
+                temp_path / "path-bin" / "protoc.cmd", "@echo off\nexit /b 0\n"
+            )
+            fixture.env["PATH"] = str(path_protoc.parent) + os.pathsep + fixture.env["PATH"]
+
+            result = self.run_fixture(fixture, "-Check")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"Using protoc: {path_protoc}", result.stdout)
+            self.assertNotIn(f"Using protoc: {fixture.default_protoc}", result.stdout)
             self.assert_lane_args(fixture)
 
     def test_explicit_protoc_precedes_environment_and_default(self) -> None:
@@ -267,6 +292,24 @@ class GenerateConfigProtoTest(unittest.TestCase):
                 list(fixture.checked_generated.parent.glob(".*.tmp*")),
                 [],
             )
+            self.assert_lane_args(fixture)
+
+    def test_write_normalizes_generated_bytes_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = create_fixture(
+                Path(temp_dir),
+                generated_contents="\ufeff// @generated\r\npub struct Generated;\r\n",
+            )
+            fixture.checked_generated.write_bytes(b"// stale binding\n")
+            lock_before = fixture.cargo_lock.read_bytes()
+
+            result = self.run_fixture(fixture)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                fixture.checked_generated.read_bytes(), EXPECTED_GENERATED.encode("utf-8")
+            )
+            self.assertEqual(fixture.cargo_lock.read_bytes(), lock_before)
             self.assert_lane_args(fixture)
 
     def test_failed_replacement_preserves_binding_and_lock(self) -> None:

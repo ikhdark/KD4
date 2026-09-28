@@ -82,20 +82,29 @@ pub fn atomic_write_lock_path(write_path: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn acquire_atomic_write_lock(write_path: &Path) -> io::Result<AtomicWriteLock> {
-    let lock_path = atomic_write_lock_path(write_path)?;
-    if let Some(parent) = lock_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
+    loop {
+        let lock_path =
+            atomic_write_lock_path(&resolve_symlink_write_paths(write_path)?.write_path)?;
+        if let Some(parent) = lock_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        let lock = AtomicWriteLock { file };
+        // A symlink may have been retargeted while this writer waited for the lock.
+        if atomic_write_lock_path(&resolve_symlink_write_paths(write_path)?.write_path)?
+            == lock_path
+        {
+            return Ok(lock);
+        }
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-    fs2::FileExt::lock_exclusive(&file)?;
-    Ok(AtomicWriteLock { file })
 }
 
 pub fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {

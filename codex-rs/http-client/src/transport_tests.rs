@@ -113,6 +113,89 @@ fn test_reqwest_client() -> reqwest::Client {
         .expect("HTTP client should build")
 }
 
+#[tokio::test]
+async fn error_diagnostics_are_bounded_without_losing_status_or_retry_deadline() {
+    use std::io::Read;
+    for streaming in [false, true] {
+        for case in ["complete", "stalled", "oversized"] {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let body = match case {
+                    "oversized" => "x".repeat(MAX_ERROR_BODY_BYTES + 1000),
+                    _ => "useful diagnostic".to_string(),
+                };
+                let length = if case == "stalled" {
+                    body.len() + 100
+                } else {
+                    body.len()
+                };
+                write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {length}\r\nRetry-After: 7\r\nConnection: close\r\n\r\n").unwrap();
+                // An oversized response may be closed by the bounded reader mid-write.
+                let _ = socket.write_all(body.as_bytes());
+                if case == "stalled" {
+                    let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                }
+            });
+            let transport = ReqwestTransport::new(test_reqwest_client());
+            let request = Request::new(Method::GET, format!("http://{address}/"));
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                if streaming {
+                    match transport.stream(request).await {
+                        Err(error) => error,
+                        Ok(_) => panic!("expected HTTP error"),
+                    }
+                } else {
+                    transport.execute(request).await.expect_err("HTTP error")
+                }
+            })
+            .await;
+            let _ = release_tx.send(());
+            server.join().unwrap();
+            let error = result.expect("diagnostics must not delay the actionable error");
+            let remaining = error.retry_after().unwrap().remaining_delay();
+            assert!(remaining > Duration::from_secs(5) && remaining <= Duration::from_secs(7));
+            let TransportError::Http {
+                status,
+                headers,
+                body,
+                ..
+            } = error
+            else {
+                panic!("lost HTTP status");
+            };
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(headers.unwrap()["retry-after"], "7");
+            let body = body.expect("available diagnostics retained");
+            match case {
+                "complete" => assert_eq!(body, "useful diagnostic"),
+                "stalled" => assert_eq!(body, "useful diagnostic\n[HTTP error body truncated]"),
+                _ => {
+                    assert!(body.starts_with(&"x".repeat(MAX_ERROR_BODY_BYTES)));
+                    assert_eq!(
+                        body.len(),
+                        MAX_ERROR_BODY_BYTES + "\n[HTTP error body truncated]".len()
+                    );
+                }
+            }
+        }
+    }
+}
+
 async fn capture_transport_logs(client: HttpClient) -> String {
     let unavailable_server =
         std::net::TcpListener::bind(("127.0.0.1", 0)).expect("server port should bind");

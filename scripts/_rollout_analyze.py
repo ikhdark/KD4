@@ -1,4 +1,10 @@
 import json, sys, collections, datetime
+from pathlib import Path
+
+try:
+    from scripts.rollout_snapshot import read_rollout_records
+except ImportError:
+    from rollout_snapshot import read_rollout_records
 
 def ts(o):
     t = o.get('timestamp')
@@ -14,14 +20,12 @@ def short(s, n=160):
     return s if len(s) <= n else s[:n] + f'...(+{len(s)-n})'
 
 def analyze(path, verbose):
-    rows = []
-    for line in open(path, encoding='utf-8'):
-        try:
-            rows.append(json.loads(line))
-        except Exception as e:
-            print('BAD LINE', e)
+    rows = [row for row, _ in read_rollout_records(Path(path))]
     print('=' * 100)
     print(path.split('\\')[-1])
+    if not rows:
+        print('no complete records')
+        return
     first = rows[0]
     meta = first.get('payload', {}) if first.get('type') == 'session_meta' else {}
     print('session_meta keys:', list(meta.keys())[:30])

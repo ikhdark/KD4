@@ -1643,14 +1643,6 @@ impl RawOutputArtifact {
         .ok()
     }
 
-    pub(crate) fn retained_bytes(&self) -> Option<u64> {
-        match self {
-            Self::Pending { .. } => None,
-            Self::Stored { bytes, .. } => Some(*bytes),
-            Self::Failed { .. } => None,
-        }
-    }
-
     pub(crate) fn retention_limit_hit(&self) -> bool {
         matches!(
             self,
@@ -3280,13 +3272,33 @@ pub(crate) async fn protect_active_tool_history_artifact(
         let path = directory.join(format!("{id}.log"));
         let marker = active_tool_history_protection_path(&path);
         let result = (|| {
-            let (file, artifact_bytes) = open_regular_artifact(&path)
-                .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
-            if artifact_bytes != expected_bytes {
-                return Err("artifact byte count does not match receipt metadata".to_string());
-            }
-            if verified_artifact_digest(file, expected_bytes)? != expected_sha256 {
-                return Err("artifact digest does not match receipt metadata".to_string());
+            match std::fs::symlink_metadata(logical_metadata_path(&path)) {
+                Ok(_) => {
+                    let metadata = load_logical_metadata(&path, id)
+                        .map_err(|error| error.for_model())?;
+                    if !metadata.complete
+                        || metadata.canonical_bytes != expected_bytes
+                        || metadata.retained_bytes != expected_bytes
+                        || metadata.canonical_sha256 != expected_sha256
+                        || metadata.retained_sha256.as_ref().is_some_and(|sha| sha != &expected_sha256)
+                    {
+                        return Err("artifact identity does not match receipt metadata".to_string());
+                    }
+                    // Validate the logical family, not just its first physical segment.
+                    load_validated_logical_snapshot(&path, &metadata)
+                        .map_err(|error| error.for_model())?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let (file, artifact_bytes) = open_regular_artifact(&path)
+                        .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
+                    if artifact_bytes != expected_bytes {
+                        return Err("artifact byte count does not match receipt metadata".to_string());
+                    }
+                    if verified_artifact_digest(file, expected_bytes)? != expected_sha256 {
+                        return Err("artifact digest does not match receipt metadata".to_string());
+                    }
+                }
+                Err(error) => return Err(format!("failed to inspect artifact metadata: {error}")),
             }
             match std::fs::symlink_metadata(&marker) {
                 Ok(_) => {

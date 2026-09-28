@@ -10,8 +10,6 @@ use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_native_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
-use futures::StreamExt;
-use futures::stream;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::process::Command;
@@ -67,7 +65,6 @@ pub async fn get_git_repo_root_with_fs(
 
 /// Timeout for git commands to prevent freezing on large repositories
 const GIT_COMMAND_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
-const UNTRACKED_DIFF_CONCURRENCY: usize = 8;
 const MAX_DIFF_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Confirmed, runtime-only repository identity plus stable Git metadata.
@@ -469,6 +466,7 @@ pub async fn git_index_entries(cwd: &Path, paths: &[PathBuf]) -> Option<Vec<u8>>
         &args,
         cwd,
         crate::FsmonitorOverride::Disabled,
+        None,
     )
     .await?;
     output.status.success().then_some(output.stdout)
@@ -504,6 +502,7 @@ impl crate::FsmonitorProbeRunner for LocalFsmonitorProbeRunner<'_> {
             &args,
             self.cwd,
             crate::FsmonitorOverride::Disabled,
+            None,
         )
         .await?;
         output.status.success().then_some(output.stdout)
@@ -522,7 +521,7 @@ async fn run_git_command_with_timeout_from(
     fsmonitor: crate::FsmonitorOverride,
 ) -> Option<std::process::Output> {
     let args = args.iter().map(OsString::from).collect::<Vec<_>>();
-    run_git_command_with_timeout_os_from(git, &args, cwd, fsmonitor).await
+    run_git_command_with_timeout_os_from(git, &args, cwd, fsmonitor, None).await
 }
 
 async fn run_git_command_with_timeout_os_from(
@@ -530,20 +529,34 @@ async fn run_git_command_with_timeout_os_from(
     args: &[OsString],
     cwd: &Path,
     fsmonitor: crate::FsmonitorOverride,
+    private_index_dir: Option<&Path>,
 ) -> Option<std::process::Output> {
     let command_args = git_inspection_args_os(args, fsmonitor, None);
-    let output = run_git_command_attempt(git, &command_args, cwd, fsmonitor).await?;
-    let Some(retry_args) = safe_directory_retry_args_os(
-        args,
-        cwd,
-        fsmonitor,
-        output.status.success(),
-        &output.stderr,
-    ) else {
+    let output =
+        run_git_command_attempt(git, &command_args, cwd, fsmonitor, private_index_dir).await?;
+    let retry_args = if private_index_dir.is_some()
+        && is_dubious_ownership_stderr(output.status.success(), &output.stderr)
+    {
+        // These commands can only update our disposable index and object store.
+        Some(git_inspection_args_os(
+            args,
+            fsmonitor,
+            Some(&get_git_repo_root(cwd)?),
+        ))
+    } else {
+        safe_directory_retry_args_os(
+            args,
+            cwd,
+            fsmonitor,
+            output.status.success(),
+            &output.stderr,
+        )
+    };
+    let Some(retry_args) = retry_args else {
         return Some(output);
     };
 
-    run_git_command_attempt(git, &retry_args, cwd, fsmonitor).await
+    run_git_command_attempt(git, &retry_args, cwd, fsmonitor, private_index_dir).await
 }
 
 fn safe_directory_retry_args_os(
@@ -629,6 +642,7 @@ async fn run_git_command_attempt(
     args: &[OsString],
     cwd: &Path,
     fsmonitor: crate::FsmonitorOverride,
+    private_index_dir: Option<&Path>,
 ) -> Option<std::process::Output> {
     let mut command = Command::new(git);
     command
@@ -636,6 +650,11 @@ async fn run_git_command_attempt(
         .args(args)
         .current_dir(cwd)
         .kill_on_drop(true);
+    if let Some(directory) = private_index_dir {
+        command
+            .env("GIT_INDEX_FILE", directory.join("index"))
+            .env("GIT_OBJECT_DIRECTORY", directory.join("objects"));
+    }
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -922,6 +941,9 @@ async fn find_closest_sha(cwd: &Path, branches: &[String], remotes: &[String]) -
             // Preserve existing behavior: skip branches that are not present on a remote.
             continue;
         };
+        if distance == 0 {
+            return Some(remote_sha);
+        }
         match &closest_sha {
             None => closest_sha = Some((remote_sha, distance)),
             Some((_, best_distance)) if distance < *best_distance => {
@@ -967,56 +989,67 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
     if untracked_output.stdout.len() > MAX_DIFF_OUTPUT_BYTES {
         return None;
     }
-    let untracked = parse_nul_terminated_paths(untracked_output.stdout)?;
-
-    if !untracked.is_empty() {
-        // Use platform-appropriate null device and guard paths with `--`.
-        let null_device = OsString::from("NUL");
-        let futures = untracked.into_iter().map(|file| {
-            let args = vec![
-                OsString::from("diff"),
-                OsString::from("--no-textconv"),
-                OsString::from("--no-ext-diff"),
-                OsString::from("--binary"),
-                OsString::from("--no-index"),
-                // -- ensures that filenames that start with - are not treated as options.
-                OsString::from("--"),
-                null_device.clone(),
-                file,
-            ];
-            async move { run_git_command_with_timeout_os_from(git, &args, cwd, fsmonitor).await }
-        });
-        let mut results = stream::iter(futures).buffered(UNTRACKED_DIFF_CONCURRENCY);
-        while let Some(extra) = results.next().await {
-            let extra = extra?;
-            if !extra
-                .status
-                .code()
-                .is_some_and(|code| code == 0 || code == 1)
-            {
-                return None;
-            }
-            let new_len = diff.len().checked_add(extra.stdout.len())?;
-            if new_len > MAX_DIFF_OUTPUT_BYTES {
-                return None;
-            }
-            diff.push_str(&String::from_utf8(extra.stdout).ok()?);
+    if !untracked_output.stdout.is_empty() {
+        let extra = diff_untracked_files(cwd, &untracked_output.stdout).await?;
+        if diff.len().checked_add(extra.len())? > MAX_DIFF_OUTPUT_BYTES {
+            return None;
         }
+        diff.push_str(&extra);
     }
 
     Some(diff)
 }
 
-fn parse_nul_terminated_paths(output: Vec<u8>) -> Option<Vec<OsString>> {
-    output
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(os_string_from_git_bytes)
-        .collect()
-}
-
-fn os_string_from_git_bytes(bytes: &[u8]) -> Option<OsString> {
-    String::from_utf8(bytes.to_vec()).ok().map(OsString::from)
+async fn diff_untracked_files(cwd: &Path, paths: &[u8]) -> Option<String> {
+    // Intent-to-add entries produce the same new-file patches as --no-index,
+    // but one diff handles the whole list. Isolate both the index and the empty
+    // blob written by `add -N`; an inspection must not alter the real repository.
+    let directory = tempfile::tempdir().ok()?;
+    tokio::fs::create_dir(directory.path().join("objects"))
+        .await
+        .ok()?;
+    let pathspec = directory.path().join("paths");
+    tokio::fs::write(&pathspec, paths).await.ok()?;
+    let mut pathspec_arg = OsString::from("--pathspec-from-file=");
+    pathspec_arg.push(pathspec);
+    let add_args = [
+        OsString::from("-c"),
+        OsString::from("core.splitIndex=false"),
+        OsString::from("--literal-pathspecs"),
+        OsString::from("add"),
+        OsString::from("--intent-to-add"),
+        OsString::from("--pathspec-file-nul"),
+        pathspec_arg,
+    ];
+    let added = run_git_command_with_timeout_os_from(
+        Path::new("git"),
+        &add_args,
+        cwd,
+        crate::FsmonitorOverride::Disabled,
+        Some(directory.path()),
+    )
+    .await?;
+    if !added.status.success() {
+        return None;
+    }
+    let args = ["diff", "--no-textconv", "--no-ext-diff", "--binary"].map(OsString::from);
+    let output = run_git_command_with_timeout_os_from(
+        Path::new("git"),
+        &args,
+        cwd,
+        crate::FsmonitorOverride::Disabled,
+        Some(directory.path()),
+    )
+    .await?;
+    if !output
+        .status
+        .code()
+        .is_some_and(|code| code == 0 || code == 1)
+        || output.stdout.len() > MAX_DIFF_OUTPUT_BYTES
+    {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
 }
 
 /// Resolve the path that should be used for trust checks. Similar to
@@ -1288,16 +1321,83 @@ mod tests {
         assert_eq!(linked_context.git_info.branch, None);
     }
 
-    #[test]
-    fn nul_terminated_paths_preserve_embedded_whitespace() {
-        let paths = parse_nul_terminated_paths(b"tab\tname.txt\0line\nname.txt\0".to_vec())
-            .expect("parse paths");
+    #[tokio::test]
+    async fn batched_untracked_diff_preserves_git_patches_and_repository_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, _, _, _) = init_repo_with_remote(&temp);
+        let mut files = vec![
+            "-leading.txt",
+            "literal[1].txt",
+            "space name.txt",
+            "é.txt",
+            "empty",
+            "binary",
+        ];
+        #[cfg(unix)]
+        files.extend(["tab\tname.txt", "line\nname.txt"]);
+        #[cfg(windows)]
+        let _ = &mut files;
+        for file in &files {
+            let contents: &[u8] = match *file {
+                "empty" => b"",
+                "binary" => b"binary\0contents",
+                _ => b"new contents\r\n",
+            };
+            std::fs::write(repo.join(file), contents).unwrap();
+        }
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(repo.join("ignored.txt"), "must not appear\n").unwrap();
+        std::fs::write(repo.join("tracked.txt"), "staged\n").unwrap();
+        run_git(&repo, &["add", "tracked.txt"]);
+        std::fs::write(repo.join("tracked.txt"), "unstaged\n").unwrap();
+        run_git(&repo, &["config", "core.autocrlf", "true"]);
+        let index_before = std::fs::read(repo.join(".git/index")).unwrap();
+        let objects_before = run_git(&repo, &["count-objects", "-v"]);
+        let listed = StdCommand::new("git")
+            .args(["ls-files", "-z", "--others", "--exclude-standard"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        let mut expected = Vec::new();
+        for path in listed
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let file = std::str::from_utf8(path).unwrap();
+            let output = StdCommand::new("git")
+                .args([
+                    "-c",
+                    "core.quotePath=true",
+                    "diff",
+                    "--no-textconv",
+                    "--no-ext-diff",
+                    "--binary",
+                    "--no-index",
+                    "--",
+                    "NUL",
+                    file,
+                ])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            expected.extend(output.stdout);
+        }
+        let actual = diff_untracked_files(&repo, &listed.stdout).await.unwrap();
+        assert_eq!(actual.as_bytes(), expected);
+        assert!(actual.contains("GIT binary patch"));
+        assert!(!actual.contains("ignored.txt b/ignored.txt"));
+        assert!(!actual.contains("tracked.txt b/tracked.txt"));
         assert_eq!(
-            paths,
-            vec![
-                OsString::from("tab\tname.txt"),
-                OsString::from("line\nname.txt")
-            ]
+            std::fs::read(repo.join(".git/index")).unwrap(),
+            index_before
+        );
+        assert_eq!(run_git(&repo, &["count-objects", "-v"]), objects_before);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "unstaged\n"
         );
     }
 

@@ -21,11 +21,8 @@ class GenerationLockError(RuntimeError):
 def _acquire_nonblocking(handle: TextIO) -> None:
     import msvcrt
 
-    handle.seek(0, os.SEEK_END)
-    if handle.tell() == 0:
-        handle.seek(0)
-        handle.write("\0")
-        handle.flush()
+    # Windows can lock beyond EOF. Never write before acquiring ownership:
+    # an older owner may have truncated its metadata while retaining the lock.
     handle.seek(0)
     try:
         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
@@ -60,7 +57,9 @@ def repository_lock(
         sort_keys=True,
         separators=(",", ":"),
     )
-    handle = lock_path.open("a+", encoding="utf-8")
+    handle = os.fdopen(
+        os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666), "r+", encoding="utf-8"
+    )
     deadline = time.monotonic() + timeout
     waiting = False
     try:
@@ -92,10 +91,10 @@ def repository_lock(
 
     try:
         handle.seek(0)
-        handle.truncate()
         handle.write(payload)
         handle.write("\n")
         handle.flush()
+        handle.truncate()
         os.fsync(handle.fileno())
         yield lock_path
     finally:
@@ -107,10 +106,12 @@ def repository_lock(
 
 @contextlib.contextmanager
 def generated_output_lock(
-    root: Path, owner: str, *, timeout: float = 0
+    root: Path, owner: str, *, timeout: float = 0, resource: str = "generated-output"
 ) -> Iterator[Path]:
-    lock_path = root / ".codex" / "locks" / "generated-output.lock"
+    if resource not in {"generated-output", "app-server-schema", "config-schema"}:
+        raise ValueError(f"unknown generated output resource: {resource}")
+    lock_path = root / ".codex" / "locks" / f"{resource}.lock"
     with repository_lock(
-        lock_path, owner, "generated outputs", timeout=timeout
+        lock_path, owner, f"generated outputs ({resource})", timeout=timeout
     ) as acquired:
         yield acquired

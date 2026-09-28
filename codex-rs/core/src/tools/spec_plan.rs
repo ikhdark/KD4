@@ -1297,26 +1297,21 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
     )
 )]
 fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
-    if let Some(mcp_tools) = context.mcp_tools {
-        for tool in mcp_tools {
+    for (tools, exposure) in [
+        (context.mcp_tools, ToolExposure::Direct),
+        (context.deferred_mcp_tools, ToolExposure::Deferred),
+    ] {
+        for tool in tools.into_iter().flatten() {
             match McpHandler::new(tool.clone()) {
-                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Direct),
-                Err(err) => warn!(
-                    "Skipping MCP tool `{}`: failed to build tool spec: {err}",
-                    tool.canonical_tool_name()
-                ),
-            }
-        }
-    }
-
-    if let Some(deferred_mcp_tools) = context.deferred_mcp_tools {
-        for tool in deferred_mcp_tools {
-            match McpHandler::new(tool.clone()) {
-                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Deferred),
-                Err(err) => warn!(
-                    "Skipping deferred MCP tool `{}`: failed to build tool spec: {err}",
-                    tool.canonical_tool_name()
-                ),
+                Ok(handler) => planned_tools.add_mcp_runtime(handler, exposure),
+                Err(err) => {
+                    let warning = format!(
+                        "MCP tool `{}` is unavailable: failed to build tool spec: {err}. Update the MCP server's tool schema to a supported equivalent without removing its constraints.",
+                        tool.canonical_tool_name()
+                    );
+                    warn!("{warning}");
+                    planned_tools.warnings.push(warning);
+                }
             }
         }
     }

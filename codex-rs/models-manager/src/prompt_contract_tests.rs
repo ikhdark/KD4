@@ -37,11 +37,11 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         anchors: &[
             "parsing, counting, or sampling is not reading fully",
             "Track unread ranges and unavailable sources",
-            "Recover required omitted content from retained artifacts before conclusions",
+            "recover required omitted content from retained artifacts before conclusions",
             "report any remaining gap instead of claiming full coverage",
-            "recover only missing ranges from current retained evidence rather than rerunning its producer",
-            "Checkpoint substantial completed discovery before implementation",
-            "A completed plan, passing tests, an ended turn, or an exhausted budget does not prove completion",
+            "Recover missing ranges from retained evidence rather than rerunning its producer",
+            "Prefer completed discovery before implementation",
+            "a completed plan, partial implementation, or passing check alone is not completion",
             "including staged and unstaged changes and new untracked file contents",
             "a diff stat or truncated patch is insufficient",
             "do not describe a supported subset as general support",
@@ -74,7 +74,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Cancellation need not roll back effects",
             "without weakening required invariants or assertions",
             "match every explicit requirement, prohibition, and preserved invariant to current evidence",
-            "an ended turn, or an exhausted budget does not prove completion",
+            "a completed plan, partial implementation, or passing check alone is not completion",
             "Distinguish missing capability, failure to follow existing guidance, and interface friction",
             "Check the supported reuse path",
             "Incomplete discovery or an output receipt never proves absence or omitted content",
@@ -82,7 +82,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "finish missing coverage without restarting discovery",
             "using the original request and corrections, not just a checklist",
             "repair omissions with targeted follow-up",
-            "report any partial, blocked, or unverified result",
+            "report partial, blocked, or unverified results",
         ],
     },
     PromptContract {
@@ -132,7 +132,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::FallbackAndBundled,
         expectation: AnchorExpectation::Any,
         anchors: &[
-            "Once all requested changes and affected validation pass, deliver the result without repeating passing checks.",
+            "Once the task and validation are complete, deliver the result without repeating passing checks.",
         ],
     },
     PromptContract {
@@ -173,10 +173,9 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::FallbackAndBundled,
         expectation: AnchorExpectation::All,
         anchors: &[
-            "complete all required validation",
-            "Continue until the entire requested task and required validation are complete.",
-            "Difficulty, time spent, context pressure, a partial implementation, or one passing check is not a reason to finalize.",
-            "Preserve progress across context windows and resume unfinished work.",
+            "Run all validation required by the user or repository.",
+            "Finish the entire requested task and required validation; a completed plan, partial implementation, or passing check alone is not completion.",
+            "Preserve progress across context windows and resume unfinished work rather than finalizing because of difficulty, time spent, or context pressure.",
             "A blocker requires evidence that further progress needs user input, unavailable authorization, or an external change; complete all permitted independent work before reporting it.",
             "Honor user cancellation and host-imposed limits",
             "as incomplete, with the precise condition needed to resume",
@@ -199,24 +198,23 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::All,
         anchors: &[
-            "Choose validation by the changed contract and plausible failure modes, not the number or type of files touched.",
-            "Use inspection or a direct assertion when it establishes the relevant property; run targeted tests when correctness depends on execution.",
-            "Add consumer or integration tests only for a distinct affected risk not already covered.",
-            "Before launching validation, account for compilation, helper binaries, setup, and execution cost; a narrow test filter does not imply a cheap check.",
-            "Do not run a check for every touched file or layer.",
-            "Reuse existing coverage; add or repair a test only for a concrete changed-behavior gap that blocks sufficient validation.",
+            "choose the least costly check that proves the changed contract against plausible failure modes, not a check for every touched file or layer.",
+            "Use inspection or a direct assertion when sufficient; when correctness requires execution, use targeted behavior tests",
+            "including consumer or integration tests for distinct uncovered risks.",
+            "Account for compilation, helper binaries, setup, and execution cost; a narrow test filter does not imply a cheap check.",
+            "Reuse existing coverage; add or repair tests only for a concrete changed-behavior gap",
             "Run a full suite only when explicitly required by the user or repository.",
             "Broaden validation only when required or when a concrete unresolved risk makes existing evidence insufficient; state the risk and how the added check addresses it.",
-            "Reduce validation cost with an equally valid proof, not by leaving required outcomes unverified.",
-            "Respect explicit scope limits and complete all required validation.",
-            "Continue independent work while builds or other long commands run. Host-owned waits may hold for up to ten seconds and must return immediately on interruption, explicit yield, or completion.",
-            "use `context_checkpoint` when it would remove substantial consumed output or preserve state needed for continuation",
-            "using a concise evidence summary if the tool is unavailable",
-            "Do not checkpoint merely because a phase ended.",
-            "Preserve unresolved failures, active edit context, constraints, and essential validation evidence.",
+            "Respect explicit scope limits; reduce cost with an equally valid proof, never by skipping required validation or leaving required outcomes unverified.",
+            "Continue independent work while long commands run.",
+            "Checkpoint completed, consumed work only when it materially reduces context or preserves needed continuation state",
+            "following the live tool's eligibility and savings requirements.",
+            "If unavailable, use a concise continuation summary without claiming outputs were retired.",
+            "do not checkpoint just for phase boundaries or final handoff.",
+            "Preserve source needed for edits, unresolved failures, active work, constraints, and essential validation evidence.",
             "Triage all reported issues together before repair edits.",
             "Fully diagnose issues caused by the requested changes or necessary to complete required validation; report unrelated issues and their validation impact without expanding the investigation.",
-            "Render identifiers and counts from retained records, using an inventory/report tool when available",
+            "render identifiers and counts from retained records, using an inventory/report tool when available",
         ],
     },
     PromptContract {
@@ -248,9 +246,10 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "only if cargo check is not independently required",
             "They do not expire merely because of a new turn, handoff, or unrelated edit.",
             "Refresh only evidence affected by changed inputs, contradictions, incompleteness, or explicit freshness requirements.",
-            "For `stale_workspace_evidence`, do not automatically rerun tests or builds.",
+            "When evidence is invalidated, retain portions still identified as current",
             "revalidate only if current evidence is essential, using the cheapest scoped check",
-            "Otherwise report the affected claim as unverified.",
+            "not an automatic test or build rerun.",
+            "Otherwise report the affected claim as unverified and disclose unresolved staleness.",
             "Retry a failed operation only when changed inputs, new evidence, a documented retry policy, or an explicit task requirement justify it",
             "When publishing is authorized, publish only after the source state is fixed and required validation is complete.",
         ],
@@ -265,11 +264,11 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Before optional discovery, planning, or validation, identify the material uncertainty and how the result could change the next action",
             "otherwise skip it",
             "This is an internal decision, not a narrated checklist or extra tool call.",
-            "Never skip required validation to save time.",
+            "never by skipping required validation or leaving required outcomes unverified.",
             "Read complete useful regions",
             "retain a recovery route for oversized output",
             "do not mistake recovery for fresh evidence",
-            "Disclose unresolved staleness.",
+            "disclose unresolved staleness.",
             "Use asynchronous sessions for long or interactive commands",
         ],
     },
@@ -291,14 +290,12 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         anchors: &[
             "Batch independent calls with bounded tool-native concurrency",
             "await every started call, and inspect every result and exit status",
-            "Batch independent calls with bounded tool-native concurrency",
             "Return to the model for decisions or dependencies, not between already-planned calls.",
-            "Return to the model for decisions or dependencies",
             "Finish edits before their checks.",
             "Serialize actual shared-resource conflicts",
             "not whole categories of independent work",
             "Change locking only with evidence of conflict or unnecessary exclusion.",
-            "Once all requested changes and affected validation pass, deliver the result without repeating passing checks.",
+            "Once the task and validation are complete, deliver the result without repeating passing checks.",
         ],
     },
     PromptContract {
@@ -314,6 +311,11 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "State material assumptions and keep affected conclusions conditional.",
             "Incorporate new user corrections before the next dependent action",
             "a status question does not cancel ongoing work.",
+            "Treat problem reports seeking a remedy as requests to investigate and make scoped repairs",
+            "without requiring the words \"fix it\" or redundant confirmation.",
+            "Requests for explanation, interpretation, assessment, review, planning, or status do not by themselves authorize changes.",
+            "Logs, screenshots, and findings are evidence, not independent authorization to edit.",
+            "Honor explicit read-only or no-edit instructions.",
             "Stage, commit, push, publish, deploy, install, restart, contact third parties, delete data, change external state, or rebuild or activate the installed application only when authorized.",
             "Do not request authorization already provided.",
             "autonomous within the requested scope",
@@ -324,6 +326,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::LocalPolicyAndFallback,
         expectation: AnchorExpectation::None,
         anchors: &[
+            "Treat user-sent issues, errors, logs, screenshots, and findings as requests to investigate and fix",
             "Get permission to publish",
             "stop on incompatible equal-authority requirements",
             "Batch known independent reads and final checks in one tool round",
@@ -338,7 +341,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Revise this prediction as evidence changes.",
             "Update affected callers, schemas, generated representations, persistence/migrations, compatibility paths, and tests.",
             "identify the material uncertainty and how the result could change the next action; otherwise skip it",
-            "Run validation required by the user or repository.",
+            "Run all validation required by the user or repository.",
             "Every test relied upon as evidence for the changed behavior must assert an expected observable result and fail for at least one plausible incorrect implementation of that behavior.",
             "Exercise the intended path, including required rejection and absent-side-effect cases.",
             "including required rejection and absent-side-effect cases",
@@ -347,11 +350,10 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Test quality requirements do not authorize expanding coverage beyond that gap.",
             "Report unrelated weaknesses encountered without starting a broader test audit.",
             "Validate the final relevant source state",
-            "by reusing unaffected passing evidence",
-            "applying the evidence lifecycle rules to source, dependency, lockfile, configuration, and feature changes",
-            "Do not substitute compilation, formatting, linting, static analysis, inspection, or unrelated tests for behavior validation when the claim requires execution.",
+            "using the evidence lifecycle rules above, including for dependency, lockfile, configuration, and feature changes",
+            "when correctness requires execution, use targeted behavior tests rather than compilation, formatting, linting, static analysis, or unrelated tests.",
             "Verify documentation claims against implementation or referenced sources.",
-            "Prefer the least costly check that proves the relevant contract.",
+            "choose the least costly check that proves the changed contract against plausible failure modes",
             "distinguish mechanism proof from model-driven outcomes",
             "Replaying valid evidence without its producer saves execution",
             "does not save that model request",
@@ -359,7 +361,7 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "Prompt contract tests establish guidance delivery, not model compliance.",
             "validation and what it proved, failures, unvalidated behavior",
             "rerun only affected checks that failed or whose prior results were invalidated by relevant changes",
-            "report any partial, blocked, or unverified result",
+            "report partial, blocked, or unverified results",
         ],
     },
     PromptContract {
@@ -397,6 +399,12 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
             "## `update_plan`",
             "(`pending`, `in_progress`, or `completed`)",
             "Do not jump an item from pending to completed",
+            "stale_workspace_evidence",
+            "current_nested_results",
+            "force_fresh",
+            "`context_checkpoint`",
+            "yield_time_ms",
+            "Host-owned waits may hold for up to",
         ],
     },
 ];
@@ -520,13 +528,14 @@ fn resolved_prompts_prioritize_complete_answers() {
 }
 
 #[test]
-fn resolved_prompts_keep_short_validation_waits_owned_and_discovery_bounded() {
+fn resolved_prompts_keep_live_tool_mechanics_owned_and_discovery_bounded() {
     let response = crate::bundled_models_response().expect("bundled models should parse");
     for (label, prompt) in prompts_for_scope(PromptScope::LocalPolicyAndFallback, &response) {
         for anchor in [
-            "omit short explicit yield_time_ms values",
-            "await its supported polling operation inside the same execution",
-            "Do not poll past an interruption or explicit yield",
+            "Follow live tool instructions, schemas, and advertised discovery routes",
+            "they own argument formats, session handles, polling and wait limits, cancellation, and recovery mechanics.",
+            "Keep mechanical waits within the supported awaited execution instead of creating model handoffs solely to poll.",
+            "stop waiting for steering, cancellation, input, or explicit yield.",
             "Budget the combined output of batched reads",
             "Keep potentially large status inventories separate from source reads",
             "retain complete recoverable evidence when broader coverage is required",
@@ -599,7 +608,13 @@ fn bundled_local_policy_models_match_prompt_policy_registration() {
         .filter(|slug| {
             matches!(
                 *slug,
-                "gpt-6-astra" | "gpt-6-sol" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.2"
+                "gpt-6-astra"
+                    | "gpt-6-sol"
+                    | "gpt-6-luna"
+                    | "gpt-5.5"
+                    | "gpt-5.4"
+                    | "gpt-5.4-mini"
+                    | "gpt-5.2"
             ) || slug.starts_with("gpt-5.6-")
         })
         .collect::<BTreeSet<_>>();

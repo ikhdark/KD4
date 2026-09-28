@@ -102,7 +102,7 @@ fn with_session_index_lock<T>(
 
 fn remove_thread_name_entries_blocking(
     codex_home: &Path,
-    thread_id: ThreadId,
+    thread_ids: &HashSet<ThreadId>,
 ) -> std::io::Result<()> {
     with_session_index_lock(codex_home, || {
         let path = session_index_path(codex_home);
@@ -119,7 +119,7 @@ fn remove_thread_name_entries_blocking(
             let should_remove = std::str::from_utf8(line)
                 .ok()
                 .and_then(|line| serde_json::from_str::<SessionIndexEntry>(line.trim()).ok())
-                .is_some_and(|entry| entry.id == thread_id);
+                .is_some_and(|entry| thread_ids.contains(&entry.id));
             if should_remove {
                 removed = true;
             } else {
@@ -149,10 +149,24 @@ pub async fn remove_thread_name_entries(
     codex_home: &Path,
     thread_id: ThreadId,
 ) -> std::io::Result<()> {
+    remove_thread_names_for_ids(codex_home, &[thread_id]).await
+}
+
+/// Remove a batch under one index lock and one durable replacement.
+pub async fn remove_thread_names_for_ids(
+    codex_home: &Path,
+    thread_ids: &[ThreadId],
+) -> std::io::Result<()> {
+    if thread_ids.is_empty() {
+        return Ok(());
+    }
     let codex_home = codex_home.to_path_buf();
-    tokio::task::spawn_blocking(move || remove_thread_name_entries_blocking(&codex_home, thread_id))
-        .await
-        .map_err(std::io::Error::other)?
+    let thread_ids = thread_ids.iter().copied().collect();
+    tokio::task::spawn_blocking(move || {
+        remove_thread_name_entries_blocking(&codex_home, &thread_ids)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Find the latest thread name for a thread id, if any.
@@ -184,6 +198,31 @@ pub async fn find_thread_names_by_ids(
     tokio::task::spawn_blocking(move || scan_index_from_end_by_ids(&path, &thread_ids))
         .await
         .map_err(std::io::Error::other)?
+}
+
+pub(crate) async fn find_thread_ids_by_title(
+    codex_home: &Path,
+    search_term: &str,
+) -> std::io::Result<HashSet<ThreadId>> {
+    let path = session_index_path(codex_home);
+    let search_term = search_term.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut seen = HashSet::new();
+        let mut matching = HashSet::new();
+        match scan_index_from_end_for_each(&path, |entry| {
+            let name = entry.thread_name.trim();
+            if seen.insert(entry.id) && !name.is_empty() && name.contains(&search_term) {
+                matching.insert(entry.id);
+            }
+            Ok(None)
+        }) {
+            Ok(_) => Ok(matching),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(HashSet::new()),
+            Err(error) => Err(error),
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Locate a recorded thread rollout and read its session metadata by thread name.

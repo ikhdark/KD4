@@ -62,6 +62,7 @@ const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
 const RETAINED_REPOSITORY_CAPACITY: usize = 64;
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 const ROOT_DISCOVERY_CONCURRENCY: usize = 4;
+const REMOTE_WORKSPACE_CAPTURE_CONCURRENCY: usize = 4;
 static NEXT_WATCHER_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -396,46 +397,58 @@ async fn capture_remote_workspace_evidence(
     let (status, paths) = reader.finish()?;
     let head_identity = workspace_head_identity(&status)?;
     let mut manifest = format!("total_paths={}\n", paths.len()).into_bytes();
-    let mut remaining = WORKSPACE_GENERATION_MAX_DECLARED_BYTES as usize;
+    let remaining = AtomicU64::new(WORKSPACE_GENERATION_MAX_DECLARED_BYTES);
     let mut deletions = Vec::new();
-    for observation in paths {
-        let path = root.join(&observation.path).ok()?;
-        let metadata = match fs.get_metadata(&path, None).await {
-            Ok(metadata) if !observation.deleted => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound && observation.deleted => {
-                manifest.extend_from_slice(observation.path.as_bytes());
-                manifest.extend_from_slice(b"\0deleted\0\n");
-                deletions.push(path);
-                continue;
+    let captures = futures::stream::iter(paths.into_iter().map(|observation| {
+        let path = root.join(&observation.path);
+        let fs = fs.as_ref();
+        let remaining = &remaining;
+        async move {
+            let path = path.ok()?;
+            let mut entry = observation.path.as_bytes().to_vec();
+            let metadata = match fs.get_metadata(&path, None).await {
+                Ok(metadata) if !observation.deleted => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound && observation.deleted => {
+                    entry.extend_from_slice(b"\0deleted\0\n");
+                    return Some((entry, Some(path)));
+                }
+                _ => return None,
+            };
+            // The filesystem protocol cannot read symlink targets without following them.
+            // Never publish a complete identity when that evidence is unavailable.
+            if metadata.is_symlink || !metadata.is_file {
+                return None;
             }
-            _ => return None,
-        };
-        // The filesystem protocol cannot read symlink targets without following them.
-        // Never publish a complete identity when that evidence is unavailable.
-        if metadata.is_symlink || !metadata.is_file {
-            return None;
-        }
-        manifest.extend_from_slice(observation.path.as_bytes());
-        manifest.push(0);
-        manifest.extend_from_slice(if metadata.is_file {
-            b"file"
-        } else {
-            b"directory"
-        });
-        manifest.push(0);
-        manifest.extend_from_slice(metadata.size.to_string().as_bytes());
-        manifest.push(0);
-        if metadata.is_file {
-            let contents = fs.read_file_bounded(&path, remaining, None).await.ok()??;
-            remaining = remaining.checked_sub(contents.len())?;
+            let declared_bytes = usize::try_from(metadata.size).ok()?;
+            // Reserve before awaiting content so concurrent readers share the same
+            // aggregate limit. A failed reservation rejects the entire capture.
+            remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(metadata.size)
+                })
+                .ok()?;
+            let contents = fs.read_file_bounded(&path, declared_bytes, None).await.ok()??;
             if contents.len() as u64 != metadata.size
                 || fs.get_metadata(&path, None).await.ok()? != metadata
             {
                 return None;
             }
-            manifest.extend_from_slice(format!("{:x}", Sha256::digest(&contents)).as_bytes());
+            entry.extend_from_slice(b"\0file\0");
+            entry.extend_from_slice(metadata.size.to_string().as_bytes());
+            entry.push(0);
+            entry.extend_from_slice(format!("{:x}", Sha256::digest(&contents)).as_bytes());
+            entry.push(b'\n');
+            Some((entry, None))
         }
-        manifest.push(b'\n');
+    }))
+    .buffered(REMOTE_WORKSPACE_CAPTURE_CONCURRENCY);
+    // Ordered buffering keeps the identity stable regardless of RPC completion
+    // order. No spawned task outlives a rejected or cancelled capture.
+    tokio::pin!(captures);
+    while let Some(capture) = captures.next().await {
+        let (entry, deletion) = capture?;
+        manifest.extend_from_slice(&entry);
+        deletions.extend(deletion);
     }
     for path in deletions {
         if !matches!(fs.get_metadata(&path, None).await, Err(error) if error.kind() == ErrorKind::NotFound)

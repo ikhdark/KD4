@@ -692,7 +692,7 @@ benchmark_control = { kind = "lacking_off_state", reason = "Production validatio
 [[features.evidence]]
 kind = "entrypoint"
 path = "codex-rs/core/src/session/turn_context.rs"
-contains = "crate::validation_admission::ValidationAuthorization::default()"
+contains = "validation_authorization: Default::default()"
 
 [[features.evidence]]
 kind = "test"

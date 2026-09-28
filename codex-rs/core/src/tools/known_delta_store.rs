@@ -410,7 +410,7 @@ async fn immutable_git_show_identity_with_authorization_scope(
     }
     let (directories, requested) = immutable_git_show_arguments(args)?;
     let mut effective_cwd = cwd.to_path_buf();
-    for directory in directories.chunks_exact(2).map(|pair| &pair[1]) {
+    for directory in directories.as_chunks::<2>().0.iter().map(|pair| &pair[1]) {
         // Git applies successive -C options relative to the preceding one;
         // an empty argument leaves the current directory unchanged.
         if !directory.is_empty() {
@@ -2377,6 +2377,8 @@ fn main() {
         let candidate = lookup(home.path(), &id).await.unwrap();
         assert_eq!(candidate.age(), None);
         let artifact = remint_task_handle(home.path(), "thread", &candidate).await;
+        assert!(artifact.is_pending());
+        assert!(!home.path().join("tool-output/thread").exists());
         let rendered = render_hit(&candidate, &artifact);
         assert!(rendered.starts_with("prior output\n"));
         assert!(rendered.contains("age=unknown (wall clock precedes capture)"));

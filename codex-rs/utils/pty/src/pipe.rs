@@ -227,7 +227,7 @@ async fn spawn_process_with_stdin_mode(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     #[cfg(windows)]
-    command.creation_flags(WINDOWS_CREATE_SUSPENDED);
+    command.creation_flags(WINDOWS_CREATE_SUSPENDED | winapi::um::winbase::CREATE_NO_WINDOW);
 
     let managed = ManagedRootProcess::reserve_with_reclaim().await?;
 

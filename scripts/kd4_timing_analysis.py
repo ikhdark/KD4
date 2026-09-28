@@ -18,9 +18,17 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from scripts.kd4_first_useful_action_analysis import canonical_milestones
+    from scripts.kd4_first_useful_action_analysis import (
+        TerminalProfiles,
+        _tool_name,
+        canonical_milestones,
+    )
 except ImportError:
-    from kd4_first_useful_action_analysis import canonical_milestones
+    from kd4_first_useful_action_analysis import (
+        TerminalProfiles,
+        _tool_name,
+        canonical_milestones,
+    )
 
 
 _OUTPUT_COLLECTED_LIFECYCLE_SCHEMA_VERSION = 25
@@ -75,28 +83,6 @@ def timing_profile_error(timing: Any, *, include_tokens: bool = True) -> str | N
     except (TypeError, ValueError, KeyError, OverflowError, AttributeError):
         return "malformed_timing_fields"
     return None
-
-
-class TerminalProfiles:
-    """Frozen terminal evidence; conflicting versions never select a winner."""
-
-    def __init__(self):
-        self.records = {}
-        self.conflicts = set()
-        self.duplicates = 0
-
-    def add(self, key, record):
-        if key in self.records:
-            old = self.records[key]
-            if (old["timing"], old.get("status")) == (
-                record["timing"],
-                record.get("status"),
-            ):
-                self.duplicates += 1
-            else:
-                self.conflicts.add(key)
-            return
-        self.records[key] = record
 
 
 def analyze_startup_timing(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -1503,12 +1489,22 @@ def _is_single_rg_command(command: Any) -> bool:
     # Compound shell commands cannot attribute their exit status or duration to rg.
     if not isinstance(command, str):
         return False
-    if any(char in command for char in "|&;<>`$()\n\r"):
+    if any(char in command for char in "\n\r"):
         return False
     try:
         words = shlex.split(command, posix=False)
     except ValueError:
         return False
+    for word in words:
+        if word.startswith("'") and word.endswith("'"):
+            continue
+        if word.startswith('"') and word.endswith('"'):
+            # Double-quoted patterns may contain literal regex operators, but
+            # shell expansion/escaped quotes need a real shell parser.
+            if any(char in word for char in "`$") or '\\"' in word:
+                return False
+        elif any(char in word for char in "|&;<>`$()\"'"):
+            return False
     return bool(
         words
         and words[0].strip("\"'").replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -1670,9 +1666,12 @@ def analyze_runner_evidence(
     pending: dict[tuple[str | None, str, str], dict[str, Any]] = {}
     calls: dict[tuple[str | None, str, str], dict[str, Any]] = {}
     failures: list[dict[str, Any]] = []
+    failed_calls: set[tuple[str | None, str, str]] = set()
     symptoms: list[dict[str, Any]] = []
     terminal: dict[tuple[str | None, str], str] = {}
     usage_by_thread: dict[str, dict[str, Any]] = {}
+    usage_baselines: dict[str, dict[str, Any]] = {}
+    observed_work_threads: set[str | None] = set()
     sampling_count = 0
     last_progress = None
     first_output = None
@@ -1719,7 +1718,12 @@ def analyze_runner_evidence(
         active_turn_by_thread[thread_id] = active_turn
         turn_key = (thread_id, active_turn)
         payload_type = params.get("type", "")
+        if method in ("turn/started", "turn.started") or payload_type == "task_started":
+            if thread_id not in observed_work_threads and thread_id in usage_by_thread:
+                usage_baselines[thread_id] = usage_by_thread[thread_id]
+            observed_work_threads.add(thread_id)
         if method == "sampling_boundary":
+            observed_work_threads.add(thread_id)
             sampling_count += 1
         if method in ("turn/completed", "turn.completed") or payload_type in (
             "task_complete",
@@ -1733,8 +1737,10 @@ def analyze_runner_evidence(
                 else "completed"
             )
             status = str(turn.get("status") or default_status)
+            previous_status = terminal.get(turn_key)
             terminal[turn_key] = status
-            if status not in ("completed", "complete"):
+            observed_work_threads.add(thread_id)
+            if status not in ("completed", "complete") and status != previous_status:
                 failures.append(
                     {
                         "kind": "turn_" + status,
@@ -1744,6 +1750,7 @@ def analyze_runner_evidence(
                 )
         timing = params.get("timing", turn.get("timing"))
         if isinstance(timing, dict):
+            observed_work_threads.add(thread_id)
             record = {
                 "timing": timing,
                 "turn_id": active_turn,
@@ -1773,19 +1780,22 @@ def analyze_runner_evidence(
         if not isinstance(item, dict):
             continue
         item_type = item.get("type", "")
+        rollout_tool = _tool_name(item)
         is_call = item_type in (
-            *_NATIVE_TOOL_ITEM_TYPES,
-            "function_call",
-            "custom_tool_call",
+            *_NATIVE_TOOL_ITEM_TYPES, "function_call", "custom_tool_call"
+        ) or rollout_tool is not None
+        is_builtin = rollout_tool is not None and item_type not in (
+            "function_call", "custom_tool_call"
         )
         is_output = item_type in ("function_call_output", "custom_tool_call_output")
         # Response item IDs identify separate call/output records; call_id links
         # those records. Native item notifications instead share their item ID.
-        if is_output or item_type in ("function_call", "custom_tool_call"):
-            call_id = str(item.get("call_id", item.get("id", "")))
+        if is_output or item_type in ("function_call", "custom_tool_call", "local_shell_call"):
+            call_id = str(item.get("call_id") or item.get("id") or "")
         else:
             call_id = str(item.get("id", params.get("itemId", "")))
         if is_call and call_id:
+            observed_work_threads.add(thread_id)
             key = (thread_id, active_turn, call_id)
             call = calls.setdefault(
                 key,
@@ -1794,7 +1804,7 @@ def analyze_runner_evidence(
                     "threadId": thread_id,
                     "turnId": active_turn,
                     "itemType": item_type,
-                    "tool": item.get("name", item_type),
+                    "tool": rollout_tool or item.get("name", item_type),
                     "eventIndex": index,
                 },
             )
@@ -1810,7 +1820,9 @@ def analyze_runner_evidence(
                     call[field] = item[field]
             if first_tool is None:
                 first_tool = elapsed
-            if method in ("item/completed", "item.completed"):
+            if method in ("item/completed", "item.completed") or (
+                is_builtin and item.get("status") in ("completed", "failed", "incomplete")
+            ):
                 call.setdefault("completionEventIndex", index)
                 call.setdefault("completedMs", elapsed)
                 pending.pop(key, None)
@@ -1823,10 +1835,11 @@ def analyze_runner_evidence(
             no_match = _is_rg_no_match(call.get("command"), exit_code, item)
             if no_match:
                 call["outcome"] = "no_match"
-            if not no_match and (
+            if key not in failed_calls and not no_match and (
                 item.get("status") == "failed"
                 or (type(exit_code) is int and exit_code != 0)
             ):
+                failed_calls.add(key)
                 failures.append(
                     {
                         "kind": "tool_execution_failure",
@@ -1836,6 +1849,7 @@ def analyze_runner_evidence(
                     }
                 )
         if is_output and call_id:
+            observed_work_threads.add(thread_id)
             key = (thread_id, active_turn, call_id)
             if key in calls:
                 calls[key].setdefault("completionEventIndex", index)
@@ -1853,12 +1867,14 @@ def analyze_runner_evidence(
             if key in item
         )
         is_model_text = (
-            item_type in ("agentMessage", "message")
+            item_type == "agentMessage"
+            or (item_type == "message" and item.get("role") == "assistant")
             or method == "item/agentMessage/delta"
         )
         if is_model_text and first_output is None:
             first_output = elapsed
         if is_model_text or is_call or is_output or method.endswith("/delta"):
+            observed_work_threads.add(thread_id)
             last_progress = {**location, "method": method, "itemType": item_type}
         for kind, pattern in (
             (
@@ -2057,6 +2073,14 @@ def analyze_runner_evidence(
     usage_turns = (
         {request["_turnKey"] for request in requests} if include_tokens else set()
     )
+    if include_tokens:
+        usage_turns.update(
+            key
+            for key, record in profiles.items()
+            if record["timing"].get("modelRequests") == []
+            and type(record["timing"].get("counters", {}).get("modelRequestCount")) is int
+            and record["timing"]["counters"]["modelRequestCount"] == 0
+        )
     missing_usage_turns = (
         sorted(turn_label(key) for key in set(terminal) - usage_turns)
         if include_tokens
@@ -2140,11 +2164,35 @@ def analyze_runner_evidence(
             promptCategoryCoverage=None,
         )
         if totals is not None:
+            # Lifetime usage may include resumed history. Only an observed
+            # pre-turn baseline for the same threads establishes comparability.
+            comparable = (
+                {key[0] for key in terminal}
+                == set(usage_by_thread)
+                == set(usage_baselines)
+                and all(
+                    row[key] >= usage_baselines[thread][key]
+                    for thread, row in usage_by_thread.items()
+                    for key in ("inputTokens", "outputTokens")
+                )
+            )
+            comparison = {
+                key: value - sum(row[key] for row in usage_baselines.values())
+                if comparable
+                and type(value) is int
+                and all(type(row.get(key)) is int for row in usage_baselines.values())
+                else value
+                if not comparable
+                else None
+                for key, value in cumulative.items()
+                if key in totals["observedTotals"]
+            }
             reconciliation = {
-                "basis": "latest native cumulative snapshots minus captured request usage; populations may differ (including resumed-session history)",
+                "basis": "native cumulative deltas from observed pre-turn baselines minus captured request usage; without matching baselines, lifetime residuals compare potentially different populations",
+                "populationComparable": comparable,
                 "residuals": {
-                    key: cumulative[key] - totals["observedTotals"][key]
-                    if type(cumulative.get(key)) is int
+                    key: comparison[key] - totals["observedTotals"][key]
+                    if type(comparison.get(key)) is int
                     and type(totals["observedTotals"].get(key)) is int
                     else None
                     for key in (
@@ -2157,7 +2205,7 @@ def analyze_runner_evidence(
                 },
                 "addedToRequestTotals": False,
             }
-            if any(
+            if comparable and any(
                 value not in (None, 0) for value in reconciliation["residuals"].values()
             ):
                 _invalidate_token_totals(totals)
@@ -2202,11 +2250,6 @@ def analyze_runner_evidence(
         include_tokens
         and totals
         and totals.get("complete") is True
-        and all(
-            request["tokenUsage"]["cachedInputTokens"]
-            <= request["tokenUsage"]["inputTokens"]
-            for request in requests
-        )
     ):
         input_tokens, cached_tokens = (
             totals.get("inputTokens"),

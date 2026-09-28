@@ -62,6 +62,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     initial_context_injection: InitialContextInjection,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    #[cfg_attr(not(test), expect(clippy::infallible_destructuring_match, reason = "test builds include additional injection variants"))]
     let world_state = match initial_context_injection {
         InitialContextInjection::AtStart(world_state) => world_state,
         #[cfg(test)]

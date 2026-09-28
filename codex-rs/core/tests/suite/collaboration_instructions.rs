@@ -120,7 +120,10 @@ async fn assert_clearing_collaboration_instructions_emits_reset(
         2,
         "clearing instructions preserves history and appends an explicit reset"
     );
-    let reset = dev_texts.iter().rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG)).unwrap();
+    let reset = dev_texts
+        .iter()
+        .rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG))
+        .expect("clearing collaboration instructions must emit a reset");
     assert!(reset.contains(&collab_xml("No collaboration-mode-specific instructions are currently active. Any previously provided collaboration-mode instructions no longer apply.")));
 
     Ok(())
@@ -448,7 +451,13 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
     let second_text = collab_xml(second_text);
     assert_eq!(count_messages_containing(&dev_texts, &first_text), 1);
     assert_eq!(count_messages_containing(&dev_texts, &second_text), 1);
-    assert!(dev_texts.iter().rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG)).unwrap().contains(&second_text));
+    assert!(
+        dev_texts
+            .iter()
+            .rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG))
+            .unwrap()
+            .contains(&second_text)
+    );
 
     Ok(())
 }
@@ -611,7 +620,13 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
     let plan_text = collab_xml(plan_text);
     assert_eq!(count_messages_containing(&dev_texts, &default_text), 1);
     assert_eq!(count_messages_containing(&dev_texts, &plan_text), 1);
-    assert!(dev_texts.iter().rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG)).unwrap().contains(&plan_text));
+    assert!(
+        dev_texts
+            .iter()
+            .rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG))
+            .unwrap()
+            .contains(&plan_text)
+    );
 
     Ok(())
 }

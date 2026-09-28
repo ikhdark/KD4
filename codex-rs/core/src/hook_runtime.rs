@@ -273,6 +273,9 @@ pub(crate) async fn run_post_tool_use_hooks(
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
     let mut outcome = hooks.run_planned_post_tool_use(plan, request).await;
+    if let Some(reason) = &outcome.stop_reason {
+        let _ = turn_context.post_tool_stop_reason.set(reason.clone());
+    }
     emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
     outcome
 }

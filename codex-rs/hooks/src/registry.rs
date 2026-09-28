@@ -30,6 +30,7 @@ use crate::types::HookResponse;
 pub struct HooksConfig {
     pub legacy_notify_argv: Option<Vec<String>>,
     pub mutating_finalizer: bool,
+    pub mutating_finalizer_stdin: bool,
     pub feature_enabled: bool,
     pub bypass_hook_trust: bool,
     pub config_layer_stack: Option<ConfigLayerStack>,
@@ -64,7 +65,11 @@ impl Hooks {
             .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
             .map(|argv| {
                 if config.mutating_finalizer {
-                    crate::mutating_finalizer_hook(argv)
+                    if config.mutating_finalizer_stdin {
+                        crate::mutating_finalizer_stdin_hook(argv)
+                    } else {
+                        crate::mutating_finalizer_hook(argv)
+                    }
                 } else {
                     crate::notify_hook(argv)
                 }
@@ -90,6 +95,16 @@ impl Hooks {
 
     pub fn startup_warnings(&self) -> &[String] {
         self.engine.warnings()
+    }
+
+    /// Uses the session owner's durable artifact root and thread-level reclamation.
+    pub fn with_output_directory(
+        mut self,
+        directory: codex_utils_absolute_path::AbsolutePathBuf,
+        thread_id: codex_protocol::ThreadId,
+    ) -> Self {
+        self.engine.set_output_directory(directory, thread_id);
+        self
     }
 
     /// Keeps the `once_per` run history of the hook set this one replaces, so a

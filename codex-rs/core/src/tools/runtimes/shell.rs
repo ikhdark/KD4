@@ -390,6 +390,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .await
             .map_err(ToolError::Codex)?;
         env.windows_sandbox_additional_read_roots = additional_read_roots;
+        #[cfg(test)]
         let authorization_guard = if let Some(launch) = req.validation_launch.as_ref() {
             let guard = Arc::clone(&ctx.turn.validation_authorization)
                 .read_owned()
@@ -404,11 +405,12 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             None
         };
         let validation_attempt_started = Arc::new(AtomicBool::new(false));
-        let after_spawn = authorization_guard.map(|guard| {
+        let after_spawn = req.validation_launch.as_ref().map(|_| {
             let validation_attempt_started = Arc::clone(&validation_attempt_started);
             Box::new(move || {
                 validation_attempt_started.store(true, Ordering::Release);
-                drop(guard);
+                #[cfg(test)]
+                drop(authorization_guard);
             }) as Box<dyn FnOnce() + Send>
         });
         let progress = req.stall_timeout_ms.map(|_| CommandProgress::new());

@@ -1547,7 +1547,12 @@ impl ChatComposer {
     }
 
     /// Integrate results from an asynchronous file search.
-    pub(crate) fn on_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
+    pub(crate) fn on_file_search_result(
+        &mut self,
+        query: String,
+        matches: Vec<FileMatch>,
+        walk_complete: bool,
+    ) {
         // Only apply if user is still editing a token starting with `query`.
         let Some(current_token) = self.current_mentions_v2_token() else {
             return;
@@ -1558,7 +1563,7 @@ impl ChatComposer {
         }
 
         if let ActivePopup::MentionV2(popup) = &mut self.popups.active {
-            popup.set_file_matches(&query, matches);
+            popup.set_file_matches(&query, matches, walk_complete);
         }
     }
 
@@ -8782,6 +8787,7 @@ mod tests {
                 root: PathBuf::from("/tmp"),
                 indices: None,
             }],
+            true,
         );
 
         let (_result, _needs_redraw) =
@@ -8832,6 +8838,7 @@ mod tests {
                 root,
                 indices: None,
             }],
+            true,
         );
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     }

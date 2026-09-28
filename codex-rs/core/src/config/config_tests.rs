@@ -610,7 +610,7 @@ profile = "codex-bedrock"
 
     assert!(
         err.to_string().contains(
-            "model_providers.custom: provider aws is only supported for `amazon-bedrock`"
+            "model_providers.custom: provider aws is only supported for `amazon-bedrock` and `amazon-bedrock-runtime`"
         )
     );
 }

@@ -39,6 +39,12 @@ use crate::trace_context::current_trace_context_headers;
 
 const ENVIRONMENT_CLIENT_NAME: &str = "codex-environment";
 
+pub(crate) fn is_noise_bundle_refresh_error(error: &ExecServerError) -> bool {
+    matches!(error, ExecServerError::WebSocketConnect { source, .. }
+        if matches!(source, tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status() == http::StatusCode::UNAUTHORIZED))
+}
+
 /// Reopens the transport for one logical exec-server client session.
 ///
 /// URL connections reuse their configured endpoint. Noise connections retain
@@ -158,17 +164,7 @@ impl ExecServerClient {
         };
         let bundle = provider.connect_bundle(identity.public_key()).await?;
         match open_connection(bundle).await {
-            Err(error)
-                if matches!(
-                    &error,
-                    ExecServerError::WebSocketConnect { source, .. }
-                        if matches!(
-                            source,
-                            tokio_tungstenite::tungstenite::Error::Http(response)
-                                if response.status().as_u16() == 401
-                        )
-                ) =>
-            {
+            Err(error) if is_noise_bundle_refresh_error(&error) => {
                 let bundle = provider.connect_bundle(identity.public_key()).await?;
                 open_connection(bundle).await
             }

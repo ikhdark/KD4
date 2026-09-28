@@ -479,6 +479,17 @@ fn unified_exec_output_schema() -> Value {
                 "type": "string",
                 "description": "One pre-execution read-only equivalent repair applied to the command."
             },
+            "replay": {
+                "type": "object",
+                "description": "An unchanged search miss was reused; no process was launched for this call.",
+                "properties": {
+                    "kind": {"const": "search_miss"},
+                    "fingerprint": {"type": "string"},
+                    "message": {"type": "string"}
+                },
+                "required": ["kind", "fingerprint", "message"],
+                "additionalProperties": false
+            },
             "output": {
                 "type": "string",
                 "description": "Command output text, possibly truncated."

@@ -124,7 +124,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     lock_owner = args.owner if args.mode == "force" else f"check:{os.getpid()}"
     generated_changed = False
     try:
-        with generated_output_lock(root, lock_owner, timeout=lock_timeout):
+        with generated_output_lock(
+            root, lock_owner, timeout=lock_timeout, resource="config-schema"
+        ):
             if args.mode == "force":
                 print("Forcing config schema regeneration.")
                 generated_changed = regenerate_schema(root, args.owner)

@@ -2,7 +2,9 @@
 
 from pathlib import Path
 import stat
+import subprocess
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -21,6 +23,24 @@ from codex_package.targets import default_target
 from codex_package.targets import is_executable
 from codex_package.targets import normalize_machine
 from codex_package.targets import resolve_input_path
+
+
+class PackageEntrypointTest(unittest.TestCase):
+    def test_legacy_package_imports_work_without_pythonpath_from_any_cwd(self) -> None:
+        script = Path(__file__).with_name("test_dotslash.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for cwd in [targets.REPO_ROOT, Path(temp_dir)]:
+                with self.subTest(cwd=cwd):
+                    completed = subprocess.run(
+                        [sys.executable, "-I", "-B", str(script), "--help"],
+                        cwd=cwd,
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertIn("usage:", completed.stdout)
+                    self.assertIn("--help", completed.stdout)
 
 
 class TargetMetadataTest(unittest.TestCase):

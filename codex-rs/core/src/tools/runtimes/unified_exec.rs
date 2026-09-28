@@ -34,6 +34,7 @@ use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
 use crate::unified_exec::NoopSpawnLifecycle;
 use crate::unified_exec::PendingSpawnRegistration;
+#[cfg(test)]
 use crate::unified_exec::SpawnLifecycle;
 use crate::unified_exec::SpawnLifecycleHandle;
 use crate::unified_exec::UnifiedExecProcess;
@@ -51,6 +52,7 @@ use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+#[cfg(test)]
 use tokio::sync::OwnedRwLockReadGuard;
 use tokio_util::sync::CancellationToken;
 
@@ -122,6 +124,7 @@ pub struct UnifiedExecRequest {
     pub additional_permissions_uri: Option<UriAdditionalPermissionProfile>,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
+    #[cfg(test)]
     pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
     pub(crate) known_delta_hit: Option<KnownDeltaHit>,
 }
@@ -132,6 +135,7 @@ pub(crate) enum UnifiedExecLaunch {
     KnownDelta(KnownDeltaHit),
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ValidationSpawnLifecycle {
     inner: SpawnLifecycleHandle,
@@ -139,6 +143,7 @@ struct ValidationSpawnLifecycle {
         Option<OwnedRwLockReadGuard<crate::validation_admission::ValidationAuthorization>>,
 }
 
+#[cfg(test)]
 impl SpawnLifecycle for ValidationSpawnLifecycle {
     fn inherited_fds(&self) -> Vec<i32> {
         self.inner.inherited_fds()
@@ -151,14 +156,18 @@ impl SpawnLifecycle for ValidationSpawnLifecycle {
 }
 
 async fn validation_spawn_lifecycle(
-    req: &UnifiedExecRequest,
-    ctx: &ToolCtx,
+    _req: &UnifiedExecRequest,
+    _ctx: &ToolCtx,
     inner: SpawnLifecycleHandle,
 ) -> Result<SpawnLifecycleHandle, ToolError> {
-    let Some(launch) = req.validation_launch.as_ref() else {
+    #[cfg(not(test))]
+    return Ok(inner);
+    #[cfg(test)]
+    {
+    let Some(launch) = _req.validation_launch.as_ref() else {
         return Ok(inner);
     };
-    let guard = Arc::clone(&ctx.turn.validation_authorization)
+    let guard = Arc::clone(&_ctx.turn.validation_authorization)
         .read_owned()
         .await;
     if let Some(skipped) = crate::validation_admission::recheck_validation_launch(&guard, launch) {
@@ -168,6 +177,7 @@ async fn validation_spawn_lifecycle(
         inner,
         authorization_guard: Some(guard),
     }))
+    }
 }
 
 /// Cache key for approval decisions that can be reused across equivalent

@@ -70,6 +70,15 @@ pub fn notify_hook(argv: Vec<String>) -> Hook {
 }
 
 pub fn mutating_finalizer_hook(argv: Vec<String>) -> Hook {
+    finalizer_hook(argv, false)
+}
+
+/// Sends the unchanged v1 notification JSON on stdin, without appending argv.
+pub fn mutating_finalizer_stdin_hook(argv: Vec<String>) -> Hook {
+    finalizer_hook(argv, true)
+}
+
+fn finalizer_hook(argv: Vec<String>, stdin_json: bool) -> Hook {
     let argv = Arc::new(argv);
     Hook {
         name: "legacy_notify".to_string(),
@@ -80,13 +89,19 @@ pub fn mutating_finalizer_hook(argv: Vec<String>) -> Hook {
                     Some(command) => command,
                     None => return HookResult::Success,
                 };
-                if let Ok(notify_payload) = legacy_notify_json(payload) {
-                    command.arg(notify_payload);
-                }
-
                 command.current_dir(payload.cwd.as_path());
+                let notify_payload = match legacy_notify_json(payload) {
+                    Ok(payload) => payload,
+                    Err(error) => return HookResult::FailedAbort(error.into()),
+                };
+                let input = if stdin_json {
+                    notify_payload.as_str()
+                } else {
+                    command.arg(&notify_payload);
+                    ""
+                };
                 let result =
-                    crate::engine::command_runner::run_finalizer_command(command, 600).await;
+                    crate::engine::command_runner::run_finalizer_command(command, input, 600).await;
                 match (result.exit_code, result.error) {
                     (Some(0), None) => HookResult::Success,
                     (exit_code, error) => HookResult::FailedAbort(
@@ -313,5 +328,62 @@ mod tests {
             !escaped.exists(),
             "mutating finalizer subprocess survived cancellation"
         );
+    }
+
+    #[tokio::test]
+    async fn finalizer_stdin_v1_delivers_large_payload_without_changing_argv_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for stdin in [false, true] {
+            #[cfg(windows)]
+            let argv = {
+                let script = dir.path().join("capture.ps1");
+                std::fs::write(&script, if stdin {
+                    "if ($args.Count -ne 0) { exit 2 }; [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'payload.json'), [Console]::In.ReadToEnd())"
+                } else {
+                    "if ($args.Count -ne 1) { exit 2 }; [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'payload.json'), $args[0])"
+                }).expect("write script");
+                vec![
+                    "powershell.exe".into(),
+                    "-NoProfile".into(),
+                    "-File".into(),
+                    script.to_string_lossy().into_owned(),
+                ]
+            };
+            #[cfg(not(windows))]
+            let argv = vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                if stdin {
+                    "test $# = 0 && cat > payload.json"
+                } else {
+                    "test $# = 1 && printf '%s' \"$1\" > payload.json"
+                }
+                .into(),
+                "finalizer".into(),
+            ];
+            let mut payload = after_agent_payload(dir.path());
+            let HookEvent::AfterAgent { event } = &mut payload.hook_event;
+            let message = "x".repeat(if stdin { 80_000 } else { 1_000 });
+            event.input_messages = vec![message.clone()];
+            event.last_assistant_message = Some("finished".into());
+            let hooks = crate::Hooks::new(crate::HooksConfig {
+                legacy_notify_argv: Some(argv),
+                mutating_finalizer: true,
+                mutating_finalizer_stdin: stdin,
+                ..Default::default()
+            });
+            let outcomes = hooks.dispatch(payload).await;
+            assert!(
+                matches!(outcomes[0].result, HookResult::Success),
+                "{outcomes:?}"
+            );
+            let received: Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join("payload.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(received["type"], "agent-turn-complete");
+            assert_eq!(received["input-messages"], json!([message]));
+            assert_eq!(received["last-assistant-message"], "finished");
+        }
     }
 }

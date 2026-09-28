@@ -578,7 +578,7 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
     for rule in [
         "Finish edits before their checks.",
         "Serialize actual shared-resource conflicts",
-        "resuming existing operations rather than launching duplicates",
+        "Resume existing operations rather than launching duplicates.",
         "Reuse current reads, exact values, enumerations, agent results, and passing checks.",
         "When clippy is required, it can replace cargo check only for",
     ] {

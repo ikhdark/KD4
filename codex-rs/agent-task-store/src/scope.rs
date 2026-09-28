@@ -407,7 +407,9 @@ fn native_os_string_from_hex(value: &str) -> Option<std::ffi::OsString> {
     }
     Some(std::ffi::OsString::from_wide(
         &bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>(),
     ))
@@ -429,7 +431,9 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = (pair[0] as char).to_digit(16)?;
             let low = (pair[1] as char).to_digit(16)?;

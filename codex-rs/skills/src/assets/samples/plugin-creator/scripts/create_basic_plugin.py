@@ -124,7 +124,7 @@ def validate_marketplace_interface(payload: dict[str, Any]) -> None:
         raise ValueError("marketplace.json field 'interface' must be an object.")
 
 
-def update_marketplace_json(
+def prepare_marketplace_json(
     marketplace_path: Path,
     marketplace_name: str | None,
     plugin_name: str,
@@ -132,7 +132,7 @@ def update_marketplace_json(
     auth_policy: str,
     category: str,
     force: bool,
-) -> None:
+) -> dict[str, Any]:
     if marketplace_path.exists():
         payload = load_json(marketplace_path)
     else:
@@ -181,7 +181,7 @@ def update_marketplace_json(
     else:
         plugins.append(new_entry)
 
-    write_json(marketplace_path, payload, force=True)
+    return payload
 
 
 def write_json(path: Path, data: dict, force: bool) -> None:
@@ -293,6 +293,17 @@ def main() -> None:
         validate_marketplace_name(marketplace_name)
 
     plugin_root = Path(args.path).expanduser().resolve() / plugin_name
+    if args.with_marketplace:
+        marketplace_path = Path(args.marketplace_path).expanduser().resolve()
+        marketplace_payload = prepare_marketplace_json(
+            marketplace_path,
+            marketplace_name,
+            plugin_name,
+            args.install_policy,
+            args.auth_policy,
+            args.category,
+            args.force,
+        )
     plugin_root.mkdir(parents=True, exist_ok=True)
 
     plugin_json_path = plugin_root / ".codex-plugin" / "plugin.json"
@@ -331,16 +342,7 @@ def main() -> None:
         )
 
     if args.with_marketplace:
-        marketplace_path = Path(args.marketplace_path).expanduser().resolve()
-        update_marketplace_json(
-            marketplace_path,
-            marketplace_name,
-            plugin_name,
-            args.install_policy,
-            args.auth_policy,
-            args.category,
-            args.force,
-        )
+        write_json(marketplace_path, marketplace_payload, force=True)
 
     print(f"Created plugin scaffold: {plugin_root}")
     print(f"plugin manifest: {plugin_json_path}")

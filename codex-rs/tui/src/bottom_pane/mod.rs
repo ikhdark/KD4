@@ -1372,6 +1372,20 @@ impl BottomPane {
         if let Some(tool_suggestion) = request.tool_suggestion()
             && let Some(install_url) = tool_suggestion.install_url.clone()
         {
+            let Some(install_url) = app_link_view::validate_external_url(
+                &install_url,
+                /*require_chatgpt_host*/ false,
+            ) else {
+                self.app_event_tx.resolve_elicitation(
+                    request.thread_id(),
+                    request.server_name().to_string(),
+                    request.request_id().clone(),
+                    codex_app_server_protocol::McpServerElicitationAction::Decline,
+                    /*content*/ None,
+                    /*meta*/ None,
+                );
+                return;
+            };
             let suggestion_type = match tool_suggestion.suggest_type {
                 mcp_server_elicitation::ToolSuggestionType::Install => {
                     AppLinkSuggestionType::Install
@@ -1401,7 +1415,7 @@ impl BottomPane {
                             "external actions use URL mode elicitation, not tool suggestion forms"
                         ),
                     },
-                    url: install_url,
+                    url: install_url.into(),
                     is_installed,
                     is_enabled: false,
                     suggest_reason: Some(tool_suggestion.suggest_reason.clone()),
@@ -1558,8 +1572,14 @@ impl BottomPane {
         self.composer.record_replayed_user_message_history(entry);
     }
 
-    pub(crate) fn on_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
-        self.composer.on_file_search_result(query, matches);
+    pub(crate) fn on_file_search_result(
+        &mut self,
+        query: String,
+        matches: Vec<FileMatch>,
+        walk_complete: bool,
+    ) {
+        self.composer
+            .on_file_search_result(query, matches, walk_complete);
         self.request_redraw();
     }
 

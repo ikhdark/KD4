@@ -694,6 +694,10 @@ struct ExecutedMcpToolCall {
     model_result: CallToolResult,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "dispatch bookkeeping accompanies the existing MCP request inputs"
+)]
 async fn execute_mcp_tool_call(
     sess: &Session,
     step_context: &StepContext,
@@ -1200,7 +1204,6 @@ async fn custom_mcp_tool_approval_mode(
 }
 
 #[cfg(test)]
-
 fn configured_mcp_tool_approval_mode(
     servers: &HashMap<String, codex_config::types::McpServerConfig>,
     server: &str,

@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 mod executor;
 mod host;
@@ -21,8 +22,15 @@ pub use executor::ExecutorSkillProvider;
 pub use host::HostSkillProvider;
 pub use orchestrator::OrchestratorSkillProvider;
 
+/// Leave room for rendering and selected instructions inside the host's context deadline.
+pub const CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
+/// Explicit recovery may wait longer than automatic context contribution.
+pub const TOOL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub struct SkillListQuery {
+    /// Total time available for remote catalog discovery, not a cache invalidation key.
+    pub discovery_timeout: Duration,
     pub continuation: Option<crate::catalog::SkillDiscoveryContinuation>,
     pub turn_id: String,
     pub executor_roots: Vec<SelectedCapabilityRoot>,

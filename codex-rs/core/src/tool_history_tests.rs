@@ -1,5 +1,59 @@
 use super::*;
 
+#[path = "tool_history_benchmarks.rs"]
+mod benchmarks;
+
+#[path = "handler_efficiency_benchmarks.rs"]
+mod handler_efficiency;
+
+#[path = "tool_history_pressure_tests.rs"]
+mod pressure;
+
+#[tokio::test]
+async fn phase_checkpoint_retention_survives_compaction_and_reports_overflow() {
+    let home = tempfile::tempdir().unwrap();
+    let thread = "checkpoint-retention";
+    let mut state = ToolHistoryState::default();
+    let mut items = Vec::new();
+    let mut critical = String::new();
+    let mut critical_bytes = Vec::new();
+    for i in 0..40 {
+        let id = format!("source-{i:02}");
+        let source = format!("verified source {i}\n").repeat(200);
+        let (entry, exact) = stored_candidate(home.path(), thread, &id, source.clone()).await;
+        if i == 0 { critical = entry.artifact_id.clone(); critical_bytes = exact; }
+        state.register(entry);
+        items.extend([function_call(&id), text_output(&id, source)]);
+    }
+    state.mark_consumed(&items, ModelGenerationId {turn_id:"read".into(),ordinal:0});
+    let checkpoint = |retained: Vec<String>| ResponseItem::Message {
+        id:None,role:"developer".into(), content:vec![codex_protocol::models::ContentItem::InputText {
+            text:format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                serde_json::json!({"receipts":state.phase_checkpoint_receipts(&["source-39".into()]).unwrap(),"retained_evidence":retained}))
+        }],phase:None,internal_chat_message_metadata_passthrough:None,
+    };
+    let mut overflow_items = items.clone();
+    overflow_items.push(checkpoint((0..39).map(|i| format!("source-{i:02}")).collect()));
+    let overflow = state.artifact_pin_payload_for_items(&overflow_items).unwrap();
+    let overflow_value: serde_json::Value = serde_json::from_str(&overflow).unwrap();
+    assert!(overflow_value["omitted_retained_evidence_count"].as_u64().unwrap() > 0);
+    assert!(approx_token_count(&overflow) <= COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET);
+    items.push(checkpoint(vec!["source-00".into()]));
+    let pins = state.artifact_pin_payload_for_items(&items).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&pins).unwrap();
+    assert_eq!(payload["artifacts"][0]["artifact_id"], critical);
+    assert_eq!(payload["omitted_retained_evidence_count"], 0);
+    let replacement = vec![text_output("compacted", pins)];
+    state.retain_for_history(&replacement);
+    persist_tool_history_state(home.path(), thread, &state).await.unwrap();
+    let restored = expect_loaded_tool_history(load_tool_history_state(home.path(), thread).await);
+    let next_pins = restored.artifact_pin_payload_for_items(&replacement).unwrap();
+    let next: serde_json::Value = serde_json::from_str(&next_pins).unwrap();
+    assert_eq!(next["artifacts"][0]["artifact_id"], critical);
+    assert_eq!(next["omitted_retained_evidence_count"], 0);
+    assert_eq!(read_exact_tool_output_artifact(home.path(), thread, &critical).await.unwrap(), critical_bytes);
+}
+
 #[test]
 fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
     let mut state = ToolHistoryState::default();
@@ -81,6 +135,45 @@ fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
     );
     assert!(projection.items.contains(&checkpoint));
     assert!(items.contains(&text_output("done", source)));
+}
+
+#[test]
+fn phase_checkpoint_never_expands_a_tiny_selected_result() {
+    // Whitespace is large in bytes but cheap in model tokens.
+    for source in ["ok".to_owned(), " ".repeat(2_000)] {
+        let mut state = ToolHistoryState::default();
+        let mut tiny = candidate("tiny", source.clone());
+        tiny.consumed_by_generation = Some(ModelGenerationId {
+            turn_id: "read".into(),
+            ordinal: 0,
+        });
+        let pin = tiny.artifact_pin_value().unwrap();
+        state.register(tiny);
+        state.register_non_workspace_code_mode_call("tiny".into());
+        if source == "ok" {
+            assert_eq!(state.phase_checkpoint_receipts(&["tiny".into()]).unwrap(), serde_json::json!({}));
+        }
+        // Replay an older checkpoint that selected a result without a savings check.
+        let checkpoint = ResponseItem::Message {
+            id: None,
+            role: "developer".into(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                    serde_json::json!({"receipts": {"tiny": pin}})),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let items: Arc<[ResponseItem]> = Arc::from([
+            function_call("tiny"), text_output("tiny", source), checkpoint,
+        ]);
+        assert_eq!(state.project_inner(Arc::clone(&items), None, None).items, items);
+        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+        assert_eq!(
+            state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache).items,
+            items,
+        );
+    }
 }
 
 #[test]
@@ -1582,13 +1675,9 @@ fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands(
         })
         .to_string(),
     };
-    assert_eq!(
-        source_dependencies_for_tool_call("exec_command", &explicit_pattern, cwd),
-        BTreeSet::from([SourceDependencyV1::new(
-            Path::new("/repo/codex-rs/core"),
-            true,
-        )])
-    );
+    let dependencies = source_dependencies_for_tool_call("exec_command", &explicit_pattern, cwd);
+    assert!(dependencies.contains(&SourceDependencyV1::new(&cwd.join("codex-rs/core"), true)));
+    assert!(dependencies.contains(&SourceDependencyV1::new(&cwd.join(".ignore"), false)));
 
     let compound = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -1598,13 +1687,9 @@ fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands(
         })
         .to_string(),
     };
-    assert_eq!(
-        source_dependencies_for_tool_call("exec_command", &compound, cwd),
-        BTreeSet::from([SourceDependencyV1::new(
-            Path::new("/repo/codex-rs/tui"),
-            true,
-        )])
-    );
+    let dependencies = source_dependencies_for_tool_call("exec_command", &compound, cwd);
+    assert!(dependencies.contains(&SourceDependencyV1::new(&cwd.join("codex-rs/tui"), true)));
+    assert!(dependencies.contains(&SourceDependencyV1::new(&cwd.join(".ignore"), false)));
 }
 
 /// Regression for the recorded sessions where `Get-Content x | Select-Object
@@ -1714,6 +1799,18 @@ fn listings_git_reads_and_path_cmdlets_scope_without_making_batches_opaque() {
             "Get-Content work.log | Select-String 'FAILED'",
             BTreeSet::from([SourceDependencyV1::new(&cwd.join("work.log"), false)]),
         ));
+        for command in [
+            "Get-Content src/work.rs; Select-String -Pattern FAILED work.log",
+            "Get-Content src/work.rs; Select-String -Pattern:FAILED work.log",
+            "Get-Content src/work.rs; Select-String work.log -Pattern FAILED",
+            "Get-Content src/work.rs; Select-String FAILED work.log",
+        ] {
+            cases.push((
+                "powershell",
+                command,
+                BTreeSet::from([work.clone(), SourceDependencyV1::new(&cwd.join("work.log"), false)]),
+            ));
+        }
         cases.push((
             "powershell",
             "git diff --stat; Get-Content src/work.rs",
@@ -1743,6 +1840,7 @@ fn commands_that_may_read_anywhere_still_make_the_batch_opaque() {
     ];
     if cfg!(windows) {
         commands.push(("powershell", "Get-Content src/work.rs; cargo check --tests"));
+        commands.push(("powershell", "Get-Content src/work.rs; Select-String -Pattern -Path work.log"));
     }
     for (shell, command) in commands {
         let payload = ToolPayload::Function {
@@ -4921,7 +5019,7 @@ fn untracked_exposure_preserves_fresh_failures_and_late_artifact_registration() 
         ordinal: 1,
     };
     let old = text_output("seen", "old detail ".repeat(220));
-    assert!(state.mark_consumed(&[old.clone()], generation.clone()));
+    assert!(state.mark_consumed(std::slice::from_ref(&old), generation.clone()));
     let detail = format!(
         "{}\nwrite failed: permission denied",
         "diagnostic ".repeat(160)
@@ -4952,7 +5050,7 @@ fn budget_receipts_distinguish_observed_and_unread_untracked_outputs() {
     let mut state = ToolHistoryState::default();
     let old = text_output("seen", "previous observation ".repeat(2_000));
     state.mark_consumed(
-        &[old.clone()],
+        std::slice::from_ref(&old),
         ModelGenerationId {
             turn_id: "turn".into(),
             ordinal: 1,

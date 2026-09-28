@@ -356,6 +356,94 @@ async fn token_budget_tools_require_feature_activation() {
 }
 
 #[tokio::test]
+async fn final_router_dispatches_direct_and_token_budget_tools() {
+    use crate::tools::context::{ToolCallSource, ToolDispatchState, ToolPayload};
+    use crate::tools::router::ToolCall;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+    use codex_protocol::models::ResponseInputItem;
+    use tokio_util::sync::CancellationToken;
+
+    let (session, mut turn) = make_session_and_context().await;
+    set_feature(&mut turn, Feature::TokenBudget, true);
+    set_feature(&mut turn, Feature::CodeMode, false);
+    turn.collaboration_mode.mode = ModeKind::Default;
+    let session = Arc::new(session);
+    let step = StepContext::for_test(Arc::new(turn));
+    let router = ToolRouter::from_context(&step, ToolRouterParams {
+        tool_suggest_candidates: None, mcp_tools: None, deferred_mcp_tools: None,
+        extension_tool_executors: vec![], dynamic_tools: &[], exposure_identity: Default::default(),
+    }, &ToolSearchHandlerCache::default());
+    for (name, arguments) in [
+        ("update_plan", json!({"plan":[{"step":"smoke dispatch", "status":"completed"}]})),
+        ("get_context_remaining", json!({})),
+    ] {
+        let dispatch = Arc::new(ToolDispatchState::new());
+        assert!(dispatch.try_admit());
+        let result = router.dispatch_tool_call_with_terminal_outcome(
+            Arc::clone(&session), Arc::clone(&step), CancellationToken::new(),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            ToolCall { tool_name: ToolName::plain(name), call_id: name.into(), payload: ToolPayload::Function { arguments: arguments.to_string() } },
+            ToolCallSource::Direct, dispatch,
+        ).await.unwrap();
+        assert!(result.success_for_logging());
+        let ResponseInputItem::FunctionCallOutput { output, .. } = result.response() else { panic!("expected direct function output") };
+        let direct: serde_json::Value = serde_json::from_str(output.text_content().expect("JSON text output")).unwrap();
+        assert_eq!(direct, result.result.code_mode_result(&result.payload));
+        if name == "get_context_remaining" {
+            assert!(direct.get("tokens_left").is_some());
+            assert!(direct["tokens_left"].is_null() || direct["tokens_left"].is_i64());
+        } else {
+            assert_eq!(direct["current_plan"]["plan"][0]["step"], "smoke dispatch");
+        }
+    }
+}
+
+#[tokio::test]
+#[expect(clippy::print_stderr, reason = "reports measured schema sizes for the growth regression")]
+async fn final_model_manifest_is_dispatchable_and_schema_growth_is_bounded() {
+    let mut measurements = Vec::new();
+    for (mode, code_mode, only, token_budget, baseline) in [
+        (ModeKind::Default, false, false, false, 54_378),
+        (ModeKind::Plan, false, false, true, 51_781),
+        (ModeKind::Default, true, false, true, 86_485),
+        (ModeKind::Default, true, true, true, 66_603),
+    ] {
+        let plan = probe(|turn| {
+            turn.collaboration_mode.mode = mode;
+            set_feature(turn, Feature::CodeMode, code_mode);
+            set_feature(turn, Feature::CodeModeOnly, only);
+            set_feature(turn, Feature::TokenBudget, token_budget);
+        }).await;
+        for spec in &plan.visible_specs {
+            let names = match spec {
+                ToolSpec::Namespace(namespace) => namespace.tools.iter().map(|tool| {
+                    let ResponsesApiNamespaceTool::Function(tool) = tool;
+                    ToolName::new(Some(namespace.name.clone()), tool.name.clone()).to_string()
+                }).collect::<Vec<_>>(),
+                // Provider-hosted tools do not dispatch through the local registry.
+                ToolSpec::WebSearch { .. } => continue,
+                _ => vec![spec.name().to_string()],
+            };
+            for name in names {
+                assert_eq!(plan.registered_names.iter().filter(|registered| **registered == name).count(), 1, "{name}: {mode:?}/{code_mode}/{only}");
+            }
+        }
+        assert_eq!(plan.registered_names.iter().any(|name| name == "new_context"), token_budget);
+        assert_eq!(plan.registered_names.iter().any(|name| name == "update_plan"), mode != ModeKind::Plan);
+        let bytes = serde_json::to_vec(&plan.visible_specs).unwrap().len();
+        measurements.push(json!({"mode":format!("{mode:?}"), "code_mode":code_mode,"code_mode_only":only,"bytes":bytes}));
+        eprintln!("tool_schema_bytes mode={mode:?} code_mode={code_mode} only={only}: {bytes}");
+        // Record mode-specific baselines; 25% growth is material even below the
+        // existing 128 KiB runtime warning. This is not a new runtime gate.
+        assert!(bytes <= baseline * 5 / 4, "material tool schema growth: {bytes} bytes (baseline {baseline})");
+    }
+    if let Some(directory) = std::env::var_os("KD4_TOOL_HISTORY_BENCH_OUTPUT_DIR").filter(|value| !value.is_empty()) {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(std::path::Path::new(&directory).join("tool-schema-baselines.json"), serde_json::to_vec_pretty(&measurements).unwrap()).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn read_file_is_visible_and_registered_for_text_models() {
     let plan = probe(|turn| turn.model_info.input_modalities = vec![InputModality::Text]).await;
     plan.assert_visible_contains(&["read_file", "list_files"]);
@@ -2026,6 +2114,58 @@ async fn invalid_mcp_tools_are_not_registered() {
 
     plan.assert_visible_lacks(&["mcp__invalid"]);
     plan.assert_registered_lacks(&[&ToolName::namespaced("mcp__invalid", "lookup").to_string()]);
+    assert_eq!(plan.warnings.len(), 1);
+    assert!(
+        plan.warnings[0].contains(&ToolName::namespaced("mcp__invalid", "lookup").to_string())
+    );
+    assert!(plan.warnings[0].contains("is unavailable"));
+}
+
+#[tokio::test]
+async fn unsupported_mcp_schema_is_reported_for_direct_and_deferred_tools() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tools/tests/fixtures/json_schema_policy/oversized_notion_create_page_input_schema.json"
+    )).unwrap();
+    for deferred in [false, true] {
+        let mut unsupported = mcp_tool("notion", "mcp__notion", "create_page");
+        unsupported.tool.input_schema = Arc::new(
+            fixture["tools"][0]["input_schema"]
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let tools = vec![unsupported, mcp_tool("notion", "mcp__notion", "lookup")];
+        let inputs = if deferred {
+            ToolPlanInputs {
+                deferred_mcp_tools: Some(tools),
+                ..ToolPlanInputs::default()
+            }
+        } else {
+            ToolPlanInputs {
+                mcp_tools: Some(tools),
+                ..ToolPlanInputs::default()
+            }
+        };
+        let plan = probe_with(|turn| turn.model_info.supports_search_tool = true, inputs).await;
+        plan.assert_registered_lacks(&[
+            &ToolName::namespaced("mcp__notion", "create_page").to_string()
+        ]);
+        plan.assert_registered_contains(&[
+            &ToolName::namespaced("mcp__notion", "lookup").to_string()
+        ]);
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(
+            plan.warnings[0].contains(&ToolName::namespaced("mcp__notion", "create_page").to_string())
+        );
+        assert!(plan.warnings[0].contains("unsupported tool input schema assertion: not"));
+        assert!(plan.warnings[0].contains("without removing its constraints"));
+        assert!(
+            !plan
+                .tool_search_texts
+                .iter()
+                .any(|text| text.contains("create_page"))
+        );
+    }
 }
 
 #[tokio::test]

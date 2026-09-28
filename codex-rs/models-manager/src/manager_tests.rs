@@ -277,6 +277,97 @@ struct NotModifiedModelsEndpoint {
     observed_etags: Mutex<Vec<Option<String>>>,
 }
 
+#[tokio::test]
+async fn failed_automatic_refresh_is_shared_and_explicit_refresh_bypasses_cooldown() {
+    let home = tempdir().unwrap();
+    let endpoint = ControlledModelsEndpoint::new(vec![
+        ControlledResponse::Failure,
+        ControlledResponse::Models(vec![remote_model("recovered", "Recovered", 1)], None),
+    ]);
+    let manager = Arc::new(openai_manager_for_tests(
+        home.path().into(),
+        endpoint.clone(),
+    ));
+    let mut callers = Vec::new();
+    for _ in 0..8 {
+        let manager = Arc::clone(&manager);
+        callers.push(tokio::spawn(async move {
+            manager
+                .list_models(
+                    RefreshStrategy::OnlineIfUncached,
+                    DEFAULT_HTTP_CLIENT_FACTORY,
+                )
+                .await
+        }));
+    }
+    endpoint.wait_for_fetches(1).await;
+    endpoint.release_one();
+    for caller in callers {
+        let error = timeout(Duration::from_secs(1), caller)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_string(), "controlled model failure");
+    }
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
+    assert!(
+        !home.path().join(MODEL_CACHE_FILE).exists(),
+        "a failure must not publish cache data"
+    );
+    endpoint.release_one();
+    let recovered = manager
+        .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .unwrap();
+    assert!(recovered.iter().any(|model| model.model == "recovered"));
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn automatic_refresh_retries_after_cooldown_or_identity_change() {
+    for change_identity in [false, true] {
+        let home = tempdir().unwrap();
+        let endpoint = ControlledModelsEndpoint::new(vec![
+            ControlledResponse::Failure,
+            ControlledResponse::Models(vec![remote_model("recovered", "Recovered", 1)], None),
+        ]);
+        let identity = Arc::new(Mutex::new("first".to_string()));
+        let current = Arc::clone(&identity);
+        let manager = OpenAiModelsManager::new(
+            home.path().into(),
+            endpoint.clone(),
+            None,
+            Arc::new(move || current.lock().unwrap().clone()),
+        );
+        endpoint.release_one();
+        assert!(
+            manager
+                .list_models(
+                    RefreshStrategy::OnlineIfUncached,
+                    DEFAULT_HTTP_CLIENT_FACTORY
+                )
+                .await
+                .is_err()
+        );
+        if change_identity {
+            *identity.lock().unwrap() = "second".into();
+        } else {
+            manager.refresh_gate.lock().await.as_mut().unwrap().retry_at = Instant::now();
+        }
+        endpoint.release_one();
+        let recovered = manager
+            .list_models(
+                RefreshStrategy::OnlineIfUncached,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await
+            .unwrap();
+        assert!(recovered.iter().any(|model| model.model == "recovered"));
+        assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+    }
+}
+
 impl ModelsEndpointClient for NotModifiedModelsEndpoint {
     fn has_command_auth(&self) -> bool {
         false
@@ -307,6 +398,59 @@ impl ModelsEndpointClient for NotModifiedModelsEndpoint {
                 .push(etag.map(ToString::to_string));
             Ok(ModelsFetchResult::NotModified)
         })
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual stale-handshake catalog fetch-count probe"]
+async fn probe_repeated_handshake_etag_fetches() {
+    for emit_once in [false, true] {
+        let codex_home = tempdir().expect("temp dir");
+        let endpoint = Arc::new(NotModifiedModelsEndpoint::default());
+        let manager = Arc::new(openai_manager_for_tests(
+            codex_home.path().to_path_buf(),
+            endpoint.clone(),
+        ));
+        let cached = vec![remote_model("probe-model", "Probe", 1)];
+        manager
+            .cache_manager
+            .persist_cache(
+                &cached,
+                Some("catalog-B".into()),
+                crate::client_version_to_whole(),
+            )
+            .await;
+        assert!(manager.try_load_cache().await.expect("load cache"));
+        let started = std::time::Instant::now();
+        for index in 0..20 {
+            if !emit_once || index == 0 {
+                Arc::clone(&manager)
+                    .notify_etag("handshake-A".into(), DEFAULT_HTTP_CLIENT_FACTORY)
+                    .await;
+            }
+        }
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let observed = endpoint.observed_etags.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![Some("catalog-B".into()); if emit_once { 1 } else { 20 }]
+        );
+        assert_eq!(manager.get_etag().await.as_deref(), Some("catalog-B"));
+        assert_models_contain(&manager.get_remote_models().await, &cached);
+        assert!(
+            manager
+                .cache_manager
+                .load_fresh(&crate::client_version_to_whole())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        println!(
+            "PROBE {}",
+            json!({"case":"catalog_consumer", "test_only_emit_once":emit_once,
+            "generations":20, "conditional_fetches":observed.len(), "wall_ms":elapsed_ms,
+            "endpoint":"instant mock; real manager and temporary filesystem cache"})
+        );
     }
 }
 
@@ -2409,7 +2553,18 @@ fn bundled_models_json_roundtrips() {
 #[tokio::test]
 async fn local_policy_remote_refresh_keeps_fork_prompt_and_server_capabilities() {
     let codex_home = tempdir().expect("temp dir");
-    let remote_models = crate::prompt_resolver::LOCAL_PROMPT_POLICY_SLUGS
+    let slugs = crate::prompt_resolver::LOCAL_PROMPT_POLICY_SLUGS
+        .iter()
+        .flat_map(|slug| {
+            [
+                slug.to_string(),
+                format!("{slug}-preview"),
+                format!("openai/{slug}"),
+                format!("openai-codex/{slug}-preview"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let remote_models = slugs
         .iter()
         .map(|slug| {
             let mut model = remote_model(slug, "Remote model", 0);
@@ -2436,7 +2591,7 @@ async fn local_policy_remote_refresh_keeps_fork_prompt_and_server_capabilities()
         .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
         .await
         .expect("refresh models");
-    for slug in crate::prompt_resolver::LOCAL_PROMPT_POLICY_SLUGS {
+    for slug in &slugs {
         let info = manager
             .get_model_info(
                 slug,

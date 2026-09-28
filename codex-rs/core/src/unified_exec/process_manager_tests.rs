@@ -783,6 +783,31 @@ async fn lag_survives_drain_for_finalization_without_duplicate_interim_reports()
     assert_eq!(output_buffer.lock().await.lagged_chunks(), 4);
 }
 
+#[tokio::test]
+async fn collected_output_loss_is_report_local() {
+    for lagged in [false, true] {
+        let buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(8)));
+        {
+            let mut guard = buffer.lock().await;
+            guard.push_chunk(if lagged { b"tail" } else { b"0123456789abcdef" });
+            if lagged { guard.record_lagged_chunks(1); }
+        }
+        let notify = Arc::new(Notify::new());
+        let closed = Arc::new(AtomicBool::new(true));
+        let closed_notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        for expected_loss in [true, false] {
+            let result = UnifiedExecProcessManager::collect_output_until_deadline_with_quiet_yield(
+                &buffer, &notify, &closed, &closed_notify, &cancel, None,
+                Instant::now() + Duration::from_millis(50), None, None, &mut None,
+            ).await;
+            assert_eq!(result.truncated, expected_loss);
+            if !expected_loss { assert!(result.bytes.is_empty()); }
+            buffer.lock().await.acknowledge_pending_output();
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn initial_output_yields_after_meaningful_output_quiet_period() {
     let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
@@ -1400,7 +1425,13 @@ async fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
             .await
             .unwrap();
 
-    assert_eq!(params.process_id.as_str(), "123");
+    let suffix = params.process_id.as_str().strip_prefix("123-").unwrap();
+    assert_eq!(Uuid::parse_str(suffix).unwrap().get_version_num(), 4);
+    let repeated =
+        exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true)
+            .await
+            .unwrap();
+    assert_ne!(params.process_id, repeated.process_id);
     assert_eq!(params.cwd, request.cwd);
     assert!(params.enforce_managed_network);
     assert_eq!(params.managed_network, Some(managed_network));
@@ -1554,7 +1585,9 @@ fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
             let error = match result { Err(error) => error, Ok(_) => panic!("external peer declines after capturing exact request") };
             assert!(error.to_string().contains("peer captured launch"), "unexpected launch error: {error:?}");
             let params: codex_exec_server::ExecParams = serde_json::from_value(captured_rx.recv().await.unwrap()).unwrap();
-            assert_eq!(params.process_id.as_str(), process_id.to_string());
+            let prefix = format!("{process_id}-");
+            let suffix = params.process_id.as_str().strip_prefix(&prefix).unwrap();
+            assert_eq!(Uuid::parse_str(suffix).unwrap().get_version_num(), 4);
             assert_eq!(params.env.get("SSL_CERT_FILE"), valid.then_some(&bundle_text));
             assert_eq!(params.env.get("HTTP_PROXY"), request.env.get("HTTP_PROXY"));
             assert_eq!(params.env_policy, Some(request.exec_server_env_config.as_ref().unwrap().policy.clone()));
@@ -2742,6 +2775,7 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),

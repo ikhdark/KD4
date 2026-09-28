@@ -370,7 +370,13 @@ impl LazyRemoteExecServerClient {
         // use the reconnect lane for later attempts instead of burning the environment forever.
         if let Some(Err(error)) = self.startup.get()
             && self.can_reconnect()
-            && recovery::is_retryable_recovery_error(error)
+            && recovery::is_retryable_recovery_error(
+                error,
+                matches!(
+                    self.transport_params,
+                    ExecServerTransportParams::NoiseRendezvous { .. }
+                ),
+            )
         {
             return Box::pin(self.reconnect()).await;
         }
@@ -3605,6 +3611,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permanent_websocket_startup_failure_is_remembered_without_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            reader
+                .into_inner()
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "subsequent startup waiters must not repeat permanent rejection"
+            );
+        });
+        let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::websocket_url(
+            url,
+            Duration::from_secs(1),
+        ));
+        let first = lazy.get().await.err().expect("authentication rejected");
+        let second = lazy.get().await.err().expect("same failure retained");
+        let (
+            super::ExecServerError::ConnectionAttempt(first),
+            super::ExecServerError::ConnectionAttempt(second),
+        ) = (first, second)
+        else {
+            panic!("expected retained startup error");
+        };
+        assert!(first.to_string().contains("401"));
+        assert!(Arc::ptr_eq(&first, &second));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn terminal_file_bytes_precede_close_ack_and_keep_cleanup_bounded() {
         use crate::ExecutorFileSystem;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3720,8 +3772,15 @@ mod tests {
             started_tx.send(()).unwrap();
             // The test advances the client's thirty-second deadline while this
             // read waits; do not install the helper's unrelated one-second timer.
-            let frame = websocket.next().await.unwrap().unwrap();
-            let message: JSONRPCMessage = serde_json::from_slice(&frame.into_data()).unwrap();
+            let message: JSONRPCMessage = loop {
+                match websocket.next().await.unwrap().unwrap() {
+                    Message::Text(text) => break serde_json::from_str(text.as_ref()).unwrap(),
+                    Message::Binary(bytes) => break serde_json::from_slice(&bytes).unwrap(),
+                    Message::Ping(payload) => websocket.send(Message::Pong(payload)).await.unwrap(),
+                    Message::Pong(_) => {}
+                    other => panic!("expected cleanup or keepalive, got {other:?}"),
+                }
+            };
             let JSONRPCMessage::Request(cleanup) = message else {
                 panic!("expected cleanup");
             };
@@ -3773,7 +3832,17 @@ mod tests {
             .await
             .expect("readiness must consume the same thirty-second start budget")
             .unwrap();
-        assert!(outcome.is_err(), "unacknowledged start must time out");
+        match outcome {
+            Err(super::ExecServerError::ProcessStartTimedOut) => {}
+            Err(super::ExecServerError::Protocol(message)) => {
+                assert!(
+                    message.contains(EXEC_METHOD) && message.contains("timed out"),
+                    "{message}"
+                );
+            }
+            Err(error) => panic!("expected the process-start deadline, got {error}"),
+            Ok(_) => panic!("unacknowledged start must time out"),
+        }
         timeout(Duration::from_secs(2), server)
             .await
             .unwrap()

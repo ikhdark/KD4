@@ -285,14 +285,14 @@ fn parse_completed(
                 status = HookRunStatus::Failed;
                 entries.push(HookOutputEntry {
                     kind: HookOutputEntryKind::Error,
-                    text: format!("hook exited with code {exit_code}"),
+                    text: common::exit_error_message(Some(exit_code), &run_result.stderr),
                 });
             }
             None => {
                 status = HookRunStatus::Failed;
                 entries.push(HookOutputEntry {
                     kind: HookOutputEntryKind::Error,
-                    text: "hook exited without a status code".to_string(),
+                    text: common::exit_error_message(None, &run_result.stderr),
                 });
             }
         },

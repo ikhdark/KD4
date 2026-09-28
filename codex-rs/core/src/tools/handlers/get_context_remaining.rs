@@ -1,6 +1,5 @@
 use crate::FunctionCallError;
 use crate::context::ContextualUserFragment;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -11,6 +10,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::models::ResponseInputItem;
 use codex_tools::ToolName;
+use codex_tools::JsonToolOutput;
 use codex_tools::ToolSpec;
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -45,7 +45,7 @@ impl ToolOutput for GetContextRemainingOutput {
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        FunctionToolOutput::from_text(self.fragment(), Some(true))
+        JsonToolOutput::new(self.code_mode_result(payload))
             .to_response_item(call_id, payload)
     }
 
@@ -89,3 +89,23 @@ impl ToolExecutor<ToolInvocation> for GetContextRemainingHandler {
 }
 
 impl CoreToolRuntime for GetContextRemainingHandler {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_and_code_mode_results_obey_the_same_schema() {
+        let payload = ToolPayload::Function { arguments: "{}".into() };
+        let ToolSpec::Function(spec) = create_get_context_remaining_tool() else { panic!("function tool") };
+        let schema = spec.output_schema.unwrap().into_value();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for tokens in [None, Some(0), Some(42)] {
+            let output = GetContextRemainingOutput::new(tokens);
+            let direct = serde_json::to_value(output.to_response_item("call", &payload)).unwrap();
+            let value: JsonValue = serde_json::from_str(direct["output"].as_str().unwrap()).unwrap();
+            assert_eq!(value, output.code_mode_result(&payload));
+            validator.validate(&value).unwrap();
+        }
+    }
+}

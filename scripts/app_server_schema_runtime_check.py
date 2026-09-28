@@ -55,6 +55,10 @@ def _child_role(role: str, key: str, path: str) -> str:
         return "schema"
     if role != "schema":
         return "data"
+    if key in {"required", "enum"}:
+        # Membership is unordered, including inside combinators; literal data
+        # and positional schemas such as prefixItems must retain their order.
+        return "unordered-data"
     if key == "definitions" and path == "$":
         return "bundle-definitions"
     if key in {"definitions", "$defs", "properties"}:
@@ -78,12 +82,17 @@ def _without_annotations(value: object, role: str, path: str) -> object:
             if role != "schema" or key not in IGNORED_SCHEMA_ANNOTATIONS
         }
     if isinstance(value, list):
-        return [
+        children = [
             _without_annotations(
                 child, "schema" if role in {"schema", "schema-array"} else "data", path
             )
             for child in value
         ]
+        return (
+            sorted(children, key=_canonical_json)
+            if role == "unordered-data"
+            else children
+        )
     return value
 
 
@@ -117,15 +126,27 @@ def hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def snapshot_outputs(root: Path) -> dict[str, str]:
+def snapshot_outputs(
+    root: Path, outputs: Sequence[str | Path] = GENERATED_OUTPUTS
+) -> dict[str, str]:
     snapshot: dict[str, str] = {}
-    for output in GENERATED_OUTPUTS:
+    for output in outputs:
         path = root / output
         if path.is_file():
-            snapshot[output] = hash_file(path)
+            name = (
+                path.relative_to(root).as_posix()
+                if path.is_relative_to(root)
+                else str(path)
+            )
+            snapshot[name] = hash_file(path)
         elif path.is_dir():
             for child in sorted(p for p in path.rglob("*") if p.is_file()):
-                snapshot[child.relative_to(root).as_posix()] = hash_file(child)
+                name = (
+                    child.relative_to(root).as_posix()
+                    if child.is_relative_to(root)
+                    else str(child)
+                )
+                snapshot[name] = hash_file(child)
     return snapshot
 
 
@@ -138,7 +159,33 @@ def regenerate_schemas(
     root: Path, owner: str, generator_args: Sequence[str] = ()
 ) -> bool:
     del owner
-    before = snapshot_outputs(root)
+    options = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    options.add_argument("--experimental", action="store_true")
+    options.add_argument("--schema-root", type=Path)
+    parsed, remaining = options.parse_known_args(generator_args)
+    stable_root = (root / GENERATED_OUTPUTS[0]).resolve()
+    output_root = stable_root
+    if parsed.schema_root is not None:
+        output_root = (root / "codex-rs" / parsed.schema_root).resolve()
+    elif parsed.experimental:
+        output_root = (root / "dist" / "app-server-schema-experimental").resolve()
+    if parsed.experimental:
+        if output_root.is_relative_to(stable_root) or stable_root.is_relative_to(
+            output_root
+        ):
+            raise ValueError(
+                "experimental output must not overlap stable schema fixtures"
+            )
+        generator_args = [
+            *remaining,
+            "--experimental",
+            "--schema-root",
+            str(output_root),
+        ]
+        print(
+            f"Exporting experimental schemas to {output_root}; stable fixtures are unchanged."
+        )
+    before = snapshot_outputs(root, (output_root,))
     code = run(
         [
             "cargo",
@@ -155,7 +202,7 @@ def regenerate_schemas(
     if code != 0:
         raise SystemExit(code)
 
-    changed = changed_outputs(before, snapshot_outputs(root))
+    changed = changed_outputs(before, snapshot_outputs(root, (output_root,)))
     if changed:
         print("Generated app-server schema outputs changed during regeneration:")
         for path in changed:
@@ -210,11 +257,9 @@ def stable_schema_compatibility_issues(
             current_value = current[key]
             child_role = _child_role(_role, key, path)
             if _role == "schema" and key in {"required", "enum", *SCHEMA_ARRAYS}:
-                if _canonical_json(
-                    _without_annotations(baseline_value, child_role, child_path)
-                ) != _canonical_json(
-                    _without_annotations(current_value, child_role, child_path)
-                ):
+                before = _without_annotations(baseline_value, child_role, child_path)
+                after = _without_annotations(current_value, child_role, child_path)
+                if _canonical_json(before) != _canonical_json(after):
                     issues.append(f"{child_path}:changed")
                 continue
             issues.extend(
@@ -226,7 +271,16 @@ def stable_schema_compatibility_issues(
                 )
             )
         for key in current.keys() - baseline.keys():
-            if (_role == "schema" and key in IGNORED_SCHEMA_ANNOTATIONS) or _role in {
+            if (
+                _role == "schema"
+                and (
+                    key in IGNORED_SCHEMA_ANNOTATIONS
+                    or (
+                        key in {"properties", "definitions", "$defs"}
+                        and isinstance(current[key], dict)
+                    )
+                )
+            ) or _role in {
                 "additive-map",
                 "bundle-definitions",
             }:
@@ -395,7 +449,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     lock_owner = args.owner if args.mode == "force" else f"check:{os.getpid()}"
     generated_changed = False
     try:
-        with generated_output_lock(root, lock_owner, timeout=lock_timeout):
+        with generated_output_lock(
+            root, lock_owner, timeout=lock_timeout, resource="app-server-schema"
+        ):
             if args.mode == "force":
                 print("Forcing app-server schema regeneration.")
                 if generator_args:
@@ -426,7 +482,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     return compatibility_code
             else:
                 print(
-                    "Skipping stable compatibility comparison for experimental schemas."
+                    "Experimental output is separate; the freshness and SDK checks "
+                    "validate the unchanged stable fixtures, not experimental compatibility."
                 )
             consumer_code = run_python_sdk_contract_check(root)
             if consumer_code != 0:
@@ -434,7 +491,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except GenerationLockError as error:
         print(str(error), file=sys.stderr)
         return 2
-    if generated_changed:
+    if generated_changed and stable_lane:
         print("Schema regeneration changed generated outputs; review and include them.")
     return 0
 

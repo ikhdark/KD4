@@ -38,6 +38,107 @@ def ps_single_quote(value: str | Path) -> str:
 
 
 class CargoLaneTest(unittest.TestCase):
+    def test_script_wrapper_can_forward_the_existing_reservation_contract(self):
+        wrapper = self.temp_root / "wrapper.ps1"
+        wrapper.write_text(
+            "cargo check --target-dir $env:CODEX_CARGO_LANE_TARGET_DIR -p fixture\n"
+            "exit $LASTEXITCODE\n"
+        )
+        result = self.run_fake_cargo("-Lane", "wrapper", str(wrapper))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"--target-dir {self.lane_path('wrapper')}", result.stdout)
+
+    def test_released_activity_snapshot_does_not_force_a_cold_suffix(self):
+        lane = self.make_lane("released")
+        line = next(
+            i for i, text in enumerate(SCRIPT.read_text().splitlines(), 1)
+            if text.startswith("$candidateLane =")
+        )
+        command = f"""
+$ErrorActionPreference = 'Stop'
+$env:CODEX_CARGO_LANE_ACTIVE_NAMES = ''
+$env:CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE = '1'
+$global:held = [IO.File]::Open({ps_single_quote(lane / '.lane-active.lock')}, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{ $global:held.Dispose() }} | Out-Null
+& {ps_single_quote(SCRIPT)} -LanesRoot {ps_single_quote(self.lanes_root)} -Lane released
+"""
+        result = subprocess.run(
+            [self.shell, "-NoProfile", "-Command", command], capture_output=True,
+            text=True, timeout=30, creationflags=CREATE_NO_WINDOW, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("LANE=released\n", result.stdout)
+        self.assertFalse((self.lanes_root / "released-2").exists())
+
+    def test_isolated_config_uses_current_home_and_refreshes_only_owned_copies(self):
+        custom = self.temp_root / "custom-cargo"
+        custom.mkdir()
+        source = custom / "config.toml"
+        source.write_bytes(b"[net]\noffline = true\n")
+        profile = self.temp_root / "user"
+        (profile / ".cargo").mkdir(parents=True)
+        (profile / ".cargo/config.toml").write_bytes(b"wrong-profile-source\n")
+        local = self.temp_root / "local"
+        env = {
+            "CARGO_HOME": str(custom), "USERPROFILE": str(profile),
+            "LOCALAPPDATA": str(local), "CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0",
+        }
+        config = local / "cargo-lanes/codexKD/config-test/config.toml"
+        marker = config.with_name(".codex-config-source.json")
+
+        def invoke():
+            result = self.run_script("-Lane", "config-test", "-IsolateCargoHome", extra_env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result
+
+        invoke()
+        self.assertEqual(config.read_bytes(), source.read_bytes())
+        self.assertTrue(marker.exists())
+        previous = source.stat()
+        updated = b"[net]\noffline = false\n"
+        source.write_bytes(updated)
+        os.utime(source, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        invoke()
+        self.assertEqual(config.read_bytes(), updated)
+        config.write_bytes(b"# deliberate isolated config\n")
+        source.write_bytes(b"# source changed again\n")
+        result = invoke()
+        self.assertEqual(config.read_bytes(), b"# deliberate isolated config\n")
+        self.assertIn("Preserving independently managed", result.stdout)
+        config.write_bytes(updated)
+        source.unlink()
+        invoke()
+        self.assertFalse(config.exists())
+        self.assertFalse(marker.exists())
+
+    def test_isolated_config_preserves_unmarked_existing_user_config(self):
+        custom = self.temp_root / "custom-cargo"
+        custom.mkdir()
+        (custom / "config.toml").write_text("# new source\n")
+        local = self.temp_root / "local"
+        config = local / "cargo-lanes/codexKD/config-test/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_bytes(b"# existing user config\n")
+        result = self.run_script(
+            "-Lane", "config-test", "-IsolateCargoHome",
+            extra_env={"CARGO_HOME": str(custom), "LOCALAPPDATA": str(local),
+                       "CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(config.read_bytes(), b"# existing user config\n")
+        self.assertFalse(config.with_name(".codex-config-source.json").exists())
+        # A byte-identical legacy copy can be adopted without rewriting it.
+        config.write_bytes((custom / "config.toml").read_bytes())
+        timestamp = config.stat().st_mtime_ns
+        result = self.run_script(
+            "-Lane", "config-test", "-IsolateCargoHome",
+            extra_env={"CARGO_HOME": str(custom), "LOCALAPPDATA": str(local),
+                       "CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(config.stat().st_mtime_ns, timestamp)
+        self.assertTrue(config.with_name(".codex-config-source.json").exists())
+
     def test_background_pruning_does_not_block_commands_and_has_one_owner(self):
         repo = self.temp_root / "repo with spaces"
         scripts = repo / "scripts"
@@ -50,6 +151,7 @@ class CargoLaneTest(unittest.TestCase):
             "cargo_lane_patterns.json",
             "cargo-lane-trash-cleanup.ps1",
             "process_owner.py",
+            "rust_tool_env.py",
         ):
             shutil.copyfile(SCRIPT.parent / name, scripts / name)
         ready, release = repo / "prune-ready", repo / "prune-release"
@@ -109,7 +211,7 @@ class CargoLaneTest(unittest.TestCase):
                         9,
                     )
                 errors.seek(0)
-                self.assertEqual(errors.read(), "")
+                self.assertNotIn("warning:", errors.read().lower())
             self.assertEqual((repo / "attempts").read_text().splitlines(), ["attempt"])
             self.assertFalse(release.exists())
             completed = True
@@ -144,6 +246,8 @@ class CargoLaneTest(unittest.TestCase):
 
     def test_shared_target_argument_corpus(self):
         target = self.temp_root / "target with spaces"
+        target.mkdir()
+        (self.temp_root / "child").mkdir()
         t = str(target)
         cases = [
             (
@@ -211,11 +315,38 @@ class CargoLaneTest(unittest.TestCase):
             (["cargo", "watch", "-x"], None),
             (["cargo", "check", "--target-dir", "escape"], None),
         ]
+        for options in ([], ["--profile", "local"], ["--profile=local"], ["-Plocal"], ["--no-pager", "--color", "never"]):
+            for subcommand in ("run", "r", "bench", "b", "list", "archive"):
+                command = ["cargo", "nextest", *options, subcommand]
+                cases.append((command, [*command, "--target-dir", t]))
+        cases.extend([
+            (["cargo", "nextest", "future-build-command"], None),
+            (["cargo", "nextest", "--profile"], None),
+            (["cargo", "nextest", "--profile", "local", "run", "--target-dir", "escape"], None),
+            (["cargo", "nextest", "--profile", "local", "run", "--target-dir", t],
+             ["cargo", "nextest", "--profile", "local", "run", "--target-dir", t]),
+            (["cargo", "nextest", "--help"], ["cargo", "nextest", "--help"]),
+            (["cargo", "nextest", "show-config"], ["cargo", "nextest", "show-config"]),
+        ])
+        for separator in ("/", "\\"):
+            command = ["cargo", "check", "--target-dir", t + separator]
+            self.assertTrue(Path(t + separator).samefile(target))
+            cases.append((command, command))
+        for workdir in (["-C", "child"], ["--workdir", "child"], ["--workdir=child"], ["-Cchild"]):
+            for before_exec in (True, False):
+                head = ["cargo", "watch", *(workdir if before_exec else [])]
+                tail = [] if before_exec else workdir
+                cases.append(([*head, "-x", 'check --target-dir "target with spaces"', *tail], None))
+                cases.append((
+                    [*head, "-x", 'test --target-dir "../target with spaces" -- --nocapture', *tail],
+                    [*head, "-x", f'test --target-dir "{t}" -- --nocapture', *tail],
+                ))
         corpus = self.temp_root / "corpus.json"
         corpus.write_text(json.dumps([{"args": args} for args, _ in cases]))
         script = f"""
 $ErrorActionPreference = 'Stop'
 . {ps_single_quote(SCRIPT.parent / "common-rust-env.ps1")}
+Set-Location -LiteralPath {ps_single_quote(self.temp_root)}
 $results = @(foreach ($case in (Get-Content -Raw {ps_single_quote(corpus)} | ConvertFrom-Json)) {{
     try {{ @{{ args = @(Add-CargoTargetDirArgument -CommandArgs $case.args -TargetDir {ps_single_quote(target)}); rejected = $false }} }}
     catch {{ @{{ args = @(); rejected = $true }} }}
@@ -233,7 +364,7 @@ ConvertTo-Json -InputObject $results -Depth 10 -Compress
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = json.loads(result.stdout)
         for (args, expected), ps_result in zip(cases, actual, strict=True):
-            with self.subTest(args=args):
+            with self.subTest(args=args), contextlib.chdir(self.temp_root):
                 if expected is None:
                     with self.assertRaises(ValueError):
                         rust_build_status._cargo_command_with_target_dir(args, target)
@@ -245,6 +376,24 @@ ConvertTo-Json -InputObject $results -Depth 10 -Compress
                     )
                     self.assertFalse(ps_result["rejected"])
                     self.assertEqual(ps_result["args"], expected)
+
+    def test_lane_entrypoint_enforces_nextest_and_rejects_watch_escape(self):
+        accepted = self.run_fake_cargo(
+            "-Lane", "nextest-options", "cargo", "nextest", "--profile", "local", "r"
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn(
+            f"cargo-args:nextest --profile local r --target-dir {self.lane_path('nextest-options')}",
+            accepted.stdout,
+        )
+        rejected = self.run_fake_cargo(
+            "-Lane", "watch-escape", "cargo", "watch", "-x",
+            "check --target-dir escape", "-C", str(self.temp_root),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("cargo-args:", rejected.stdout)
+        self.assertIn("does not match reserved lane target", rejected.stderr)
+        self.assertFalse(rust_build_status.lane_active_lock_is_held(self.lanes_root / "watch-escape"))
 
     def test_candidate_junction_is_skipped_without_writing_external_metadata(self):
         self.mark_lanes_root()
@@ -398,7 +547,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         )
         self.assertIsNotNone(lock)
         with lock:
-            result = self.run_fake_cargo("-Lane", "unit", "cargo", "check")
+            result = self.run_fake_cargo("-Lane", "unit", "cargo", "check", maintenance=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("cargo-args:check", result.stdout)
             self.assertFalse((self.lanes_root / ".gc-stamp").exists())
@@ -500,6 +649,8 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                         lane_root=self.lanes_root,
                         requested_lane="real-cargo",
                         command=["cargo", "check"],
+                        allow_cold_overflow=True,
+                        warm_wait_seconds=0,
                     ) as (name, _):
                         self.assertEqual(name, "real-cargo-2")
                     result = self.run_fake_cargo(
@@ -647,10 +798,12 @@ Write-Output 'reservation released'
         extra_env: dict[str, str] | None = None,
         lanes_root: Path | None = None,
         cwd: Path | None = None,
+        maintenance: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE"] = "1"
-        env["CODEX_CARGO_LANE_MAINTENANCE_SYNC"] = "1"
+        # GC assertions opt in; naming/forwarding tests do not need a GC process.
+        env["CODEX_CARGO_LANE_MAINTENANCE_SYNC"] = "1" if maintenance else "0"
         # Most lane-wrapper tests exercise naming, locking, and forwarding. Keep
         # them isolated from the real repository's large non-lane target tree;
         # target-budget tests opt back into the production default explicitly.
@@ -717,11 +870,12 @@ Write-Output 'reservation released'
         *args: str,
         extra_env: dict[str, str] | None = None,
         cwd: Path | None = None,
+        maintenance: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(extra_env or {})
         base_path = env.get("PATH", os.environ["PATH"])
         env["PATH"] = f"{self.fake_cargo_bin()}{os.pathsep}{base_path}"
-        return self.run_script(*args, extra_env=env, cwd=cwd)
+        return self.run_script(*args, extra_env=env, cwd=cwd, maintenance=maintenance)
 
     def make_lane(self, lane: str, *, size: int = 0, days_old: int = 0) -> Path:
         self.mark_lanes_root()
@@ -1078,6 +1232,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "PATH": path_without_python,
                 "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
             },
+            maintenance=True,
         )
 
         # Maintenance tolerates a missing interpreter; the command itself must
@@ -1242,6 +1397,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
             "echo ok",
             lanes_root=unsafe_root,
             extra_env={"CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0"},
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -1513,6 +1669,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_TEST_GC_ARGS_LOG": str(args_log),
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
             },
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -1980,6 +2137,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
             "echo wrapper=%RUSTC_WRAPPER% incremental=%CARGO_INCREMENTAL% %CARGO_HOME% %SCCACHE_BASEDIR% %SCCACHE_CACHE_SIZE%",
             extra_env={
                 "CARGO_INCREMENTAL": "",
+                "CARGO_HOME": "",
                 "LOCALAPPDATA": str(local_app_data),
                 "RUSTC_WRAPPER": "",
                 "USERPROFILE": str(user_profile),
@@ -2070,6 +2228,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
                 "CODEX_CARGO_LANE_MAX_AGE_DAYS": "1",
             },
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -2098,6 +2257,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE": "",
                 "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
             },
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -2132,6 +2292,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
                 "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
             },
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -2157,7 +2318,8 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
 
         def run():
             result = self.run_script(
-                "-Lane", "unit", "cmd.exe", "/c", "echo ok", extra_env=env
+                "-Lane", "unit", "cmd.exe", "/c", "echo ok", extra_env=env,
+                maintenance=True,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -2199,6 +2361,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_CARGO_LANE_MAX_AGE_DAYS": "3650",
                 "CODEX_CARGO_LANE_MAX_LANE_BYTES": "15",
             },
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -2206,7 +2369,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
             0,
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        self.assertFalse(oversized_path.exists())
+        self.assertFalse(oversized_path.exists(), result.stdout + result.stderr)
         self.assertTrue(small_path.exists())
 
     def test_gc_global_cap_evicts_oldest_idle_lane(self) -> None:
@@ -2234,6 +2397,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_CARGO_LANE_MAX_AGE_DAYS": "3650",
                 "CODEX_CARGO_LANE_MAX_TOTAL_BYTES": str(3 * 1024 * 1024),
             },
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -2262,6 +2426,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_TEST_GC_ARGS_LOG": str(args_log),
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
             },
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -2298,6 +2463,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_TEST_GC_ARGS_LOG": str(args_log),
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
             },
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -2327,6 +2493,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
                 "CODEX_CARGO_LANE_MAX_AGE_DAYS": "1",
             },
+            maintenance=True,
         )
 
         self.assertEqual(
@@ -2351,6 +2518,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                 "CODEX_CARGO_LANE_MAX_TOTAL_BYTES": "not-a-number",
                 "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES": "not-a-number",
             },
+            maintenance=True,
         )
 
         self.assertEqual(

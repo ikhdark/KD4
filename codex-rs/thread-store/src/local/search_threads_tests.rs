@@ -17,6 +17,37 @@ use crate::local::test_support::test_config;
 use crate::local::test_support::write_session_file;
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "holds the cache busy to verify queries do not wait for it"
+)]
+async fn busy_search_cache_does_not_block_independent_queries() {
+    let home = TempDir::new().expect("temp dir");
+    let id = Uuid::from_u128(123);
+    write_session_file(home.path(), "2025-01-03T12-30-00", id).expect("session");
+    let store = LocalThreadStore::new(test_config(home.path()), None);
+    let _busy = store.search_cache.lock().await;
+    let page = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.search_threads(SearchThreadsParams {
+            page_size: 10,
+            cursor: None,
+            sort_key: ThreadSortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            archived: false,
+            search_term: "Hello from user".to_string(),
+        }),
+    )
+    .await
+    .expect("a busy cache must not block the query")
+    .expect("search");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].thread.thread_id.to_string(), id.to_string());
+    assert_eq!(page.items[0].snippet, "Hello from user");
+}
+
+#[tokio::test]
 async fn search_threads_rejects_zero_page_size_before_scanning() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(&home.path().join("missing")), None);

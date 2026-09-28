@@ -41,11 +41,13 @@ function Remove-WorkspaceFeatureArgs {
         if ($arg -in @("--workspace", "--all-features")) {
             continue
         }
-        if ($arg -eq "--exclude") {
+        # The fallback package is library-only. Named targets belong to the
+        # workspace pass; --tests/--all-targets already select its library.
+        if ($arg -in @("--exclude", "--bin", "--test", "--bench", "--example")) {
             $index++
             continue
         }
-        if ($arg.StartsWith("--exclude=")) {
+        if ($arg -match '^--(exclude|bin|test|bench|example)=') {
             continue
         }
         $filtered.Add($arg)
@@ -86,12 +88,12 @@ if ($Analyzer -eq "clippy") {
     # preserving Cargo's effective target/build/environment rustflags.
     $compilerArgs = @("--", "-A", "clippy::all", "-Ddead_code") + @($compilerArgs | Select-Object -Skip 1)
     $cargoArgs = @("clippy")
-    if (-not $hasExplicitPackage) {
+    if (-not $hasExplicitPackage -and $forwarded -notcontains "--workspace") {
         $cargoArgs += "--workspace"
     }
     $cargoArgs += "--all-targets"
     $cargoArgs += $forwarded
-    $isWorkspace = -not $hasExplicitPackage
+    $isWorkspace = ($forwarded -contains "--workspace") -or -not $hasExplicitPackage
 }
 
 $needsWindowsV8Fallback =

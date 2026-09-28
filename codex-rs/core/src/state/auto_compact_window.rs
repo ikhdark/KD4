@@ -1,4 +1,5 @@
 use codex_protocol::protocol::TokenUsage;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,9 @@ pub(super) struct AutoCompactWindow {
     /// not the growth itself; server-observed usage replaces estimated
     /// resume/recompute baselines when available.
     prefill_input_tokens: Option<AutoCompactWindowPrefill>,
+    /// Checkpointing one of these outputs rewrites the measured prefill. Unknown
+    /// resume baselines must not grant unverified body-after-prefix credit.
+    prefill_tool_output_ids: Option<BTreeSet<String>>,
 }
 
 impl AutoCompactWindow {
@@ -48,11 +52,13 @@ impl AutoCompactWindow {
             window_number: 0,
             ids,
             prefill_input_tokens: None,
+            prefill_tool_output_ids: None,
         }
     }
 
     pub(super) fn clear_prefill(&mut self) {
         self.prefill_input_tokens = None;
+        self.prefill_tool_output_ids = None;
     }
 
     pub(super) fn window_number(&self) -> u64 {
@@ -72,14 +78,18 @@ impl AutoCompactWindow {
         self.window_number = self.window_number.saturating_add(1);
         self.ids.previous_window_id = Some(self.ids.window_id);
         self.ids.window_id = Uuid::now_v7();
-        self.prefill_input_tokens = None;
+        self.clear_prefill();
         (self.window_number, self.ids)
     }
 
     /// Records the request-input side of the first server usage sample. The
     /// sampled output from that response is body growth and should remain
     /// counted against the scoped auto-compact budget.
-    pub(super) fn ensure_server_observed_prefill_from_usage(&mut self, usage: &TokenUsage) {
+    pub(super) fn ensure_server_observed_prefill_from_usage(
+        &mut self,
+        usage: &TokenUsage,
+        tool_output_ids: impl FnOnce() -> Option<BTreeSet<String>>,
+    ) {
         if matches!(
             self.prefill_input_tokens,
             Some(AutoCompactWindowPrefill::ServerObserved(_))
@@ -90,6 +100,13 @@ impl AutoCompactWindow {
         self.prefill_input_tokens = Some(AutoCompactWindowPrefill::ServerObserved(
             usage.input_tokens.max(0),
         ));
+        self.prefill_tool_output_ids = tool_output_ids();
+    }
+
+    pub(super) fn checkpoint_preserves_prefill(&self, retired: &BTreeSet<String>) -> bool {
+        self.prefill_tool_output_ids
+            .as_ref()
+            .is_some_and(|ids| ids.is_disjoint(retired))
     }
 
     pub(super) fn set_estimated_prefill(&mut self, tokens: i64) {
@@ -101,6 +118,7 @@ impl AutoCompactWindow {
         }
 
         self.prefill_input_tokens = Some(AutoCompactWindowPrefill::Estimated(tokens.max(0)));
+        self.prefill_tool_output_ids = None;
     }
 
     pub(super) fn snapshot(&self) -> AutoCompactWindowSnapshot {
@@ -171,11 +189,18 @@ mod tests {
             }
         );
 
-        window.ensure_server_observed_prefill_from_usage(&TokenUsage {
-            input_tokens: 120,
-            total_tokens: 170,
-            ..Default::default()
-        });
+        window.ensure_server_observed_prefill_from_usage(
+            &TokenUsage {
+                input_tokens: 120,
+                total_tokens: 170,
+                ..Default::default()
+            },
+            || Some(BTreeSet::from(["prefix-result".to_string()])),
+        );
+        assert!(window.checkpoint_preserves_prefill(&BTreeSet::from(["body-result".to_string()])));
+        assert!(
+            !window.checkpoint_preserves_prefill(&BTreeSet::from(["prefix-result".to_string()]))
+        );
         assert_eq!(
             window.snapshot(),
             AutoCompactWindowSnapshot {
@@ -183,11 +208,14 @@ mod tests {
             }
         );
 
-        window.ensure_server_observed_prefill_from_usage(&TokenUsage {
-            input_tokens: 130,
-            total_tokens: 180,
-            ..Default::default()
-        });
+        window.ensure_server_observed_prefill_from_usage(
+            &TokenUsage {
+                input_tokens: 130,
+                total_tokens: 180,
+                ..Default::default()
+            },
+            || panic!("later usage must not recapture the prefill"),
+        );
         window.set_estimated_prefill(/*tokens*/ 90);
         assert_eq!(
             window.snapshot(),
@@ -197,6 +225,7 @@ mod tests {
         );
 
         window.advance();
+        assert!(!window.checkpoint_preserves_prefill(&BTreeSet::new()));
         assert_eq!(
             window.snapshot(),
             AutoCompactWindowSnapshot {

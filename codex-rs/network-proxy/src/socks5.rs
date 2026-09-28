@@ -1,6 +1,5 @@
 use crate::attribution::BindConnectionAttribution;
 use crate::config::NetworkMode;
-use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::mitm;
 use crate::network_policy::BlockDecisionAuditEventArgs;
 use crate::network_policy::NetworkDecision;
@@ -22,6 +21,8 @@ use crate::runtime::HostMitmRequirement;
 use crate::state::BlockedRequest;
 use crate::state::BlockedRequestArgs;
 use crate::state::NetworkProxyState;
+use crate::upstream::TunnelConnection;
+use crate::upstream::connect_tunnel;
 use anyhow::Context as _;
 use anyhow::Result;
 use rama_core::Service;
@@ -190,8 +191,6 @@ async fn handle_socks5_tcp(
         error!("failed to read proxy policy: {err}");
         io::Error::other("proxy error")
     })?;
-    let tcp_connector =
-        TargetCheckedTcpConnector::from_allow_local_binding(policy_snapshot.allow_local_binding());
 
     let host = normalize_host(&req.authority.host.to_string());
     let port = req.authority.port;
@@ -417,6 +416,7 @@ async fn handle_socks5_tcp(
                 mode,
                 mitm: mitm_state,
                 allow_local_binding: policy_snapshot.allow_local_binding(),
+                allow_upstream_proxy: policy_snapshot.allow_upstream_proxy(),
                 extensions: req.extensions().clone(),
             }),
         };
@@ -430,7 +430,13 @@ async fn handle_socks5_tcp(
 
     info!("SOCKS upstream dial started (host={host}, port={port})");
     let connect_started_at = Instant::now();
-    let result = tcp_connector.serve(req).await.map(|connection| {
+    let result = connect_tunnel(
+        req,
+        policy_snapshot.allow_upstream_proxy(),
+        policy_snapshot.allow_local_binding(),
+    )
+    .await
+    .map(|connection| {
         let EstablishedClientConnection { input, conn } = connection;
         EstablishedClientConnection {
             input,
@@ -461,7 +467,7 @@ enum SocksMitmMode {
 
 #[derive(Debug)]
 enum Socks5TcpConnection {
-    Direct(TcpStream),
+    Direct(TunnelConnection),
     Mitm {
         target: HostWithPort,
         mode: NetworkMode,
@@ -473,6 +479,7 @@ enum Socks5TcpConnection {
         mode: NetworkMode,
         mitm: Arc<mitm::MitmState>,
         allow_local_binding: bool,
+        allow_upstream_proxy: bool,
         extensions: Extensions,
     },
 }
@@ -573,6 +580,7 @@ async fn proxy_socks5_tcp(
             mode,
             mitm,
             allow_local_binding,
+            allow_upstream_proxy,
             extensions,
         } => {
             source.extensions_mut().insert(ProxyTarget(target.clone()));
@@ -586,10 +594,12 @@ async fn proxy_socks5_tcp(
             } else {
                 info!("SOCKS opaque upstream dial started (target={target})");
                 let connect_started_at = Instant::now();
-                let EstablishedClientConnection { conn: upstream, .. } =
-                    TargetCheckedTcpConnector::from_allow_local_binding(allow_local_binding)
-                        .serve(TcpRequest::new_with_extensions(target.clone(), extensions))
-                        .await?;
+                let EstablishedClientConnection { conn: upstream, .. } = connect_tunnel(
+                    TcpRequest::new_with_extensions(target.clone(), extensions),
+                    allow_upstream_proxy,
+                    allow_local_binding,
+                )
+                .await?;
                 info!(
                     "SOCKS opaque upstream dial established (target={target}, elapsed_ms={})",
                     connect_started_at.elapsed().as_millis()

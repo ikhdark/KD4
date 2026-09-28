@@ -1,4 +1,6 @@
 use crate::model_info::clear_instruction_messages;
+use crate::model_info::matches_model_slug;
+use crate::model_info::namespaced_model_suffix;
 use codex_protocol::openai_models::ModelInfo;
 use tracing::debug;
 
@@ -6,6 +8,7 @@ use tracing::debug;
 pub(crate) const LOCAL_PROMPT_POLICY_SLUGS: &[&str] = &[
     "gpt-6-astra",
     "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -53,7 +56,11 @@ pub(crate) fn resolve_prompt<'a>(
     slug: &str,
     catalog_prompt: Option<&'a str>,
 ) -> ResolvedPrompt<'a> {
-    if LOCAL_PROMPT_POLICY_SLUGS.contains(&slug) {
+    let policy_slug = namespaced_model_suffix(slug).unwrap_or(slug);
+    if LOCAL_PROMPT_POLICY_SLUGS
+        .iter()
+        .any(|registered| matches_model_slug(policy_slug, registered))
+    {
         return ResolvedPrompt {
             id: PromptId::LocalPolicy,
             source: PromptSource::LocalModelPolicy,
@@ -117,27 +124,46 @@ mod tests {
 
     #[test]
     fn resolver_reports_local_policy_canonical_prompt_provenance() {
-        let resolved = resolve_prompt("gpt-5.6-sol", Some("remote prompt"));
+        for slug in LOCAL_PROMPT_POLICY_SLUGS {
+            for model in [
+                slug.to_string(),
+                format!("{slug}-preview"),
+                format!("openai/{slug}"),
+                format!("openai-codex/{slug}-preview"),
+            ] {
+                let resolved = resolve_prompt(&model, Some("remote prompt"));
 
-        assert_eq!(resolved.id, PromptId::LocalPolicy);
-        assert_eq!(resolved.source, PromptSource::LocalModelPolicy);
-        assert_eq!(resolved.normalization, PromptNormalization::Trim);
-        assert_eq!(
-            resolved.content,
-            codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
-        );
-        assert!(resolved.clears_instruction_template);
+                assert_eq!(resolved.id, PromptId::LocalPolicy, "{model}");
+                assert_eq!(resolved.source, PromptSource::LocalModelPolicy);
+                assert_eq!(resolved.normalization, PromptNormalization::Trim);
+                assert_eq!(
+                    resolved.content,
+                    codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
+                );
+                assert!(resolved.clears_instruction_template);
+            }
+        }
     }
 
     #[test]
     fn resolver_preserves_non_family_catalog_prompt() {
-        let resolved = resolve_prompt("catalog-model", Some("catalog prompt\n"));
+        for model in [
+            "catalog-model",
+            "gpt-6-solevil",
+            "openai/gpt-6-solevil",
+            "openai.gpt-6-sol",
+            "open.ai/gpt-6-sol",
+            "ns1/ns2/gpt-6-sol",
+            "/gpt-6-sol",
+        ] {
+            let resolved = resolve_prompt(model, Some("catalog prompt\n"));
 
-        assert_eq!(resolved.id, PromptId::Catalog);
-        assert_eq!(resolved.source, PromptSource::Catalog);
-        assert_eq!(resolved.normalization, PromptNormalization::Preserve);
-        assert_eq!(resolved.content, "catalog prompt\n");
-        assert!(!resolved.clears_instruction_template);
+            assert_eq!(resolved.id, PromptId::Catalog, "{model}");
+            assert_eq!(resolved.source, PromptSource::Catalog);
+            assert_eq!(resolved.normalization, PromptNormalization::Preserve);
+            assert_eq!(resolved.content, "catalog prompt\n");
+            assert!(!resolved.clears_instruction_template);
+        }
     }
 
     #[test]

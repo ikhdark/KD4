@@ -28,8 +28,8 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
         with (
             mock.patch.object(dev_env_doctor.shutil, "which", return_value="git.exe"),
             mock.patch.object(
-                dev_env_doctor.subprocess,
-                "run",
+                dev_env_doctor,
+                "run_owned",
                 return_value=subprocess.CompletedProcess(
                     [], 0, "git version 2.53.0.windows.1\n", ""
                 ),
@@ -61,8 +61,8 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
                     ),
                 ),
                 mock.patch.object(
-                    dev_env_doctor.subprocess,
-                    "run",
+                    dev_env_doctor,
+                    "run_owned",
                     return_value=subprocess.CompletedProcess([], 0, "99.0.0\n", ""),
                 ),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -87,8 +87,8 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
                 self.subTest(stdout=stdout, stderr=stderr),
                 mock.patch.object(dev_env_doctor.shutil, "which", return_value="pnpm"),
                 mock.patch.object(
-                    dev_env_doctor.subprocess,
-                    "run",
+                    dev_env_doctor,
+                    "run_owned",
                     return_value=subprocess.CompletedProcess([], 0, stdout, stderr),
                 ),
             ):
@@ -290,7 +290,7 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
             ["pnpm"], 0, stdout="10.34.0\n", stderr="Corepack download warning\n"
         )
         with mock.patch.object(
-            dev_env_doctor.subprocess, "run", return_value=completed
+            dev_env_doctor, "run_owned", return_value=completed
         ) as run:
             self.assertEqual(
                 dev_env_doctor.run_version(["pnpm", "--version"]), "10.34.0"
@@ -303,9 +303,7 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             ["python"], 0, stdout="", stderr="Python 3.11.9\n"
         )
-        with mock.patch.object(
-            dev_env_doctor.subprocess, "run", return_value=completed
-        ):
+        with mock.patch.object(dev_env_doctor, "run_owned", return_value=completed):
             self.assertEqual(
                 dev_env_doctor.run_version(["python", "--version"]), "Python 3.11.9"
             )
@@ -347,6 +345,46 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
         with contextlib.redirect_stdout(stdout):
             dev_env_doctor.print_text([check])
         self.assertIn("- pnpm: mismatch (10.12.3)", stdout.getvalue())
+
+    def test_standalone_bootstrap_ignores_unrelated_scripts_package(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "__init__.py").write_text("")
+            result = subprocess.run(
+                [sys.executable, str(Path(dev_env_doctor.__file__)), "--help"],
+                cwd=root,
+                env={**os.environ, "PYTHONPATH": str(root)},
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--no-fail", result.stdout)
+
+    def test_version_timeout_stops_descendant_and_inherited_pipes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            started, finished = root / "started", root / "finished"
+            child = (
+                "import time; from pathlib import Path; "
+                f"Path({str(started)!r}).touch(); time.sleep(2); "
+                f"Path({str(finished)!r}).touch()"
+            )
+            parent = (
+                "import subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+            )
+            begin = time.monotonic()
+            with mock.patch.object(dev_env_doctor, "VERSION_TIMEOUT_SECONDS", 1):
+                self.assertIsNone(
+                    dev_env_doctor.run_version([sys.executable, "-c", parent])
+                )
+            self.assertTrue(started.exists(), "the descendant must run before timeout")
+            self.assertLess(time.monotonic() - begin, 2)
+            # Also reject a fast return which abandons the child rather than owning it.
+            time.sleep(max(0, 2.5 - (time.monotonic() - begin)))
+            self.assertFalse(finished.exists(), "the descendant survived the timeout")
 
 
 class GitDoctorTest(unittest.TestCase):
@@ -397,9 +435,7 @@ class GitDoctorTest(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             ["git"], 0, stdout="C:/Users/Jos\u00e9/repo\n", stderr=""
         )
-        with mock.patch.object(
-            git_doctor.subprocess, "run", return_value=completed
-        ) as run:
+        with mock.patch.object(git_doctor, "run_owned", return_value=completed) as run:
             self.assertEqual(
                 git_doctor.run_git(["rev-parse", "--show-toplevel"]).stdout,
                 "C:/Users/Jos\u00e9/repo\n",
@@ -727,6 +763,27 @@ class GeneratedOutputLockTest(unittest.TestCase):
 
 
 class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
+    def test_membership_order_is_not_a_schema_break_but_membership_changes_are(self):
+        compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
+        for key, values in (
+            ("required", ["name", "tag"]),
+            ("enum", [{"title": "a"}, {"title": "b"}]),
+        ):
+            with self.subTest(keyword=key):
+                self.assertEqual(
+                    compare({key: values}, {key: list(reversed(values))}), []
+                )
+                self.assertEqual(
+                    compare({key: values}, {key: values[:1]}), [f"$/{key}:changed"]
+                )
+        positional = [{"type": "string"}, {"type": "number"}]
+        self.assertEqual(
+            compare(
+                {"prefixItems": positional}, {"prefixItems": list(reversed(positional))}
+            ),
+            ["$/prefixItems:changed"],
+        )
+
     def setUp(self):
         self.baseline = mock.patch.object(
             app_server_schema_runtime_check, "resolve_baseline", return_value="a" * 40
@@ -1069,6 +1126,189 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             app_server_schema_runtime_check.main(["--mode", "auto"])
 
         self.assertEqual(raised.exception.code, 2)
+
+
+class SchemaWorkflowRegressionTest(unittest.TestCase):
+    def test_unordered_keywords_are_normalized_inside_combinators_not_literal_data(
+        self,
+    ):
+        compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
+        old = {
+            "oneOf": [
+                {
+                    "required": ["a", "b"],
+                    "properties": {
+                        "a": {"enum": [{"title": "first"}, {"title": "second"}]},
+                    },
+                }
+            ]
+        }
+        new = {
+            "oneOf": [
+                {
+                    "required": ["b", "a"],
+                    "properties": {
+                        "a": {"enum": [{"title": "second"}, {"title": "first"}]},
+                    },
+                }
+            ]
+        }
+        self.assertEqual(compare(old, new), [])
+        new["oneOf"][0]["required"].append("c")
+        self.assertTrue(compare(old, new))
+        for keyword in ("const", "enum"):
+            before = {keyword: {"required": ["a", "b"]}}
+            after = {keyword: {"required": ["b", "a"]}}
+            if keyword == "enum":
+                before, after = (
+                    {keyword: [before[keyword]]},
+                    {keyword: [after[keyword]]},
+                )
+            self.assertTrue(compare(before, after))
+        self.assertTrue(
+            compare(
+                {"prefixItems": [{"type": "string"}, {"type": "number"}]},
+                {"prefixItems": [{"type": "number"}, {"type": "string"}]},
+            )
+        )
+
+    def test_first_optional_property_is_additive_but_required_or_constraint_is_not(
+        self,
+    ):
+        compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
+        old = {"type": "object"}
+        new = {"type": "object", "properties": {"label": {"type": "string"}}}
+        self.assertEqual(compare(old, new), [])
+        self.assertTrue(compare(old, {**new, "required": ["label"]}))
+        self.assertTrue(compare(old, {**new, "additionalProperties": False}))
+        self.assertTrue(
+            compare(
+                old, {"type": "object", "patternProperties": {".*": {"type": "string"}}}
+            )
+        )
+
+    def test_schema_families_can_progress_but_same_family_writers_cannot(self):
+        schema = app_server_schema_runtime_check
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                generated_output_lock.generated_output_lock(
+                    root, "app-reader", resource="app-server-schema"
+                ),
+                mock.patch.object(config_schema_check, "repo_root", return_value=root),
+                mock.patch.object(
+                    config_schema_check, "run_protocol_check", return_value=0
+                ) as config_proof,
+                mock.patch.object(schema, "repo_root", return_value=root),
+                mock.patch.object(schema, "resolve_baseline", return_value="a" * 40),
+                mock.patch.object(schema, "regenerate_schemas") as regenerate,
+                mock.patch.object(schema, "run_protocol_check") as app_proof,
+            ):
+                self.assertEqual(
+                    config_schema_check.main(
+                        ["--mode", "check", "--lock-timeout", "0"]
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    schema.main(
+                        [
+                            "--mode",
+                            "force",
+                            "--owner",
+                            "writer",
+                            "--compatibility-baseline",
+                            "HEAD",
+                        ]
+                    ),
+                    2,
+                )
+                config_proof.assert_called_once_with(root)
+                regenerate.assert_not_called()
+                app_proof.assert_not_called()
+            with (
+                generated_output_lock.generated_output_lock(
+                    root, "config-reader", resource="config-schema"
+                ),
+                mock.patch.object(config_schema_check, "repo_root", return_value=root),
+                mock.patch.object(
+                    config_schema_check, "regenerate_schema"
+                ) as regenerate,
+            ):
+                self.assertEqual(
+                    config_schema_check.main(["--mode", "force", "--owner", "writer"]),
+                    2,
+                )
+                regenerate.assert_not_called()
+
+    def test_experimental_export_preserves_stable_fixtures_and_checks_stable_consumers(
+        self,
+    ):
+        schema = app_server_schema_runtime_check
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stable = root / schema.GENERATED_OUTPUTS[0] / "json" / "stable.json"
+            stable.parent.mkdir(parents=True)
+            stable.write_bytes(b'{"stable": true}\n')
+            calls = []
+
+            def generate(args, *, cwd):
+                self.assertIn("--experimental", args)
+                destination = Path(args[args.index("--schema-root") + 1])
+                self.assertEqual(
+                    destination, root / "dist" / "app-server-schema-experimental"
+                )
+                (destination / "json").mkdir(parents=True)
+                (destination / "json" / "experimental.json").write_bytes(
+                    b'{"experimental": true}\n'
+                )
+                calls.append("generate")
+                return 0
+
+            def stable_check(_root):
+                self.assertEqual(stable.read_bytes(), b'{"stable": true}\n')
+                self.assertEqual(list(stable.parent.iterdir()), [stable])
+                calls.append("check")
+                return 0
+
+            with (
+                mock.patch.object(schema, "repo_root", return_value=root),
+                mock.patch.object(schema, "run", side_effect=generate),
+                mock.patch.object(
+                    schema, "run_protocol_check", side_effect=stable_check
+                ),
+                mock.patch.object(
+                    schema, "run_python_sdk_contract_check", side_effect=stable_check
+                ),
+            ):
+                self.assertEqual(
+                    schema.main(
+                        ["--mode", "force", "--owner", "test", "--", "--experimental"]
+                    ),
+                    0,
+                )
+            self.assertEqual(calls, ["generate", "check", "check"])
+            self.assertTrue(
+                (
+                    root / "dist/app-server-schema-experimental/json/experimental.json"
+                ).is_file()
+            )
+
+    def test_experimental_output_cannot_overlap_stable_fixtures(self):
+        schema = app_server_schema_runtime_check
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stable = root / schema.GENERATED_OUTPUTS[0]
+            for path in (stable, stable / "child", stable.parent):
+                with (
+                    self.subTest(path=path),
+                    mock.patch.object(schema, "run") as run,
+                    self.assertRaisesRegex(ValueError, "must not overlap"),
+                ):
+                    schema.regenerate_schemas(
+                        root, "test", ["--experimental", "--schema-root", str(path)]
+                    )
+                run.assert_not_called()
 
 
 if __name__ == "__main__":

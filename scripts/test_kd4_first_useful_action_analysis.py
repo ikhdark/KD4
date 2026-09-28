@@ -98,6 +98,7 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                 "abortedTurns": {"count": 0, "denominator": 4, "rate": 0},
                 "terminalWithoutStart": {"count": 0, "denominator": 4, "rate": 0},
                 "duplicateTerminalEvents": {"count": 0, "denominator": 4, "rate": 0},
+                "conflictingTerminalProfiles": {"count": 0, "denominator": 4, "rate": 0},
                 "invalidTimingProfiles": {"count": 0, "denominator": 4, "rate": 0},
                 "incompleteCanonicalMilestones": {
                     "count": 0,
@@ -106,6 +107,45 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                 },
             },
         )
+
+    def test_control_only_turn_keeps_independent_milestones(self):
+        result = self.analyze_rows(self.canonical_turn({
+            "firstInfrastructureActionMs": 2000,
+            "firstToolDiscoveryActionMs": 4000,
+        }))
+        self.assertEqual(result["canonicalTurnCount"], 0)
+        for name, expected in (
+            ("startToFirstInfrastructureActionMs", 2000),
+            ("startToFirstToolDiscoveryActionMs", 4000),
+        ):
+            self.assertEqual(result["canonical"][name]["count"], 1)
+            self.assertEqual(result["canonical"][name]["p50"], expected)
+            self.assertEqual(result["canonical"][name]["coverage"], 1)
+        self.assertIsNone(result["canonical"]["startToFirstDomainActionMs"]["p50"])
+
+    def test_conflicting_terminals_never_select_a_latency_or_status(self):
+        first = {"type": "task_complete", "turn_id": "conflict", "timing": {
+            "schemaVersion": 25, "profileValid": True,
+            "milestones": {"firstUsefulActionMs": 10000, "firstDomainActionMs": 10000},
+        }}
+        for other in (
+            {**first, "timing": {**first["timing"], "milestones": {
+                "firstUsefulActionMs": 30000, "firstDomainActionMs": 30000,
+            }}},
+            {**first, "type": "turn_aborted"},
+            {**first, "timing": {**first["timing"], "exclusive": {"modelOnlyNs": 1}}},
+        ):
+            for terminals in ((first, other), (other, first)):
+                with self.subTest(terminals=terminals):
+                    result = self.analyze_rows([
+                        record("2026-08-17T00:00:00Z", "event_msg", payload)
+                        for payload in terminals
+                    ])
+                    self.assertEqual(result["exclusions"]["conflictingTerminalProfiles"], 1)
+                    self.assertEqual(result["completedTurnCount"], 0)
+                    self.assertEqual(result["exclusions"]["abortedTurns"], 0)
+                    self.assertEqual(result["canonicalTurnCount"], 0)
+                    self.assertEqual(result["legacyReconstructedTurnCount"], 0)
 
     def test_partial_canonical_milestone_is_not_admitted(self):
         with tempfile.TemporaryDirectory() as temp:

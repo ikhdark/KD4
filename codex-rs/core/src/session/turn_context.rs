@@ -212,6 +212,8 @@ pub struct TurnContext {
     /// Shared by model variants of this turn; tool dispatch and ordered delivery
     /// access it without entering the synchronous extension type map.
     pub(crate) pending_post_tool_contexts: Arc<Mutex<HashMap<String, Vec<ResponseItem>>>>,
+    // Stop admission and further sampling without cancelling completed-result persistence.
+    pub(crate) post_tool_stop_reason: Arc<OnceLock<String>>,
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
     pub(crate) tool_call_acceptance: Arc<crate::state::ToolCallAcceptanceGate>,
@@ -323,13 +325,16 @@ impl TurnContext {
 
     pub(crate) async fn update_validation_authorization(
         &self,
-        input: &[codex_protocol::user_input::UserInput],
+        _input: &[codex_protocol::user_input::UserInput],
     ) {
+        #[cfg(test)]
+        {
         let mut authorization = self.validation_authorization.write().await;
-        for item in input {
+        for item in _input {
             if let codex_protocol::user_input::UserInput::Text { text, .. } = item {
                 authorization.update_from_user_input(text);
             }
+        }
         }
     }
 
@@ -599,10 +604,11 @@ impl TurnContext {
             dynamic_tools: self.dynamic_tools.clone(),
             workspace_execution_coordinator: Arc::clone(&self.workspace_execution_coordinator),
             deferred_tool_activations: Arc::clone(&self.deferred_tool_activations),
-            validation_authorization: Arc::clone(&self.validation_authorization),
+            validation_authorization: self.validation_authorization.clone(),
             turn_metadata_state: self.turn_metadata_state.clone(),
             extension_data: Arc::clone(&self.extension_data),
             pending_post_tool_contexts: Arc::clone(&self.pending_post_tool_contexts),
+            post_tool_stop_reason: Arc::clone(&self.post_tool_stop_reason),
             turn_skills: self.turn_skills.clone(),
             turn_timing_state: Arc::clone(&self.turn_timing_state),
             tool_call_acceptance: Arc::clone(&self.tool_call_acceptance),
@@ -907,12 +913,11 @@ impl Session {
             deferred_tool_activations: Arc::new(std::sync::RwLock::new(
                 DeferredToolActivationState::default(),
             )),
-            validation_authorization: Arc::new(tokio::sync::RwLock::new(
-                crate::validation_admission::ValidationAuthorization::default(),
-            )),
+            validation_authorization: Default::default(),
             turn_metadata_state,
             extension_data,
             pending_post_tool_contexts: Arc::new(Mutex::new(HashMap::new())),
+            post_tool_stop_reason: Arc::new(OnceLock::new()),
             turn_skills: TurnSkillsContext::new(skills_snapshot),
             turn_timing_state: Arc::new(TurnTimingState::default()),
             tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),

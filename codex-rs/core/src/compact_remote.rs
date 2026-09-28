@@ -10,6 +10,7 @@ use crate::context_manager::estimate_item_token_count;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tool_history::response_item_has_valid_tool_history_receipt;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -22,6 +23,8 @@ use sha2::Sha256;
 const REMOTE_COMPACTION_TOOL_RECEIPT_MAX_TOKENS: usize = 2_000;
 const REMOTE_COMPACTION_TOOL_RECEIPT_MAX_ITEMS: usize = 32;
 const REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS: i64 = 512;
+const COMPACTION_ARTIFACT_PINS_ITEM_ID_BASE: &str = "msg_compaction_artifact_pins";
+const COMPACTION_ARTIFACT_PINS_ITEM_ID_PREFIX: &str = "msg_compaction_artifact_pins_";
 const TOOL_SEARCH_RECEIPT_KIND: &str = "tool_search_receipt";
 const TOOL_SEARCH_RECEIPT_MAX_TOKENS: usize = 256;
 const TOOL_SEARCH_ARGUMENT_VALUE_MAX_TOKENS: usize = 64;
@@ -106,13 +109,18 @@ pub(crate) async fn process_compacted_history_with_retained_input(
     )
 }
 
+pub(crate) fn is_remote_compaction_artifact_pins(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { id: Some(id), role, .. }
+        if role == "user" && id.as_str().starts_with(COMPACTION_ARTIFACT_PINS_ITEM_ID_PREFIX))
+}
+
 fn append_remote_compaction_artifact_pins(
     mut history: Vec<ResponseItem>,
     artifact_pin_payload: Option<String>,
 ) -> Vec<ResponseItem> {
     if let Some(text) = artifact_pin_payload {
         history.push(ResponseItem::Message {
-            id: None,
+            id: Some(ResponseItemId::new(COMPACTION_ARTIFACT_PINS_ITEM_ID_BASE)),
             role: "user".to_string(),
             content: vec![ContentItem::InputText { text }],
             phase: None,

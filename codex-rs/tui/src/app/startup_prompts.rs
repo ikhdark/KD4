@@ -118,6 +118,29 @@ pub(super) fn emit_app_server_runtime_warnings(
     }
 }
 
+pub(super) fn model_upgrade_for_migration(
+    model: &str,
+    available_models: &[ModelPreset],
+) -> Option<ModelUpgrade> {
+    if let Some(preset) = available_models.iter().find(|preset| preset.model == model) {
+        return preset.upgrade.clone();
+    }
+
+    // Saved selections can outlive their catalog entries.
+    if model != "gpt-5.4-mini" {
+        return None;
+    }
+    Some(ModelUpgrade {
+        id: "gpt-6-luna".to_string(),
+        migration_config_key: model.to_string(),
+        model_link: None,
+        upgrade_copy: None,
+        migration_markdown: Some(
+            "GPT-5.4 Mini is no longer available\n\nCodex now uses GPT-6 Luna in place of GPT-5.4 Mini. Switch to GPT-6 Luna to continue.\n".to_string(),
+        ),
+    })
+}
+
 pub(super) fn should_show_model_migration_prompt(
     current_model: &str,
     target_model: &str,
@@ -141,9 +164,8 @@ pub(super) fn should_show_model_migration_prompt(
         return false;
     }
 
-    if available_models
-        .iter()
-        .any(|preset| preset.model == current_model && preset.upgrade.is_some())
+    if model_upgrade_for_migration(current_model, available_models)
+        .is_some_and(|upgrade| upgrade.id == target_model)
     {
         return true;
     }
@@ -263,10 +285,7 @@ pub(super) async fn handle_model_migration_prompt_if_needed(
     app_event_tx: &AppEventSender,
     available_models: &[ModelPreset],
 ) -> Option<AppExitInfo> {
-    let upgrade = available_models
-        .iter()
-        .find(|preset| preset.model == model)
-        .and_then(|preset| preset.upgrade.as_ref());
+    let upgrade = model_upgrade_for_migration(model, available_models);
 
     if let Some(ModelUpgrade {
         id: target_model,

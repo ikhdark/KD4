@@ -56,6 +56,7 @@ enum WatchEntry {
 }
 
 struct ActiveWatchEntry {
+    reservation_id: u64,
     cancellation: CancellationToken,
     abort_handle: AbortHandle,
     done_rx: oneshot::Receiver<()>,
@@ -169,6 +170,8 @@ impl FsWatchManager {
             let cancellation = rpc_gate.cancellation_token().child_token();
             let task_cancellation = cancellation.clone();
             let task_watch_id = watch_id.clone();
+            let task_watch_key = watch_key.clone();
+            let state = Arc::downgrade(&self.state);
             let (start_tx, start_rx) = oneshot::channel();
             let (done_tx, done_rx) = oneshot::channel();
             let task = tokio::spawn(async move {
@@ -195,7 +198,7 @@ impl FsWatchManager {
                         changed_paths.dedup();
                         if !changed_paths.is_empty()
                             && !outgoing
-                                .send_server_notification_to_connection_bounded(
+                                .send_server_notification_to_connection_cancellable(
                                     connection_id,
                                     ServerNotification::FsChanged(FsChangedNotification {
                                         watch_id: task_watch_id.clone(),
@@ -209,9 +212,19 @@ impl FsWatchManager {
                         }
                     }
                 }
+                if let Some(state) = state.upgrade() {
+                    let mut state = state.lock().await;
+                    if matches!(
+                        state.entries.get(&task_watch_key),
+                        Some(WatchEntry::Active(entry)) if entry.reservation_id == reservation_id
+                    ) {
+                        state.entries.remove(&task_watch_key);
+                    }
+                }
                 let _ = done_tx.send(());
             });
             let entry = ActiveWatchEntry {
+                reservation_id,
                 cancellation,
                 abort_handle: task.abort_handle(),
                 done_rx,

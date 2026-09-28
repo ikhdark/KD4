@@ -1,0 +1,10 @@
+{
+  "baseline_approx_tokens": 73008,
+  "baseline_notices": 144,
+  "case": "notice_deduplication",
+  "current_approx_tokens": 8112,
+  "current_notices": 16,
+  "measurement_scope": "old full-message equality replay vs current production deduplication; actual watcher and projection; no model timing",
+  "observations": 16,
+  "unrelated_edits": 8
+}

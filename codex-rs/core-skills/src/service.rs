@@ -4,6 +4,8 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use codex_config::ConfigLayerStack;
 use codex_exec_server::ExecutorFileSystem;
@@ -32,6 +34,7 @@ use codex_config::SkillsConfig;
 const MAX_CACHED_SKILL_SNAPSHOTS: usize = 64;
 
 struct SnapshotCacheOptions<'a> {
+    generation: u64,
     force_reload: bool,
     cache_result: bool,
     cwd_cache_key: Option<&'a AbsolutePathBuf>,
@@ -81,6 +84,7 @@ pub struct SkillsService {
     extra_roots: RwLock<Vec<AbsolutePathBuf>>,
     input_snapshot_cache: RwLock<HashMap<SkillsInputCacheKey, HostSkillsSnapshot>>,
     snapshot_cache: RwLock<HashMap<SkillsCacheKey, HostSkillsSnapshot>>,
+    cache_generation: AtomicU64,
 }
 
 impl SkillsService {
@@ -99,6 +103,7 @@ impl SkillsService {
             extra_roots: RwLock::new(Vec::new()),
             input_snapshot_cache: RwLock::new(HashMap::new()),
             snapshot_cache: RwLock::new(HashMap::new()),
+            cache_generation: AtomicU64::new(0),
         };
         if !bundled_skills_enabled {
             // The loader caches bundled skills under `skills/.system`. Clearing that directory is
@@ -138,6 +143,7 @@ impl SkillsService {
         input: &SkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
+        let generation = self.cache_generation.load(Ordering::Acquire);
         let input_cache_key = SkillsInputCacheKey::new(input, fs.as_ref());
         if let Some(snapshot) = self.cached_input_snapshot(&input_cache_key) {
             return snapshot;
@@ -150,13 +156,14 @@ impl SkillsService {
                 roots,
                 skill_config_rules,
                 SnapshotCacheOptions {
+                    generation,
                     force_reload: false,
                     cache_result: true,
                     cwd_cache_key: None,
                 },
             )
             .await;
-        self.cache_input_snapshot(input_cache_key, snapshot.clone());
+        self.cache_input_snapshot(input_cache_key, snapshot.clone(), generation);
         snapshot
     }
 
@@ -185,6 +192,11 @@ impl SkillsService {
         force_reload: bool,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
+        if force_reload {
+            // Listing and model snapshots share sources but use distinct keys.
+            self.clear_cache();
+        }
+        let generation = self.cache_generation.load(Ordering::Acquire);
         let cache_result = true;
         let mut roots = skill_roots(
             fs,
@@ -203,6 +215,7 @@ impl SkillsService {
             roots,
             skill_config_rules,
             SnapshotCacheOptions {
+                generation,
                 force_reload,
                 cache_result,
                 cwd_cache_key: Some(&input.cwd),
@@ -219,6 +232,7 @@ impl SkillsService {
         cache_options: SnapshotCacheOptions<'_>,
     ) -> HostSkillsSnapshot {
         let SnapshotCacheOptions {
+            generation,
             force_reload,
             cache_result,
             cwd_cache_key,
@@ -245,6 +259,9 @@ impl SkillsService {
                 .snapshot_cache
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.cache_generation.load(Ordering::Acquire) != generation {
+                return snapshot;
+            }
             if !cache.contains_key(&cache_key)
                 && cache.len() >= MAX_CACHED_SKILL_SNAPSHOTS
                 && let Some(evicted_key) = cache.keys().next().cloned()
@@ -282,6 +299,9 @@ impl SkillsService {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cleared = cache.len() + input_entries;
+        // Both publication locks are held, so a scan from before invalidation
+        // cannot refill either cache after they have been cleared.
+        self.cache_generation.fetch_add(1, Ordering::AcqRel);
         cache.clear();
         info!("skills cache cleared ({cleared} entries)");
     }
@@ -300,11 +320,19 @@ impl SkillsService {
         }
     }
 
-    fn cache_input_snapshot(&self, cache_key: SkillsInputCacheKey, snapshot: HostSkillsSnapshot) {
+    fn cache_input_snapshot(
+        &self,
+        cache_key: SkillsInputCacheKey,
+        snapshot: HostSkillsSnapshot,
+        generation: u64,
+    ) {
         let mut cache = self
             .input_snapshot_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.cache_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
         if !cache.contains_key(&cache_key)
             && cache.len() >= MAX_CACHED_SKILL_SNAPSHOTS
             && let Some(evicted_key) = cache.keys().next().cloned()

@@ -7,10 +7,14 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
+
+try:
+    from scripts.process_owner import run_finite
+except ModuleNotFoundError:
+    from process_owner import run_finite
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,19 +32,17 @@ def run_version(path: str | None, *, enabled: bool) -> str | None:
     if not enabled or not path:
         return None
     try:
-        completed = subprocess.run(
+        completed = run_finite(
             [path, "--version"],
             cwd=REPO_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
             timeout=10,
-            check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
+        return None
+    if completed.returncode != 0 or completed.output_truncated:
         return None
     output = completed.stdout.strip().splitlines()
-    return output[0] if completed.returncode == 0 and output else None
+    return output[0] if output else None
 
 
 def desktop_target() -> str | None:

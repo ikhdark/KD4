@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -21,6 +22,7 @@ try:
         _MAX_SLOW_TOOL_CALLS,
         _SLOW_TOOL_CALL_NS,
         _diagnostic_token_report,
+        _is_rg_no_match,
         analyze_runner_evidence,
         _population_report,
         _request_metric,
@@ -44,6 +46,7 @@ except ImportError:
         _MAX_SLOW_TOOL_CALLS,
         _SLOW_TOOL_CALL_NS,
         _diagnostic_token_report,
+        _is_rg_no_match,
         analyze_runner_evidence,
         _population_report,
         _request_metric,
@@ -63,13 +66,14 @@ except ImportError:
     from rollout_snapshot import discover_rollouts, existing_rollout_path
 
 
-REPORT_SCHEMA_VERSION = 20
+REPORT_SCHEMA_VERSION = 21
 BEHAVIOR_SCHEMA_VERSION = 2
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 
 _MAX_RENDERED_TURNS = 10
 _MAX_SUMMARY_TURNS = 20
 _MAX_SUMMARY_TOKEN_INTERVALS = 16
+_MAX_SUMMARY_BYTES = 32 * 1024
 _SAMPLING_PASS_TARGET_PER_COMPLETED_TURN = 8
 _MAX_OPEN_TURN_DETAILS = 100
 _MAX_SOURCE_DISCOVERY_EVENTS = 64
@@ -156,7 +160,25 @@ def _tool_label(payload: dict[str, Any]) -> str:
     return f"{name}>{'+'.join(nested[:3])}"
 
 
-def _tool_status(output: str) -> str:
+def _tool_status(output: str, command: str | None = None) -> str:
+    try:
+        result = json.loads(output)
+    except ValueError:
+        result = None
+    if isinstance(result, dict):
+        if result.get("execution_state") == "running":
+            return "running"
+        if (
+            result.get("execution_state") == "exited"
+            or result.get("process_exited") is True
+        ):
+            exit_code = result.get("exit_code")
+            if type(exit_code) is int:
+                return (
+                    "completed"
+                    if exit_code == 0 or _is_rg_no_match(command, exit_code, result)
+                    else "failed"
+                )
     if re.search(
         r"\b(?:Script failed|exec cancelled|Traceback \(most recent call last\))\b",
         output,
@@ -205,14 +227,17 @@ def _source_discovery_paths(text: str) -> list[str]:
     return _ordered_unique(paths)
 
 
-def _safe_source_discovery_queries(text: str) -> list[str]:
+def _source_discovery_search_terms(text: str) -> tuple[list[str], list[str]]:
     queries: list[str] = []
+    paths: list[str] = []
     options_with_values = {
-        "-a",
-        "-b",
-        "-c",
+        "-A",
+        "-B",
+        "-C",
         "-g",
         "-m",
+        "-t",
+        "-T",
         "--after-context",
         "--before-context",
         "--context",
@@ -220,53 +245,157 @@ def _safe_source_discovery_queries(text: str) -> list[str]:
         "--max-count",
         "--type",
         "--type-add",
+        "--type-not",
+        "--encoding",
+        "--max-depth",
     }
     for match in _SOURCE_DISCOVERY_RG_PATTERN.finditer(text):
-        tokens = [
-            next(group for group in token if group != "")
-            for token in re.findall(
-                r'"([^"\r\n]*)"|\'([^\'\r\n]*)\'|([^\s,"\'\)\]}]+)',
-                match.group(1),
-            )
-        ]
+        tokens = re.findall(r""""[^"\r\n]*"|'[^'\r\n]*'|[^\s]+""", match.group(1))
         skip_value = False
+        explicit_pattern = any(
+            token in ("-e", "--regexp", "-f", "--file", "--files")
+            or token.startswith(("--regexp=", "--file="))
+            for token in tokens
+        )
+        needs_pattern = not explicit_pattern
+        pattern_value = False
+        positional = False
         for token in tokens:
-            lowered = token.casefold()
+            if token in ("|", "&&", "||", ";", ">", ">>"):
+                break
+            token = (
+                token[1:-1]
+                if token.startswith(('"', "'")) and token[-1:] == token[:1]
+                else token
+            )
             if skip_value:
                 skip_value = False
                 continue
-            if lowered in options_with_values:
+            if not positional and token == "--":
+                positional = True
+                continue
+            if not positional and token in options_with_values | {"-f", "--file"}:
                 skip_value = True
                 continue
-            if token.startswith("-"):
+            if not positional and token in ("-e", "--regexp"):
+                pattern_value = True
                 continue
-            if _SOURCE_DISCOVERY_PATH_PATTERN.fullmatch(token):
+            if not positional and token.startswith("--regexp="):
+                token = token.partition("=")[2]
+                pattern_value = True
+            elif not positional and token.startswith("-"):
                 continue
-            if re.fullmatch(r"[A-Za-z0-9_:.@+*?^$|()\[\]{}\\/-]{1,120}", token):
-                queries.append(token)
-            else:
-                queries.append("<redacted>")
-            break
-    return _ordered_unique(queries)
+            if needs_pattern or pattern_value:
+                queries.append(
+                    token
+                    if re.fullmatch(r"[A-Za-z0-9_:.@+*?^$|()\[\]{}\\/-]{1,120}", token)
+                    else "<redacted>"
+                )
+                needs_pattern = pattern_value = False
+            elif re.fullmatch(r"[A-Za-z0-9_@+./\\:-]+", token):
+                paths.append(token.replace("\\", "/").removeprefix("./") or ".")
+    return _ordered_unique(queries), _ordered_unique(paths)
+
+
+def _native_read_paths(pending: dict[str, Any]) -> tuple[bool, list[str]]:
+    source = str(pending.get("input") or "")
+    direct = str(pending.get("tool") or "").split(".")[-1] == "read_file"
+    arguments: list[dict[str, Any]] = []
+    if direct:
+        try:
+            value = json.loads(source)
+        except ValueError:
+            value = None
+        if isinstance(value, dict):
+            arguments.append(value)
+    calls = list(re.finditer(r"\btools\.read_file\s*\(", source))
+    for call in calls:
+        tail = source[call.end() :].lstrip()
+        try:
+            value, _ = json.JSONDecoder().raw_decode(tail)
+        except ValueError:
+            # Common code-mode object literals; dynamic JS expressions are
+            # deliberately not evaluated or guessed.
+            match = re.match(
+                r"""\{[^}]*?\bpath\s*:\s*("(?:\\.|[^"\\])*"|'[^'\r\n]*')""", tail
+            )
+            value = None
+            if match:
+                literal = match.group(1)
+                try:
+                    value = {
+                        "path": json.loads(literal)
+                        if literal.startswith('"')
+                        else literal[1:-1]
+                    }
+                except ValueError:
+                    pass
+        if isinstance(value, dict):
+            arguments.append(value)
+    return direct or bool(calls), _ordered_unique(
+        path.replace("\\", "/").removeprefix("./")
+        for argument in arguments
+        if isinstance(path := argument.get("path"), str)
+    )
+
+
+def _discovery_receipt_payload(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_discovery_receipt_payload(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if (
+        "output" in value
+        and "wall_time_seconds" in value
+        and ("exit_code" in value or "execution_state" in value)
+    ):
+        # Execution identities and durations are not changes to the evidence.
+        # Keep status and completeness: identical bytes from a failed/partial
+        # command must not be treated as the same successful complete result.
+        return {
+            key: value[key]
+            for key in (
+                "output",
+                "exit_code",
+                "execution_state",
+                "output_complete",
+                "output_reduced",
+            )
+            if key in value
+        }
+    return {key: _discovery_receipt_payload(item) for key, item in value.items()}
 
 
 def _source_discovery_event(
     pending: dict[str, Any], output: str, ordinal: int
 ) -> dict[str, Any] | None:
-    source = _discovery_input(str(pending.get("input") or ""))
+    raw_source = str(pending.get("input") or "")
+    source = _discovery_input(raw_source)
+    native_read, native_paths = _native_read_paths(pending)
+    if native_read and source == raw_source:
+        source = ""
     operations: list[str] = []
     if _SOURCE_DISCOVERY_SEARCH_PATTERN.search(source):
         operations.append("search")
-    if _SOURCE_DISCOVERY_READ_PATTERN.search(source):
+    if native_read or _SOURCE_DISCOVERY_READ_PATTERN.search(source):
         operations.append("read")
     if not operations:
         return None
 
-    requested_paths = _source_discovery_paths(source)
+    queries, search_paths = _source_discovery_search_terms(source)
+    requested_paths = _ordered_unique(
+        native_paths
+        + search_paths
+        + (
+            _source_discovery_paths(source)
+            if _SOURCE_DISCOVERY_READ_PATTERN.search(source)
+            or not _SOURCE_DISCOVERY_RG_PATTERN.search(source)
+            else []
+        )
+    )
     result_paths = [
         path for path in _source_discovery_paths(output) if path not in requested_paths
     ]
-    queries = _safe_source_discovery_queries(source)
     source_folded = source.casefold()
     evidence: list[str] = []
     if any(path.casefold().endswith("agents.md") for path in requested_paths):
@@ -296,7 +425,9 @@ def _source_discovery_event(
     is_broad = is_search and not requested_paths
     # Do not deduplicate on redacted display tokens: private queries collide.
     # Scope/options stay significant because a glob changes the search.
-    signature = hashlib.sha256(source.strip().encode("utf-8")).hexdigest()
+    signature = hashlib.sha256(
+        (raw_source if native_read else source).strip().encode("utf-8")
+    ).hexdigest()
     evidence_output = re.sub(
         r"\AScript [^\n]*\nWall time [^\n]*\nOutput:\s*\n?",
         "",
@@ -313,6 +444,18 @@ def _source_discovery_event(
         "",
         evidence_output,
     ).strip()
+    decoder = json.JSONDecoder()
+    remaining = evidence_output
+    receipts = []
+    while remaining:
+        try:
+            value, end = decoder.raw_decode(remaining)
+        except ValueError:
+            break
+        receipts.append(_discovery_receipt_payload(value))
+        remaining = remaining[end:].lstrip()
+    if receipts and not remaining:
+        evidence_output = json.dumps(receipts, sort_keys=True, separators=(",", ":"))
     return {
         "ordinal": ordinal,
         "turnId": pending.get("turnId"),
@@ -330,7 +473,8 @@ def _source_discovery_event(
         "evidenceIdentity": hashlib.sha256(evidence_output.encode("utf-8")).hexdigest(),
         "outputReduced": bool(
             re.search(
-                r"Warning: (?:truncated output|output summarized)|\[omitted |\[command output reduced;",
+                r"Warning: (?:truncated output|output summarized)|\[omitted |\[command output reduced;"
+                r'|"output_(?:reduced"\s*:\s*true|complete"\s*:\s*false)',
                 evidence_output,
             )
         ),
@@ -1097,11 +1241,11 @@ def _turn_report(
             "internallyDrainedWaitObservations": counters.get(
                 "internallyDrainedWaitCount"
             ),
-            "provenAvoidedModelRequests": None,
+            "provenAvoidedModelRequests": counters.get("provenAvoidedModelRequests"),
             "definition": (
-                "Internal wait observations and suppression receipts are not a "
-                "counterfactual count of avoided provider requests. Artifact "
-                "continuations can perform implementation or completion work."
+                "Direct runtime observations of suppressed model handoffs only; "
+                "not inferred from wait observations or suppression receipts. "
+                "Null means unmeasured. This does not measure saved wall-clock time."
             ),
         },
         "tokenIntervals": token_intervals,
@@ -1303,7 +1447,7 @@ def _behavior_metrics(
             if coverage["snapshots"]
             else None,
         },
-        "discoveryClassifierVersion": 1,
+        "discoveryClassifierVersion": 2,
         "configuration": report["runnerDiagnostics"]["configuration"],
         "metrics": metrics,
         "unavailableReasons": unavailable,
@@ -1330,7 +1474,9 @@ def _startup_log_report(source: Path) -> dict[str, Any]:
     snapshot = read_rollout_snapshot(source)
     records = []
     parse_errors = 0
-    for line in snapshot.data.splitlines():
+    with contextlib.closing(snapshot.stream):
+        lines = snapshot.data.splitlines()
+    for line in lines:
         if not line.strip():
             continue
         try:
@@ -1394,6 +1540,15 @@ def analyze_session_path(
     last_timestamp_ns: int | None = None
     native_events: list[dict[str, Any]] = []
 
+    def record_tool_batch(count: int) -> None:
+        if count:
+            execution_loop_counts["samplingPassesWithTools"] += 1
+            if count > 1:
+                execution_loop_counts["multiToolCallSamplingPasses"] += 1
+                execution_loop_counts["batchedToolCalls"] += count
+            else:
+                execution_loop_counts["singleToolCallSamplingPasses"] += 1
+
     for file in files:
         pending_tool_calls: dict[str, dict[str, Any]] = {}
         task_started_at: dict[str, int] = {}
@@ -1407,7 +1562,7 @@ def analyze_session_path(
         snapshots.append(snapshot.metadata())
         byte_count += snapshot.byte_length
         cwd = ""
-        with snapshot.open_lines() as handle:
+        with contextlib.closing(snapshot.stream), snapshot.open_lines() as handle:
             for line_number, line in enumerate(handle, 1):
                 line_count += 1
                 try:
@@ -1447,7 +1602,8 @@ def analyze_session_path(
                 payload = item.get("payload")
                 if not isinstance(payload, dict):
                     payload = {}
-                # Only compact fields used by first-action analysis survive this pass.
+                # Reuse terminal timing by reference so both analyses compare the
+                # same evidence when duplicate terminal profiles conflict.
                 action_records.append(
                     {
                         "timestamp": item.get("timestamp"),
@@ -1458,16 +1614,7 @@ def analyze_session_path(
                             if key in payload
                         }
                         | (
-                            {
-                                "timing": {
-                                    key: payload["timing"].get(key)
-                                    for key in (
-                                        "schemaVersion",
-                                        "profileValid",
-                                        "milestones",
-                                    )
-                                }
-                            }
+                            {"timing": payload["timing"]}
                             if isinstance(payload.get("timing"), dict)
                             else {}
                         ),
@@ -1486,15 +1633,7 @@ def analyze_session_path(
                         else max(last_timestamp_ns, timestamp_ns)
                     )
                 if item.get("type") == "sampling_boundary":
-                    if calls_since_sampling_boundary:
-                        execution_loop_counts["samplingPassesWithTools"] += 1
-                        if calls_since_sampling_boundary > 1:
-                            execution_loop_counts["multiToolCallSamplingPasses"] += 1
-                            execution_loop_counts["batchedToolCalls"] += (
-                                calls_since_sampling_boundary
-                            )
-                        else:
-                            execution_loop_counts["singleToolCallSamplingPasses"] += 1
+                    record_tool_batch(calls_since_sampling_boundary)
                     execution_loop_counts["samplingPasses"] += 1
                     if (
                         timestamp_ns is not None
@@ -1550,9 +1689,10 @@ def analyze_session_path(
                         paired_tool_intervals.append(
                             (started_ns, started_ns + round_trip_ns)
                         )
-                        last_tool_output_ns = max(
-                            last_tool_output_ns or timestamp_ns, timestamp_ns
-                        )
+                        if pending["turnId"] == active_turn_id:
+                            last_tool_output_ns = max(
+                                last_tool_output_ns or timestamp_ns, timestamp_ns
+                            )
                         output = _tool_output_text(payload)
                         discovery_event = _source_discovery_event(
                             pending,
@@ -1577,7 +1717,9 @@ def analyze_session_path(
                                 "callId": pending["callId"],
                                 "cwd": pending["cwd"],
                                 "tool": pending["tool"],
-                                "status": _tool_status(output),
+                                "status": _tool_status(
+                                    output, _discovery_input(pending["input"])
+                                ),
                                 "statusSource": "response_output_heuristic",
                                 "roundTripNs": round_trip_ns,
                                 "reportedExecWallNs": (
@@ -1612,6 +1754,11 @@ def analyze_session_path(
                     )
                 if payload_type == "task_started" and turn_id:
                     turn_id = str(turn_id)
+                    if active_turn_id != turn_id:
+                        record_tool_batch(calls_since_sampling_boundary)
+                        current_sampling_boundary_ns = None
+                        last_tool_output_ns = None
+                        calls_since_sampling_boundary = 0
                     active_turn_id = turn_id
                     started_turns.add(turn_id)
                     turn_starts[turn_id] = {
@@ -1641,6 +1788,10 @@ def analyze_session_path(
                 if pending_at_terminal and turn_id not in unresolved_tools_by_turn:
                     unresolved_tools_by_turn[turn_id] = pending_at_terminal
                 if active_turn_id == turn_id:
+                    record_tool_batch(calls_since_sampling_boundary)
+                    current_sampling_boundary_ns = None
+                    last_tool_output_ns = None
+                    calls_since_sampling_boundary = 0
                     active_turn_id = None
                 status_counts[str(payload_type)] += 1
                 record = _terminal_record(
@@ -1666,15 +1817,7 @@ def analyze_session_path(
                 unresolved_tools_by_turn[str(pending_turn_id)].append(
                     str(pending.get("tool") or "unknown")
                 )
-        if calls_since_sampling_boundary:
-            execution_loop_counts["samplingPassesWithTools"] += 1
-            if calls_since_sampling_boundary > 1:
-                execution_loop_counts["multiToolCallSamplingPasses"] += 1
-                execution_loop_counts["batchedToolCalls"] += (
-                    calls_since_sampling_boundary
-                )
-            else:
-                execution_loop_counts["singleToolCallSamplingPasses"] += 1
+        record_tool_batch(calls_since_sampling_boundary)
 
     records = list(timed_records.values())
     for key, record in timed_records.items():
@@ -2563,15 +2706,24 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                         key: value for key, value in event.items() if key != "signature"
                     },
                     "resultPaths": event["resultPaths"][:4],
+                    "omittedResultPaths": event["omittedResultPaths"]
+                    + max(0, len(event["resultPaths"]) - 4),
                 }
                 for event in report["sourceDiscovery"]["events"][:12]
             ],
+            "omittedEvents": report["sourceDiscovery"]["omittedEvents"]
+            + max(0, len(report["sourceDiscovery"]["events"]) - 12),
             "candidateSignals": report["sourceDiscovery"]["candidateSignals"][:12],
+            "omittedCandidateSignals": report["sourceDiscovery"][
+                "omittedCandidateSignals"
+            ]
+            + max(0, len(report["sourceDiscovery"]["candidateSignals"]) - 12),
         },
         "latencyBreakdown": bounded_latency_breakdown,
         "firstUsefulActionAnalysis": bounded_first_useful,
         "perTurn": bounded_turns,
-        "omittedPerTurnRecords": max(0, len(report["perTurn"]) - len(bounded_turns)),
+        "omittedPerTurnRecords": report.get("omittedPerTurnRecords", 0)
+        + max(0, len(report["perTurn"]) - len(bounded_turns)),
         "behaviorSignals": report["behaviorSignals"],
         "populations": bounded_populations,
         "auditDecision": report["auditDecision"],
@@ -2663,6 +2815,59 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         }
         result["startupTiming"]["records"] = startup["records"][:10]
         result["startupTiming"]["omittedRecords"] = max(0, len(startup["records"]) - 10)
+    result["summaryBudget"] = {
+        "maxBytes": _MAX_SUMMARY_BYTES,
+        "limitExceeded": False,
+    }
+
+    def over_budget() -> bool:
+        return (
+            len(json.dumps(result, separators=(",", ":")).encode("utf-8"))
+            > _MAX_SUMMARY_BYTES
+        )
+
+    budget_exceeded = over_budget()
+    if budget_exceeded:
+        result["summaryBudget"]["fullDetail"] = (
+            "Use --json with the same source snapshot for omitted detail."
+        )
+
+    def trim_rows(container: dict[str, Any], key: str, omitted: str) -> None:
+        nonlocal budget_exceeded
+        rows = container.get(key, [])
+        while rows and budget_exceeded:
+            removed = max(1, len(rows) // 2)
+            del rows[-removed:]
+            container[omitted] = container.get(omitted, 0) + removed
+            budget_exceeded = over_budget()
+
+    # Drop detail before totals, preserving exact omission accounting. The
+    # full report is untouched, so reducing display never loses captured data.
+    for turn in reversed(result["perTurn"]):
+        trim_rows(turn, "tokenIntervals", "omittedTokenIntervals")
+    for container, key, omitted in (
+        (result, "perTurn", "omittedPerTurnRecords"),
+        (result["sourceDiscovery"], "events", "omittedEvents"),
+        (result["sourceDiscovery"], "candidateSignals", "omittedCandidateSignals"),
+        (result["coverage"], "openTurns", "omittedOpenTurns"),
+        (
+            result["coverage"],
+            "terminalTurnInvariantViolations",
+            "omittedTerminalTurnInvariantViolations",
+        ),
+        (result["coverage"], "snapshots", "omittedSnapshots"),
+        (result["commandOrchestration"], "topSlowToolCalls", "omittedSlowToolCalls"),
+        (result["toolRelay"], "topSlowCalls", "omittedSlowCalls"),
+        (result["runnerDiagnostics"], "failures", "omittedFailures"),
+        (result["runnerDiagnostics"], "symptoms", "omittedSymptoms"),
+        (result["runnerDiagnostics"], "pendingTools", "omittedPendingTools"),
+    ):
+        trim_rows(container, key, omitted)
+    if "startupTiming" in result:
+        trim_rows(result["startupTiming"], "records", "omittedRecords")
+    # Do not silently discard essential totals/coverage to satisfy a byte
+    # target when those alone exceed it (for example, many distinct categories).
+    result["summaryBudget"]["limitExceeded"] = budget_exceeded
     return result
 
 

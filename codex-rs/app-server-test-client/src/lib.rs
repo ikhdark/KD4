@@ -2096,9 +2096,13 @@ impl CodexClient {
                     }
                     let operation_succeeded = match (&payload.item, self.approval_expectation) {
                         (
-                            ThreadItem::CommandExecution { status, exit_code, .. },
+                            ThreadItem::CommandExecution {
+                                status, exit_code, ..
+                            },
                             Some(ApprovalExpectation::Command | ApprovalExpectation::NoCommand),
-                        ) => Some(*status == CommandExecutionStatus::Completed && *exit_code == Some(0)),
+                        ) => Some(
+                            *status == CommandExecutionStatus::Completed && *exit_code == Some(0),
+                        ),
                         (
                             ThreadItem::FileChange { status, .. },
                             Some(ApprovalExpectation::FileChange),
@@ -2106,9 +2110,8 @@ impl CodexClient {
                         _ => None,
                     };
                     if let Some(succeeded) = operation_succeeded {
-                        approval_operation_succeeded = Some(
-                            approval_operation_succeeded.unwrap_or(true) && succeeded,
-                        );
+                        approval_operation_succeeded =
+                            Some(approval_operation_succeeded.unwrap_or(true) && succeeded);
                     }
                     if let ThreadItem::CommandExecution {
                         id,
@@ -2388,11 +2391,8 @@ impl CodexClient {
         );
         self.command_approval_count += 1;
         if self.approval_expectation.is_some() {
-            self.approval_requests.push((
-                thread_id.clone(),
-                turn_id.clone(),
-                ApprovalExpectation::Command,
-            ));
+            self.approval_requests
+                .push((thread_id, turn_id, ApprovalExpectation::Command));
         }
         if let Some(environment_id) = environment_id.as_deref() {
             println!("< environment: {environment_id}");

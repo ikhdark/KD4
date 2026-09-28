@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,128 @@ from scripts import rollout_snapshot
 
 
 class RolloutSnapshotTest(unittest.TestCase):
+    def test_compression_handoff_recovers_at_resolution_and_open_boundaries(self):
+        data = b'{"type":"session_meta","payload":{}}\n'
+        compressed = zstd.compress(data)
+        existing = rollout_snapshot.existing_rollout_path
+        resolve = Path.resolve
+        for boundary in ("resolve", "open"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temp:
+                plain = Path(temp) / "rollout.jsonl"
+                plain.write_bytes(data)
+                cold = plain.with_name(plain.name + ".zst")
+                cold.write_bytes(compressed)
+
+                def retire_plain(plain=plain):
+                    plain.rename(plain.with_name("retired.jsonl"))
+
+                def retire_before_resolve(path, retire=retire_plain):
+                    selected = existing(path)
+                    retire()
+                    return selected
+
+                def retire_before_open(
+                    path, *args, plain=plain, retire=retire_plain, **kwargs
+                ):
+                    resolved = resolve(path, *args, **kwargs)
+                    if path == plain:
+                        retire()
+                    return resolved
+
+                transition = (
+                    mock.patch.object(
+                        rollout_snapshot,
+                        "existing_rollout_path",
+                        side_effect=retire_before_resolve,
+                    )
+                    if boundary == "resolve"
+                    else mock.patch.object(
+                        Path, "resolve", autospec=True, side_effect=retire_before_open
+                    )
+                )
+                with transition:
+                    snapshot = rollout_snapshot.read_rollout_snapshot(plain)
+                with contextlib.closing(snapshot.stream):
+                    self.assertEqual(snapshot.path, cold.resolve())
+                    self.assertEqual(snapshot.text_lines(), data.decode().splitlines())
+                    self.assertEqual(snapshot.byte_length, len(compressed))
+                    self.assertEqual(
+                        snapshot.sha256, hashlib.sha256(compressed).hexdigest()
+                    )
+
+    def test_handoff_retry_is_bounded_and_does_not_retry_permission_errors(self):
+        cases = (
+            (PermissionError("denied"), True, 1),
+            (FileNotFoundError("gone"), False, 1),
+            (FileNotFoundError("both gone"), True, 2),
+        )
+        for error, has_compressed, expected_opens in cases:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temp:
+                plain = Path(temp) / "rollout.jsonl"
+                plain.write_bytes(b"source")
+                if has_compressed:
+                    plain.with_name(plain.name + ".zst").write_bytes(b"compressed")
+                opener = (
+                    mock.patch.object(
+                        rollout_snapshot, "_open_shared_binary", side_effect=error
+                    )
+                    if os.name == "nt"
+                    else mock.patch.object(Path, "open", side_effect=error)
+                )
+                with opener as opened, self.assertRaises(type(error)):
+                    rollout_snapshot.read_rollout_snapshot(plain)
+                self.assertEqual(opened.call_count, expected_opens)
+
+    def test_failed_export_preserves_evidence_and_never_publishes_partial_output(self):
+        for existing_output in (False, True):
+            with (
+                self.subTest(existing_output=existing_output),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                source = Path(temp) / "live.jsonl"
+                output = Path(temp) / "snapshot.jsonl"
+                data = b'{"type":"session_meta","payload":{}}\n'
+                source.write_bytes(data)
+                if existing_output:
+                    output.write_bytes(b"previous verified evidence")
+                snapshot = rollout_snapshot.read_rollout_snapshot(source)
+
+                def interrupted_copy(captured, destination):
+                    destination.write(captured.read(8))
+                    raise OSError("disk full")
+
+                with (
+                    mock.patch.object(
+                        rollout_snapshot, "read_rollout_snapshot", return_value=snapshot
+                    ),
+                    mock.patch("shutil.copyfileobj", side_effect=interrupted_copy),
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    self.assertRaisesRegex(OSError, "disk full"),
+                ):
+                    rollout_snapshot.main([str(source), "--output", str(output)])
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertTrue(snapshot.stream.closed)
+                self.assertEqual(source.read_bytes(), data)
+                if existing_output:
+                    self.assertEqual(output.read_bytes(), b"previous verified evidence")
+                else:
+                    self.assertFalse(output.exists())
+                self.assertEqual(list(Path(temp).glob(".*.tmp")), [])
+
+    def test_export_rejects_mismatched_format_before_atomic_publication(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "live.jsonl.zst"
+            source.write_bytes(zstd.compress(b'{"type":"session_meta"}\n'))
+            output = Path(temp) / "snapshot.jsonl"
+            output.write_bytes(b"previous evidence")
+            with (
+                mock.patch.object(rollout_snapshot, "write_stream_atomic") as publish,
+                self.assertRaisesRegex(ValueError, "suffix must match"),
+            ):
+                rollout_snapshot.main([str(source), "--output", str(output)])
+            publish.assert_not_called()
+            self.assertEqual(output.read_bytes(), b"previous evidence")
+
     def test_compressed_rollout_cli_accepts_path_directory_and_uuid(self):
         session_id = "01234567-89ab-cdef-0123-456789abcdef"
         rows = [

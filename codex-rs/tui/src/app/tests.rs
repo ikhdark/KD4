@@ -2503,6 +2503,11 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     );
 
     let rollout_path = temp_dir.path().join("agent-rollout.jsonl");
+    let session_meta = serde_json::json!({
+        "timestamp": "t0",
+        "type": "session_meta",
+        "payload": {"id": agent_thread_id, "cwd": test_path_buf("/tmp/agent")},
+    });
     let rollout = serde_json::json!({
         "timestamp": "t0",
         "type": "turn_context",
@@ -2513,7 +2518,11 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     });
     std::fs::write(
         &rollout_path,
-        format!("{}\n", serde_json::to_string(&rollout)?),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&session_meta)?,
+            serde_json::to_string(&rollout)?
+        ),
     )?;
     app.enqueue_thread_notification(
         agent_thread_id,

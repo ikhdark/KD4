@@ -2187,13 +2187,19 @@ async fn thread_resume_skips_restored_token_usage_when_turns_are_excluded() -> R
     } = to_response::<ThreadResumeResponse>(second_resume_resp)?;
     assert!(resumed_again.turns.is_empty());
 
-    let second_note = timeout(
+    // Running-thread resume responses share the listener's FIFO command lane.
+    // The next response fences the previous resume's optional usage replay.
+    let barrier_id = mcp.send_thread_resume_request(ThreadResumeParams {
+        thread_id: resumed_again.id,
+        exclude_turns: true,
+        ..Default::default()
+    }).await?;
+    timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/tokenUsage/updated"),
-    )
-    .await;
+        mcp.read_stream_until_response_message(RequestId::Integer(barrier_id)),
+    ).await??;
     assert!(
-        second_note.is_err(),
+        !mcp.pending_notification_methods().iter().any(|method| method == "thread/tokenUsage/updated"),
         "excludeTurns=true should not replay token usage"
     );
 

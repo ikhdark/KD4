@@ -1,0 +1,18 @@
+{
+  "baseline": {
+    "iterations": 288,
+    "max_batch_us": 102.446875,
+    "median_us": 90.9125
+  },
+  "baseline_handles": 0,
+  "case": "recovery_ordering",
+  "freshness_after_resume": false,
+  "prototype": {
+    "iterations": 288,
+    "max_batch_us": 383.728125,
+    "median_us": 356.240625
+  },
+  "prototype_handles": 1,
+  "recovered_bytes": 7296,
+  "sidecar_approx_tokens": 333
+}

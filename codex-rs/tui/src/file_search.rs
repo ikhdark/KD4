@@ -127,6 +127,7 @@ impl TuiSessionReporter {
         self.app_tx.send(AppEvent::FileSearchResult {
             query,
             matches: snapshot.matches.clone(),
+            walk_complete: snapshot.walk_complete,
         });
     }
 }
@@ -167,8 +168,8 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            matches!(rx.try_recv().expect("current results"), AppEvent::FileSearchResult { query, matches }
-            if query == "current" && matches.is_empty())
+            matches!(rx.try_recv().expect("current results"), AppEvent::FileSearchResult { query, matches, walk_complete }
+            if query == "current" && matches.is_empty() && !walk_complete)
         );
     }
 
@@ -196,11 +197,15 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match rx.recv().await.expect("search must publish before closing") {
-                    AppEvent::FileSearchResult { query, matches }
-                        if query == "needle"
-                            && matches
-                                .iter()
-                                .any(|entry| entry.path == std::path::Path::new("needle.rs")) =>
+                    AppEvent::FileSearchResult {
+                        query,
+                        matches,
+                        walk_complete,
+                    } if query == "needle"
+                        && walk_complete
+                        && matches
+                            .iter()
+                            .any(|entry| entry.path == std::path::Path::new("needle.rs")) =>
                     {
                         break;
                     }

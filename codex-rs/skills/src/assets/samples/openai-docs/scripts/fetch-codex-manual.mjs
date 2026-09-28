@@ -171,12 +171,19 @@ const requestManualWithFetch = async (url, { method, timeoutMs }) => {
   }
 
   return withTimeout(
-    (signal) =>
-      fetch(url, {
+    async (signal) => {
+      const response = await fetch(url, {
         method,
         headers: { "User-Agent": USER_AGENT },
         signal,
-      }),
+      });
+      // Fetch resolves at headers; keep the deadline alive through body consumption.
+      return makeResponse({
+        body: await response.text(),
+        headers: response.headers,
+        status: response.status,
+      });
+    },
     timeoutMs
   );
 };

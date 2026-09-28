@@ -1,0 +1,17 @@
+{
+  "baseline": {
+    "iterations": 288,
+    "max_batch_us": 4012.253125,
+    "median_us": 2915.753125
+  },
+  "baseline_false_stale": 16,
+  "case": "compaction_watcher",
+  "changed_input_rejections": 16,
+  "observations": 16,
+  "prototype": {
+    "iterations": 288,
+    "max_batch_us": 2922.384375,
+    "median_us": 2859.871875
+  },
+  "prototype_false_stale": 0
+}

@@ -116,7 +116,13 @@ def digest(value):
 def query_profile(query):
     """Classification decisions do not change the discovery scope."""
     return {
-        "categories": sorted(query["categories"], key=lambda rule: rule["name"]),
+        "categories": sorted(
+            (
+                {**rule, "paths": [normalized_path(path) for path in rule["paths"]]}
+                for rule in query["categories"]
+            ),
+            key=lambda rule: rule["name"],
+        ),
         "required_categories": sorted(
             set(
                 query.get(
@@ -193,7 +199,7 @@ def discovery_paths(query):
     prefixes = set()
     for rule in query["categories"]:
         for pattern in rule["paths"]:
-            normalized_path(pattern)
+            pattern = normalized_path(pattern)
             fixed = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
             prefix = (
                 fixed
@@ -244,6 +250,7 @@ def compile_categories(query):
             raise ValueError("categories require unique names and nonempty paths")
         if rule.get("verification", "runtime") not in ("path", "runtime"):
             raise ValueError("verification must be path or runtime")
+        rule = {**rule, "paths": [normalized_path(path) for path in rule["paths"]]}
         categories[name] = (
             rule,
             re.compile(rule["contains"]) if rule.get("contains") else None,
@@ -251,6 +258,31 @@ def compile_categories(query):
     if not categories:
         raise ValueError("at least one category is required")
     return categories
+
+
+def validate_control_paths(root, definition, **paths):
+    """Control files must not become evidence that their next write invalidates."""
+    root = root.resolve()
+    patterns = [
+        normalized_path(pattern)
+        for rule in definition["categories"]
+        for pattern in rule["paths"]
+    ]
+    candidates = {normalized_path(r["path"]) for r in definition.get("candidates", [])}
+    for name, path in paths.items():
+        for location in {path.absolute(), path.resolve()}:
+            if not location.is_relative_to(root):
+                continue
+            relative = location.relative_to(root).as_posix()
+            if any(part in PRUNE for part in PurePosixPath(relative).parts[:-1]):
+                continue
+            if relative in candidates or any(
+                fnmatch.fnmatchcase(relative, pattern) for pattern in patterns
+            ):
+                raise ValueError(
+                    f"{name} file overlaps selected sources: {relative}; "
+                    "place it outside the discovery scope"
+                )
 
 
 def consumer_evidence(root, references, cache):
@@ -739,7 +771,7 @@ def describe_contract():
             "categories": [
                 {
                     "name": "unique category name",
-                    "paths": ["repository-relative globs"],
+                    "paths": ["repository-relative globs; backslash separators and leading ./ are normalized"],
                     "verification": "path | runtime (default runtime)",
                     "contains": "optional Python regular expression",
                     "json_summary": "optional boolean; expose fields, types and lengths, never string bodies",
@@ -822,6 +854,7 @@ def describe_contract():
             "delivery_sha256": "hash of canonical JSON bytes",
         },
         "paging": f"Use --state STATE --render-only --offset N without rescanning. Paths and remaining pages hold {PAGE_RECORDS} records; JSON summaries also have a {SUMMARY_PAGE_BYTES}-byte target. Each next-offset field advances its own list.",
+        "control_files": "Query and state must be distinct files outside the selected source paths, even when a state file does not exist yet. Pruned directories are outside discovery scope.",
         "delivery": "Canonical JSON contains all paths, categories, json_summaries, unresolved/excluded records and prior scope. Prefer its link to rereading or reprinting the report. A ready result proves only the declared query, not that its scope answers the entire task.",
     }
 
@@ -968,6 +1001,8 @@ def main(argv=None):
         )
     if not args.state:
         parser.error("--state is required for an inventory")
+    if args.query and args.state.resolve() == args.query.resolve():
+        parser.error("state must not overwrite the query")
     previous = (
         json.loads(args.state.read_text(encoding="utf-8"))
         if args.state.exists()
@@ -982,6 +1017,7 @@ def main(argv=None):
         if not args.query:
             parser.error("--query is required unless --render-only is used")
         query = json.loads(args.query.read_text(encoding="utf-8"))
+        validate_control_paths(args.root, query, query=args.query, state=args.state)
         output, state = inventory(args.root, query, previous, refresh=args.refresh)
     delivery = {}
     if args.report:

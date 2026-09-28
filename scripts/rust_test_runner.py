@@ -52,9 +52,18 @@ WINDOWS_RESOURCE_HELPERS = ("codex-windows-sandbox-setup", "codex-command-runner
 class RunnerError(RuntimeError):
     """Raised when a declared test contract cannot be honored."""
 
-    def __init__(self, message: str, *, outcome: str = "failed") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: str = "failed",
+        result: subprocess.CompletedProcess[str] | None = None,
+        completed_gates: dict[str, list[str]] | None = None,
+    ) -> None:
         super().__init__(message)
         self.outcome = outcome
+        self.result = result
+        self.completed_gates = completed_gates or {}
 
 
 @dataclass(frozen=True)
@@ -953,17 +962,47 @@ class RustTestRunner:
         # of the declared IDs alone cannot detect an over-broad source filter.
         self.check_gates(names, include_generated=discover)
 
-        artifacts = self._build_helpers(
-            self._active_helper_names(
-                helper for step in grouped for helper in step.helpers or ()
-            )
-        )
+        required_by_gate = {
+            name: self._group_gate_steps([name]) for name in dict.fromkeys(names)
+        }
+        proved: set[tuple[str, frozenset[str], str]] = set()
+
+        def completed_gates() -> dict[str, list[str]]:
+            return {
+                name: sorted({test for step in steps for test in step.tests})
+                for name, steps in required_by_gate.items()
+                if all(
+                    (
+                        _nextest_binary_id(self.target(step.target)),
+                        frozenset(step.helpers or ()),
+                        test,
+                    )
+                    in proved
+                    for step in steps
+                    for test in step.tests
+                )
+            }
+
         failures: list[RunnerError] = []
-        for batch in self._gate_batches(grouped):
-            targets = [self.target(step.target) for step in batch]
-            env = self._helper_environment(
-                targets, self._active_helper_names(batch[0].helpers or ()), artifacts
+        try:
+            artifacts = self._build_helpers(
+                self._active_helper_names(
+                    helper for step in grouped for helper in step.helpers or ()
+                )
             )
+        except RunnerError as error:
+            if error.outcome in {"cancelled", "timed_out", "cleanup_failed"}:
+                raise
+            failures.append(error)
+            artifacts = {}
+        for batch in self._gate_batches(grouped):
+            helpers = self._active_helper_names(batch[0].helpers or ())
+            # A failed shared build proves no helper artifact, but must not
+            # suppress independent helper-free tests or trigger a build retry.
+            if any(helper.name not in artifacts for helper in helpers):
+                continue
+            targets = [self.target(step.target) for step in batch]
+            env = self._helper_environment(targets, helpers, artifacts)
             try:
                 result = self._checked(
                     self._gate_run_command(
@@ -977,6 +1016,7 @@ class RustTestRunner:
             except RunnerError as error:
                 if error.outcome in {"cancelled", "timed_out", "cleanup_failed"}:
                     if not failures:
+                        error.completed_gates = completed_gates()
                         raise
                     # Gate runs capture their output, so an earlier group's
                     # failure is reported nowhere else; the stop keeps its outcome.
@@ -984,9 +1024,14 @@ class RustTestRunner:
                         f"{error}\ngate runs that failed before the stop:\n"
                         + "\n".join(str(failure) for failure in failures),
                         outcome=error.outcome,
+                        completed_gates=completed_gates(),
                     ) from error
                 failures.append(error)
-                continue
+                # Nextest's test-failure exit still carries independent PASS
+                # receipts. Build/transport/abnormal exits are not test proof.
+                if error.result is None or error.result.returncode != 100:
+                    continue
+                result = error.result
             # Require completed per-test results from this execution, not just
             # a successful exit or discovery. Suppress summary repetitions and
             # unrelated filtered-out skips, and disallow retries for this proof.
@@ -996,27 +1041,42 @@ class RustTestRunner:
                 for target, step in zip(targets, batch)
             }
             passed: dict[tuple[str, str], int] = {}
+            failed: set[tuple[str, str]] = set()
             unexpected = False
             for stream in ("stdout", "stderr"):
                 for line in _output_lines(result, stream):
                     # Nextest reports a passing test that leaked handles as
-                    # LEAK; LEAK-FAIL does not match and fails the run.
+                    # LEAK; LEAK-FAIL is a failure, never a passing receipt.
                     match = re.fullmatch(
-                        r"\s*(?:PASS|LEAK)\s+\[[^]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*",
+                        r"\s*(PASS|LEAK|FAIL|LEAK-FAIL|TIMEOUT|EXECFAIL)\s+\[[^]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*",
                         line,
                     )
                     if match:
-                        binary, test = match.groups()
+                        status, binary, test = match.groups()
                         if test in expected.get(binary, ()):
                             key = (binary, test)
-                            passed[key] = min(2, passed.get(key, 0) + 1)
+                            if status in {"PASS", "LEAK"}:
+                                passed[key] = min(2, passed.get(key, 0) + 1)
+                            else:
+                                failed.add(key)
                         else:
                             unexpected = True
             required = {
                 (binary, test) for binary, tests in expected.items() for test in tests
             }
             if (
+                not unexpected
+                and all(count == 1 for count in passed.values())
+                and not failed.intersection(passed)
+                and (result.returncode == 0 or set(passed) < required)
+            ):
+                proved.update(
+                    (binary, frozenset(batch[0].helpers or ()), test)
+                    for binary, test in passed
+                )
+            if (
                 unexpected
+                or failed
                 or set(passed) != required
                 or any(count != 1 for count in passed.values())
             ):
@@ -1024,12 +1084,11 @@ class RustTestRunner:
                 # fails an empty run before this point, so a missing or ignored
                 # test is only known as not executed; `check-gates` names it.
                 steps = ", ".join(repr(step.target) for step in batch)
-                reported = {f"{binary} {test}": n for (binary, test), n in passed.items()}
                 failures.append(
                     RunnerError(
                         f"gate {steps} did not report every required test passed exactly once: "
-                        f"expected={sorted(f'{binary} {test}' for binary, test in required)}, "
-                        f"passed={reported}, unexpected={unexpected}\n"
+                        + self._gate_failure_summary(required, passed, unexpected)
+                        + "\n"
                         + self._failure_detail(result),
                         outcome="not_executed",
                     )
@@ -1040,22 +1099,50 @@ class RustTestRunner:
         if failures:
             outcomes = {error.outcome for error in failures}
             raise RunnerError(
-                "gate runs failed after executing every selected target:\n"
+                "gate runs failed after completing the unblocked selected targets:\n"
                 + "\n".join(str(error) for error in failures),
                 outcome=next(iter(outcomes)) if len(outcomes) == 1 else "failed",
+                completed_gates=completed_gates(),
             )
-        return {
-            name: sorted(
-                {test for step in self.gate(name).steps for test in step.tests}
-            )
-            for name in dict.fromkeys(names)
-        }
+        return completed_gates()
 
     def _gate_filter_args(self, step: GateStep) -> list[str]:
         expression = step.filterset or " | ".join(
             f"test(={test})" for test in step.tests
         )
         return ["-E", expression]
+
+    def _gate_failure_summary(
+        self,
+        required: set[tuple[str, str]],
+        passed: Mapping[tuple[str, str], int],
+        unexpected: bool,
+    ) -> str:
+        missing = sorted(
+            f"{binary} {test}" for binary, test in required - passed.keys()
+        )
+        duplicates = sorted(
+            f"{binary} {test}" for (binary, test), count in passed.items() if count != 1
+        )
+        inventory = json.dumps(
+            {
+                "expected": sorted(f"{binary} {test}" for binary, test in required),
+                "passed": {
+                    f"{binary} {test}": n for (binary, test), n in passed.items()
+                },
+                "unexpected": unexpected,
+            },
+            indent=2,
+        )
+        path = self._retain_text(inventory, prefix="gate-proof-")
+        if path is None:
+            return inventory
+        summary = (
+            f"expected={len(required)}, passed={len(passed)}, "
+            f"missing({len(missing)})={missing[:8]}, "
+            f"duplicates({len(duplicates)})={duplicates[:8]}, unexpected={unexpected}"
+        )
+        return summary[:MAX_FAILURE_STREAM_CHARS] + f"\nFull gate proof: {path}"
 
     def _gate_batches(self, grouped: Sequence[GateStep]) -> list[list[GateStep]]:
         """Share one nextest invocation among compatible grouped steps.
@@ -1351,6 +1438,11 @@ class RustTestRunner:
         effective_env = dict(env)
         if self._sccache_disabled:
             effective_env["RUSTC_WRAPPER"] = ""
+        rendered = subprocess.list2cmdline(list(args))
+        if len(rendered) > MAX_FAILURE_STREAM_CHARS:
+            path = self._retain_text(rendered, prefix="command-")
+            if path is not None:
+                rendered = rendered[:256] + f"...\nFull command: {path}"
         for attempt in range(2):
             phase = (
                 "compile/discover"
@@ -1362,7 +1454,7 @@ class RustTestRunner:
             started = time.monotonic()
             result = None
             print(
-                f"Rust phase {phase}: starting {subprocess.list2cmdline(list(args))}",
+                f"Rust phase {phase}: starting {rendered}",
                 file=sys.stderr,
             )
             try:
@@ -1398,7 +1490,6 @@ class RustTestRunner:
             detail = self._failure_detail(
                 result, include_stdout=capture == CAPTURE_BOTH
             )
-            rendered = subprocess.list2cmdline(list(args))
             if result.returncode in (-1, 0xFFFFFFFF):
                 detail = (
                     "Process exited 0xFFFFFFFF without a normal Cargo exit code. "
@@ -1408,10 +1499,12 @@ class RustTestRunner:
                 )
             if detail:
                 raise RunnerError(
-                    f"command failed ({rendered}), exit code {result.returncode}:\n{detail}"
+                    f"command failed ({rendered}), exit code {result.returncode}:\n{detail}",
+                    result=result,
                 )
             raise RunnerError(
-                f"command failed ({rendered}), exit code {result.returncode}"
+                f"command failed ({rendered}), exit code {result.returncode}",
+                result=result,
             )
         return result
 
@@ -1475,6 +1568,24 @@ class RustTestRunner:
             compile_failed or list(args[:3]) == ["cargo", "nextest", "list"]
         )
 
+    def _retain_text(self, text: str, *, prefix: str) -> Path | None:
+        try:
+            log_dir = self.target_dir / "test-runner-logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                suffix=".log",
+                prefix=prefix,
+                dir=log_dir,
+                delete=False,
+            ) as log:
+                log.write(text)
+                return Path(log.name)
+        except OSError:
+            return None
+
     def _failure_detail(
         self,
         result: subprocess.CompletedProcess[str],
@@ -1501,21 +1612,8 @@ class RustTestRunner:
             return full_detail
 
         # Captured output must remain recoverable without rerunning a failed build.
-        try:
-            log_dir = self.target_dir / "test-runner-logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                newline="",
-                suffix=".log",
-                prefix="failure-",
-                dir=log_dir,
-                delete=False,
-            ) as log:
-                log.write(full_detail)
-                log_path = log.name
-        except OSError:
+        log_path = self._retain_text(full_detail, prefix="failure-")
+        if log_path is None:
             return full_detail
 
         half = MAX_FAILURE_STREAM_CHARS // 2
@@ -1873,24 +1971,43 @@ _RUNNER_OWNED_RUN_OPTIONS = {"--no-fail-fast", "--all"}
 
 def _split_runner_owned_options(
     filter_args: Sequence[str],
-) -> tuple[list[str], set[str]]:
+) -> tuple[list[str], set[str], float | None]:
     """Separates runner-owned execution flags from caller filtering args.
 
-    Recipes may pass `--no-fail-fast` and the explicit full-library opt-in
-    `--all` after the target name. Consume these policy flags instead of
-    forwarding them as nextest selection overrides.
+    Recipes forward execution flags and the per-command deadline after the
+    target name. Leave libtest arguments and filtering-option values intact.
     """
     remaining: list[str] = []
     owned: set[str] = set()
+    timeout = None
     after_separator = False
-    for token in filter_args:
+    tokens = iter(filter_args)
+    for token in tokens:
         if token == "--":
             after_separator = True
         if not after_separator and token in _RUNNER_OWNED_RUN_OPTIONS:
             owned.add(token)
             continue
+        if not after_separator and (
+            token == "--command-timeout-seconds"
+            or token.startswith("--command-timeout-seconds=")
+        ):
+            value = token.split("=", 1)[1] if "=" in token else next(tokens, "")
+            try:
+                timeout = float(value)
+                if not math.isfinite(timeout) or timeout <= 0:
+                    raise ValueError
+            except ValueError as exc:
+                raise RunnerError(
+                    "command timeout must be a finite positive number of seconds"
+                ) from exc
+            continue
         remaining.append(token)
-    return remaining, owned
+        if not after_separator and token in {"-E", "--filterset", "--run-ignored"}:
+            value = next(tokens, None)
+            if value is not None:
+                remaining.append(value)
+    return remaining, owned, timeout
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1912,7 +2029,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             filter_args = list(args.filter_args)
             if filter_args[:1] == ["--"]:
                 filter_args = filter_args[1:]
-            filter_args, owned = _split_runner_owned_options(filter_args)
+            filter_args, owned, timeout = _split_runner_owned_options(filter_args)
+            if timeout is not None:
+                args.command_timeout_seconds = timeout
             no_fail_fast = no_fail_fast or "--no-fail-fast" in owned
             allow_all = allow_all or "--all" in owned
             validate_filtering_args(filter_args)

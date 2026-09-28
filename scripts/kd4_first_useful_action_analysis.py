@@ -136,6 +136,28 @@ class _Turn:
     useful_tool_name: str | None = None
 
 
+class TerminalProfiles:
+    """Frozen terminal evidence; conflicting versions never select a winner."""
+
+    def __init__(self):
+        self.records = {}
+        self.conflicts = set()
+        self.duplicates = 0
+
+    def add(self, key, record):
+        if key in self.records:
+            old = self.records[key]
+            if (old["timing"], old.get("status")) == (
+                record["timing"],
+                record.get("status"),
+            ):
+                self.duplicates += 1
+            else:
+                self.conflicts.add(key)
+            return
+        self.records[key] = record
+
+
 def decoded_records(snapshot: RolloutSnapshot) -> Iterable[Any]:
     with snapshot.open_lines() as handle:
         for line in handle:
@@ -194,6 +216,7 @@ def analyze_records(
         "abortedTurns": 0,
         "terminalWithoutStart": 0,
         "duplicateTerminalEvents": 0,
+        "conflictingTerminalProfiles": 0,
         "invalidTimingProfiles": 0,
         "incompleteCanonicalMilestones": 0,
     }
@@ -210,7 +233,7 @@ def analyze_records(
     for metadata, records in record_sets:
         snapshot_metadata.append(metadata)
         active: _Turn | None = None
-        terminated_ids: set[str] = set()
+        terminals = TerminalProfiles()
         for record in records:
             record_count += 1
             if not isinstance(record, dict):
@@ -238,8 +261,14 @@ def analyze_records(
                 "turn_aborted",
             ):
                 turn_id = _turn_id(payload)
-                if turn_id is not None and turn_id in terminated_ids:
-                    exclusions["duplicateTerminalEvents"] += 1
+                key = turn_id if turn_id is not None else ("record", record_count)
+                terminal = {
+                    "timing": payload.get("timing"),
+                    "status": payload_type,
+                    "active": active,
+                }
+                if key in terminals.records:
+                    terminals.add(key, terminal)
                     continue
                 if (
                     active is not None
@@ -251,16 +280,14 @@ def analyze_records(
                     exclusions["incompleteTurns"] += 1
                     exclusions["unterminatedTurns"] += 1
                     active = None
-                if turn_id is not None:
-                    terminated_ids.add(turn_id)
+                terminal["active"] = active
+                terminals.add(key, terminal)
                 terminal_turns += 1
                 if active is None:
                     exclusions["terminalWithoutStart"] += 1
-                if payload_type == "turn_aborted":
-                    # Aborted work never completed; later records must not pair with it.
-                    exclusions["abortedTurns"] += 1
-                    active = None
-                    continue
+                # Defer metrics until every terminal version has been compared.
+                active = None
+                continue
             elif active is None:
                 continue
             elif record_type == "event_msg" and payload_type == "user_message":
@@ -280,8 +307,20 @@ def analyze_records(
             else:
                 continue
 
+        if active is not None:
+            exclusions["incompleteTurns"] += 1
+            exclusions["unterminatedTurns"] += 1
+        exclusions["duplicateTerminalEvents"] += terminals.duplicates
+        exclusions["conflictingTerminalProfiles"] += len(terminals.conflicts)
+        for key, terminal in terminals.records.items():
+            if key in terminals.conflicts:
+                continue
+            if terminal["status"] == "turn_aborted":
+                exclusions["abortedTurns"] += 1
+                continue
+            active = terminal["active"]
             completed_turns += 1
-            timing = payload.get("timing")
+            timing = terminal["timing"]
             schema_version = (
                 timing.get("schemaVersion") if isinstance(timing, dict) else None
             )
@@ -327,10 +366,6 @@ def analyze_records(
                         active.useful_tool_emitted_ms - active.user_input_ms
                     )
                 legacy_rows.append(row)
-            active = None
-        if active is not None:
-            exclusions["incompleteTurns"] += 1
-            exclusions["unterminatedTurns"] += 1
 
     canonical_metrics = {
         "startToUserInputRecordedMs": _summary(
@@ -356,12 +391,12 @@ def analyze_records(
         ),
         "startToFirstInfrastructureActionMs": _summary(
             row["firstInfrastructureActionMs"]
-            for row in canonical_rows
+            for row in independent_rows
             if "firstInfrastructureActionMs" in row
         ),
         "startToFirstToolDiscoveryActionMs": _summary(
             row["firstToolDiscoveryActionMs"]
-            for row in canonical_rows
+            for row in independent_rows
             if "firstToolDiscoveryActionMs" in row
         ),
         "startToFirstDomainActionMs": _summary(
@@ -417,6 +452,7 @@ def analyze_records(
         "terminalWithoutStart": terminal_turns,
         "duplicateTerminalEvents": terminal_turns
         + exclusions["duplicateTerminalEvents"],
+        "conflictingTerminalProfiles": terminal_turns,
         "invalidTimingProfiles": canonical_schema_turns,
         "incompleteCanonicalMilestones": canonical_schema_turns,
     }
@@ -427,7 +463,7 @@ def analyze_records(
             "spread": "population standard deviation of observed values",
             "coverage": "Each metric reports its observed count over all completed turns. Optional or inapplicable milestones are not zero latency.",
             "incompleteTurns": "supersededTurns counts a start before the active turn completed; unterminatedTurns counts an active turn that never received its own terminal (end of input, or a terminal for a different turn id). These describe evidence shape, not its cause. abortedTurns are terminal but not completed and never enter a metric.",
-            "terminals": "terminalWithoutStart counts a terminal whose start was not captured (for example a truncated rollout head); it remains a completed turn, canonical milestones stay usable, and legacy reconstruction is unavailable. duplicateTerminalEvents repeat an already-terminated turn id and are never counted twice.",
+            "terminals": "terminalWithoutStart counts a terminal whose start was not captured (for example a truncated rollout head); it remains a completed turn, canonical milestones stay usable, and legacy reconstruction is unavailable. duplicateTerminalEvents repeat identical timing and status for a terminated turn id. conflictingTerminalProfiles counts unique turns with conflicting terminal versions; they are excluded from completed/aborted populations and every metric rather than choosing a winner.",
             "intervals": "Gaps may span different tool calls or records; an end before its start is counted as outOfOrderCount, never as zero or negative latency.",
             "profileValidity": "Schema 25+ milestones require profileValid=true; invalid profiles (clock regression, invalid transition, saturation) are excluded and counted.",
             "canonical": (

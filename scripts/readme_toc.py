@@ -22,7 +22,7 @@ from typing import TextIO
 BEGIN_TOC: str = "<!-- Begin ToC -->"
 END_TOC: str = "<!-- End ToC -->"
 DEFAULT_DIFF_MAX_LINES = 200
-HEADING_RE = re.compile(r"^(#{2,6})\s+(.*)$")
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 CODE_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 LINE_ENDING_RE = re.compile(r"(\r\n|\r|\n)")
 CLOSING_ATX_RE = re.compile(r"[ \t]+#+[ \t]*$")
@@ -102,8 +102,10 @@ def generate_toc_lines(lines: Iterable[str]) -> list[str]:
             continue
         level = len(m.group(1))
         text = heading_plain_text(m.group(2))
-        indent = "  " * (level - 2)
         slug = disambiguate_slug(slugify_heading(text), used_slugs)
+        if level == 1:
+            continue
+        indent = "  " * (level - 2)
         label = text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
         toc.append(f"{indent}- [{label}](#{slug})")
     return toc

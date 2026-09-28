@@ -382,9 +382,9 @@ impl ChatComposerHistory {
             return None;
         }
 
-        let next_idx_opt = match self.history_cursor {
-            None => return None, // not browsing
-            Some(idx) => self.next_history_offset(idx, HistorySearchDirection::Newer),
+        let next_idx_opt = {
+            let idx = self.history_cursor?;
+            self.next_history_offset(idx, HistorySearchDirection::Newer)
         };
 
         match next_idx_opt {

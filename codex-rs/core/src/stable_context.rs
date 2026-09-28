@@ -608,14 +608,94 @@ fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSignatureE
     (!signature.is_empty()).then_some(signature)
 }
 
-/// Removes an unchanged non-volatile stable injection that is already the
-/// latest value in history. Volatile or ambiguous items remain turn-scoped.
+const SKILL_BODY_REFERENCE_PREFIX: &str = "<skill_body_ref sha256=\"";
+const SKILL_REUSE_GUIDANCE: &str = "Selected again for this turn. Apply the complete instructions most recently supplied above for this name, path, and scope; they are unchanged. No new read is needed solely for this selection. If that full body is no longer present, reload this source before applying it.";
+
+struct RenderedSkill<'a> {
+    header: &'a str,
+    body: &'a str,
+}
+
+impl<'a> RenderedSkill<'a> {
+    fn parse(text: &'a str) -> Option<Self> {
+        let (name, rest) = text
+            .strip_prefix("<skill>\n<name>")?
+            .split_once("</name>\n<path>")?;
+        let (path, mut rest) = rest.split_once("</path>\n")?;
+        if name.is_empty() || path.is_empty() {
+            return None;
+        }
+        if let Some(scope) = rest.strip_prefix("<scope>") {
+            rest = scope.split_once("</scope>\n")?.1;
+        }
+        let header = &text[..text.len() - rest.len()];
+        let body = rest.strip_suffix("\n</skill>")?;
+        Some(Self { header, body })
+    }
+
+    fn reference_digest(&self) -> Option<&str> {
+        let (digest, guidance) = self
+            .body
+            .strip_prefix(SKILL_BODY_REFERENCE_PREFIX)?
+            .split_once("\" />\n")?;
+        (guidance == SKILL_REUSE_GUIDANCE
+            && digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then_some(digest)
+    }
+
+    fn is_complete(&self) -> bool {
+        // Both skill producers and the aggregate context budget can emit excerpts
+        // or recovery notices. They must never become evidence of a complete read.
+        !self.body.trim().is_empty()
+            && !self.body.contains("<skill_body_ref")
+            && !self.body.contains("[... context truncated ...]")
+            && !self
+                .body
+                .contains("instructions are incomplete. The omitted portion has not been loaded.")
+            && !self.body.starts_with("Instructions were not loaded.")
+    }
+
+    fn reference(&self, full_text: &str) -> String {
+        let digest = format!("{:x}", Sha256::digest(full_text.as_bytes()));
+        format!(
+            "{}{SKILL_BODY_REFERENCE_PREFIX}{digest}\" />\n{SKILL_REUSE_GUIDANCE}\n</skill>",
+            self.header,
+        )
+    }
+}
+
+fn trusted_rendered_skill(item: &ResponseItem) -> Option<(&str, &str, RenderedSkill<'_>)> {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return None;
+    };
+    if !is_trusted_stable_context_item(item)
+        || !matches!(role.as_str(), "user" | "developer" | "system")
+    {
+        return None;
+    }
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        return None;
+    };
+    Some((role, text, RenderedSkill::parse(text)?))
+}
+
+/// Removes unchanged non-volatile injections and reselects unchanged complete
+/// skills without repeating their retained bodies. Ambiguous items stay intact.
 pub(crate) fn filter_unchanged_stable_context_items(
     history: &[ResponseItem],
     candidates: Vec<ResponseItem>,
 ) -> Vec<ResponseItem> {
     let mut latest = HashMap::<StableContextSlot, StableItemSignatureEntry>::new();
+    let mut latest_skill = HashMap::<(&str, &str), &str>::new();
     for item in history {
+        if let Some((role, text, skill)) = trusted_rendered_skill(item)
+            && skill.reference_digest().is_none()
+        {
+            latest_skill.insert((role, skill.header), text);
+        }
         if let Some(signature) = stable_item_signature(item) {
             for entry in signature {
                 latest.insert(entry.slot, entry);
@@ -627,24 +707,44 @@ pub(crate) fn filter_unchanged_stable_context_items(
         .iter()
         .map(|item| {
             let Some(signature) = stable_item_signature(item) else {
-                return true;
+                return (true, None);
             };
             let unchanged = signature
                 .iter()
                 .all(|entry| !entry.slot.is_volatile() && latest.get(&entry.slot) == Some(entry));
             if unchanged {
-                return false;
+                return (false, None);
             }
+            let replacement = trusted_rendered_skill(item).and_then(|(role, text, skill)| {
+                let key = (role, skill.header);
+                let replacement = (skill.is_complete() && latest_skill.get(&key) == Some(&text))
+                    .then(|| skill.reference(text))
+                    .filter(|reference| reference.len() < text.len());
+                if replacement.is_none() && skill.reference_digest().is_none() {
+                    latest_skill.insert(key, text);
+                }
+                replacement
+            });
             for entry in signature {
                 latest.insert(entry.slot, entry);
             }
-            true
+            (true, replacement)
         })
         .collect::<Vec<_>>();
     candidates
         .into_iter()
         .zip(retained)
-        .filter_map(|(item, keep)| keep.then_some(item))
+        .filter_map(|(mut item, (keep, replacement))| {
+            if !keep {
+                return None;
+            }
+            if let Some(text) = replacement
+                && let ResponseItem::Message { content, .. } = &mut item
+            {
+                *content = vec![ContentItem::InputText { text }];
+            }
+            Some(item)
+        })
         .collect()
 }
 
@@ -659,13 +759,7 @@ pub(crate) fn project_stable_context(
     let mut user_insertion_by_turn = HashMap::<&str, usize>::new();
 
     for (item_index, item) in items.iter().enumerate() {
-        let ResponseItem::Message {
-            role,
-            content,
-            internal_chat_message_metadata_passthrough: _,
-            ..
-        } = item
-        else {
+        let ResponseItem::Message { role, content, .. } = item else {
             continue;
         };
         let trusted_stable_context = is_trusted_stable_context_item(item);
@@ -840,8 +934,12 @@ fn project_items(
             continue;
         };
         let text = occurrence.text(items).to_string();
+        // A whole skill envelope retains its trusted identity so another
+        // projection can resolve references and expire turn-local selections.
+        let preserve_id = occurrence.slot == StableContextSlot::SelectedSkill
+            && trusted_rendered_skill(item).is_some();
         let Some(projected_item) =
-            projected_message(item, false, vec![ContentItem::InputText { text }])
+            projected_message(item, preserve_id, vec![ContentItem::InputText { text }])
         else {
             continue;
         };
@@ -1021,7 +1119,7 @@ fn current_selected_skill_indexes(
         return Vec::new();
     };
     let user_turn_id = items[user_index].turn_id();
-    occurrences
+    let mut selected = occurrences
         .iter()
         .enumerate()
         .filter(|(_, occurrence)| occurrence.slot == StableContextSlot::SelectedSkill)
@@ -1030,7 +1128,40 @@ fn current_selected_skill_indexes(
             None => occurrence.item_index > user_index,
         })
         .map(|(index, _)| index)
-        .collect()
+        .collect::<Vec<_>>();
+    let mut backing_bodies = Vec::new();
+    for index in &selected {
+        let reference = &occurrences[*index];
+        let Some(skill) = RenderedSkill::parse(reference.text(items)) else {
+            continue;
+        };
+        let Some(digest) = skill.reference_digest() else {
+            continue;
+        };
+        let ResponseItem::Message { role, .. } = &items[reference.item_index] else {
+            continue;
+        };
+        // Projection can drop prior-turn skills. Keep the exact complete body
+        // supporting a current selection, never another reference or a quote.
+        if let Some(backing) = occurrences[..*index].iter().rposition(|candidate| {
+            if candidate.slot != StableContextSlot::SelectedSkill {
+                return false;
+            }
+            let text = candidate.text(items);
+            matches!(&items[candidate.item_index], ResponseItem::Message { role: candidate_role, .. } if candidate_role == role)
+                && RenderedSkill::parse(text).is_some_and(|body| {
+                    body.header == skill.header
+                        && body.is_complete()
+                        && format!("{:x}", Sha256::digest(text.as_bytes())) == digest
+                })
+        }) {
+            backing_bodies.push(backing);
+        }
+    }
+    selected.extend(backing_bodies);
+    selected.sort_unstable();
+    selected.dedup();
+    selected
 }
 
 fn occurrence_matches_latest_user_turn(

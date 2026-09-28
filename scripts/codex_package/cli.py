@@ -228,43 +228,52 @@ def main() -> int:
             release_dir.resolve() / f"codex-package_{spec.target}_PROVENANCE.json",
             release_dir.resolve() / "codex-package_SHA256SUMS",
         ]
-    with (
-        publication_transaction(output_paths),
-        package_build_lease(spec, args.cargo_profile),
-    ):
+    with publication_transaction(output_paths):
         timings = getattr(args, "timings", False)
-        with timed_step("inputs", timings):
-            version, inputs = resolve_package_inputs(args, spec, variant)
-            validate_package_input_roles(inputs)
         reuse_package_dir = getattr(args, "reuse_package_dir", False)
         with staged_package_destination(
             package_dir, reuse_existing=reuse_package_dir, force=args.force
         ) as staged_package_dir:
-            with timed_step("package-dir", timings):
-                prepare_package_dir(
-                    staged_package_dir,
-                    force=True,
-                    reuse=reuse_package_dir,
-                )
-                build_identity = {
-                    "packagingSource": source_tree_fingerprint(),
-                }
-                build_package_dir(
-                    staged_package_dir,
-                    version,
-                    variant,
-                    spec,
-                    inputs,
-                    build_identity=build_identity,
-                )
-            if not getattr(args, "skip_validate", False):
-                with timed_step("validate", timings):
-                    validate_package_dir(
+            with package_build_lease(
+                spec,
+                args.cargo_profile,
+                inputs=(
+                    None
+                    if getattr(args, "skip_build_if_present", False)
+                    else tuple(
+                        getattr(args, name, None)
+                        for name in SourceBuildOutputs.__dataclass_fields__
+                    )
+                ),
+            ):
+                with timed_step("inputs", timings):
+                    version, inputs = resolve_package_inputs(args, spec, variant)
+                    validate_package_input_roles(inputs)
+                with timed_step("package-dir", timings):
+                    prepare_package_dir(
                         staged_package_dir,
+                        force=True,
+                        reuse=reuse_package_dir,
+                    )
+                    build_identity = {
+                        "packagingSource": source_tree_fingerprint(),
+                    }
+                    build_package_dir(
+                        staged_package_dir,
+                        version,
                         variant,
                         spec,
-                        expected_version=version,
+                        inputs,
+                        build_identity=build_identity,
                     )
+                if not getattr(args, "skip_validate", False):
+                    with timed_step("validate", timings):
+                        validate_package_dir(
+                            staged_package_dir,
+                            variant,
+                            spec,
+                            expected_version=version,
+                        )
 
             archive_entries = None
             if args.archive_output:
@@ -539,7 +548,9 @@ def resolve_package_inputs(
         from .layout import pe_machine
 
         machine = pe_machine(rg_bin)
-        if machine is not None and machine != pe_machine_for_target(spec):
+        if machine is None:
+            raise RuntimeError(f"Invalid PE executable for ripgrep: {rg_bin}")
+        if machine != pe_machine_for_target(spec):
             raise RuntimeError(
                 "ripgrep executable architecture does not match package target"
             )

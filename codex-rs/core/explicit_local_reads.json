@@ -1,0 +1,9 @@
+{
+  "actual_source_invalidations": 24,
+  "baseline_false_invalidations": 12,
+  "case": "explicit_local_reads",
+  "false_notice_approx_tokens": 7488,
+  "measurement_scope": "registered file reads and real mutations; normalized known-local arguments, not a deployed fix",
+  "normalized_false_invalidations": 0,
+  "reads_per_variant": 12
+}

@@ -737,17 +737,16 @@ impl CoreToolRuntime for ApplyPatchHandler {
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
         let mut command = apply_patch_payload_command(&invocation.payload)?;
-        if apply_patch_retries::is_retry(&command) {
-            if let Ok(retry) = invocation
+        if apply_patch_retries::is_retry(&command)
+            && let Ok(retry) = invocation
                 .session
                 .services
                 .retained_patches
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .prepare(&command)
-            {
-                command = retry.args.patch;
-            }
+        {
+            command = retry.args.patch;
         }
         Some(PreToolUsePayload {
             tool_name: HookToolName::apply_patch(),

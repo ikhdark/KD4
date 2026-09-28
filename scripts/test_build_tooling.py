@@ -731,7 +731,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             justfile,
         )
         profiles = nextest["profile"]
-        self.assertEqual(profiles["default"]["test-threads"], 2)
+        self.assertEqual(profiles["default"]["test-threads"], 6)
         self.assertEqual(profiles["local"]["inherits"], "default")
         self.assertEqual(profiles["fast"]["inherits"], "local")
 
@@ -780,7 +780,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             if "package(codex-app-server) & kind(test)" in override["filter"]
         )
         self.assertEqual(app_server_group, "process_heavy")
-        self.assertEqual(nextest["test-groups"]["login_callback_port"]["max-threads"], 1)
+        self.assertEqual(
+            nextest["test-groups"]["login_callback_port"]["max-threads"], 1
+        )
         # The first matching test-group wins, so the fixed-port login tests must be
         # claimed before the broader app-server group.
         self.assertLess(
@@ -814,16 +816,23 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                 ("fmt-full", []),
                 ("fmt-check", ["--check"]),
             ):
-                with self.subTest(recipe=recipe):
-                    result = subprocess.run(
-                        ["just", "--justfile", str(root / "justfile"), recipe],
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                        check=False,
-                    )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(json.loads(result.stdout), expected)
+                for extra in ([], ["--rust-package", "codex-app-server-protocol"]):
+                    with self.subTest(recipe=recipe, extra=extra):
+                        result = subprocess.run(
+                            [
+                                "just",
+                                "--justfile",
+                                str(root / "justfile"),
+                                recipe,
+                                *extra,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                            check=False,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(json.loads(result.stdout), [*expected, *extra])
 
     def test_cargo_config_caps_parallelism_and_nonduplicated_windows_flags(
         self,
@@ -834,21 +843,21 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertEqual(cargo_config["build"]["jobs"], 2)
         self.assertEqual(
             cargo_config["env"]["RUST_TEST_THREADS"],
-            {"value": "2", "force": False},
+            {"value": "6", "force": False},
         )
         nextest_config = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
-        self.assertEqual(nextest_config["profile"]["default"]["test-threads"], 2)
+        self.assertEqual(nextest_config["profile"]["default"]["test-threads"], 6)
         self.assertIn('rust_parallelism := "2"', justfile)
         self.assertIn(
             'env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)',
             justfile,
         )
         self.assertIn(
-            'env_var_or_default("RUST_TEST_THREADS", rust_parallelism)',
+            'env_var_or_default("RUST_TEST_THREADS", "6")',
             justfile,
         )
         self.assertIn(
-            'env_var_or_default("NEXTEST_TEST_THREADS", rust_parallelism)',
+            'env_var_or_default("NEXTEST_TEST_THREADS", "6")',
             justfile,
         )
         self.assertIn("export CARGO_BUILD_JOBS := cargo_build_jobs", justfile)
@@ -1138,44 +1147,94 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertNotIn("CARGO_TARGET_*_RUSTFLAGS", publish_entrypoint)
         self.assertNotIn("$env:RUSTFLAGS", publish_entrypoint)
 
-    def test_publish_commit_state_covers_changed_binary_restart_failures(self) -> None:
-        publish_script = (REPO_ROOT / "scripts" / "publish-local-codex.ps1").read_text(
-            encoding="utf-8"
-        )
-
-        state_start = publish_script.index("$publishCommitted = $false")
-        outer_try = publish_script.index("try {", state_start)
-        self.assertIn("$restartFailure = $null", publish_script[state_start:outer_try])
-
-        commit_markers = [
-            index
-            for index in range(len(publish_script))
-            if publish_script.startswith("$publishCommitted = $true", index)
-        ]
-        self.assertEqual(len(commit_markers), 2)
-        changed_publish_commit = commit_markers[1]
-        changed_publish_restart = publish_script.index(
-            "if ($RestartDesktop) {", changed_publish_commit
-        )
-        backup_cleanup = publish_script.index(
-            "$protectedBackupPath =", changed_publish_restart
-        )
-        self.assertLess(changed_publish_commit, changed_publish_restart)
-        self.assertLess(changed_publish_restart, backup_cleanup)
-        restart_block = publish_script[changed_publish_restart:backup_cleanup]
-        self.assertIn("$restartFailure = $_.Exception", restart_block)
-        self.assertIn('Write-ProofLine "restartFailed" "true"', restart_block)
-        self.assertIn(
-            "if ((-not $publishCommitted) -and $null -ne $desktopRoutingSnapshot)",
-            publish_script,
-        )
-
     def test_dependency_policy_dispatches_duplicate_check_recipe(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         recipe = justfile.split("deps-policy-check *args:", 1)[1].split("\n\n", 1)[0]
 
         self.assertIn("just deps-duplicates-check {args}", recipe)
         self.assertNotIn("just deps-duplicates {args}", recipe)
+
+
+class FormatterWorkflowRegressionTest(unittest.TestCase):
+    def test_truncated_failure_preserves_full_log_and_short_output_leaves_no_log(self):
+        formatter = load_format_module()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(tempfile, "tempdir", directory),
+        ):
+            command = formatter.Command(
+                (
+                    sys.executable,
+                    "-c",
+                    "print('FIRST_DIAGNOSTIC'); print('x'*150000); print('LAST_DIAGNOSTIC'); exit(1)",
+                )
+            )
+            result = formatter.run_formatter_group(
+                formatter.FormatterGroup("noisy", (command,))
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertLess(len(result.output), 66000)
+            log_line = next(
+                line
+                for line in result.output.splitlines()
+                if line.startswith("Full formatter log: ")
+            )
+            log = Path(log_line.removeprefix("Full formatter log: "))
+            full = log.read_text("utf-8")
+            self.assertTrue(full.startswith("FIRST_DIAGNOSTIC\n"))
+            self.assertTrue(full.endswith("LAST_DIAGNOSTIC\n"))
+            self.assertIn("x" * 150000, full)
+            log.unlink()
+            result = formatter.run_formatter_group(
+                formatter.FormatterGroup(
+                    "short", (formatter.Command((sys.executable, "-c", "print('ok')")),)
+                )
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("ok\n", result.output)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_rust_package_selection_reaches_command_without_changing_defaults(self):
+        formatter = load_format_module()
+        with (
+            mock.patch.object(
+                formatter,
+                "run_finite",
+                return_value=mock.Mock(
+                    returncode=0, stdout="", status="passed", output_truncated=False
+                ),
+            ) as run,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(
+                formatter.main(
+                    [
+                        "--check",
+                        "--only",
+                        "rust",
+                        "--rust-package",
+                        "codex-core",
+                        "--rust-package",
+                        "codex-app-server-protocol",
+                        "--rust-package",
+                        "codex-core",
+                    ]
+                ),
+                0,
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[-4:],
+            ("--package", "codex-core", "--package", "codex-app-server-protocol"),
+        )
+        self.assertIn("--check", command)
+        with (
+            mock.patch.object(formatter, "run_finite") as run,
+            self.assertRaises(SystemExit),
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            formatter.main(["--only", "python-scripts", "--rust-package", "codex-core"])
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

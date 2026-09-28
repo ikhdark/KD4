@@ -23,6 +23,44 @@ import threading
 
 
 class Report26ValidationRegressions(unittest.TestCase):
+    def test_lock_waiter_never_writes_to_an_empty_owned_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lock"
+            ready = Path(directory) / "ready"
+            program = (
+                "import msvcrt, sys; from pathlib import Path\n"
+                "with Path(sys.argv[1]).open('w+') as handle:\n"
+                " msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)\n"
+                " Path(sys.argv[2]).touch()\n"
+                " sys.stdin.read(1)\n"
+            )
+            with process_owner.owned_process(
+                [sys.executable, "-c", program, str(path), str(ready)],
+                stdin=subprocess.PIPE,
+            ) as child:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ready.exists())
+                with (
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaisesRegex(
+                        generated_output_lock.GenerationLockError, "timed out"
+                    ),
+                ):
+                    with generated_output_lock.repository_lock(
+                        path, "waiter", timeout=0.05
+                    ):
+                        self.fail("acquired another process's lock")
+                self.assertEqual(path.stat().st_size, 0)
+                child.stdin.write(b"x")
+                child.stdin.flush()
+                child.stdin.close()
+                self.assertEqual(child.wait(timeout=5), 0)
+            with generated_output_lock.repository_lock(path, "next"):
+                pass
+            self.assertEqual(json.loads(path.read_text())["owner"], "next")
+
     def test_finite_results_reach_schema_and_formatter_callers(self):
         from scripts import config_schema_check
         from scripts.build_tooling_test_support import load_format_module
@@ -61,7 +99,7 @@ class Report26ValidationRegressions(unittest.TestCase):
         self.assertTrue(result.stdout.endswith("END"))
         self.assertTrue(result.output_truncated)
 
-    def test_finite_timeout_reaps_grandchild_holding_stdout(self):
+    def test_finite_completion_reaps_grandchild_holding_stdout(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "orphan"
             child = f"import time; from pathlib import Path; time.sleep(1.5); Path({str(marker)!r}).touch(); time.sleep(60)"
@@ -69,7 +107,7 @@ class Report26ValidationRegressions(unittest.TestCase):
             result = process_owner.run_finite(
                 [sys.executable, "-c", parent], timeout=0.5
             )
-            self.assertEqual((result.status, result.returncode), ("timed_out", 124))
+            self.assertEqual((result.status, result.returncode), ("passed", 0))
             self.assertLess(result.elapsed, 5)
             time.sleep(1.6)
             self.assertFalse(marker.exists())
@@ -215,6 +253,53 @@ class Report26ValidationRegressions(unittest.TestCase):
 
 
 class ScriptReportRegressions(unittest.TestCase):
+    def test_report_regressions_follow_their_changed_owners_once(self):
+        cases = {
+            "scripts/app_server_schema_runtime_check.py": "Report26ValidationRegressions.test_compatibility_keeps_fixed_baseline_across_unrelated_commit",
+            "scripts/generated_output_lock.py": "Report26ValidationRegressions.test_lock_waits_for_release_and_distinguishes_timeout_from_io_error",
+            "scripts/stage_npm_packages.py": "ScriptReportRegressions.test_npm_cancellation_restores_all_outputs_and_clears_journal",
+            "scripts/check_kd4_features.py": "ScriptReportRegressions.test_feature_lane_is_lazy_and_held_across_both_phases",
+            "scripts/rust_test_runner.py": "ScriptReportRegressions.test_nextest_progress_counter_and_binary_identity",
+        }
+        prefix = "scripts.test_report_script_regressions"
+        for path, case in cases.items():
+            with (
+                self.subTest(path=path),
+                mock.patch.object(root_maintenance, "run", return_value=0) as run,
+            ):
+                self.assertEqual(
+                    root_maintenance.main(["test-python", "--changed", path]), 0
+                )
+                command = run.call_args.args[0]
+                self.assertIn(f"{prefix}.{case}", command)
+                self.assertNotIn(prefix, command)
+
+        selectors = {
+            target
+            for targets in root_maintenance.SCRIPT_TEST_MODULES.values()
+            for target in targets
+            if target.startswith(prefix + ".")
+        }
+        loader = unittest.TestLoader()
+        for selector in selectors:
+            with self.subTest(selector=selector):
+                suite = loader.loadTestsFromName(selector)
+                self.assertEqual(loader.errors, [])
+                self.assertEqual(suite.countTestCases(), 1)
+        # A module requested through another changed owner subsumes its cases.
+        selected = root_maintenance.python_test_targets(
+            [prefix], list(cases) + ["scripts/process_owner.py"]
+        )
+        self.assertIn(prefix, selected)
+        self.assertFalse(any(target.startswith(prefix + ".") for target in selected))
+        cls = prefix + ".ScriptReportRegressions"
+        self.assertEqual(
+            root_maintenance.python_test_targets(
+                [cls, cls + ".test_recent_overflow_survives_expired_base"], []
+            ),
+            [cls],
+        )
+
     def test_recent_overflow_survives_expired_base(self):
         root = Path("lanes")
         base, recent = root / "pkg", root / "pkg-2"

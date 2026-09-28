@@ -86,10 +86,14 @@ async fn run_command_with_reservation(
     run_owned_command(command, input_json, handler.timeout_sec, true, reservation).await
 }
 
-pub(crate) async fn run_finalizer_command(command: Command, timeout_sec: u64) -> CommandRunResult {
+pub(crate) async fn run_finalizer_command(
+    command: Command,
+    input_json: &str,
+    timeout_sec: u64,
+) -> CommandRunResult {
     run_owned_command(
         command,
-        "",
+        input_json,
         timeout_sec,
         false,
         codex_utils_pty::ManagedRootProcess::reserve_with_reclaim(),
@@ -867,7 +871,7 @@ mod tests {
         let handler = test_handler(script.to_string(), 1, &cwd);
         let mut command = build_command(&explicit_test_shell(), &handler);
         command.current_dir(cwd.as_path());
-        let result = super::run_finalizer_command(command, 1).await;
+        let result = super::run_finalizer_command(command, "", 1).await;
         assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert!(!temp_dir.path().join("escaped.txt").exists());

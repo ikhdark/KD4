@@ -612,6 +612,7 @@ where
 #[derive(Clone)]
 pub struct JsonToolOutput {
     value: JsonValue,
+    sampling_request_signal: Option<JsonValue>,
     success: Option<bool>,
     outcome: Option<ToolOutputOutcome>,
     skip_disposition: Option<ToolOutputSkipDisposition>,
@@ -623,6 +624,7 @@ impl std::fmt::Debug for JsonToolOutput {
         formatter
             .debug_struct("JsonToolOutput")
             .field("value", &self.value)
+            .field("sampling_request_signal", &self.sampling_request_signal)
             .field("success", &self.success)
             .field("outcome", &self.outcome)
             .field("skip_disposition", &self.skip_disposition)
@@ -633,6 +635,7 @@ impl std::fmt::Debug for JsonToolOutput {
 impl PartialEq for JsonToolOutput {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
+            && self.sampling_request_signal == other.sampling_request_signal
             && self.success == other.success
             && self.outcome == other.outcome
             && self.skip_disposition == other.skip_disposition
@@ -648,6 +651,7 @@ impl JsonToolOutput {
     pub fn new(value: JsonValue) -> Self {
         Self {
             value,
+            sampling_request_signal: None,
             success: Some(true),
             outcome: None,
             skip_disposition: None,
@@ -658,6 +662,7 @@ impl JsonToolOutput {
     pub fn with_success(value: JsonValue, success: Option<bool>) -> Self {
         Self {
             value,
+            sampling_request_signal: None,
             success,
             outcome: None,
             skip_disposition: None,
@@ -668,6 +673,7 @@ impl JsonToolOutput {
     pub fn skipped(value: JsonValue) -> Self {
         Self {
             value,
+            sampling_request_signal: None,
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: None,
@@ -681,11 +687,18 @@ impl JsonToolOutput {
     ) -> Self {
         Self {
             value,
+            sampling_request_signal: None,
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: Some(disposition),
             serialized: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Attach successful-result evidence without changing any public output projection.
+    pub fn with_sampling_request_signal(mut self, signal: JsonValue) -> Self {
+        self.sampling_request_signal = Some(signal);
+        self
     }
 
     fn serialized(&self) -> &str {
@@ -738,32 +751,42 @@ impl ToolOutputProjectionMetadata {
     }
 }
 
-/// Returns the small control-plane subset that must survive model projection
-/// and wrapper conversion. Payload arrays and text remain spillable unless the
-/// producer gives them one of these explicit semantic identities.
+/// Infers a bounded set of controls at the result boundary, not inside payload
+/// rows. Producers with known nested or larger controls must promote them with
+/// `merge_essential_fields`; canonical payloads remain recoverable either way.
 pub fn essential_projection_fields(value: &JsonValue) -> JsonValue {
-    match value {
-        JsonValue::Object(object) => JsonValue::Object(
-            object
-                .iter()
-                .filter_map(|(key, value)| {
-                    if is_essential_key(key) {
-                        return Some((key.clone(), value.clone()));
-                    }
-                    let nested = essential_projection_fields(value);
-                    (!is_empty_projection(&nested)).then(|| (key.clone(), nested))
-                })
-                .collect(),
-        ),
-        JsonValue::Array(values) => JsonValue::Array(
-            values
-                .iter()
-                .map(essential_projection_fields)
-                .filter(|value| !is_empty_projection(value))
-                .collect(),
-        ),
-        _ => JsonValue::Null,
+    struct RemainingBytes(usize);
+
+    impl std::io::Write for RemainingBytes {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| {
+                std::io::Error::other("inferred control metadata exceeds inline budget")
+            })?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
+
+    let Some(object) = value.as_object() else {
+        return JsonValue::Null;
+    };
+    let mut remaining = 2_048 - 2;
+    let fields = object
+        .iter()
+        .filter(|(key, _)| is_essential_key(key))
+        .filter_map(|(key, value)| {
+            let mut counter = RemainingBytes(remaining);
+            // A serialized pair includes enough punctuation for a member and
+            // its separator. Stop counting oversized values without copying them.
+            serde_json::to_writer(&mut counter, &(key, value)).ok()?;
+            remaining = counter.0;
+            Some((key.clone(), value.clone()))
+        })
+        .collect();
+    JsonValue::Object(fields)
 }
 
 fn merge_projection_values(target: &mut JsonValue, incoming: JsonValue) {
@@ -887,7 +910,7 @@ impl ToolOutput for JsonToolOutput {
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
         if self.outcome_for_logging() == ToolOutputOutcome::Success {
-            return None;
+            return self.sampling_request_signal.clone();
         }
         self.value
             .get("failure_signature")
@@ -956,8 +979,11 @@ impl ToolOutput for codex_protocol::mcp::CallToolResult {
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
-        let value = serde_json::to_value(self).ok()?;
-        let serialized = value.to_string();
+        let serialized = self
+            .as_function_call_output_payload()
+            .body
+            .to_text()
+            .unwrap_or_default();
         let mut fragments = Vec::new();
         if self.is_error == Some(true) {
             fragments.push(ToolOutputProjectionFragment::new(
@@ -989,7 +1015,19 @@ impl ToolOutput for codex_protocol::mcp::CallToolResult {
                 "has_structured_content": self.structured_content.is_some(),
                 "has_meta": self.meta.is_some(),
                 });
-                merge_projection_values(&mut essential, essential_projection_fields(&value));
+                // These are MCP envelope boundaries, unlike arbitrary nested
+                // objects in a tool's payload. Keep their small controls inline.
+                for (key, value) in [
+                    ("structuredContent", self.structured_content.as_ref()),
+                    ("_meta", self.meta.as_ref()),
+                ] {
+                    if let Some(value) = value {
+                        let fields = essential_projection_fields(value);
+                        if !is_empty_projection(&fields) {
+                            essential[key] = fields;
+                        }
+                    }
+                }
                 essential
             },
             requested_limit: None,
@@ -1146,7 +1184,7 @@ mod canonical_tests {
             serde_json::json!({
                 "STATUS": "ready", "NextCursor": "next", "task_id": "one",
                 "SHA256": "digest",
-                "taskId": "two", "body": [{"GATES": ["approval"]}]
+                "taskId": "two"
             })
         );
     }
@@ -1337,10 +1375,7 @@ mod canonical_tests {
             metadata.essential_inline["retention_limit_reason"],
             "per_artifact_safety_limit"
         );
-        assert_eq!(
-            metadata.essential_inline["nested"]["remaining_match_count"],
-            3
-        );
+        assert!(metadata.essential_inline.get("nested").is_none());
         assert_eq!(metadata.essential_inline["sha256"], "content-digest");
         assert_eq!(
             metadata.essential_inline["content_identity"],
@@ -1379,13 +1414,94 @@ mod canonical_tests {
         assert_eq!(
             metadata.essential_inline,
             serde_json::json!({
-                "nested": { "status": "running" },
                 "gate": { "state": { "status": "blocked", "reason": "approval" } },
                 "nextCursor": "page-2",
                 "call_id": "call-1",
             })
         );
         assert_eq!(metadata.spillable_text, vec![value.to_string()]);
+    }
+
+    #[test]
+    fn inferred_controls_do_not_promote_rows_or_large_state_but_explicit_controls_survive() {
+        let rows = (0..1_000)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id, "status": "available", "state": {"body": "row payload"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let value = serde_json::json!({
+            "rows": rows, "state": rows, "nextCursor": "page-2", "complete": false
+        });
+        let mut metadata = ToolOutputProjectionMetadata::from_json(&value, true, None);
+        assert_eq!(
+            metadata.essential_inline,
+            serde_json::json!({
+                "nextCursor": "page-2", "complete": false
+            })
+        );
+        assert_eq!(metadata.spillable_text, vec![value.to_string()]);
+        // Names alone cannot identify critical nested state; a producer can.
+        let controls = serde_json::json!({"required_gate": {"reason": "approval ".repeat(400)}});
+        metadata.merge_essential_fields(controls.clone());
+        assert_eq!(
+            metadata.essential_inline["required_gate"],
+            controls["required_gate"]
+        );
+        let many_ids = (0..500)
+            .map(|id| (format!("task_{id}_id"), serde_json::json!(id)))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(
+            essential_projection_fields(&JsonValue::Object(many_ids))
+                .to_string()
+                .len()
+                <= 2_048
+        );
+    }
+
+    #[test]
+    fn mcp_projection_deduplicates_text_without_changing_the_canonical_result() {
+        let structured =
+            serde_json::json!({"rows": [{"id": 7, "body": "record"}], "nextCursor": "next"});
+        let result = codex_protocol::mcp::CallToolResult {
+            content: vec![
+                serde_json::json!({"type": "text", "text": structured.to_string()}),
+                serde_json::json!({"type": "text", "text": "Distinct caption"}),
+                serde_json::json!({"type": "image", "data": "AAAA", "mimeType": "image/png"}),
+            ],
+            structured_content: Some(structured.clone()),
+            is_error: Some(true),
+            meta: Some(serde_json::json!({"nextCursor": "meta-cursor", "provider": "test"})),
+        };
+        let payload = ToolPayload::Function {
+            arguments: "{}".into(),
+        };
+        let raw = serde_json::to_value(&result).unwrap();
+        let metadata = result.projection_metadata().unwrap();
+        assert_eq!(
+            metadata.spillable_text,
+            vec![format!(
+                "MCP tool reported an error.\nDistinct caption\n{structured}"
+            )]
+        );
+        assert_eq!(metadata.outcome, ToolOutputOutcome::Failure);
+        assert_eq!(
+            metadata.essential_inline["_meta"]["nextCursor"],
+            "meta-cursor"
+        );
+        assert_eq!(
+            result.canonical_result(&payload),
+            Some(CanonicalToolResult::json(raw.clone()))
+        );
+        assert_eq!(result.code_mode_result(&payload), raw);
+        assert_eq!(
+            result.to_response_item("call", &payload),
+            ResponseInputItem::McpToolCallOutput {
+                call_id: "call".into(),
+                output: result
+            }
+        );
     }
 
     #[test]
@@ -1431,6 +1547,41 @@ mod canonical_tests {
             );
             assert_eq!(metadata.spillable_text, vec![value.to_string()]);
         }
+    }
+
+    #[test]
+    fn json_sampling_signal_is_private_and_cannot_override_failure() {
+        let value = serde_json::json!({"complete": true, "text": "source"});
+        let signal = serde_json::json!({"semantic_evidence": {"identity": "source-v1"}});
+        let payload = ToolPayload::Function {
+            arguments: "{}".into(),
+        };
+        let plain = JsonToolOutput::new(value.clone());
+        let signalled = plain.clone().with_sampling_request_signal(signal.clone());
+        assert_eq!(signalled.sampling_request_signal(), Some(signal.clone()));
+        assert_eq!(
+            signalled.to_response_item("read", &payload),
+            plain.to_response_item("read", &payload)
+        );
+        assert_eq!(signalled.code_mode_result(&payload), value);
+        assert_eq!(
+            signalled.canonical_result(&payload),
+            plain.canonical_result(&payload)
+        );
+        assert_eq!(signalled.projection_metadata(), plain.projection_metadata());
+        assert_eq!(
+            signalled.post_tool_use_response("read", &payload),
+            plain.post_tool_use_response("read", &payload)
+        );
+        let failure = JsonToolOutput::with_success(
+            serde_json::json!({"failure_signature":"real-failure"}),
+            Some(false),
+        )
+        .with_sampling_request_signal(signal);
+        assert_eq!(
+            failure.sampling_request_signal(),
+            Some(serde_json::json!({"failure":{"fingerprint":"real-failure"}}))
+        );
     }
 
     #[test]

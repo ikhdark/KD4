@@ -2654,3 +2654,64 @@ async fn code_mode_activation_keeps_provider_schemas_but_registers_dispatch_tool
             .contains("deferred_reader")
     );
 }
+
+#[tokio::test]
+async fn code_mode_exclusions_only_activate_direct_namespace_schemas() {
+    let (_, mut turn) = make_session_and_context().await;
+    turn.model_info.supports_search_tool = true;
+    turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeModeOnly);
+    Arc::make_mut(&mut turn.config)
+        .code_mode
+        .excluded_tool_namespaces = vec!["direct".into()];
+    let turn = Arc::new(turn);
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let dynamic_tools = ["direct", "nested"].map(|namespace| {
+        DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+            name: namespace.into(),
+            description: "Test namespace".into(),
+            tools: vec![DynamicToolNamespaceTool::Function(
+                DynamicToolFunctionSpec {
+                    name: "reader".into(),
+                    description: "Read a resource".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                    defer_loading: true,
+                },
+            )],
+        })
+    });
+    let router = ToolRouter::from_context(
+        step.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &dynamic_tools,
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    );
+    turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+    let before = router.model_visible_schemas_for_turn(&turn);
+    let nested = ToolName::namespaced("nested", "reader");
+    turn.activate_deferred_tools([nested.clone()]);
+    assert!(turn.deferred_tool_is_activated(&nested));
+    assert!(router.has_registered_tool(&nested));
+    let after_nested = router.model_visible_schemas_for_turn(&turn);
+    assert!(Arc::ptr_eq(&before, &after_nested));
+    assert_eq!(before.digest(), after_nested.digest());
+    let manifest = router.tool_manifest(&turn).manifest.unwrap();
+    assert!(manifest["activated_schemas"].to_string().contains("nested"));
+    turn.activate_deferred_tools([ToolName::namespaced("direct", "reader")]);
+    let after_direct = router.model_visible_schemas_for_turn(&turn);
+    assert_eq!(
+        namespace_function_names(after_direct.specs(), "direct"),
+        vec!["reader"]
+    );
+    assert!(namespace_function_names(after_direct.specs(), "nested").is_empty());
+    assert_ne!(after_nested.digest(), after_direct.digest());
+    assert!(Arc::ptr_eq(
+        &after_direct,
+        &router.model_visible_schemas_for_turn(&turn)
+    ));
+}

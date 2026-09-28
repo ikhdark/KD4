@@ -182,6 +182,7 @@ class CheckBlobSizeTest(unittest.TestCase):
 
     def test_explicit_paths_with_kind_do_not_expand_git_command_line(self) -> None:
         paths = [f"generated/path-{index:05d}.bin" for index in range(10_000)]
+        binary_paths = {paths[0], paths[1234], paths[-1]}
 
         observed = []
 
@@ -189,7 +190,11 @@ class CheckBlobSizeTest(unittest.TestCase):
             self.assertLess(sum(len(arg) * 2 + 3 for arg in args), 8300)
             observed.extend(args[args.index("--") + 1 :])
             self.assertIsNone(input_text)
-            return ""
+            return "".join(
+                f"-\t-\t{path}\0"
+                for literal in args[args.index("--") + 1 :]
+                if (path := literal.removeprefix(":(literal)")) in binary_paths
+            )
 
         changed = check_blob_size.get_changed_paths(
             "BASE",
@@ -200,8 +205,10 @@ class CheckBlobSizeTest(unittest.TestCase):
         )
 
         self.assertEqual(observed, [f":(literal){path}" for path in paths])
-        self.assertEqual(len(changed), len(paths))
-        self.assertFalse(any(path.is_binary for path in changed))
+        self.assertEqual([entry.path for entry in changed], paths)
+        self.assertEqual(
+            {entry.path for entry in changed if entry.is_binary}, binary_paths
+        )
 
     def test_parse_paths_accepts_newline_or_nul_delimiters(self) -> None:
         self.assertEqual(check_blob_size.parse_paths("a\n\nb\n"), ["a", "b"])

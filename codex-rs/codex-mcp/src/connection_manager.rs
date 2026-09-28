@@ -176,12 +176,13 @@ pub fn tool_is_model_visible(tool: &ToolInfo) -> bool {
 /// A thin wrapper around a set of running [`RmcpClient`] instances.
 pub struct McpConnectionManager {
     clients: HashMap<String, AsyncManagedClient>,
+    pub(crate) auth_discovery_cache: HashMap<String, codex_rmcp_client::OAuthDiscoveryCache>,
     server_definitions: HashMap<String, EffectiveMcpServer>,
     server_metadata: HashMap<String, McpServerMetadata>,
     required_servers: Vec<String>,
     tool_plugin_provenance: Arc<ToolPluginProvenance>,
     tool_catalog_revision: Arc<AtomicU64>,
-    tool_catalog_cache: StdMutex<Option<CachedToolCatalog>>,
+    tool_catalog_cache: StdMutex<Option<McpToolCatalogSnapshot>>,
     resource_cache_generation: Arc<AtomicU64>,
     prefix_mcp_tool_names: bool,
     elicitation_requests: ElicitationRequestManager,
@@ -215,9 +216,13 @@ impl ClientReuseContext {
     }
 }
 
-struct CachedToolCatalog {
-    revision: u64,
-    tools: Arc<Vec<ToolInfo>>,
+/// Complete per-server catalogs captured at one manager revision.
+#[derive(Clone, Debug)]
+pub struct McpToolCatalogSnapshot {
+    pub revision: u64,
+    pub tools: Arc<Vec<ToolInfo>>,
+    /// Servers whose initial catalogs are not ready and have no usable cache.
+    pub pending_servers: Vec<String>,
 }
 
 struct ShutdownCompletion(tokio::sync::watch::Sender<bool>);
@@ -298,6 +303,46 @@ async fn shutdown_clients_with_deadline<T, G, GFut, F, FFut>(
 }
 
 impl McpConnectionManager {
+    /// Read-only status reuse must not construct a successor manager: that path
+    /// transfers lifecycle ownership and updates the live elicitation policy.
+    pub(crate) async fn can_reuse_for_status(
+        &self,
+        config: &crate::McpConfig,
+        auth: Option<&CodexAuth>,
+        runtime_context: &McpRuntimeContext,
+        servers: &HashMap<String, EffectiveMcpServer>,
+    ) -> bool {
+        let expected = ClientReuseContext {
+            store_mode: config.mcp_oauth_credentials_store_mode,
+            keyring_backend_kind: config.auth_keyring_backend_kind,
+            runtime_context: runtime_context.clone(),
+            codex_home: config.codex_home.clone(),
+            codex_apps_tools_cache_key: crate::codex_apps_cache::codex_apps_tools_cache_key(
+                auth,
+                &config.chatgpt_base_url,
+                config.apps_mcp_product_sku.as_deref(),
+            ),
+            client_elicitation_capability: config.client_elicitation_capability.clone(),
+            supports_openai_form_elicitation: self
+                .client_reuse_context
+                .supports_openai_form_elicitation,
+        };
+        if self.shutdown_started()
+            || !self.client_reuse_context.is_compatible_with(&expected)
+            || self.tool_plugin_provenance.as_ref() != &crate::mcp::tool_plugin_provenance(config)
+        {
+            return false;
+        }
+        for (name, server) in servers {
+            if (server.enabled() && self.reusable_client(name, server).await.is_none())
+                || (!server.enabled() && self.clients.contains_key(name))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     async fn reusable_client(
         &self,
         server_name: &str,
@@ -368,6 +413,7 @@ impl McpConnectionManager {
         let mut server_metadata = HashMap::new();
         let mut reused_server_names = Vec::new();
         let mut join_set = JoinSet::new();
+        let oauth_read_cache = Arc::new(codex_rmcp_client::LocalSecretsReadCache::default());
         let tool_plugin_provenance = Arc::new(tool_plugin_provenance);
         let client_reuse_context = ClientReuseContext {
             store_mode,
@@ -510,6 +556,7 @@ impl McpConnectionManager {
                 server,
                 store_mode,
                 keyring_backend_kind,
+                Arc::downgrade(&oauth_read_cache),
                 cancel_token.clone(),
                 tx_event.clone(),
                 elicitation_requests.clone(),
@@ -566,6 +613,10 @@ impl McpConnectionManager {
             });
         }
         let manager = Self {
+            auth_discovery_cache: clients
+                .keys()
+                .map(|name| (name.clone(), Default::default()))
+                .collect(),
             clients,
             server_definitions,
             server_metadata,
@@ -585,6 +636,9 @@ impl McpConnectionManager {
         };
         tokio::spawn(async move {
             let outcomes = join_set.join_all().await;
+            // Reconnect recipes hold only Weak references. Plaintext is retained for
+            // this startup batch, not for the lifetime of the manager or its clients.
+            drop(oauth_read_cache);
             let mut summary = McpStartupCompleteEvent::default();
             summary.ready.extend(reused_server_names);
             for (server_name, outcome) in outcomes {
@@ -663,6 +717,7 @@ impl McpConnectionManager {
     ) -> Self {
         Self {
             clients: HashMap::new(),
+            auth_discovery_cache: HashMap::new(),
             server_definitions: HashMap::new(),
             server_metadata: HashMap::new(),
             required_servers: Vec::new(),
@@ -864,17 +919,29 @@ impl McpConnectionManager {
     /// Returns an immutable aggregate tool snapshot for the current catalog revision.
     #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.clients.len()))]
     pub async fn list_all_tools_snapshot(&self) -> Arc<Vec<ToolInfo>> {
+        self.tool_catalog_snapshot(/*wait_for_startup*/ true)
+            .await
+            .tools
+    }
+
+    /// Captures ready or cached catalogs without waiting for unrelated server startup.
+    pub async fn list_ready_tools_snapshot(&self) -> McpToolCatalogSnapshot {
+        self.tool_catalog_snapshot(/*wait_for_startup*/ false).await
+    }
+
+    async fn tool_catalog_snapshot(&self, wait_for_startup: bool) -> McpToolCatalogSnapshot {
         for managed_client in self.clients.values() {
             managed_client.reconnect_failed_startup().await;
         }
 
         loop {
             let revision = self.tool_catalog_revision();
-            if let Some(tools) = self.cached_tool_catalog(revision) {
-                return tools;
+            if let Some(snapshot) = self.cached_tool_catalog(revision, wait_for_startup) {
+                return snapshot;
             }
 
-            let tools = self.build_tool_catalog().await;
+            let (tools, pending_servers) =
+                self.build_tool_catalog(wait_for_startup, |_| true).await;
             if revision != self.tool_catalog_revision() {
                 // A hot catalog must still allow caller deadlines/cancellation
                 // to be polled even when every listing completes immediately.
@@ -882,25 +949,31 @@ impl McpConnectionManager {
                 continue;
             }
 
-            let tools = Arc::new(tools);
+            let snapshot = McpToolCatalogSnapshot {
+                revision,
+                tools: Arc::new(tools),
+                pending_servers,
+            };
             *self
                 .tool_catalog_cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedToolCatalog {
-                revision,
-                tools: Arc::clone(&tools),
-            });
-            return tools;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
+            return snapshot;
         }
     }
 
-    fn cached_tool_catalog(&self, revision: u64) -> Option<Arc<Vec<ToolInfo>>> {
+    fn cached_tool_catalog(
+        &self,
+        revision: u64,
+        wait_for_startup: bool,
+    ) -> Option<McpToolCatalogSnapshot> {
         self.tool_catalog_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .filter(|cached| cached.revision == revision)
-            .map(|cached| Arc::clone(&cached.tools))
+            .filter(|cached| !wait_for_startup || cached.pending_servers.is_empty())
+            .cloned()
     }
 
     /// Returns all tools with model-visible names normalized.
@@ -908,12 +981,27 @@ impl McpConnectionManager {
         self.list_all_tools_snapshot().await.as_ref().clone()
     }
 
-    async fn build_tool_catalog(&self) -> Vec<ToolInfo> {
+    pub(crate) async fn list_tools_for_servers(&self, selected: &HashSet<&str>) -> Vec<ToolInfo> {
+        // Status reads must not wait for or retry an unselected server.
+        self.build_tool_catalog(true, |name| selected.contains(name))
+            .await
+            .0
+    }
+
+    async fn build_tool_catalog(
+        &self,
+        wait_for_startup: bool,
+        include_server: impl Fn(&str) -> bool,
+    ) -> (Vec<ToolInfo>, Vec<String>) {
         let mut tools = Vec::new();
+        let mut pending_servers = Vec::new();
         let mut available_server_count = 0;
         let mut unavailable_server_count = 0;
         let mut listings = JoinSet::new();
         for (server_name, managed_client) in &self.clients {
+            if !include_server(server_name) {
+                continue;
+            }
             let server_name = server_name.clone();
             let managed_client = managed_client.clone();
             listings.spawn(async move {
@@ -921,8 +1009,8 @@ impl McpConnectionManager {
                 let startup_complete = managed_client
                     .startup_complete
                     .load(std::sync::atomic::Ordering::Acquire);
-                let server_tools = managed_client
-                    .listed_tools()
+                let (server_tools, pending_startup) = managed_client
+                    .listed_tools(wait_for_startup)
                     .instrument(trace_span!(
                         "list_tools_for_server",
                         server_name = %server_name,
@@ -935,15 +1023,26 @@ impl McpConnectionManager {
                     has_cached_tools,
                     startup_complete,
                     server_tools,
+                    pending_startup,
                 )
             });
         }
         while let Some(result) = listings.join_next().await {
-            let Ok((server_name, has_cached_tools, startup_complete, server_tools)) = result else {
+            let Ok((
+                server_name,
+                has_cached_tools,
+                startup_complete,
+                server_tools,
+                pending_startup,
+            )) = result
+            else {
                 unavailable_server_count += 1;
                 warn!("MCP server tool listing task failed");
                 continue;
             };
+            if pending_startup {
+                pending_servers.push(server_name.clone());
+            }
             let Some(server_tools) = server_tools else {
                 unavailable_server_count += 1;
                 trace!(
@@ -962,13 +1061,14 @@ impl McpConnectionManager {
             );
         }
         let tools = normalize_tools_for_model_with_prefix(tools, self.prefix_mcp_tool_names);
+        pending_servers.sort();
         trace!(
             available_server_count,
             unavailable_server_count,
             tool_count = tools.len(),
             "built MCP tool list"
         );
-        tools
+        (tools, pending_servers)
     }
 
     /// Returns the current information for one raw tool name without rebuilding
@@ -1041,8 +1141,9 @@ impl McpConnectionManager {
             )?;
         }
         let tools = self
-            .list_all_tools_snapshot()
+            .list_ready_tools_snapshot()
             .await
+            .tools
             .iter()
             .filter(|tool| tool.server_name == CODEX_APPS_MCP_SERVER_NAME)
             .cloned()
@@ -1651,13 +1752,14 @@ async fn emit_update(
     submit_id: &str,
     tx_event: &Sender<Event>,
     update: McpStartupUpdateEvent,
-) -> Result<(), async_channel::SendError<Event>> {
+) -> Result<(), Box<async_channel::SendError<Event>>> {
     tx_event
         .send(Event {
             id: submit_id.to_string(),
             msg: EventMsg::McpStartupUpdate(update),
         })
         .await
+        .map_err(Box::new)
 }
 
 fn mcp_startup_failure_reason(
@@ -1733,3 +1835,7 @@ fn is_mcp_client_startup_timeout_error(error: &StartupOutcomeError) -> bool {
 #[cfg(test)]
 #[path = "connection_manager_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "catalog_efficiency_benchmarks.rs"]
+mod catalog_efficiency_benchmarks;

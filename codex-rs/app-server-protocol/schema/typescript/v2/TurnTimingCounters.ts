@@ -22,6 +22,11 @@ logicalGenerationCount: number, generationsByReason: TurnTimingGenerationReasonC
  */
 suppressedDeterministicContinuationCount: number,
 /**
+ * Model handoffs suppressed at an instrumented runtime decision, not
+ * inferred from wait observations or receipts. Null denotes older telemetry.
+ */
+provenAvoidedModelRequests: number | null,
+/**
  * Residual deterministic generation requests proved by turn execution.
  * Null means production execution control does not measure this counter.
  */

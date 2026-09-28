@@ -26,6 +26,7 @@ use crate::types::UriBasedFileOpener;
 use crate::types::WindowsToml;
 use codex_features::FeaturesToml;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
@@ -56,8 +57,9 @@ use serde::Serialize;
 use serde::de::Error as SerdeError;
 use serde_json::Value as JsonValue;
 
-const RESERVED_MODEL_PROVIDER_IDS: [&str; 4] = [
+const RESERVED_MODEL_PROVIDER_IDS: [&str; 5] = [
     AMAZON_BEDROCK_PROVIDER_ID,
+    AMAZON_BEDROCK_RUNTIME_PROVIDER_ID,
     OPENAI_PROVIDER_ID,
     OLLAMA_OSS_PROVIDER_ID,
     LMSTUDIO_OSS_PROVIDER_ID,
@@ -210,6 +212,16 @@ pub enum AfterAgentPolicy {
     #[default]
     Legacy,
     MutatingFinalizer,
+    /// Wait for `notify` as a finalizer, sending the agent-turn-complete JSON on
+    /// stdin instead of appending it to argv. The v1 payload has the same fields
+    /// as legacy notifications and supports inputs beyond OS command-line limits.
+    MutatingFinalizerStdinV1,
+}
+
+impl AfterAgentPolicy {
+    pub fn is_mutating_finalizer(self) -> bool {
+        matches!(self, Self::MutatingFinalizer | Self::MutatingFinalizerStdinV1)
+    }
 }
 
 /// Base config deserialized from ~/.codex/config.toml.
@@ -865,8 +877,10 @@ pub fn validate_reserved_model_provider_ids(
     let mut conflicts = model_providers
         .keys()
         .filter(|key| {
-            key.as_str() != AMAZON_BEDROCK_PROVIDER_ID
-                && RESERVED_MODEL_PROVIDER_IDS.contains(&key.as_str())
+            !matches!(
+                key.as_str(),
+                AMAZON_BEDROCK_PROVIDER_ID | AMAZON_BEDROCK_RUNTIME_PROVIDER_ID
+            ) && RESERVED_MODEL_PROVIDER_IDS.contains(&key.as_str())
         })
         .map(|key| format!("`{key}`"))
         .collect::<Vec<_>>();
@@ -887,12 +901,15 @@ pub fn validate_model_providers(
 ) -> Result<(), String> {
     validate_reserved_model_provider_ids(model_providers)?;
     for (key, provider) in model_providers {
-        if key == AMAZON_BEDROCK_PROVIDER_ID {
+        if matches!(
+            key.as_str(),
+            AMAZON_BEDROCK_PROVIDER_ID | AMAZON_BEDROCK_RUNTIME_PROVIDER_ID
+        ) {
             continue;
         }
         if provider.aws.is_some() {
             return Err(format!(
-                "model_providers.{key}: provider aws is only supported for `{AMAZON_BEDROCK_PROVIDER_ID}`"
+                "model_providers.{key}: provider aws is only supported for `{AMAZON_BEDROCK_PROVIDER_ID}` and `{AMAZON_BEDROCK_RUNTIME_PROVIDER_ID}`"
             ));
         }
         if provider.name.trim().is_empty() {
@@ -941,6 +958,61 @@ mod tests {
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    #[test]
+    fn bedrock_runtime_config_preserves_registration_and_aws_overrides() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+model_provider = "amazon-bedrock-runtime"
+[model_providers.amazon-bedrock-runtime.aws]
+profile = "runtime-profile"
+region = "us-west-2"
+"#,
+        )
+        .unwrap();
+        let providers = codex_model_provider_info::merge_configured_model_providers(
+            codex_model_provider_info::built_in_model_providers(None),
+            config.model_providers,
+        )
+        .unwrap();
+        let runtime = &providers[AMAZON_BEDROCK_RUNTIME_PROVIDER_ID];
+        assert!(runtime.is_amazon_bedrock());
+        assert!(runtime.is_amazon_bedrock_runtime());
+        assert_eq!(runtime.http_headers, None);
+        assert_eq!(
+            runtime.aws.as_ref().unwrap().profile.as_deref(),
+            Some("runtime-profile")
+        );
+        assert_eq!(
+            runtime.aws.as_ref().unwrap().region.as_deref(),
+            Some("us-west-2")
+        );
+        let mantle = &providers[AMAZON_BEDROCK_PROVIDER_ID];
+        assert!(!mantle.is_amazon_bedrock_runtime());
+        assert_eq!(mantle.aws.as_ref().unwrap().region, None);
+        let overrides = HashMap::from([(
+            AMAZON_BEDROCK_RUNTIME_PROVIDER_ID.to_string(),
+            ModelProviderInfo {
+                base_url: Some("https://example.com".to_string()),
+                ..Default::default()
+            },
+        )]);
+        assert!(
+            codex_model_provider_info::merge_configured_model_providers(providers, overrides)
+                .is_err()
+        );
+        assert!(
+            toml::from_str::<ConfigToml>(
+                r#"
+[model_providers.custom]
+name = "Custom"
+[model_providers.custom.aws]
+region = "us-west-2"
+"#
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn disabled_windows_sandbox_only_downgrades_on_windows() {

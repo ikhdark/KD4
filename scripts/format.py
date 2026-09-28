@@ -4,6 +4,7 @@
 import argparse
 import shlex
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from concurrent.futures import as_completed
 from dataclasses import dataclass
@@ -73,12 +74,16 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
     return FormatterGroup("Just", (Command(tuple(args)),))
 
 
-def rust_formatter_group(*, check: bool) -> FormatterGroup:
+def rust_formatter_group(
+    *, check: bool, packages: Sequence[str] = ()
+) -> FormatterGroup:
     # Invoke Rustup explicitly so formatting does not depend on `cargo` being
     # the Rustup proxy (for example, Scoop may place its own cargo shim first).
     args = ["rustup", "run", RUSTFMT_TOOLCHAIN, "cargo", "fmt"]
     if check:
         args.append("--check")
+    for package in dict.fromkeys(packages):
+        args.extend(["--package", package])
     command = Command(
         tuple(args),
         REPO_ROOT / "codex-rs",
@@ -157,10 +162,11 @@ def formatter_groups(
     fast_local: bool = False,
     selected_groups: set[str] | None = None,
     python_script_targets: Sequence[str] = ("scripts",),
+    rust_packages: Sequence[str] = (),
 ) -> tuple[FormatterGroup, ...]:
     factories: list[FormatterGroupFactory] = [
         ("just", lambda: just_formatter_group(check=check)),
-        ("rust", lambda: rust_formatter_group(check=check)),
+        ("rust", lambda: rust_formatter_group(check=check, packages=rust_packages)),
     ]
     if not fast_local:
         factories.extend(
@@ -193,9 +199,25 @@ def run_formatter_group(group: FormatterGroup) -> FormatterResult:
     returncode = 0
     for command in group.commands:
         output.append(f"$ {shlex.join(command.args)}\n")
-        process = run_finite(command.args, cwd=command.cwd)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            prefix="codex-formatter-",
+            suffix=".log",
+            delete=False,
+        ) as log:
+            log_path = Path(log.name)
+            try:
+                process = run_finite(command.args, cwd=command.cwd, observe=log.write)
+            except BaseException:
+                print(f"Full formatter log: {log_path}", file=sys.stderr)
+                raise
         if process.output_truncated:
             output.append("[output truncated; retaining final 65536 bytes]\n")
+            output.append(f"Full formatter log: {log_path}\n")
+        else:
+            log_path.unlink()
         if process.status not in {"passed", "failed"}:
             output.append(f"[{process.status}]\n")
         output.append(process.stdout)
@@ -235,6 +257,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="run only the named formatter group; may be provided multiple times",
     )
     parser.add_argument(
+        "--rust-package",
+        action="append",
+        default=[],
+        metavar="PACKAGE",
+        help="limit Rust formatting to a Cargo package; repeat for multiple packages",
+    )
+    parser.add_argument(
         "--changed",
         action="append",
         nargs="?",
@@ -260,6 +289,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     if args.changed and selected_groups != {"python-scripts"}:
         parser.error("--changed requires --only python-scripts")
+    if (
+        args.rust_package
+        and selected_groups is not None
+        and "rust" not in selected_groups
+    ):
+        parser.error("--rust-package requires the Rust formatter to be selected")
     python_script_targets: Sequence[str] = ("scripts",)
     if args.changed:
         changed_paths = resolved_changed_paths(args.changed)
@@ -276,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fast_local=args.fast_local,
         selected_groups=selected_groups,
         python_script_targets=python_script_targets,
+        rust_packages=args.rust_package,
     )
     if not groups:
         print("No formatter groups selected.", file=sys.stderr)

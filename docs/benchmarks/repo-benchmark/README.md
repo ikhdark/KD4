@@ -129,7 +129,10 @@ full JSON retains the complete phase vocabulary and population details.
 
 [kd4_perf_snapshot.py](../../../scripts/kd4_perf_snapshot.py) already measures
 local workflow commands. Its quick profile covers Python startup, Git status,
-and feature validation; the phase0 catalogue also includes CLI builds, a focused
+and static feature validation (`feature-check-static`). Static checks may build
+the feature-defaults helper but do not run runtime gates. Full feature validation
+remains available as `--scenario feature-check` and in `phase0`.
+The phase0 catalogue also includes CLI builds, a focused
 core test, app-server initialization tests, and a Desktop publish dry run.
 Select only the scenario needed for the change:
 
@@ -146,6 +149,16 @@ not establish OS, compiler, or provider cache state. A failed invocation stays i
 `samples` but is excluded from every statistic. It does not measure actual
 Desktop installation, end-user paint latency, or a complete edit-to-runtime loop.
 Record background builds and other competing work when interpreting differences.
+
+Timeouts and launch errors retain elapsed time and output sizes in `samples`,
+with a null `exit_code` and an explicit `outcome`; they never enter successful-run
+percentiles. Unsuccessful attempts retain full temporary-directory logs at
+`stdout_path`/`stderr_path`, with only bounded tails in `reason`. Keep those logs
+alongside the report if evidence must survive system temporary-file cleanup.
+Known telemetry-input and report-destination errors are rejected before scenarios.
+On interruption during a scenario or unconfirmed process cleanup, `--output` saves completed and
+aborted evidence with `incomplete`, `abortReason`, and `pendingScenarios`; later
+scenarios do not run, even with `--allow-failures` or `--allow-incomplete`.
 
 For a breakdown inside the existing lane runner, pass a new output filename:
 
@@ -430,7 +443,7 @@ Exclusion rates name their denominators. Reports also show excluded pair rates
 per metric and completion caveats for incomplete segments, so surviving samples
 cannot silently stand for the entire scheduled experiment.
 
-Audit schema 20 carries `behaviorMetrics` with independent `behaviorSchemaVersion: 2`.
+Audit schema 21 carries `behaviorMetrics` with independent `behaviorSchemaVersion: 2`.
 The fixed vector includes discovery events, searches, reads, broad searches,
 excess repeated searches, executed validations, model retries/fallbacks, and
 provider total tokens, plus validation duration, suppressed validation output,

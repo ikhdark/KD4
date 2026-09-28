@@ -1,6 +1,8 @@
+#[cfg(test)]
 use std::sync::Arc;
 
 use serde::Serialize;
+#[cfg(test)]
 use tokio::sync::RwLock;
 
 use crate::tools::handlers::command_shape::CommandInvocation;
@@ -15,6 +17,7 @@ pub(crate) enum ValidationOperation {
     Fuzz,
 }
 
+#[cfg(test)]
 const ALL_OPERATIONS: [ValidationOperation; 5] = [
     ValidationOperation::Test,
     ValidationOperation::Check,
@@ -23,6 +26,7 @@ const ALL_OPERATIONS: [ValidationOperation; 5] = [
     ValidationOperation::Fuzz,
 ];
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct ValidationAuthorization {
     // Production turn construction intentionally leaves this inactive. Only tests
@@ -32,8 +36,16 @@ pub(crate) struct ValidationAuthorization {
     denied: [bool; 5],
 }
 
+#[cfg(test)]
 pub(crate) type SharedValidationAuthorization = Arc<RwLock<ValidationAuthorization>>;
 
+// Authorization has no production contract yet. Keep only the pure classifier
+// on the live path; tests can still exercise the proposed admission policy.
+#[cfg(not(test))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SharedValidationAuthorization;
+
+#[cfg(test)]
 impl ValidationAuthorization {
     #[cfg(test)]
     pub(crate) fn enabled() -> Self {
@@ -71,6 +83,7 @@ impl ValidationAuthorization {
     }
 }
 
+#[cfg(test)]
 const fn operation_index(operation: ValidationOperation) -> usize {
     match operation {
         ValidationOperation::Test => 0,
@@ -81,6 +94,7 @@ const fn operation_index(operation: ValidationOperation) -> usize {
     }
 }
 
+#[cfg(test)]
 fn parse_directives(text: &str) -> Vec<(ValidationOperation, bool)> {
     let actionable_text = actionable_directive_text(text);
     let mut normalized = actionable_text
@@ -142,6 +156,7 @@ fn parse_directives(text: &str) -> Vec<(ValidationOperation, bool)> {
     directives
 }
 
+#[cfg(test)]
 fn actionable_directive_text(text: &str) -> String {
     let mut actionable = String::with_capacity(text.len());
     let mut fence: Option<&str> = None;
@@ -203,6 +218,7 @@ fn actionable_directive_text(text: &str) -> String {
     actionable
 }
 
+#[cfg(test)]
 fn imperative_suffix_denial(clause: &str) -> Option<&str> {
     let clause = clause
         .trim()
@@ -241,6 +257,7 @@ fn imperative_suffix_denial(clause: &str) -> Option<&str> {
         })
 }
 
+#[cfg(test)]
 fn parse_directive(clause: &str) -> Vec<(ValidationOperation, bool)> {
     let clause = clause.trim();
     if clause.is_empty() || clause.contains('?') {
@@ -305,6 +322,7 @@ fn parse_directive(clause: &str) -> Vec<(ValidationOperation, bool)> {
         .collect()
 }
 
+#[cfg(test)]
 fn skip_validation_body(body: &str) -> Option<&str> {
     let first_target = body.split_once(" and ").map_or(body, |(first, _)| first);
     let first_target = first_target
@@ -313,6 +331,7 @@ fn skip_validation_body(body: &str) -> Option<&str> {
     (!operations_from_instruction(first_target).is_empty()).then_some(body)
 }
 
+#[cfg(test)]
 fn bare_no_validation_body(body: &str) -> Option<&str> {
     let mut saw_operation = false;
     for component in body
@@ -331,6 +350,7 @@ fn bare_no_validation_body(body: &str) -> Option<&str> {
     saw_operation.then_some(body)
 }
 
+#[cfg(test)]
 fn validation_action_body(text: &str) -> Option<&str> {
     let text = text.trim();
     for prefix in [
@@ -352,6 +372,7 @@ fn validation_action_body(text: &str) -> Option<&str> {
     .then_some(text)
 }
 
+#[cfg(test)]
 fn operations_from_instruction(body: &str) -> Vec<ValidationOperation> {
     let components = body
         .split(|character: char| !character.is_ascii_alphanumeric())
@@ -406,6 +427,7 @@ pub(crate) enum ValidationClassification {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ValidationSkipReason {
+    #[cfg(test)]
     UserProhibitedValidation,
 }
 
@@ -417,6 +439,7 @@ pub(crate) struct ValidationSkippedToolOutput {
     pub(crate) operation: Option<ValidationOperation>,
 }
 
+#[cfg(test)]
 impl ValidationSkippedToolOutput {
     fn prohibited(operation: Option<ValidationOperation>) -> Self {
         Self {
@@ -438,6 +461,7 @@ pub(crate) fn prohibited_skip_for(
     prohibited_skip_for_classification(authorization, &classification, explicitly_tagged)
 }
 
+#[cfg(test)]
 pub(crate) fn prohibited_skip_for_classification(
     authorization: &ValidationAuthorization,
     classification: &ValidationClassification,
@@ -473,20 +497,27 @@ pub(crate) fn prohibited_skip_for_classification(
 #[derive(Debug)]
 pub(crate) enum ValidationAdmission {
     Execute {
+        #[cfg(test)]
         authorization_revision: u64,
         is_validation: bool,
+        #[cfg(test)]
         classification: ValidationClassification,
     },
+    #[cfg(test)]
     Skip(ValidationSkippedToolOutput),
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ValidationLaunchPlan {
+    #[cfg(test)]
     pub(crate) classification: ValidationClassification,
+    #[cfg(test)]
     pub(crate) authorization_revision: u64,
+    #[cfg(test)]
     pub(crate) explicitly_tagged: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn recheck_validation_launch(
     authorization: &ValidationAuthorization,
     launch: &ValidationLaunchPlan,
@@ -517,14 +548,16 @@ pub(crate) async fn admit_validation(
 }
 
 pub(crate) async fn admit_validation_invocations(
-    authorization: &SharedValidationAuthorization,
+    _authorization: &SharedValidationAuthorization,
     invocations: &[CommandInvocation],
     explicitly_tagged: bool,
 ) -> ValidationAdmission {
     // Classification also drives execution diagnostics. Only denial enforcement
     // is disabled when production validation authorization is inactive.
     let classification = classify_validation_invocations(invocations);
-    let authorization = authorization.read().await;
+    #[cfg(test)]
+    let authorization = _authorization.read().await;
+    #[cfg(test)]
     if let Some(skipped) =
         prohibited_skip_for_classification(&authorization, &classification, explicitly_tagged)
     {
@@ -533,8 +566,10 @@ pub(crate) async fn admit_validation_invocations(
     let is_validation =
         explicitly_tagged || matches!(&classification, ValidationClassification::Validation { .. });
     ValidationAdmission::Execute {
+        #[cfg(test)]
         authorization_revision: authorization.revision,
         is_validation,
+        #[cfg(test)]
         classification,
     }
 }
@@ -559,13 +594,7 @@ fn classify_powershell_script(script: &str) -> ValidationClassification {
     // Preserve control-flow information before the PowerShell parser flattens
     // pipelines and command chains into argv leaves.
     let simple = classify_simple_script(script, 0);
-    if matches!(
-        simple,
-        ValidationClassification::Validation {
-            exit_code_is_authoritative: true,
-            ..
-        }
-    ) {
+    if matches!(simple, ValidationClassification::Validation { .. }) {
         return simple;
     }
     let command = vec![
@@ -663,17 +692,12 @@ fn classify_simple_script(script: &str, depth: usize) -> ValidationClassificatio
         .into_iter()
         .filter_map(|command| {
             let command = command.trim();
-            // A guard such as `if ($LASTEXITCODE -eq 0) { cargo test }` runs
-            // the same commands a flat sequence would, so its condition and
-            // bodies are classified instead of the `if` keyword.
-            if let Some(parts) = powershell_if_statement_parts(command)
-                .or_else(|| grouped_command_body(command).map(|body| vec![body]))
-            {
-                return Some(combine_validation_classifications(
-                    parts
-                        .into_iter()
-                        .map(|part| classify_simple_script(part, depth + 1)),
-                ));
+            // A successful shell exit does not prove that any conditional body ran.
+            if powershell_if_statement_parts(command).is_some() {
+                return Some(ValidationClassification::Opaque);
+            }
+            if let Some(body) = grouped_command_body(command) {
+                return Some(classify_simple_script(body, depth + 1));
             }
             let Some(words) = shlex::split(command) else {
                 return Some(ValidationClassification::Opaque);
@@ -739,11 +763,10 @@ fn split_deterministic_script(script: &str) -> Option<(Vec<&str>, bool)> {
             b'{' => closers.push(b'}'),
             // A stray closer stays literal; a mismatched one leaves the
             // command boundaries unknowable.
-            b')' | b'}' if !closers.is_empty() => {
-                if closers.pop() != Some(byte) {
+            b')' | b'}' if !closers.is_empty()
+                && closers.pop() != Some(byte) => {
                     return None;
                 }
-            }
             _ => {}
         }
         let separator_length = match byte {
@@ -1131,13 +1154,6 @@ fn python_operation(args: &[String]) -> Option<ValidationOperation> {
             return None;
         }
         if !argument.starts_with('-') {
-            if normalized_program_name(argument) == "validate.py" {
-                return (args.get(index + 1).is_some_and(|action| action == "run")
-                    && !args[index + 2..]
-                        .iter()
-                        .any(|option| matches!(option.as_str(), "-h" | "--help")))
-                .then_some(ValidationOperation::Test);
-            }
             if normalized_program_name(argument) == "rust_test_runner.py" {
                 let mut runner_index = index + 1;
                 while let Some(option) = args.get(runner_index) {
@@ -1795,132 +1811,43 @@ mod tests {
         }
     }
 
-    mod manifest_runner {
-        use super::*;
-
-        #[test]
-        fn manifest_validation_runner_recognizes_only_execution() {
-            for invocation in [
-                argv("python", &["scripts/validate.py", "run", "atomic-write"]),
-                argv(
-                    "python",
-                    &[
-                        "-I",
-                        "scripts/validate.py",
-                        "run",
-                        "--changed",
-                        "src/lib.rs",
-                    ],
-                ),
-                argv("py", &["scripts/validate.py", "run"]),
-                CommandInvocation::Script(
-                    concat!(
-                        "python scripts/validate.py plan atomic-write; ",
-                        "python scripts/validate.py run atomic-write",
-                    )
-                    .to_string(),
-                ),
-            ] {
-                assert!(is_validation(&invocation), "{invocation:?}");
-                let mut authorization = ValidationAuthorization::enabled();
-                assert!(authorization.update_from_user_input("do not run tests"));
-                assert!(prohibited_skip_for(&authorization, &invocation, false).is_some());
-            }
+    #[test]
+    fn arbitrary_validate_scripts_are_not_classified_by_filename() {
+        for program in ["python", "py"] {
             for args in [
-                vec!["scripts/validate.py"],
-                vec!["scripts/validate.py", "plan", "atomic-write"],
-                vec!["scripts/validate.py", "list"],
-                vec!["scripts/validate.py", "--help"],
-                vec!["scripts/validate.py", "run", "--help"],
-                vec!["scripts/not_validate.py", "run"],
-                vec!["script.py", "scripts/validate.py", "run"],
+                vec!["scripts/validate.py", "run"],
+                vec![
+                    "-I",
+                    "scripts/validate.py",
+                    "run",
+                    "--changed",
+                    "src/lib.rs",
+                ],
+                vec!["scripts/validate.py", "plan"],
             ] {
-                assert!(!is_validation(&argv("python", &args)), "{args:?}");
+                assert!(!is_validation(&argv(program, &args)), "{args:?}");
             }
         }
+    }
 
-        #[test]
-        fn guarded_manifest_runs_from_rollout_are_validation() {
-            // Exact `exec_command` scripts a recorded session sent.
-            let guarded_runs = [
-                concat!(
-                    "python scripts/validate.py plan validation-tooling; ",
-                    "if ($LASTEXITCODE -eq 0) { python scripts/validate.py run validation-tooling }; ",
-                    "exit $LASTEXITCODE",
-                ),
-                concat!(
-                    "python scripts/validate.py plan --changed src/atomic_write.rs; ",
-                    "if ($LASTEXITCODE -eq 0) { python scripts/validate.py run --changed src/atomic_write.rs }; ",
-                    "exit $LASTEXITCODE",
-                ),
-                concat!(
-                    "python scripts/validate.py run --changed src/atomic_write.rs; ",
-                    "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; ",
-                    "rg -n '^mod tests|^    mod tests' src/config/mod.rs src/workspace.rs src/test_plan.rs ",
-                    "src/validation_identity.rs src/execution_control.rs src/analysis_jobs.rs; ",
-                    "git diff --check -- .cargo/config.toml .config/nextest.toml ",
-                    "scripts/check_test_targets.py AGENTS.md; exit $LASTEXITCODE",
-                ),
-                concat!(
-                    "python scripts/validate.py plan validation-tooling atomic-write; ",
-                    "if ($LASTEXITCODE -eq 0) { python scripts/validate.py run validation-tooling atomic-write }; ",
-                    "exit $LASTEXITCODE",
-                ),
-            ];
-            let mut authorization = ValidationAuthorization::enabled();
-            assert!(authorization.update_from_user_input("do not run tests"));
-            for script in guarded_runs {
-                let invocation = CommandInvocation::Script(script.to_string());
-                assert!(
-                    matches!(
-                        classify_validation(&invocation),
-                        ValidationClassification::Validation {
-                            ref leaves,
-                            exit_code_is_authoritative: false,
-                            ..
-                        } if leaves.iter().all(|leaf| leaf.operation == ValidationOperation::Test)
-                    ),
-                    "{script}"
-                );
-                assert!(
-                    prohibited_skip_for(&authorization, &invocation, false).is_some(),
-                    "{script}"
-                );
-            }
-            for script in [
-                concat!(
-                    "python scripts/validate.py plan --changed src/validation_identity.rs ",
-                    "--changed tests/config_runtime_contracts.rs --changed src/atomic_write.rs",
-                ),
-                "if ($LASTEXITCODE -eq 0) { python scripts/validate.py plan atomic-write }",
+    #[test]
+    fn conditional_powershell_is_opaque_for_execution_proof() {
+        for script in [
+            "if ($false) { cargo test }",
+            "If($ok){cargo test}",
+            "if (Test-Path Cargo.toml) { echo skip } elseif ($env:CI) { echo ci } else { cargo test }",
+            "if ($ok) { cargo test",
+        ] {
+            for invocation in [
+                CommandInvocation::Script(script.into()),
+                CommandInvocation::PowerShellScript(script.into()),
             ] {
                 assert_eq!(
-                    classify_validation(&CommandInvocation::Script(script.to_string())),
-                    ValidationClassification::NonValidation,
+                    classify_validation(&invocation),
+                    ValidationClassification::Opaque,
                     "{script}"
                 );
             }
-        }
-
-        #[test]
-        fn powershell_if_blocks_keep_their_commands_together() {
-            for script in [
-                "if ($LASTEXITCODE -eq 0) { python scripts/validate.py plan a; python scripts/validate.py run a }",
-                "if (Test-Path Cargo.toml) { echo skip } elseif ($env:CI) { echo ci } else { cargo test }",
-                "If($ok){cargo test}",
-            ] {
-                assert!(
-                    is_validation(&CommandInvocation::Script(script.to_string())),
-                    "{script}"
-                );
-            }
-            // An unclosed block leaves the command boundaries unknowable.
-            assert_eq!(
-                classify_validation(&CommandInvocation::Script(
-                    "if ($ok) { cargo test".to_string()
-                )),
-                ValidationClassification::Opaque
-            );
         }
     }
 

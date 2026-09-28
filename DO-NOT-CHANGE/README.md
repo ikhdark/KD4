@@ -71,6 +71,12 @@ their restored contents; it does not perform another upstream update.
 
 ### Workspace integration
 
+The requested `df3094107210471940bd15fee00629f87283d04b` backport adds GPT-6
+Sol/Luna identifiers to `model-provider-info`, plus Runtime provider registration
+and AWS override handling from prerequisite `d5e256ceb210dacbab9d8dcc7eafda58f90f6e51`.
+The baseline and original path above remain unchanged. Other auth/provider
+migrations are not imported; fork integration stays in `codex-rs/model-provider`.
+
 These remain active Cargo workspace members. Their dependency keys and package
 names are unchanged; the parent workspace manifest supplies the relocated paths.
 For the six exact mirrors above, crate-local files, including upstream Bazel

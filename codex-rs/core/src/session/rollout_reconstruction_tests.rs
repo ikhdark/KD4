@@ -594,6 +594,7 @@ async fn durability_regression_resume_invalidates_unified_exec_session() {
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
+        raw_output_truncated: false,
         raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),

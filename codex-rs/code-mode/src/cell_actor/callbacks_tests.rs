@@ -3,11 +3,11 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
+use crate::NestedCancellation;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -42,7 +42,7 @@ impl CellHost for PanickingCallbackHost {
 
     async fn commit_completion(
         &self,
-        _stored_value_writes: HashMap<String, crate::runtime::StoredValue>,
+        _stored_value_writes: HashMap<String, crate::runtime::StoredValueWrite>,
         _event: CellEvent,
         _pending_initial_yield_items: Option<Vec<crate::session_runtime::OutputItem>>,
         _cell_state: Arc<CellState>,
@@ -73,7 +73,7 @@ impl CellHost for NonCooperativeCallbackHost {
 
     async fn commit_completion(
         &self,
-        _stored_value_writes: HashMap<String, crate::runtime::StoredValue>,
+        _stored_value_writes: HashMap<String, crate::runtime::StoredValueWrite>,
         _event: CellEvent,
         _pending_initial_yield_items: Option<Vec<crate::session_runtime::OutputItem>>,
         _cell_state: Arc<CellState>,

@@ -119,7 +119,7 @@ fn json_schema_policy_fixtures_convert_to_responses_tools() {
 }
 
 #[test]
-fn json_schema_policy_oversized_golden_schema_rejects_not_and_compacts_supported_subset() {
+fn json_schema_policy_oversized_golden_schema_rejects_not_and_preserves_supported_guidance() {
     let mut fixture: FixtureFile = load_fixture(OVERSIZED_NOTION_CREATE_PAGE_SCHEMA_PATH);
     let fixture_tool = fixture
         .tools
@@ -131,7 +131,7 @@ fn json_schema_policy_oversized_golden_schema_rejects_not_and_compacts_supported
             .to_string(),
         "unsupported tool input schema assertion: not"
     );
-    // Exercise compaction separately on the supported portion of the fixture.
+    // Exercise pruning separately on the supported portion of the fixture.
     assert_eq!(
         fixture_tool
             .input_schema
@@ -153,10 +153,13 @@ fn json_schema_policy_oversized_golden_schema_rejects_not_and_compacts_supported
 
     assert!(
         output_bytes < input_bytes,
-        "compaction should reduce schema size from {input_bytes} bytes"
+        "pruning should reduce schema size from {input_bytes} bytes"
     );
 
-    assert!(parameters.pointer("/description").is_none());
+    assert_eq!(
+        parameters.get("description"),
+        fixture_tool.input_schema.get("description")
+    );
 
     let expected_values = [
         (

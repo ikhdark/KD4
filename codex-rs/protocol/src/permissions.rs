@@ -249,7 +249,7 @@ struct FileSystemSemanticSignature {
 
 /// Runtime matcher for read-deny entries in a filesystem sandbox policy.
 pub struct ReadDenyMatcher {
-    denied_candidates: Vec<Vec<PathBuf>>,
+    path_candidates: Vec<(Vec<PathBuf>, usize, FileSystemAccessMode)>,
     deny_read_matchers: Vec<GlobMatcher>,
     invalid_pattern: bool,
 }
@@ -299,10 +299,20 @@ impl ReadDenyMatcher {
         // Exact roots are stored as all meaningful path spellings we can derive
         // cheaply. This lets direct tool checks catch both a symlink path and
         // its canonical target without changing the policy entries themselves.
-        let denied_candidates = file_system_sandbox_policy
-            .get_unreadable_roots_with_cwd(cwd)
+        let path_candidates = file_system_sandbox_policy
+            .resolved_entries_with_cwd(cwd)
             .into_iter()
-            .map(|path| normalized_and_canonical_candidates(path.as_path()))
+            .filter(|entry| {
+                entry.access != FileSystemAccessMode::Deny
+                    || entry.path.as_path().parent().is_some()
+            })
+            .map(|entry| {
+                (
+                    normalized_and_canonical_candidates(entry.path.as_path()),
+                    entry.path.as_path().components().count(),
+                    entry.access,
+                )
+            })
             .collect();
         // Pattern entries stay as policy-level globs. They are matched at read
         // time here instead of being snapshotted to startup filesystem state.
@@ -320,7 +330,7 @@ impl ReadDenyMatcher {
             }
         }
         Ok(Some(Self {
-            denied_candidates,
+            path_candidates,
             deny_read_matchers,
             invalid_pattern,
         }))
@@ -338,12 +348,16 @@ impl ReadDenyMatcher {
         // glob matchers. Exact entries are subtree denies; glob entries match
         // according to the pattern compiler's path-separator rules.
         let path_candidates = normalized_and_canonical_candidates(path);
-        if self.denied_candidates.iter().any(|denied_candidates| {
-            path_candidates.iter().any(|candidate| {
-                denied_candidates.iter().any(|denied_candidate| {
-                    candidate == denied_candidate || candidate.starts_with(denied_candidate)
+        if path_candidates.iter().any(|candidate| {
+            self.path_candidates
+                .iter()
+                .filter(|(roots, _, _)| {
+                    roots
+                        .iter()
+                        .any(|root| permission_path_starts_with(candidate, root))
                 })
-            })
+                .max_by_key(|(_, specificity, access)| (*specificity, *access))
+                .is_some_and(|(_, _, access)| *access == FileSystemAccessMode::Deny)
         }) {
             return true;
         }
@@ -713,7 +727,7 @@ impl FileSystemSandboxPolicy {
 
         self.resolved_entries_with_cwd(cwd)
             .into_iter()
-            .filter(|entry| path.as_path().starts_with(entry.path.as_path()))
+            .filter(|entry| permission_path_starts_with(path.as_path(), entry.path.as_path()))
             .max_by_key(resolved_entry_precedence)
             .map(|entry| entry.access)
             .unwrap_or(FileSystemAccessMode::Deny)
@@ -1376,6 +1390,30 @@ fn resolve_candidate_path(path: &Path, cwd: &Path) -> Option<AbsolutePathBuf> {
     }
 }
 
+fn permission_path_starts_with(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let prefix: PathBuf = path.components().take(root.components().count()).collect();
+        // Only case aliases are eligible: do not expand lexical grants through symlinks.
+        if prefix
+            .as_os_str()
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(root.as_os_str().as_encoded_bytes())
+        {
+            // Only proven aliases may extend a grant. A missing prefix could
+            // name a different directory on a case-sensitive Windows volume.
+            return std::fs::canonicalize(prefix)
+                .ok()
+                .zip(std::fs::canonicalize(root).ok())
+                .is_some_and(|(prefix, root)| prefix == root);
+        }
+    }
+    false
+}
+
 /// Returns true when two config paths refer to the same exact target before
 /// any prefix matching is applied.
 ///
@@ -1760,9 +1798,29 @@ fn metadata_child_of_writable_root(
         .iter()
         .filter(|entry| entry.access.can_write())
         .filter_map(|entry| {
-            let relative_path = target.strip_prefix(entry.path.as_path()).ok()?;
-            let first_component = relative_path.components().next()?;
-            let metadata_name = metadata_path_name(first_component.as_os_str())?;
+            if !permission_path_starts_with(target, entry.path.as_path()) {
+                return None;
+            }
+            let first_component = target
+                .components()
+                .nth(entry.path.as_path().components().count())?;
+            let metadata_name = metadata_path_name(first_component.as_os_str()).or_else(|| {
+                #[cfg(windows)]
+                {
+                    PROTECTED_METADATA_PATH_NAMES.iter().copied().find(|name| {
+                        let actual = entry.path.join(first_component.as_os_str());
+                        let protected = entry.path.join(name);
+                        // Reserve metadata aliases even before the directory exists.
+                        (!actual.as_path().exists()
+                            && name.as_bytes().eq_ignore_ascii_case(
+                                first_component.as_os_str().as_encoded_bytes(),
+                            ))
+                            || permission_path_starts_with(actual.as_path(), protected.as_path())
+                    })
+                }
+                #[cfg(not(windows))]
+                None
+            })?;
             Some((entry.path.join(metadata_name), metadata_name))
         })
         .next()
@@ -1831,11 +1889,8 @@ fn has_explicit_write_entry_for_metadata_path(
 ) -> bool {
     policy.resolved_entries_with_cwd(cwd).iter().any(|entry| {
         entry.access.can_write()
-            && target.starts_with(entry.path.as_path())
-            && entry
-                .path
-                .as_path()
-                .starts_with(protected_metadata_path.as_path())
+            && permission_path_starts_with(target, entry.path.as_path())
+            && permission_path_starts_with(entry.path.as_path(), protected_metadata_path.as_path())
     })
 }
 
@@ -2198,6 +2253,73 @@ mod tests {
             policy.resolve_access_with_cwd(docs_private_public.as_path(), cwd.path()),
             FileSystemAccessMode::Write
         );
+    }
+
+    #[test]
+    fn read_deny_matcher_preserves_narrower_allows_and_glob_denies() {
+        let cwd = TempDir::new().unwrap();
+        let root = AbsolutePathBuf::from_absolute_path(cwd.path()).unwrap();
+        std::fs::create_dir_all(root.join("private/public")).unwrap();
+        let entries = vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: root.clone() },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.join("private"),
+                },
+                access: FileSystemAccessMode::Deny,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.join("private/public"),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::GlobPattern {
+                    pattern: format!("{}/**/*.secret", globset::escape(&root.to_string_lossy())),
+                },
+                access: FileSystemAccessMode::Deny,
+            },
+        ];
+        let policy = FileSystemSandboxPolicy::restricted(entries);
+        let matcher = ReadDenyMatcher::new(&policy, cwd.path()).unwrap();
+        assert!(!matcher.is_read_denied(root.join("private/public/data.txt").as_path()));
+        assert!(matcher.is_read_denied(root.join("private/hidden.txt").as_path()));
+        assert!(matcher.is_read_denied(root.join("private/public/data.secret").as_path()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_case_aliases_preserve_grants_and_metadata_protection() {
+        let cwd = TempDir::new().unwrap();
+        let root = AbsolutePathBuf::from_absolute_path(cwd.path().join("Workspace")).unwrap();
+        let alias = cwd.path().join("workspace");
+        let mut policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path { path: root.clone() },
+            access: FileSystemAccessMode::Write,
+        }]);
+        assert!(!policy.can_write_path_with_cwd(&alias.join("new.txt"), cwd.path()));
+        std::fs::create_dir_all(root.as_path()).unwrap();
+        assert!(!policy.can_write_path_with_cwd(&alias.join(".CODEX/config.toml"), cwd.path()));
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        std::fs::write(root.join(".codex/config.toml"), "protected").unwrap();
+        assert_eq!(
+            std::fs::canonicalize(root.as_path()).unwrap(),
+            std::fs::canonicalize(&alias).unwrap()
+        );
+        assert!(policy.can_write_path_with_cwd(&alias.join("new.txt"), cwd.path()));
+        assert!(!policy.can_write_path_with_cwd(&alias.join(".CODEX/config.toml"), cwd.path()));
+        assert!(!policy.can_write_path_with_cwd(&cwd.path().join("outside.txt"), cwd.path()));
+        policy.entries.push(FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: root.join(".codex"),
+            },
+            access: FileSystemAccessMode::Write,
+        });
+        assert!(policy.can_write_path_with_cwd(&alias.join(".CODEX/config.toml"), cwd.path()));
     }
 
     #[test]

@@ -1106,6 +1106,11 @@ async fn replay_reconstructs_full_tool_surface_from_compact_references() -> std:
     let replayed = RolloutRecorder::existing_tool_manifests(&rollout_path).await?;
     assert_eq!(replayed.manifest(hash), Some(&surface));
     assert_eq!(replayed.current_hash(), Some(hash));
+    RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    let reused = RolloutRecorder::existing_tool_manifests(&rollout_path).await?;
+    assert_eq!(reused.manifest(hash), Some(&surface));
+    assert_eq!(reused.current_hash(), Some(hash));
+    assert!(crate::metadata::take_cached_manifests(&rollout_path).await.is_none());
     Ok(())
 }
 

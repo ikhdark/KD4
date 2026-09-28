@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use chrono::Duration as ChronoDuration;
 use chrono::SecondsFormat;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
@@ -15,6 +14,7 @@ use super::helpers::stored_thread_from_rollout_item;
 use super::helpers::thread_item_titles;
 use super::read_thread::stored_thread_from_sqlite_metadata_with_name;
 use crate::ListThreadsParams;
+#[cfg(test)]
 use crate::SortDirection;
 use crate::StoredThread;
 use crate::ThreadListStorageMode;
@@ -154,9 +154,7 @@ async fn list_threads_with_state_db_read_count(
 
     let backwards_cursor = items
         .first()
-        .and_then(|thread| {
-            backwards_cursor_position(thread, params.sort_key, params.sort_direction)
-        })
+        .and_then(|thread| backwards_cursor_position(thread, params.sort_key))
         .map(|position| bind_cursor(storage_path, &position));
 
     Ok((
@@ -489,21 +487,17 @@ fn bind_cursor(storage_path: ThreadListStoragePath, position: &str) -> String {
     format!("{THREAD_LIST_CURSOR_PREFIX}{storage_prefix}{position}")
 }
 
-fn backwards_cursor_position(
-    thread: &StoredThread,
-    sort_key: ThreadSortKey,
-    sort_direction: SortDirection,
-) -> Option<String> {
+fn backwards_cursor_position(thread: &StoredThread, sort_key: ThreadSortKey) -> Option<String> {
     let timestamp = match sort_key {
         ThreadSortKey::CreatedAt => thread.created_at,
         ThreadSortKey::UpdatedAt => thread.updated_at,
         ThreadSortKey::RecencyAt => thread.recency_at,
     };
-    let timestamp = match sort_direction {
-        SortDirection::Asc => timestamp.checked_add_signed(ChronoDuration::milliseconds(1))?,
-        SortDirection::Desc => timestamp.checked_sub_signed(ChronoDuration::milliseconds(1))?,
-    };
-    Some(timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
+    Some(format!(
+        "{}|{}",
+        timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
+        thread.thread_id
+    ))
 }
 
 #[cfg(test)]
@@ -584,6 +578,37 @@ mod tests {
         .await
         .expect("rollout scan should backfill state db");
         runtime
+    }
+
+    #[tokio::test]
+    async fn backwards_cursor_round_trips_tied_timestamps() {
+        for mode in [
+            ThreadListStorageMode::StateDbOnly,
+            ThreadListStorageMode::ScanAndRepair,
+        ] {
+            let home = TempDir::new().expect("home");
+            let config = test_config(home.path());
+            for n in 1..=3 {
+                write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::from_u128(n)).unwrap();
+            }
+            let runtime = backfilled_runtime(&home, &config).await;
+            let store = LocalThreadStore::new(config, Some(runtime));
+            for direction in [SortDirection::Asc, SortDirection::Desc] {
+                let mut params = list_params(1, None, mode);
+                params.sort_direction = direction;
+                let first = store.list_threads(params.clone()).await.unwrap();
+                params.cursor = first.next_cursor;
+                let second = store.list_threads(params.clone()).await.unwrap();
+                params.cursor = second.backwards_cursor;
+                params.sort_direction = match direction {
+                    SortDirection::Asc => SortDirection::Desc,
+                    SortDirection::Desc => SortDirection::Asc,
+                };
+                let back = store.list_threads(params).await.unwrap();
+                assert_eq!(back.items.len(), 1);
+                assert_eq!(back.items[0].thread_id, first.items[0].thread_id);
+            }
+        }
     }
 
     #[tokio::test]

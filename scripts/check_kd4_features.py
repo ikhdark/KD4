@@ -330,29 +330,20 @@ def _verification_route(
         else:
             # Legacy aggregators use `mod suite;`; bounded shards keep `suite`
             # inline and explicitly register the selected source within it.
-            candidates = [
-                p
-                for p in (cargo_path.parent / "tests").glob("*.rs")
-                if re.search(
-                    r"\bmod\s+" + re.escape(relative.parts[1]) + r"\s*;",
-                    p.read_text(encoding="utf-8"),
-                )
-                or (
+            candidates = []
+            for candidate in (cargo_path.parent / "tests").glob("*.rs"):
+                declarations = _rust_scope_items(
+                    candidate.read_text(encoding="utf-8")
+                ).get(("mod", relative.parts[1]), [])
+                if len(declarations) != 1:
+                    continue
+                _, body = declarations[0]
+                if body is None or (
                     len(relative.parts) == 3
-                    and re.search(
-                        r"\bmod\s+" + re.escape(relative.parts[1]) + r"\s*\{",
-                        p.read_text(encoding="utf-8"),
-                    )
-                    and re.search(
-                        r'#\[path\s*=\s*"'
-                        + re.escape(source.name)
-                        + r'"\]\s*mod\s+'
-                        + re.escape(source.stem)
-                        + r"\s*;",
-                        p.read_text(encoding="utf-8"),
-                    )
-                )
-            ]
+                    and (source.name, None)
+                    in _rust_scope_items(body).get(("mod", source.stem), [])
+                ):
+                    candidates.append(candidate)
             if len(candidates) != 1:
                 raise ValueError(
                     "verification source must resolve to one integration test binary"
@@ -410,13 +401,28 @@ def execute_runtime_verification(
     outcomes: list[dict[str, Any]] | None = None,
 ) -> int:
     """Execute one selected, or every enabled, runtime verification command."""
+    repo_root = repo_root.resolve()
+
+    def invalid(message: str) -> int:
+        if outcomes is not None:
+            outcomes.append(
+                {
+                    "feature_id": feature_id,
+                    "outcome": "not_executed",
+                    "test_identities": [],
+                    "returncode": 2,
+                    "error": message,
+                }
+            )
+        if not quiet:
+            print(message)
+        return 2
+
     try:
         with manifest_path.open("rb") as manifest_file:
             manifest = tomllib.load(manifest_file)
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        if not quiet:
-            print(f"runtime verification manifest could not be read: {exc}")
-        return 2
+        return invalid(f"runtime verification manifest could not be read: {exc}")
 
     eligible = [
         feature
@@ -431,11 +437,9 @@ def execute_runtime_verification(
         else eligible
     )
     if feature_id is not None and len(matching) != 1:
-        if not quiet:
-            print(
-                f"runtime verification feature must resolve exactly once: {feature_id!r}"
-            )
-        return 2
+        return invalid(
+            f"runtime verification feature must resolve exactly once: {feature_id!r}"
+        )
     if not matching:
         return 0
     # Resolve every route before executing anything. Capability gates use the
@@ -458,9 +462,7 @@ def execute_runtime_verification(
         KeyError,
         rust_test_runner.RunnerError,
     ) as exc:
-        if not quiet:
-            print(f"invalid runtime verification: {exc}")
-        return 2
+        return invalid(f"invalid runtime verification: {exc}")
 
     gates = list(
         dict.fromkeys(
@@ -483,18 +485,25 @@ def execute_runtime_verification(
             # batching; generated exact selectors need no preliminary discovery.
             completed = runner.run_gates(gates, quiet=quiet, discover=False)
     except (rust_test_runner.RunnerError, OSError) as exc:
+        completed = getattr(exc, "completed_gates", {})
         for feature in matching:
+            verification = feature["runtime_verification"]
+            identities = completed.get(verification["command"][3])
             if outcomes is not None:
                 outcomes.append(
                     {
                         "feature_id": feature["id"],
-                        "outcome": getattr(exc, "outcome", "failed"),
-                        "test_identities": [],
-                        "returncode": 2,
-                        "evidence_kind": feature["runtime_verification"]["kind"],
-                        "error": str(exc),
+                        "outcome": "passed"
+                        if identities is not None
+                        else getattr(exc, "outcome", "failed"),
+                        "test_identities": identities or [],
+                        "returncode": 0 if identities is not None else 2,
+                        "evidence_kind": verification["kind"],
+                        **({"error": str(exc)} if identities is None else {}),
                     }
                 )
+            if identities is not None and not quiet:
+                print(f"KD4 TEST RESULT [{feature['id']}]: passed")
         if not quiet:
             print(f"KD4 RUNTIME VERIFICATION failed: {exc}")
         return 2
@@ -1400,12 +1409,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json", action="store_true", help="Emit one JSON result object."
     )
-    parser.add_argument(
+    verification_mode = parser.add_mutually_exclusive_group()
+    verification_mode.add_argument(
         "--static-only",
         action="store_true",
         help="Check declared evidence presence without executing tests.",
     )
-    parser.add_argument(
+    verification_mode.add_argument(
         "--run-runtime-verification",
         metavar="FEATURE_ID",
         help="Execute only this feature's declared runtime test instead of every enabled runtime test.",
@@ -1415,6 +1425,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.repo_root = args.repo_root.resolve()
     manifest_path = args.manifest
     if not manifest_path.is_absolute():
         manifest_path = args.repo_root / manifest_path
@@ -1424,10 +1435,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         outcomes: list[dict[str, Any]] = []
         if args.static_only:
-            if args.run_runtime_verification:
-                raise SystemExit(
-                    "--static-only cannot be combined with --run-runtime-verification"
-                )
             if args.json:
                 payload = result.to_json()
                 payload.update(

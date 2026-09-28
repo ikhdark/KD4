@@ -103,6 +103,25 @@ class ReadmeTocTest(unittest.TestCase):
             ["- [Real](#real)"],
         )
 
+    def test_h1_slugs_are_reserved_without_listing_titles(self) -> None:
+        self.assertEqual(
+            readme_toc.generate_toc_lines(
+                [
+                    "# Install",
+                    "```markdown",
+                    "# Install",
+                    "```",
+                    "## Install",
+                    "# Install",
+                    "### Install",
+                ]
+            ),
+            [
+                "- [Install](#install-1)",
+                "  - [Install](#install-3)",
+            ],
+        )
+
     def test_generate_toc_lines_requires_closing_fence_at_least_as_long(self) -> None:
         self.assertEqual(
             readme_toc.generate_toc_lines(

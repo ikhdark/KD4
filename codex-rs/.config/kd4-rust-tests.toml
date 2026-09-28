@@ -11,6 +11,17 @@
 
 version = 1
 
+[gates.token-budget-lifecycle]
+description = "Real new_context handler, sampling handoff, and nonblocking startup prewarm."
+
+[[gates.token-budget-lifecycle.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "session::turn::context_lifecycle_tests::new_context_tool_installs_fresh_window_before_next_generation",
+  "session::turn::context_lifecycle_tests::first_turn_dispatch_aborts_never_completing_prewarm",
+]
+
 # ---------------------------------------------------------------------------
 # Helper binaries
 #
@@ -79,6 +90,13 @@ helpers = [
 # Unknown test modules retain the conservative helper set above. Nextest
 # resolves caller filters before the helper set is narrowed.
 [targets.core_lib.helpers_by_test_prefix]
+"tools::handlers::context_checkpoint::tests::" = []
+"session::turn::context_checkpoint_tests::" = []
+"session::turn::context_lifecycle_tests::" = []
+"session::context_window::tests::" = []
+"state::auto_compact_window::tests::" = []
+"agent::task_capabilities::tests::" = []
+"session::turn::review_benchmarks::" = []
 "client::tests::" = []
 "validation_admission::tests::" = []
 "context_manager::history::tests::" = []
@@ -96,8 +114,13 @@ helpers = [
 "plan_store::tests::" = []
 "responses_retry::tests::" = []
 "session::rollout_reconstruction_tests::" = []
+"session::tests::context_review_benchmarks::" = []
+"stable_context::" = []
 "session::token_budget::tests::" = []
 "session::token_budget::runtime_tests::" = []
+"session::turn::efficiency_benchmarks::" = []
+"session::mcp::tests::" = []
+"session::step_context::snapshot_deadline_tests::" = []
 "tool_history::tests::" = []
 "git_workspace::tests::" = []
 "context::available_skills_instructions::tests::" = []
@@ -108,6 +131,7 @@ helpers = [
 "stream_events_utils::tests::" = []
 "tools::handlers::multi_agents_spec::tests::" = []
 "tools::handlers::read_file::tests::" = []
+"tools::handlers::list_files::tests::" = []
 "tools::handlers::request_user_input_spec::tests::" = []
 "tools::router::tests::" = []
 
@@ -133,6 +157,8 @@ helpers = [
   "codex-code-mode-host",
   "test_stdio_server",
   "test_streamable_http_server",
+  "codex-windows-sandbox-setup",
+  "codex-command-runner",
 ]
 
 [targets.core_exec_permissions]
@@ -198,6 +224,11 @@ helpers = []
 package = "codex-app-server"
 lib = true
 helpers = []
+
+[targets.exec_server_file_system_windows]
+package = "codex-exec-server"
+test = "file_system_windows"
+helpers = ["codex-windows-sandbox-setup", "codex-command-runner"]
 
 [targets.app_server_initialize]
 package = "codex-app-server"
@@ -561,6 +592,41 @@ tests = [
 ]
 
 # Capability gates are the runtime proofs named by `kd4_features.toml`.
+
+[gates.generation-ceiling-proof]
+description = "No-progress ceiling and productive repair renewal through the sampling loop."
+
+[[gates.generation-ceiling-proof.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "session::turn::tests::logical_generation_budget_allows_regular_limit_and_one_terminal_generation",
+  "session::turn::tests::productive_work_and_owned_polling_preserve_generation_capacity",
+  "session::turn::tests::validation_failure_at_generation_limit_keeps_repair_tools_available",
+]
+
+[gates.verified-runtime-contracts]
+description = "Context-tool contracts, conservative validation evidence, cache settings, and progress renewal."
+
+[[gates.verified-runtime-contracts.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "tools::handlers::get_context_remaining::tests::direct_and_code_mode_results_obey_the_same_schema",
+  "tools::handlers::context_checkpoint::tests::checkpoint_admission_is_profitable_idempotent_and_preserves_failures",
+  "session::turn::tests::registered_new_context_resets_the_next_sampling_request",
+  "session::turn::tests::productive_work_and_owned_polling_preserve_generation_capacity",
+  "client::tests::request_setting_tests::dispatched_request_settings_gate_fixed_prefix_reuse",
+  "client::tests::fixed_prefix_reuse_requires_comparable_setting_digests",
+  "client::tests::encoded_setting_digests_preserve_null_omission_and_incremental_transport",
+  "tool_history::tests::phase_checkpoint_never_expands_a_tiny_selected_result",
+  "tool_history::tests::phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence",
+  "validation_admission::tests::arbitrary_validate_scripts_are_not_classified_by_filename",
+  "validation_admission::tests::conditional_powershell_is_opaque_for_execution_proof",
+  "tools::handlers::unified_exec::tests::unexecuted_powershell_branch_is_not_validation_evidence",
+  "turn_timing::tests::wait_and_tool_output_counters_are_additive",
+  "turn_timing::tests::optimization_activation_decision_counters_are_additive",
+]
 
 [gates.capability-structured-command-execution]
 description = "Script and argv command shapes with untagged legacy compatibility; explicitly tagged legacy input is rejected."

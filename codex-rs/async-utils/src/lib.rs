@@ -59,6 +59,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "verifies cancellation drops a guard owned by the pending future"
+    )]
     async fn returns_err_when_token_cancelled_first() {
         let token = CancellationToken::new();
         let child = token.child_token();

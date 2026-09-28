@@ -823,8 +823,13 @@ impl App {
             AppEvent::StartFileSearch(query) => {
                 self.file_search.on_user_query(query);
             }
-            AppEvent::FileSearchResult { query, matches } => {
-                self.chat_widget.apply_file_search_result(query, matches);
+            AppEvent::FileSearchResult {
+                query,
+                matches,
+                walk_complete,
+            } => {
+                self.chat_widget
+                    .apply_file_search_result(query, matches, walk_complete);
             }
             AppEvent::RefreshRateLimits { origin } => {
                 self.refresh_rate_limits(app_server, origin);

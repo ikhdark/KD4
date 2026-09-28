@@ -227,9 +227,11 @@ fn output_recovery_receipt(req: &ResponsesRequest, call_id: &str) -> Value {
     let raw = raw_custom_tool_output_text(req, call_id);
     raw.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|value| value["output_truncated"] == true
-            && value["artifact_id"].is_string()
-            && value["recovery_tool"] == "read_tool_output")
+        .find(|value| {
+            value["output_truncated"] == true
+                && value["artifact_id"].is_string()
+                && value["recovery_tool"] == "read_tool_output"
+        })
         .unwrap_or_else(|| panic!("missing recoverable output receipt: {raw}"))
 }
 
@@ -445,9 +447,15 @@ async fn predetermined_command_drains_complete_in_one_cell_without_lost_chunks()
     let launch_marker = launch_dir.path().join("launches.txt");
     // Count actual launches independently of the model-facing output projection.
     let command = if cfg!(windows) {
-        format!("[System.IO.File]::AppendAllText('{}', 'x'); [Console]::Out.Write('first'); Start-Sleep -Milliseconds 1800; [Console]::Out.Write('middle'); Start-Sleep -Milliseconds 1800; [Console]::Out.Write('last')", powershell_single_quoted_path(&launch_marker))
+        format!(
+            "[System.IO.File]::AppendAllText('{}', 'x'); [Console]::Out.Write('first'); Start-Sleep -Milliseconds 1800; [Console]::Out.Write('middle'); Start-Sleep -Milliseconds 1800; [Console]::Out.Write('last')",
+            powershell_single_quoted_path(&launch_marker)
+        )
     } else {
-        format!("printf x >> '{}'; printf first; sleep 1.8; printf middle; sleep 1.8; printf last", launch_marker.to_string_lossy().replace('\'', "'\\''"))
+        format!(
+            "printf x >> '{}'; printf first; sleep 1.8; printf middle; sleep 1.8; printf last",
+            launch_marker.to_string_lossy().replace('\'', "'\\''")
+        )
     };
     let script = format!(
         r#"// @exec: {{"yield_time_ms": 5}}
@@ -482,7 +490,11 @@ text(JSON.stringify({{chunks,polls,exit_code:result.exit_code,session_id:result.
         .map(|v| v.as_str().unwrap())
         .collect::<String>();
     assert_eq!(chunks, "firstmiddlelast");
-    assert_eq!(fs::read_to_string(launch_marker)?, "x", "launch exactly once");
+    assert_eq!(
+        fs::read_to_string(launch_marker)?,
+        "x",
+        "launch exactly once"
+    );
     let requests = server
         .received_requests()
         .await
@@ -1445,7 +1457,9 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
     let mut call_batches = vec![
         events[..BUDGET_OUTPUT_CALLS].to_vec(),
         vec![responses::ev_function_call(
-            "budget-checkpoint", "context_checkpoint", &checkpoint.to_string(),
+            "budget-checkpoint",
+            "context_checkpoint",
+            &checkpoint.to_string(),
         )],
     ];
     call_batches.extend(events[BUDGET_OUTPUT_CALLS..].chunks(50).map(<[_]>::to_vec));
@@ -1471,11 +1485,19 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
         assert_eq!(batch.requests().len(), 1);
     }
     let request = final_request.single_request();
-    let checkpoint_output = request.function_call_output_text("budget-checkpoint")
+    let checkpoint_output = request
+        .function_call_output_text("budget-checkpoint")
         .expect("checkpoint output");
     let checkpoint_result: Value = serde_json::from_str(&checkpoint_output)
         .unwrap_or_else(|error| panic!("checkpoint failed: {error}: {checkpoint_output}"));
-    assert_eq!(checkpoint_result["checkpointed_call_ids"], checkpoint["completed_call_ids"], "{checkpoint_output}");
+    assert_eq!(
+        checkpoint_result["checkpointed_call_count"],
+        checkpoint["completed_call_ids"].as_array().unwrap().len(),
+        "{checkpoint_output}"
+    );
+    assert_eq!(checkpoint_result["changed"], true);
+    assert_eq!(checkpoint_result["checkpoint_item_persisted"], true);
+    assert_eq!(checkpoint_result["canonical_history_preserved"], true);
     let body = request.body_json();
     let input = body["input"].as_array().unwrap();
     let outputs = input
@@ -1484,7 +1506,8 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
         .collect::<Vec<_>>();
     assert!(!outputs.is_empty());
     assert_eq!(
-        outputs.len(), BUDGET_FAILURE_CALLS + BUDGET_OUTPUT_CALLS,
+        outputs.len(),
+        BUDGET_FAILURE_CALLS + BUDGET_OUTPUT_CALLS,
         "checkpoint receipts and unresolved dispatch failures must remain visible"
     );
     let total = outputs
@@ -1504,14 +1527,20 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
         .sum::<usize>();
     let uncheckpointed = batches[1].single_request();
     let raw_success_tokens = (0..BUDGET_OUTPUT_CALLS)
-        .map(|index| codex_utils_output_truncation::approx_token_count(
-            &raw_custom_tool_output_text(&uncheckpointed, &format!("budget-output-{index}")),
-        ))
+        .map(|index| {
+            codex_utils_output_truncation::approx_token_count(&raw_custom_tool_output_text(
+                &uncheckpointed,
+                &format!("budget-output-{index}"),
+            ))
+        })
         .sum::<usize>();
     let failure_tokens = (0..BUDGET_FAILURE_CALLS)
-        .map(|index| codex_utils_output_truncation::approx_token_count(
-            &raw_custom_tool_output_text(&request, &format!("budget-{index:03}")),
-        ))
+        .map(|index| {
+            codex_utils_output_truncation::approx_token_count(&raw_custom_tool_output_text(
+                &request,
+                &format!("budget-{index:03}"),
+            ))
+        })
         .sum::<usize>();
     assert!(
         raw_success_tokens + failure_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET,
@@ -1580,11 +1609,14 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
         &server,
         sse(vec![
             responses::ev_function_call(
-                "pressure-checkpoint", "context_checkpoint", &checkpoint.to_string(),
+                "pressure-checkpoint",
+                "context_checkpoint",
+                &checkpoint.to_string(),
             ),
             ev_completed("checkpoint-response"),
         ]),
-    ).await;
+    )
+    .await;
     let projected = responses::mount_sse_once(
         &server,
         sse(vec![
@@ -1598,11 +1630,19 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
         assert_eq!(batch.requests().len(), 1);
     }
     let request = projected.single_request();
-    let checkpoint_output = request.function_call_output_text("pressure-checkpoint")
+    let checkpoint_output = request
+        .function_call_output_text("pressure-checkpoint")
         .expect("checkpoint output");
     let checkpoint_result: Value = serde_json::from_str(&checkpoint_output)
         .unwrap_or_else(|error| panic!("checkpoint failed: {error}: {checkpoint_output}"));
-    assert_eq!(checkpoint_result["checkpointed_call_ids"], checkpoint["completed_call_ids"], "{checkpoint_output}");
+    assert_eq!(
+        checkpoint_result["checkpointed_call_count"],
+        checkpoint["completed_call_ids"].as_array().unwrap().len(),
+        "{checkpoint_output}"
+    );
+    assert_eq!(checkpoint_result["changed"], true);
+    assert_eq!(checkpoint_result["checkpoint_item_persisted"], true);
+    assert_eq!(checkpoint_result["canonical_history_preserved"], true);
     let body = request.body_json();
     let input = body["input"].as_array().unwrap();
     assert_eq!(
@@ -1753,7 +1793,8 @@ async fn output_only_preserves_running_command_and_recovers_middle(
     assert!(!raw.contains("Script failed"), "{raw}");
     assert_eq!(raw.contains("INITIAL_RESULT"), !zero_budget, "{raw}");
     assert!(!raw.contains("DECISIVE_FINAL_RESULT"), "{raw}");
-    let session_id = raw.lines()
+    let session_id = raw
+        .lines()
         .find_map(|line| line.strip_prefix("Running command session_id: "))
         .expect("output-only cells must retain the live handle")
         .parse::<u64>()?;
@@ -1781,8 +1822,10 @@ async fn output_only_preserves_running_command_and_recovers_middle(
     .await;
     test.submit_turn("Collect the remaining output using the returned handle.")
         .await?;
-    assert!(raw_custom_tool_output_text(&observed.single_request(), "call-1")
-        .contains(&format!("Running command session_id: {session_id}")));
+    assert!(
+        raw_custom_tool_output_text(&observed.single_request(), "call-1")
+            .contains(&format!("Running command session_id: {session_id}"))
+    );
     let raw = raw_custom_tool_output_text(&observed.single_request(), "poll");
     assert_eq!(
         raw.matches("DECISIVE_FINAL_RESULT").count(),
@@ -1847,12 +1890,11 @@ const filler = "filler evidence line\n".repeat(4000);
 text(`HEAD\n${filler}OMITTED_CELL_MIDDLE_SENTINEL\n${filler}TAIL`);
 "#;
     let (test, observed) = run_code_mode_turn(&server, "Print the large report.", code).await?;
-    let raw = custom_tool_output_last_non_empty_text(&observed.single_request(), "call-1")
-        .expect("exec output");
+    let request = observed.single_request();
+    let raw = raw_custom_tool_output_text(&request, "call-1");
     assert!(raw.contains("HEAD"), "{raw}");
     assert!(!raw.contains("OMITTED_CELL_MIDDLE_SENTINEL"), "{raw}");
-    let (_, notice) = raw.rsplit_once('\n').expect("recovery notice line");
-    let notice: Value = serde_json::from_str(notice)?;
+    let notice = output_recovery_receipt(&request, "call-1");
     assert_eq!(notice["output_truncated"], true, "{notice}");
     assert_eq!(notice["recovery_tool"], "read_tool_output", "{notice}");
     let artifact_id = notice["artifact_id"]
@@ -2416,10 +2458,10 @@ if (!tool) {
             })
         })
         .expect("exec description should be present");
-    assert!(exec_description.contains("Nested tools: use a present schema"));
+    assert!(exec_description.contains("Reuse current schemas and results"));
     assert!(exec_description.contains("`resolve_tool(name)` to obtain a missing schema"));
     assert!(exec_description.contains("callable with `.name`/`.description`"));
-    assert!(exec_description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+    assert!(exec_description.contains("Filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
     assert!(!exec_description.contains("### `tool_search`"));
     assert!(exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
     assert!(exec_description.contains("execution: \"client\";"));
@@ -3078,7 +3120,7 @@ await new Promise(() => {});
     let output = text_item(&items, 1);
     assert!(output.contains('…'), "{output}");
     assert!(
-        codex_utils_output_truncation::approx_token_count(&output) <= 5,
+        codex_utils_output_truncation::approx_token_count(output) <= 5,
         "{output}"
     );
     assert!(!output.contains("0123456789012345678901234567890123456789"));
@@ -3105,10 +3147,7 @@ throw new Error("boom");
     let items = custom_tool_output_items(&req, "call-1");
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed with cell ID \d+\z"
-        ),
+        concat!(r"(?s)\A", r"Script failed with cell ID \d+\z"),
         text_item(&items, /*index*/ 0),
     );
     assert_regex_match(
@@ -3249,13 +3288,14 @@ text("phase 3");
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
-    assert_eq!(second_items.len(), 1);
+    assert_eq!(second_items.len(), 2);
     let second_output = text_item(&second_items, 0);
     assert_regex_match(
-        r"\AScript running with cell ID \d+ after explicit yield\nphase 2\z",
+        r"\AScript running with cell ID \d+ after explicit yield\z",
         second_output,
     );
     assert_eq!(extract_running_cell_id(second_output), cell_id);
+    assert_eq!(text_item(&second_items, 1), "phase 2");
 
     responses::mount_sse_once(
         &server,
@@ -4001,10 +4041,7 @@ text("phase 2");
     let second_items = function_tool_output_items(&second_request, "call-2");
     assert_eq!(second_items.len(), 1);
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script terminated with cell ID \d+\z"
-        ),
+        concat!(r"(?s)\A", r"Script terminated with cell ID \d+\z"),
         text_item(&second_items, /*index*/ 0),
     );
 
@@ -4553,10 +4590,7 @@ text(circular);
     );
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed with cell ID \d+\z"
-        ),
+        concat!(r"(?s)\A", r"Script failed with cell ID \d+\z"),
         text_item(&items, /*index*/ 0),
     );
     assert!(text_item(&items, /*index*/ 1).contains("Script error:"));
@@ -4705,10 +4739,7 @@ async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
     );
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed with cell ID \d+\z"
-        ),
+        concat!(r"(?s)\A", r"Script failed with cell ID \d+\z"),
         text_item(&items, /*index*/ 0),
     );
     assert_eq!(
@@ -4790,10 +4821,7 @@ image(out);
         "{items:?}"
     );
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"(?:Script running with cell ID \d+)?\z"
-        ),
+        concat!(r"(?s)\A", r"(?:Script running with cell ID \d+)?\z"),
         text_item(&items, /*index*/ 0),
     );
 
@@ -4838,10 +4866,7 @@ image(imageItem);
     );
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"(?:Script running with cell ID \d+)?\z"
-        ),
+        concat!(r"(?s)\A", r"(?:Script running with cell ID \d+)?\z"),
         text_item(&items, /*index*/ 0),
     );
 
@@ -5265,6 +5290,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "ReferenceError",
         "Reflect",
         "RegExp",
+        "remove_store",
         "resolve_tool",
         "Set",
         "String",

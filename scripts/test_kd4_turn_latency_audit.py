@@ -259,6 +259,17 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(report["toolResultInterpretationLatency"]["logicalGenerations"], 1)
         self.assertEqual(report["toolResultInterpretationLatency"]["modelStreamWaitNs"], 123)
 
+    def test_direct_handoff_observation_is_not_derived_from_wait_counts(self):
+        for observed in (None, 0, 3):
+            timing = _timing()
+            if observed is not None:
+                timing["counters"]["provenAvoidedModelRequests"] = observed
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "rollout.jsonl"
+                path.write_text(_event({"type": "task_complete", "turn_id": "turn", "timing": timing}), encoding="utf-8")
+                report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+            self.assertEqual(report["perTurn"][0]["continuationAccounting"]["provenAvoidedModelRequests"], observed)
+
     @staticmethod
     def startup_event(**overrides):
         fields = {
@@ -1526,17 +1537,20 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                 )
         report = json.loads(stdout.getvalue())
         self.assertEqual(exit_code, 0)
-        self.assertEqual(len(report["perTurn"]), 20)
-        self.assertEqual(report["omittedPerTurnRecords"], 1)
+        self.assertEqual(len(report["perTurn"]) + report["omittedPerTurnRecords"], 21)
         self.assertEqual(report["populations"]["all"]["turns"], 21)
         self.assertEqual(
             report["populations"]["all"]["tokens"]["totalTokens"], 21 * 17 * 115
         )
         for turn in report["perTurn"]:
-            self.assertEqual(len(turn["tokenIntervals"]), 16)
-            self.assertEqual(turn["omittedTokenIntervals"], 1)
+            self.assertEqual(
+                len(turn["tokenIntervals"]) + turn["omittedTokenIntervals"], 17
+            )
             self.assertEqual(turn["tokens"]["totalTokens"], 17 * 115)
-        self.assertLess(len(stdout.getvalue().encode("utf-8")), 512 * 1024)
+        self.assertLessEqual(
+            len(stdout.getvalue().rstrip("\n").encode("utf-8")), 32 * 1024
+        )
+        self.assertFalse(report["summaryBudget"]["limitExceeded"])
 
     def test_uuid_cli_resolves_snapshot_and_emits_bounded_execution_loop(self) -> None:
         session_id = "01a018c7-a357-7c11-a7ca-9248dd075f22"
@@ -1662,7 +1676,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(
             report["populations"]["repository_root"], {"turns": 1, "sameAs": "all"}
         )
-        self.assertEqual(report["schemaVersion"], 20)
+        self.assertEqual(report["schemaVersion"], 21)
         breakdown = report["latencyBreakdown"]
         orchestration_breakdown = breakdown["orchestration"]
         self.assertEqual(orchestration_breakdown["exclusiveTotalNs"], 100_000_000)
@@ -1897,6 +1911,197 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(len(repeats), 1)
         self.assertEqual((repeats[0]["previousOrdinal"], repeats[0]["ordinal"]), (4, 5))
         self.assertFalse(repeats[0]["causallyEstablished"])
+
+    def test_audit_closes_its_rollout_snapshot(self):
+        snapshots = []
+        read_snapshot = kd4_turn_latency_audit.read_rollout_snapshot
+
+        def capture(path):
+            snapshot = read_snapshot(path)
+            snapshots.append(snapshot)
+            return snapshot
+
+        with mock.patch.object(
+            kd4_turn_latency_audit, "read_rollout_snapshot", side_effect=capture
+        ):
+            self.audit_rows([_event({"type": "task_started", "turn_id": "open"})])
+        self.assertEqual(len(snapshots), 1)
+        self.assertTrue(snapshots[0].stream.closed)
+
+    def test_native_reads_include_literal_paths_without_searching_selector_text(self):
+        rows = [_event({"type": "task_started", "turn_id": "native"})]
+        calls = [
+            {
+                "type": "function_call",
+                "name": "read_file",
+                "arguments": json.dumps(
+                    {
+                        "path": "src/worker.py",
+                        "selectors": [{"kind": "search", "query": "rg private"}],
+                    }
+                ),
+            },
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": 'await tools.read_file({path: "AGENTS.md"});',
+            },
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": 'await tools.read_file({"path":"scripts/test_worker.py"});',
+            },
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "await tools.read_file({path: dynamicPath});",
+            },
+        ]
+        for index, call in enumerate(calls):
+            rows.extend(
+                [
+                    _response({**call, "call_id": str(index)}, "2026-08-17T00:00:01Z"),
+                    _response(
+                        {
+                            "type": "function_call_output",
+                            "call_id": str(index),
+                            "output": "private contents",
+                        },
+                        "2026-08-17T00:00:02Z",
+                    ),
+                ]
+            )
+        rows.append(
+            _event({"type": "task_complete", "turn_id": "native", "timing": _timing()})
+        )
+        report = self.audit_rows(rows)
+        discovery = report["sourceDiscovery"]
+        self.assertEqual(discovery["readCount"], 4)
+        self.assertEqual(discovery["searchCount"], 0)
+        self.assertEqual(
+            [row["requestedPaths"] for row in discovery["events"]],
+            [["src/worker.py"], ["AGENTS.md"], ["scripts/test_worker.py"], []],
+        )
+        self.assertEqual(discovery["events"][1]["evidence"], ["instructions"])
+        self.assertNotIn("private", json.dumps(discovery))
+        self.assertEqual(report["behaviorMetrics"]["discoveryClassifierVersion"], 2)
+
+    def test_search_scope_uses_operands_not_query_or_option_values(self):
+        discovery = self.audit_commands(
+            [
+                ("rg needle scripts", ""),
+                ("rg -n needle src", ""),
+                ("rg -g '*.py' -e needle src", ""),
+                ("rg --files scripts", ""),
+                ("rg --regexp=needle src", ""),
+                ('rg "" src', ""),
+                ("rg src/worker.py", ""),
+                ("rg needle -g '*.py'", ""),
+            ]
+        )["sourceDiscovery"]
+        self.assertEqual(discovery["broadSearchCount"], 2)
+        self.assertEqual(
+            [row["scope"] for row in discovery["events"]],
+            ["path_scoped"] * 6 + ["repository"] * 2,
+        )
+        self.assertEqual(discovery["events"][6]["queries"], ["src/worker.py"])
+        self.assertEqual(discovery["events"][6]["requestedPaths"], [])
+
+    def test_structured_receipts_ignore_execution_metadata_not_result_changes(self):
+        outputs = []
+        for index, (body, exit_code, complete) in enumerate(
+            [
+                ("src/a.py", 0, True),
+                ("src/a.py", 0, True),
+                ("src/b.py", 0, True),
+                ("src/b.py", 1, True),
+                ("src/b.py", 1, False),
+                ("src/b.py", 1, False),
+            ]
+        ):
+            outputs.append(
+                json.dumps(
+                    {
+                        "chunk_id": str(index),
+                        "wall_time_seconds": index + 0.1,
+                        "exit_code": exit_code,
+                        "output": body,
+                        "output_complete": complete,
+                    }
+                )
+            )
+        discovery = self.audit_commands(
+            [("rg needle src", output) for output in outputs]
+        )["sourceDiscovery"]
+        self.assertEqual(
+            [row["newEvidence"] for row in discovery["events"]],
+            [True, False, True, True, True, False],
+        )
+        self.assertEqual(discovery["evidenceProgressCount"], 4)
+        self.assertEqual(discovery["unchangedEvidenceCount"], 2)
+        self.assertTrue(discovery["events"][4]["outputReduced"])
+        self.assertEqual(
+            discovery["candidateSignalCounts"]["repeated_search_after_reduced_output"],
+            1,
+        )
+
+    def test_summary_accounts_for_every_omitted_discovery_record_and_path(self):
+        report = self.audit_commands(
+            [
+                (
+                    "rg needle scripts",
+                    "\n".join(f"scripts/worker{n}.py" for n in range(10)),
+                )
+            ]
+            * 30
+        )
+        original = json.dumps(report, sort_keys=True)
+        discovery = kd4_turn_latency_audit.bounded_summary(report)["sourceDiscovery"]
+        self.assertEqual(len(discovery["events"]) + discovery["omittedEvents"], 30)
+        self.assertEqual(
+            len(discovery["candidateSignals"]) + discovery["omittedCandidateSignals"],
+            sum(discovery["candidateSignalCounts"].values()),
+        )
+        for row in discovery["events"]:
+            self.assertEqual(len(row["resultPaths"]) + row["omittedResultPaths"], 10)
+        self.assertEqual(json.dumps(report, sort_keys=True), original)
+
+    def test_turn_boundaries_exclude_idle_time_without_losing_tool_batches(self):
+        def boundary(turn, timestamp):
+            return json.dumps(
+                {
+                    "type": "sampling_boundary",
+                    "timestamp": timestamp,
+                    "payload": {"turn_id": turn},
+                }
+            )
+
+        report = self.audit_rows(
+            [
+                _event({"type": "task_started", "turn_id": "a"}),
+                boundary("a", "2026-08-17T00:00:01Z"),
+                *self.paired_call("a", "00:00:02", "00:00:03"),
+                _event(
+                    {"type": "task_complete", "turn_id": "a", "timing": _timing()},
+                    "2026-08-17T00:00:04Z",
+                ),
+                _event(
+                    {"type": "task_started", "turn_id": "b"}, "2026-08-17T01:00:00Z"
+                ),
+                boundary("b", "2026-08-17T01:00:01Z"),
+                *self.paired_call("b", "01:00:02", "01:00:03"),
+                boundary("b", "2026-08-17T01:00:04Z"),
+                _event(
+                    {"type": "task_complete", "turn_id": "b", "timing": _timing()},
+                    "2026-08-17T01:00:05Z",
+                ),
+            ]
+        )
+        loop = report["executionLoop"]
+        self.assertEqual(loop["postToolHandoffNs"], 1_000_000_000)
+        self.assertEqual(loop["samplingToFirstToolCallNs"], 2_000_000_000)
+        self.assertEqual(loop["singleToolCallSamplingPasses"], 2)
+        self.assertEqual(loop["samplingPassesWithTools"], 2)
 
     def test_waiting_input_tail_is_classified_without_blocking_completed_audit(
         self,

@@ -1018,12 +1018,14 @@ mod tests {
         assert_eq!(
             models,
             vec![
-                ("openai.gpt-6-astra", "GPT-6 Astra"),
-                ("openai.gpt-5.5", "GPT-5.5"),
-                ("openai.gpt-5.4", "GPT-5.4"),
+                ("openai.gpt-6-sol", "GPT-6 Sol"),
+                ("openai.gpt-6-astra", "GPT-6-Astra"),
+                ("openai.gpt-6-luna", "GPT-6 Luna"),
                 ("openai.gpt-5.6-sol", "GPT-5.6 Sol"),
                 ("openai.gpt-5.6-terra", "GPT-5.6 Terra"),
                 ("openai.gpt-5.6-luna", "GPT-5.6 Luna"),
+                ("openai.gpt-5.5", "GPT-5.5"),
+                ("openai.gpt-5.4", "GPT-5.4"),
             ]
         );
 
@@ -1038,10 +1040,10 @@ mod tests {
             .find(|preset| preset.is_default)
             .expect("Bedrock catalog should have a default model");
 
-        assert_eq!(default_model.model, "openai.gpt-6-astra");
+        assert_eq!(default_model.model, "openai.gpt-6-sol");
         let astra = manager
             .get_model_info(
-                &default_model.model,
+                "openai.gpt-6-astra",
                 &codex_models_manager::ModelsManagerConfig::default(),
             )
             .await;

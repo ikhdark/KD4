@@ -1498,8 +1498,14 @@ impl ChatWidget {
     }
 
     /// Forward file-search results to the bottom pane.
-    pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
-        self.bottom_pane.on_file_search_result(query, matches);
+    pub(crate) fn apply_file_search_result(
+        &mut self,
+        query: String,
+        matches: Vec<FileMatch>,
+        walk_complete: bool,
+    ) {
+        self.bottom_pane
+            .on_file_search_result(query, matches, walk_complete);
     }
 
     /// Return the markdown body width available to an active stream.

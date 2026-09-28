@@ -7,8 +7,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use codex_app_server_protocol::ClientRequestSerializationScope;
-use futures::future::join_all;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tracing::Instrument;
 
 use crate::connection_rpc_gate::ConnectionRpcGate;
@@ -250,6 +252,7 @@ impl Default for RequestSerializationLimits {
 struct KeyQueues {
     control: VecDeque<QueuedSerializedRequest>,
     ordered: VecDeque<QueuedSerializedRequest>,
+    changed: Arc<Notify>,
 }
 
 impl KeyQueues {
@@ -274,6 +277,7 @@ impl KeyQueues {
         } else {
             self.ordered.push_back(request);
         }
+        self.changed.notify_one();
     }
 }
 
@@ -465,6 +469,7 @@ impl RequestSerializationQueues {
             let retained_bytes = queues.ordered_bytes();
             cancelled_bytes =
                 cancelled_bytes.saturating_add(previous_bytes.saturating_sub(retained_bytes));
+            queues.changed.notify_one();
         }
         state.total_queued -= cancelled;
         state.total_control -= cancelled_control;
@@ -473,58 +478,63 @@ impl RequestSerializationQueues {
     }
 
     async fn drain(self, key: RequestSerializationQueueKey) {
+        let mut running = FuturesUnordered::<BoxFutureUnit>::new();
+        let mut exclusive = false;
         loop {
-            let requests = {
+            let (requests, changed) = {
                 let mut state = self.inner.lock().await;
                 let Some(queues) = state.queues.get_mut(&key) else {
                     return;
                 };
-                // Control traffic runs ahead of queued mutations. Mutations keep strict FIFO
-                // among themselves because they are only ever taken from the ordered lane.
-                let next = queues
-                    .control
-                    .pop_front()
-                    .map(|request| (request, true))
-                    .or_else(|| queues.ordered.pop_front().map(|request| (request, false)));
-                match next {
-                    Some((request, from_control)) => {
-                        let mut popped = 1;
-                        let access = request.access;
-                        let mut requests = vec![request];
-                        if access == RequestSerializationAccess::SharedRead {
-                            while requests.len() < self.limits.max_concurrent_shared_reads
-                                && queues.ordered.front().is_some_and(|request| {
-                                    request.access == RequestSerializationAccess::SharedRead
-                                })
-                            {
-                                let Some(request) = queues.ordered.pop_front() else {
-                                    break;
-                                };
-                                requests.push(request);
-                                popped += 1;
-                            }
-                        }
-                        if !from_control {
-                            state.total_queued -= popped;
-                            state.total_queued_bytes = state.total_queued_bytes.saturating_sub(
-                                requests
-                                    .iter()
-                                    .map(QueuedSerializedRequest::estimated_bytes)
-                                    .fold(0usize, usize::saturating_add),
-                            );
-                        }
-                        requests
-                    }
-                    None => {
-                        state.queues.remove(&key);
-                        return;
-                    }
+                if running.is_empty() && queues.control.is_empty() && queues.ordered.is_empty() {
+                    state.queues.remove(&key);
+                    return;
                 }
+                let changed = Arc::clone(&queues.changed);
+                let mut requests = Vec::new();
+                let mut popped = 0;
+                let mut bytes = 0usize;
+                while !exclusive
+                    && running.len() + requests.len() < self.limits.max_concurrent_shared_reads
+                {
+                    let from_control = !queues.control.is_empty();
+                    let lane = if from_control {
+                        &mut queues.control
+                    } else {
+                        &mut queues.ordered
+                    };
+                    let Some(next) = lane.front() else { break };
+                    // An exclusive request is a FIFO barrier, including for readers
+                    // arriving after it. Otherwise refill free read slots immediately.
+                    if next.access != RequestSerializationAccess::SharedRead
+                        && (!running.is_empty() || !requests.is_empty())
+                    {
+                        break;
+                    }
+                    let Some(request) = lane.pop_front() else { break };
+                    exclusive = request.access != RequestSerializationAccess::SharedRead;
+                    if !from_control {
+                        popped += 1;
+                        bytes = bytes.saturating_add(request.estimated_bytes());
+                    }
+                    requests.push(request);
+                }
+                state.total_queued -= popped;
+                state.total_queued_bytes = state.total_queued_bytes.saturating_sub(bytes);
+                (requests, changed)
             };
-
-            join_all(requests.into_iter().map(|request| request.request.run())).await;
-            if matches!(key, RequestSerializationQueueKey::Control(_)) {
-                self.inner.lock().await.total_control -= 1;
+            for request in requests {
+                running.push(Box::pin(request.request.run()));
+            }
+            tokio::select! {
+                Some(()) = running.next() => {
+                    if matches!(key, RequestSerializationQueueKey::Control(_)) {
+                        self.inner.lock().await.total_control -= 1;
+                    }
+                    exclusive = false;
+                }
+                _ = changed.notified(), if !exclusive
+                    && running.len() < self.limits.max_concurrent_shared_reads => {}
             }
         }
     }

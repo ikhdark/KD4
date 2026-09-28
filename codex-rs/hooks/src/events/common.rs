@@ -56,6 +56,23 @@ pub(crate) fn trimmed_non_empty(text: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn exit_error_message(exit_code: Option<i32>, stderr: &str) -> String {
+    let status = match exit_code {
+        Some(code) => format!("hook exited with code {code}"),
+        None => "hook exited without a status code".to_string(),
+    };
+    match trimmed_non_empty(stderr) {
+        Some(stderr) => format!(
+            "{status}\n{}",
+            codex_utils_output_truncation::formatted_truncate_text(
+                &stderr,
+                codex_utils_output_truncation::TruncationPolicy::Tokens(1_024),
+            )
+        ),
+        None => status,
+    }
+}
+
 pub(crate) fn append_additional_context(
     entries: &mut Vec<HookOutputEntry>,
     additional_contexts_for_model: &mut Vec<String>,

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import desktop_protocol_drift as drift
 
@@ -25,6 +27,13 @@ def schema_with_methods(*methods: str) -> dict:
     }
 
 
+def rejected_request(method: str) -> str:
+    return (
+        f"Invalid request: unknown variant `{method}`, "
+        "expected one of `initialize`, `thread/start`"
+    )
+
+
 class DesktopProtocolDriftTest(unittest.TestCase):
     def test_just_recipe_uses_repository_schema_and_preserves_arguments(self) -> None:
         repo = Path(__file__).resolve().parents[1]
@@ -33,7 +42,7 @@ class DesktopProtocolDriftTest(unittest.TestCase):
             logs = root / "Desktop logs"
             logs.mkdir()
             log = logs / "desktop.log"
-            log.write_text("unknown variant `initialize`", encoding="utf-8")
+            log.write_text(rejected_request("initialize"), encoding="utf-8")
             command = ["just", "desktop-protocol-drift", "--logs", str(logs), "--json"]
 
             def run(*extra: str) -> subprocess.CompletedProcess[str]:
@@ -55,7 +64,7 @@ class DesktopProtocolDriftTest(unittest.TestCase):
                 [{"method": "initialize", "count": 1}],
             )
 
-            log.write_text("unknown variant `audit/missingMethod`", encoding="utf-8")
+            log.write_text(rejected_request("audit/missingMethod"), encoding="utf-8")
             missing = run()
             self.assertEqual(missing.returncode, 1, missing.stderr)
             self.assertEqual(
@@ -88,13 +97,14 @@ class DesktopProtocolDriftTest(unittest.TestCase):
                         "info [host] request_routed",
                         'error [host-app-server-projects] errorMessage="Invalid request: '
                         'unknown variant `project/list`, expected one of `initialize`"',
-                        "error [host] unknown variant `thread/queue/list`",
-                        "error [host] unknown variant `project/list`",
+                        rejected_request("thread/queue/list"),
+                        rejected_request("project/list"),
                     ]
                 ),
                 encoding="utf-8",
             )
-            rejected = drift.rejected_methods([log])
+            scan = drift.rejected_methods([log])
+            rejected = scan.rejected
             missing, present = drift.drift_report(
                 rejected,
                 drift.schema_methods(schema_with_methods("initialize", "project/list")),
@@ -104,6 +114,8 @@ class DesktopProtocolDriftTest(unittest.TestCase):
         self.assertEqual([entry.method for entry in present], ["project/list"])
         self.assertEqual(rejected["project/list"].count, 2)
         self.assertEqual(rejected["thread/queue/list"].count, 1)
+        self.assertEqual(scan.unclassified, {})
+        self.assertEqual(scan.errors, [])
 
     def test_main_exit_code_reflects_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -111,7 +123,7 @@ class DesktopProtocolDriftTest(unittest.TestCase):
             logs = root / "Logs"
             logs.mkdir()
             (logs / "a.log").write_text(
-                "unknown variant `thread/realtime/listVoices`", encoding="utf-8"
+                rejected_request("thread/realtime/listVoices"), encoding="utf-8"
             )
             schema = root / "ClientRequest.json"
             schema.write_text(
@@ -136,7 +148,7 @@ class DesktopProtocolDriftTest(unittest.TestCase):
             logs = root / "Logs"
             logs.mkdir()
             stale = logs / "old.log"
-            stale.write_text("unknown variant `audit/missingMethod`", encoding="utf-8")
+            stale.write_text(rejected_request("audit/missingMethod"), encoding="utf-8")
             month_ago = time.time() - 30 * 86_400
             os.utime(stale, (month_ago, month_ago))
             schema = root / "ClientRequest.json"
@@ -153,6 +165,100 @@ class DesktopProtocolDriftTest(unittest.TestCase):
         self.assertIn(
             "no Desktop logs modified in the last 7 day(s)", stderr.getvalue()
         )
+
+    def test_parameter_and_truncated_rejections_are_not_missing_methods(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            log = root / "desktop.log"
+            log.write_text(
+                "\n".join(
+                    [
+                        'method=thread/start error="Invalid request: unknown variant '
+                        '`newPolicy`, expected one of `never`, `on-request`"',
+                        "unknown variant `truncated/method`",
+                        rejected_request("real/missing"),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            schema = root / "schema.json"
+            schema.write_text(json.dumps(schema_with_methods("thread/start")))
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                code = drift.main(
+                    ["--logs", str(root), "--schema", str(schema), "--json"]
+                )
+            report = json.loads(stdout.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual([m["method"] for m in report["missing"]], ["real/missing"])
+        self.assertEqual(
+            [m["variant"] for m in report["unclassified_rejections"]],
+            ["newPolicy", "truncated/method"],
+        )
+        self.assertEqual(report["scan_errors"], [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows exclusive file sharing")
+    def test_locked_log_is_incomplete_and_preserves_other_findings(self):
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        api.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        api.CreateFileW.restype = ctypes.c_void_p
+        api.CloseHandle.argtypes = [ctypes.c_void_p]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            locked = root / "locked.log"
+            locked.write_text(rejected_request("hidden/method"))
+            (root / "readable.log").write_text(rejected_request("visible/method"))
+            schema = root / "schema.json"
+            schema.write_text(json.dumps(schema_with_methods("initialize")))
+            handle = api.CreateFileW(str(locked), 0x80000000, 0, None, 3, 0x80, None)
+            self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    code = drift.main(
+                        ["--logs", str(root), "--schema", str(schema), "--json"]
+                    )
+            finally:
+                api.CloseHandle(handle)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                [m["method"] for m in report["missing"]], ["visible/method"]
+            )
+            self.assertEqual(len(report["scan_errors"]), 1)
+            self.assertIn(str(locked), report["scan_errors"][0])
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                code = drift.main(
+                    ["--logs", str(root), "--schema", str(schema), "--json"]
+                )
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                [m["method"] for m in report["missing"]],
+                ["hidden/method", "visible/method"],
+            )
+            self.assertEqual(report["scan_errors"], [])
+
+    def test_discovery_failure_is_not_a_clean_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            schema = root / "schema.json"
+            schema.write_text(json.dumps(schema_with_methods("initialize")))
+            with (
+                mock.patch.object(
+                    drift, "recent_log_files", side_effect=PermissionError("denied")
+                ),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                code = drift.main(["--logs", str(root), "--schema", str(schema)])
+            self.assertEqual(code, 2)
+            self.assertIn("could not enumerate Desktop logs", stderr.getvalue())
 
 
 if __name__ == "__main__":

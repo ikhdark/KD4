@@ -2,7 +2,9 @@ use codex_utils_string::approx_tokens_from_byte_count;
 
 use crate::ContextualUserFragment;
 
-const MAX_ADDITIONAL_CONTEXT_VALUE_BYTES: usize = 4_000;
+/// Maximum escaped value size, including any truncation and recovery notice.
+pub const MAX_ADDITIONAL_CONTEXT_VALUE_BYTES: usize = 4_000;
+const MAX_RECOVERY_NOTICE_BYTES: usize = 512;
 const MAX_ADDITIONAL_CONTEXT_SOURCE_LABEL_BYTES: usize = 1_536;
 const SOURCE_LABEL_TRUNCATION_MARKER: &str = "…source truncated…";
 const APPLICATION_CONTEXT_KIND: &str = "application";
@@ -16,11 +18,22 @@ const LEGACY_ADDITIONAL_CONTEXT_START_MARKER_PREFIX: &str = "<external_";
 pub struct AdditionalContextUserFragment {
     key: String,
     value: String,
+    recovery_notice: Option<String>,
 }
 
 impl AdditionalContextUserFragment {
     pub fn new(key: String, value: String) -> Self {
-        Self { key, value }
+        Self {
+            key,
+            value,
+            recovery_notice: None,
+        }
+    }
+
+    /// Include a bounded recovery notice when the original value is truncated.
+    pub fn with_recovery_notice(mut self, notice: String) -> Self {
+        self.recovery_notice = Some(notice);
+        self
     }
 }
 
@@ -53,6 +66,7 @@ impl ContextualUserFragment for AdditionalContextUserFragment {
             EXTERNAL_CONTEXT_KIND,
             &self.key,
             &self.value,
+            self.recovery_notice.as_deref(),
         ))
     }
 }
@@ -61,11 +75,22 @@ impl ContextualUserFragment for AdditionalContextUserFragment {
 pub struct AdditionalContextDeveloperFragment {
     key: String,
     value: String,
+    recovery_notice: Option<String>,
 }
 
 impl AdditionalContextDeveloperFragment {
     pub fn new(key: String, value: String) -> Self {
-        Self { key, value }
+        Self {
+            key,
+            value,
+            recovery_notice: None,
+        }
+    }
+
+    /// Include a bounded recovery notice when the original value is truncated.
+    pub fn with_recovery_notice(mut self, notice: String) -> Self {
+        self.recovery_notice = Some(notice);
+        self
     }
 }
 
@@ -97,6 +122,7 @@ impl ContextualUserFragment for AdditionalContextDeveloperFragment {
             APPLICATION_CONTEXT_KIND,
             &self.key,
             &self.value,
+            self.recovery_notice.as_deref(),
         ))
     }
 }
@@ -198,11 +224,28 @@ fn matches_legacy_external_context(trimmed: &str) -> bool {
     value_and_close.ends_with(&format!("</external_{key}>"))
 }
 
-fn additional_context_body(tag: &str, kind: &str, key: &str, value: &str) -> String {
+pub fn additional_context_value_is_truncated(value: &str) -> bool {
+    let mut escaped_bytes = 0usize;
+    for ch in value.chars() {
+        escaped_bytes += escaped_text_char_len(ch);
+        if escaped_bytes > MAX_ADDITIONAL_CONTEXT_VALUE_BYTES {
+            return true;
+        }
+    }
+    false
+}
+
+fn additional_context_body(
+    tag: &str,
+    kind: &str,
+    key: &str,
+    value: &str,
+    recovery_notice: Option<&str>,
+) -> String {
     format!(
         "<{tag} source=\"{}\" kind=\"{kind}\">\n{}\n</{tag}>",
         escape_attr_value_with_byte_budget(key),
-        escape_text_with_token_budget(value)
+        escape_text_with_token_budget(value, MAX_ADDITIONAL_CONTEXT_VALUE_BYTES, recovery_notice)
     )
 }
 
@@ -236,8 +279,11 @@ fn escape_attr_value_with_byte_budget(value: &str) -> String {
     escaped
 }
 
-fn escape_text_with_token_budget(value: &str) -> String {
-    let max_bytes = MAX_ADDITIONAL_CONTEXT_VALUE_BYTES;
+fn escape_text_with_token_budget(
+    value: &str,
+    max_bytes: usize,
+    recovery_notice: Option<&str>,
+) -> String {
     let escaped_bytes = value.chars().fold(0usize, |total, ch| {
         total.saturating_add(escaped_text_char_len(ch))
     });
@@ -247,9 +293,13 @@ fn escape_text_with_token_budget(value: &str) -> String {
         return escaped;
     }
 
+    let recovery_notice = recovery_notice
+        .map(|notice| escape_text_with_token_budget(notice, MAX_RECOVERY_NOTICE_BYTES, None))
+        .map(|notice| format!("\n{notice}\n"))
+        .unwrap_or_default();
     let mut omitted_tokens = approx_tokens_from_byte_count(escaped_bytes.saturating_sub(max_bytes));
     for _ in 0..4 {
-        let marker = format!("…{omitted_tokens} tokens truncated…");
+        let marker = format!("…{omitted_tokens} tokens truncated…{recovery_notice}");
         let bounds = escaped_bounds(
             value,
             max_bytes.saturating_sub(marker.len()),
@@ -263,7 +313,7 @@ fn escape_text_with_token_budget(value: &str) -> String {
         omitted_tokens = next_omitted_tokens;
     }
 
-    let marker = format!("…{omitted_tokens} tokens truncated…");
+    let marker = format!("…{omitted_tokens} tokens truncated…{recovery_notice}");
     let bounds = escaped_bounds(
         value,
         max_bytes.saturating_sub(marker.len()),

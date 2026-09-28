@@ -219,6 +219,17 @@ class CheckKd4FeaturesTest(unittest.TestCase):
             check_kd4_features._verification_route(verification, self.repo_root),
             "nextest",
         )
+        for decoy in (
+            "// old layout: mod suite;\n",
+            'const EXAMPLE: &str = "mod suite;";\n',
+            '/* #[path = "suite"] mod suite { #[path = "behavior.rs"] mod behavior; } */\n',
+        ):
+            with self.subTest(decoy=decoy):
+                (owner / "tests/decoy.rs").write_text(decoy)
+                self.assertEqual(
+                    check_kd4_features._verification_route(verification, self.repo_root),
+                    "nextest",
+                )
         gates.write_text(
             gates.read_text() + '\n[[gates.alpha.steps]]\ntarget = "beta"\n'
             'tests = ["suite::other::independent_behavior"]\nhelpers = []\n'
@@ -533,6 +544,90 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertEqual(payload["runtimeVerification"], "not_run")
         self.assertIsNone(payload["runtimeVerificationExitCode"])
 
+    def test_conflicting_cli_modes_fail_before_validation(self) -> None:
+        with (
+            mock.patch.object(check_kd4_features, "validate_manifest") as validate,
+            mock.patch.object(check_kd4_features, "validation_session") as session,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as error,
+        ):
+            check_kd4_features.main(
+                ["--static-only", "--run-runtime-verification", "feature"]
+            )
+        self.assertEqual(error.exception.code, 2)
+        validate.assert_not_called()
+        session.assert_not_called()
+
+    def test_relative_repo_root_runs_the_same_proof(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        original = Path.cwd()
+        try:
+            os.chdir(self.repo_root)
+            for root in (str(self.repo_root), "."):
+                with (
+                    self.subTest(root=root),
+                    self.fake_cargo(
+                        "PASS [0.001s] fixture test_feature_is_live"
+                    ) as calls,
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                ):
+                    code = check_kd4_features.main(
+                        ["--repo-root", root, "--manifest", manifest.name, "--json"]
+                    )
+                    self.assertEqual(code, 0, output.getvalue())
+                    payload = json.loads(output.getvalue())
+                    self.assertEqual(
+                        payload["runtimeVerificationResults"][0]["test_identities"],
+                        ["test_feature_is_live"],
+                    )
+                    self.assertEqual(len(calls), 2)
+        finally:
+            os.chdir(original)
+
+    def test_json_unknown_feature_preserves_error_without_launch(self) -> None:
+        with mock.patch.object(subprocess, "run") as run:
+            payload = self.run_json_verification(
+                self.write_manifest(self.valid_evidence()),
+                "--run-runtime-verification",
+                "feature-typo",
+            )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["runtimeVerificationExitCode"], 2)
+        [result] = payload["runtimeVerificationResults"]
+        self.assertEqual(result["outcome"], "not_executed")
+        self.assertIn("feature-typo", result["error"])
+        run.assert_not_called()
+
+    def test_runtime_route_errors_are_structured_in_quiet_mode(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        for remove in (False, True):
+            if remove:
+                manifest.unlink()
+            else:
+                (self.repo_root / "owner/src/lib.rs").write_text("// test removed\n")
+            outcomes = []
+            with (
+                self.subTest(remove=remove),
+                mock.patch.object(subprocess, "run") as run,
+            ):
+                self.assertEqual(
+                    check_kd4_features.execute_runtime_verification(
+                        manifest,
+                        feature_id="feature",
+                        repo_root=self.repo_root,
+                        quiet=True,
+                        outcomes=outcomes,
+                    ),
+                    2,
+                )
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0]["outcome"], "not_executed")
+                self.assertIn(
+                    "could not be read" if remove else "invalid runtime verification",
+                    outcomes[0]["error"],
+                )
+                run.assert_not_called()
+
     def test_rust_verification_batches_through_real_gate_runner(self) -> None:
         # Two capabilities share one proof; both must receive its actual result.
         manifest = self.write_manifest(self.valid_evidence())
@@ -602,6 +697,41 @@ class CheckKd4FeaturesTest(unittest.TestCase):
                     "KD4 TEST RESULT [feature]: passed" in output.getvalue(),
                     expected_exit == 0,
                 )
+
+    def test_failed_batch_keeps_an_independent_features_pass(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        text = manifest.read_text()
+        second = text.split("[[features]]", 1)[1].replace(
+            'id = "feature"', 'id = "second"', 1
+        )
+        second = second.replace('"proof"', '"second"').replace(
+            "test_feature_is_live", "test_second"
+        )
+        manifest.write_text(text + "\n[[features]]" + second)
+        source = self.repo_root / "owner/src/lib.rs"
+        source.write_text(source.read_text() + "\n#[test] fn test_second() {}\n")
+        gates = self.repo_root / "codex-rs/.config/kd4-rust-tests.toml"
+        gates.write_text(
+            gates.read_text()
+            + '\n[gates.second]\n[[gates.second.steps]]\ntarget="fixture_lib"\ntests=["test_second"]\nhelpers=[]\n'
+        )
+        with self.fake_cargo(
+            "PASS [0.001s] fixture test_feature_is_live\nFAIL [0.001s] fixture test_second",
+            100,
+        ) as calls:
+            payload = self.run_json_verification(manifest)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["runtimeVerificationExitCode"], 2)
+        first, second = payload["runtimeVerificationResults"]
+        self.assertEqual(first["outcome"], "passed")
+        self.assertEqual(first["test_identities"], ["test_feature_is_live"])
+        self.assertEqual(first["returncode"], 0)
+        self.assertNotIn("error", first)
+        self.assertEqual(second["outcome"], "failed")
+        self.assertEqual(second["test_identities"], [])
+        self.assertEqual(
+            sum(call[:3] == ["cargo", "nextest", "run"] for call in calls), 1
+        )
 
     def test_busy_core_lane_is_reported_without_launching_anything(self) -> None:
         busy = "Cargo lane 'core-tests' is busy; no cold overflow was started."

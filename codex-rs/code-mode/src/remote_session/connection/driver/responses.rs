@@ -20,6 +20,7 @@ use super::types::InitialResponse;
 use super::types::PendingRequest;
 use super::types::RemoteSession;
 use super::types::UnclaimedExecute;
+use crate::delivery::Delivery;
 
 impl ConnectionDriver {
     pub(super) fn flush_deferred_waits(&mut self) -> bool {
@@ -147,12 +148,20 @@ impl ConnectionDriver {
                     self.requests.insert_initial_response(
                         id,
                         InitialResponse {
-                            generation: session.generation,
+                            session: session.clone(),
                             cell_id: remote_cell_id.clone(),
                             response_tx: initial_response_tx,
                         },
                     );
-                    let started = StartedCell::from_result_receiver(public_id, initial_response_rx);
+                    let started = StartedCell::from_response_future(
+                        public_id,
+                        Box::pin(async move {
+                            initial_response_rx
+                                .await
+                                .map_err(|_| "exec runtime ended unexpectedly".to_string())?
+                                .map(Delivery::claim)
+                        }),
+                    );
                     if cancellation.is_cancelled() || response_tx.is_closed() {
                         return self.terminate_abandoned_cell(session, remote_cell_id);
                     }
@@ -210,6 +219,7 @@ impl ConnectionDriver {
                     }
                     Err(err) => Err(err),
                 };
+                let result = result.map(|outcome| self.sessions.guard_outcome(&session, outcome));
                 let _ = response_tx.send(result);
             }
             PendingRequest::Terminate {
@@ -242,6 +252,8 @@ impl ConnectionDriver {
                         return true;
                     }
                 };
+                let result = self.sessions.restore_before_termination(&session, result);
+                let result = self.sessions.guard_outcome(&session, result);
                 let _ = response_tx.send(Ok(result));
             }
             PendingRequest::ShutdownSession {
@@ -376,9 +388,9 @@ impl ConnectionDriver {
             return false;
         };
         let response = match result {
-            Ok(response) if runtime_response_cell_id(&response) == &initial.cell_id => {
-                Ok(public_runtime_response(initial.generation, response.into()))
-            }
+            Ok(response) if runtime_response_cell_id(&response) == &initial.cell_id => Ok(
+                public_runtime_response(initial.session.generation, response.into()),
+            ),
             Ok(response) => {
                 let reason = format!(
                     "code-mode host returned initial response for cell {} instead of {}",
@@ -391,6 +403,8 @@ impl ConnectionDriver {
             }
             Err(err) => Err(err),
         };
+        let response =
+            response.map(|response| self.sessions.guard_response(&initial.session, response));
         let _ = initial.response_tx.send(response);
         true
     }

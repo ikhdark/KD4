@@ -418,14 +418,20 @@ async fn run_compact_task_inner_impl(
     )
     .await;
     let tool_history = history.tool_history_state();
+    // Collect exact references before freshness or budget projection replaces
+    // historical outputs. The sidecar keeps its existing bounded selection.
+    let artifact_pin_payload = tool_history.artifact_pin_payload_for_items(history.raw_items());
     let turn_input = history.for_compaction_prompt_with_completed_tool_projection(
         &turn_context.model_info.input_modalities,
         workspace_identity.as_ref(),
+        &sess.services.git_workspace,
     );
     let turn_input = strip_compaction_startup_envelopes(turn_input);
-    let artifact_pin_payload = tool_history.artifact_pin_payload_for_items(&turn_input);
     let summary_text_result = if reuse_previous_summary {
-        validated_compaction_summary(previous_summary.as_deref(), "", false)
+        match validated_compaction_summary(previous_summary.as_deref(), "", false) {
+            Ok(summary) => preserve_bounded_summary(&sess, previous_summary.as_deref(), "", summary).await,
+            Err(error) => Err(error),
+        }
     } else {
         let base_instructions = BaseInstructions {
             text: COMPACTION_BASE_INSTRUCTIONS.trim().to_string(),
@@ -484,10 +490,16 @@ async fn run_compact_task_inner_impl(
                         true,
                     ) {
                         Ok(summary_text) => {
+                            let summary = match preserve_bounded_summary(
+                                &sess, previous_summary.as_deref(), &summary_suffix, summary_text,
+                            ).await {
+                                Ok(summary) => summary,
+                                Err(error) => break Err(error),
+                            };
                             // Model output is tentative until its checkpoint is semantically valid.
                             sess.record_conversation_items(turn_context.as_ref(), &output.items)
                                 .await?;
-                            break Ok(summary_text);
+                            break Ok(summary);
                         }
                         Err(error) if !retried_invalid_summary => {
                             // Keep rejected output out of durable and live history. Give the
@@ -555,7 +567,7 @@ async fn run_compact_task_inner_impl(
             }
         }
     };
-    let summary_text = match summary_text_result {
+    let (summary_text, summary_recovery) = match summary_text_result {
         Ok(summary_text) => summary_text,
         Err(error) => {
             sess.track_turn_codex_error(turn_context.as_ref(), &error);
@@ -576,6 +588,11 @@ async fn run_compact_task_inner_impl(
     let mut summary_item =
         compaction_summary_item_with_artifact_pins(summary_for_history, artifact_pin_payload);
     if let Some(text) = text_recovery_sidecar
+        && let ResponseItem::Message { content, .. } = &mut summary_item
+    {
+        content.push(ContentItem::InputText { text });
+    }
+    if let Some(text) = summary_recovery
         && let ResponseItem::Message { content, .. } = &mut summary_item
     {
         content.push(ContentItem::InputText { text });
@@ -785,6 +802,32 @@ fn validated_compaction_summary(
         validate_generated_compaction_summary(None, &summary_text)?;
     }
     Ok(summary_text)
+}
+
+async fn preserve_bounded_summary(
+    sess: &Session,
+    previous_summary: Option<&str>,
+    summary_suffix: &str,
+    summary: String,
+) -> CodexResult<(String, Option<String>)> {
+    let complete = match previous_summary {
+        Some(previous) if summary_suffix.is_empty() => previous.to_string(),
+        Some(previous) => format!("{previous}\n\n{summary_suffix}"),
+        None => format!("{SUMMARY_PREFIX}\n{summary_suffix}"),
+    };
+    // Section reordering alone does not need recovery; omitted or cut lines do.
+    let omitted = complete.lines().map(str::trim).any(|line| {
+        !line.is_empty() && !summary.contains(line)
+    });
+    let recovery = if omitted {
+        Some(persist_compaction_recovery(
+            sess,
+            CanonicalToolResult::json(serde_json::json!({"items": [{"checkpoint": complete}]})),
+        ).await?)
+    } else {
+        None
+    };
+    Ok((summary, recovery))
 }
 
 fn has_nonempty_compaction_section(summary: &str) -> bool {
@@ -1213,7 +1256,8 @@ fn unresolved_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
             .iter()
             .enumerate()
             .filter(|(index, item)| {
-                *index >= start || crate::session::is_unified_exec_resume_invalidation(item)
+                (*index >= start || crate::session::is_unified_exec_resume_invalidation(item))
+                    && !crate::compact_remote::is_remote_compaction_artifact_pins(item)
             })
             .map(|(_, item)| item.clone())
             .collect::<Vec<_>>(),
@@ -1417,10 +1461,18 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
             .collect::<Vec<_>>(),
     );
     retained.retain_mut(|item| {
+        // Regenerated from the origin ledger after retention. Do not charge the old copy to
+        // user intent, and do not classify untagged user JSON as runtime-owned metadata.
+        if crate::compact_remote::is_remote_compaction_artifact_pins(item) {
+            return false;
+        }
+        let is_summary = is_compaction_summary_item(item);
         if let ResponseItem::Message { content, .. } = item {
             content.retain(|part| {
                 !matches!(part, ContentItem::InputText { text }
-                if text.starts_with("<codex_internal_context source=\"compaction_plan\">"))
+                if text.starts_with("<codex_internal_context source=\"compaction_plan\">")
+                    || (is_summary && serde_json::from_str::<serde_json::Value>(text)
+                        .is_ok_and(|value| value["kind"] == "tool_history_artifact_pins")))
             });
             return !content.is_empty();
         }
@@ -1832,12 +1884,22 @@ async fn persist_compaction_recovery(
                 .to_string(),
         ));
     }
-    compaction_text_recovery_sidecar(&canonical, &artifact).ok_or_else(|| {
+    let unavailable = || {
         CodexErr::Fatal(
             "Compaction recovery artifact is unavailable; original history was retained."
                 .to_string(),
         )
-    })
+    };
+    let artifact_id = artifact.artifact_id().ok_or_else(unavailable)?;
+    let sidecar = compaction_text_recovery_sidecar(&canonical, &artifact).ok_or_else(unavailable)?;
+    sess.register_tool_artifact_origin(
+        artifact_id.clone(),
+        format!("compaction:{artifact_id}"),
+        canonical.exact_bytes,
+        canonical.sha256.clone(),
+    )
+    .await;
+    Ok(sidecar)
 }
 
 fn compaction_text_recovery_canonical(

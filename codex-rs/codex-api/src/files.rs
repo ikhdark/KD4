@@ -11,6 +11,7 @@ use codex_http_client::RouteAwareClientPoolError;
 use codex_http_client::RouteAwareRequestBuilder;
 use codex_http_client::RouteAwareRequestError;
 use futures::Stream;
+use futures::TryStreamExt;
 use http::Method;
 use http::StatusCode;
 use http::header::CONTENT_LENGTH;
@@ -249,17 +250,14 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
         })?;
     let file_id = create_payload.file_id.clone();
     let upload_result: Result<UploadedOpenAiFile, OpenAiFileError> = async {
-        let upload_response = http_clients
-            .request(Method::PUT, &create_payload.upload_url)
-            .timeout(openai_file_upload_timeout(file_size_bytes))
-            .header("x-ms-blob-type", "BlockBlob")
-            .header(CONTENT_LENGTH, file_size_bytes)
-            .body_stream(contents)
-            .send()
-            .await
-            .map_err(|source| request_error(&create_payload.upload_url, source))?;
-        let upload_status = upload_response.status();
-        let upload_body = upload_response.text().await.unwrap_or_default();
+        let (upload_status, upload_body) = upload_file_contents(
+            http_clients,
+            &create_payload.upload_url,
+            file_size_bytes,
+            contents,
+            OPENAI_FILE_REQUEST_TIMEOUT,
+        )
+        .await?;
         if !upload_status.is_success() {
             return Err(OpenAiFileError::UnexpectedStatus {
                 url: diagnostic_url(&create_payload.upload_url),
@@ -380,6 +378,56 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
     }
 }
 
+async fn upload_file_contents(
+    http_clients: &RouteAwareClientPool,
+    url: &str,
+    file_size_bytes: u64,
+    contents: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    idle_timeout: Duration,
+) -> Result<(StatusCode, String), OpenAiFileError> {
+    let (progress, last_progress) = tokio::sync::watch::channel(Instant::now());
+    // Bound chunks so transport backpressure is observable even when the caller
+    // supplies an entire file in one Bytes value. Empty chunks are not progress.
+    let contents = contents
+        .map_ok(|bytes| {
+            futures::stream::unfold(bytes, |mut bytes| async move {
+                if bytes.is_empty() {
+                    None
+                } else {
+                    let chunk = bytes.split_to(bytes.len().min(64 * 1024));
+                    Some((Ok::<_, std::io::Error>(chunk), bytes))
+                }
+            })
+        })
+        .try_flatten()
+        .inspect_ok(move |_| {
+            progress.send_replace(Instant::now());
+        });
+    let upload = async {
+        let response = http_clients
+            .request(Method::PUT, url)
+            .timeout(openai_file_upload_timeout(file_size_bytes))
+            .header("x-ms-blob-type", "BlockBlob")
+            .header(CONTENT_LENGTH, file_size_bytes)
+            .body_stream(contents)
+            .send()
+            .await
+            .map_err(|source| request_error(url, source))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Ok((status, body))
+    };
+    tokio::pin!(upload);
+    loop {
+        let deadline = *last_progress.borrow() + idle_timeout;
+        match tokio::time::timeout_at(deadline, &mut upload).await {
+            Ok(result) => return result,
+            Err(_) if Instant::now() < *last_progress.borrow() + idle_timeout => {}
+            Err(_) => return Err(request_error(url, RouteAwareRequestError::Timeout)),
+        }
+    }
+}
+
 fn openai_file_upload_timeout(file_size_bytes: u64) -> Duration {
     OPENAI_FILE_REQUEST_TIMEOUT.saturating_add(Duration::from_secs(
         file_size_bytes.div_ceil(OPENAI_FILE_UPLOAD_MIN_BYTES_PER_SECOND),
@@ -476,6 +524,46 @@ mod tests {
 
     fn base_url_for(server: &MockServer) -> String {
         format!("{}/backend-api", server.uri())
+    }
+
+    #[tokio::test]
+    async fn upload_idle_deadline_resets_for_progress_without_truncating_chunks() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/blob"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let contents = futures::stream::unfold(0, |index| async move {
+            if index == 8 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // Larger than the transport-facing chunk size, with distinct data.
+            Some((Ok(Bytes::from(vec![index as u8; 128 * 1024])), index + 1))
+        });
+        let pool = openai_file_http_client_pool(&codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ));
+        let started = Instant::now();
+        let (status, _) = upload_file_contents(
+            &pool,
+            &format!("{}/blob", server.uri()),
+            1024 * 1024,
+            contents,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(started.elapsed() >= Duration::from_millis(240));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let expected = (0..8)
+            .flat_map(|index| vec![index as u8; 128 * 1024])
+            .collect::<Vec<_>>();
+        assert_eq!(requests[0].body, expected);
     }
 
     struct ScriptedAuth {

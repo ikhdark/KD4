@@ -194,7 +194,8 @@ function Get-LocalPublishBuildRecipeFingerprint {
             }
             $toolArguments = @($tool.Arguments)
             $output = @(& $command.Source @toolArguments 2>$null)
-            $identity[$tool.Name] = @{
+            # Hash serialization must be stable across PowerShell processes.
+            $identity[$tool.Name] = [ordered]@{
                 path = [IO.Path]::GetFullPath($command.Source)
                 versionSha256 = Get-TextSha256 -Value ($output -join "`n")
             }
@@ -204,17 +205,27 @@ function Get-LocalPublishBuildRecipeFingerprint {
         $ErrorActionPreference = $oldErrorActionPreference
         Pop-Location
     }
-    # CARGO_* is Cargo's whole environment configuration surface; the cc/cmake
-    # compiler and flag variables (including cc's HOST_/TARGET_ and per-target
+    # Ignore presentation and overridden publish inputs; retain other CARGO_*
+    # values conservatively. The cc/cmake compiler and flag variables (including
+    # cc's HOST_/TARGET_ and per-target
     # forms) feed the vendored C builds; the rest are compiler, build-script,
     # and compile-time inputs outside those namespaces.
+    $ignoredEnvironmentNames = @("CARGO_TARGET_DIR", "CARGO_TERM_COLOR")
+    if ($NoSccache -or $Profile -eq "release") {
+        $ignoredEnvironmentNames += @(
+            "RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+        )
+    }
     $environmentNames = @(
         Get-ChildItem Env: | Where-Object {
-            $_.Name -like "CARGO_*" -or
-            $_.Name -match "^(HOST_|TARGET_)?(CC|CXX|AR|CFLAGS|CXXFLAGS|ARFLAGS)(_.+)?$" -or
-            $_.Name -like "CMAKE_*" -or
-            $_.Name -like "*V8*" -or
-            $_.Name -in @("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "CODEX_SCCACHE_CACHE_SIZE", "CODEX_RELEASE_VERSION", "SOURCE_DATE_EPOCH")
+            $_.Name -notin $ignoredEnvironmentNames -and (
+                $_.Name -like "CARGO_*" -or
+                $_.Name -match "^(HOST_|TARGET_)?(CC|CXX|AR|CFLAGS|CXXFLAGS|ARFLAGS)(_.+)?$" -or
+                $_.Name -like "CMAKE_*" -or
+                $_.Name -like "*V8*" -or
+                $_.Name -in @("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "CODEX_RELEASE_VERSION", "SOURCE_DATE_EPOCH")
+            )
         } | Select-Object -ExpandProperty Name | Sort-Object -Unique
     )
     foreach ($name in $environmentNames) {
@@ -885,6 +896,14 @@ function Read-BuildStamp {
             return $null
         }
 
+        # PowerShell 7 eagerly decodes JSON timestamps as DateTime, whereas
+        # Windows PowerShell leaves strings. Preserve the round-trip text for
+        # both validation here and the timestamp consumers below.
+        foreach ($property in @($writtenAtUtc, $sourceNewestWriteUtc)) {
+            if ($null -ne $property -and $property.Value -is [DateTime]) {
+                $property.Value = $property.Value.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
+            }
+        }
         [void][DateTime]::ParseExact(
             [string]$writtenAtUtc.Value,
             "o",
@@ -1069,7 +1088,7 @@ function Write-BuildStamp {
         $utf8WithoutBom = [Text.UTF8Encoding]::new($false)
         [IO.File]::WriteAllText($temporaryPath, ($stamp | ConvertTo-Json -Compress), $utf8WithoutBom)
         if (Test-Path -LiteralPath $StampPath -PathType Leaf) {
-            [IO.File]::Replace($temporaryPath, $StampPath, $null)
+            [IO.File]::Replace($temporaryPath, $StampPath, [System.Management.Automation.Language.NullString]::Value)
         }
         else {
             [IO.File]::Move($temporaryPath, $StampPath)
@@ -1229,6 +1248,21 @@ function Write-VersionProofLinesBlock {
     Write-ProofLine "$($Prefix)Dirty" (Get-VersionDetail -VersionLines $VersionLines -Name "dirty")
     Write-ProofLine "$($Prefix)Profile" (Get-VersionDetail -VersionLines $VersionLines -Name "profile")
     Write-ProofLine "$($Prefix)Built" (Get-VersionDetail -VersionLines $VersionLines -Name "built")
+}
+
+function Assert-SourceBundleVersion {
+    param(
+        [string[]]$VersionLines,
+        [string]$ExpectedVersion
+    )
+
+    if (-not (Test-VersionProofAvailable -VersionLines $VersionLines)) {
+        throw "Source bundle executable failed --version verification."
+    }
+    $versionMatch = [regex]::Match($VersionLines[0], '^codex(?:-cli)?\s+(\S+)\s*$')
+    if (-not $versionMatch.Success -or $versionMatch.Groups[1].Value -cne $ExpectedVersion) {
+        throw "Source bundle version mismatch: expected $ExpectedVersion, got '$($VersionLines[0])'."
+    }
 }
 
 function Write-VersionProofBlock {
@@ -2369,8 +2403,13 @@ function Set-ProcessEnvironmentVariable {
         [object]$Value
     )
 
-    $environmentValue = if ($null -eq $Value) { $null } else { [string]$Value }
-    [System.Environment]::SetEnvironmentVariable($Name, $environmentValue, "Process")
+    if ($null -eq $Value) {
+        # Binding null to the string parameter becomes an empty variable on
+        # modern .NET. Remove it explicitly, without collapsing a real "".
+        Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+        return
+    }
+    [System.Environment]::SetEnvironmentVariable($Name, [string]$Value, "Process")
 }
 
 function Enable-SccacheForPublish {
@@ -2388,6 +2427,8 @@ function Enable-SccacheForPublish {
         }
         Set-ProcessEnvironmentVariable -Name "RUSTC_WRAPPER" -Value $null
         Set-ProcessEnvironmentVariable -Name "CARGO_BUILD_RUSTC_WRAPPER" -Value $null
+        Set-ProcessEnvironmentVariable -Name "RUSTC_WORKSPACE_WRAPPER" -Value $null
+        Set-ProcessEnvironmentVariable -Name "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER" -Value $null
         Set-ProcessEnvironmentVariable -Name "SCCACHE_BASEDIR" -Value $null
         Set-ProcessEnvironmentVariable -Name "SCCACHE_CACHE_SIZE" -Value $null
         Write-ProofLine "rustcWrapper" "<none: $reason>"
@@ -2913,6 +2954,7 @@ function Invoke-CodexBuild {
             $cargoConfigLines = [System.Collections.Generic.List[string]]::new()
             $cargoConfigLines.Add("[build]")
             $cargoConfigLines.Add("rustc-wrapper = `"`"")
+            $cargoConfigLines.Add("rustc-workspace-wrapper = `"`"")
             [System.IO.File]::WriteAllText($noSccacheCargoConfigPath, ([string]::Join("`n", $cargoConfigLines) + "`n"))
             $cargoConfigArgs = @("--config", $noSccacheCargoConfigPath)
         }
@@ -2954,6 +2996,8 @@ function Invoke-CodexBuild {
         SCCACHE_CACHE_SIZE = $env:SCCACHE_CACHE_SIZE
         RUSTC_WRAPPER = $env:RUSTC_WRAPPER
         CARGO_BUILD_RUSTC_WRAPPER = $env:CARGO_BUILD_RUSTC_WRAPPER
+        RUSTC_WORKSPACE_WRAPPER = $env:RUSTC_WORKSPACE_WRAPPER
+        CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER = $env:CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
     }
     $previousTargetDir = $env:CARGO_TARGET_DIR
     $previousLinkerEnv = @{
@@ -3604,7 +3648,11 @@ if ($TestRun) {
     Write-ProofLine "sourceCodeModeHostSha256" (Get-FileSha256 $SourceCodeModeHostExe)
     Write-ProofLine "sourceWindowsSandboxSetupSha256" (Get-FileSha256 $SourceWindowsSandboxSetupExe)
     Write-ProofLine "sourceCommandRunnerSha256" (Get-FileSha256 $SourceCommandRunnerExe)
-    Write-VersionProofBlock -Prefix "source" -Path $SourceExe
+    $testVersionLines = @(Get-VersionProofLines -Path $SourceExe)
+    Write-VersionProofLinesBlock -Prefix "source" -VersionLines $testVersionLines
+    if (-not (Test-VersionProofAvailable -VersionLines $testVersionLines)) {
+        throw "Test run built Codex binary failed --version verification: $($testVersionLines[0])"
+    }
     if ($RunDoctor) {
         Invoke-DoctorForPublish -TargetPath $SourceExe
     }
@@ -3656,7 +3704,11 @@ if (-not (Test-Path -LiteralPath $SourceCommandRunnerExe -PathType Leaf)) {
 else {
     Write-ProofLine "sourceCommandRunnerMissing" "false"
 }
-Write-VersionProofBlock -Prefix "source" -Path $SourceExe
+$sourceVersionLines = @(Get-VersionProofLines -Path $SourceExe)
+Write-VersionProofLinesBlock -Prefix "source" -VersionLines $sourceVersionLines
+if ($null -ne $sourceBundle) {
+    Assert-SourceBundleVersion -VersionLines $sourceVersionLines -ExpectedVersion $sourceBundle.Version
+}
 Write-ProofLine "targetPath" $targetPath
 Write-ProofLine "codeModeHostTargetPath" $codeModeHostTargetPath
 Write-ProofLine "windowsSandboxSetupTargetPath" $windowsSandboxSetupTargetPath
@@ -4139,6 +4191,9 @@ try {
     Write-VersionProofLinesBlock -Prefix "target" -VersionLines $targetVersionLines
     if (-not (Test-VersionProofAvailable -VersionLines $targetVersionLines)) {
         throw "Published Codex binary failed --version verification: $($targetVersionLines[0])"
+    }
+    if ($null -ne $sourceBundle) {
+        Assert-SourceBundleVersion -VersionLines $targetVersionLines -ExpectedVersion $sourceBundle.Version
     }
     Write-ProofLine "postPublishVerify" "version ok"
     $targetSha256 = Get-FileSha256 $targetPath

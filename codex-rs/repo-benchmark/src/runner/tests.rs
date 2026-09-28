@@ -134,6 +134,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         "kd4_timing_analysis.py",
         "kd4_first_useful_action_analysis.py",
         "rollout_snapshot.py",
+        "atomic_json.py",
     ]
     .into_iter()
     .map(|name| {

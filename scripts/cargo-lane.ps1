@@ -831,20 +831,63 @@ function Add-PathPrefix {
 
 function Copy-UserCargoConfig {
     param(
-        [string]$CargoHome
+        [string]$CargoHome,
+        [string]$SourceCargoHome
     )
 
     $configPath = Join-Path $CargoHome "config.toml"
-    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        return $configPath
+    if ([string]::IsNullOrWhiteSpace($SourceCargoHome)) {
+        if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) { return $configPath }
+        $SourceCargoHome = Join-Path $env:USERPROFILE ".cargo"
     }
-    if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
-        return $configPath
+    $SourceCargoHome = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($SourceCargoHome)
+    $sourceConfig = Join-Path $SourceCargoHome "config"
+    if (-not (Test-Path -LiteralPath $sourceConfig -PathType Leaf)) {
+        $sourceConfig = Join-Path $SourceCargoHome "config.toml"
     }
+    if ((Get-NormalizedCargoLanePath $sourceConfig) -ieq (Get-NormalizedCargoLanePath $configPath)) { return $configPath }
 
-    $sourceConfig = Join-Path $env:USERPROFILE ".cargo\config.toml"
+    $sourceBytes = $null
+    $sourceHash = $null
     if (Test-Path -LiteralPath $sourceConfig -PathType Leaf) {
-        Copy-Item -LiteralPath $sourceConfig -Destination $configPath -Force
+        $sourceBytes = [IO.File]::ReadAllBytes($sourceConfig)
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $sourceHash = [BitConverter]::ToString($sha256.ComputeHash($sourceBytes)).Replace("-", "") }
+        finally { $sha256.Dispose() }
+    }
+    $markerPath = Join-Path $CargoHome ".codex-config-source.json"
+    $previous = $null
+    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+        try { $previous = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json }
+        catch { $previous = $null }
+    }
+    $previousHash = if ($null -ne $previous -and $null -ne $previous.PSObject.Properties["sha256"]) { [string]$previous.sha256 } else { $null }
+    $targetHash = $null
+    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        $target = Get-Item -LiteralPath $configPath -Force
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $targetHash = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($configPath))).Replace("-", "") }
+        finally { $sha256.Dispose() }
+        # An old unmarked copy is safe to adopt only when it still equals its
+        # source. Never overwrite a user's independently edited lane config.
+        if (($target.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            ($targetHash -cne $previousHash -and $targetHash -cne $sourceHash)) {
+            Write-Warning "Preserving independently managed isolated Cargo config '$configPath'; source is '$sourceConfig'."
+            return $configPath
+        }
+    }
+    if ($null -eq $sourceBytes) {
+        if ($null -ne $targetHash -and $targetHash -ceq $previousHash) {
+            Remove-Item -LiteralPath $configPath -Force
+            Remove-Item -LiteralPath $markerPath -Force
+        }
+        return $configPath
+    }
+    if ($targetHash -cne $sourceHash) {
+        [IO.File]::WriteAllBytes($configPath, $sourceBytes)
+    }
+    if ($previousHash -cne $sourceHash) {
+        [IO.File]::WriteAllText($markerPath, (@{ sha256 = $sourceHash } | ConvertTo-Json -Compress))
     }
     return $configPath
 }
@@ -852,10 +895,11 @@ function Copy-UserCargoConfig {
 function Enable-SccacheForCargoHome {
     param(
         [string]$CargoHome,
+        [string]$SourceCargoHome,
         [string]$RepoRoot
     )
 
-    $null = Copy-UserCargoConfig -CargoHome $CargoHome
+    $null = Copy-UserCargoConfig -CargoHome $CargoHome -SourceCargoHome $SourceCargoHome
 
     if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
         return
@@ -879,7 +923,8 @@ function Enable-SccacheForLane {
 function Get-CargoLaneOwnedCommand {
     param(
         [string]$TargetDir,
-        [string[]]$CommandArgs
+        [string[]]$CommandArgs,
+        [switch]$PrepareSccache
     )
 
     # Run lane work under scripts/process_owner.py, as rust_build_status.py
@@ -898,15 +943,15 @@ function Get-CargoLaneOwnedCommand {
     if ($command.CommandType -eq [Management.Automation.CommandTypes]::ExternalScript) {
         $owned = @((Get-Process -Id $PID).Path, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File") + $owned
     }
+    $prepareArgs = if ($PrepareSccache) { @("--prepare-sccache") } else { @() }
     return @(
         $python.Source,
         (Join-Path $PSScriptRoot "process_owner.py"),
         "--parent-pid",
         [string]$PID,
         "--cleanup-failed-marker",
-        (Join-Path $TargetDir ".lane-cleanup-unconfirmed"),
-        "--"
-    ) + $owned
+        (Join-Path $TargetDir ".lane-cleanup-unconfirmed")
+    ) + $prepareArgs + @("--") + $owned
 }
 
 function Update-CargoLaneLastUsed {
@@ -945,18 +990,23 @@ if ($commandArgs.Count -eq 1 -and [string]::IsNullOrWhiteSpace($commandArgs[0]))
 # names the same directory from either entrypoint.
 $requestedLane = $Lane
 $activeLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
+$excludedLaneNames = if ([string]::IsNullOrWhiteSpace($env:CODEX_CARGO_LANE_ACTIVE_NAMES)) { @() } else { $activeLaneNames }
 $candidateLane = if ($requestedLane -ceq "auto") { Get-AffinityLaneBase -CommandArgs $commandArgs } else { $requestedLane }
 # Affinity names come from command text; hold them to the explicit-name rules.
 Assert-CargoLaneName -Lane $candidateLane
 $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
 $didPushLocation = $false
-$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames -PreferWarm:($requestedLane -ceq "auto")
+# OS observations may become idle while waiting for coordination. Reservation
+# rechecks their locks; only explicit administrative exclusions stay excluded.
+$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $excludedLaneNames -PreferWarm:($requestedLane -ceq "auto")
 try {
     $resolvedLane = $reservation.Lane
     $targetDir = $reservation.TargetDir
     Push-Location $rustRoot
     $didPushLocation = $true
     $commandArgs = @(Add-CargoTargetDirArgument -CommandArgs $commandArgs -TargetDir $targetDir)
+    # Arbitrary wrappers are not shell-rewritten: they must pass this existing
+    # reservation value to each nested Cargo invocation as --target-dir.
     $env:CODEX_CARGO_LANE_TARGET_DIR = $targetDir
     if ($requestedLane -cne "auto" -and $resolvedLane -ne $requestedLane) {
         Write-Warning "Requested Cargo lane '$requestedLane' is busy; using '$resolvedLane'."
@@ -992,12 +1042,13 @@ try {
 
         $cargoHome = Join-Path $env:LOCALAPPDATA "cargo-lanes\codexKD\$resolvedLane"
         New-Item -ItemType Directory -Force -Path $cargoHome | Out-Null
+        $sourceCargoHome = $env:CARGO_HOME
         $env:CARGO_HOME = $cargoHome
 
         if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
             Add-PathPrefix (Join-Path $env:USERPROFILE ".cargo\bin")
         }
-        Enable-SccacheForCargoHome -CargoHome $cargoHome -RepoRoot $repoRoot
+        Enable-SccacheForCargoHome -CargoHome $cargoHome -SourceCargoHome $sourceCargoHome -RepoRoot $repoRoot
     }
     else {
         Enable-SccacheForLane -RepoRoot $repoRoot
@@ -1036,7 +1087,7 @@ try {
     Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
     # Invoke at script level so the command writes straight to this host's
     # output handles instead of being captured as function output.
-    $owned = @(Get-CargoLaneOwnedCommand -TargetDir $targetDir -CommandArgs $commandArgs)
+    $owned = @(Get-CargoLaneOwnedCommand -TargetDir $targetDir -CommandArgs $commandArgs -PrepareSccache)
     $program = $owned[0]
     $arguments = @($owned | Select-Object -Skip 1)
     & $program @arguments
