@@ -90,7 +90,7 @@ ratatui-macros = { workspace = true }
 regex-lite = { workspace = true }
 rmcp = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 shlex = { workspace = true }
@@ -153,8 +153,6 @@ objc2-foundation = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-app_test_support = { workspace = true }
-codex-cli = { workspace = true }
 codex-mcp = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 codex-utils-pty = { workspace = true }

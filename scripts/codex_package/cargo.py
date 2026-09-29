@@ -630,7 +630,7 @@ def reject_rustflags_overrides(env: dict[str, str]) -> None:
 
 
 def set_sccache_env(env: dict[str, str]) -> None:
-    env["SCCACHE_BASEDIR"] = str(REPO_ROOT.resolve())
+    env["SCCACHE_BASEDIRS"] = str(REPO_ROOT.resolve())
     env["SCCACHE_CACHE_SIZE"] = shared_rust_tool_env.sccache_cache_size(env)
 
 

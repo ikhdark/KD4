@@ -558,10 +558,10 @@ async fn windows_snapshot_timeout_terminates_descendants() -> Result<()> {
             .collect::<Vec<_>>(),
     );
     let root_script = format!(
-        "$null = Start-Process -FilePath 'powershell.exe' \
+        "$child = Start-Process -FilePath 'powershell.exe' -PassThru \
              -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant_script}') \
              -WindowStyle Hidden; \
-         Set-Content -LiteralPath '{}' -Value ready; \
+         Set-Content -Encoding ascii -LiteralPath '{}' -Value $child.Id; \
          Start-Sleep -Seconds 60",
         powershell_single_quote(&ready_marker.to_string_lossy())
     );
@@ -581,7 +581,8 @@ async fn windows_snapshot_timeout_terminates_descendants() -> Result<()> {
         ready_marker.exists(),
         "snapshot root did not launch its descendant before timing out"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let pid = std::fs::read_to_string(&ready_marker)?.trim().parse()?;
+    codex_utils_pty::test_support::wait_for_process_exit(pid, Duration::from_secs(2)).await?;
     assert!(
         !survival_marker.exists(),
         "snapshot descendant survived the timeout"

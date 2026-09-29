@@ -41,13 +41,13 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     delete_global(scope, global, "SharedArrayBuffer")?;
     delete_global(scope, global, "WebAssembly")?;
     install_error_serialization(scope)?;
+    super::output_projection::install(scope)?;
 
     let enabled_tools = scope
         .get_slot::<RuntimeState>()
         .map(|state| Arc::clone(&state.enabled_tools))
         .unwrap_or_default();
     let tools = build_tools_object(scope, &enabled_tools.tools)?;
-    let all_tools = build_all_tools_value(scope, &enabled_tools.tools)?;
     let all_tool_names = build_all_tool_names_value(scope, &enabled_tools.tools)?;
     let resolve_tool = helper_function(scope, "resolve_tool", resolve_tool_callback)?;
     let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
@@ -62,7 +62,11 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     let exit = helper_function(scope, "exit", exit_callback)?;
 
     set_global(scope, global, "tools", tools.into())?;
-    set_global(scope, global, "ALL_TOOLS", all_tools)?;
+    let all_tools_key = v8::String::new(scope, "ALL_TOOLS")
+        .ok_or_else(|| "failed to allocate ALL_TOOLS key".to_string())?;
+    if global.set_lazy_data_property(scope, all_tools_key.into(), all_tools_callback) != Some(true) {
+        return Err("failed to install lazy ALL_TOOLS".to_string());
+    }
     set_global(scope, global, "ALL_TOOL_NAMES", all_tool_names)?;
     set_global(scope, global, "resolve_tool", resolve_tool.into())?;
     set_global(scope, global, "clearTimeout", clear_timeout.into())?;
@@ -247,6 +251,27 @@ fn build_tools_object<'s>(
     Ok(tools)
 }
 
+fn all_tools_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _key: v8::Local<v8::Name>,
+    _args: v8::PropertyCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let enabled_tools = scope.get_slot::<RuntimeState>()
+        .map(|state| Arc::clone(&state.enabled_tools)).unwrap_or_default();
+    match build_all_tools_value(scope, &enabled_tools.tools) {
+        Ok(value) => retval.set(value),
+        Err(error) => throw_type_error(scope, &error),
+    }
+}
+
+fn shared_description<'s>(scope: &mut v8::PinScope<'s, '_>, description: &str) -> Result<v8::Local<'s, v8::String>, String> {
+    // Internalization shares description storage between callable metadata and
+    // the optional discovery array within this cell's isolate.
+    v8::String::new_from_utf8(scope, description.as_bytes(), v8::NewStringType::Internalized)
+        .ok_or_else(|| "failed to allocate tool description".to_string())
+}
+
 fn build_all_tools_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     enabled_tools: &[EnabledToolMetadata],
@@ -261,8 +286,7 @@ fn build_all_tools_value<'s>(
         let item = v8::Object::new(scope);
         let name = v8::String::new(scope, &tool.global_name)
             .ok_or_else(|| "failed to allocate ALL_TOOLS name".to_string())?;
-        let description = v8::String::new(scope, &tool.description)
-            .ok_or_else(|| "failed to allocate ALL_TOOLS description".to_string())?;
+        let description = shared_description(scope, &tool.description)?;
 
         if item.set(scope, name_key.into(), name.into()) != Some(true) {
             return Err("failed to set ALL_TOOLS name".to_string());
@@ -300,10 +324,11 @@ fn tool_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     tool_index: usize,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
-    let tool = scope
+    let enabled_tools = scope
         .get_slot::<RuntimeState>()
-        .and_then(|state| state.enabled_tools.get(tool_index))
-        .cloned()
+        .map(|state| Arc::clone(&state.enabled_tools))
+        .ok_or_else(|| "missing enabled tools".to_string())?;
+    let tool = enabled_tools.get(tool_index)
         .ok_or_else(|| "missing enabled tool".to_string())?;
     let index =
         u32::try_from(tool_index).map_err(|_| "tool callback index exceeds u32".to_string())?;
@@ -319,8 +344,7 @@ fn tool_function<'s>(
         .ok_or_else(|| "failed to allocate tool name".to_string())?;
     function.set_name(name);
     set_global(scope, metadata, "name", name.into())?;
-    let description = v8::String::new(scope, &tool.description)
-        .ok_or_else(|| "failed to allocate tool description".to_string())?;
+    let description = shared_description(scope, &tool.description)?;
     set_global(scope, metadata, "description", description.into())?;
     set_global(scope, function.into(), "description", description.into())?;
     // Keep JSON discovery receipts compatible while allowing direct invocation.

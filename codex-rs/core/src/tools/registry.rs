@@ -3046,6 +3046,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             &envelope.sections,
             &canonical.json_pointers,
             applied_token_limit,
+            Some(&canonical),
         )
         .await;
     let base_envelope = envelope.clone();
@@ -3366,6 +3367,7 @@ async fn drain_predetermined_artifact_selectors(
     sections: &[ToolProjectionSection],
     canonical_json_pointers: &BTreeMap<String, CanonicalJsonPointer>,
     token_ceiling: usize,
+    producer: Option<&CanonicalToolResult>,
 ) -> (
     Vec<Value>,
     Option<TurnTimingDeterministicContinuationReceipt>,
@@ -3387,15 +3389,22 @@ async fn drain_predetermined_artifact_selectors(
                 }),
         )
         .collect::<Vec<_>>();
-    let Ok((result, _reused)) = read_tool_output_selectors_with_ceiling_and_reuse(
-        codex_home,
-        thread_id,
-        artifact_id,
-        selectors.clone(),
-        token_ceiling,
-    )
-    .await
-    else {
+    let selection = if let Some(canonical) = producer
+        && canonical.complete
+        && canonical.sha256 == state_revision
+        && canonical.unavailable_ranges.is_empty()
+    {
+        crate::tools::command_output_artifact::select_producer_snapshot(
+            canonical, artifact_id, selectors.clone(), token_ceiling,
+        )
+    } else {
+        read_tool_output_selectors_with_ceiling_and_reuse(
+            codex_home, thread_id, artifact_id, selectors.clone(), token_ceiling,
+        )
+        .await
+        .map(|(result, _)| result)
+    };
+    let Ok(result) = selection else {
         return (Vec::new(), None);
     };
     if !result.complete
@@ -3501,6 +3510,7 @@ async fn drain_predetermined_artifact_ranges(
         sections,
         &BTreeMap::new(),
         codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
+        None,
     )
     .await
 }

@@ -906,7 +906,7 @@ mod request_setting_tests {
     ) -> ModelRequestMeasurements {
         let encoded = dispatched.then(|| serde_json::to_vec(&request).unwrap().into());
         let prompt = Prompt {
-            input: request.input.clone(),
+            input: Arc::clone(&request.input),
             prompt_provenance: history_test_provenance(&request),
             base_instructions: BaseInstructions {
                 text: request.instructions.clone(),
@@ -1784,7 +1784,7 @@ fn websocket_property_fingerprint_tracks_every_reuse_property() {
 }
 
 #[test]
-fn websocket_verified_current_history_becomes_the_next_baseline() {
+fn websocket_verified_prefix_survives_appended_context_manifest_change() {
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
     let first = history_test_request(vec![history_test_item("first", None)]);
@@ -1806,7 +1806,7 @@ fn websocket_verified_current_history_becomes_the_next_baseline() {
         .prepare_websocket_request(
             ResponseCreateWsRequest::from(&current),
             &current,
-            [1; 32],
+            [2; 32],
             &[],
             None,
         )
@@ -1819,8 +1819,9 @@ fn websocket_verified_current_history_becomes_the_next_baseline() {
     assert_eq!(prepared.input.as_ref(), &[history_test_item("new", None)]);
     assert!(fallback.is_none());
     assert!(proof.is_some());
-    session.remember_verified_request_history(&current, [1; 32], proof);
+    session.remember_verified_request_history(&current, [2; 32], proof);
     let baseline = session.websocket_session.last_request_history.unwrap();
+    assert_eq!(baseline.stable_context_fingerprint, [2; 32]);
     assert_eq!(
         baseline.request_prefix,
         CanonicalPrefixHash::from_items(&current.input).unwrap()
@@ -2740,6 +2741,46 @@ async fn responses_lite_orders_base_and_tools_before_history() {
     let mut expected_history_item = prompt.input.last().cloned().expect("history item");
     expected_history_item.clear_internal_chat_message_metadata_passthrough();
     assert_eq!(request.input.last(), Some(&expected_history_item));
+}
+
+#[tokio::test]
+async fn terminal_request_disables_calls_without_changing_cached_tools() {
+    let client = test_model_client(SessionSource::Cli);
+    let setup = client.current_client_setup().await.unwrap();
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        None,
+        format!("{}:0", client.state.thread_id),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    for lite in [false, true] {
+        let mut model = test_model_info();
+        model.use_responses_lite = lite;
+        let mut prompt = request_schema_cache_test_prompt();
+        prompt.parallel_tool_calls = true;
+        let build = |prompt: &Prompt| {
+            client
+                .build_responses_request(
+                    &setup.api_provider,
+                    prompt,
+                    &model,
+                    None,
+                    codex_protocol::config_types::ReasoningSummary::None,
+                    None,
+                    &metadata,
+                )
+                .unwrap()
+        };
+        let ordinary = build(&prompt);
+        prompt.tool_calls_disabled = true;
+        let terminal = build(&prompt);
+        assert_eq!(ordinary.tool_choice, "auto");
+        assert_eq!(terminal.tool_choice, "none");
+        assert_eq!(ordinary.tools, terminal.tools);
+        assert_eq!(ordinary.input, terminal.input);
+        assert_eq!(ordinary.parallel_tool_calls, terminal.parallel_tool_calls);
+    }
 }
 
 fn test_model_provider() -> SharedModelProvider {

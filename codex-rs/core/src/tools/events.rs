@@ -9,7 +9,6 @@ use crate::tools::tool_dispatch_trace::active_tool_dispatch_timing;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::AttributionConfidence;
 use codex_apply_patch::AppliedPatchDelta;
-use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::error::SandboxErr;
@@ -903,31 +902,22 @@ pub(crate) async fn begin_exec_mutation_evidence(
         return;
     }
 
-    let repo_root = get_git_repo_root(cwd.as_path()).unwrap_or_else(|| cwd.as_path().to_path_buf());
+    let repo_root = ctx.session.services.git_workspace.resolve_workspace_root(cwd.as_path())
+        .await.ok().flatten().unwrap_or_else(|| cwd.as_path().to_path_buf());
     let repo_paths = paths
         .iter()
         .filter_map(|path| normalize_absolute_repo_path(&repo_root, path).ok())
         .collect::<Vec<_>>();
-    let mut begun_paths = Vec::new();
-    for path in repo_paths {
-        match store
-            .begin_mutation(
-                binding.attempt_id,
-                &repo_root,
-                path.clone(),
-                AttributionConfidence::Definitive,
-            )
-            .await
-        {
-            Ok(_) => begun_paths.push(path),
-            Err(error) => tracing::warn!(
-                %error,
-                path,
-                "command mutation evidence was unavailable; continuing with the command"
-            ),
-        }
+    if repo_paths.is_empty() {
+        return;
     }
-    if !begun_paths.is_empty() {
+    match store.begin_mutations(
+        binding.attempt_id, &repo_root, repo_paths.clone(), AttributionConfidence::Definitive,
+    ).await {
+        Err(error) => tracing::warn!(
+            %error, "command mutation evidence was unavailable; continuing with the command"
+        ),
+        Ok(_) => {
         ctx.session
             .services
             .command_execution
@@ -937,10 +927,11 @@ pub(crate) async fn begin_exec_mutation_evidence(
                 crate::tools::command_execution::TypedMutationBaseline {
                     attempt_id: binding.attempt_id,
                     repo_root,
-                    paths: begun_paths,
+                    paths: repo_paths,
                 },
             )
             .await;
+        }
     }
 }
 
@@ -963,18 +954,15 @@ async fn finish_exec_mutation_evidence(ctx: ToolEventCtx<'_>) {
     else {
         return;
     };
-    for path in baseline.paths {
         if let Err(error) = store
-            .finalize_mutation(baseline.attempt_id, &baseline.repo_root, path.clone())
+            .finalize_mutations(baseline.attempt_id, &baseline.repo_root, baseline.paths)
             .await
         {
             tracing::warn!(
                 %error,
-                path,
                 "command mutation evidence finalization was unavailable; the command outcome remains terminal"
             );
         }
-    }
 }
 
 async fn emit_exec_end(

@@ -67,6 +67,34 @@ fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool {
 }
 
 #[test]
+fn stall_timeout_schema_is_available_on_all_command_routes() {
+    let options = CommandToolOptions {
+        allow_login_shell: true,
+        exec_permission_approvals_enabled: false,
+    };
+    for spec in [
+        create_exec_command_tool(options),
+        create_shell_command_tool(options),
+        create_foreign_shell_command_tool(options, false),
+    ] {
+        let spec = serde_json::to_value(spec).unwrap();
+        let field = if spec["name"] == "exec_command" { "cmd" } else { "command" };
+        let schema = &spec["parameters"];
+        let description = schema["properties"]["stall_timeout_ms"]["description"].as_str().unwrap();
+        assert!(description.contains("Defaults to 60000 ms"));
+        let validator = jsonschema::validator_for(schema).unwrap();
+        for timeout in [0, 125, 60_000] {
+            let mut arguments = json!({"stall_timeout_ms": timeout});
+            arguments[field] = json!("echo ready");
+            assert!(validator.is_valid(&arguments));
+        }
+        let mut arguments = json!({"stall_timeout_ms": -1});
+        arguments[field] = json!("must-not-run");
+        assert!(!validator.is_valid(&arguments));
+    }
+}
+
+#[test]
 fn command_declarations_preserve_input_alternatives_and_return_contracts() {
     for spec in [
         create_exec_command_tool(CommandToolOptions {
@@ -221,10 +249,11 @@ fn exec_command_tool_matches_expected_spec() {
                         .to_string(),
                 )),
         ),
+        ("stall_timeout_ms".to_string(), stall_timeout_schema()),
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise (10000 ms inside `exec`); explicit values use 250-300000 ms. On Windows, waits are floored to 2000 ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.".to_string(),
+                "Wait before yielding output. Defaults to 30000 ms for recognized validation commands, Cargo builds, and nextest discovery, and 2000 ms otherwise (10000 ms inside `exec`); explicit values use 250-300000 ms. On Windows, waits are floored to 2000 ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
@@ -232,7 +261,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "max_output_tokens".to_string(),
             bounded_integer(
-                "Output token budget. Source reads and searches default to 25000 tokens; other commands use the standard output policy. Larger requests may be capped by policy. Zero returns only execution controls.".to_string(),
+                "Output token budget, capped at 10000 tokens (8000 inside exec). Zero returns only execution controls.".to_string(),
                 0, usize::MAX as u64),
         ),
         (
@@ -406,7 +435,8 @@ fn request_permissions_tool_includes_full_permission_schema() {
             // The caller must read which permissions were actually granted, so
             // the response shape is published with the tool.
             output_schema: Some(
-                codex_protocol::request_permissions::RequestPermissionsResponse::output_schema().into()
+                codex_protocol::request_permissions::RequestPermissionsResponse::output_schema()
+                    .into()
             ),
         })
     );
@@ -475,15 +505,7 @@ fn shell_command_tool_matches_expected_spec() {
                 u64::MAX,
             ),
         ),
-        (
-            "stall_timeout_ms".to_string(),
-            bounded_integer(
-                "Optional maximum time without stdout or stderr progress before cancellation. Omit or set zero to disable the stall deadline."
-                    .to_string(),
-                0,
-                u64::MAX,
-            ),
-        ),
+        ("stall_timeout_ms".to_string(), stall_timeout_schema()),
         (
             "login".to_string(),
             JsonSchema::boolean(Some(
@@ -667,7 +689,10 @@ fn command_output_schemas_require_integral_counters_but_allow_fractional_time() 
         let ToolSpec::Function(tool) = tool else {
             panic!("expected command function tool");
         };
-        let schema = tool.output_schema.expect("command output schema").into_value();
+        let schema = tool
+            .output_schema
+            .expect("command output schema")
+            .into_value();
         let validator = jsonschema::validator_for(&schema).expect("valid output schema");
         let output = json!({
             "wall_time_seconds": 0.125,

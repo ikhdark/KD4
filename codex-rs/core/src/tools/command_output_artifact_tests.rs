@@ -2,6 +2,31 @@ use super::*;
 use codex_utils_string::approx_token_count;
 use std::time::Duration;
 
+#[tokio::test]
+async fn recovery_searches_share_remaining_capacity_and_keep_exact_evidence() {
+    let text = (0..180).map(|i| format!("{} row {i}: {}\n",
+        ["ALPHA", "BETA", "GAMMA"][i / 60], "exact evidence ".repeat(12))).collect::<String>();
+    let temp = tempfile::tempdir().unwrap();
+    let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
+    let selectors = ["ALPHA", "BETA", "GAMMA"].map(|query| ToolOutputSelector::Search {
+        query: query.into(), start_byte: 0, max_results: 60, context_lines: 0,
+    });
+    let result = select_tool_output_snapshot(&metadata, &snapshot, selectors.to_vec(), 4_000).unwrap();
+    assert_eq!(result.results.len(), 3);
+    for selected in &result.results {
+        assert_eq!(selected.status, ToolOutputSelectorStatus::Ok);
+        let value = selected.value.as_ref().unwrap();
+        assert!(value["matches_returned"].as_u64().unwrap() > 0);
+        assert!(selected.continuation.is_some());
+        for range in value["hydrated_ranges"].as_array().unwrap() {
+            let start = range["canonical_range"]["start"].as_u64().unwrap() as usize;
+            let end = range["canonical_range"]["end"].as_u64().unwrap() as usize;
+            assert_eq!(range["text"].as_str().unwrap(), &text[start..end]);
+        }
+    }
+    assert!(!result.complete);
+}
+
 /// Loads an artifact's metadata and validated bytes the way a read does.
 async fn logical_artifact_for_test(
     codex_home: &Path,
@@ -23,6 +48,140 @@ async fn logical_artifact_for_test(
     let snapshot =
         load_validated_logical_snapshot(&path, &metadata).expect("validated artifact snapshot");
     (metadata, snapshot)
+}
+
+#[tokio::test]
+#[cfg(not(feature = "bench-generation-opportunities"))]
+#[serial_test::serial(command_output_artifact)]
+async fn shared_search_hydration_preserves_evidence_and_independent_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let text = format!(
+        "ALPHA BETA {}\r\n",
+        "λ verified signed value -7; ".repeat(25)
+    );
+    let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
+    let selectors = ["ALPHA", "BETA"].map(|query| ToolOutputSelector::Search {
+        query: query.into(),
+        start_byte: 0,
+        max_results: 100,
+        context_lines: 0,
+    });
+    let result =
+        select_tool_output_snapshot(&metadata, &snapshot, selectors.to_vec(), 6000).unwrap();
+    assert!(result.complete);
+    let first = &result.results[0].value.as_ref().unwrap()["hydrated_ranges"][0];
+    let second = &result.results[1].value.as_ref().unwrap()["hydrated_ranges"][0];
+    assert_eq!(first["text"], text);
+    assert_eq!(second["shared"], true);
+    assert_eq!(second["canonical_range"], first["canonical_range"]);
+    assert!(second.get("text").is_none());
+    assert!(!result.results[1].child_selectors.is_empty());
+    let mut expanded = result.clone();
+    expanded.results[1].value.as_mut().unwrap()["hydrated_ranges"][0] = first.clone();
+    assert!(
+        codex_utils_output_truncation::model_token_count(&serde_json::to_string(&result).unwrap())
+            < codex_utils_output_truncation::model_token_count(
+                &serde_json::to_string(&expanded).unwrap()
+            )
+    );
+    let schema = crate::tools::handlers::read_tool_output_spec::read_tool_output_output_schema(
+        crate::tools::handlers::read_tool_output_spec::tool_output_selector_schema(),
+    );
+    jsonschema::validator_for(&schema)
+        .unwrap()
+        .validate(&serde_json::to_value(&result).unwrap())
+        .unwrap();
+    let independent = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &metadata.artifact_id,
+        vec![selectors[1].clone()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        independent.results[0].value.as_ref().unwrap()["hydrated_ranges"][0]["text"],
+        text
+    );
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &metadata.artifact_id,
+        result.results[1].child_selectors.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.results[0].text.as_deref(), Some(text.as_str()));
+    assert_eq!(
+        read_complete_canonical_snapshot(temp.path(), "thread", &metadata.artifact_id, text.len())
+            .await
+            .unwrap(),
+        text.as_bytes()
+    );
+}
+
+#[test]
+#[cfg(not(feature = "bench-generation-opportunities"))]
+fn shared_search_hydration_rejects_missing_tiny_or_non_saving_evidence() {
+    let range = CanonicalByteRange::new(0, 512);
+    let reference = serde_json::json!({"selector":{"kind":"lines","start":1,"end":1},"canonical_range":range,"exact_bytes":512});
+    let mut hydrated = reference.clone();
+    hydrated["text"] = serde_json::json!("verified evidence ".repeat(30));
+    let mut previous = ToolOutputSelectorResult::state(
+        ToolOutputSelector::Search {
+            query: "first".into(),
+            start_byte: 0,
+            max_results: 1,
+            context_lines: 0,
+        },
+        ToolOutputSelectorStatus::Ok,
+    );
+    previous.value = Some(serde_json::json!({"hydrated_ranges":[hydrated]}));
+    assert!(share_search_hydration(
+        range,
+        &[previous.clone()],
+        &mut reference.clone()
+    ));
+    for status in [
+        ToolOutputSelectorStatus::AggregateOmitted,
+        ToolOutputSelectorStatus::SelectorTooLarge,
+        ToolOutputSelectorStatus::Invalid,
+    ] {
+        let mut omitted = previous.clone();
+        omitted.status = status;
+        let mut candidate = reference.clone();
+        assert!(!share_search_hydration(range, &[omitted], &mut candidate));
+        assert_eq!(candidate, reference);
+    }
+    let mut missing = previous.clone();
+    missing.value = Some(serde_json::json!({"hydrated_ranges":[reference]}));
+    assert!(!share_search_hydration(
+        range,
+        &[missing],
+        &mut reference.clone()
+    ));
+    let mut different = reference.clone();
+    different["canonical_range"] = serde_json::json!({"start":1,"end":513});
+    assert!(!share_search_hydration(
+        CanonicalByteRange::new(1, 513),
+        &[previous.clone()],
+        &mut different
+    ));
+    assert!(!share_search_hydration(
+        CanonicalByteRange::new(0, 255),
+        &[previous.clone()],
+        &mut reference.clone()
+    ));
+    // Byte size alone is not a token-saving guarantee, even for a valid match.
+    let mut expensive_reference = reference.clone();
+    expensive_reference["selector"] = serde_json::json!("extra selection metadata ".repeat(100));
+    let unchanged = expensive_reference.clone();
+    assert!(!share_search_hydration(
+        range,
+        &[previous],
+        &mut expensive_reference
+    ));
+    assert_eq!(expensive_reference, unchanged);
 }
 
 /// Adjacent selectors that each fit were normalized into one range that could
@@ -72,6 +231,7 @@ async fn adjacent_fitting_selectors_are_not_merged_into_one_that_no_longer_fits(
             selector.clone(),
             RECOVERY_FRAGMENT_TOKEN_CEILING,
             RECOVERY_AGGREGATE_TOKEN_CEILING,
+            &[],
         );
         let readable = selected.status == ToolOutputSelectorStatus::Ok
             || internally_drain_exact_subdivisions(&metadata, &snapshot, &selected).is_some();
@@ -2295,7 +2455,7 @@ async fn streaming_chunks_batch_disk_updates_and_preserve_exact_output() {
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
-async fn streaming_finish_does_not_publish_success_when_file_sync_fails() {
+async fn artifact_durability_barrier_reports_sync_failure_and_can_retry() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"").await;
     let state = Arc::new(Mutex::new(artifact));
@@ -2306,14 +2466,13 @@ async fn streaming_finish_does_not_publish_success_when_file_sync_fails() {
 
     inject_streaming_finalize_sync_failure_for_test();
     writer.finish(Some(&state)).await;
-
-    let artifact = state.lock().await;
-    assert!(matches!(
-        &*artifact,
-        RawOutputArtifact::Failed { message, .. }
-            if message.contains("failed to sync")
-                && message.contains("injected streaming output sync failure")
-    ));
+    assert!(matches!(&*state.lock().await, RawOutputArtifact::Stored { .. }));
+    let error = sync_tool_output_artifacts(temp.path(), "thread").await.unwrap_err();
+    assert!(error.to_string().contains("injected artifact barrier sync failure"));
+    let directory = temp.path().join("tool-output/thread");
+    assert!(lock_retention_registry().pending_sync.keys().any(|path| path.starts_with(&directory)));
+    sync_tool_output_artifacts(temp.path(), "thread").await.unwrap();
+    assert!(!lock_retention_registry().pending_sync.keys().any(|path| path.starts_with(&directory)));
 }
 
 #[tokio::test]
@@ -2467,7 +2626,10 @@ async fn reconciliation_releases_registry_mutex_and_rejects_known_internal_mutat
 
     barrier.wait().await;
     assert!(retention_registry_mutex_is_available_for_test());
-    writer.write_chunk(Some(&state), b"concurrent").await;
+    // Exercise a published filesystem mutation, not just the writer's buffer.
+    writer
+        .write_chunk(Some(&state), &vec![b'x'; STREAMING_ARTIFACT_BUFFER_BYTES])
+        .await;
     barrier.wait().await;
 
     assert_eq!(
@@ -3936,7 +4098,7 @@ async fn audit_search_oversized_context_delivers_coordinates_without_skipping_ma
         max_results: 20,
         context_lines: 0,
     };
-    let first = search_logical_artifact(&metadata, &snapshot, selector, 1024);
+    let first = search_logical_artifact(&metadata, &snapshot, selector, 1024, &[]);
     assert_eq!(first.status, ToolOutputSelectorStatus::Ok);
     assert_eq!(first.value.as_ref().unwrap()["matches_returned"], 1);
     assert_eq!(first.value.as_ref().unwrap()["matches"][0]["start_byte"], 0);
@@ -3952,6 +4114,7 @@ async fn audit_search_oversized_context_delivers_coordinates_without_skipping_ma
         &snapshot,
         first.continuation.unwrap(),
         1024,
+        &[],
     );
     assert_eq!(second.value.as_ref().unwrap()["matches_returned"], 1);
     assert_eq!(
@@ -4112,4 +4275,66 @@ async fn threads_with_live_or_archived_compressed_rollouts_are_resumable() {
             .expect("archived")
     );
     assert!(!thread_rollout_exists(home, deleted).await.expect("deleted"));
+}
+fn generation_search_projection(result: &ReadToolOutputResult, coordinates_only: bool) -> Value {
+    let mut result = serde_json::to_value(result).unwrap();
+    let mut shared = Vec::<Value>::new();
+    for selection in result["results"].as_array_mut().unwrap() {
+        let Some(value) = selection.get_mut("value") else {continue};
+        let Some(ranges) = value.get_mut("hydrated_ranges").and_then(Value::as_array_mut) else {continue};
+        if coordinates_only {ranges.clear();continue;}
+        for range in ranges {
+            if let Some(index) = shared.iter().position(|previous| previous == range) {
+                *range = serde_json::json!({"shared_excerpt":index});
+            } else {
+                shared.push(range.clone());
+                *range = serde_json::json!({"shared_excerpt":shared.len()-1});
+            }
+        }
+    }
+    if !coordinates_only {result["shared_excerpts"] = serde_json::json!(shared);}
+    result
+}
+
+async fn generation_search_case(finding:u32, queries:&[&str], dense:bool) {
+    use crate::generation_benchmarks::{emit,measure,tokens};
+    let home = tempfile::tempdir().unwrap();
+    let text = (0..24).map(|i|format!("line {i:03} {} {} {}\n",if dense {"ALPHA BETA GAMMA"} else if i%3 == 0 {"ALPHA"} else if i%3 == 1 {"BETA"} else {"GAMMA"},"source evidence ".repeat(5),"é")).collect::<String>();
+    let (metadata,snapshot) = logical_artifact_for_test(home.path(),&text).await;
+    let selectors = queries.iter().map(|query|ToolOutputSelector::Search{query:(*query).into(),start_byte:0,max_results:100,context_lines:0}).collect::<Vec<_>>();
+    let select = ||select_tool_output_snapshot(&metadata,&snapshot,selectors.clone(),10_000).unwrap();
+    let baseline_result = select();
+    assert!(baseline_result.complete);
+    let baseline = serde_json::to_value(&baseline_result).unwrap();
+    let prototype = generation_search_projection(&baseline_result,finding==10);
+    for (a,b) in baseline["results"].as_array().unwrap().iter().zip(prototype["results"].as_array().unwrap()) {
+        for key in ["matches","total_matches","remaining_match_count","coverage_complete"] {assert_eq!(a["value"][key],b["value"][key]);}
+        if finding==12 {
+            for (original,reference) in a["value"]["hydrated_ranges"].as_array().unwrap().iter().zip(b["value"]["hydrated_ranges"].as_array().unwrap()) {
+                assert_eq!(*original,prototype["shared_excerpts"][reference["shared_excerpt"].as_u64().unwrap() as usize]);
+            }
+        } else {assert!(b["value"]["hydrated_ranges"].as_array().unwrap().is_empty());}
+    }
+    assert_eq!(snapshot,text.as_bytes(),"raw recovery evidence remains intact");
+    emit(finding,&format!("{}_{}queries",if dense {"overlap"}else{"disjoint"},queries.len()),serde_json::json!({
+        "baseline_select":measure(||serde_json::to_string(&select()).unwrap()),
+        "prototype_select_and_project":measure(||generation_search_projection(&select(),finding==10).to_string()),
+        "baseline_tokens":tokens(&baseline.to_string()),"prototype_tokens":tokens(&prototype.to_string()),
+        "baseline_output":baseline,"prototype_output":prototype,
+        "limits":"Post-selection prototype includes its full transformation cost; an integrated producer could differ. No model/API round trip is measured."}));
+}
+
+#[tokio::test]
+#[ignore = "opt-in ordered generation opportunity benchmark"]
+async fn generation_bench_12() {
+    generation_search_case(12,&["ALPHA","BETA","GAMMA"],true).await;
+    generation_search_case(12,&["ALPHA","BETA","GAMMA"],false).await;
+    generation_search_case(12,&["ALPHA"],true).await;
+}
+
+#[tokio::test]
+#[ignore = "opt-in ordered generation opportunity benchmark"]
+async fn generation_bench_10() {
+    generation_search_case(10,&["ALPHA"],true).await;
+    generation_search_case(10,&["MISSING"],true).await;
 }

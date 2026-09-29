@@ -502,6 +502,14 @@ async fn collect_mcp_server_status_snapshot_impl(
     )
     .await;
 
+    // A status request owns this short-lived manager. Unlike prompt discovery,
+    // it must wait for the selected servers before reading their ready catalog.
+    futures::future::join_all(mcp_servers.iter().map(|(name, server)| {
+        let timeout = server.configured_config()
+            .and_then(|config| config.startup_timeout_sec)
+            .unwrap_or(crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT);
+        mcp_connection_manager.wait_for_server_ready(name, timeout)
+    })).await;
     let snapshot = collect_mcp_server_status_snapshot_from_manager(
         &mcp_connection_manager,
         auth_status_entries,

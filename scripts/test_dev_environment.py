@@ -790,6 +790,11 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
         )
         self.baseline.start()
         self.addCleanup(self.baseline.stop)
+        self.snapshot = mock.patch.object(
+            app_server_schema_runtime_check, "snapshot_python_sdk_contract"
+        )
+        self.snapshot.start()
+        self.addCleanup(self.snapshot.stop)
 
     def test_command_launch_errors_preserve_exit_classification(self) -> None:
         for module in (config_schema_check, app_server_schema_runtime_check):
@@ -1070,7 +1075,7 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             mock.patch.object(
                 app_server_schema_runtime_check,
                 "run_python_sdk_contract_check",
-                side_effect=lambda _root: calls.append("python-sdk") or 0,
+                side_effect=lambda _root, _snapshot: calls.append("python-sdk") or 0,
             ),
             mock.patch.object(
                 app_server_schema_runtime_check,
@@ -1087,8 +1092,48 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
 
         self.assertEqual(
             calls,
-            ["lock", "protocol", "compatibility:" + "a" * 40, "python-sdk", "unlock"],
+            ["lock", "protocol", "compatibility:" + "a" * 40, "unlock", "python-sdk"],
         )
+
+    def test_consumer_snapshot_survives_later_source_changes(self):
+        self.snapshot.stop()
+        with tempfile.TemporaryDirectory(prefix="schema with spaces ") as directory:
+            root = Path(directory) / "source"
+            destination = Path(directory) / "snapshot"
+            files = (
+                "sdk/python/src/openai_codex/api.py",
+                "sdk/python/scripts/generate.py",
+                "sdk/python/pyproject.toml",
+                "sdk/python/tests/test_contract_generation.py",
+                "codex-rs/app-server-protocol/schema/json/contract.json",
+            )
+            for relative in files:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("before")
+            app_server_schema_runtime_check.snapshot_python_sdk_contract(
+                root, destination
+            )
+            for relative in files:
+                (root / relative).write_text("after")
+                self.assertEqual((destination / relative).read_text(), "before")
+            with mock.patch.object(
+                app_server_schema_runtime_check, "run", return_value=0
+            ) as run:
+                self.assertEqual(
+                    app_server_schema_runtime_check.run_python_sdk_contract_check(
+                        root, destination
+                    ),
+                    0,
+                )
+            command = run.call_args.args[0]
+            self.assertIn(
+                f'pythonpath="{(destination / "sdk/python/src").as_posix()}"', command
+            )
+            self.assertEqual(
+                command[-1],
+                str(destination / "sdk/python/tests/test_contract_generation.py"),
+            )
 
     def test_schema_gate_stops_before_consumer_on_compatibility_failure(self) -> None:
         with (

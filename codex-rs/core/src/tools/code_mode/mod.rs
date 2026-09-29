@@ -106,6 +106,9 @@ struct CodeModePacketAdmission {
 
 #[derive(Default)]
 struct CodeModePacketMetrics {
+    output_budget: Option<usize>,
+    #[cfg(feature = "bench-generation-opportunities")]
+    recovery_index: Vec<(usize, JsonValue)>,
     command_states: Vec<JsonValue>,
     next_nested_ordinal: usize,
     nested_call_count: usize,
@@ -141,6 +144,8 @@ struct CodeModeNestedResultEvidence {
 }
 
 struct CodeModePacketReceipt {
+    #[cfg(feature = "bench-generation-opportunities")]
+    recovery_index: Vec<(usize, JsonValue)>,
     command_states: Vec<JsonValue>,
     nested_call_count: usize,
     batchable_observation_count: usize,
@@ -312,6 +317,25 @@ impl CodeModeService {
             .insert(cell_id.to_string(), call_id.to_string());
     }
 
+    pub(crate) fn record_output_budget(&self, cell_id: &CellId, budget: Option<usize>) {
+        if let Some(metrics) = self.packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cells.get_mut(cell_id.as_str())
+            && budget.is_some()
+        {
+            metrics.output_budget = budget;
+        }
+    }
+
+    pub(crate) fn output_budget(&self, cell_id: &str) -> Option<usize> {
+        self.packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cells.get(cell_id)
+            .and_then(|metrics| metrics.output_budget)
+    }
+
     pub(crate) fn cell_parent_call_id(&self, cell_id: &CellId) -> Option<String> {
         self.cell_parent_call_ids
             .lock()
@@ -456,6 +480,7 @@ impl CodeModeService {
                 // Live output and steering can cross outstanding child calls.
                 // Drain response data, but keep registration order for the cell.
                 metrics.next_nested_ordinal = next_nested_ordinal;
+                metrics.output_budget = packet.output_budget;
                 if retain_terminal {
                     metrics.first_required_terminal = packet.first_required_terminal.clone();
                 }
@@ -466,6 +491,8 @@ impl CodeModeService {
             .nested_results
             .sort_unstable_by_key(|result| result.ordinal);
         CodeModePacketReceipt {
+            #[cfg(feature = "bench-generation-opportunities")]
+            recovery_index: metrics.recovery_index,
             command_states: metrics.command_states,
             nested_call_count: metrics.nested_call_count,
             batchable_observation_count: metrics.batchable_observation_count,
@@ -589,6 +616,17 @@ pub(super) fn handle_runtime_response(
     let mut post_tool_use_feedback = packet.post_tool_use_feedback;
     let nested_results = if response_needs_retained_nested_results(&response) {
         if packet.omitted_nested_result_count > 0 {
+            #[cfg(feature = "bench-generation-opportunities")]
+            if crate::generation_live_bench::active(14) && !packet.recovery_index.is_empty() {
+                let mut index = packet.recovery_index;
+                index.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+                post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
+                    text: serde_json::json!({"recovery_tool":"read_tool_output",
+                        "retained_nested_results":index.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
+                        "instruction":"Recover these existing complete snapshots instead of rerunning successful reads. Index covers only listed results, not all tool types."}).to_string(),
+                });
+                crate::generation_live_bench::record(14, "omitted_result_recovery_index_delivered");
+            }
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
                 text: format!(
                     "{} additional nested tool results were omitted from this fallback output; it retains at most {MAX_RETAINED_NESTED_RESULTS} results. Use text(...) to include the results needed from a script.",
@@ -1154,7 +1192,7 @@ async fn call_nested_tool(
                 &tool_name,
                 None,
                 nested_failure_fingerprint(&tool_name, &error),
-            );
+            ).await;
             exec.session
                 .services
                 .code_mode_service
@@ -1194,7 +1232,7 @@ async fn call_nested_tool(
             &tool_name,
             Some(&payload),
             nested_failure_fingerprint(&tool_name, &message),
-        );
+        ).await;
         exec.session
             .services
             .code_mode_service
@@ -1242,7 +1280,7 @@ async fn call_nested_tool(
                 &tool_name,
                 Some(&payload),
                 nested_failure_fingerprint(&tool_name, &message),
-            );
+            ).await;
             exec.session
                 .services
                 .code_mode_service
@@ -1276,7 +1314,7 @@ async fn call_nested_tool(
     let signal = result.sampling_request_signal();
     let canonical_artifact_required = result.requires_canonical_artifact();
     let receipts = result.intrinsic_deterministic_continuation_receipts();
-    let source_dependencies = result.projected_source_dependencies().cloned();
+    let source_dependencies = result.source_dependencies.clone();
     if let Some(continuation) = result.owner_drained_continuation() {
         exec.turn
             .turn_timing_state
@@ -1289,6 +1327,27 @@ async fn call_nested_tool(
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let failure_is_error = result.code_mode_failure_is_error();
     let result_value = result.code_mode_result();
+    // Reuse source artifacts already retained by read_file. No duplicate blob,
+    // no assertion that a truncated fallback contains the omitted evidence.
+    #[cfg(feature = "bench-generation-opportunities")]
+    if crate::generation_live_bench::active(14)
+        && tool_name == ToolName::plain("read_file")
+        && result_value["retained_artifact_complete"] == true
+        && let (Some(artifact_id), Some(bytes)) = (
+            result_value["artifact_id"].as_str(), result_value["canonical_bytes"].as_u64())
+    {
+        let mut admission = exec.session.services.code_mode_service.packet_admission
+            .lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(metrics) = admission.cells.get_mut(cell_id.as_str())
+            && metrics.recovery_index.len() < 32
+        {
+            metrics.recovery_index.push((packet_ordinal, serde_json::json!({
+                "call_id":nested_call_id,"tool":"read_file","path":result_value["path"],
+                "artifact_id":artifact_id,"canonical_sha256":result_value["canonical_sha256"],
+                "selectors":[{"kind":"bytes","start":0,"end":bytes}]
+            })));
+        }
+    }
     let (retained_output, output_truncated, result_bytes) = bounded_serialized_json(&result_value);
     if let Some(parent_call_id) = parent_tool_call_id.as_ref()
         && source_dependencies
@@ -1439,30 +1498,41 @@ fn nested_result_already_emitted(result: &CodeModeNestedResultEvidence, emitted:
     const PROBE_BYTES: usize = 256;
     // A short result costs little to repeat and is weak evidence of printing.
     const MIN_PAYLOAD_BYTES: usize = 32;
-    let payload = match result
-        .output
-        .strip_prefix("exit_code: ")
-        .and_then(|rest| rest.split_once('\n'))
-    {
-        Some((_, output)) => output,
-        // A script may spread a result object into another, so its opening
-        // brace is not evidence.
-        None => result.output.strip_prefix('{').unwrap_or(&result.output),
+    let matches_output = |output: &str| {
+        let payload = match output
+            .strip_prefix("exit_code: ")
+            .and_then(|rest| rest.split_once('\n'))
+        {
+            Some((_, output)) => output,
+            // A script may spread a result object into another, so its opening
+            // brace is not evidence.
+            None => output.strip_prefix('{').unwrap_or(output),
+        };
+        if payload.len() < MIN_PAYLOAD_BYTES {
+            return false;
+        }
+        let head = &payload[..payload.floor_char_boundary(PROBE_BYTES)];
+        let tail = &payload[payload.ceil_char_boundary(payload.len().saturating_sub(PROBE_BYTES))..];
+        [head, tail].into_iter().all(|probe| {
+            emitted.contains(probe)
+                || serde_json::to_string(probe)
+                    .is_ok_and(|escaped| emitted.contains(&escaped[1..escaped.len() - 1]))
+        })
     };
-    if payload.len() < MIN_PAYLOAD_BYTES {
-        return false;
-    }
-    let head = &payload[..payload.floor_char_boundary(PROBE_BYTES)];
-    let tail = &payload[payload.ceil_char_boundary(payload.len().saturating_sub(PROBE_BYTES))..];
-    [head, tail].into_iter().all(|probe| {
-        emitted.contains(probe)
-            || serde_json::to_string(probe)
-                .is_ok_and(|escaped| emitted.contains(&escaped[1..escaped.len() - 1]))
-    })
+    matches_output(&result.output)
+        || serde_json::from_str(&result.output)
+            .ok()
+            .and_then(|raw| codex_code_mode::model_visible_tool_result(
+                &ToolName::plain(&result.tool_name), &raw,
+            ))
+            .is_some_and(|projected| matches_output(&projected.to_string()))
 }
 
 // Presentation only: never use this projection for a JavaScript tool return.
 fn model_visible_nested_result(tool: &ToolName, value: JsonValue) -> JsonValue {
+    if let Some(projected) = codex_code_mode::model_visible_tool_result(tool, &value) {
+        return projected;
+    }
     if tool.namespace.is_some() || !value.is_object() {
         return value;
     }
@@ -1861,6 +1931,12 @@ fn build_freeform_tool_payload(
 mod response_tests;
 
 #[cfg(test)]
+mod token_cache_benchmarks;
+
+#[cfg(test)]
+mod output_recovery_benchmarks;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -1896,6 +1972,21 @@ mod tests {
 
     fn test_service() -> CodeModeService {
         CodeModeService::new(Arc::new(ProcessOwnedCodeModeSessionProvider::default()))
+    }
+
+    #[test]
+    fn recovery_budget_survives_packet_drain_and_tracks_wait_updates() {
+        let service = test_service();
+        let cell = CellId::new("budget-cell".to_string());
+        service.record_cell_parent_call_id(&cell, "outer");
+        service.record_output_budget(&cell, Some(4_000));
+        service.finish_packet(cell.as_str(), false);
+        assert_eq!(service.output_budget(cell.as_str()), Some(4_000));
+        service.record_output_budget(&cell, Some(1_000));
+        assert_eq!(service.output_budget(cell.as_str()), Some(1_000));
+        service.finish_cell_dispatch(&cell);
+        service.record_output_budget(&cell, Some(10_000));
+        assert_eq!(service.output_budget(cell.as_str()), None);
     }
 
     #[test]
@@ -3072,7 +3163,7 @@ mod tests {
     }
 
     #[test]
-    fn default_outer_budget_is_smaller_than_the_explicit_budget() {
+    fn default_outer_budget_avoids_a_second_cut_and_respects_explicit_limits() {
         let text = "source line test\n".repeat(1_300);
         let original_tokens = codex_utils_output_truncation::model_token_count(&text);
         assert!(original_tokens > 4_000);
@@ -3081,9 +3172,14 @@ mod tests {
 
         let (default_projection, omitted) =
             truncate_code_mode_result(items.clone(), None, OutputOutcome::Success, 10_000, None);
-        assert!(omitted);
+        assert!(!omitted);
         let default_text = super::code_mode_text_content(&default_projection);
-        assert!(codex_utils_output_truncation::model_token_count(&default_text) <= 4_000);
+        assert_eq!(default_text, text);
+        let (small, omitted) = truncate_code_mode_result(
+            items.clone(), Some(4_000), OutputOutcome::Success, 10_000, None);
+        assert!(omitted);
+        assert!(codex_utils_output_truncation::model_token_count(
+            &super::code_mode_text_content(&small)) <= 4_000);
         let (projected, omitted) =
             truncate_code_mode_result(items, Some(10_000), OutputOutcome::Success, 10_000, None);
 

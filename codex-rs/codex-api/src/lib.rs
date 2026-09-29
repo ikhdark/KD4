@@ -44,6 +44,7 @@ pub use crate::common::ResponseCreateWsRequest;
 pub use crate::common::ResponseEvent;
 pub use crate::common::ResponseStream;
 pub use crate::common::ResponsesApiRequest;
+pub use crate::common::ResponsesInput;
 pub use crate::common::ResponsesWsRequest;
 pub use crate::common::SafetyBuffering;
 pub use crate::common::StreamOptions;

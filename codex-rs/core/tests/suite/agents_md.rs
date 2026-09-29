@@ -117,19 +117,19 @@ fn instruction_fragments(request: &responses::ResponsesRequest) -> Vec<String> {
 fn expected_instruction_fragment(cwd: &AbsolutePathBuf, contents: &str) -> String {
     let cwd = PathUri::from_abs_path(cwd).inferred_native_path_string();
     format!(
-        "# AGENTS.md instructions for {cwd}\n\n<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions for {cwd}\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
     )
 }
 
 fn expected_provider_only_instruction_fragment(contents: &str) -> String {
     format!(
-        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
     )
 }
 
 fn expected_provider_only_replacement_fragment(contents: &str) -> String {
     format!(
-        "# AGENTS.md instructions\n\n<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{contents}\n</INSTRUCTIONS>"
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{contents}\n</INSTRUCTIONS>"
     )
 }
 
@@ -155,8 +155,8 @@ fn assert_single_fresh_instruction_fragment_contains(
     let fragments = instruction_fragments(request);
     assert_eq!(fragments.len(), 1, "expected one AGENTS.md fragment");
     assert!(
-        fragments[0].contains(&format!("<AGENTS_MD_OBSERVATION>\n{FRESH_PROVENANCE}\n</AGENTS_MD_OBSERVATION>\n\n<INSTRUCTIONS>")),
-        "expected fresh direct-read provenance: {}",
+        !fragments[0].contains("<AGENTS_MD_OBSERVATION>"),
+        "redundant observation wrapper must be absent: {}",
         fragments[0]
     );
     assert!(

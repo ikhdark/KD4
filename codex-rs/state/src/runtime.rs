@@ -163,6 +163,7 @@ pub struct StateRuntime {
     logs_pool: Arc<sqlx::SqlitePool>,
     agent_job_runner_instance_id: String,
     agent_job_runner_heartbeat_shutdown: tokio::sync::watch::Sender<bool>,
+    agent_job_updates: tokio::sync::watch::Sender<u64>,
     db_telemetry: Option<DbTelemetryHandle>,
     #[cfg(test)]
     log_retention_test_control: Arc<logs::LogRetentionTestControl>,
@@ -313,6 +314,7 @@ SELECT
             logs_pool,
             agent_job_runner_instance_id,
             agent_job_runner_heartbeat_shutdown,
+            agent_job_updates: tokio::sync::watch::channel(0).0,
             db_telemetry: telemetry_override,
             #[cfg(test)]
             log_retention_test_control: Arc::new(logs::LogRetentionTestControl::default()),
@@ -405,11 +407,23 @@ async fn open_sqlite(
 ) -> anyhow::Result<SqlitePool> {
     let options = base_sqlite_options(path).auto_vacuum(SqliteAutoVacuum::Incremental);
     let started = Instant::now();
-    let pool_result = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect_with(options)
-        .await
-        .map_err(anyhow::Error::from);
+    // Initial WAL/auto-vacuum pragmas can report SQLITE_BUSY before SQLite's
+    // busy handler takes effect when another process creates the same database.
+    let pool_result = loop {
+        let result = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options.clone())
+            .await;
+        match result {
+            Err(ref err)
+                if sqlite_error_detail_is_lock(&err.to_string())
+                    && started.elapsed() < std::time::Duration::from_secs(5) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            result => break result.map_err(anyhow::Error::from),
+        }
+    };
     crate::telemetry::record_init_result(
         telemetry_override,
         spec.kind,

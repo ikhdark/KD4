@@ -12,6 +12,73 @@ use uuid::Uuid;
 
 static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+#[tokio::test]
+async fn command_mutation_batches_are_atomic_and_deduplicate_paths() {
+    let fixture = Fixture::new().await;
+    let repo = fixture.repo.path();
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(repo, worker_draft("batch-evidence", "src"))
+        .await
+        .unwrap();
+    let paths = vec!["a.txt".to_string(), "b.txt".to_string()];
+    for path in &paths {
+        std::fs::write(repo.join(path), "before").unwrap();
+    }
+    let events = fixture
+        .store
+        .begin_mutations(
+            attempt.attempt_id,
+            repo,
+            vec![paths[0].clone(), paths[1].clone(), paths[0].clone()],
+            AttributionConfidence::Definitive,
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    // Failure on the second path must roll back finalization of the first.
+    assert!(
+        fixture
+            .store
+            .finalize_mutations(
+                attempt.attempt_id,
+                repo,
+                vec![paths[0].clone(), "missing.txt".into()],
+            )
+            .await
+            .is_err()
+    );
+    for path in &paths {
+        std::fs::write(repo.join(path), "after").unwrap();
+    }
+    let evidence = fixture
+        .store
+        .finalize_mutations(attempt.attempt_id, repo, paths.clone())
+        .await
+        .unwrap();
+    assert_eq!(evidence.len(), 2);
+    // Failure after adding a new path must not leave a partial baseline.
+    assert!(
+        fixture
+            .store
+            .begin_mutations(
+                attempt.attempt_id,
+                repo,
+                vec!["0-new.txt".into(), paths[0].clone()],
+                AttributionConfidence::Definitive,
+            )
+            .await
+            .is_err()
+    );
+    let retained = fixture
+        .store
+        .list_mutation_evidence(attempt.attempt_id, None)
+        .await
+        .unwrap();
+    assert_eq!(retained.len(), 2);
+    assert!(retained.iter().all(|entry| paths.contains(&entry.path)));
+}
+
 fn task_store_migrator_through(version: i64) -> sqlx::migrate::Migrator {
     sqlx::migrate::Migrator {
         migrations: Cow::Owned(
@@ -1432,8 +1499,16 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        let seed = std::env::var_os("KD4_AGENT_TASK_FIXTURE_SEED").map(std::path::PathBuf::from);
+        Self::with_seed(seed.as_deref()).await
+    }
+
+    async fn with_seed(seed: Option<&std::path::Path>) -> Self {
         let codex_home = TempDir::new().expect("codex home tempdir");
         let repo = TempDir::new().expect("repository tempdir");
+        if let Some(seed) = seed {
+            copy_fixture_seed(seed, codex_home.path()).await;
+        }
         let state =
             StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
                 .await
@@ -1447,6 +1522,94 @@ impl Fixture {
             state,
             store,
         }
+    }
+}
+
+// The runner owns this directory for one invocation, including all nextest
+// processes. Migration/recovery tests still initialize their own fresh stores.
+async fn copy_fixture_seed(root: &std::path::Path, destination: &std::path::Path) {
+    let lock_path = root.join("seed.lock");
+    let _lock = tokio::task::spawn_blocking(move || {
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .expect("open seed lock");
+        lock.lock().expect("lock fixture seed");
+        lock
+    })
+    .await
+    .expect("seed lock worker");
+    let ready = root.join("ready");
+    let relative_paths = [
+        std::path::PathBuf::from(codex_state::state_db_filename()),
+        std::path::PathBuf::from(codex_state::logs_db_filename()),
+        std::path::PathBuf::from(codex_state::goals_db_filename()),
+        std::path::PathBuf::from("agent-task-coordination/agent_tasks.sqlite"),
+    ];
+    if !ready.exists() {
+        let build = TempDir::new_in(root).expect("unpublished seed directory");
+        let state = StateRuntime::init(build.path().to_path_buf(), "test-provider".to_string())
+            .await
+            .expect("seed state migrates");
+        let store = LocalAgentTaskStore::initialize(&state)
+            .await
+            .expect("seed store migrates");
+        store.close().await;
+        state.close().await;
+        // Closed pools must have checkpointed all data; never copy a live WAL.
+        for relative in &relative_paths {
+            let database = build.path().join(relative);
+            assert!(database.is_file(), "missing seed database: {database:?}");
+            let wal = std::path::PathBuf::from(format!("{}-wal", database.display()));
+            assert!(
+                wal.metadata().map_or(true, |metadata| metadata.len() == 0),
+                "uncheckpointed seed WAL"
+            );
+        }
+        std::fs::rename(build.path(), &ready).expect("publish complete seed");
+    }
+    for relative in relative_paths {
+        let target = destination.join(&relative);
+        std::fs::create_dir_all(target.parent().expect("database parent"))
+            .expect("fixture directories");
+        std::fs::copy(ready.join(relative), target).expect("copy closed seed database");
+    }
+}
+
+#[tokio::test]
+async fn migrated_fixture_seed_is_reused_without_sharing_mutable_databases() {
+    let seed = TempDir::new().unwrap();
+    let (first, second) = tokio::join!(
+        Fixture::with_seed(Some(seed.path())),
+        Fixture::with_seed(Some(seed.path())),
+    );
+    let first_pool = coordination_pool(&first).await;
+    sqlx::query("CREATE TABLE fixture_isolation_probe (value INTEGER)")
+        .execute(&first_pool)
+        .await
+        .unwrap();
+    let seed_path = seed
+        .path()
+        .join("ready/agent-task-coordination/agent_tasks.sqlite");
+    let before = std::fs::read(&seed_path).unwrap();
+    let second_pool = coordination_pool(&second).await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fixture_isolation_probe'",
+    )
+    .fetch_one(&second_pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+    let third = Fixture::with_seed(Some(seed.path())).await;
+    assert_eq!(std::fs::read(seed_path).unwrap(), before);
+    first_pool.close().await;
+    second_pool.close().await;
+    for fixture in [first, second, third] {
+        fixture.store.close().await;
+        fixture.state.close().await;
     }
 }
 
@@ -1660,6 +1823,65 @@ async fn lease_heartbeats_and_quiescence_wait_for_transient_writer_contention() 
     );
     assert_eq!(quiescence.running_validation_call_ids, vec![call.call_id]);
     blocker_pool.close().await;
+}
+
+#[tokio::test]
+async fn migration_reopens_store_with_retired_capture_generation() {
+    let fixture = Fixture::new().await;
+    let (assignment, _) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("resume-migration", "src"))
+        .await
+        .expect("assignment creates");
+    fixture.store.close().await;
+    let pool = coordination_pool(&fixture).await;
+
+    // Model the released migration independently of the current embedded set.
+    // Retiring its consumer must not remove this version or change its checksum.
+    let mut historical_migrations = task_store_migrator_through(21).migrations.into_owned();
+    historical_migrations.push(sqlx::migrate::Migration::new(
+        22,
+        Cow::Borrowed("workspace capture generation"),
+        sqlx::migrate::MigrationType::Simple,
+        sqlx::SqlSafeStr::into_sql_str(
+            "ALTER TABLE workspace_repositories\n\
+ADD COLUMN capture_generation INTEGER NOT NULL DEFAULT 0 CHECK (capture_generation >= 0);\n",
+        ),
+        false,
+    ));
+    sqlx::migrate::Migrator::with_migrations(historical_migrations)
+        .run(&pool)
+        .await
+        .expect("historical migration applies or matches its persisted checksum");
+    sqlx::query("UPDATE workspace_repositories SET capture_generation = 7")
+        .execute(&pool)
+        .await
+        .expect("historical generation persists");
+
+    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .expect("store reopens with migration 22 already applied");
+    assert_eq!(
+        restarted
+            .get_agent_task(assignment.assignment_id, None)
+            .await
+            .expect("existing task remains readable")
+            .assignment,
+        assignment
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT capture_generation FROM workspace_repositories")
+            .fetch_one(&pool)
+            .await
+            .expect("historical generation reads"),
+        7
+    );
+    restarted
+        .create_assignment(fixture.repo.path(), worker_draft("after-resume", "docs"))
+        .await
+        .expect("resumed store remains writable");
+    restarted.close().await;
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -5122,7 +5344,14 @@ async fn wake_wait_observes_a_commit_from_an_independent_store_instance() {
                 .await
         }));
     }
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fixture
+            .store
+            .wait_for_durable_wake_poll(waiters.len(), poll_count_before),
+    )
+    .await
+    .expect("all waiters register and share a durable poll");
     let shared_poll_count = fixture
         .store
         .durable_wake_poll_count()

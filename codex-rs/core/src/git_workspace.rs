@@ -251,17 +251,18 @@ async fn capture_workspace_evidence_identity_with_attribution(
 async fn capture_workspace_evidence_identity_for_repo_root_with_attribution(
     repo_root: PathBuf,
 ) -> WorkspaceEvidenceCapture {
-    capture_workspace_evidence_with_cancellation(repo_root, CancellationToken::new()).await
+    capture_workspace_evidence_with_cancellation(repo_root, CancellationToken::new(), Arc::default()).await
 }
 
 async fn capture_workspace_evidence_with_cancellation(
     repo_root: PathBuf,
     cancellation: CancellationToken,
+    content_cache: Arc<StdMutex<WorkspaceContentCache>>,
 ) -> WorkspaceEvidenceCapture {
     let unavailable = WorkspaceEvidenceIdentity::unavailable(Some(&repo_root));
     match within_workspace_generation_deadline(
         WORKSPACE_GENERATION_DEADLINE,
-        capture_workspace_generation_marker(repo_root, cancellation),
+        capture_workspace_generation_marker(repo_root, cancellation, content_cache),
     )
     .await
     {
@@ -283,7 +284,28 @@ async fn capture_workspace_evidence_with_cancellation(
 
 async fn resolve_workspace_evidence_root(cwd: &Path) -> std::io::Result<Option<PathBuf>> {
     let cwd = cwd.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || WorkspaceRootCache::default().resolve(&cwd))
+        .await.map_err(std::io::Error::other)?
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct WorkspaceRootCache {
+    entries: StdMutex<HashMap<PathBuf, (Option<PathBuf>, Vec<DependencyFingerprint>)>>,
+}
+
+impl WorkspaceRootCache {
+    #[cfg(test)]
+    pub(crate) fn with_lock_for_test<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self.entries.lock().expect("workspace root cache");
+        f()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    pub(crate) fn resolve(&self, cwd: &Path) -> std::io::Result<Option<PathBuf>> {
         // Only an exhaustive, successful ancestor walk proves absence. Missing
         // cwd, unreadable metadata and worker failure must not look like non-Git.
         let cwd = dunce::canonicalize(cwd)?;
@@ -293,17 +315,88 @@ async fn resolve_workspace_evidence_root(cwd: &Path) -> std::io::Result<Option<P
             cwd.parent()
                 .ok_or_else(|| std::io::Error::other("cwd has no parent"))?
         };
-        for root in base.ancestors() {
-            match std::fs::symlink_metadata(root.join(".git")) {
-                Ok(_) => return Ok(Some(root.to_path_buf())),
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
+        let mut dependencies = Vec::new();
+        for ancestor in base.ancestors() {
+            let path = ancestor.join(".git");
+            let exists = match std::fs::symlink_metadata(&path) {
+                Ok(_) => true,
+                Err(error) if error.kind() == ErrorKind::NotFound => false,
                 Err(error) => return Err(error),
-            }
+            };
+            let dependency = if exists {
+                dependency_fingerprint(path, true).filter(|dependency| {
+                    !matches!(dependency.state, DependencyState::Missing)
+                }).ok_or_else(|| std::io::Error::other("cannot inspect repository marker"))?
+            } else {
+                DependencyFingerprint { path, state: DependencyState::Missing }
+            };
+            dependencies.push(dependency);
+            if exists { break; }
         }
-        Ok(None)
-    })
-    .await
-    .map_err(std::io::Error::other)?
+        let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((root, previous)) = entries.get(base)
+            && *previous == dependencies
+        {
+            return Ok(root.clone());
+        }
+        let root = dependencies.iter().find_map(|dependency| {
+            (!matches!(dependency.state, DependencyState::Missing))
+                .then(|| dependency.path.parent().map(Path::to_path_buf)).flatten()
+        });
+        if entries.len() >= RETAINED_REPOSITORY_CAPACITY && !entries.contains_key(base) {
+            entries.clear();
+        }
+        entries.insert(base.to_path_buf(), (root.clone(), dependencies));
+        Ok(root)
+    }
+}
+
+async fn git_ignores_all_changed_paths(root: &Path, paths: &[PathBuf]) -> bool {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    if paths.is_empty() {
+        return true;
+    }
+    let mut input = Vec::new();
+    for path in paths {
+        let Some(path) = path.to_str() else { return false; };
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    // Bound both command-line size and ignore-query output. Overflow and any
+    // inability to prove exclusion remain capture-relevant.
+    if input.len() > 8 * 1024 {
+        return false;
+    }
+    timeout(Duration::from_secs(2), async {
+        // An ignored directory can still contain force-added tracked files.
+        let mut tracked = Command::new("git")
+            .args(["--literal-pathspecs", "ls-files", "--cached", "-z", "--"])
+            .args(paths).current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()).kill_on_drop(true).spawn().ok()?;
+        let mut byte = [0];
+        if tracked.stdout.take()?.read(&mut byte).await.ok()? != 0
+            || !tracked.wait().await.ok()?.success()
+        {
+            return Some(false);
+        }
+        let mut ignored = Command::new("git")
+            .args(["check-ignore", "-z", "--stdin"]).current_dir(root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()).kill_on_drop(true).spawn().ok()?;
+        let mut stdin = ignored.stdin.take()?;
+        let (written, output) = tokio::join!(async move {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await
+        }, ignored.wait_with_output());
+        written.ok()?;
+        let output = output.ok()?;
+        Some(output.status.success()
+            && output.stdout.iter().filter(|byte| **byte == 0).count() == paths.len())
+    }).await.ok().flatten().unwrap_or(false)
 }
 
 async fn remote_workspace_evidence_capture(
@@ -482,7 +575,9 @@ fn workspace_generation_status_args() -> &'static [&'static str] {
 async fn capture_workspace_generation_marker(
     repo_root: PathBuf,
     cancellation: CancellationToken,
+    content_cache: Arc<StdMutex<WorkspaceContentCache>>,
 ) -> Option<WorkspaceEvidenceIdentity> {
+    let capture_started = SystemTime::now();
     let _cancel_on_drop = cancellation.clone().drop_guard();
     let control = WorkspaceCaptureControl {
         deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE,
@@ -490,7 +585,7 @@ async fn capture_workspace_generation_marker(
     };
     let (status, paths) = workspace_generation_status(&repo_root).await?;
     let head_identity = workspace_head_identity(&status)?;
-    let metadata = capture_workspace_metadata(repo_root.clone(), paths, control).await?;
+    let metadata = capture_workspace_metadata_cached(repo_root.clone(), paths, control, content_cache, capture_started).await?;
 
     let mut index_hasher = Sha256::new();
     index_hasher.update(b"KD4_WORKSPACE_INDEX_GENERATION_V1\n");
@@ -749,20 +844,49 @@ fn hash_workspace_content(
     Some((format!("{:x}", hasher.finalize()), bytes_read))
 }
 
+#[derive(Default)]
+struct WorkspaceContentCache {
+    files: HashMap<PathBuf, CachedWorkspaceContent>,
+    #[cfg(test)]
+    hits: AtomicUsize,
+}
+
+struct CachedWorkspaceContent {
+    size: u64,
+    modified: SystemTime,
+    file_id: StableFileIdentity,
+    capture_started: SystemTime,
+    hash: String,
+}
+
+#[cfg(test)]
 async fn capture_workspace_metadata(
     repo_root: PathBuf,
     paths: Vec<WorkspaceGenerationPath>,
     control: WorkspaceCaptureControl,
 ) -> Option<WorkspaceGenerationMetadata> {
-    tokio::task::spawn_blocking(move || {
-        // The status byte budget bounds the path list; the content byte budget
-        // and deadline bound this scan even for large sets of small dirty files.
-        let total_paths = paths.len();
-        let mut manifest = format!("total_paths={total_paths}\n").into_bytes();
-        let mut observed_bytes = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        let mut deletions = Vec::new();
-        for observation in paths {
+    capture_workspace_metadata_cached(repo_root, paths, control, Arc::default(), SystemTime::now()).await
+}
+
+async fn capture_workspace_metadata_cached(
+    repo_root: PathBuf,
+    paths: Vec<WorkspaceGenerationPath>,
+    control: WorkspaceCaptureControl,
+    content_cache: Arc<StdMutex<WorkspaceContentCache>>,
+    capture_started: SystemTime,
+) -> Option<WorkspaceGenerationMetadata> {
+    let total_paths = paths.len();
+    let mut manifest = format!("total_paths={total_paths}\n").into_bytes();
+    let observed_bytes = Arc::new(AtomicU64::new(0));
+    // Ordered buffering bounds blocking workers and preserves the status
+    // reader's sorted manifest order regardless of hash completion order.
+    let results = futures::stream::iter(paths.into_iter().map(|observation| {
+        let repo_root = repo_root.clone();
+        let control = control.clone();
+        let content_cache = Arc::clone(&content_cache);
+        let observed_bytes = Arc::clone(&observed_bytes);
+        async move { tokio::task::spawn_blocking(move || {
+            let mut manifest = Vec::new();
             if !control.active() { return None; }
             let path = observation.path;
             let absolute = repo_root.join(&path);
@@ -771,8 +895,7 @@ async fn capture_workspace_metadata(
                 Err(error) if error.kind() == ErrorKind::NotFound && observation.deleted => {
                     manifest.extend_from_slice(path.as_bytes());
                     manifest.extend_from_slice(b"\0deleted\0\n");
-                    deletions.push(absolute);
-                    continue;
+                    return Some((manifest, Some(absolute)));
                 }
                 _ => return None,
             };
@@ -782,8 +905,9 @@ async fn capture_workspace_metadata(
                 return None;
             }
             let declared_bytes = if metadata.is_file() { metadata.len() } else { 0 };
-            let remaining = WORKSPACE_GENERATION_MAX_DECLARED_BYTES.checked_sub(observed_bytes)?;
-            if declared_bytes > remaining { return None; }
+            observed_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                total.checked_add(declared_bytes).filter(|total| *total <= WORKSPACE_GENERATION_MAX_DECLARED_BYTES)
+            }).ok()?;
             let kind = if metadata.file_type().is_symlink() { "symlink" }
                 else if metadata.is_file() { "file" }
                 else if metadata.is_dir() { "directory" }
@@ -799,16 +923,48 @@ async fn capture_workspace_metadata(
                 manifest.extend_from_slice(format!("{:x}", Sha256::digest(target.to_string_lossy().as_bytes())).as_bytes());
             } else if metadata.is_file() {
                 let mut file = File::open(&absolute).ok()?;
-                let (hash, actual_bytes) = hash_workspace_content(&mut file, remaining, &mut buffer, &control)?;
+                let modified = metadata.modified().ok()?;
+                let file_id = stable_file_identity(&file);
+                let cached_hash = {
+                    let cache = content_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let hash = cache.files.get(&absolute).filter(|entry| {
+                        entry.size == declared_bytes && entry.modified == modified
+                            && Some(&entry.file_id) == file_id.as_ref()
+                            && modified < entry.capture_started
+                    }).map(|entry| entry.hash.clone());
+                    #[cfg(test)]
+                    if hash.is_some() { cache.hits.fetch_add(1, Ordering::Relaxed); }
+                    hash
+                };
+                let (hash, actual_bytes) = match cached_hash {
+                    Some(hash) => (hash, declared_bytes),
+                    None => hash_workspace_content(&mut file, declared_bytes, &mut [0_u8; 64 * 1024], &control)?,
+                };
                 let after = file.metadata().ok()?;
                 if actual_bytes != declared_bytes || after.len() != declared_bytes || after.modified().ok()? != metadata.modified().ok()? {
                     return None;
                 }
-                observed_bytes = observed_bytes.checked_add(actual_bytes)?;
                 manifest.extend_from_slice(hash.as_bytes());
+                if let Some(file_id) = file_id {
+                    let mut cache = content_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Bound cross-repository retention; eviction only costs a rehash.
+                    if cache.files.len() >= 4096 && !cache.files.contains_key(&absolute) { cache.files.clear(); }
+                    if cache.files.get(&absolute).is_none_or(|entry| entry.capture_started <= capture_started) {
+                        cache.files.insert(absolute, CachedWorkspaceContent { size: declared_bytes, modified, file_id, capture_started, hash });
+                    }
+                }
             }
             manifest.push(b'\n');
-        }
+            Some((manifest, None))
+        }).await.ok()? }
+    })).buffered(4).collect::<Vec<_>>().await;
+    let mut deletions = Vec::new();
+    for result in results {
+        let (entry, deletion) = result?;
+        manifest.extend(entry);
+        deletions.extend(deletion);
+    }
+    tokio::task::spawn_blocking(move || {
         for path in deletions {
             if !control.active() || !matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == ErrorKind::NotFound) {
                 return None;
@@ -1166,6 +1322,7 @@ struct CachedWorkspaceEvidenceIdentity {
     capture_sequence: u64,
     host_mutation_generation: u64,
     identity: Option<WorkspaceEvidenceIdentity>,
+    failed_capture: Option<(WorkspaceEvidenceCaptureKey, WorkspaceEvidenceCapture)>,
 }
 
 struct RetainedSourceWatchRegistration {
@@ -1271,12 +1428,16 @@ impl WorkspaceEvidenceCapturePause {
 
 pub(crate) struct GitWorkspaceCache {
     state: Mutex<GitWorkspaceCacheState>,
+    pub(crate) roots: Arc<WorkspaceRootCache>,
+    content_cache: Arc<StdMutex<WorkspaceContentCache>>,
     watcher_epoch: u64,
     watcher_generation: AtomicU64,
     host_mutation_generation: AtomicU64,
     watcher_reliable: AtomicBool,
     watcher_worker: Option<GitWatchWorker>,
     source_watcher_generation: AtomicU64,
+    source_capture_generation: AtomicU64,
+    source_event_gate: tokio::sync::RwLock<()>,
     source_watcher_reliable: AtomicBool,
     repository_retention: StdMutex<RepositoryRetention>,
     source_change_journal: StdMutex<SourceChangeJournal>,
@@ -1582,12 +1743,16 @@ impl GitWorkspaceCache {
             | NEXT_WATCHER_EPOCH.fetch_add(1, Ordering::Relaxed);
         let cache = Arc::new(Self {
             state: Mutex::new(GitWorkspaceCacheState::default()),
+            roots: Arc::default(),
+            content_cache: Arc::default(),
             watcher_epoch,
             watcher_generation: AtomicU64::new(0),
             host_mutation_generation: AtomicU64::new(0),
             watcher_reliable: AtomicBool::new(watcher_available),
             watcher_worker,
             source_watcher_generation: AtomicU64::new(0),
+            source_capture_generation: AtomicU64::new(0),
+            source_event_gate: tokio::sync::RwLock::new(()),
             source_watcher_reliable: AtomicBool::new(watcher_available),
             repository_retention: StdMutex::new(RepositoryRetention::default()),
             source_change_journal: StdMutex::new(SourceChangeJournal::default()),
@@ -1636,7 +1801,7 @@ impl GitWorkspaceCache {
                         return;
                     };
                     let changed_paths = (!event.rescan_required).then_some(event.paths);
-                    cache.record_source_change_event(changed_paths);
+                    cache.record_watched_source_change_event(changed_paths).await;
                 }
                 if let Some(cache) = weak_cache.upgrade() {
                     cache.invalidate_source_watcher();
@@ -1676,11 +1841,18 @@ impl GitWorkspaceCache {
             .identity
     }
 
+    pub(crate) async fn resolve_workspace_root(&self, cwd: &Path) -> std::io::Result<Option<PathBuf>> {
+        let roots = Arc::clone(&self.roots);
+        let cwd = cwd.to_path_buf();
+        tokio::task::spawn_blocking(move || roots.resolve(&cwd))
+            .await.map_err(std::io::Error::other)?
+    }
+
     pub(crate) async fn workspace_evidence_identity_with_attribution(
         &self,
         cwd: &Path,
     ) -> WorkspaceEvidenceCapture {
-        let discovery = resolve_workspace_evidence_root(cwd).await;
+        let discovery = self.resolve_workspace_root(cwd).await;
         let repo_root = match discovery {
             Ok(Some(root)) => root,
             result => {
@@ -1715,17 +1887,34 @@ impl GitWorkspaceCache {
                 };
             }
         };
+        let source_event_guard = self.source_event_gate.read().await;
         let key = WorkspaceEvidenceCaptureKey {
             repo_root: repo_root.clone(),
             watcher_generation: self.watcher_generation.load(Ordering::Acquire),
-            source_watcher_generation: self.source_watcher_generation.load(Ordering::Acquire),
+            source_watcher_generation: self.source_capture_generation.load(Ordering::Acquire),
             host_mutation_generation: self.host_mutation_generation.load(Ordering::Acquire),
         };
+        drop(source_event_guard);
         let (in_flight_capture, coalesced) = {
             let mut in_flight = self
                 .in_flight_workspace_evidence
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut retention = self
+                .repository_retention
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((failed_key, capture)) = retention
+                .latest_workspace_evidence
+                .get(&repo_root)
+                .and_then(|cached| cached.failed_capture.as_ref())
+                && failed_key == &key
+            {
+                let capture = capture.clone();
+                retention.touch(&repo_root);
+                return capture;
+            }
+            drop(retention);
             // A newer local observation epoch must never join an older
             // capture. Dropping the map's old shared future is cancellation
             // safe because every active caller owns its own clone, and keeps
@@ -1754,6 +1943,7 @@ impl GitWorkspaceCache {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
                     let capture_repo_root = repo_root.clone();
+                    let content_cache = Arc::clone(&self.content_cache);
                     let cancellation = CancellationToken::new();
                     let interest = Arc::new(WorkspaceCaptureInterest {
                         waiters: AtomicUsize::new(1),
@@ -1768,6 +1958,7 @@ impl GitWorkspaceCache {
                         capture_workspace_evidence_with_cancellation(
                             capture_repo_root,
                             cancellation,
+                            content_cache,
                         )
                         .await
                     }
@@ -1796,17 +1987,12 @@ impl GitWorkspaceCache {
         #[cfg(not(test))]
         let _ = coalesced;
         let capture = in_flight_capture.future.await;
-        {
-            let mut in_flight = self
-                .in_flight_workspace_evidence
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if in_flight.get(&key).is_some_and(|current| {
-                current.capture_sequence == in_flight_capture.capture_sequence
-            }) {
-                in_flight.remove(&key);
-            }
-        }
+        // Publish before retiring the shared future, so a sibling cannot slip
+        // between completion and negative-cache insertion and start a new scan.
+        let mut in_flight = self
+            .in_flight_workspace_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let capture_sequence = in_flight_capture.capture_sequence;
         let mut retention = self
             .repository_retention
@@ -1823,10 +2009,20 @@ impl GitWorkspaceCache {
                     capture_sequence,
                     host_mutation_generation: key.host_mutation_generation,
                     identity: capture.identity.clone(),
+                    failed_capture: capture.identity.as_ref()
+                        .is_some_and(|identity| identity.unavailable)
+                        .then(|| (key.clone(), capture.clone())),
                 },
             );
         }
         retention.touch(&repo_root);
+        if in_flight.get(&key).is_some_and(|current| {
+            current.capture_sequence == in_flight_capture.capture_sequence
+        }) {
+            in_flight.remove(&key);
+        }
+        drop(retention);
+        drop(in_flight);
         capture
     }
 
@@ -2153,6 +2349,44 @@ impl GitWorkspaceCache {
     }
 
     fn record_filtered_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) -> u64 {
+        self.record_source_change_with_capture_effect(changed_paths, true)
+    }
+
+    async fn record_watched_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) {
+        let _guard = self.source_event_gate.write().await;
+        let changed_paths = changed_paths.map(|paths| paths.into_iter()
+            .filter(|path| !is_generated_codex_eval_path(path)).collect::<Vec<_>>());
+        let roots = self.repository_retention.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .source_watch_registrations.keys().cloned().collect::<Vec<_>>();
+        let mut groups = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+        let mut ignored = changed_paths.is_some();
+        if let Some(paths) = &changed_paths {
+            for path in paths {
+                let root = roots.iter().filter(|root| path.starts_with(root))
+                    .max_by_key(|root| root.components().count());
+                match root {
+                    Some(root) => groups.entry(root.clone()).or_default().push(path.clone()),
+                    None => { ignored = false; break; }
+                }
+            }
+        }
+        if ignored {
+            for (root, paths) in groups {
+                if !git_ignores_all_changed_paths(&root, &paths).await {
+                    ignored = false;
+                    break;
+                }
+            }
+        }
+        // Ignored files remain observable dependencies. Only the git-status
+        // capture identity is unaffected; never omit them from the journal.
+        self.record_source_change_with_capture_effect(changed_paths, !ignored);
+    }
+
+    fn record_source_change_with_capture_effect(
+        &self, changed_paths: Option<Vec<PathBuf>>, affects_capture: bool,
+    ) -> u64 {
         if changed_paths.as_ref().is_some_and(Vec::is_empty) {
             return self.source_watcher_generation.load(Ordering::Acquire);
         }
@@ -2165,6 +2399,9 @@ impl GitWorkspaceCache {
             .load(Ordering::Acquire)
             .saturating_add(1);
         journal.record(generation, changed_paths);
+        if affects_capture {
+            self.source_capture_generation.fetch_add(1, Ordering::AcqRel);
+        }
         self.source_watcher_generation
             .store(generation, Ordering::Release);
         generation

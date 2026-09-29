@@ -17914,6 +17914,7 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
                     }
                     _ => None,
                 })
+                .flat_map(|notice| notice["notices"].as_array().cloned().unwrap_or_else(|| vec![notice]))
                 .filter(|notice| notice["call_id"] == recovery_call_id)
                 .collect::<Vec<_>>();
             if expect_stale {
@@ -17923,9 +17924,10 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
                 assert_eq!(notice["valid_for_current_workspace"], false);
                 assert_eq!(notice["reason_code"], "missing_observation");
                 assert_eq!(notice["observed_revision"], serde_json::Value::Null);
-                assert!(notice["if_rerun_unavailable"].as_str().unwrap().contains("unverified"));
-                assert!(notice["rerun"]["instruction"].as_str().unwrap().contains("Recovered bytes are authenticated historical evidence"));
-                assert!(notice["rerun"]["instruction"].as_str().unwrap().contains("not a request to rerun tests or builds"));
+                let guidance = serde_json::to_string(items.as_ref()).unwrap();
+                assert!(guidance.contains("report the affected claim as unverified"));
+                assert!(guidance.contains("read_tool_output recovers historical bytes, not freshness"));
+                assert!(guidance.contains("not a request to rerun tests or builds"));
                 assert!(
                     !notice.to_string().contains(&original_text),
                     "{case}/{route}: invalidation must not promote tool bytes into developer instructions"

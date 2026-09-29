@@ -169,7 +169,7 @@ async fn throttled_receiver_emits_elapsed_pending_event_before_ready_raw_events(
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn throttled_receiver_coalesces_within_interval() {
     let (tx, rx) = watch_channel();
     let mut throttled = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
@@ -239,7 +239,7 @@ async fn throttled_receiver_flushes_pending_on_shutdown() {
     assert_eq!(closed, None);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn debounced_receiver_coalesces_each_event_batch() {
     let (tx, rx) = watch_channel();
     let mut debounced = DebouncedWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);

@@ -61,7 +61,7 @@ pub(super) fn serialize_output_text_with_limit(
 
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
-    if let Some(stringified) = v8::json::stringify(&tc, value) {
+    if let Some(stringified) = super::output_projection::stringify(&mut tc, value) {
         return bounded_string(&mut tc, stringified, max_bytes);
     }
     if tc.has_caught() {
@@ -91,7 +91,7 @@ pub(super) fn serialize_console_text(
     }
     tc.reset();
     if value.is_object() {
-        if let Some(stringified) = v8::json::stringify(&tc, value) {
+        if let Some(stringified) = super::output_projection::stringify(&mut tc, value) {
             return bounded_string(&mut tc, stringified, max_bytes);
         }
         if tc.has_caught() && max_bytes >= 24 {

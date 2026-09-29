@@ -159,8 +159,6 @@ mod otel;
 mod permission_profile_catalog;
 mod permissions;
 mod resolved_permission_profile;
-#[cfg(test)]
-mod schema;
 pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
 pub use codex_config::ConfigLoadOptions;
 pub use codex_config::Constrained;

@@ -7,6 +7,7 @@ mod schema_fixtures;
 pub use experimental_api::*;
 pub use export::GenerateTsOptions;
 pub use export::generate_internal_json_schema;
+pub use export::generate_json_schema_tree;
 pub use export::generate_json_with_experimental;
 pub use export::generate_ts_with_options;
 pub use protocol::common::*;
@@ -38,6 +39,8 @@ pub use protocol::v1::UserSavedConfig;
 pub use protocol::v2::*;
 pub use rpc::*;
 pub use schema_fixtures::SchemaFixtureOptions;
+#[doc(hidden)]
+pub use schema_fixtures::generate_json_schema_fixture_subtree_for_tests;
 #[doc(hidden)]
 pub use schema_fixtures::generate_typescript_schema_fixture_subtree_for_tests;
 pub use schema_fixtures::read_schema_fixture_subtree;

@@ -201,11 +201,18 @@ impl TurnDiffTracker {
         display_roots: impl IntoIterator<Item = (String, PathBuf)>,
     ) -> Self {
         let mut tracker = Self::new();
-        tracker.display_roots_by_environment = display_roots
+        tracker.set_environment_display_roots(display_roots);
+        tracker
+    }
+
+    pub(crate) fn set_environment_display_roots(
+        &mut self,
+        display_roots: impl IntoIterator<Item = (String, PathBuf)>,
+    ) {
+        self.display_roots_by_environment = display_roots
             .into_iter()
             .map(|(environment_id, root)| (environment_id, normalize_tracked_path(&root)))
             .collect();
-        tracker
     }
 
     pub fn track_delta(&mut self, environment_id: &str, delta: &AppliedPatchDelta) {

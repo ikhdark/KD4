@@ -184,25 +184,26 @@ mod tests {
         let fallback =
             TaskModelGuidance::for_base_instructions("catalog supplied instructions").render();
         assert_eq!(fallback, TaskModelGuidance::default().render());
-        for required in [
-            "A no-change result is valid and preferred when the requested capability already exists adequately.",
-            "Before adding a mechanism, establish from relevant source evidence the concrete missing capability and why existing abstractions are insufficient.",
-            "Prefer reuse, consolidation, or deletion over adding parallel machinery.",
-            "When edits overlap, preserve independent changes and combine compatible behavior against the requested contract.",
-            "Verify the combined runtime path; ask only when conflicting intended behavior cannot be resolved from current evidence.",
-            "Partial wiring of implemented code is forbidden. End-to-end wiring is mandatory.",
-            "Every test relied upon as evidence for the changed behavior must assert an expected observable result and fail for at least one plausible incorrect implementation of that behavior.",
-            "Report unrelated weaknesses encountered without starting a broader test audit.",
-            "When validation or tests report errors, warnings, or failures, let a valid, progressing run finish. Triage all reported issues together before repair edits.",
-            "Fully diagnose issues caused by the requested changes or necessary to complete required validation; report unrelated issues and their validation impact without expanding the investigation.",
-            "Stop a run when evidence shows it is stalled or cannot validate the intended inputs; retain its output and diagnose the cause before restarting.",
-            "Apply related fixes in consolidated batches and rerun only affected checks that failed or whose prior results were invalidated by relevant changes.",
+        for (required, compact) in [
+            ("A no-change result is valid and preferred when the requested capability already exists adequately.", "A no-change result is valid when existing behavior satisfies the request."),
+            ("Before adding a mechanism, establish from relevant source evidence the concrete missing capability and why existing abstractions are insufficient.", "Before adding a mechanism, identify the concrete missing capability and why existing abstractions are insufficient."),
+            ("Prefer reuse, consolidation, or deletion over adding parallel machinery.", "Prefer reuse, consolidation, or deletion."),
+            ("When edits overlap, preserve independent changes and combine compatible behavior against the requested contract.", "Preserve independent changes and combine compatible behavior; ask only when intended behavior conflicts."),
+            ("Verify the combined runtime path; ask only when conflicting intended behavior cannot be resolved from current evidence.", "End-to-end wiring is mandatory."),
+            ("Partial wiring of implemented code is forbidden. End-to-end wiring is mandatory.", "End-to-end wiring is mandatory."),
+            ("Every test relied upon as evidence for the changed behavior must assert an expected observable result and fail for at least one plausible incorrect implementation of that behavior.", "Add tests only for concrete coverage gaps, assert observable behavior, and do not weaken assertions."),
+            ("Report unrelated weaknesses encountered without starting a broader test audit.", "Do not re-run, fix, or analyze unrelated failures in the concurrently changing checkout; report their validation impact without investigating them."),
+            ("When validation or tests report errors, warnings, or failures, let a valid, progressing run finish. Triage all reported issues together before repair edits.", "Let progressing checks finish, triage all reported failures together, and repair task-related ones in one batch before rerunning."),
+            ("Fully diagnose issues caused by the requested changes or necessary to complete required validation; report unrelated issues and their validation impact without expanding the investigation.", "Let progressing checks finish, triage all reported failures together, and repair task-related ones in one batch before rerunning."),
+            ("Stop a run when evidence shows it is stalled or cannot validate the intended inputs; retain its output and diagnose the cause before restarting.", "Stop a run that shows no progress or cannot validate the intended inputs; keep its output."),
+            ("Apply related fixes in consolidated batches and rerun only affected checks that failed or whose prior results were invalidated by relevant changes.", "Within the same validation, rerun only failed checks; do not rerun passing tests."),
         ] {
             assert!(
                 fallback.contains(required),
                 "missing fallback guidance: {required}"
             );
-            assert_eq!(base.matches(required).count(), 1, "base policy: {required}");
+            assert_eq!(base.matches(compact).count(), 1, "base policy: {compact}");
+            assert!(!supplemental.contains(compact), "duplicate policy: {compact}");
             assert!(
                 !supplemental.contains(required),
                 "duplicate policy: {required}"
@@ -223,9 +224,9 @@ mod tests {
             );
         }
         for required in [
-            "Reuse current reads, exact values, enumerations, agent results, and passing checks.",
-            "Refresh only evidence affected by changed inputs, contradictions, incompleteness, or explicit freshness requirements.",
-            "Retry a failed operation only when changed inputs, new evidence, a documented retry policy, or an explicit task requirement justify it",
+            "Reuse current reads, schemas, exact values, inventories, agent results, and passing checks.",
+            "Refresh only for relevant changed inputs, contradictions, incompleteness, or explicit freshness requirements.",
+            "Retry only with changed inputs, new evidence, a documented retry policy, or an explicit requirement.",
         ] {
             assert!(
                 base.contains(required),

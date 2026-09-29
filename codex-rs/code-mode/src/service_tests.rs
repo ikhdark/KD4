@@ -366,7 +366,13 @@ async fn compact_tool_discovery_resolves_one_exact_description() {
                 default_timeout_ms: None,
                 output_schema: None,
             }],
-            source: r#"text(JSON.stringify({ names: ALL_TOOL_NAMES, resolved: resolve_tool("sample_tool"), missing: resolve_tool("missing") === undefined }));"#.to_string(),
+            source: r#"
+const all = ALL_TOOLS;
+if (all !== ALL_TOOLS) throw new Error("discovery array must be memoized");
+if (JSON.stringify(all) !== JSON.stringify([resolve_tool("sample_tool")])) throw new Error("discovery metadata differs");
+all[0].description = "changed discovery copy";
+text(JSON.stringify({ names: ALL_TOOL_NAMES, resolved: resolve_tool("sample_tool"), missing: resolve_tool("missing") === undefined }));
+"#.to_string(),
             yield_time_ms: None,
             ..execute_request("")
         },

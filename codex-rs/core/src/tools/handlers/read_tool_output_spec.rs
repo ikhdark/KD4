@@ -118,6 +118,13 @@ fn selector_schema(include_structured: bool) -> JsonSchema {
                 vec!["query"],
             )
     );
+    #[cfg(feature = "bench-generation-opportunities")]
+    if crate::generation_live_bench::active(10) {
+        let mut index = variants.last().expect("search selector").clone();
+        index.properties.as_mut().expect("selector properties").insert("kind".to_string(),
+            JsonSchema::string_enum(vec![serde_json::json!("search_index")], Some("Counts and match coordinates only: no hydrated text. Use child_selectors when exact context is required.".to_string())));
+        variants.push(index);
+    }
     JsonSchema::one_of(
         variants,
         Some("Ordered search or exact-select operations over the original artifact.".to_string()),
@@ -266,6 +273,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                                 "selector": {"$ref": "#/$defs/selector"},
                                 "canonical_range": {"$ref": "#/$defs/range"},
                                 "exact_bytes": {"type": "integer", "minimum": 0},
+                                "shared": {"type": "boolean", "enum": [true], "description": "The exact bytes were already hydrated at this identical canonical_range in an earlier result of this same response. Reuse that text; no further read is needed. This never refers to another response."},
                                 "text": {"type": "string"},
                                 "data_base64": {"type": "string"}
                             },
@@ -290,7 +298,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                 properties
                     .get("kind")
                     .and_then(|kind| kind.enum_values.as_ref())
-                    == Some(&vec![serde_json::json!("search")])
+                    .is_some_and(|values| values == &vec![serde_json::json!("search")] || values == &vec![serde_json::json!("search_index")])
             })
         });
     exact_result["properties"]["selector"] = serde_json::json!({"oneOf": exact_selectors});

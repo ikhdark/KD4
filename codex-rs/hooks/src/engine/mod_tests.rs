@@ -1030,7 +1030,7 @@ async fn cancelling_registered_hook_terminates_descendants() {
                 profile: None,
             },
             config_with_pre_tool_use_hook(
-                "(printf ready > started; sleep 2; printf escaped > escaped) & sleep 60",
+                "(sleep 2; printf escaped > escaped) & printf '%s' $! > started; sleep 60",
             ),
         )],
         ConfigRequirements::default(),
@@ -1059,13 +1059,13 @@ async fn cancelling_registered_hook_terminates_descendants() {
         tool_input: serde_json::json!({ "command": "echo hello" }),
         turn_tool_calls: Vec::new(),
     }));
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let pid = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             tokio::select! {
                 outcome = &mut run => panic!("hook completed before cancellation: {outcome:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    if temp.path().join("started").exists() {
-                        break;
+                    if let Some(pid) = std::fs::read_to_string(temp.path().join("started")).ok().and_then(|value| value.trim().parse::<u32>().ok()) {
+                        break pid;
                     }
                 }
             }
@@ -1074,7 +1074,9 @@ async fn cancelling_registered_hook_terminates_descendants() {
     .await
     .expect("registered hook descendant should start");
     drop(run);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    codex_utils_pty::test_support::wait_for_process_exit(pid, Duration::from_secs(2))
+        .await
+        .expect("cancelled hook must terminate its descendant");
     assert!(
         !temp.path().join("escaped").exists(),
         "a descendant survived cancellation of the registered hook"

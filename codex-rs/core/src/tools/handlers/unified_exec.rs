@@ -32,6 +32,7 @@ pub(crate) struct ExecCommandArgs {
     yield_time_ms: u64,
     /// Whether the caller chose `yield_time_ms` rather than its default.
     yield_time_requested: bool,
+    stall_timeout_ms: Option<u64>,
     max_output_tokens: Option<usize>,
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
@@ -76,7 +77,7 @@ struct RawExecCommandArgs {
     force_fresh: bool,
     #[serde(default)]
     validation: Option<codex_protocol::validation::ValidationCommandContext>,
-    // Decode unsupported deadlines to report an explicit error, including when
+    // Decode the unsupported hard deadline to report an explicit error, including when
     // they arrive through the foreign-environment shell_command adapter.
     #[serde(default)]
     timeout_ms: Option<u64>,
@@ -92,15 +93,11 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
     type Error = String;
 
     fn try_from(raw: RawExecCommandArgs) -> Result<Self, Self::Error> {
-        for (field, value) in [
-            ("timeout_ms", raw.timeout_ms),
-            ("stall_timeout_ms", raw.stall_timeout_ms),
-        ] {
-            if value.is_some() {
-                return Err(format!(
-                    "exec_command does not support `{field}`; no command was started. `yield_time_ms` controls the observation wait, not a process deadline."
-                ));
-            }
+        if raw.timeout_ms.is_some() {
+            return Err(
+                "exec_command does not support `timeout_ms`; no command was started. `yield_time_ms` controls the observation wait, not a process deadline."
+                    .to_string(),
+            );
         }
 
         if let Some(yield_time_ms) = raw.yield_time_ms
@@ -133,10 +130,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
         let _compatibility_only_fields = (&raw.environment_id, &raw.workdir);
 
         let yield_time_ms = raw.yield_time_ms.unwrap_or_else(|| {
-            if matches!(
-                crate::validation_admission::classify_validation(&command),
-                crate::validation_admission::ValidationClassification::Validation { .. }
-            ) {
+            if crate::validation_admission::prefers_long_observation_wait(&command) {
                 crate::unified_exec::MAX_YIELD_TIME_MS
             } else {
                 default_exec_yield_time_ms()
@@ -149,6 +143,10 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             tty: raw.tty,
             yield_time_ms,
             yield_time_requested: raw.yield_time_ms.is_some(),
+            stall_timeout_ms: raw
+                .stall_timeout_ms
+                .or(Some(crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS))
+                .filter(|timeout| *timeout != 0),
             max_output_tokens: raw.max_output_tokens,
             sandbox_permissions: raw.sandbox_permissions,
             additional_permissions: raw.additional_permissions,

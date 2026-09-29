@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +64,7 @@ class RunnerError(RuntimeError):
         self.outcome = outcome
         self.result = result
         self.completed_gates = completed_gates or {}
+        self.completed_tests: dict[str, list[str]] = {}
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,21 @@ class Target:
     selector_value: str | None
     helpers: tuple[str, ...]
     helpers_by_test_prefix: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
+    @property
+    def all_helpers(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                [
+                    *self.helpers,
+                    *(
+                        name
+                        for names in self.helpers_by_test_prefix.values()
+                        for name in names
+                    ),
+                ]
+            )
+        )
 
     def selection_args(self) -> list[str]:
         args = ["-p", self.package]
@@ -208,9 +224,9 @@ class Manifest:
                     raise RunnerError(f"invalid test module prefix {prefix!r}")
                 names = _require_string_list(names, f"helper prefix {prefix}")
                 _reject_duplicates(names, f"helper prefix {prefix}")
-                if not set(names).issubset(helper_names):
+                if not set(names).issubset(helpers):
                     raise RunnerError(
-                        f"helper prefix {prefix} must be a subset of target helpers"
+                        f"helper prefix {prefix} references unknown helper"
                     )
                 if any(
                     prefix.startswith(other) or other.startswith(prefix)
@@ -252,15 +268,17 @@ class Manifest:
                 filterset = None
                 if filter_value is not None:
                     filterset = _require_string(filter_value, f"{prefix}.filter")
-                tests = _require_string_list(step.get("tests"), f"{prefix}.tests")
-                if not tests:
-                    raise RunnerError(f"{prefix}.tests must not be empty")
+                tests = _require_string_list(step.get("tests", []), f"{prefix}.tests")
+                if not tests and (filterset is None or "tests" in step):
+                    raise RunnerError(
+                        f"{prefix}.tests must not be empty; omit it for a filter-only step"
+                    )
                 _reject_duplicates(tests, f"{prefix}.tests")
                 step_helpers = None
                 if "helpers" in step:
                     names = _require_string_list(step["helpers"], f"{prefix}.helpers")
                     _reject_duplicates(names, f"{prefix}.helpers")
-                    if not set(names).issubset(targets[target_name].helpers):
+                    if not set(names).issubset(targets[target_name].all_helpers):
                         raise RunnerError(
                             f"{prefix}.helpers must be a subset of target helpers"
                         )
@@ -448,6 +466,19 @@ def _stdout_text(result: subprocess.CompletedProcess[str]) -> str:
     # JSON inventory/metadata is control data, not an unbounded diagnostic log.
     path = getattr(result, "stdout_path", None)
     return path.read_text(encoding="utf-8", errors="replace") if path else result.stdout
+
+
+def _nextest_results(
+    result: subprocess.CompletedProcess[str],
+) -> Iterable[tuple[str, str, str]]:
+    for stream in ("stdout", "stderr"):
+        for line in _output_lines(result, stream):
+            match = re.fullmatch(
+                r"\s*(PASS|LEAK|FAIL|LEAK-FAIL|TIMEOUT|EXECFAIL)\s+\[[^]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*",
+                line,
+            )
+            if match:
+                yield match.groups()
 
 
 def _stop_process_tree(process: subprocess.Popen) -> None:
@@ -665,6 +696,7 @@ class RustTestRunner:
         platform: str | None = None,
         executor: Executor = _default_executor,
         profile: str | None = None,
+        cargo_profile: str | None = None,
         no_fail_fast: bool = False,
         command_timeout_seconds: float | None = None,
         env: Mapping[str, str] | None = None,
@@ -677,11 +709,20 @@ class RustTestRunner:
         self.executor = executor
         self.cwd = cwd
         self.no_fail_fast = no_fail_fast
+        if (
+            cargo_profile is not None
+            and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None
+        ):
+            raise RunnerError(
+                "Cargo profile must be a profile name, not a filesystem path"
+            )
+        self.cargo_profile = cargo_profile
         self.base_env = {
             key: value
             for key, value in (os.environ if env is None else env).items()
             # Only helpers built for this run may satisfy a helper lookup.
             if not key.upper().startswith("CARGO_BIN_EXE_")
+            and key.upper() not in {"KD4_AGENT_TASK_FIXTURE_SEED"}
         }
         self.environment_updates = local_rust_env(self.base_env, repo_root=REPO_ROOT)
         self.base_env.update(self.environment_updates)
@@ -706,7 +747,7 @@ class RustTestRunner:
         # points RUSTC_WRAPPER at sccache, and sccache aborts
         # the whole build when that variable asks for incremental compilation
         # while refusing to honor it when it asks for "0". Leaving it unset lets
-        # `codex-rs/.cargo/config.toml` give workspace crates the incremental
+        # Cargo's dev/test profile defaults give workspace crates the incremental
         # cache -- the only one a narrow edit/test loop can use -- while sccache
         # still serves the registry dependencies it does cache.
         if profile is not None:
@@ -728,7 +769,7 @@ class RustTestRunner:
 
     def active_helpers(self, target_names: Iterable[str]) -> list[Helper]:
         return self._active_helper_names(
-            name for target in target_names for name in self.target(target).helpers
+            name for target in target_names for name in self.target(target).all_helpers
         )
 
     def _active_helper_names(self, names: Iterable[str]) -> list[Helper]:
@@ -746,7 +787,11 @@ class RustTestRunner:
         return selected
 
     def _group_gate_steps(
-        self, names: Sequence[str], *, exact_only: bool = False
+        self,
+        names: Sequence[str],
+        *,
+        exact_only: bool = False,
+        resolved_tests: Mapping[GateStep, tuple[str, ...]] | None = None,
     ) -> list[GateStep]:
         groups: dict[
             tuple[str, str, str | None, frozenset[str]],
@@ -756,11 +801,13 @@ class RustTestRunner:
             for step in self.gate(name).steps:
                 if exact_only and step.filterset is not None:
                     continue
+                if resolved_tests is not None and step in resolved_tests:
+                    step = replace(step, tests=resolved_tests[step])
                 target = self.target(step.target)
                 helpers = tuple(
                     helper.name
                     for helper in self._active_helper_names(
-                        target.helpers if step.helpers is None else step.helpers
+                        target.all_helpers if step.helpers is None else step.helpers
                     )
                 )
                 # A step proves its tests with exactly its declared helpers, so
@@ -783,7 +830,9 @@ class RustTestRunner:
                     filters[0]
                     if len(filters) == 1
                     else " | ".join(f"({value})" for value in filters),
-                    tuple(dict.fromkeys(test for step in steps for test in step.tests)),
+                    tuple(dict.fromkeys(test for step in steps for test in step.tests))
+                    if all(step.tests for step in steps)
+                    else (),
                     helpers,
                 )
             )
@@ -806,7 +855,7 @@ class RustTestRunner:
                 "discovery_builds_test_binary": bool(target.helpers_by_test_prefix),
                 "environment_defaults": self.environment_updates,
                 "builds": self._helper_build_commands(helpers),
-                "run": self._run_command(target, []),
+                "run": self._run_command(target, [], report_results=True),
             }
         if name in self.manifest.gates:
             grouped = self._group_gate_steps([name])
@@ -851,7 +900,7 @@ class RustTestRunner:
         *,
         no_fail_fast: bool | None = None,
         allow_all: bool = False,
-    ) -> None:
+    ) -> dict[str, list[str]]:
         args = validate_filtering_args(filter_args)
         target = self.target(name)
         require_core_lib_filter(target, args, allow_all=allow_all)
@@ -872,7 +921,7 @@ class RustTestRunner:
         # Otherwise the direct run already rejects an empty selection.
         if any(
             len(self._active_helper_names(names)) < len(helpers)
-            for names in target.helpers_by_test_prefix.values()
+            for names in (target.helpers, *target.helpers_by_test_prefix.values())
         ):
             # Exact IDs already bound the selection, so their helpers need no
             # discovery invocation; an ID the run cannot select only adds helpers.
@@ -899,15 +948,43 @@ class RustTestRunner:
                 )
             helpers = self._active_helper_names(required)
         env = self._helper_environment([target], helpers, self._build_helpers(helpers))
-        self._checked(
-            self._run_command(target, args, no_fail_fast=no_fail_fast),
-            env=env,
-            capture=CAPTURE_NONE,
+        command = self._run_command(
+            target, args, no_fail_fast=no_fail_fast, report_results=True
         )
+        failure = None
+        try:
+            result = self._checked(command, env=env, capture=CAPTURE_BOTH)
+        except RunnerError as error:
+            if error.result is None or error.result.returncode != 100:
+                raise
+            failure = error
+            result = error.result
+        binary_id = _nextest_binary_id(target)
+        outcomes: dict[str, list[str]] = {}
+        for status, binary, test in _nextest_results(result):
+            if binary == binary_id:
+                outcomes.setdefault(test, []).append(status)
+        passed = sorted(
+            test
+            for test, statuses in outcomes.items()
+            if statuses in (["PASS"], ["LEAK"])
+        )
+        receipts = {binary_id: passed} if passed else {}
+        # These are execution receipts, not a cache or proof after input changes.
+        rendered = json.dumps({"completed_tests": receipts}, sort_keys=True)
+        path = self._retain_text(rendered, prefix="completed-tests-")
+        print(
+            f"Completed test receipts (reuse only while inputs match): {path or rendered}",
+            file=sys.stderr,
+        )
+        if failure is not None:
+            failure.completed_tests = receipts
+            raise failure
+        return receipts
 
     def check_gates(
         self, names: Sequence[str], *, include_generated: bool = True
-    ) -> None:
+    ) -> dict[GateStep, tuple[str, ...]]:
         """Verify declared filter/ID parity without running tests or helpers."""
         if not names:
             raise RunnerError("at least one gate is required")
@@ -922,11 +999,16 @@ class RustTestRunner:
             for step in self.gate(name).steps
             if step.filterset is not None
         )
+        resolved_tests = {}
         for step in discovery_steps:
             target = self.target(step.target)
             listed = self._list_tests(target, self._gate_filter_args(step))
             actual = set(listed)
-            expected = set(step.tests)
+            expected = set(step.tests) if step.tests else actual
+            if not actual:
+                raise RunnerError(
+                    f"gate {step.target!r} selected no tests", outcome="not_executed"
+                )
             if actual != expected:
                 missing = sorted(expected - actual)
                 unexpected = sorted(actual - expected)
@@ -945,6 +1027,9 @@ class RustTestRunner:
                     f"gate requires ignored tests that would not execute: {ignored}",
                     outcome="skipped",
                 )
+            if not step.tests:
+                resolved_tests[step] = tuple(sorted(actual))
+        return resolved_tests
 
     def run_gate(self, name: str) -> None:
         self.run_gates([name])
@@ -956,14 +1041,15 @@ class RustTestRunner:
         per declared helper set with only that set exported."""
         if not names:
             raise RunnerError("at least one gate is required")
-        grouped = self._group_gate_steps(names)
         # Exact generated selections are proved by completed results below.
         # Explicit filters must always prove parity before batching: execution
         # of the declared IDs alone cannot detect an over-broad source filter.
-        self.check_gates(names, include_generated=discover)
+        resolved_tests = self.check_gates(names, include_generated=discover)
+        grouped = self._group_gate_steps(names, resolved_tests=resolved_tests)
 
         required_by_gate = {
-            name: self._group_gate_steps([name]) for name in dict.fromkeys(names)
+            name: self._group_gate_steps([name], resolved_tests=resolved_tests)
+            for name in dict.fromkeys(names)
         }
         proved: set[tuple[str, frozenset[str], str]] = set()
 
@@ -1043,24 +1129,15 @@ class RustTestRunner:
             passed: dict[tuple[str, str], int] = {}
             failed: set[tuple[str, str]] = set()
             unexpected = False
-            for stream in ("stdout", "stderr"):
-                for line in _output_lines(result, stream):
-                    # Nextest reports a passing test that leaked handles as
-                    # LEAK; LEAK-FAIL is a failure, never a passing receipt.
-                    match = re.fullmatch(
-                        r"\s*(PASS|LEAK|FAIL|LEAK-FAIL|TIMEOUT|EXECFAIL)\s+\[[^]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*",
-                        line,
-                    )
-                    if match:
-                        status, binary, test = match.groups()
-                        if test in expected.get(binary, ()):
-                            key = (binary, test)
-                            if status in {"PASS", "LEAK"}:
-                                passed[key] = min(2, passed.get(key, 0) + 1)
-                            else:
-                                failed.add(key)
-                        else:
-                            unexpected = True
+            for status, binary, test in _nextest_results(result):
+                if test in expected.get(binary, ()):
+                    key = (binary, test)
+                    if status in {"PASS", "LEAK"}:
+                        passed[key] = min(2, passed.get(key, 0) + 1)
+                    else:
+                        failed.add(key)
+                else:
+                    unexpected = True
             required = {
                 (binary, test) for binary, tests in expected.items() for test in tests
             }
@@ -1169,7 +1246,11 @@ class RustTestRunner:
         targets: Sequence[Target], steps: Sequence[GateStep]
     ) -> list[str]:
         def exact(step: GateStep) -> str:
-            return " | ".join(f"test(={test})" for test in step.tests)
+            return (
+                " | ".join(f"test(={test})" for test in step.tests)
+                if step.tests
+                else step.filterset or "none()"
+            )
 
         if len(steps) == 1:
             return ["-E", exact(steps[0])]
@@ -1214,6 +1295,7 @@ class RustTestRunner:
             verb,
             "--target-dir",
             str(self.target_dir),
+            *(["--cargo-profile", self.cargo_profile] if self.cargo_profile else []),
             *target.selection_args(),
             *(arg for other in batch for arg in other.selection_args()[2:]),
         ]
@@ -1228,6 +1310,7 @@ class RustTestRunner:
         *,
         no_fail_fast: bool | None = None,
         batch: Sequence[Target] = (),
+        report_results: bool = False,
     ) -> list[str]:
         args = validate_filtering_args(filter_args)
         keep_going = self.no_fail_fast if no_fail_fast is None else no_fail_fast
@@ -1239,6 +1322,20 @@ class RustTestRunner:
             "--success-output",
             "never",
             *(["--no-fail-fast"] if keep_going else []),
+            *(
+                [
+                    "--color",
+                    "never",
+                    "--status-level",
+                    "pass",
+                    "--final-status-level",
+                    "none",
+                    "--retries",
+                    "0",
+                ]
+                if report_results
+                else []
+            ),
             *args,
         ]
 
@@ -1263,6 +1360,7 @@ class RustTestRunner:
             "--message-format=json-render-diagnostics",
             "--target-dir",
             str(self.target_dir),
+            *(["--profile", self.cargo_profile] if self.cargo_profile else []),
             *(arg for package in packages for arg in ("-p", package)),
             *(arg for helper in helpers for arg in ("--bin", helper.binary)),
         ]
@@ -1358,7 +1456,13 @@ class RustTestRunner:
             dict.fromkeys(
                 profile_dir / "deps" / "codex-resources"
                 for profile_dir in (
-                    self.target_dir / "debug",
+                    self.target_dir
+                    / (
+                        {"dev": "debug", "test": "debug", "bench": "release"}.get(
+                            self.cargo_profile, self.cargo_profile
+                        )
+                        or "debug"
+                    ),
                     *(executable.parent for executable in selected.values()),
                 )
             )
@@ -1421,9 +1525,20 @@ class RustTestRunner:
         capture: str,
     ) -> subprocess.CompletedProcess[str]:
         try:
-            return self.executor(
-                list(args), cwd=self.cwd, env=dict(env), capture=capture
-            )
+            with ExitStack() as cleanup:
+                child_env = dict(env)
+                # All nextest workers in this invocation share an immutable,
+                # freshly migrated seed. Never reuse one from a previous build.
+                if (
+                    list(args[:3]) == ["cargo", "nextest", "run"]
+                    and "codex-agent-task-store" in args
+                ):
+                    child_env["KD4_AGENT_TASK_FIXTURE_SEED"] = cleanup.enter_context(
+                        tempfile.TemporaryDirectory(prefix="kd4-agent-task-seed-")
+                    )
+                return self.executor(
+                    list(args), cwd=self.cwd, env=child_env, capture=capture
+                )
         except CleanupFailed as error:
             (self.target_dir / ".lane-cleanup-unconfirmed").write_text(str(error))
             raise RunnerError(str(error), outcome="cleanup_failed") from error
@@ -1864,6 +1979,57 @@ def guard_generic_recipe_args(
         )
 
 
+def crate_validation_commands(
+    mode: str, package: str, raw_args: Sequence[str]
+) -> list[list[str]]:
+    """Preflight the entire ladder before any formatter or Cargo process starts."""
+    if mode not in {"focused", "local", "full"}:
+        raise RunnerError(f"unknown crate validation mode {mode!r}")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", package):
+        raise RunnerError("crate validation requires one exact package name")
+    args = list(raw_args)
+    separator = args.index("--") if "--" in args else len(args)
+    selection, forwarded = args[:separator], args[separator:]
+    allow_all = "--all-tests" in selection
+    selection = [arg for arg in selection if arg != "--all-tests"]
+    args = [*selection, *forwarded]
+    # Package selection remains owned by the recipe, never by forwarded flags.
+    if cargo_package_specs(selection) or any(
+        arg in {"--workspace", "--all"} for arg in selection
+    ):
+        raise RunnerError("crate validation cannot override its package")
+    guard_generic_recipe_args(["-p", package, *args], recipe="crate validation")
+    has_target = any(
+        arg == "--lib"
+        or arg.startswith(("--test=", "--bin="))
+        and bool(arg.split("=", 1)[1])
+        or arg in {"--test", "--bin"}
+        and index + 1 < len(selection)
+        and not selection[index + 1].startswith("-")
+        for index, arg in enumerate(selection)
+    )
+    if not allow_all and (
+        not has_target
+        or any(
+            arg in {"--all-targets", "--tests", "--bins", "--examples", "--benches"}
+            for arg in selection
+        )
+    ):
+        raise RunnerError(
+            "select --lib, --test <target>, or --bin <target>; "
+            "use --all-tests only for an intentional whole-package run"
+        )
+    commands = []
+    if mode != "focused":
+        commands.append(
+            ["just", "fmt-check"]
+            if mode == "full"
+            else ["just", "fmt-check-fast", "--only", "rust", "--rust-package", package]
+        )
+    commands.append(["just", "test-fast", "-p", package, "--no-tests=fail", *args])
+    return commands
+
+
 def load_metadata(
     executor: Executor = _default_executor,
     *,
@@ -1927,6 +2093,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--target-dir")
+    parser.add_argument(
+        "--cargo-profile",
+        help="Cargo build profile for both tests and their helpers (for example dev-small).",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Execution policy the calling recipe owns. `--target-dir` uses SUPPRESS so a
@@ -2058,6 +2228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             metadata,
             target_dir=_resolve_target_dir(args.target_dir, metadata),
             profile=getattr(args, "profile", None),
+            cargo_profile=args.cargo_profile,
             no_fail_fast=no_fail_fast,
             command_timeout_seconds=getattr(args, "command_timeout_seconds", None),
         )

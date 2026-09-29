@@ -384,6 +384,16 @@ pub(crate) async fn run_turn(
         record_inspected_inputs(&sess, &turn_context, &input).await?;
         return Ok(TurnTaskResult::default());
     }
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
+        TurnDiffTracker::with_environment_display_roots([]),
+    ));
+    let mut initial_workspace_prefetch = start_continuation_workspace_prefetch(
+        &sess.clone_history().await,
+        &turn_diff_tracker,
+        Arc::clone(&sess.services.git_workspace),
+        turn_context.config.cwd.clone(),
+        turn_context.environments.clone(),
+    ).await;
     let mut preparation_timing_guard = None;
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
@@ -484,9 +494,7 @@ pub(crate) async fn run_turn(
     let mut defer_pending_input = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
-    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
-        TurnDiffTracker::with_environment_display_roots(display_roots),
-    ));
+    turn_diff_tracker.lock().await.set_environment_display_roots(display_roots);
     let kd4_runtime = turn_context.config.features.enabled(Feature::Kd4Runtime);
     let mut turn_execution =
         TurnExecutionControl::new_with_timing(Arc::clone(&turn_context.turn_timing_state));
@@ -540,6 +548,7 @@ pub(crate) async fn run_turn(
             run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await?
         };
         if recorded_input.accepted_context_input {
+            initial_workspace_prefetch = None;
             prefetched_workspace_identity = None;
             finalized_mutation_revision = None;
             last_stop_repair = None;
@@ -674,35 +683,31 @@ pub(crate) async fn run_turn(
                 .begin_request_preparation(&mut preparation_timing_guard);
 
             // Construct the input that we will send to the model.
+            record_sampling_notices(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                step_context.mcp_tool_snapshot().await.temporarily_unavailable,
+                budget_forced_terminal,
+            )
+            .await?;
             let sampling_request_input: PreparedPromptInput = async {
                 let history_snapshot_guard = turn_context
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::HistorySnapshot);
-                let mut history = sess.clone_history().await;
-                if step_context.mcp_tool_snapshot().await.temporarily_unavailable {
-                    history.record_items(
-                        &[ResponseItem::Message {
-                            id: None,
-                            role: "developer".to_string(),
-                            content: vec![ContentItem::InputText {
-                                text: "The MCP tool catalog is temporarily unavailable for this request. This does not mean that no MCP tools are configured. Continue independent local work; if this task requires MCP, retry discovery on a subsequent step or report the unavailable capability.".to_string(),
-                            }],
-                            phase: None,
-                            internal_chat_message_metadata_passthrough: None,
-                        }],
-                        turn_context.model_info.truncation_policy.into(),
-                    );
-                }
-                if budget_forced_terminal {
-                    history.record_items(
-                        std::slice::from_ref(&forced_terminal_budget_directive()),
-                        turn_context.model_info.truncation_policy.into(),
-                    );
-                }
+                let history = sess.clone_history().await;
                 drop(history_snapshot_guard);
                 let normalization_guard = turn_context
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::Normalization);
+                if let Some((baseline, handle)) = initial_workspace_prefetch.take()
+                    && continuation_workspace_prefetch_is_current(
+                        baseline,
+                        turn_diff_tracker.lock().await.current_mutation_revision(),
+                        false,
+                    )
+                {
+                    prefetched_workspace_identity = handle.await.ok();
+                }
                 let prepared = match prefetched_workspace_identity.take() {
                     Some(workspace_identity) => prepare_sampling_prompt_with_workspace_identity(
                         history,
@@ -1455,16 +1460,65 @@ async fn record_forced_terminal_budget_boundary(sess: &Session, turn_context: &T
     .await;
 }
 
-fn forced_terminal_budget_directive() -> ResponseItem {
-    ResponseItem::Message {
+async fn record_context_notice_if_changed(
+    sess: &Session,
+    turn: &TurnContext,
+    marker: &str,
+    text: &str,
+) -> CodexResult<bool> {
+    let opening = format!("<{marker}>");
+    let rendered = format!("{opening}\n{text}\n</{marker}>");
+    let history = sess.clone_history().await;
+    let previous = history
+        .raw_items()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                content.iter().find_map(|content| match content {
+                    ContentItem::InputText { text } if text.starts_with(&opening) => Some(text),
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+    if previous == Some(&rendered) || (previous.is_none() && text.is_empty()) {
+        return Ok(false);
+    }
+    let item = ResponseItem::Message {
         id: None,
         role: "developer".to_string(),
-        content: vec![ContentItem::InputText {
-            text: LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE.to_string(),
-        }],
+        content: vec![ContentItem::InputText { text: rendered }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
+    };
+    sess.record_conversation_items(turn, &[item]).await?;
+    Ok(true)
+}
+
+async fn record_sampling_notices(
+    sess: &Session,
+    turn: &TurnContext,
+    mcp_unavailable: bool,
+    forced_terminal: bool,
+) -> CodexResult<()> {
+    if mcp_unavailable {
+        record_context_notice_if_changed(
+            sess,
+            turn,
+            "mcp_catalog_notice",
+            "The MCP tool catalog was temporarily unavailable when this notice was recorded. This does not mean no MCP tools are configured and is not evidence of availability on later requests. Continue independent local work; if needed, retry discovery on a subsequent step or report the unavailable capability.",
+        ).await?;
     }
+    if forced_terminal {
+        record_context_notice_if_changed(
+            sess,
+            turn,
+            "forced_terminal_notice",
+            &format!("Applies only to the final synthesis in turn {}. Later user input may resume work.\n{LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE}", turn.sub_id),
+        ).await?;
+    }
+    Ok(())
 }
 
 async fn emit_status_affecting_turn_error(
@@ -3210,6 +3264,7 @@ pub(crate) fn build_prompt(
         digests: PromptDigests::default(),
         tools: router.model_visible_schemas_for_turn(turn_context),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+        tool_calls_disabled: false,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
         output_schema_strict: true,
@@ -3469,11 +3524,7 @@ impl RequestScaffoldCache {
             };
         }
 
-        let tools = if terminal_completion_only {
-            Arc::new(ToolSchemaArtifact::default())
-        } else {
-            router.model_visible_schemas_for_turn(&step_context.turn)
-        };
+        let tools = router.model_visible_schemas_for_turn(&step_context.turn);
         // A different router instance or activation revision can still project the same
         // surface. Fall back to the artifact comparison so those requests keep reusing the
         // scaffold instead of rebuilding it.
@@ -3643,6 +3694,7 @@ fn build_projected_prompt_from_scaffold(
         digests,
         tools: Arc::clone(&scaffold.tools),
         parallel_tool_calls: step_context.turn.model_info.supports_parallel_tool_calls,
+        tool_calls_disabled: false,
         base_instructions: scaffold.base_instructions.clone(),
         output_schema: step_context.turn.final_output_json_schema.clone(),
         output_schema_strict: true,
@@ -3665,7 +3717,7 @@ async fn run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
-    prepared_input: PreparedPromptInput,
+    mut prepared_input: PreparedPromptInput,
     selected_skill_invocations: &[SkillInvocation],
     prebuilt_router: &mut Option<Arc<ToolRouter>>,
     base_instructions: &BaseInstructions,
@@ -3690,9 +3742,8 @@ async fn run_sampling_request(
     let cached_router = prebuilt_router.take();
     let mut router = match cached_router {
         Some(router) if terminal_completion_only => {
-            // A terminal continuation advertises no tools, so exposure drift
-            // cannot affect this request. Reuse the already-finalized router
-            // only as a defensive sink for an invalid model-emitted tool call.
+            // Preserve the last schema surface for the terminal answer.
+            // Dispatch still rejects any invalid model-emitted tool call.
             turn_context.turn_timing_state.record_tool_router_reuse();
             router
         }
@@ -3740,6 +3791,21 @@ async fn run_sampling_request(
     // still rebuild while ordinary tool continuations reuse the same registry.
     *prebuilt_router = Some(Arc::clone(&router));
     drop(router_preparation_guard);
+    if record_context_notice_if_changed(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        "tool_search_sources",
+        &router.tool_search_sources,
+    )
+    .await?
+    {
+        prepared_input = prepare_sampling_prompt_for_client(
+            sess.clone_history().await,
+            turn_context.as_ref(),
+            sess.services.git_workspace.as_ref(),
+        )
+        .await;
+    }
     let scaffold_guard = turn_context
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::RequestTransformation);
@@ -3755,7 +3821,7 @@ async fn run_sampling_request(
             base_instructions,
             terminal_completion_only,
         );
-    let pending_tool_manifest = Arc::new(Mutex::new(if !terminal_completion_only {
+    let pending_tool_manifest = Arc::new(Mutex::new({
         let previous_manifest_hash = sess
             .queued_tool_manifest_hash
             .lock()
@@ -3764,8 +3830,6 @@ async fn run_sampling_request(
         let manifest = router
             .tool_manifest_for_rollout(turn_context.as_ref(), previous_manifest_hash.as_deref());
         Some(manifest)
-    } else {
-        None
     }));
 
     drop(scaffold_guard);
@@ -3865,13 +3929,6 @@ async fn run_sampling_request(
         retry_result?;
         turn_context.turn_timing_state.record_sampling_retry();
         if attempt_progress.requires_authoritative_retry_input() {
-            let history = sess.clone_history().await;
-            let retry_input = prepare_sampling_prompt_for_client(
-                history,
-                turn_context.as_ref(),
-                sess.services.git_workspace.as_ref(),
-            )
-            .await;
             // Accepted output has changed authoritative state. Revalidate the
             // whole request snapshot while retaining this recovery episode's budget.
             step_context = sess.capture_step_context(Arc::clone(&turn_context)).await?;
@@ -3897,6 +3954,19 @@ async fn run_sampling_request(
                     CodexErr::Fatal("recovery step router was already finalized".to_string())
                 })?;
             *prebuilt_router = Some(Arc::clone(&router));
+            record_context_notice_if_changed(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                "tool_search_sources",
+                &router.tool_search_sources,
+            )
+            .await?;
+            let retry_input = prepare_sampling_prompt_for_client(
+                sess.clone_history().await,
+                turn_context.as_ref(),
+                sess.services.git_workspace.as_ref(),
+            )
+            .await;
             request_scaffold = sess
                 .request_scaffold_cache
                 .lock()
@@ -3911,9 +3981,7 @@ async fn run_sampling_request(
                 );
             *pending_tool_manifest
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = if terminal_completion_only {
-                None
-            } else {
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = {
                 let previous = sess
                     .queued_tool_manifest_hash
                     .lock()
@@ -3986,13 +4054,9 @@ pub(super) async fn persist_sampling_prefix_before_dispatch(
 }
 
 fn enforce_terminal_prompt_contract(prompt: &mut Prompt, terminal_completion_only: bool) {
-    if terminal_completion_only {
-        if !prompt.tools.specs().is_empty() {
-            prompt.tools = Arc::new(ToolSchemaArtifact::default());
-        }
-        prompt.digests.tools = Some(prompt.tools.digest());
-        prompt.parallel_tool_calls = false;
-    }
+    // Dispatch also rejects unexpected calls; do not rewrite the cached schema
+    // prefix or parallel-call setting just to request a final answer.
+    prompt.tool_calls_disabled = terminal_completion_only;
 }
 
 async fn finalized_router_matches_current_exposure(
@@ -5859,7 +5923,7 @@ async fn try_run_sampling_request(
                     Err(err) => break Err(err),
                 };
                 if let Some(tool_future) = output_result.tool_future {
-                    all_tool_calls_eager_read_eligible &= output_result.eager_read_eligible;
+                    all_tool_calls_eager_read_eligible &= output_result.read_only_prefetch_eligible;
                     // Poll every accepted call while the response is streaming. The
                     // runtime still owns repository gates, approvals and cancellation;
                     // FuturesOrdered preserves provider order when relaying results.

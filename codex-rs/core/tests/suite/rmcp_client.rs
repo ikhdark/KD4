@@ -348,6 +348,37 @@ async fn openai_form_capability_updates_for_loaded_thread() -> anyhow::Result<()
         .codex
         .set_openai_form_elicitation_support(/*supported*/ true)
         .await?;
+    // Optional MCP refresh is nonblocking. Trigger it on the loaded thread and
+    // observe both completion signals before asking the model to use its tools.
+    mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("refresh", "refreshed"),
+            responses::ev_completed("refresh"),
+        ]),
+    )
+    .await;
+    fixture
+        .codex
+        .submit(read_only_user_turn(&fixture, "refresh the client capabilities"))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut ready = false;
+        let mut completed = false;
+        while !ready || !completed {
+            match fixture.codex.next_event().await?.msg {
+                EventMsg::McpStartupComplete(summary) => {
+                    anyhow::ensure!(summary.failed.is_empty(), "MCP refresh failed: {:?}", summary.failed);
+                    anyhow::ensure!(summary.cancelled.is_empty(), "MCP refresh was cancelled");
+                    ready = summary.ready.iter().any(|name| name == server_name);
+                }
+                EventMsg::TurnComplete(_) => completed = true,
+                _ => {}
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
     let supported = call_structured_tool(
         &server,
         &fixture,

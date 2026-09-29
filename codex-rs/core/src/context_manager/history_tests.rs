@@ -3401,7 +3401,7 @@ fn recorded_context_window_scales_the_tool_result_budget() {
         history
             .tool_history_state()
             .configured_model_visible_tool_result_token_budget(),
-        Some(129_200)
+        Some(75_000)
     );
     // A reloaded ledger has no window of its own; the derived budget carries over.
     history.set_tool_history_state(ToolHistoryState::default());
@@ -3409,7 +3409,7 @@ fn recorded_context_window_scales_the_tool_result_budget() {
         history
             .tool_history_state()
             .configured_model_visible_tool_result_token_budget(),
-        Some(129_200)
+        Some(75_000)
     );
     history.set_token_info(None);
     assert_eq!(

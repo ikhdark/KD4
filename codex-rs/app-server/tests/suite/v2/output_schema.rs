@@ -12,7 +12,6 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use core_test_support::require_network;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
-use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
 

@@ -8,7 +8,9 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -369,7 +371,29 @@ def run_stable_compatibility_check(
     return 0
 
 
-def run_python_sdk_contract_check(root: Path) -> int:
+def snapshot_python_sdk_contract(root: Path, destination: Path) -> None:
+    """Capture the consumer and its schema inputs while the generation lock is held."""
+    for relative in (
+        "sdk/python/src",
+        "sdk/python/scripts",
+        "codex-rs/app-server-protocol/schema/json",
+    ):
+        shutil.copytree(
+            root / relative,
+            destination / relative,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+    for relative in (
+        "sdk/python/pyproject.toml",
+        "sdk/python/tests/test_contract_generation.py",
+    ):
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / relative, target)
+
+
+def run_python_sdk_contract_check(root: Path, snapshot_root: Path | None = None) -> int:
+    sdk = (snapshot_root or root) / "sdk" / "python"
     return run(
         [
             "uv",
@@ -379,7 +403,9 @@ def run_python_sdk_contract_check(root: Path) -> int:
             "--group",
             "dev",
             "pytest",
-            "tests/test_contract_generation.py",
+            "-o",
+            f'pythonpath="{(sdk / "src").as_posix()}"',
+            str(sdk / "tests" / "test_contract_generation.py"),
         ],
         cwd=root,
     )
@@ -448,6 +474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
     lock_owner = args.owner if args.mode == "force" else f"check:{os.getpid()}"
     generated_changed = False
+    snapshot = tempfile.TemporaryDirectory(prefix="codex-schema-consumer-")
     try:
         with generated_output_lock(
             root, lock_owner, timeout=lock_timeout, resource="app-server-schema"
@@ -485,12 +512,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "Experimental output is separate; the freshness and SDK checks "
                     "validate the unchanged stable fixtures, not experimental compatibility."
                 )
-            consumer_code = run_python_sdk_contract_check(root)
-            if consumer_code != 0:
-                return consumer_code
-    except GenerationLockError as error:
+            snapshot_python_sdk_contract(root, Path(snapshot.name))
+        # The SDK and all schema inputs are now a private snapshot. A new
+        # generation may proceed without racing this consumer's reads.
+        consumer_code = run_python_sdk_contract_check(root, Path(snapshot.name))
+        if consumer_code != 0:
+            return consumer_code
+    except (GenerationLockError, OSError) as error:
         print(str(error), file=sys.stderr)
         return 2
+    finally:
+        snapshot.cleanup()
     if generated_changed and stable_lane:
         print("Schema regeneration changed generated outputs; review and include them.")
     return 0

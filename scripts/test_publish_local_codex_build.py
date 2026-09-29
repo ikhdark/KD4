@@ -753,10 +753,10 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 command = rf"""
 $ErrorActionPreference = 'Stop'
 . {ps_single_quote(SCRIPT)} -ImportOnly -NoSccache
-Remove-Item Env:SCCACHE_BASEDIR -ErrorAction SilentlyContinue
+Remove-Item Env:SCCACHE_BASEDIRS -ErrorAction SilentlyContinue
 [Environment]::SetEnvironmentVariable('SCCACHE_CACHE_SIZE', '', 'Process')
 $env:CODEX_BUILD_TIMESTAMP = 'original-timestamp'
-$names = @('SCCACHE_BASEDIR', 'SCCACHE_CACHE_SIZE', 'CODEX_BUILD_TIMESTAMP', 'CARGO_TARGET_DIR', {", ".join(ps_single_quote(name) for name in names)})
+$names = @('SCCACHE_BASEDIRS', 'SCCACHE_CACHE_SIZE', 'CODEX_BUILD_TIMESTAMP', 'CARGO_TARGET_DIR', {", ".join(ps_single_quote(name) for name in names)})
 $before = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 'Process') }})
 Invoke-CodexBuild -RepoRoot {ps_single_quote(self.repo_root)} -Profile debug
 $after = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 'Process') }})

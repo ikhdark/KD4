@@ -451,11 +451,21 @@ mod tests {
         let destination = tmp.path().join("destination.exe");
 
         fs::write(&destination, b"same-size").expect("write destination");
-        std::thread::sleep(std::time::Duration::from_secs(1));
         fs::write(&source, b"same-size").expect("write source");
+        let source_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let set_modified = |path: &Path, time| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open fixture for timestamps")
+                .set_times(fs::FileTimes::new().set_modified(time))
+                .expect("set fixture timestamp");
+        };
+        set_modified(&source, source_time);
+        set_modified(&destination, source_time - std::time::Duration::from_secs(2));
         assert!(!destination_is_fresh(&source, &destination).expect("stale metadata"));
 
-        fs::write(&destination, b"same-size").expect("rewrite destination");
+        set_modified(&destination, source_time + std::time::Duration::from_secs(2));
         assert!(destination_is_fresh(&source, &destination).expect("fresh metadata"));
     }
 

@@ -1032,6 +1032,7 @@ mod tests {
         let loader = Arc::new(BlockingLoader::default());
         let client = start_test_client_with_loader(SessionSource::Cli, 1, loader.clone()).await;
         let sender = client.sender();
+        drop(sender.client_tx.reserve().await.expect("initialization notification drained"));
         let request = |id| ClientRequest::ThreadStart {
             request_id: RequestId::Integer(id),
             params: ThreadStartParams::default(),
@@ -1073,16 +1074,18 @@ mod tests {
         assert!(error.message.contains("intentional loader failure"));
         let response = timeout(
             Duration::from_secs(5),
-            sender.request(ClientRequest::ConfigRequirementsRead {
+            sender.request(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
-                params: None,
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
             }),
         )
         .await
         .expect("request after error completes")
         .expect("transport")
         .expect("capacity and request ID released");
-        let _: ConfigRequirementsReadResponse =
+        let _: codex_app_server_protocol::GetAccountResponse =
             serde_json::from_value(response).expect("real handler response");
         client.shutdown().await.expect("shutdown");
         assert_eq!(

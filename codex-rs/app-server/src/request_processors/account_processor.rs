@@ -7,6 +7,9 @@ mod workspace_routing;
 
 // Duration before a browser ChatGPT login attempt is abandoned.
 const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+// Explicit test-process override. Zero asks the OS to allocate the callback
+// socket; ordinary launches retain the registered OAuth port.
+const LOGIN_TEST_PORT_ENV_VAR: &str = "CODEX_APP_SERVER_TEST_LOGIN_PORT";
 const ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
 const ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT: Duration =
     Duration::from_millis(/*millis*/ 1000);
@@ -447,6 +450,20 @@ impl AccountRequestProcessor {
                 config.auth_keyring_backend_kind(),
                 config.auth_route_config(),
             )
+        };
+        let opts = match std::env::var(LOGIN_TEST_PORT_ENV_VAR) {
+            Ok(port) => LoginServerOptions {
+                port: port.parse::<u16>().map_err(|err| {
+                    internal_error(format!("invalid test login callback port: {err}"))
+                })?,
+                ..opts
+            },
+            Err(std::env::VarError::NotPresent) => opts,
+            Err(err) => {
+                return Err(internal_error(format!(
+                    "invalid test login callback port: {err}"
+                )));
+            }
         };
         #[cfg(debug_assertions)]
         let opts = {

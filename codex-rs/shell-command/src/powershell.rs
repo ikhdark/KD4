@@ -462,7 +462,9 @@ mod tests {
             assert_eq!(prefix_powershell_script_with_utf8(&command), command);
             assert_eq!(parse_powershell_command_into_plain_commands(&command), None);
             assert!(!crate::is_safe_command::is_known_safe_command(&command));
-            assert!(crate::is_dangerous_command::command_might_be_dangerous(&command));
+            assert!(crate::is_dangerous_command::command_might_be_dangerous(
+                &command
+            ));
         }
     }
 

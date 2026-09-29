@@ -189,6 +189,7 @@ pub(crate) struct OutputItemResult {
     pub needs_follow_up: bool,
     pub tool_future: Option<InFlightToolCall>,
     pub eager_read_eligible: bool,
+    pub read_only_prefetch_eligible: bool,
 }
 
 pub(crate) struct HandleOutputCtx {
@@ -447,9 +448,19 @@ pub(crate) async fn handle_output_item_done(
                 )));
             }
             let mut next_earlier_tool_calls_eligible = *earlier_tool_calls_eligible;
+            let (admission, read_only) =
+                crate::tool_history::classify_workspace_tool_call_at_admission(
+                    call.tool_name.name.to_string(), call.payload.clone(),
+                    ctx.turn_context.config.cwd.to_path_buf(),
+                ).await.map_err(|error| CodexErr::Fatal(format!(
+                    "workspace admission analysis failed: {error}"
+                )))?;
             output.eager_read_eligible = ctx
                 .tool_runtime
-                .take_eager_read_eligibility(&call, &mut next_earlier_tool_calls_eligible);
+                .take_eager_read_eligibility_with_proof(
+                    &call, &mut next_earlier_tool_calls_eligible, read_only,
+                );
+            output.read_only_prefetch_eligible = read_only || output.eager_read_eligible;
             let timing = ctx
                 .tool_runtime
                 .create_tool_dispatch_timing(item_accepted_at, output.eager_read_eligible);
@@ -507,7 +518,9 @@ pub(crate) async fn handle_output_item_done(
             // Join it before relaying outputs, without delaying tool execution.
             let completion = async move {
                 tool_runtime
-                    .handle_model_tool_call_with_trace(call, cancellation_token, future_timing)
+                    .handle_model_tool_call_with_admission(
+                        call, cancellation_token, future_timing, Some(admission),
+                    )
                     .await
             };
             let tool_future: InFlightFuture<'static> = Box::pin(completion);

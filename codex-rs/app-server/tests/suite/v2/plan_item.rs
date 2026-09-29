@@ -25,7 +25,6 @@ use codex_protocol::config_types::Settings;
 use core_test_support::require_network;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
-use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tokio::time::timeout;

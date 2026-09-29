@@ -92,7 +92,8 @@ platform = "windows"
 # ---------------------------------------------------------------------------
 # Named targets
 #
-# Target helpers are the upper bound for a caller-filtered `run-target`. In
+# Target helpers are the fallback for unlisted modules; their union with prefix
+# overrides is the upper bound for a caller-filtered `run-target`. In
 # codex-core, only `cli_stream` and `live_cli` launch the `codex` CLI; the
 # `test_codex()` fixture treats it as optional and nothing in the session runtime
 # consumes it. `test_codex()` sessions resolve `codex-code-mode-host` because
@@ -114,18 +115,16 @@ helpers = [
 # resolves caller filters before the helper set is narrowed.
 [targets.core_lib.helpers_by_test_prefix]
 "tools::handlers::context_checkpoint::tests::" = []
-"session::turn::context_checkpoint_tests::" = []
-"session::turn::context_lifecycle_tests::" = []
 "session::context_window::tests::" = []
 "state::auto_compact_window::tests::" = []
 "agent::task_capabilities::tests::" = []
-"session::turn::review_benchmarks::" = []
 "client::tests::" = []
 "validation_admission::tests::" = []
 "context_manager::history::tests::" = []
 "tools::handlers::tool_search::tests::" = []
 "tools::handlers::mcp::search_tests::" = []
 "tools::handlers::shell_spec::tests::" = []
+"tools::handlers::shell::tests::pure::" = []
 "tools::command_output_artifact::tests::" = []
 "tools::handlers::read_tool_output::tests::" = []
 "tools::handlers::apply_patch_retries::tests::" = []
@@ -137,11 +136,9 @@ helpers = [
 "plan_store::tests::" = []
 "responses_retry::tests::" = []
 "session::rollout_reconstruction_tests::" = []
-"session::tests::context_review_benchmarks::" = []
 "stable_context::" = []
 "session::token_budget::tests::" = []
 "session::token_budget::runtime_tests::" = []
-"session::turn::efficiency_benchmarks::" = []
 "session::mcp::tests::" = []
 "session::step_context::snapshot_deadline_tests::" = []
 "tool_history::tests::" = []
@@ -169,7 +166,7 @@ helpers = ["codex", "codex-code-mode-host"]
 # Only `cli_stream` and `live_cli` spawn the CLI; they keep the full set above.
 [targets.core_cli_workspace.helpers_by_test_prefix]
 "suite::agents_md::" = ["codex-code-mode-host"]
-"suite::deprecation_notice::" = ["codex-code-mode-host"]
+"suite::deprecation_notice::" = []
 "suite::remote_env::" = ["codex-code-mode-host"]
 "suite::user_shell_cmd::" = ["codex-code-mode-host"]
 
@@ -212,6 +209,19 @@ helpers = ["codex-code-mode-host"]
 package = "codex-core"
 test = "core_model_prompt_runtime"
 helpers = ["codex-code-mode-host"]
+
+[targets.web_search_code_mode]
+package = "codex-web-search-extension"
+test = "code_mode"
+helpers = ["codex-code-mode-host"]
+
+[targets.image_generation_contracts]
+package = "codex-image-generation-extension"
+test = "extension_contracts"
+helpers = ["codex-code-mode-host"]
+
+[targets.image_generation_contracts.helpers_by_test_prefix]
+"suite::extension_sandbox::" = ["codex-code-mode-host", "codex-windows-sandbox-setup", "codex-command-runner"]
 
 [targets.config_lib]
 package = "codex-config"
@@ -259,104 +269,54 @@ test = "all"
 # The app-server binaries come from this package's integration-test build.
 helpers = ["codex-code-mode-host"]
 
+[targets.app_server_sessions]
+package = "codex-app-server"
+test = "app_server_sessions"
+helpers = ["codex-code-mode-host"]
+
+[targets.app_server_plugins]
+package = "codex-app-server"
+test = "app_server_plugins"
+helpers = ["codex-code-mode-host"]
+
+[targets.app_server_transport]
+package = "codex-app-server"
+test = "app_server_transport"
+helpers = ["codex-code-mode-host"]
+
+[targets.app_server_environments]
+package = "codex-app-server"
+test = "app_server_environments"
+helpers = ["codex-code-mode-host"]
+
+[targets.app_server_threads]
+package = "codex-app-server"
+test = "app_server_threads"
+helpers = ["codex-code-mode-host"]
+
+[targets.app_server_accounts]
+package = "codex-app-server"
+test = "app_server_accounts"
+helpers = ["codex-code-mode-host"]
+
+[targets.http_client_lib]
+package = "codex-http-client"
+lib = true
+helpers = []
+
+[targets.rollout_lib]
+package = "codex-rollout"
+lib = true
+helpers = []
+
 [targets.tui_lib]
 package = "codex-tui"
 lib = true
-# `session_archive_commands` tests spawn the CLI as their app-server subprocess.
-helpers = ["codex"]
+# New modules are helper-free unless they explicitly declare a subprocess.
+helpers = []
 
-# Only `session_archive_commands` resolves a helper binary, so every other test
-# module needs none. The CLI depends on codex-tui, so an unlisted module
-# conservatively rebuilds and relinks it after every TUI edit.
 [targets.tui_lib.helpers_by_test_prefix]
-"additional_dirs::" = []
-"analytics::" = []
-"ansi_escape::" = []
-"app::" = []
-"app_backtrack::" = []
-"app_server_approval_conversions::" = []
-"app_server_session::" = []
-"approval_presets::" = []
-"ascii_animation::" = []
-"bottom_pane::" = []
-"branch_summary::" = []
-"chatwidget::" = []
-"cli::" = []
-"clipboard_copy::" = []
-"clipboard_paste::" = []
-"clock_format::" = []
-"composer_input::" = []
-"config_update::" = []
-"custom_terminal::" = []
-"cwd_prompt::" = []
-"debug_config::" = []
-"diff_render::" = []
-"duration_format::" = []
-"exec_cell::" = []
-"exec_command::" = []
-"external_agent_config_migration::" = []
-"external_agent_config_migration_flow::" = []
-"external_editor::" = []
-"file_search::" = []
-"fuzzy_match::" = []
-"get_git_diff::" = []
-"git_action_directives::" = []
-"goal_display::" = []
-"history_cell::" = []
-"ide_context::" = []
-"insert_history::" = []
-"key_hint::" = []
-"keymap::" = []
-"keymap_setup::" = []
-"line_truncation::" = []
-"live_wrap::" = []
-"local_chatgpt_auth::" = []
-"managed_new_thread_defaults::" = []
-"markdown::" = []
-"markdown_render::" = []
-"markdown_stream::" = []
-"mention_codec::" = []
-"model_migration::" = []
-"motion::" = []
-"multi_agents::" = []
-"notifications::" = []
-"onboarding::" = []
-"oss_selection::" = []
-"pager_overlay::" = []
-"permission_compat::" = []
-"pets::" = []
-"render::" = []
-"resize_reflow_cap::" = []
-"resume_picker::" = []
-"session_log::" = []
-"session_resume::" = []
-"shimmer::" = []
-"slash_command::" = []
-"startup_hooks_review::" = []
-"status::" = []
-"status_indicator_widget::" = []
-"streaming::" = []
-"style::" = []
-"table_detect::" = []
-"terminal_hyperlinks::" = []
-"terminal_palette::" = []
-"terminal_probe::" = []
-"terminal_title::" = []
-"test_backend::" = []
-"tests::" = []
-"text_formatting::" = []
-"theme_picker::" = []
-"token_usage::" = []
-"tooltips::" = []
-"transcript_reflow::" = []
-"tui::" = []
-"update_prompt::" = []
-"updates::" = []
-"updates_cache::" = []
-"width::" = []
-"workspace_command::" = []
-"workspace_messages::" = []
-"wrapping::" = []
+"session_archive_commands::" = ["codex"]
 
 [targets.pty_lib]
 package = "codex-utils-pty"
@@ -453,15 +413,77 @@ tests = [
   "unified_exec::process_tests::output_chunk_updates_are_cancellation_atomic",
 ]
 
+[gates.validation-command-recognition]
+description = "Pure validation recipe and observation-policy recognition; no core helpers or compile-capable test discovery."
+
+[[gates.validation-command-recognition.steps]]
+target = "shell_command_lib"
+helpers = []
+tests = [
+  "validation::tests::operation_recognizer_keeps_supported_runner_families",
+  "validation::tests::fork_validation_routes_exclude_inventory_and_unrelated_scripts",
+  "validation::tests::build_and_discovery_waits_are_not_validation_evidence",
+  "validation::tests::focused_recipes_own_arguments_without_inventing_checks",
+]
+
+[gates.validation-bloat-contracts]
+description = "Focused runtime waiting, output, schema, and attempt-accounting contracts without helper builds."
+
+[[gates.validation-bloat-contracts.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "tools::handlers::unified_exec::tests::exec_command_boundary_uses_validation_wait_unless_explicitly_overridden",
+  "tools::handlers::unified_exec::tests::identical_tagged_validation_rg_misses_both_launch",
+  "tools::handlers::shell_spec::tests::exec_command_tool_matches_expected_spec",
+  "tools::handlers::shell::tests::pure::shell_failure_sampling_signal_is_stable_and_distinguishes_outcomes",
+  "tools::handlers::shell::tests::pure::successful_shell_sampling_signal_uses_canonical_output",
+  "tools::handlers::shell::tests::pure::validation_diagnostic_ranges_are_exact_and_bounded",
+  "tools::shell_output_summary::tests::passing_validation_is_compact_before_the_generic_threshold",
+]
+
+[gates.validation-bloat-fixtures]
+description = "Lightweight deprecation fixtures, one large scan-cap regression, small pagination matrix, and isolated OAuth callback ports."
+
+[[gates.validation-bloat-fixtures.steps]]
+target = "core_cli_workspace"
+helpers = []
+tests = [
+  "suite::deprecation_notice::emits_deprecation_notice_for_legacy_feature_flag",
+  "suite::deprecation_notice::emits_deprecation_notice_for_web_search_feature_flag_values",
+]
+
+[[gates.validation-bloat-fixtures.steps]]
+target = "rollout_lib"
+helpers = []
+tests = [
+  "tests::filesystem_listing_reaches_threads_beyond_the_former_scan_cap",
+  "tests::filesystem_listing_preserves_order_and_exclusive_cursors",
+]
+
+[[gates.validation-bloat-fixtures.steps]]
+target = "app_server_accounts"
+tests = [
+  "suite::v2::account::ephemeral_login_callbacks_do_not_cancel_another_server",
+  "suite::v2::account::login_account_chatgpt_start_can_be_cancelled",
+  "suite::v2::account::active_chatgpt_login_does_not_block_app_server_shutdown",
+  "suite::v2::account::login_account_chatgpt_uses_debug_oauth_overrides",
+  "suite::v2::account::login_account_chatgpt_redirects_to_hosted_success_page",
+  "suite::v2::account::set_auth_token_cancels_active_chatgpt_login",
+  "suite::v2::account::login_account_chatgpt_includes_forced_workspace_query_param",
+  "suite::v2::account::login_account_chatgpt_includes_forced_workspace_allowlist_query_param",
+]
+
 [gates.config-schema-protocol]
 description = "Config schema fixture parity without regenerating generated output."
 
 [[gates.config-schema-protocol.steps]]
-target = "core_lib"
+target = "config_lib"
 helpers = []
 tests = [
-  "config::schema::tests::config_schema_hides_unsupported_inline_mcp_bearer_token",
-  "config::schema::tests::config_schema_matches_fixture",
+  "schema::fixture_tests::config_schema_hides_unsupported_inline_mcp_bearer_token",
+  "schema::fixture_tests::config_schema_matches_fixture",
+  "schema::fixture_tests::config_schema_excludes_removed_code_mode_waiting_policy",
 ]
 
 [gates.windows-sandbox-core-exec]
@@ -636,13 +658,9 @@ target = "core_lib"
 helpers = []
 tests = [
   "tools::handlers::get_context_remaining::tests::direct_and_code_mode_results_obey_the_same_schema",
-  "tool_history::tests::checkpoint_handler_boundaries_and_retained_artifacts",
-  "session::turn::tests::new_context_tool_installs_fresh_window_before_next_generation",
-  "session::turn::tests::productive_work_and_owned_polling_preserve_generation_capacity",
   "client::tests::request_setting_tests::dispatched_request_settings_gate_fixed_prefix_reuse",
   "client::tests::fixed_prefix_reuse_requires_comparable_setting_digests",
   "client::tests::encoded_setting_digests_preserve_null_omission_and_incremental_transport",
-  "tool_history::tests::phase_checkpoint_leaves_tiny_results_inline",
   "tool_history::tests::phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence",
   "validation_admission::tests::arbitrary_validate_scripts_are_not_classified_by_filename",
   "validation_admission::tests::conditional_powershell_is_opaque_for_execution_proof",
@@ -813,6 +831,14 @@ tests = ["tools::events::tests::shell_and_unified_exec_finalize_typed_mutation_e
 
 # Recipe gates are invoked by the matching root justfile recipes.
 
+[gates.test-slow-boundaries]
+description = "Real 10s continuation boundary, excluded only from the fast profile. HTTP timeout coverage uses a short injected boundary."
+
+[[gates.test-slow-boundaries.steps]]
+target = "core_code_mode_mcp"
+helpers = ["codex-code-mode-host"]
+tests = ["suite::code_mode::owned_continuation::printed_process_receipts_do_not_interrupt_a_predetermined_drain"]
+
 [gates.app-server-command-exec]
 description = "Exact test contract for the app-server-command-exec recipe."
 
@@ -824,7 +850,7 @@ tests = [
 ]
 
 [[gates.app-server-command-exec.steps]]
-target = "app_server_initialize"
+target = "app_server_transport"
 tests = ["suite::v2::command_exec::command_exec_non_streaming_respects_output_cap"]
 
 [gates.app-server-process-exec]
@@ -835,7 +861,7 @@ target = "app_server_protocol_lib"
 tests = ["protocol::v2::tests::process_notifications_round_trip"]
 
 [[gates.app-server-process-exec.steps]]
-target = "app_server_initialize"
+target = "app_server_transport"
 tests = ["suite::v2::process_exec::process_spawn_reports_buffered_output_cap_reached"]
 
 [gates.app-server-thread-status]
@@ -883,7 +909,12 @@ tests = [
 ]
 
 [gates.tui-large-widget]
-description = "Exact test contract for the tui-large-widget recipe."
+description = "Composer regressions and the complete resume-picker test module."
+
+[[gates.tui-large-widget.steps]]
+target = "tui_lib"
+helpers = []
+filter = "test(resume_picker::tests::)"
 
 [[gates.tui-large-widget.steps]]
 target = "tui_lib"
@@ -891,100 +922,15 @@ helpers = []
 tests = [
   "bottom_pane::chat_composer::tests::footer_collapse_snapshots",
   "bottom_pane::chat_composer::tests::handle_paste_large_uses_placeholder_and_replaces_on_submit",
-  "resume_picker::tests::picker_reload_storm_coalesces_before_rpc_and_results_apply_backpressure",
-  "resume_picker::tests::jumping_to_end_keeps_only_fitting_rows_above_selection",
-  "resume_picker::tests::measured_row_heights_match_rendering_at_footer_wrap_boundaries",
-  "resume_picker::tests::footer_wrap_accounts_for_the_gap_between_fields",
-  "resume_picker::tests::appended_pages_filter_new_rows_and_deduplicate_by_thread_id",
-  "resume_picker::tests::reopening_a_failed_preview_requests_it_again",
-  "resume_picker::tests::footer_hints_show_active_searchable_bindings",
-  "resume_picker::tests::row_display_preview_prefers_thread_name",
-  "resume_picker::tests::local_picker_thread_list_params_include_cwd_filter",
-  "resume_picker::tests::row_search_matches_metadata_fields",
-  "resume_picker::tests::relative_time_formats_zero_seconds_as_now",
-  "resume_picker::tests::long_relative_time_uses_words",
-  "resume_picker::tests::expanded_session_details_include_metadata",
-  "resume_picker::tests::footer_prioritizes_active_sort_timestamp",
-  "resume_picker::tests::footer_marks_missing_branch",
-  "resume_picker::tests::footer_branch_expands_when_line_has_room",
-  "resume_picker::tests::footer_cwd_truncates_to_responsive_column",
-  "resume_picker::tests::footer_omits_cwd_when_hidden",
-  "resume_picker::tests::remote_thread_list_params_omit_provider_filter",
-  "resume_picker::tests::remote_thread_list_params_can_include_non_interactive_sources",
-  "resume_picker::tests::remote_picker_sends_cwd_filter_without_local_post_filtering",
-  "resume_picker::tests::remote_picker_does_not_filter_rows_by_local_cwd",
-  "resume_picker::tests::resume_table_snapshot",
-  "resume_picker::tests::resume_search_error_snapshot",
-  "resume_picker::tests::hint_line_switches_esc_label_for_search_mode",
-  "resume_picker::tests::hint_line_labels_cancel_keys_as_exit_for_existing_session_resume_picker",
-  "resume_picker::tests::hint_line_switches_density_label",
-  "resume_picker::tests::hint_line_compacts_on_narrow_width",
-  "resume_picker::tests::hint_line_snapshot_uses_distributed_wide_footer",
-  "resume_picker::tests::hint_line_snapshot_uses_compact_footer",
-  "resume_picker::tests::hint_line_prioritizes_keybinds_when_very_narrow",
-  "resume_picker::tests::hint_line_shows_loading_transcript_mode",
-  "resume_picker::tests::picker_footer_percent_reports_scroll_progress",
-  "resume_picker::tests::picker_footer_progress_label_shows_position_total_and_percent",
-  "resume_picker::tests::picker_footer_progress_label_uses_known_count_when_more_pages_exist",
-  "resume_picker::tests::picker_footer_progress_label_freezes_percent_while_loading",
-  "resume_picker::tests::picker_footer_percent_is_complete_when_not_scrollable",
-  "resume_picker::tests::ctrl_o_toggles_density_without_typing_into_search",
-  "resume_picker::tests::ctrl_t_requests_selected_session_transcript",
-  "resume_picker::tests::transcript_loading_consumes_picker_input",
-  "resume_picker::tests::transcript_loading_still_allows_ctrl_c_exit",
-  "resume_picker::tests::transcript_loading_overlay_snapshot",
-  "resume_picker::tests::raw_ctrl_t_requests_selected_session_transcript",
-  "resume_picker::tests::ctrl_t_on_row_without_thread_id_shows_inline_error",
-  "resume_picker::tests::loaded_transcript_waits_for_loading_frame_before_opening_overlay",
-  "resume_picker::tests::cached_transcript_still_shows_loading_frame_before_opening_overlay",
-  "resume_picker::tests::ctrl_o_persists_density_preference",
-  "resume_picker::tests::ctrl_o_keeps_toggled_density_when_persistence_fails",
-  "resume_picker::tests::raw_ctrl_o_toggles_density_without_typing_into_search",
-  "resume_picker::tests::space_appends_to_search_query",
-  "resume_picker::tests::ctrl_e_toggles_selected_session_expansion",
-  "resume_picker::tests::raw_ctrl_e_toggles_selected_session_expansion",
-  "resume_picker::tests::search_line_renders_sort_and_filter_tabs",
-  "resume_picker::tests::oversized_search_query_preserves_visible_search_and_toolbar",
-  "resume_picker::tests::search_line_compacts_toolbar_on_narrow_width",
-  "resume_picker::tests::dense_session_snapshot_omits_cwd_in_cwd_filter",
-  "resume_picker::tests::dense_session_snapshot_includes_cwd_in_all_filter",
-  "resume_picker::tests::dense_session_snapshot_auto_hides_cwd_when_narrow",
-  "resume_picker::tests::dense_session_snapshot_forces_cwd_when_narrow",
-  "resume_picker::tests::dense_session_snapshot_drops_metadata_when_narrow",
-  "resume_picker::tests::dense_session_line_prefers_thread_name_over_preview",
-  "resume_picker::tests::dense_selected_summary_line_uses_full_width_selection_style",
-  "resume_picker::tests::dense_session_snapshot_uses_no_blank_lines_between_rows",
-  "resume_picker::tests::expanded_session_snapshot",
-  "resume_picker::tests::narrow_session_snapshot",
-  "resume_picker::tests::session_list_more_indicators_snapshot",
-  "resume_picker::tests::density_toggle_clears_stale_more_indicator",
-  "resume_picker::tests::pageless_scrolling_deduplicates_and_keeps_order",
-  "resume_picker::tests::ensure_minimum_rows_prefetches_when_underfilled",
-  "resume_picker::tests::ensure_minimum_rows_does_not_prefetch_when_comfortable_cards_fill_view",
-  "resume_picker::tests::ensure_minimum_rows_still_prefetches_when_dense_rows_underfill_view",
-  "resume_picker::tests::list_viewport_width_matches_rendered_list_inset",
-  "resume_picker::tests::toggle_sort_key_reloads_with_new_sort",
-  "resume_picker::tests::default_filter_focus_arrows_reload_with_new_filter",
-  "resume_picker::tests::all_filter_can_switch_back_to_cwd_when_cwd_candidate_exists",
-  "resume_picker::tests::filter_stays_all_when_no_cwd_candidate_exists",
-  "resume_picker::tests::page_navigation_uses_view_rows",
-  "resume_picker::tests::page_and_jump_navigation_use_list_keymap",
-  "resume_picker::tests::ctrl_c_exits_even_when_cancel_is_remapped_to_ctrl_c",
-  "resume_picker::tests::end_jumps_to_last_known_row_and_starts_loading_more",
-  "resume_picker::tests::enter_on_row_without_resolvable_thread_id_shows_inline_error",
-  "resume_picker::tests::enter_on_pathless_thread_uses_thread_id",
-  "resume_picker::tests::app_server_row_keeps_pathless_threads",
-  "resume_picker::tests::thread_to_transcript_cells_renders_core_message_types",
-  "resume_picker::tests::thread_to_transcript_cells_hides_raw_reasoning_when_not_enabled",
-  "resume_picker::tests::thread_to_transcript_cells_shows_raw_reasoning_over_summary_when_enabled",
-  "resume_picker::tests::moving_to_last_card_scrolls_when_cards_exceed_viewport",
-  "resume_picker::tests::up_from_bottom_keeps_viewport_stable_when_card_remains_visible",
-  "resume_picker::tests::up_scrolls_only_after_crossing_top_edge",
-  "resume_picker::tests::list_reports_more_rows_above_and_below",
-  "resume_picker::tests::set_query_loads_until_match_and_respects_scan_cap",
-  "resume_picker::tests::paste_appends_to_existing_query",
-  "resume_picker::tests::whitespace_only_paste_is_ignored",
-  "resume_picker::tests::paste_uses_existing_search_loading_path",
-  "resume_picker::tests::esc_with_empty_query_starts_fresh",
-  "resume_picker::tests::esc_with_query_clears_search_and_preserves_selected_result",
 ]
+
+[gates.extension-contracts]
+description = "Extension-owned Code Mode, Responses Lite, and sandbox regressions."
+
+[[gates.extension-contracts.steps]]
+target = "web_search_code_mode"
+filter = "all()"
+
+[[gates.extension-contracts.steps]]
+target = "image_generation_contracts"
+filter = "all()"

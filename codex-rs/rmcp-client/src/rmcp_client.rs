@@ -84,6 +84,10 @@ use codex_config::types::OAuthCredentialsStoreMode;
 #[path = "streamable_http_retry.rs"]
 mod streamable_http_retry;
 
+#[cfg(test)]
+#[path = "oauth_refresh_tests.rs"]
+mod oauth_refresh_tests;
+
 use self::streamable_http_retry::HandshakeError;
 use self::streamable_http_retry::STREAMABLE_HTTP_RETRY_DELAYS_MS;
 

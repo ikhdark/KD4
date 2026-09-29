@@ -780,7 +780,9 @@ mod tests {
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                session.flush_rollout().await?;
+                // The fixture deliberately holds session state; only drain the
+                // physical recorder, without reacquiring it for artifact sync.
+                session.live_thread().expect("attached persistence").flush().await?;
                 if outputs(&physical(&rollout).await?, CALL).len() == 1 {
                     break;
                 }

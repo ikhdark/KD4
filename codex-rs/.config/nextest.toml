@@ -9,7 +9,7 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 retries = 0
 # Bound local test fanout; retain narrower groups below.
 # NEXTEST_TEST_THREADS or --test-threads can opt into a different limit.
-test-threads = 2
+test-threads = 8
 
 [scripts.setup.windows-test-stack]
 command = ["python", "scripts/nextest_windows_stack.py"]
@@ -35,6 +35,11 @@ failure-output = "final"
 
 [profile.fast]
 inherits = "local"
+# Preserve the real continuation boundary in `test-slow-boundaries`, not in
+# every edit loop. The HTTP transport boundary now uses a short injected timeout.
+default-filter = '''
+not test(=suite::code_mode::owned_continuation::printed_process_receipts_do_not_interrupt_a_predetermined_drain)
+'''
 
 # The ChatGPT login server binds fixed callback ports 1455/1457, and a new
 # server sends `/cancel` to whichever process already holds them.
@@ -46,7 +51,7 @@ max-threads = 1
 # Each test launches its own subprocesses. Keep their combined load below the
 # ordinary worker limit, including when NEXTEST_TEST_THREADS is raised.
 [test-groups.process_heavy]
-max-threads = 2
+max-threads = 4
 
 [test-groups.windows_sandbox_legacy_sessions]
 max-threads = 1
@@ -55,19 +60,15 @@ max-threads = 1
 max-threads = 2
 
 [[profile.default.overrides]]
+# Opt-in live A/B has two bounded ten-minute turns, not a mock-server test.
+filter = 'package(codex-core) & test(=suite::code_mode::token_cache_e2e::live::integrated_live_model_pair)'
+slow-timeout = { period = "1m", terminate-after = 22 }
+
+[[profile.default.overrides]]
 # These tests start the real login server on its fixed callback ports. Keep
 # this before the process_heavy override: the first matching test-group wins.
 filter = '''
-(package(codex-app-server) & binary(all) & (
-    test(=suite::v2::account::login_account_chatgpt_start_can_be_cancelled)
-  | test(=suite::v2::account::active_chatgpt_login_does_not_block_app_server_shutdown)
-  | test(=suite::v2::account::login_account_chatgpt_uses_debug_oauth_overrides)
-  | test(=suite::v2::account::login_account_chatgpt_redirects_to_hosted_success_page)
-  | test(=suite::v2::account::set_auth_token_cancels_active_chatgpt_login)
-  | test(=suite::v2::account::login_account_chatgpt_includes_forced_workspace_query_param)
-  | test(=suite::v2::account::login_account_chatgpt_includes_forced_workspace_allowlist_query_param)
-))
-| (package(codex-app-server) & kind(lib)
+(package(codex-app-server) & kind(lib)
     & test(=request_processors::account_processor::tests::cancelled_login_start_closes_callback_before_registry_ownership))
 | (package(codex-login) & binary(all)
     & test(=suite::login_server_e2e::falls_back_to_registered_fallback_port_when_default_port_is_in_use))
@@ -87,7 +88,7 @@ slow-timeout = { period = "1m", terminate-after = 2 }
 # App-server integration tests spawn a fresh app-server subprocess per case, and
 # core apply_patch_cli tests run full Codex turns that launch apply_patch. Both
 # use isolated homes and ephemeral ports. The library unit tests stay ungrouped.
-filter = '(package(codex-app-server) & kind(test)) | (package(codex-core) & kind(test) & test(suite::apply_patch_cli::))'
+filter = '(package(codex-app-server) & kind(test) & not test(suite::v2::analytics::app_server_default_analytics_)) | (package(codex-core) & kind(test) & test(suite::apply_patch_cli::))'
 test-group = 'process_heavy'
 
 [[profile.default.overrides]]
@@ -102,15 +103,36 @@ filter = 'package(codex-windows-sandbox) & test(unified_exec::tests::legacy_)'
 test-group = 'windows_sandbox_legacy_sessions'
 
 [[profile.default.overrides]]
-# Core's Windows library tests include real PowerShell parsing and child-process
-# execution. Bound the whole package so those internal deadlines remain meaningful
-# instead of measuring scheduler starvation when NEXTEST_TEST_THREADS is raised.
+# Bound modules that start shells, Git, MCP or sandboxed subprocesses. Pure
+# guidance, history, schema and tool-spec tests use the global worker pool.
 platform = 'cfg(windows)'
-filter = 'package(codex-core)'
+filter = '''
+package(codex-core) & (
+    test(unified_exec::)
+  | test(/^shell::tests::/)
+  | test(shell_snapshot::)
+  | test(user_shell_command::)
+  | test(exec_policy::)
+  | test(git_info::)
+  | test(git_workspace::)
+  | test(turn_diff_tracker::)
+  | test(tools::sandboxing::)
+  | test(tools::handlers::shell::tests::) & not test(tools::handlers::shell::tests::pure::)
+  | test(tools::handlers::command_preflight::)
+  | test(tools::handlers::command_windows_corpus::)
+  | test(tools::handlers::agent_jobs::)
+  | test(suite::shell_command::)
+  | test(suite::unified_exec::)
+  | test(suite::windows_sandbox::)
+  | test(suite::user_shell_cmd::)
+  | test(suite::mcp::)
+  | test(suite::code_mode::)
+)
+'''
 test-group = 'windows_core'
 
 [[profile.default.overrides]]
-# This regression creates 10,000 rollouts and scans them for every listing order.
+# This regression creates 10,000 rollouts for one exhaustive listing.
 # Windows filesystem latency exceeds the default one-minute allowance.
 platform = "cfg(windows)"
 filter = "package(codex-rollout) & test(filesystem_listing_reaches_threads_beyond_the_former_scan_cap)"

@@ -60,6 +60,12 @@ fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
     for (command, expected) in [
         ("rg --files", 2_000),
         ("cargo nextest run -p codex-core", 30_000),
+        ("cargo build -p codex-config", 30_000),
+        ("cargo +stable --locked build", 30_000),
+        ("cargo nextest list -p codex-config", 30_000),
+        ("echo cargo build", 2_000),
+        ("just test-fast -p codex-config --lib", 30_000),
+        ("just app-server-runtime-check", 30_000),
         ("just core-test-fast core_lib -E test(parser)", 30_000),
         ("just core-gate tool-output-recovery", 30_000),
         ("uv run pytest -q", 30_000),
@@ -76,7 +82,7 @@ fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
 
 #[test]
 fn exec_command_boundary_rejects_unsupported_deadlines() {
-    for field in ["timeout_ms", "stall_timeout_ms"] {
+    for field in ["timeout_ms"] {
         for value in [0, 60_000] {
             let mut arguments = serde_json::json!({"cmd": "long-running"});
             arguments[field] = serde_json::json!(value);
@@ -89,6 +95,63 @@ fn exec_command_boundary_rejects_unsupported_deadlines() {
             assert!(error.contains("not a process deadline"), "{error}");
         }
     }
+}
+
+#[test]
+fn stall_timeout_exec_command_defaults_and_overrides() {
+    for (requested, expected) in [(None, Some(60_000)), (Some(0), None), (Some(125), Some(125))] {
+        let mut arguments = serde_json::json!({"cmd": "long-running"});
+        if let Some(requested) = requested {
+            arguments["stall_timeout_ms"] = serde_json::json!(requested);
+        }
+        let decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
+        assert_eq!(decoded.stall_timeout_ms, expected);
+    }
+    assert!(validate_exec_command_arguments(
+        &serde_json::json!({"cmd": "must-not-run", "stall_timeout_ms": -1}).to_string()
+    ).is_err());
+}
+
+#[tokio::test]
+async fn stall_timeout_exec_command_terminates_between_polls() {
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": "python",
+            "args": ["-c", "import time; print('ready', flush=True); time.sleep(30)"],
+            "stall_timeout_ms": 3500,
+            "yield_time_ms": 250,
+        }).to_string(),
+    };
+    let invocation = invocation_for_payload_without_sandbox(
+        "exec_command", "stall-timeout-start", payload.clone(),
+    ).await;
+    let session = Arc::clone(&invocation.session);
+    let step_context = invocation.step_context.clone();
+    let tracker = Arc::clone(&invocation.tracker);
+    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+    let result = output.code_mode_result(&payload);
+    let process_id = result["session_id"].as_u64().expect("initial yield returns a live session");
+    assert_eq!(result["process_exited"], false);
+    // No polling or input keeps the watchdog alive: the process owns it.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let poll = ToolInvocation {
+        session,
+        step_context,
+        tracker,
+        call_id: "stall-timeout-poll".to_string(),
+        tool_name: codex_tools::ToolName::plain("write_stdin"),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: serde_json::json!({"session_id": process_id, "yield_time_ms": 1000}).to_string(),
+        },
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+    };
+    let error = WriteStdinHandler::default()
+        .handle(poll)
+        .await
+        .err()
+        .expect("stalled command must fail");
+    assert!(error.to_string().contains("command stalled after 3500 milliseconds"), "{error}");
 }
 
 #[test]
@@ -918,6 +981,15 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
         .await;
 
     assert_eq!(launches.process_launches, 2);
+    assert_eq!(
+        session
+            .services
+            .command_execution
+            .started_attempt_count()
+            .await,
+        2,
+        "validation launches must enter the ordinary retry ledger"
+    );
     assert_eq!(first.code_mode_result(&payload)["exit_code"], 1);
     assert_eq!(second.code_mode_result(&payload)["exit_code"], 1);
     let counters = turn
@@ -1185,12 +1257,12 @@ async fn known_delta_replay_case(repetitions: usize, replay_budget: Option<usize
             },
         )
         .await;
-    // Unified exec's output policy can exceed the model's generic policy.
-    // Lazy retention must use the same budget as the delivered result.
+    // Keep the model hard cap above this inline fixture. A deliberately smaller
+    // replay budget below must still materialize a recovery artifact.
     Arc::get_mut(&mut turn)
         .expect("unshared setup turn")
         .model_info
-        .truncation_policy = codex_protocol::openai_models::TruncationPolicyConfig::bytes(256);
+        .truncation_policy = codex_protocol::openai_models::TruncationPolicyConfig::bytes(40_000);
     assert!(
         session
             .features()
@@ -1791,7 +1863,7 @@ async fn unsupported_deadlines_reject_before_execution() {
     let temp = tempfile::tempdir().expect("deadline rejection directory");
     let marker = temp.path().join("must-not-exist");
     let marker_literal = serde_json::to_string(&marker.to_string_lossy()).unwrap();
-    for field in ["timeout_ms", "stall_timeout_ms"] {
+    for field in ["timeout_ms"] {
         let mut arguments = serde_json::json!({
             "program": "python",
             "args": ["-c", format!("open({marker_literal}, 'w').write('started')")],
@@ -3133,7 +3205,12 @@ async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
         .expect("advertised artifact");
     assert_eq!(direct["artifact_id"], id);
     assert_eq!(direct["exit_code"], 0);
-    assert!(!direct["output"].as_str().unwrap().contains("stdin-notice-0128"));
+    assert!(
+        !direct["output"]
+            .as_str()
+            .unwrap()
+            .contains("stdin-notice-0128")
+    );
     let retained = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
         &home, &thread_id, id,
     )

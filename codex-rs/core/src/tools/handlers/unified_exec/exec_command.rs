@@ -532,6 +532,7 @@ impl ExecCommandHandler {
             tty,
             yield_time_ms,
             yield_time_requested,
+            stall_timeout_ms,
             max_output_tokens,
             sandbox_permissions,
             additional_permissions,
@@ -618,7 +619,7 @@ impl ExecCommandHandler {
             context.turn.windows_sandbox_level,
         );
         let runtime_context = format!(
-            "shell={shell_type:?};login={use_login_shell};tty={tty};network={:?}",
+            "shell={shell_type:?};login={use_login_shell};tty={tty};stall_timeout_ms={stall_timeout_ms:?};network={:?}",
             context.turn.network,
         );
         let input_context = format!("prefix={prefix_rule:?}");
@@ -726,8 +727,9 @@ impl ExecCommandHandler {
             .as_ref()
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
         let validation_attempt = validation_launch.is_some();
+        // Validation shares ordinary attempt accounting. Only input-state
+        // determined failures are replayed; a failing test remains rerunnable.
         if !known_delta_hit
-            && !validation_attempt
             && let Err(blocked) = session
                 .services
                 .command_execution
@@ -776,7 +778,7 @@ impl ExecCommandHandler {
                     &raw_output,
                 )
                 .await) } else { None };
-                if !known_delta_hit && !validation_attempt {
+                if !known_delta_hit {
                     session
                         .services
                         .command_execution
@@ -810,7 +812,7 @@ impl ExecCommandHandler {
             }
             Ok(None) => {}
             Err(err) => {
-                if !known_delta_hit && !validation_attempt {
+                if !known_delta_hit {
                     err.record_attempt_failure(&session.services.command_execution, &attempt_key)
                         .await;
                 }
@@ -842,6 +844,7 @@ impl ExecCommandHandler {
                     hook_command: hook_command.clone(),
                     process_id,
                     yield_time_ms,
+                    stall_timeout_ms,
                     max_output_tokens,
                     cwd,
 
@@ -894,7 +897,7 @@ impl ExecCommandHandler {
                         None => notice,
                     });
                 }
-                if !known_delta_hit && !validation_attempt {
+                if !known_delta_hit {
                     if let Some(process_id) = response.process_id {
                         session
                             .services
@@ -947,7 +950,7 @@ impl ExecCommandHandler {
                     output_text.as_bytes(),
                 )
                 .await;
-                if !known_delta_hit && !validation_attempt {
+                if !known_delta_hit {
                     let tracked = if let Some((execution_id, parent_tool_execution_id)) =
                         tracked_execution.as_ref()
                     {
@@ -1008,7 +1011,7 @@ impl ExecCommandHandler {
             }) => {
                 // The process completed; retain its actual outcome in command
                 // accounting while ending this model turn on failed durability.
-                if !known_delta_hit && !validation_attempt {
+                if !known_delta_hit {
                     let tracked = if let Some((execution_id, parent_tool_execution_id)) =
                         tracked_execution.as_ref()
                     {
@@ -1051,7 +1054,7 @@ impl ExecCommandHandler {
                     &err,
                     UnifiedExecError::CreateProcess { .. } | UnifiedExecError::ProcessFailed { .. }
                 );
-                if retry_failure && !known_delta_hit && !validation_attempt {
+                if retry_failure && !known_delta_hit {
                     let finalized_running_process =
                         if matches!(&err, UnifiedExecError::ProcessFailed { .. }) {
                             if let Some((execution_id, parent_tool_execution_id)) =

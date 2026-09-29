@@ -155,6 +155,7 @@ INSERT INTO agent_jobs (
         }
 
         tx.commit().await?;
+        self.notify_agent_job_change();
 
         let job_id = params.id.as_str();
         self.get_agent_job(job_id)
@@ -254,6 +255,7 @@ WHERE job_id = ? AND status IN (?, ?)
             job_ids.push(job_id);
         }
         tx.commit().await?;
+        self.notify_agent_job_change();
 
         let mut jobs = Vec::with_capacity(job_ids.len());
         for job_id in job_ids {
@@ -393,6 +395,7 @@ WHERE id = ? AND status = ?
         .bind(AgentJobStatus::Pending.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(())
     }
 
@@ -412,6 +415,7 @@ WHERE id = ? AND status = ?
         .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(())
     }
 
@@ -437,6 +441,7 @@ WHERE id = ? AND status IN (?, ?)
         .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(())
     }
 
@@ -462,6 +467,7 @@ WHERE id = ? AND status IN (?, ?)
         .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(result.rows_affected() > 0)
     }
 
@@ -517,6 +523,7 @@ WHERE
         .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(result.rows_affected() > 0)
     }
 
@@ -556,6 +563,7 @@ WHERE
         .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(result.rows_affected() > 0)
     }
 
@@ -585,6 +593,7 @@ WHERE job_id = ? AND item_id = ? AND status = ?
         .bind(AgentJobItemStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(result.rows_affected() > 0)
     }
 
@@ -626,6 +635,7 @@ WHERE
         .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(result.rows_affected() > 0)
     }
 
@@ -650,6 +660,7 @@ WHERE job_id = ? AND item_id = ? AND status = ?
         .bind(AgentJobItemStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(result.rows_affected() > 0)
     }
 
@@ -746,6 +757,7 @@ WHERE id = ? AND status = ?
         }
 
         tx.commit().await?;
+        self.notify_agent_job_change();
         Ok(true)
     }
 
@@ -778,6 +790,7 @@ WHERE
         .bind(AgentJobItemStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(result.rows_affected() > 0)
     }
 
@@ -812,7 +825,16 @@ WHERE
         .bind(AgentJobItemStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
+        self.notify_agent_job_change();
         Ok(result.rows_affected() > 0)
+    }
+
+    pub fn subscribe_agent_job_changes(&self) -> watch::Receiver<u64> {
+        self.agent_job_updates.subscribe()
+    }
+
+    fn notify_agent_job_change(&self) {
+        self.agent_job_updates.send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     pub async fn get_agent_job_progress(&self, job_id: &str) -> anyhow::Result<AgentJobProgress> {
@@ -1058,6 +1080,7 @@ mod tests {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home, "test-provider".to_string()).await?;
         let (job_id, item_id, thread_id) = create_running_single_item_job(runtime.as_ref()).await?;
+        let changes = runtime.subscribe_agent_job_changes();
 
         let accepted = runtime
             .report_agent_job_item_result(
@@ -1068,6 +1091,7 @@ mod tests {
             )
             .await?;
         assert!(accepted);
+        assert!(changes.has_changed()?);
 
         let item = runtime
             .get_agent_job_item(job_id.as_str(), item_id.as_str())

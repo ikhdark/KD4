@@ -18,6 +18,7 @@ from typing import Any, Sequence
 
 try:
     from scripts import kd4_first_useful_action_analysis
+    from scripts import kd4_session_diagnostics
     from scripts.kd4_timing_analysis import (
         _MAX_SLOW_TOOL_CALLS,
         _SLOW_TOOL_CALL_NS,
@@ -42,6 +43,7 @@ try:
     from scripts.rollout_snapshot import discover_rollouts, existing_rollout_path
 except ImportError:
     import kd4_first_useful_action_analysis
+    import kd4_session_diagnostics
     from kd4_timing_analysis import (
         _MAX_SLOW_TOOL_CALLS,
         _SLOW_TOOL_CALL_NS,
@@ -1234,6 +1236,7 @@ def _turn_report(
         "samplingPassTarget": _SAMPLING_PASS_TARGET_PER_COMPLETED_TURN,
         "tokens": tokens,
         "tokenScope": "turn_model_requests_not_session_cumulative",
+        "requestRetention": analysis["requestRetention"],
         "continuationAccounting": {
             "reportedSuppressedContinuations": counters.get(
                 "suppressedDeterministicContinuationCount"
@@ -1509,6 +1512,7 @@ def analyze_session_path(
     include_tokens: bool = True,
     runner_evidence: dict[str, Any] | None = None,
     startup_log: Path | None = None,
+    diagnostic_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source = existing_rollout_path(source) if source else None
     files = (
@@ -1533,6 +1537,9 @@ def analyze_session_path(
     first_action_records = []
     command_orchestration_records: list[dict[str, Any]] = []
     source_discovery_events: list[dict[str, Any]] = []
+    diagnostic_observations: dict[str, list[dict[str, Any]]] = collections.defaultdict(
+        list
+    )
     execution_loop_counts: collections.Counter[str] = collections.Counter()
     execution_loop_ns: collections.Counter[str] = collections.Counter()
     paired_tool_intervals: list[tuple[int, int]] = []
@@ -1671,6 +1678,7 @@ def analyze_session_path(
                             "startedNs": timestamp_ns,
                             "cwd": cwd,
                             "tool": _tool_label(payload),
+                            "diagnosticToolName": str(payload.get("name") or "unknown"),
                             "turnId": active_turn_id,
                             "timestamp": item.get("timestamp"),
                             "input": _tool_input_text(payload),
@@ -1694,6 +1702,14 @@ def analyze_session_path(
                                 last_tool_output_ns or timestamp_ns, timestamp_ns
                             )
                         output = _tool_output_text(payload)
+                        if pending["turnId"] is not None:
+                            diagnostic_observations[pending["turnId"]].append(
+                                kd4_session_diagnostics.tool_observation(
+                                    pending["diagnosticToolName"],
+                                    pending["input"],
+                                    output,
+                                )
+                            )
                         discovery_event = _source_discovery_event(
                             pending,
                             output,
@@ -1889,6 +1905,9 @@ def analyze_session_path(
     )
     for record in records:
         record["unresolvedTools"] = unresolved_tools_by_turn.get(record["turn_id"], [])
+        record["diagnosticToolObservations"] = diagnostic_observations[
+            record["turn_id"]
+        ]
     terminal_invariant_violations = [
         {
             "turnId": turn_id,
@@ -2029,6 +2048,13 @@ def analyze_session_path(
         include_tokens=include_tokens,
     )
     report["behaviorMetrics"] = _behavior_metrics(report, records)
+    report["sessionDiagnostics"] = kd4_session_diagnostics.build_diagnostics(
+        valid,
+        {turn["turnId"]: turn["population"] for turn in per_turn},
+        coverage,
+        per_turn=per_turn,
+        evidence=diagnostic_evidence,
+    )
     if startup_log is not None:
         report["startupTiming"] = _startup_log_report(startup_log)
     return report
@@ -2433,6 +2459,7 @@ def render_report(report: dict[str, Any]) -> str:
             }
         )
     lines.append("runner diagnostics: " + encoded)
+    lines.extend(kd4_session_diagnostics.render_diagnostics(report))
     return "\n".join(lines)
 
 
@@ -2797,6 +2824,12 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
             0, len(rows) - 8
         )
     result = compact_tokens(result)
+    # Full distributions belong in --json baselines, not the compact view.
+    # Copy comparison detail before trimming, preserving the full report.
+    if "baselineComparison" in report:
+        result["baselineComparison"] = json.loads(
+            json.dumps(report["baselineComparison"])
+        )
     # Retain nonzero and unavailable phases; full JSON keeps the phase vocabulary.
     relay = result["toolRelay"]
     phases = relay.get("phaseTotalsMs", {})
@@ -2865,6 +2898,8 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         trim_rows(container, key, omitted)
     if "startupTiming" in result:
         trim_rows(result["startupTiming"], "records", "omittedRecords")
+    if "baselineComparison" in result:
+        trim_rows(result["baselineComparison"], "metrics", "omittedMetrics")
     # Do not silently discard essential totals/coverage to satisfy a byte
     # target when those alone exceed it (for example, many distinct categories).
     result["summaryBudget"]["limitExceeded"] = budget_exceeded
@@ -2939,6 +2974,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Emit bounded JSON without per-record diagnostic arrays",
     )
     parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="Saved full JSON audit to compare matched terminal-turn cohorts",
+    )
+    parser.add_argument(
+        "--comparison-min-samples",
+        type=int,
+        default=5,
+        help="Minimum measured turns per cohort on each side (default: 5)",
+    )
+    parser.add_argument(
+        "--comparison-threshold",
+        type=float,
+        default=0.20,
+        help="Relative change review threshold (default: 0.20); also requires 50ms or 1 count",
+    )
+    parser.add_argument(
         "--runner-evidence",
         type=Path,
         help="Version 1 native runner evidence JSON for one attempt",
@@ -2947,6 +2999,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--startup-log",
         type=Path,
         help="App-server JSON stderr log containing startup timing traces (LOG_FORMAT=json)",
+    )
+    parser.add_argument(
+        "--diagnostic-evidence",
+        type=Path,
+        help=(
+            "Version 1 snapshot-bound evidence/answer annotations "
+            "for rollout turn diagnostics"
+        ),
     )
     parser.add_argument(
         "--tokens",
@@ -2978,7 +3038,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             include_tokens=args.tokens == "on",
             runner_evidence=evidence,
             startup_log=args.startup_log,
+            diagnostic_evidence=(
+                json.loads(args.diagnostic_evidence.read_text(encoding="utf-8-sig"))
+                if args.diagnostic_evidence
+                else None
+            ),
         )
+        if args.baseline is not None:
+            report["baselineComparison"] = kd4_session_diagnostics.compare_diagnostics(
+                report["sessionDiagnostics"],
+                json.loads(args.baseline.read_text(encoding="utf-8-sig")),
+                min_samples=args.comparison_min_samples,
+                relative_threshold=args.comparison_threshold,
+            )
     except (FileNotFoundError, OSError, ValueError, TypeError) as error:
         parser.error(str(error))
     if args.json:

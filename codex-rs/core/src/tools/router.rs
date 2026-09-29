@@ -77,6 +77,7 @@ pub struct ToolRouter {
     planning_warnings: Vec<String>,
     exposure_identity: ToolExposureIdentity,
     pub(crate) tool_suggest_candidates: Option<ToolSuggestCandidates>,
+    pub(crate) tool_search_sources: String,
     schema_cache: Mutex<Option<(HashSet<ToolName>, Arc<ToolSchemaArtifact>)>>,
     manifest_cache: Mutex<ToolManifestCache>,
     deferred_tool_capability_revisions: OnceLock<Arc<HashMap<ToolName, String>>>,
@@ -191,6 +192,23 @@ impl ToolRouter {
         exposure_identity: ToolExposureIdentity,
     ) -> Self {
         registry.set_model_visible_specs(model_visible_specs);
+        let search_infos = registry
+            .manifest_entries()
+            .into_iter()
+            .filter(|tool| tool.exposure() == codex_tools::ToolExposure::Deferred)
+            .filter_map(RegisteredTool::search_info)
+            .collect::<Vec<_>>();
+        let tool_search_sources = if search_infos.is_empty() {
+            String::new()
+        } else {
+            crate::tools::handlers::tool_search_spec::render_tool_search_sources(
+                &search_infos
+                    .iter()
+                    .filter_map(|info| info.source_info.clone())
+                    .collect::<Vec<_>>(),
+                search_infos.iter().any(|info| info.source_info.is_none()),
+            )
+        };
         let mut planning_warnings = planning_warnings;
         if let Some(warning) = tool_schema_size_warning(&registry.model_visible_schemas()) {
             tracing::warn!("{warning}");
@@ -201,6 +219,7 @@ impl ToolRouter {
             planning_warnings,
             exposure_identity,
             tool_suggest_candidates: None,
+            tool_search_sources,
             schema_cache: Mutex::new(None),
             manifest_cache: Mutex::new(ToolManifestCache::default()),
             deferred_tool_capability_revisions: OnceLock::new(),

@@ -104,6 +104,45 @@ fn small_output_is_unchanged() {
 }
 
 #[test]
+fn passing_validation_is_compact_before_the_generic_threshold() {
+    let mut output = (0..160)
+        .map(|index| format!("test case_{index:04} ... ok\n"))
+        .collect::<String>();
+    output.push_str(
+        "warning: fixture uses legacy syntax\ntest result: ok. 160 passed; 0 failed; 2 ignored\n",
+    );
+    let summary = summarize_shell_output_for_model(
+        &output,
+        0,
+        false,
+        options(Some("cargo test --lib"), None),
+    )
+    .expect("passing validation should be reduced");
+    assert!(summary.len() < output.len());
+    assert!(summary.contains("160 passed; 0 failed; 2 ignored"));
+    assert!(summary.contains("warning: fixture uses legacy syntax"));
+    assert!(summary.contains("omitted"));
+    assert_eq!(
+        summarize_shell_output_for_model(&output, 0, false, options(Some("cat fixture.txt"), None)),
+        None
+    );
+    crate::validation_admission::reset_validation_classification_count();
+    assert_eq!(
+        summarize_shell_output_for_model(
+            "test result: ok. 1 passed\n",
+            0,
+            false,
+            options(Some("cargo test"), None)
+        ),
+        None
+    );
+    assert_eq!(
+        crate::validation_admission::validation_classification_count(),
+        0
+    );
+}
+
+#[test]
 fn source_reads_use_ordered_truncation_in_the_normal_output_path() {
     let mut lines = (0..700)
         .map(|index| format!("source line {index:04}: {}", "x".repeat(80)))
@@ -268,13 +307,11 @@ fn oversized_first_line_reserves_room_for_the_tail() {
     lines[0] = oversized_warning_line(SUMMARY_MAX_BYTES);
     // Exercise the byte ceiling independently of a tighter caller token limit.
     let probe =
-        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
-            .unwrap();
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None)).unwrap();
     let prefix_bytes = probe.find("    1: ").unwrap() + "    1: ".len();
     lines[0] = oversized_warning_line(SUMMARY_MAX_BYTES - SUMMARY_FOOTER_BYTES - prefix_bytes);
     let summary =
-        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
-            .unwrap();
+        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None)).unwrap();
     assert!(summary.ends_with("[summary capped]"), "{summary}");
     assert!(summary.contains("- emitted_source_lines: 88\n"));
     // A final empty line is not a source line according to str::lines().
@@ -306,9 +343,8 @@ fn summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit() {
     let mut lines = vec!["ordinary".to_string(); 700];
     lines[0] = oversized_warning_line(SUMMARY_MAX_BYTES);
     // Exercise the byte ceiling independently of a tighter caller token limit.
-    let probe =
-        summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
-            .expect("large output summary");
+    let probe = summarize_shell_output_for_model(&lines.join("\n"), 0, false, options(None, None))
+        .expect("large output summary");
     let prefix_bytes = probe.find("    1: ").expect("first source line") + "    1: ".len();
     let following_head_bytes = (SUCCESS_HEAD_LINES - 1) * "\n    2: ordinary".len();
     let gap_bytes = "\n... [612 lines omitted]".len();

@@ -54,6 +54,11 @@ use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_utils_path_uri::PathUri;
 
 pub(crate) const TRAILING_OUTPUT_GRACE: Duration = Duration::from_millis(100);
+const TRAILING_OUTPUT_QUIET: Duration = Duration::from_millis(20);
+
+fn trailing_output_deadline(now: Instant, hard_deadline: Instant) -> Instant {
+    (now + TRAILING_OUTPUT_QUIET).min(hard_deadline)
+}
 
 /// Upper bound for a single ExecCommandOutputDelta chunk emitted by unified exec.
 ///
@@ -112,6 +117,7 @@ pub(crate) fn start_streaming_output(
         let emitted_deltas = OutputDeltaLimiter::default();
 
         let mut grace_sleep: Option<Pin<Box<Sleep>>> = None;
+        let mut trailing_deadline = None;
         let output_closed_notification = output_closed_notify.notified();
         tokio::pin!(output_closed_notification);
         output_closed_notification.as_mut().enable();
@@ -147,7 +153,10 @@ pub(crate) fn start_streaming_output(
                         }
 
                     _ = exit_token.cancelled(), if grace_sleep.is_none() => {
-                        let deadline = Instant::now() + TRAILING_OUTPUT_GRACE;
+                        let now = Instant::now();
+                        let hard_deadline = now + TRAILING_OUTPUT_GRACE;
+                        trailing_deadline = Some(hard_deadline);
+                        let deadline = trailing_output_deadline(now, hard_deadline);
                         grace_sleep.replace(Box::pin(tokio::time::sleep_until(deadline)));
                     }
 
@@ -170,6 +179,15 @@ pub(crate) fn start_streaming_output(
                     }
 
                     received = receiver.recv() => {
+                        // Activity extends the quiet window, but a child holding
+                        // the pipe cannot extend the existing hard drain bound.
+                        if let (Some(sleep), Some(hard_deadline)) =
+                            (grace_sleep.as_mut(), trailing_deadline)
+                        {
+                            sleep.as_mut().reset(trailing_output_deadline(
+                                Instant::now(), hard_deadline,
+                            ));
+                        }
                         let chunk = match received {
                             Ok(chunk) => chunk,
                             Err(RecvError::Lagged(skipped)) => {

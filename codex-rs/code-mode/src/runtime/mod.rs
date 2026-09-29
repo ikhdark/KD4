@@ -1,6 +1,7 @@
 mod callbacks;
 mod globals;
 mod module_loader;
+mod output_projection;
 mod timers;
 mod value;
 
@@ -254,6 +255,74 @@ impl Drop for StartupTestExit {
     }
 }
 
+struct RuntimeStart {
+    config: RuntimeConfig,
+    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    command_rx: std_mpsc::Receiver<RuntimeCommand>,
+    isolate_handle_tx: tokio::sync::oneshot::Sender<Result<StartupIsolateHandle, String>>,
+    runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
+    task_failure_handler: Option<TaskFailureHandler>,
+    #[cfg(test)]
+    startup_test_gate: Option<Arc<StartupTestGate>>,
+}
+
+fn spare_runtime() -> &'static Mutex<Option<std_mpsc::Sender<RuntimeStart>>> {
+    static SPARE: std::sync::OnceLock<Mutex<Option<std_mpsc::Sender<RuntimeStart>>>> =
+        std::sync::OnceLock::new();
+    SPARE.get_or_init(|| Mutex::new(None))
+}
+
+fn create_spare_runtime() -> std::io::Result<std_mpsc::Sender<RuntimeStart>> {
+    let (sender, receiver) = std_mpsc::channel::<RuntimeStart>();
+    thread::Builder::new().name("code-mode-spare".into()).spawn(move || {
+        if let Err(error) = ensure_v8_initialized() {
+            if let Ok(start) = receiver.recv() {
+                let _ = start.isolate_handle_tx.send(Err(error));
+            }
+            return;
+        }
+        // Isolates and contexts never cross threads and never execute a second
+        // cell. Only the startup request crosses this one-use channel.
+        let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+        isolate.set_host_import_module_dynamically_callback(module_loader::dynamic_import_callback);
+        isolate.set_promise_reject_callback(module_loader::promise_rejected);
+        v8::scope!(let scope, isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let projector = output_projection::prepare(scope);
+        let Ok(start) = receiver.recv() else { return; };
+        let event_tx = start.event_tx.clone();
+        let failure_handler = start.task_failure_handler.clone();
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            let _startup_test_exit = start.startup_test_gate.map(|gate| {
+                gate.entered.notify_one();
+                gate.release.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                StartupTestExit(gate)
+            });
+            let projector = match projector {
+                Ok(projector) => projector,
+                Err(error) => { let _ = start.isolate_handle_tx.send(Err(error)); return; }
+            };
+            run_runtime(scope, projector, start.config, start.event_tx, start.command_rx,
+                start.isolate_handle_tx, start.runtime_command_tx);
+        })) {
+            report_runtime_panic(payload, event_tx, failure_handler);
+        }
+    })?;
+    Ok(sender)
+}
+
+pub(crate) fn prewarm_runtime() {
+    let mut spare = spare_runtime().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if spare.is_none() {
+        match create_spare_runtime() {
+            Ok(sender) => *spare = Some(sender),
+            Err(error) => tracing::warn!(%error, "code mode runtime prewarm failed"),
+        }
+    }
+}
+
 pub(crate) async fn spawn_runtime(
     stored_values: HashMap<String, StoredValue>,
     request: ExecuteRequest,
@@ -292,31 +361,21 @@ pub(crate) async fn spawn_runtime(
         output_admission,
     };
 
-    #[cfg(test)]
-    let startup_test_gate = STARTUP_TEST_GATE.try_with(Arc::clone).ok();
-    spawn_supervised_runtime_thread(event_tx.clone(), task_failure_handler, move || {
+    let sender = spare_runtime().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take().map(Ok).unwrap_or_else(create_spare_runtime)
+        .map_err(|error| format!("failed to start code mode runtime: {error}"))?;
+    let start = RuntimeStart {
+        config, event_tx, command_rx, isolate_handle_tx, runtime_command_tx, task_failure_handler,
         #[cfg(test)]
-        let _startup_test_exit = startup_test_gate.map(|gate| {
-            gate.entered.notify_one();
-            gate.release
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
-            StartupTestExit(gate)
-        });
-        if let Err(error) = ensure_v8_initialized() {
-            let _ = isolate_handle_tx.send(Err(error));
-            return;
-        }
-        run_runtime(
-            config,
-            event_tx,
-            command_rx,
-            isolate_handle_tx,
-            runtime_command_tx,
-        );
-    });
+        startup_test_gate: STARTUP_TEST_GATE.try_with(Arc::clone).ok(),
+    };
+    if let Err(error) = sender.send(start) {
+        // The spare died before accepting work; the returned request has never
+        // run and can safely be delivered to a replacement exactly once.
+        create_spare_runtime().map_err(|error| error.to_string())?
+            .send(error.0).map_err(|_| "code mode runtime unavailable".to_string())?;
+    }
+    prewarm_runtime();
 
     let isolate_handle =
         receive_runtime_startup(isolate_handle_rx, RUNTIME_STARTUP_TIMEOUT).await?;
@@ -370,6 +429,7 @@ async fn receive_runtime_startup<T>(
     }
 }
 
+#[cfg(test)]
 fn spawn_supervised_runtime_thread(
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     task_failure_handler: Option<TaskFailureHandler>,
@@ -377,6 +437,16 @@ fn spawn_supervised_runtime_thread(
 ) {
     thread::spawn(move || {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(runtime)) {
+            report_runtime_panic(payload, event_tx, task_failure_handler);
+        }
+    });
+}
+
+fn report_runtime_panic(
+    payload: Box<dyn std::any::Any + Send>,
+    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    task_failure_handler: Option<TaskFailureHandler>,
+) {
             let message = payload
                 .downcast_ref::<String>()
                 .map(String::as_str)
@@ -386,8 +456,6 @@ fn spawn_supervised_runtime_thread(
                 task_failure_handler(format!("code-mode V8 runtime thread panicked: {message}"));
             }
             let _ = event_tx.send(RuntimeEvent::ThreadPanicked);
-        }
-    });
 }
 
 struct RuntimeConfig {
@@ -450,7 +518,8 @@ impl EnabledToolCatalog {
 
 pub(super) struct RuntimeState {
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    pending_tool_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
+    pending_tool_calls: HashMap<String, (v8::Global<v8::PromiseResolver>, ToolName)>,
+    output_projector: Option<v8::Global<v8::Function>>,
     pending_notifications: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     unhandled_rejections: Vec<v8::Global<v8::Promise>>,
@@ -564,6 +633,8 @@ pub(super) enum CompletionState {
 }
 
 fn run_runtime(
+    scope: &mut v8::PinScope<'_, '_>,
+    projector: v8::Global<v8::Function>,
     config: RuntimeConfig,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     command_rx: std_mpsc::Receiver<RuntimeCommand>,
@@ -573,8 +644,7 @@ fn run_runtime(
     if isolate_handle_tx.is_closed() {
         return;
     }
-    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
-    let isolate_handle = isolate.thread_safe_handle();
+    let isolate_handle = scope.thread_safe_handle();
     if isolate_handle_tx
         .send(Ok(StartupIsolateHandle(Some(RuntimeTerminationHandle {
             isolate: isolate_handle,
@@ -584,13 +654,6 @@ fn run_runtime(
     {
         return;
     }
-    isolate.set_host_import_module_dynamically_callback(module_loader::dynamic_import_callback);
-    isolate.set_promise_reject_callback(module_loader::promise_rejected);
-
-    v8::scope!(let scope, isolate);
-    let context = v8::Context::new(scope, Default::default());
-    let scope = &mut v8::ContextScope::new(scope, context);
-
     let timer_scheduler = timers::TimerScheduler::new(runtime_command_tx);
     let total_stored_value_bytes = config
         .stored_values
@@ -599,6 +662,7 @@ fn run_runtime(
     scope.set_slot(RuntimeState {
         event_tx: event_tx.clone(),
         pending_tool_calls: HashMap::new(),
+        output_projector: Some(projector),
         pending_notifications: HashMap::new(),
         pending_timeouts: HashMap::new(),
         unhandled_rejections: Vec::new(),
@@ -847,6 +911,31 @@ mod tests {
             Some("other")
         );
         assert!(catalog.index_of("sample").is_none());
+    }
+
+    #[tokio::test]
+    async fn prewarmed_runtime_is_used_for_only_one_cell() {
+        super::prewarm_runtime();
+        for source in [
+            "globalThis.previousCellSecret = 47; text('first');",
+            "if ('previousCellSecret' in globalThis) throw Error('isolate reused'); text('second');",
+        ] {
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let (_commands, _termination) = spawn_runtime(
+                HashMap::new(), execute_request(source), 60_000, event_tx,
+                std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)), None,
+            ).await.unwrap();
+            let completed = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = event_rx.recv().await {
+                    if let RuntimeEvent::Result { error_text, .. } = event {
+                        assert_eq!(error_text, None);
+                        return true;
+                    }
+                }
+                false
+            }).await.unwrap();
+            assert!(completed);
+        }
     }
 
     #[tokio::test(start_paused = true)]

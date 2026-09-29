@@ -314,7 +314,7 @@ fn coherent_packet_budget_uses_bounded_defaults_and_honors_override() {
 
     assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
     assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
-    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 16_000);
+    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 8_000);
     assert_eq!(
         resolve_output_limits(
             None,
@@ -1727,6 +1727,7 @@ async fn cancelled_known_delta_replay_closes_started_command_before_returning() 
         .chain(args)
         .collect::<Vec<_>>();
     let request = ExecCommandRequest {
+        stall_timeout_ms: None,
         validation: None,
         command: command.clone(),
         command_for_safety: command.clone(),
@@ -1973,6 +1974,7 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
         .await
         .unwrap();
     let request = ExecCommandRequest {
+        stall_timeout_ms: None,
         validation: None,
         command: command.clone(),
         command_for_safety: command.clone(),
@@ -2309,6 +2311,7 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
         .await
         .unwrap();
     let request = ExecCommandRequest {
+        stall_timeout_ms: None,
         validation: None,
         command: command.clone(),
         command_for_safety: command.clone(),
@@ -2542,6 +2545,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         "call-unified-denied".to_string(),
     );
     let request = ExecCommandRequest {
+        stall_timeout_ms: None,
         validation: None,
         command: vec![
             "sh".to_string(),
@@ -2902,6 +2906,7 @@ fn check_pending_remote_exec_drop(entered_shutdown: bool) {
                 fixture.path(), "outside-runtime", b"",
             ));
             let request = ExecCommandRequest {
+                stall_timeout_ms: None,
                 validation: None,                command: command.clone(), command_for_safety: command,
                 attempt_key, raw_output_artifact: artifact,
                 shell_type: crate::shell::ShellType::PowerShell, shell_wrapper_is_owned: false,
@@ -3140,6 +3145,7 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
                 fixture.path(), "pre-start-cancel", b"",
             ));
             let request = ExecCommandRequest {
+                stall_timeout_ms: None,
                 validation: None,                command: command.clone(), command_for_safety: command,
                 attempt_key, raw_output_artifact: artifact,
                 shell_type: crate::shell::ShellType::PowerShell, shell_wrapper_is_owned: false,
@@ -3754,6 +3760,7 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
                 fixture.path(), "commit-retirement", b"",
             ));
             let request = ExecCommandRequest {
+                stall_timeout_ms: None,
                 validation: None,                command: command.clone(), command_for_safety: command,
                 attempt_key, raw_output_artifact: artifact,
                 shell_type: crate::shell::ShellType::PowerShell, shell_wrapper_is_owned: false,

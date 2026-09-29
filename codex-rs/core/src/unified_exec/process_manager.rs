@@ -154,30 +154,20 @@ impl Drop for WriteStdinWait {
 
 /// Test-only override for deterministic unified exec process IDs.
 ///
-/// Integration tests enable this through `core_test_support`; ordinary builds
-/// contain neither the override nor its setters.
-#[cfg(any(test, feature = "test-deterministic-process-ids"))]
+/// Integration tests enable this through `core_test_support`; production callers
+/// must leave it disabled, just like the thread-manager test-mode override.
 static FORCE_DETERMINISTIC_PROCESS_IDS: AtomicBool = AtomicBool::new(false);
 
-#[cfg(any(test, feature = "test-deterministic-process-ids"))]
 pub(super) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     FORCE_DETERMINISTIC_PROCESS_IDS.store(enabled, Ordering::Relaxed);
 }
 
-#[cfg(any(test, feature = "test-deterministic-process-ids"))]
 fn deterministic_process_ids_forced_for_tests() -> bool {
     FORCE_DETERMINISTIC_PROCESS_IDS.load(Ordering::Relaxed)
 }
 
 fn should_use_deterministic_process_ids() -> bool {
-    #[cfg(any(test, feature = "test-deterministic-process-ids"))]
-    {
-        cfg!(test) || deterministic_process_ids_forced_for_tests()
-    }
-    #[cfg(not(any(test, feature = "test-deterministic-process-ids")))]
-    {
-        false
-    }
+    cfg!(test) || deterministic_process_ids_forced_for_tests()
 }
 
 fn apply_unified_exec_env(
@@ -1266,6 +1256,7 @@ impl UnifiedExecProcessManager {
             }
         };
         process.set_validation(request.validation.clone());
+        process.start_stall_watchdog(request.stall_timeout_ms);
         let validation_process =
             request.validation_launch.is_some() || request.validation.is_some();
         registration.attach_process(Arc::clone(&process), deferred_network_approval.clone());

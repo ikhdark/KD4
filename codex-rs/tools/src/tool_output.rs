@@ -612,6 +612,7 @@ where
 #[derive(Clone)]
 pub struct JsonToolOutput {
     value: JsonValue,
+    model_value: Option<JsonValue>,
     success: Option<bool>,
     outcome: Option<ToolOutputOutcome>,
     skip_disposition: Option<ToolOutputSkipDisposition>,
@@ -623,6 +624,7 @@ impl std::fmt::Debug for JsonToolOutput {
         formatter
             .debug_struct("JsonToolOutput")
             .field("value", &self.value)
+            .field("model_value", &self.model_value)
             .field("success", &self.success)
             .field("outcome", &self.outcome)
             .field("skip_disposition", &self.skip_disposition)
@@ -633,6 +635,7 @@ impl std::fmt::Debug for JsonToolOutput {
 impl PartialEq for JsonToolOutput {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
+            && self.model_value == other.model_value
             && self.success == other.success
             && self.outcome == other.outcome
             && self.skip_disposition == other.skip_disposition
@@ -648,6 +651,7 @@ impl JsonToolOutput {
     pub fn new(value: JsonValue) -> Self {
         Self {
             value,
+            model_value: None,
             success: Some(true),
             outcome: None,
             skip_disposition: None,
@@ -658,6 +662,7 @@ impl JsonToolOutput {
     pub fn with_success(value: JsonValue, success: Option<bool>) -> Self {
         Self {
             value,
+            model_value: None,
             success,
             outcome: None,
             skip_disposition: None,
@@ -668,6 +673,7 @@ impl JsonToolOutput {
     pub fn skipped(value: JsonValue) -> Self {
         Self {
             value,
+            model_value: None,
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: None,
@@ -681,6 +687,7 @@ impl JsonToolOutput {
     ) -> Self {
         Self {
             value,
+            model_value: None,
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: Some(disposition),
@@ -688,9 +695,16 @@ impl JsonToolOutput {
         }
     }
 
+    /// Override only model presentation; JS, hooks and canonical retention stay raw.
+    pub fn with_model_value(mut self, value: JsonValue) -> Self {
+        self.model_value = Some(value);
+        self.serialized = Arc::new(OnceLock::new());
+        self
+    }
+
     fn serialized(&self) -> &str {
         self.serialized
-            .get_or_init(|| self.value.to_string())
+            .get_or_init(|| self.model_value.as_ref().unwrap_or(&self.value).to_string())
             .as_str()
     }
 
@@ -1213,6 +1227,26 @@ mod canonical_tests {
             preview.len()
                 <= TELEMETRY_PREVIEW_MAX_BYTES + TELEMETRY_PREVIEW_TRUNCATION_NOTICE.len() + 1
         );
+    }
+
+    #[test]
+    fn model_projection_keeps_execution_hooks_and_canonical_result_raw() {
+        let raw = serde_json::json!({"complete":true,"alias":true});
+        let projected = serde_json::json!({"complete":true});
+        let original = JsonToolOutput::new(raw.clone());
+        // Populate the shared cache before overriding a clone's presentation.
+        assert_eq!(original.log_preview(), raw.to_string());
+        let output = original.clone().with_model_value(projected.clone());
+        let payload = ToolPayload::Function { arguments: "{}".to_string() };
+        assert_eq!(output.code_mode_result(&payload), raw);
+        assert_eq!(output.post_tool_use_response("call", &payload), Some(raw.clone()));
+        assert_eq!(output.canonical_result(&payload), original.canonical_result(&payload));
+        assert_eq!(output.projection_metadata().unwrap().spillable_text, vec![projected.to_string()]);
+        let ResponseInputItem::FunctionCallOutput { output: response, .. } = output.to_response_item("call", &payload) else {
+            panic!("function output expected");
+        };
+        assert_eq!(response.body, FunctionCallOutputBody::Text(projected.to_string()));
+        assert_eq!(original.log_preview(), raw.to_string());
     }
 
     #[test]

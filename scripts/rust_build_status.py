@@ -722,7 +722,7 @@ def _auto_lane_base(command: Sequence[str]) -> str:
     # Affinity also covers Cargo watch's embedded --exec/-x command strings.
     packages = cargo_package_specs(signature.split())
     if packages:
-        base = packages[0]
+        base = "core-tests" if "codex-core" in packages else packages[0]
     elif command:
         program = Path(command[0]).stem
         # Normalize only Cargo's own display options, never arguments passed

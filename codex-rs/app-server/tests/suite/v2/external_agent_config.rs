@@ -1,14 +1,14 @@
 use std::time::Duration;
 
+use super::analytics::AnalyticsCapture;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
-use app_test_support::start_analytics_events_server;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
-use app_test_support::write_mock_responses_config_toml;
 use app_test_support::write_mock_provider_config_toml;
+use app_test_support::write_mock_responses_config_toml;
 use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
 use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
 use codex_app_server_protocol::ExternalAgentConfigImportHistoriesReadResponse;
@@ -322,7 +322,8 @@ async fn external_agent_config_import_reports_failed_sync_import_in_completion()
 
 #[tokio::test]
 async fn external_agent_config_import_completed_tracks_analytics_event() -> Result<()> {
-    let analytics_server = start_analytics_events_server().await?;
+    let analytics_server = wiremock::MockServer::start().await;
+    let capture = AnalyticsCapture::mount(&analytics_server).await;
     let codex_home = TempDir::new()?;
     write_analytics_config(codex_home.path(), &analytics_server.uri())?;
     write_chatgpt_auth(
@@ -388,7 +389,7 @@ async fn external_agent_config_import_completed_tracks_analytics_event() -> Resu
     assert_eq!(completed.item_type_results[0].failures.len(), 1);
 
     let event = wait_for_analytics_event(
-        &analytics_server,
+        &capture,
         DEFAULT_TIMEOUT,
         "codex_onboarding_external_agent_import_complete",
     )
@@ -402,7 +403,7 @@ async fn external_agent_config_import_completed_tracks_analytics_event() -> Resu
     assert!(event_params.get("raw_errors").is_none());
 
     let event = wait_for_analytics_event(
-        &analytics_server,
+        &capture,
         DEFAULT_TIMEOUT,
         "codex_onboarding_external_agent_import_failure",
     )
@@ -422,7 +423,8 @@ async fn external_agent_config_import_completed_tracks_analytics_event() -> Resu
 #[tokio::test]
 async fn external_agent_config_import_reinstalls_plugins_from_known_marketplaces() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let analytics_server = start_analytics_events_server().await?;
+    let analytics_server = wiremock::MockServer::start().await;
+    let capture = AnalyticsCapture::mount(&analytics_server).await;
     write_analytics_config(codex_home.path(), &analytics_server.uri())?;
     write_chatgpt_auth(
         codex_home.path(),
@@ -576,12 +578,8 @@ async fn external_agent_config_import_reinstalls_plugins_from_known_marketplaces
         "plugin `missing` was not found in marketplace `debug`"
     );
 
-    let event = wait_for_analytics_event(
-        &analytics_server,
-        DEFAULT_TIMEOUT,
-        "codex_plugin_install_failed",
-    )
-    .await?;
+    let event =
+        wait_for_analytics_event(&capture, DEFAULT_TIMEOUT, "codex_plugin_install_failed").await?;
     let event_params = &event["event_params"];
     assert_eq!(event_params["plugin_id"], "missing@debug");
     assert_eq!(event_params["plugin_name"], "missing");
@@ -590,7 +588,7 @@ async fn external_agent_config_import_reinstalls_plugins_from_known_marketplaces
     assert_eq!(event_params["error_type"], "plugin_not_found");
 
     let event = wait_for_analytics_event(
-        &analytics_server,
+        &capture,
         DEFAULT_TIMEOUT,
         "codex_onboarding_external_agent_import_failure",
     )

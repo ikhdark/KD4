@@ -38,6 +38,14 @@ pub fn read_schema_fixture_subtree(
 }
 
 #[doc(hidden)]
+pub fn generate_json_schema_fixture_subtree_for_tests() -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    crate::export::generate_json_schema_tree(/*experimental_api*/ false)?
+        .into_iter()
+        .map(|(path, bytes)| Ok((path.clone(), normalize_fixture_bytes(&path, bytes)?)))
+        .collect()
+}
+
+#[doc(hidden)]
 pub fn generate_typescript_schema_fixture_subtree_for_tests() -> Result<BTreeMap<PathBuf, Vec<u8>>>
 {
     let mut files = BTreeMap::new();
@@ -109,6 +117,10 @@ pub fn write_schema_fixtures_with_options(
 fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    normalize_fixture_bytes(path, bytes)
+}
+
+fn normalize_fixture_bytes(path: &Path, bytes: Vec<u8>) -> Result<Vec<u8>> {
     if path.extension().is_some_and(|ext| ext == "json") {
         let value: Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse JSON in {}", path.display()))?;

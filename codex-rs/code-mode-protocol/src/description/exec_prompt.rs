@@ -7,14 +7,14 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - `text(...)` emits values; on failure/no output, the host retains up to two nested-tool results, each capped at 1024 bytes, and reports omissions. Emit needed results explicitly.
 - Reuse current schemas and results; resolve missing/stale schemas before calls.
 - Nested tools: use a present schema; filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally; use `resolve_tool(name)` to obtain a missing schema and callable with `.name`/`.description`. Search only if local discovery fails.
-- Await `Promise.allSettled` for independent known calls in the same exec and inspect every result. Do not split a known independent batch into one-call execs. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results.
+- Await `Promise.allSettled` for independent known calls in the same exec and inspect every result. Do not split a known independent batch into one-call execs. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results. Do mechanical checks, such as exit codes, in JS and continue in the same exec.
 - For command output, prefer `text(result.output)` and inspect `result.exit_code`; live-session and recovery controls are preserved by the host. Use `text(result)` only when the complete object is needed.
 - Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. Resume only an actually returned live session/cell ID; otherwise check the outcome before retrying uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
 - `text(...)` buffers output while awaited work continues in the same awaited evaluation; `yield_control()` is only for a new model decision. Input and host deadlines can yield.
 - An exec cell and a command process have separate lifecycles. A resolved `exec_command` call may still return a running command session. Resume a running cell with `wait(cell_id)`; resume a returned command session with `write_stdin(session_id)`. When no new model decision is needed, continue that session within the current evaluation. Completion of the cell does not establish completion of every process it started. Command lifecycle and recovery metadata survive text-only output and zero-token text budgets.
 - Empty `write_stdin` polls: use default waits; avoid one-second loops.
 - Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
-- Output defaults to 4000 tokens, with a 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin results carry at most 8000 output tokens, bounded by the cell hard cap; request a larger cell budget when needed. Read whole useful regions; use retained-artifact selectors after truncation.
+- Output defaults to 10000 tokens, with a 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin results carry at most 8000 output tokens, bounded by the cell hard cap. Read whole useful regions; use retained-artifact selectors after truncation.
 
 Helpers:
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
@@ -23,7 +23,7 @@ Helpers:
 - `setTimeout(callback: () => void, delayMs?: number)` returns an ID; `clearTimeout(timeoutId?: number)` cancels it. Await a promise resolved by the callback to wait."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` buffers output while its awaited continuation runs. Use `wait` only after `exec` returns a genuinely live `Script running with cell ID ...` result, such as an explicit `yield_control()`, input interruption, or bounded host wait; a completed cell never needs `wait`.
 - `cell_id` identifies the running `exec` cell to resume.
-- `max_tokens` limits how much new output this wait call returns. Model projections default to 4000 tokens; explicit requests are capped at 10000 tokens.
+- `max_tokens` limits how much new output this wait call returns. Model projections default to 10000 tokens; explicit requests are capped at 10000 tokens.
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` buffers output until an explicit yield, input activity, the host's bounded wait, or the final completion or termination result for that cell.
 - New user steering or mailbox input interrupts a held wait without terminating a still-valid cell.
@@ -126,6 +126,7 @@ mod tests {
                     build_exec_tool_description(code_mode_only, has_deferred_tools, &[]);
                 for required in [
                     "Sequence dependent calls only after checking prerequisite results.",
+                    "Do mechanical checks, such as exit codes, in JS and continue in the same exec.",
                     "Await `Promise.allSettled`",
                     "for independent known calls in the same exec and inspect every result.",
                     "Do not split a known independent batch into one-call execs.",
@@ -135,7 +136,7 @@ mod tests {
                     "Reuse current schemas and results;",
                     "A resolved `exec_command` call may still return a running command session.",
                     "continue that session within the current evaluation.",
-                    "bounded by the cell hard cap; request a larger cell budget when needed.",
+                    "bounded by the cell hard cap.",
                     "host-configured default deadline",
                     "Expiry cancels the nested call and may return only an error, without a live handle.",
                     "Resume only an actually returned live session/cell ID;",
@@ -156,6 +157,7 @@ mod tests {
                     "never whole files",
                     "never repeat the same call/poll",
                     "never duplicate a timed-out operation",
+                    "request a larger cell budget",
                 ] {
                     assert!(
                         !description.contains(retired),

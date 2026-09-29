@@ -174,6 +174,9 @@ impl ToolHistoryPersistenceQueue {
             let mut journal_records = 0_u64;
             let mut journal_bytes = 0_u64;
             let mut journal_sequence = 0_u64;
+            let journal_writer = Arc::new(std::sync::Mutex::new(
+                crate::tool_history::ToolHistoryJournalWriter::default(),
+            ));
             let mut checkpoint_required = false;
             // The durable ledger already equals the mirror and no journal
             // append awaits sync. Starts false: the loaded journal may be unsynced.
@@ -272,11 +275,12 @@ impl ToolHistoryPersistenceQueue {
                                 )
                             })
                             .collect::<Vec<_>>();
-                        match crate::tool_history::persist_tool_history_mutations(
+                        match crate::tool_history::persist_tool_history_mutations_with_writer(
                             &codex_home,
                             &thread_id,
                             &writer_id,
                             &sequenced_mutations,
+                            Arc::clone(&journal_writer),
                         )
                         .await
                         {
@@ -305,10 +309,11 @@ impl ToolHistoryPersistenceQueue {
                             || journal_bytes >= TOOL_HISTORY_JOURNAL_COMPACTION_BYTES)
                     {
                         let mirror = worker_mirror.lock().await.clone();
-                        match crate::tool_history::persist_tool_history_state(
+                        match crate::tool_history::persist_tool_history_state_with_writer(
                             &codex_home,
                             &thread_id,
                             &mirror,
+                            Arc::clone(&journal_writer),
                         )
                         .await
                         {

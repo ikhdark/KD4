@@ -722,6 +722,30 @@ impl OAuthPersistenceState {
 }
 
 impl OAuthPersistor {
+    /// Adjust only this client's in-memory expiry; never the wall clock or disk.
+    #[cfg(test)]
+    pub(crate) async fn set_remaining_lifetime_for_test(&self, lifetime: Duration) -> Result<()> {
+        use rmcp::transport::auth::CredentialStore;
+        use rmcp::transport::auth::InMemoryCredentialStore;
+        use rmcp::transport::auth::StoredCredentials;
+
+        let mut manager = self.inner.authorization_manager.lock().await;
+        let (client_id, token) = manager.get_credentials().await?;
+        let mut token = token.ok_or_else(|| anyhow::anyhow!("test client has no token"))?;
+        token.set_expires_in(Some(&lifetime));
+        let store = InMemoryCredentialStore::new();
+        store
+            .save(StoredCredentials::new(
+                client_id,
+                Some(token),
+                Vec::new(),
+                Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),
+            ))
+            .await?;
+        manager.set_credential_store(store);
+        Ok(())
+    }
+
     pub(crate) fn new(
         server_name: String,
         url: String,
@@ -1185,7 +1209,6 @@ mod tests {
         let expected = tokens.clone();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
         store.set_error(
-            KEYRING_SERVICE,
             &key,
             KeyringError::Invalid("error".into(), "load".into()),
         );
@@ -1224,7 +1247,7 @@ mod tests {
         let fallback_path = super::fallback_file_path(env.path());
         assert!(!fallback_path.exists(), "fallback file should be removed");
         let stored = store
-            .saved_value(KEYRING_SERVICE, &key)
+            .saved_value(&key)
             .expect("value saved to keyring");
         assert_eq!(serde_json::from_str::<StoredOAuthTokens>(&stored)?, tokens);
         Ok(())
@@ -1248,7 +1271,7 @@ mod tests {
             &tokens,
         )?;
 
-        assert!(store.saved_value(KEYRING_SERVICE, &key).is_some());
+        assert!(store.saved_value(&key).is_some());
         assert_eq!(std::fs::read(fallback_path)?, malformed_plaintext);
         Ok(())
     }
@@ -1260,7 +1283,6 @@ mod tests {
         let tokens = sample_tokens();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
         store.set_error(
-            KEYRING_SERVICE,
             &key,
             KeyringError::Invalid("error".into(), "save".into()),
         );
@@ -1286,7 +1308,7 @@ mod tests {
             entry.access_token,
             tokens.token_response.0.access_token().secret().as_str()
         );
-        assert!(store.saved_value(KEYRING_SERVICE, &key).is_none());
+        assert!(store.saved_value(&key).is_none());
         Ok(())
     }
 
@@ -1318,7 +1340,7 @@ mod tests {
             .get(&SecretScope::Global, &secret_name)?
             .expect("tokens should be saved to encrypted storage");
         assert_eq!(serde_json::from_str::<StoredOAuthTokens>(&stored)?, tokens);
-        assert_eq!(store.saved_value(KEYRING_SERVICE, &key), Some(serialized));
+        assert_eq!(store.saved_value(&key), Some(serialized));
         assert!(env.path().join("secrets").join("mcp_oauth.age").exists());
         assert!(!env.path().join("secrets").join("local.age").exists());
         assert!(!super::fallback_file_path(env.path()).exists());
@@ -1471,7 +1493,7 @@ mod tests {
         let secret_name = super::compute_secret_name(&tokens.server_name, &tokens.url)?;
         assert!(removed);
         assert!(backend.get(&SecretScope::Global, &secret_name)?.is_none());
-        assert!(store.saved_value(KEYRING_SERVICE, &key).is_none());
+        assert!(store.saved_value(&key).is_none());
         assert!(!super::fallback_file_path(env.path()).exists());
         Ok(())
     }
@@ -1495,7 +1517,7 @@ mod tests {
             &tokens.url,
         )?;
         assert!(removed);
-        assert!(!store.contains(KEYRING_SERVICE, &key));
+        assert!(!store.contains(&key));
         assert!(!super::fallback_file_path(env.path()).exists());
         Ok(())
     }
@@ -1508,7 +1530,7 @@ mod tests {
         let serialized = serde_json::to_string(&tokens)?;
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
         store.save(KEYRING_SERVICE, &key, &serialized)?;
-        assert!(store.contains(KEYRING_SERVICE, &key));
+        assert!(store.contains(&key));
 
         let removed = super::delete_oauth_tokens_from_keyring_and_file(
             &store,
@@ -1519,7 +1541,7 @@ mod tests {
             &tokens.url,
         )?;
         assert!(removed);
-        assert!(!store.contains(KEYRING_SERVICE, &key));
+        assert!(!store.contains(&key));
         assert!(!super::fallback_file_path(env.path()).exists());
         Ok(())
     }
@@ -1531,7 +1553,6 @@ mod tests {
         let tokens = sample_tokens();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
         store.set_error(
-            KEYRING_SERVICE,
             &key,
             KeyringError::Invalid("error".into(), "delete".into()),
         );

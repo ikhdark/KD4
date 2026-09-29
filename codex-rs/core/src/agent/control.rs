@@ -632,6 +632,10 @@ impl AgentControl {
     }
 
     /// Subscribe to status updates for `agent_id`, yielding the latest value and changes.
+    pub(crate) fn subscribe_capacity_changes(&self) -> watch::Receiver<u64> {
+        self.state.subscribe_capacity_changes()
+    }
+
     pub(crate) async fn subscribe_status(
         &self,
         agent_id: ThreadId,

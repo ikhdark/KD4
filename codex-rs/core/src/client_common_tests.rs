@@ -276,7 +276,7 @@ fn serializes_flex_service_tier_when_set() {
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
-        input: Arc::from([]),
+        input: Vec::new().into(),
         tools: Some(Vec::new().into()),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,

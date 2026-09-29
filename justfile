@@ -5,12 +5,12 @@ set shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
 rust_min_stack := "8388608" # 8 MiB
-rust_parallelism := "2" # Match codex-rs/.cargo/config.toml; standard env/CLI overrides still win.
+rust_parallelism := "8" # Match codex-rs/.cargo/config.toml; standard env/CLI overrides still win.
 cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)
 export CARGO_BUILD_JOBS := cargo_build_jobs
-rust_test_threads := env_var_or_default("RUST_TEST_THREADS", "2") # Match Cargo's libtest default.
+rust_test_threads := env_var_or_default("RUST_TEST_THREADS", "4") # Match Cargo's libtest default.
 export RUST_TEST_THREADS := rust_test_threads
-nextest_test_threads := env_var_or_default("NEXTEST_TEST_THREADS", "2") # Match nextest.toml.
+nextest_test_threads := env_var_or_default("NEXTEST_TEST_THREADS", "8") # Match nextest.toml.
 export NEXTEST_TEST_THREADS := nextest_test_threads
 python := "python"
 # One reserved Cargo lane shared by every named core test target and gate, so
@@ -275,8 +275,8 @@ rust-perf-env *args:
 # Run nextest with --no-fail-fast so all tests are run.
 #
 # Run `cargo install cargo-nextest` if you don't have it installed.
-# The process-ID test feature is selected by core_test_support. Other workspace
-# crate features remain disallowed; there is no need to add `--all-features`.
+# core_test_support enables deterministic process IDs at runtime, without a
+# separate crate feature. There is no need to add `--all-features`.
 [windows]
 test *args:
     $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-fail-fast @forwarded_args
@@ -294,8 +294,9 @@ test-fast *args:
 # Every one of these runs takes a reserved Cargo lane. Sharing `codex-rs/target`
 # with another build invalidates the whole graph whenever the two disagree on a
 # compiler setting, which costs far more than the tests themselves. They share
-# one lane rather than taking one each, so the codex-core library and its
-# dependencies stay compiled once and warm between targets. A concurrent run
+# one lane rather than taking one each, so compatible codex-core artifacts and
+# dependencies stay warm between targets. Feature/profile differences can still
+# require separate artifacts. A concurrent run
 # reuses an idle warm sibling lane with matching build settings (such as
 # `core-tests-2`); without one it waits up to 30 s, then stops instead of
 # starting a duplicate cold build (`run-lane --allow-cold-overflow` opts in).
@@ -309,6 +310,15 @@ core-test target *args:
 [windows]
 core-test-fast target *args:
     $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ core_test_lane }}" -- just _core-test-reserved fast "{{ target }}" @forwarded_args
+
+# Opt-in symbol-free builds; keep separate artifacts for a fair dev/dev-small comparison.
+[windows]
+core-test-small target *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane core-tests-small -- just _core-test-small-reserved "{{ target }}" @forwarded_args
+
+[windows]
+_core-test-small-reserved target *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" --target-dir $target_dir --cargo-profile dev-small run-target --profile fast "{{ target }}" @forwarded_args
 
 # Run a named core target in a lane of its own, apart from the shared core lane.
 [windows]
@@ -329,6 +339,11 @@ core-gate +gates:
 [windows]
 _core-gate-reserved +gates:
     $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" --target-dir $target_dir run-gate @forwarded_args
+
+# Run transport and real continuation boundary regressions deliberately.
+[windows]
+test-slow-boundaries:
+    just core-gate --profile local test-slow-boundaries
 
 # List the named core targets and gates.
 [no-cd]
@@ -410,18 +425,33 @@ test-timings *args:
     $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-fail-fast --timings @forwarded_args
 
 # Focused crate test without repo-wide formatting.
-validate-crate-focused crate:
-    just test-fast -p {{ crate }}
+validate-crate-focused crate *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); just _validate-crate focused "{{ crate }}" @forwarded_args
 
 # Validation ladder: fast local formatting, then a focused crate test.
-validate-crate crate:
-    just fmt-check-fast
-    just test-fast -p {{ crate }}
+validate-crate crate *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); just _validate-crate local "{{ crate }}" @forwarded_args
 
 # Full validation ladder for release-like source hygiene plus a focused crate test.
-validate-crate-full crate:
-    just fmt-check
-    just test-fast -p {{ crate }}
+validate-crate-full crate *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); just _validate-crate full "{{ crate }}" @forwarded_args
+
+# Resolve the whole ladder before starting any formatter. Core uses named gates.
+[script("python")]
+_validate-crate mode crate *args:
+    import subprocess
+    import sys
+    sys.path.insert(0, r"{{ justfile_directory() }}")
+    from scripts.rust_test_runner import RunnerError, crate_validation_commands
+    try:
+        commands = crate_validation_commands(sys.argv[1], sys.argv[2], sys.argv[3:])
+    except RunnerError as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(2)
+    for command in commands:
+        result = subprocess.run(command)
+        if result.returncode:
+            raise SystemExit(result.returncode)
 
 [windows]
 cargo-lane lane *args:
@@ -470,7 +500,7 @@ _test-lane-package-reserved package *args:
 
 [windows]
 check-lane package *args:
-    @python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" -- cargo check -p "{{ package }}" @($args | Select-Object -Skip 2)
+    @$forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ package }}" -- cargo check -p "{{ package }}" @forwarded_args
 
 [windows]
 clippy-lane package *args:
@@ -573,11 +603,9 @@ config-schema-regenerate owner:
 # Run focused app-server runtime validation without regenerating schemas.
 app-server-runtime-check:
     just core-gate app-server-command-exec app-server-process-exec app-server-thread-status
-    cargo check -p codex-app-server
 
 tui-large-widget-check:
     just core-gate tui-large-widget
-    cargo check -p codex-tui
 
 deps-duplicates-check *args:
     {{ python }} "{{ justfile_directory() }}/scripts/check_duplicate_deps.py" {args}
@@ -632,15 +660,12 @@ codex-cli-wrapper-check:
 
 app-server-command-exec-check:
     just core-gate app-server-command-exec
-    cargo check -p codex-app-server
 
 app-server-process-exec-check:
     just core-gate app-server-process-exec
-    cargo check -p codex-app-server
 
 app-server-thread-status-check:
     just core-gate app-server-thread-status
-    cargo check -p codex-app-server
 
 app-server-schema-protocol-check:
     just core-gate app-server-schema-fixtures
@@ -667,7 +692,7 @@ write-hooks-schema:
 
 # Compare generated hook schemas in a temporary directory with checked-in fixtures.
 hooks-schema-check:
-    cargo nextest run --profile local --no-tests=fail -p codex-hooks --lib -E 'test(=schema::tests::generated_hook_schemas_match_fixtures)'
+    just cargo-lane core-tests cargo nextest run --profile local --no-tests=fail -p codex-hooks --lib -E 'test(=schema::tests::generated_hook_schemas_match_fixtures)'
 
 # Run the argument-comment Dylint checks across codex-rs.
 [no-cd]

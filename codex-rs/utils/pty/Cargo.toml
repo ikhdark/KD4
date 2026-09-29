@@ -7,6 +7,9 @@ version.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow = { workspace = true }
 log = { workspace = true }

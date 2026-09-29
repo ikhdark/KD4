@@ -21,6 +21,34 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell_snapshot::ShellSnapshot;
 
+#[tokio::test]
+async fn ignored_build_events_are_journaled_without_changing_capture_keys() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    std::fs::write(repo.join(".gitignore"), "/target/\n/lanes/\n").unwrap();
+    std::fs::create_dir(repo.join("target")).unwrap();
+    let build = repo.join("target/output.bin").to_path_buf();
+    std::fs::write(&build, "build").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let observed = cache.begin_source_path_change_observation(
+        repo.as_path(), &build, false,
+    ).await.unwrap();
+    let before = cache.source_capture_generation.load(Ordering::Acquire);
+    cache.record_watched_source_change_event(Some(vec![build.clone()])).await;
+    assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before);
+    assert!(!cache.source_path_change_observation_is_current(&observed));
+    assert!(git_ignores_all_changed_paths(repo.as_path(), &[build.clone()]).await);
+    assert!(std::process::Command::new("git").args(["add", "-f", "target/output.bin"])
+        .current_dir(repo.as_path()).status().unwrap().success());
+    // Force-added files, including changes reported only on their directory,
+    // affect git status even though the directory itself is ignored.
+    for path in [build, repo.join("target").to_path_buf(), repo.join(".gitignore").to_path_buf()] {
+        assert!(!git_ignores_all_changed_paths(repo.as_path(), &[path.clone()]).await);
+        let before = cache.source_capture_generation.load(Ordering::Acquire);
+        cache.record_watched_source_change_event(Some(vec![path])).await;
+        assert!(cache.source_capture_generation.load(Ordering::Acquire) > before);
+    }
+}
+
 fn test_runtime_paths() -> ExecServerRuntimePaths {
     ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
         .expect("runtime paths")
@@ -442,6 +470,17 @@ async fn unavailable_workspace_capture_cannot_reuse_successful_tool_output() {
     std::fs::write(repo.join("untracked-0.txt"), "externally changed contents").unwrap();
     let after = cache.workspace_evidence_identity(repo.as_path()).await;
     assert!(after.as_ref().is_some_and(|identity| identity.unavailable));
+    assert_eq!(cache.workspace_evidence_capture_count(), 1);
+    // A failed scan is memoized only for its exact capture key, never as proof
+    // of freshness. Watcher and host mutations must each permit a new scan.
+    cache.record_source_change_event(Some(vec![repo.join("untracked-0.txt").to_path_buf()]));
+    cache.workspace_evidence_identity(repo.as_path()).await;
+    assert_eq!(cache.workspace_evidence_capture_count(), 2);
+    cache.note_host_workspace_mutation_paths(repo.as_path(), &["oversized.bin".to_string()]).await;
+    oversized.set_len(0).unwrap();
+    let recovered = cache.workspace_evidence_identity(repo.as_path()).await;
+    assert!(recovered.as_ref().is_some_and(|identity| !identity.unavailable));
+    assert_eq!(cache.workspace_evidence_capture_count(), 3);
     // Cover both new explicit failures and old persisted None observations.
     for captured in [before, None] {
         let mut state = ToolHistoryState::default();
@@ -462,6 +501,55 @@ async fn unavailable_workspace_capture_cannot_reuse_successful_tool_output() {
         assert_eq!(notice["valid_for_current_workspace"], false);
         assert_eq!(notice["historical_digest"], "first contents");
     }
+}
+
+#[tokio::test]
+async fn workspace_content_cache_checks_age_metadata_and_file_identity() {
+    let root = TempDir::new().unwrap();
+    let cache = Arc::new(StdMutex::new(WorkspaceContentCache::default()));
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let path = root.path().join("dirty.txt");
+    std::fs::write(&path, b"first").unwrap();
+    File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+    let capture = || capture_workspace_metadata_cached(
+        root.path().to_path_buf(),
+        vec![WorkspaceGenerationPath { path: "dirty.txt".into(), deleted: false }],
+        WorkspaceCaptureControl { deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE, cancellation: CancellationToken::new() },
+        Arc::clone(&cache), SystemTime::now(),
+    );
+    let first = capture().await.unwrap().manifest;
+    assert_eq!(capture().await.unwrap().manifest, first);
+    assert_eq!(cache.lock().unwrap().hits.load(Ordering::Relaxed), 1);
+    // Replacement with the same size and mtime must not reuse the old digest.
+    std::fs::rename(&path, root.path().join("old.txt")).unwrap();
+    std::fs::write(&path, b"other").unwrap();
+    File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+    let replacement = capture().await.unwrap().manifest;
+    assert_ne!(replacement, first);
+    assert_eq!(cache.lock().unwrap().hits.load(Ordering::Relaxed), 1);
+    let future = SystemTime::now() + Duration::from_secs(60);
+    File::options().write(true).open(&path).unwrap().set_modified(future).unwrap();
+    assert_eq!(capture().await.unwrap().manifest, replacement);
+    assert_eq!(capture().await.unwrap().manifest, replacement);
+    assert_eq!(cache.lock().unwrap().hits.load(Ordering::Relaxed), 1);
+    std::fs::write(&path, b"longer contents").unwrap();
+    assert_ne!(capture().await.unwrap().manifest, replacement);
+}
+
+#[tokio::test]
+async fn parallel_workspace_hashes_preserve_manifest_order() {
+    let root = TempDir::new().unwrap();
+    let mut paths = Vec::new();
+    let mut expected = b"total_paths=8\n".to_vec();
+    for index in 0..8 {
+        let path = format!("{index}.txt");
+        let content = vec![b'a' + index; (8 - index as usize) * 1024];
+        std::fs::write(root.path().join(&path), &content).unwrap();
+        expected.extend_from_slice(format!("{path}\0file\0{}\0{:x}\n", content.len(), Sha256::digest(&content)).as_bytes());
+        paths.push(path);
+    }
+    let actual = workspace_generation_metadata(root.path().to_path_buf(), paths).await.unwrap();
+    assert_eq!(actual.manifest, expected);
 }
 
 #[tokio::test]
@@ -1592,6 +1680,7 @@ async fn repository_retention_eviction_invalidates_source_observation_and_cached
                 capture_sequence: 1,
                 host_mutation_generation: 0,
                 identity: None,
+                failed_capture: None,
             },
         );
     }

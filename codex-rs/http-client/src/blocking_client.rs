@@ -81,12 +81,17 @@ impl BlockingHttpClientBuilder {
     }
 
     fn build_inner(self, direct: bool) -> Result<BlockingHttpClient, BuildCustomCaTransportError> {
-        self.build_inner_using(direct, build_blocking_reqwest_client_with_custom_ca_policy)
+        self.build_inner_using(
+            direct,
+            reqwest::blocking::Client::builder(),
+            build_blocking_reqwest_client_with_custom_ca_policy,
+        )
     }
 
     fn build_inner_using(
         self,
         direct: bool,
+        mut builder: reqwest::blocking::ClientBuilder,
         build_with_custom_ca: impl FnOnce(
             reqwest::blocking::ClientBuilder,
             CustomCaPolicy,
@@ -100,7 +105,6 @@ impl BlockingHttpClientBuilder {
         } else {
             CustomCaPolicy::HonorProcessEnvironment
         };
-        let mut builder = reqwest::blocking::Client::builder();
         if direct {
             builder = builder.no_proxy();
         }

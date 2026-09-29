@@ -87,7 +87,7 @@ pub(super) fn tool_callback(
     let id = format!("tool-{}", state.next_tool_call_id);
     state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
     let event_tx = state.event_tx.clone();
-    state.pending_tool_calls.insert(id.clone(), resolver);
+    state.pending_tool_calls.insert(id.clone(), (resolver, tool_name.clone()));
     if event_tx.send(RuntimeEvent::ToolCall {
         id: id.clone(),
         name: tool_name,

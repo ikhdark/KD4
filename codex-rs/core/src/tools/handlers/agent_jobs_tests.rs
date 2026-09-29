@@ -325,7 +325,13 @@ async fn wait_for_status_change_blocks_after_non_final_update_is_consumed() {
     );
     assert_eq!(observed, Some(AgentStatus::Running));
 
-    let wait = wait_for_status_change(&active_items);
+    let (_jobs, mut job_changes) = tokio::sync::watch::channel(0);
+    let (_capacity, mut capacity_changes) = tokio::sync::watch::channel(0);
+    let cancellation = CancellationToken::new();
+    let wait = wait_for_status_change(
+        &active_items, &mut job_changes, &mut capacity_changes,
+        &cancellation, Duration::from_secs(60),
+    );
     tokio::pin!(wait);
     assert!(futures::poll!(&mut wait).is_pending());
 
@@ -335,6 +341,52 @@ async fn wait_for_status_change_blocks_after_non_final_update_is_consumed() {
     timeout(Duration::from_secs(1), &mut wait)
         .await
         .expect("a genuinely newer status should wake the waiter");
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_for_status_change_wakes_on_capacity_release_without_active_workers() {
+    let registry = Arc::new(crate::agent::AgentRegistry::default());
+    let reservation = registry.reserve_spawn_slot(Some(1)).unwrap();
+    assert!(registry.reserve_spawn_slot(Some(1)).is_err());
+    let mut capacity = registry.subscribe_capacity_changes();
+    let (_jobs, mut jobs) = tokio::sync::watch::channel(0);
+    let cancellation = CancellationToken::new();
+    let active = HashMap::new();
+    let start = Instant::now();
+    let wait = wait_for_status_change(
+        &active, &mut jobs, &mut capacity, &cancellation, Duration::from_secs(60),
+    );
+    tokio::pin!(wait);
+    assert!(futures::poll!(&mut wait).is_pending());
+    drop(reservation);
+    wait.await;
+    assert_eq!(Instant::now(), start, "capacity release must not wait for a polling interval");
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_for_status_change_wakes_on_job_commit_and_honors_runtime_deadline() {
+    let (jobs_tx, mut jobs) = tokio::sync::watch::channel(0);
+    let (_capacity, mut capacity) = tokio::sync::watch::channel(0);
+    let cancellation = CancellationToken::new();
+    let active = HashMap::new();
+    let wait = wait_for_status_change(
+        &active, &mut jobs, &mut capacity, &cancellation, Duration::from_secs(60),
+    );
+    tokio::pin!(wait);
+    assert!(futures::poll!(&mut wait).is_pending());
+    jobs_tx.send_replace(1);
+    assert!(futures::poll!(&mut wait).is_ready());
+
+    let (_jobs, mut jobs) = tokio::sync::watch::channel(0);
+    let (_capacity, mut capacity) = tokio::sync::watch::channel(0);
+    let (_status, status_rx) = tokio::sync::watch::channel(AgentStatus::Running);
+    let started_at = Instant::now();
+    let active = HashMap::from([(ThreadId::new(), ActiveJobItem {
+        item_id: "deadline".into(), started_at, status_rx: Some(status_rx),
+    })]);
+    wait_for_status_change(&active, &mut jobs, &mut capacity, &cancellation,
+        Duration::from_millis(40)).await;
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(40));
 }
 
 #[tokio::test]

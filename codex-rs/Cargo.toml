@@ -393,7 +393,7 @@ semver = "1.0"
 sentry = { version = "0.47.0", default-features = false }
 serde = { version = "1", features = ["rc"] }
 serde_ignored = "0.1.14"
-serde_json = "1"
+serde_json = { version = "1", features = ["alloc", "arbitrary_precision", "float_roundtrip", "preserve_order", "raw_value"] }
 serde_path_to_error = "0.1.20"
 serde_with = "3.17"
 noyalib = { version = "0.0.27", features = ["compat-serde-yaml"] }
@@ -538,6 +538,15 @@ ignored = [
 # across local dev builds.
 debug = "limited"
 
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.dev-small]
 inherits = "dev"
 opt-level = 0
@@ -564,12 +573,6 @@ inherits = "release"
 debug = "full"
 lto = false
 strip = false
-
-[profile.ci-test]
-# Reduce binary size to reduce disk pressure.
-debug = "limited"
-inherits = "test"
-opt-level = 0
 
 [patch.crates-io]
 # Uncomment to debug local changes.

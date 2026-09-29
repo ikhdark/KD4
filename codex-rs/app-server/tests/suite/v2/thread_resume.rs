@@ -789,7 +789,7 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
 
     let codex_home = TempDir::new()?;
     create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
+    let capture = mount_analytics_capture(&server, codex_home.path()).await?;
 
     let conversation_id = create_fake_rollout(
         codex_home.path(),
@@ -833,7 +833,7 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
     );
     assert_eq!(thread.thread_source, Some(ThreadSource::User));
 
-    let payload = wait_for_analytics_payload(&server, DEFAULT_READ_TIMEOUT).await?;
+    let payload = wait_for_analytics_payload(&capture, DEFAULT_READ_TIMEOUT).await?;
     let event = thread_initialized_event(&payload)?;
     assert_basic_thread_initialized_event(
         event,
@@ -854,7 +854,7 @@ async fn thread_resume_running_thread_tracks_thread_originator_in_analytics() ->
 
     let codex_home = TempDir::new()?;
     create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
+    let capture = mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_args(&["-c", "analytics.enabled=true"])
@@ -917,7 +917,7 @@ async fn thread_resume_running_thread_tracks_thread_originator_in_analytics() ->
         thread: resumed, ..
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
 
-    let event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
+    let event = wait_for_matching_analytics_event(&capture, DEFAULT_READ_TIMEOUT, |event| {
         event["event_type"] == "codex_thread_initialized"
             && event["event_params"]["thread_id"] == resumed.id
             && event["event_params"]["initialization_mode"] == "resumed"
@@ -1884,7 +1884,7 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
             config.replace("personality = true\n", "personality = true\ngoals = true\n"),
         ),
     )?;
-    mount_analytics_capture(&analytics_server, codex_home.path()).await?;
+    let capture = mount_analytics_capture(&analytics_server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1951,7 +1951,7 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     .await??;
 
     let created =
-        wait_for_goal_event(&analytics_server, DEFAULT_READ_TIMEOUT, "created", "active").await?;
+        wait_for_goal_event(&capture, DEFAULT_READ_TIMEOUT, "created", "active").await?;
     let persisted_goal_id = created["event_params"]["goal_id"]
         .as_str()
         .expect("created goal id");
@@ -1965,7 +1965,7 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     assert!(created["event_params"].get("token_budget").is_none());
 
     let usage = wait_for_goal_event(
-        &analytics_server,
+        &capture,
         DEFAULT_READ_TIMEOUT,
         "usage_accounted",
         "budgetLimited",
@@ -1983,7 +1983,7 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     );
 
     let status = wait_for_goal_event(
-        &analytics_server,
+        &capture,
         DEFAULT_READ_TIMEOUT,
         "status_changed",
         "budgetLimited",
@@ -2023,7 +2023,7 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     .await??;
 
     let cleared = wait_for_goal_event(
-        &analytics_server,
+        &capture,
         DEFAULT_READ_TIMEOUT,
         "cleared",
         "budgetLimited",

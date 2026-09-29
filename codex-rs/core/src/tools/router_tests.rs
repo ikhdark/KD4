@@ -86,13 +86,17 @@ async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Res
         );
         let specs = router.model_visible_specs();
         let mut names = HashSet::new();
-        for name in specs.iter().flat_map(ToolSpec::callable_tool_names) {
+        for (name, hosted) in specs.iter().flat_map(|spec| {
+            spec.callable_tool_names()
+                .into_iter()
+                .map(|name| (name, matches!(spec, ToolSpec::WebSearch { .. })))
+        }) {
             assert!(
                 names.insert(name.clone()),
                 "duplicate visible handler: {name:?}"
             );
             assert!(
-                router.has_registered_tool(&name),
+                hosted || router.has_registered_tool(&name),
                 "missing handler: {name:?}"
             );
         }

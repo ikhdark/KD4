@@ -4,11 +4,7 @@ use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
 use std::collections::BTreeMap;
 
-pub(crate) fn create_tool_search_tool(
-    searchable_sources: &[ToolSearchSourceInfo],
-    has_unnamed_tools: bool,
-    default_limit: usize,
-) -> ToolSpec {
+pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "query".to_string(),
@@ -29,6 +25,24 @@ pub(crate) fn create_tool_search_tool(
         ),
     ]);
 
+    let description = format!(
+        "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call. An exact deferred-tool name may be called directly; the router resolves and activates that registered capability atomically.\n\nAvailable sources are listed in the latest <tool_search_sources> context message, not in this stable contract. Use `{TOOL_SEARCH_TOOL_NAME}` to discover or disambiguate deferred capabilities. For MCP tool discovery, always use `{TOOL_SEARCH_TOOL_NAME}` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
+    );
+    ToolSpec::ToolSearch {
+        execution: "client".to_string(),
+        description,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["query".to_string()]),
+            Some(false.into()),
+        ),
+    }
+}
+
+pub(crate) fn render_tool_search_sources(
+    searchable_sources: &[ToolSearchSourceInfo],
+    has_unnamed_tools: bool,
+) -> String {
     let mut source_descriptions = BTreeMap::new();
     for source in searchable_sources {
         source_descriptions
@@ -41,7 +55,7 @@ pub(crate) fn create_tool_search_tool(
             .or_insert(source.description.clone());
     }
 
-    let source_descriptions = if source_descriptions.is_empty() {
+    if source_descriptions.is_empty() {
         if has_unnamed_tools {
             "- Deferred built-in or extension tools (named source metadata is unavailable; these deferred tools remain searchable)."
                 .to_string()
@@ -66,34 +80,18 @@ pub(crate) fn create_tool_search_tool(
         }
         crate::tools::spec_plan::apply_fair_description_budget(&mut source_descriptions);
         source_descriptions.concat().trim_end().to_string()
-    };
-
-    let description = format!(
-        "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call. An exact deferred-tool name may be called directly; the router resolves and activates that registered capability atomically.\n\nYou have access to tools from the following sources:\n{source_descriptions}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`{TOOL_SEARCH_TOOL_NAME}`) when you need to discover or disambiguate them. For MCP tool discovery, always use `{TOOL_SEARCH_TOOL_NAME}` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
-    );
-
-    ToolSpec::ToolSearch {
-        execution: "client".to_string(),
-        description,
-        parameters: JsonSchema::object(
-            properties,
-            Some(vec!["query".to_string()]),
-            Some(false.into()),
-        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_tools::JsonSchema;
     use pretty_assertions::assert_eq;
-    use std::collections::BTreeMap;
 
     #[test]
     fn create_tool_search_tool_deduplicates_and_renders_enabled_sources() {
         assert_eq!(
-            create_tool_search_tool(
+            render_tool_search_sources(
                 &[
                     ToolSearchSourceInfo {
                         name: "Google Drive".to_string(),
@@ -112,32 +110,8 @@ mod tests {
                     },
                 ],
                 /*has_unnamed_tools*/ false,
-                /*default_limit*/ 8,
             ),
-            ToolSpec::ToolSearch {
-                execution: "client".to_string(),
-                description: "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call. An exact deferred-tool name may be called directly; the router resolves and activates that registered capability atomically.\n\nYou have access to tools from the following sources:\n- Google Drive: Use Google Drive as the single entrypoint for Drive, Docs, Sheets, and Slides work.\n- docs\nSome of the tools may not have been provided to you upfront, and you should use this tool (`tool_search`) when you need to discover or disambiguate them. For MCP tool discovery, always use `tool_search` instead of `list_mcp_resources` or `list_mcp_resource_templates`.".to_string(),
-                parameters: JsonSchema::object(BTreeMap::from([
-                        (
-                            "limit".to_string(),
-                            JsonSchema {
-                                minimum: Some(serde_json::Number::from(1_u64)),
-                                maximum: Some(serde_json::Number::from(64_u64)),
-                                ..JsonSchema::integer(Some(
-                                    "Maximum number of tools to return and activate. Choose the smallest useful limit to avoid loading unrelated schemas. Must be an integer from 1 through 64. Defaults to 8."
-                                        .to_string(),
-                                ))
-                            },
-                        ),
-                        (
-                            "query".to_string(),
-                            JsonSchema::string(Some(
-                                    "Short search terms or an exact name for deferred tools; omit unrelated task context. Must contain non-whitespace text and must not exceed 4,096 UTF-8 bytes."
-                                        .to_string(),
-                                ),),
-                        ),
-                    ]), Some(vec!["query".to_string()]), Some(false.into())),
-            }
+            "- Google Drive: Use Google Drive as the single entrypoint for Drive, Docs, Sheets, and Slides work.\n- docs"
         );
     }
 
@@ -153,17 +127,7 @@ mod tests {
                 description: Some("Find small records.".to_string()),
             },
         ];
-        let ToolSpec::ToolSearch { description, .. } = create_tool_search_tool(&sources, false, 8)
-        else {
-            panic!("expected search tool");
-        };
-        let catalog = description
-            .split_once("sources:\n")
-            .unwrap()
-            .1
-            .split_once("\nSome of the tools")
-            .unwrap()
-            .0;
+        let catalog = render_tool_search_sources(&sources, false);
         assert!(catalog.len() <= 40_000);
         assert!(catalog.contains("- small: Find small records."));
         assert!(catalog.contains("context truncated"));
@@ -171,11 +135,7 @@ mod tests {
 
     #[test]
     fn create_tool_search_tool_describes_unnamed_deferred_tools() {
-        let ToolSpec::ToolSearch { description, .. } =
-            create_tool_search_tool(&[], /*has_unnamed_tools*/ true, 8)
-        else {
-            panic!("expected tool search specification");
-        };
+        let description = render_tool_search_sources(&[], true);
 
         assert!(description.contains("- Deferred built-in or extension tools"));
         assert!(description.contains("named source metadata is unavailable"));
@@ -185,9 +145,7 @@ mod tests {
 
     #[test]
     fn tool_search_limit_schema_matches_runtime_range() {
-        let ToolSpec::ToolSearch { parameters, .. } =
-            create_tool_search_tool(&[], /*has_unnamed_tools*/ false, 8)
-        else {
+        let ToolSpec::ToolSearch { parameters, .. } = create_tool_search_tool(8) else {
             panic!("expected tool search specification");
         };
         let schema = serde_json::to_value(parameters).expect("serialize tool_search schema");
@@ -202,16 +160,13 @@ mod tests {
 
     #[test]
     fn create_tool_search_tool_describes_named_and_unnamed_tools() {
-        let ToolSpec::ToolSearch { description, .. } = create_tool_search_tool(
+        let description = render_tool_search_sources(
             &[ToolSearchSourceInfo {
                 name: "Google Drive".to_string(),
                 description: Some("Search Drive files.".to_string()),
             }],
             /*has_unnamed_tools*/ true,
-            8,
-        ) else {
-            panic!("expected tool search specification");
-        };
+        );
 
         assert!(description.contains("- Google Drive: Search Drive files."));
         assert!(description.contains("- Deferred built-in or extension tools"));

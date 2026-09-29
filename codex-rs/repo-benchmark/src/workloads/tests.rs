@@ -332,7 +332,7 @@ fn python_refactor_checks_real_helper_use_and_preserved_results() {
         .unwrap();
     let end = original[start..].find("    return toc").unwrap() + start;
     let updated = format!(
-        "{}        slug = disambiguate_slug(slugify_heading(text), used_slugs)\n        toc.append(format_toc_entry(level, text, slug))\n{}\n\ndef format_toc_entry(level, text, slug):\n    label = text.replace('\\\\', '\\\\\\\\').replace('[', '\\\\[').replace(']', '\\\\]')\n    return '  ' * (level - 2) + f'- [{{label}}](#{{slug}})'\n",
+        "{}        toc.append(format_toc_entry(level, text, slug))\n{}\n\ndef format_toc_entry(level, text, slug):\n    label = text.replace('\\\\', '\\\\\\\\').replace('[', '\\\\[').replace(']', '\\\\]')\n    return '  ' * (level - 2) + f'- [{{label}}](#{{slug}})'\n",
         &original[..start],
         &original[end..]
     );

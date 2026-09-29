@@ -128,6 +128,14 @@ impl CodeModeWaitHandler {
                 let exec = ExecContext { session, turn };
                 let started_at = Instant::now();
                 let cell_id = codex_code_mode::CellId::new(args.cell_id);
+                exec.session.services.code_mode_service.record_output_budget(
+                    &cell_id,
+                    Some(args.max_tokens
+                        .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+                        .min(exec.turn.config.tool_output_token_limit
+                            .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL))
+                        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)),
+                );
                 let (wait_response, drained_observations) = if args.terminate {
                     exec.session
                         .services

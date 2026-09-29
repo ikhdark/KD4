@@ -332,7 +332,7 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             self.assertTrue(outputs.entrypoint_bin.is_file())
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.kwargs["env"]["RUSTC_WRAPPER"], "")
-            self.assertNotIn("SCCACHE_BASEDIR", run.call_args.kwargs["env"])
+            self.assertNotIn("SCCACHE_BASEDIRS", run.call_args.kwargs["env"])
 
     def test_unavailable_recipe_evidence_runs_cargo_without_reuse_stamp(self):
         with self.package_fixture() as fixture:
@@ -695,7 +695,7 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             self.assertEqual(call.env["CODEX_RELEASE_VERSION"], "1.2.3")
             self.assertEqual(call.env["RUSTC_WRAPPER"], "sccache")
             self.assertEqual(
-                call.env["SCCACHE_BASEDIR"], str(cargo_module.REPO_ROOT.resolve())
+                call.env["SCCACHE_BASEDIRS"], str(cargo_module.REPO_ROOT.resolve())
             )
             self.assertEqual(call.env["SCCACHE_CACHE_SIZE"], "80G")
             self.assertNotIn("CARGO_TARGET_DIR", call.env)

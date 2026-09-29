@@ -696,7 +696,7 @@ async fn task_model_guidance_is_injected_only_when_the_feature_is_enabled() -> R
                     ] {
                         assert!(guidance[0].contains(required), "missing guidance: {required}");
                     }
-                    let shared = "A no-change result is valid and preferred when the requested capability already exists adequately.";
+                    let shared = "A no-change result is valid";
                     assert_eq!(guidance[0].contains(shared), !base_owns_shared_policy);
                     assert_eq!(
                         instructions.matches(shared).count() + guidance[0].matches(shared).count(),

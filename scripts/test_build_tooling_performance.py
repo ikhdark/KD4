@@ -99,7 +99,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         env = os.environ.copy()
         env["CARGO_INCREMENTAL"] = "keep"
         env["RUSTC_WRAPPER"] = "existing-wrapper"
-        env["SCCACHE_BASEDIR"] = "stale"
+        env["SCCACHE_BASEDIRS"] = "stale"
         env["SCCACHE_CACHE_SIZE"] = "stale"
 
         result = subprocess.run(
@@ -153,7 +153,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             "RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER",
             "CARGO_INCREMENTAL",
-            "SCCACHE_BASEDIR",
+            "SCCACHE_BASEDIRS",
             "SCCACHE_CACHE_SIZE",
         ]
         cases = [
@@ -216,7 +216,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                         "RUSTC_WRAPPER": "",
                         "RUSTC_WORKSPACE_WRAPPER": "",
                         "CARGO_INCREMENTAL": "0",
-                        "SCCACHE_BASEDIR": None,
+                        "SCCACHE_BASEDIRS": None,
                         "SCCACHE_CACHE_SIZE": None,
                     },
                 )

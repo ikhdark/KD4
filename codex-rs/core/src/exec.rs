@@ -64,6 +64,7 @@ use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::ManagedRootProcess;
 
 pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const DEFAULT_COMMAND_STALL_TIMEOUT_MS: u64 = 60_000;
 
 // Hardcode these since it does not seem worth including the libc crate just
 // for these.

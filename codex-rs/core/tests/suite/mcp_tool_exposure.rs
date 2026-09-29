@@ -215,6 +215,20 @@ async fn apps_guidance_appears_after_background_recovery_within_a_turn() -> Resu
 
     let requests = response.requests();
     assert_eq!(requests.len(), 2);
+    let initial_sources = initial_request
+        .message_input_texts("developer")
+        .into_iter()
+        .filter(|text| text.starts_with("<tool_search_sources>"))
+        .collect::<Vec<_>>();
+    let final_sources = requests[1]
+        .message_input_texts("developer")
+        .into_iter()
+        .filter(|text| text.starts_with("<tool_search_sources>"))
+        .collect::<Vec<_>>();
+    assert_eq!(initial_sources.len(), 1);
+    assert_eq!(final_sources.len(), 2);
+    assert_eq!(final_sources[0], initial_sources[0]);
+    assert_ne!(final_sources[0], final_sources[1]);
     assert_eq!(
         requests[1]
             .message_input_texts("developer")

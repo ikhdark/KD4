@@ -1,6 +1,5 @@
 ---
 source: core/src/session/tests.rs
-assertion_line: 4727
 expression: snapshot
 ---
 Scenario: First request after fork when startup preserves the parent baseline, the fork changes approval policy, and the first forked turn enters plan mode.
@@ -11,13 +10,12 @@ Scenario: First request after fork when startup preserves the parent baseline, t
     [02] <configured_developer_instructions state="removed" />
     [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
     [04] <skills_usage_instructions>\n## How to use skills\n- Use the smallest skill set named by the use...
-01:message/developer[2]:
-    [01] <multi_agent_usage_hint state="present" />
-    [02] You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+01:message/developer:<multi_agent_usage_hint state="removed" />
 02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
 03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
 04:message/user:fork seed
-05:message/developer[2]:
+05:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
+06:message/developer[2]:
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <collaboration_mode>Fork turn collaboration instructions.</collaboration_mode>
-06:message/user:after fork
+07:message/user:after fork

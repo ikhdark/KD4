@@ -1048,7 +1048,7 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
     let config = std::fs::read_to_string(&config_path)?
         .replace("stream_max_retries = 0", "stream_max_retries = 1");
     std::fs::write(config_path, config)?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
+    let capture = mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_args(&["-c", "analytics.enabled=true"])
@@ -1101,7 +1101,7 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
     )
     .await??;
 
-    let event = wait_for_analytics_event(&server, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
+    let event = wait_for_analytics_event(&capture, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
     assert_eq!(event["event_params"]["thread_id"], thread.id);
     assert_eq!(event["event_params"]["session_id"], thread.session_id);
     assert_eq!(event["event_params"]["turn_id"], turn.id);
@@ -1178,7 +1178,7 @@ async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()
         &server.uri(),
         &server.uri(),
     )?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
+    let capture = mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1252,7 +1252,7 @@ async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()
     )
     .await??;
 
-    let event = wait_for_analytics_event(&server, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
+    let event = wait_for_analytics_event(&capture, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
     let params = &event["event_params"];
     assert_eq!(
         json!({

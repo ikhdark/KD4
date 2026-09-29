@@ -50,28 +50,9 @@ pub(crate) fn stage_windows_sandbox_helpers_in(
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     use fs2::FileExt;
-    use sha2::Digest;
-    use sha2::Sha256;
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::path::Path;
-
-    fn digest(path: &Path) -> anyhow::Result<[u8; 32]> {
-        let mut file = std::fs::File::open(path)
-            .with_context(|| format!("open staged helper candidate {}", path.display()))?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .with_context(|| format!("read staged helper candidate {}", path.display()))?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        Ok(hasher.finalize().into())
-    }
 
     fn already_staged(source: &Path, destination: &Path) -> anyhow::Result<bool> {
         let Ok(destination_metadata) = destination.metadata() else {
@@ -80,7 +61,23 @@ pub(crate) fn stage_windows_sandbox_helpers_in(
         if source.metadata()?.len() != destination_metadata.len() {
             return Ok(false);
         }
-        Ok(digest(source)? == digest(destination)?)
+        // Compare bytes rather than hashing two complete executables. Timestamps
+        // alone cannot detect a same-size stale helper whose mtime was preserved.
+        let mut source = std::fs::File::open(source)?;
+        let mut destination = std::fs::File::open(destination)?;
+        let mut left = [0_u8; 64 * 1024];
+        let mut right = [0_u8; 64 * 1024];
+        let mut remaining = destination_metadata.len();
+        while remaining > 0 {
+            let count = remaining.min(left.len() as u64) as usize;
+            source.read_exact(&mut left[..count])?;
+            destination.read_exact(&mut right[..count])?;
+            if left[..count] != right[..count] {
+                return Ok(false);
+            }
+            remaining -= count as u64;
+        }
+        Ok(true)
     }
 
     match std::fs::create_dir_all(resources_dir) {
@@ -109,7 +106,7 @@ pub(crate) fn stage_windows_sandbox_helpers_in(
         let destination = resources_dir.join(file_name);
         // Windows prevents overwriting an executable while a sandbox process
         // still has it mapped. Avoid opening the destination for write when
-        // the runner already staged this exact artifact. The digest check also
+        // the runner already staged this exact artifact. The byte comparison also
         // prevents a stale helper from being silently reused after a rebuild.
         if already_staged(&helper, &destination)? {
             continue;

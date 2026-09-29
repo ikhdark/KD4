@@ -1120,9 +1120,12 @@ mod tests {
         let remote = temp.path().join("remote.git");
         std::fs::create_dir_all(&repo).expect("create repo");
         run_git(&repo, &["init"]);
-        run_git(&repo, &["config", "core.autocrlf", "false"]);
-        run_git(&repo, &["config", "user.email", "test@example.com"]);
-        run_git(&repo, &["config", "user.name", "Test User"]);
+        // These constant fixture settings need no three extra Git processes.
+        // Persist them locally so production Git calls see the same settings.
+        let config_path = repo.join(".git/config");
+        let mut config = std::fs::read_to_string(&config_path).expect("read git config");
+        config.push_str("\n[core]\n\tautocrlf = false\n[user]\n\temail = test@example.com\n\tname = Test User\n");
+        std::fs::write(config_path, config).expect("write fixture git config");
         std::fs::write(repo.join("tracked.txt"), "base\n").expect("write tracked file");
         run_git(&repo, &["add", "tracked.txt"]);
         run_git(&repo, &["commit", "-m", "base"]);

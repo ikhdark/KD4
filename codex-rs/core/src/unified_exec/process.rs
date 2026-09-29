@@ -274,6 +274,64 @@ impl std::fmt::Debug for UnifiedExecProcess {
 }
 
 impl UnifiedExecProcess {
+    pub(super) fn start_stall_watchdog(self: &Arc<Self>, stall_timeout_ms: Option<u64>) {
+        let Some(stall_timeout_ms) = stall_timeout_ms.filter(|timeout| *timeout != 0) else {
+            return;
+        };
+        let mut output = self.output_tx.subscribe();
+        let cancelled = self.cancellation_token.clone();
+        let process = Arc::downgrade(self);
+        let termination_owner = self.termination_owner.get().cloned();
+        let watchdog = async move {
+            let timeout = Duration::from_millis(stall_timeout_ms);
+            let deadline = tokio::time::sleep(timeout);
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancelled.cancelled() => return,
+                    chunk = output.recv() => {
+                        match chunk {
+                            Ok(chunk) if chunk.bytes.is_empty() => continue,
+                            Err(broadcast::error::RecvError::Closed) => return,
+                            // Lag means output progressed faster than the watchdog read it.
+                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                                deadline.as_mut().reset(tokio::time::Instant::now() + timeout);
+                            }
+                        }
+                    }
+                    _ = &mut deadline => break,
+                }
+            }
+            let Some(process) = process.upgrade() else {
+                return;
+            };
+            if process.has_exited() || process.termination_was_requested() {
+                return;
+            }
+            let message = format!(
+                "command stalled after {stall_timeout_ms} milliseconds without stdout or stderr"
+            );
+            let termination = async move {
+                if let Err(error) = process.fail_and_terminate(message).await {
+                    tracing::warn!(%error, "failed to terminate stalled unified-exec process");
+                }
+            };
+            if let Some(owner) = termination_owner {
+                owner.tasks.spawn_on(termination, &owner.runtime);
+            } else {
+                termination.await;
+            }
+        };
+        // An idle observer owns no shutdown-barrier slot. Only accepted
+        // termination must be retained until process cleanup completes.
+        if let Some(owner) = self.termination_owner.get() {
+            owner.runtime.spawn(watchdog);
+        } else {
+            tokio::spawn(watchdog);
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn hold_termination_for_test(&self) -> tokio::sync::SemaphorePermit<'_> {
         self.termination_lock

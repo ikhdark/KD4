@@ -718,13 +718,6 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
             .all(|skill| skill.name != "late-extra-skill")
     );
 
-    let skill_dir = cwd.path().join(".codex/skills/late-extra-skill");
-    std::fs::create_dir_all(&skill_dir)?;
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        "---\nname: late-extra-skill\ndescription: late skill\n---\n\n# Body\n",
-    )?;
-
     let second_request_id = mcp
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
@@ -745,6 +738,14 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
             .all(|skill| skill.name != "late-extra-skill")
     );
 
+    // Filesystem notifications may invalidate the cache automatically. Check
+    // reuse before mutation, then verify explicit reload sees the new skill.
+    let skill_dir = cwd.path().join(".codex/skills/late-extra-skill");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: late-extra-skill\ndescription: late skill\n---\n\n# Body\n",
+    )?;
     let third_request_id = mcp
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],

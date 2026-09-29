@@ -577,10 +577,10 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
     let instructions = requests[0].instructions_text();
     for rule in [
         "Finish edits before their checks.",
-        "Serialize actual shared-resource conflicts",
-        "resuming existing operations rather than launching duplicates",
-        "Reuse current reads, exact values, enumerations, agent results, and passing checks.",
-        "When clippy is required, it can replace cargo check only for",
+        "Sequence dependencies and shared-resource conflicts, including Cargo commands sharing a target directory.",
+        "Use asynchronous sessions for long commands and resume existing operations.",
+        "Reuse current reads, schemas, exact values, inventories, agent results, and passing checks.",
+        "For any change, use the smallest check that proves it; inspection suffices when execution is unnecessary.",
     ] {
         assert_eq!(
             instructions.matches(rule).count(),

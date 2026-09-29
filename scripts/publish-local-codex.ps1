@@ -2429,7 +2429,7 @@ function Enable-SccacheForPublish {
         Set-ProcessEnvironmentVariable -Name "CARGO_BUILD_RUSTC_WRAPPER" -Value $null
         Set-ProcessEnvironmentVariable -Name "RUSTC_WORKSPACE_WRAPPER" -Value $null
         Set-ProcessEnvironmentVariable -Name "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER" -Value $null
-        Set-ProcessEnvironmentVariable -Name "SCCACHE_BASEDIR" -Value $null
+        Set-ProcessEnvironmentVariable -Name "SCCACHE_BASEDIRS" -Value $null
         Set-ProcessEnvironmentVariable -Name "SCCACHE_CACHE_SIZE" -Value $null
         Write-ProofLine "rustcWrapper" "<none: $reason>"
         Write-ProofLine "cargoRustcWrapperConfig" "<none: $reason>"
@@ -2450,13 +2450,13 @@ function Enable-SccacheForPublish {
         return
     }
 
-    Set-ProcessEnvironmentVariable -Name "SCCACHE_BASEDIR" -Value (Get-CodexRustSccacheBaseDir -RepoRoot $RepoRoot)
+    Set-ProcessEnvironmentVariable -Name "SCCACHE_BASEDIRS" -Value (Get-CodexRustSccacheBaseDir -RepoRoot $RepoRoot)
     Set-ProcessEnvironmentVariable -Name "SCCACHE_CACHE_SIZE" -Value (Get-CodexRustSccacheCacheSize)
     if ([string]::IsNullOrWhiteSpace($env:RUSTC_WRAPPER)) {
         Set-ProcessEnvironmentVariable -Name "RUSTC_WRAPPER" -Value "sccache"
     }
     Ensure-CodexRustSccacheServer -RepoRoot $RepoRoot
-    Write-ProofLine "sccacheBaseDir" $env:SCCACHE_BASEDIR
+    Write-ProofLine "sccacheBaseDir" $env:SCCACHE_BASEDIRS
     Write-ProofLine "sccacheCacheSize" $env:SCCACHE_CACHE_SIZE
     Write-ProofLine "rustcWrapper" $env:RUSTC_WRAPPER
 }
@@ -2992,7 +2992,7 @@ function Invoke-CodexBuild {
     }
 
     $previousSccacheEnv = @{
-        SCCACHE_BASEDIR = $env:SCCACHE_BASEDIR
+        SCCACHE_BASEDIRS = $env:SCCACHE_BASEDIRS
         SCCACHE_CACHE_SIZE = $env:SCCACHE_CACHE_SIZE
         RUSTC_WRAPPER = $env:RUSTC_WRAPPER
         CARGO_BUILD_RUSTC_WRAPPER = $env:CARGO_BUILD_RUSTC_WRAPPER

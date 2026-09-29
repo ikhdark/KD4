@@ -1421,6 +1421,18 @@ impl CommandExecutionLedger {
     }
 
     #[cfg(test)]
+    pub(crate) async fn started_attempt_count(&self) -> u64 {
+        self.state
+            .lock()
+            .await
+            .retry
+            .attempts
+            .values()
+            .map(|entry| u64::from(entry.attempts))
+            .sum()
+    }
+
+    #[cfg(test)]
     async fn snapshot(&self, key: &CommandAttemptKey) -> Option<AttemptEntry> {
         self.state.lock().await.retry.attempts.get(key).cloned()
     }

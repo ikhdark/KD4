@@ -852,6 +852,15 @@ impl MessageProcessor {
             .admit_request_work(&mut request_context, estimated_request_bytes, control)
             .await
         {
+            self.initialize_processor.track_initialized_request(
+                connection_request_id.connection_id,
+                connection_request_id.request_id.clone(),
+                &codex_request,
+            );
+            self.initialize_processor.track_initialized_request_error(
+                connection_request_id.connection_id,
+                connection_request_id.request_id.clone(),
+            );
             return Err(overloaded_error(
                 OverloadReason::SerializedRequestQueue,
                 "outstanding request budget exhausted; wait for accepted requests to finish",

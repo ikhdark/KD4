@@ -392,6 +392,33 @@ async fn exec_resume_last_accepts_prompt_after_flag_in_json_mode() -> anyhow::Re
 async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<()> {
     require_network!();
 
+    async fn backdate_session(
+        home: &std::path::Path,
+        rollout: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        use sqlx::Connection;
+        let timestamp = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let seconds = i64::try_from(timestamp.duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(rollout)?
+            .set_times(std::fs::FileTimes::new().set_modified(timestamp))?;
+        let mut connection = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new().filename(codex_state::state_db_path(home)),
+        )
+        .await?;
+        let changed =
+            sqlx::query("UPDATE threads SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+                .bind(seconds)
+                .bind(seconds * 1000)
+                .bind(extract_conversation_id(rollout))
+                .execute(&mut connection)
+                .await?;
+        assert_eq!(changed.rows_affected(), 1, "fixture thread must be indexed");
+        connection.close().await?;
+        Ok(())
+    }
+
     let test = test_codex_exec();
     let server = MockServer::start().await;
     let _response_mock = mount_exec_responses(&server, /*count*/ 6).await;
@@ -429,9 +456,8 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
         "different initial runs must create different sessions"
     );
 
-    // updated_at has second granularity. Make B strictly newer than A before
-    // testing that the normal cwd filter still chooses A.
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // Make B strictly newer without depending on timestamp precision or speed.
+    backdate_session(test.home_path(), &path_a).await?;
     let session_id_b = extract_conversation_id(&path_b);
     let marker_b_touch = format!("resume-cwd-b-touch-{}", Uuid::new_v4());
     test.cmd_with_server(&server)
@@ -448,9 +474,6 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
         Some(path_b.clone())
     );
 
-    // Make the filtered A turn strictly newer than B for the following --all
-    // assertion, independently of UUID tie ordering on fast machines.
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let marker_a2 = format!("resume-cwd-a-filtered-{}", Uuid::new_v4());
     test.cmd_with_server(&server)
         .arg("--skip-git-repo-check")
@@ -468,6 +491,8 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
     );
     assert!(!std::fs::read_to_string(&path_b)?.contains(&marker_a2));
 
+    // Keep both filesystem fallback and SQLite ordering consistent for --all.
+    backdate_session(test.home_path(), &path_b).await?;
     let marker_all = format!("resume-cwd-all-{}", Uuid::new_v4());
     test.cmd_with_server(&server)
         .arg("--skip-git-repo-check")

@@ -19,12 +19,16 @@ fn exclusive_tls_roots_select_explicit_root_policy() {
     let client = BlockingHttpClientBuilder::new()
         .tls_certs_only_pem(ca_pem)
         .expect("valid CA certificate")
-        .build_inner_using(/*direct*/ false, |builder, custom_ca_policy| {
-            assert_eq!(custom_ca_policy, CustomCaPolicy::ExplicitRootSet);
-            builder
-                .build()
-                .map_err(BuildCustomCaTransportError::BuildClientWithExplicitRoots)
-        });
+        .build_inner_using(
+            /*direct*/ false,
+            reqwest::blocking::Client::builder(),
+            |builder, custom_ca_policy| {
+                assert_eq!(custom_ca_policy, CustomCaPolicy::ExplicitRootSet);
+                builder
+                    .build()
+                    .map_err(BuildCustomCaTransportError::BuildClientWithExplicitRoots)
+            },
+        );
 
     assert!(client.is_ok());
 }
@@ -121,8 +125,8 @@ fn blocking_client_sends_buffered_request_and_reads_response_without_exposing_tr
 
 #[test]
 fn explicit_none_disables_blocking_transport_timeout() {
-    // Reqwest's blocking default is 30 seconds. Only a response beyond that boundary
-    // distinguishes an explicit None from accidentally leaving the default in place.
+    // Supply a short transport timeout instead of waiting out reqwest's 30s
+    // default. Omitting the facade's timeout(None) must still fail this test.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -152,12 +156,16 @@ fn explicit_none_disables_blocking_transport_timeout() {
             stream.read_exact(&mut byte).unwrap();
             request.push(byte[0]);
         }
-        thread::sleep(std::time::Duration::from_secs(31));
+        thread::sleep(std::time::Duration::from_millis(100));
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
     });
     let result = BlockingHttpClientBuilder::new()
         .request_timeout(None)
-        .build_direct()
+        .build_inner_using(
+            /*direct*/ true,
+            reqwest::blocking::Client::builder().timeout(std::time::Duration::from_millis(50)),
+            crate::custom_ca::build_blocking_reqwest_client_with_custom_ca_policy,
+        )
         .expect("build without timeout")
         .get(format!("http://{address}/"))
         .send();
@@ -167,7 +175,7 @@ fn explicit_none_disables_blocking_transport_timeout() {
         .expect("response written");
     assert_eq!(
         result
-            .expect("explicit None permits a response after 30 seconds")
+            .expect("explicit None permits a response beyond the transport timeout")
             .status(),
         StatusCode::OK
     );

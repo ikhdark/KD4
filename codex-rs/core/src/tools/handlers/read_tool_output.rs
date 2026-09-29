@@ -311,8 +311,17 @@ impl RecoveryContinuationState {
         if !self.output.unavailable_ranges.is_empty() {
             return ContinuationStep::Stop(ContinuationStopReason::IncompleteOwnerResult);
         }
+        #[cfg(feature = "bench-generation-opportunities")]
+        let mut isolated_failure = None;
         for (result_index, result) in self.output.results.iter().enumerate() {
             if let Some(reason) = selector_stop_reason(result.status) {
+                #[cfg(feature = "bench-generation-opportunities")]
+                if crate::generation_live_bench::active(11)
+                    && matches!(result.status, ToolOutputSelectorStatus::Invalid | ToolOutputSelectorStatus::NotFound)
+                {
+                    isolated_failure.get_or_insert(reason);
+                    continue;
+                }
                 return ContinuationStep::Stop(reason);
             }
             let Some(selector) = result.continuation.as_ref() else {
@@ -321,7 +330,7 @@ impl RecoveryContinuationState {
             // A search continuation is another requested page, not an unfinished
             // fragment of the requested page. Preserve the caller's max_results.
             if result.status == ToolOutputSelectorStatus::Ok
-                && matches!(selector, ToolOutputSelector::Search { .. })
+                && selector.is_search()
             {
                 continue;
             }
@@ -331,10 +340,18 @@ impl RecoveryContinuationState {
             {
                 return ContinuationStep::Stop(ContinuationStopReason::RepeatedSelector);
             }
+            #[cfg(feature = "bench-generation-opportunities")]
+            if isolated_failure.is_some() {
+                crate::generation_live_bench::record(11, "drain_past_selector_local_failure");
+            }
             return ContinuationStep::Follow {
                 result_index,
                 selector: selector.clone(),
             };
+        }
+        #[cfg(feature = "bench-generation-opportunities")]
+        if let Some(reason) = isolated_failure {
+            return ContinuationStep::Stop(reason);
         }
         ContinuationStep::Complete
     }
@@ -987,15 +1004,41 @@ async fn handle_read_tool_output(
         FunctionCallError::RespondToModel(format!("failed to serialize recovery selectors: {err}"))
     })?;
     let action_bounds_hash = format!("{:x}", action_bounds_digest.finalize());
-    let transaction = execute_recovery_transaction_with_continuations(
-        invocation.step_context.turn.config.codex_home.as_path(),
-        &invocation.session.thread_id.to_string(),
-        &args.artifact_id,
-        selectors,
-        code_mode_recovery,
-        &invocation.cancellation_token,
-    )
-    .await
+    let outer_budget = match &invocation.source {
+        ToolCallSource::CodeMode { cell_id, .. } => invocation
+            .session.services.code_mode_service.output_budget(cell_id),
+        _ => None,
+    };
+    let transaction = if let Some(budget) = outer_budget {
+        if budget < 896 {
+            return Err(FunctionCallError::RespondToModel(
+                "Recovery cannot fit this cell budget; use a fresh cell with at least 896 output tokens.".into()));
+        }
+        #[cfg(feature = "bench-generation-opportunities")]
+        crate::generation_live_bench::record(5, "outer_budget_negotiated");
+        let snapshot = load_tool_output_snapshot(
+            invocation.step_context.turn.config.codex_home.as_path(),
+            &invocation.session.thread_id.to_string(),
+            &args.artifact_id,
+        )
+        .await
+        .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
+        drain_recovery_snapshot(
+            &snapshot,
+            selectors,
+            CODE_MODE_RECOVERY_TOKEN_CEILING.min(budget.saturating_sub(384)),
+            &invocation.cancellation_token,
+        ).await
+    } else {
+        execute_recovery_transaction_with_continuations(
+            invocation.step_context.turn.config.codex_home.as_path(),
+            &invocation.session.thread_id.to_string(),
+            &args.artifact_id,
+            selectors,
+            code_mode_recovery,
+            &invocation.cancellation_token,
+        ).await
+    }
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
     let DrainedRecoveryTransaction {
         output,
@@ -1025,6 +1068,10 @@ async fn handle_read_tool_output(
         drained_continuation_pages,
     );
     let semantic_evidence = read_tool_output_semantic_evidence(&output, continuation_stop.as_ref());
+    if output.results.iter().any(|result| result.status == ToolOutputSelectorStatus::Ok) {
+        invocation.session
+            .mark_tool_history_artifact_recovered(args.artifact_id.clone()).await;
+    }
     let output = recovery_envelope(&output, continuation_stop.as_ref()).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
@@ -1540,6 +1587,62 @@ mod tests {
 
     use super::*;
     use crate::tools::command_output_artifact::ByteSubdivisionPlan;
+
+    #[tokio::test]
+    async fn recovery_uses_actual_cell_budget_and_rejects_tiny_budgets_before_reading() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = std::sync::Arc::new(session);
+        let turn = std::sync::Arc::new(turn);
+        let text = "exact source line with unique context\n".repeat(2_000);
+        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+            &turn.config.codex_home, &session.thread_id.to_string(),
+            &CanonicalToolResult::text(text.clone())).await;
+        session.register_tool_artifact_origin(
+            artifact.artifact_id().unwrap(), "producer".into(), text.len() as u64,
+            crate::tool_history::sha256(text.as_bytes())).await;
+        let cell = codex_code_mode::CellId::new("bounded-recovery".into());
+        session.services.code_mode_service.record_cell_parent_call_id(&cell, "outer");
+        for budget in [0, 512, 4_000, 10_000] {
+            session.services.code_mode_service.record_output_budget(&cell, Some(budget));
+            let payload = ToolPayload::Function { arguments: serde_json::json!({
+                "artifact_id": if budget < 896 { "not-an-artifact".to_string() } else { artifact.artifact_id().unwrap() },
+                "selectors": [{"kind":"bytes", "start":0, "end":text.len()}]
+            }).to_string() };
+            let result = ReadToolOutputHandler.handle(ToolInvocation {
+                session: std::sync::Arc::clone(&session),
+                step_context: crate::session::step_context::StepContext::for_test(std::sync::Arc::clone(&turn)),
+                cancellation_token: Default::default(),
+                tracker: std::sync::Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
+                call_id: "recover".into(), tool_name: ToolName::plain("read_tool_output"),
+                source: ToolCallSource::CodeMode { cell_id: cell.to_string(), parent_call_id: Some("outer".into()),
+                    runtime_tool_call_id: "nested".into(), nested_deadline: None, cancellation_cause: None },
+                payload: payload.clone(),
+            }).await;
+            if budget < 896 {
+                let error = result.err().expect("tiny budgets must fail before artifact lookup");
+                assert!(error.to_string().contains("Recovery cannot fit this cell budget"));
+                let history = serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
+                assert!(history.get("recovered_call_ids").is_none());
+                continue;
+            }
+            let output = result.unwrap().code_mode_result(&payload);
+            assert!(codex_utils_output_truncation::model_token_count(&output.to_string()) <= budget - 384);
+            assert_eq!(output["complete"], false);
+            let pages = output["results"].as_array().unwrap().iter()
+                .filter(|page| page["text"].is_string()).collect::<Vec<_>>();
+            assert!(!pages.is_empty());
+            for page in pages {
+                let start = page["canonical_range"]["start"].as_u64().unwrap() as usize;
+                let end = page["canonical_range"]["end"].as_u64().unwrap() as usize;
+                assert_eq!(page["text"].as_str().unwrap(), &text[start..end]);
+            }
+            assert!(output.get("continuation_stop").is_some());
+            let history = serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
+            assert_eq!(history["recovered_call_ids"], serde_json::json!(["producer"]));
+        }
+        session.services.code_mode_service.finish_cell_dispatch(&cell);
+        assert_eq!(session.services.code_mode_service.output_budget(cell.as_str()), None);
+    }
 
     #[tokio::test]
     async fn recovery_handler_output_schema_covers_exact_search_and_rejected_selectors() {
@@ -2918,25 +3021,25 @@ mod tests {
                 })
         };
         let cases = [
-            (selector_args(1), true),
-            (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS), true),
-            (selector_args(0), false),
-            (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS + 1), false),
-            (range_args(1), true),
-            (range_args(64), true),
-            (range_args(0), false),
-            (range_args(65), false),
+            (selector_args(1), true, true),
+            (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS), true, true),
+            (selector_args(0), false, false),
+            (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS + 1), false, false),
+            (range_args(1), false, true),
+            (range_args(64), false, true),
+            (range_args(0), false, false),
+            (range_args(65), false, false),
         ];
 
-        for (arguments, expected) in cases {
+        for (arguments, schema_expected, runtime_expected) in cases {
             assert_eq!(
                 validator.is_valid(&arguments),
-                expected,
+                schema_expected,
                 "schema verdict for {arguments}"
             );
             assert_eq!(
                 runtime_accepts(&arguments),
-                expected,
+                runtime_expected,
                 "runtime verdict for {arguments}"
             );
         }

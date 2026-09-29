@@ -32,8 +32,8 @@ def local_rust_env(
         if wrapper:
             updates["RUSTC_WRAPPER"] = wrapper
     if wrapper and is_sccache_wrapper(wrapper) and repo_root is not None:
-        if not env.get("SCCACHE_BASEDIR"):
-            updates["SCCACHE_BASEDIR"] = os.path.abspath(repo_root)
+        if not env.get("SCCACHE_BASEDIRS"):
+            updates["SCCACHE_BASEDIRS"] = os.path.abspath(repo_root)
         if not env.get("SCCACHE_CACHE_SIZE"):
             updates["SCCACHE_CACHE_SIZE"] = sccache_cache_size(env)
     missing_linkers = [

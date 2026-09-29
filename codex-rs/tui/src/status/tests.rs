@@ -17,9 +17,7 @@ use crate::test_support::PathBufExt;
 use crate::test_support::test_path_buf;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
-use app_test_support::ChatGptAuthFixture;
-use app_test_support::write_chatgpt_auth;
-use app_test_support::write_models_cache;
+use base64::Engine;
 use chrono::Duration as ChronoDuration;
 use chrono::Local;
 use chrono::TimeZone;
@@ -325,17 +323,47 @@ async fn status_snapshot_includes_reasoning_details() {
 #[tokio::test]
 async fn status_snapshot_shows_chatgpt_plan_without_email() {
     let temp_home = TempDir::new().expect("temp home");
-    write_models_cache(temp_home.path()).expect("write models cache");
+    let catalog_path = temp_home.path().join("models_test_catalog.json");
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec(
+            &codex_models_manager::bundled_models_response().expect("bundled models"),
+        )
+        .expect("serialize models"),
+    )
+    .expect("write model catalog");
+    std::fs::write(
+        temp_home.path().join("config.toml"),
+        format!(
+            "model_catalog_json = {}\n",
+            serde_json::to_string(&catalog_path).unwrap()
+        ),
+    )
+    .expect("configure model catalog");
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
     config.cli_auth_credentials_store_mode = AuthCredentialsStoreMode::File;
     set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
 
-    write_chatgpt_auth(
-        temp_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt").plan_type("enterprise"),
-        AuthCredentialsStoreMode::File,
+    let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "enterprise"}
+        }))
+        .unwrap(),
+    );
+    std::fs::write(
+        temp_home.path().join("auth.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": format!("e30.{claims}.signature"),
+                "access_token": "access-chatgpt",
+                "refresh_token": "refresh-token"
+            },
+            "last_refresh": Utc::now()
+        }))
+        .unwrap(),
     )
     .expect("write email-less ChatGPT auth");
     let mut app_server = crate::start_embedded_app_server_for_picker(&config)

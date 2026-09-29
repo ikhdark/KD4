@@ -1,5 +1,59 @@
 use super::*;
 
+#[tokio::test]
+async fn journal_writer_reuses_handles_and_replays_after_another_writer() {
+    let temp = tempfile::tempdir().unwrap();
+    let writer = Arc::new(std::sync::Mutex::new(ToolHistoryJournalWriter::default()));
+    let mut state = ToolHistoryState::default();
+    state.register_non_workspace_code_mode_call("initial".into());
+    persist_tool_history_state_with_writer(temp.path(), "thread", &state, Arc::clone(&writer))
+        .await.unwrap();
+    assert_eq!(writer.lock().unwrap().checkpoint_replays, 1);
+    for sequence in 1..=2 {
+        let mutation = ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+            call_id: format!("local-{sequence}"),
+        };
+        mutation.apply(&mut state);
+        persist_tool_history_mutations_with_writer(temp.path(), "thread", "local",
+            &[(sequence, mutation)], Arc::clone(&writer)).await.unwrap();
+    }
+    assert_eq!(writer.lock().unwrap().journal_opens, 1);
+    persist_tool_history_state_with_writer(temp.path(), "thread", &state, Arc::clone(&writer))
+        .await.unwrap();
+    assert_eq!(writer.lock().unwrap().checkpoint_replays, 1);
+    let foreign = ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall { call_id: "foreign".into() };
+    foreign.apply(&mut state);
+    persist_tool_history_mutations(temp.path(), "thread", "foreign", &[(1, foreign)])
+        .await.unwrap();
+    persist_tool_history_state_with_writer(temp.path(), "thread", &state, Arc::clone(&writer))
+        .await.unwrap();
+    assert_eq!(writer.lock().unwrap().checkpoint_replays, 2);
+    let ledger: ToolHistoryLedgerFile = serde_json::from_slice(
+        &std::fs::read(ledger_path(temp.path(), "thread")).unwrap(),
+    ).unwrap();
+    assert_eq!(ledger.journal_sequences.get("local"), Some(&2));
+    assert_eq!(ledger.journal_sequences.get("foreign"), Some(&1));
+    assert!(ledger.state.non_workspace_code_mode_calls.contains("foreign"));
+}
+
+#[tokio::test]
+async fn admission_read_only_proof_rejects_shell_writes_and_unknown_commands() {
+    for (arguments, expected) in [
+        (serde_json::json!({"program":"rg", "args":["needle", "."]}), true),
+        (serde_json::json!({"program":"unknown-command", "args":[]}), false),
+        (serde_json::json!({"cmd":"cat input > output", "shell":"bash"}), false),
+        (serde_json::json!({"cmd":"cat input; rm output", "shell":"bash"}), false),
+        (serde_json::json!({"cmd":"cat $(touch output)", "shell":"bash"}), false),
+    ] {
+        let (_, read_only) = classify_workspace_tool_call_at_admission(
+            "exec_command".to_string(),
+            ToolPayload::Function { arguments: arguments.to_string() },
+            std::env::current_dir().unwrap(),
+        ).await.unwrap();
+        assert_eq!(read_only, expected, "{arguments}");
+    }
+}
+
 /// Deterministic projection/recovery workload, not a model-latency benchmark.
 #[tokio::test]
 async fn long_session_prompt_pressure_comparison() {
@@ -193,7 +247,10 @@ async fn checkpoint_handler_boundaries_and_retained_artifacts() {
         let output = if id == "tiny" {
             "ok".into()
         } else {
-            bounded_output()
+            codex_utils_output_truncation::truncate_text(
+                &bounded_output(),
+                turn.model_info.truncation_policy.into(),
+            )
         };
         let canonical = CanonicalToolResult::text(output.clone());
         let artifact = create_canonical_output_artifact(
@@ -364,7 +421,10 @@ async fn checkpoint_handler_boundaries_and_retained_artifacts() {
         )
         .await
         .unwrap(),
-        bounded_output().as_bytes()
+        codex_utils_output_truncation::truncate_text(
+            &bounded_output(),
+            turn.model_info.truncation_policy.into(),
+        ).as_bytes()
     );
 }
 
@@ -550,6 +610,59 @@ fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_histo
     );
     assert!(without_budget.items.starts_with(&canonical));
     assert_eq!(without_budget.items.len(), canonical.len() + 1);
+}
+
+#[test]
+fn sampling_freshness_batches_results_and_only_appends_new_invalidations() {
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let captured = workspace_identity("captured");
+    let changed = workspace_identity("changed");
+    let mut state = ToolHistoryState::default();
+    let mut canonical = Vec::new();
+    for id in ["first", "second"] {
+        let output = text_output(id, format!("source bytes for {id}"));
+        state.register_workspace_evidence(
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured.clone()),
+                &output,
+                BTreeSet::new(),
+            )
+            .unwrap(),
+        );
+        canonical.extend([function_call(id), output]);
+    }
+    let canonical: Arc<[ResponseItem]> = canonical.into();
+    let projected =
+        state.project_sampling_with_workspace_cache(Arc::clone(&canonical), Some(&changed), &cache);
+    assert!(projected.items.starts_with(&canonical));
+    assert_eq!(projected.items.len(), canonical.len() + 1);
+    let ResponseItem::Message { content, .. } = projected.items.last().unwrap() else {
+        panic!("batch")
+    };
+    let codex_protocol::models::ContentItem::InputText { text } = &content[0] else {
+        panic!("text")
+    };
+    let batch: serde_json::Value = text
+        .lines()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap();
+    let notices = batch["notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[0]["call_id"], "first");
+    assert_eq!(notices[1]["call_id"], "second");
+    assert!(
+        notices
+            .iter()
+            .all(|notice| notice["rerun"]["instruction"].is_null())
+    );
+    let anchor = SamplingProjectionAnchor {
+        prepared_items: Arc::clone(&canonical),
+        projection: projected.clone(),
+    };
+    let repeated = state
+        .project_continuation_with_workspace_cache(&anchor, canonical, Some(&changed), &cache)
+        .unwrap();
+    assert_eq!(repeated.items, projected.items);
 }
 
 #[test]
@@ -3956,6 +4069,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
         candidates: BTreeMap::from([("call-1".to_string(), candidate("call-1", bounded))]),
         untracked_consumption: BTreeMap::new(),
         exposed_representations: BTreeMap::new(),
+        recovered_call_ids: BTreeSet::new(),
         workspace_evidence: BTreeMap::new(),
         non_workspace_code_mode_calls: BTreeSet::new(),
         code_mode_nested_evidence: BTreeMap::new(),
@@ -3978,6 +4092,75 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
         serde_json::from_value(serialized).expect("legacy fields should be ignored");
     assert!(restored.candidates.contains_key("call-1"));
     assert!(restored.untracked_consumption.is_empty());
+}
+
+#[tokio::test]
+async fn recovered_evidence_priority_survives_persistence_and_preserves_safety_classes() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = "exact source evidence ".repeat(500);
+    let _budget = override_model_visible_tool_result_token_budget_for_test(
+        approx_token_count(&output) + 1_000);
+    let mut state = ToolHistoryState::default();
+    let mut items = Vec::new();
+    for id in ["old-hot", "new-cold"] {
+        let mut record = candidate(id, output.clone());
+        let canonical = CanonicalToolResult::text(output.clone());
+        let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+        record.artifact_id = artifact.artifact_id().unwrap();
+        record.artifact_bytes = canonical.exact_bytes;
+        record.artifact_sha256 = canonical.sha256;
+        record.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 1 });
+        state.register(record);
+        items.extend([function_call(id), text_output(id, output.clone())]);
+    }
+    let items: Arc<[ResponseItem]> = items.into();
+    let baseline = state.project(Arc::clone(&items));
+    assert!(baseline.items.iter().filter_map(textual_output_identity)
+        .any(|(id, text)| id == "new-cold" && text == output));
+    assert!(!ToolHistoryMutation::MarkArtifactRecovered { artifact_id: "unknown".into() }.apply(&mut state));
+    persist_tool_history_state(temp.path(), "thread", &state).await.unwrap();
+    let mutation = ToolHistoryMutation::MarkArtifactRecovered {
+        artifact_id: state.candidates["old-hot"].artifact_id.clone(),
+    };
+    assert!(mutation.apply(&mut state));
+    assert!(!mutation.apply(&mut state), "repeated recovery must not grow the ledger");
+    persist_tool_history_mutations(temp.path(), "thread", "writer", &[(1, mutation)]).await.unwrap();
+    let restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
+    let projection = restored.project(items);
+    let outputs = projection.items.iter().filter_map(textual_output_identity).collect::<Vec<_>>();
+    assert!(outputs.iter().any(|(id, text)| *id == "old-hot" && *text == output));
+    assert!(!outputs.iter().any(|(id, text)| *id == "new-cold" && *text == output));
+    assert!(restored.reuse_priority("new-cold", 0) < restored.reuse_priority("old-hot", 5));
+    assert!(restored.reuse_priority("new-unread", 2) < restored.reuse_priority("old-hot", 5));
+    persist_tool_history_state(temp.path(), "thread", &restored).await.unwrap();
+    let restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
+    assert!(restored.recovered_call_ids.contains("old-hot"));
+    let mut retired = restored;
+    retired.retain_for_history(&[]);
+    assert!(retired.recovered_call_ids.is_empty());
+}
+
+#[test]
+fn recovered_evidence_priority_follows_nested_file_provenance_to_its_carrier() {
+    let mut state = ToolHistoryState::default();
+    let output = text_output("nested", "exact file evidence".into());
+    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
+        None, &output, BTreeSet::from([SourceDependencyV1::new(Path::new("file.txt"), false)])
+    ).unwrap());
+    assert!(ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+        parent_call_id: "outer".into(), call_id: "nested".into(), output: "exact file evidence".into(),
+    }.apply(&mut state));
+    assert!(ToolHistoryMutation::RegisterArtifactOrigin {
+        artifact_id: "file-artifact".into(), call_id: "nested".into(), bytes: 19,
+        sha256: sha256(b"exact file evidence"),
+    }.apply(&mut state));
+    assert_eq!(state.reuse_priority("outer", 5), state.reuse_priority("cold", 5));
+    assert!(ToolHistoryMutation::MarkArtifactRecovered {
+        artifact_id: "file-artifact".into(),
+    }.apply(&mut state));
+    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(restored.reuse_priority("outer", 5) < restored.reuse_priority("cold", 5));
+    assert!(restored.reuse_priority("unread", 2) < restored.reuse_priority("outer", 5));
 }
 
 #[test]
@@ -5644,4 +5827,98 @@ fn internal_artifact_provenance_and_protection_survive_resume_and_history_retent
     );
     resumed.retain_for_history(&[]);
     assert!(resumed.is_persisted_empty());
+}
+async fn generation_checkpoint_fixture(eligible: bool, notes: &str) -> (serde_json::Value, Vec<ResponseItem>, u64) {
+    use crate::tools::context::{ToolCallSource, ToolInvocation};
+    use crate::tools::registry::ToolExecutor;
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let source = codex_utils_output_truncation::truncate_text(&bounded_output(), turn.model_info.truncation_policy.into());
+    if eligible {
+        let canonical = CanonicalToolResult::text(source.clone());
+        let artifact = create_canonical_output_artifact(&turn.config.codex_home, &session.thread_id.to_string(), &canonical).await;
+        let mut entry = candidate("bench-completed", source.clone());
+        entry.artifact_id = artifact.artifact_id().unwrap();
+        entry.artifact_bytes = canonical.exact_bytes;
+        entry.artifact_sha256 = canonical.sha256;
+        entry.consumed_by_generation = Some(ModelGenerationId{turn_id:"bench".into(),ordinal:0});
+        session.register_tool_history_candidate(entry).await;
+        session.record_conversation_items(&turn, &[function_call("bench-completed"),text_output("bench-completed",source.clone())]).await.unwrap();
+    }
+    let arguments = serde_json::json!({"completed_call_ids":if eligible {vec!["bench-completed"]}else{vec![]},
+        "summary":notes,"active_work":"ACTIVE_EVIDENCE: validation still required", "retained_evidence":[]}).to_string();
+    let payload = ToolPayload::Function{arguments:arguments.clone()};
+    let before_history = session.clone_history().await;
+    let before = before_history.raw_items().len();
+    let start = std::time::Instant::now();
+    let output = crate::tools::handlers::ContextCheckpointHandler.handle(ToolInvocation {
+        session:Arc::clone(&session),step_context:crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
+        cancellation_token:Default::default(),tracker:Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
+        call_id:"bench-checkpoint".into(),tool_name:codex_tools::ToolName::plain("context_checkpoint"),source:ToolCallSource::Direct,payload:payload.clone(),
+    }).await.unwrap();
+    let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap();
+    let result = output.code_mode_result(&payload);
+    assert_eq!(result["changed"], eligible, "checkpoint result: {result}");
+    let history = session.clone_history().await;
+    assert_eq!(history.raw_items().len(), before + usize::from(eligible));
+    if eligible {
+        assert_eq!(&history.raw_items()[..before], before_history.raw_items(), "canonical history must survive checkpointing exactly");
+        assert!(history.raw_items().iter().filter_map(canonical_textual_output_identity).any(|(id,text)|id == "bench-completed" && text == source), "canonical evidence must survive checkpointing");
+    }
+    let mut exchange = vec![ResponseItem::FunctionCall{id:None,call_id:"bench-checkpoint".into(),name:"context_checkpoint".into(),namespace:None,
+        arguments,internal_chat_message_metadata_passthrough:None}];
+    exchange.extend_from_slice(&history.raw_items()[before..]);
+    exchange.push(text_output("bench-checkpoint",result.to_string()));
+    (result,exchange,elapsed)
+}
+
+#[tokio::test]
+#[ignore = "opt-in ordered generation opportunity benchmark"]
+async fn generation_bench_17() {
+    use crate::generation_benchmarks::{emit,summarize,tokens};
+    for repeats in [1,64,248] {
+        let notes = "PHASE_EVIDENCE confirmed source. ".repeat(repeats);
+        let mut elapsed = Vec::new();
+        let mut wire = String::new();
+        for _ in 0..7 {
+            let (result,exchange,ns) = generation_checkpoint_fixture(false,&notes).await;
+            assert_eq!(result["checkpoint_item_persisted"],false);
+            wire = serde_json::to_string(&exchange).unwrap();
+            elapsed.push(ns);
+        }
+        emit(17,&format!("no_eligible_results_notes_{repeats}"),serde_json::json!({"handler":summarize(elapsed),
+            "no_op_exchange_tokens":tokens(&wire),"changed":false,"persisted_checkpoint_count":0,"exchange":wire,
+            "limits":"Eligibility telemetry is not implemented; avoided model calls and telemetry overhead are not measured."}));
+    }
+    let (accepted,_,_) = generation_checkpoint_fixture(true,"CONTROL: confirmed evidence").await;
+    assert_eq!(accepted["changed"],true);
+}
+
+#[tokio::test]
+#[ignore = "opt-in ordered generation opportunity benchmark"]
+async fn generation_bench_18() {
+    use crate::generation_benchmarks::{emit,measure,tokens};
+    for repeats in [1,64,248] {
+        let notes = "PHASE_EVIDENCE confirmed source. ".repeat(repeats);
+        let (_,exchange,handler_ns) = generation_checkpoint_fixture(true,&notes).await;
+        let baseline = serde_json::to_string(&exchange).unwrap();
+        let project = || {
+            let mut projected = exchange.clone();
+            let ResponseItem::FunctionCall{arguments,..} = &mut projected[0] else {panic!("checkpoint call")};
+            let mut args:serde_json::Value = serde_json::from_str(arguments).unwrap();
+            args["summary"] = serde_json::json!("Working notes retained in the following checkpoint.");
+            args["active_work"] = serde_json::json!("");
+            *arguments = args.to_string();
+            serde_json::to_string(&projected).unwrap()
+        };
+        let prototype = project();
+        assert_eq!(baseline.matches("PHASE_EVIDENCE").count(),repeats*2);
+        assert_eq!(prototype.matches("PHASE_EVIDENCE").count(),repeats);
+        assert!(prototype.contains("ACTIVE_EVIDENCE"));
+        emit(18,&format!("notes_{repeats}"),serde_json::json!({"handler_ns":handler_ns,
+            "baseline_serialize":measure(||serde_json::to_string(&exchange).unwrap()),"prototype_projection":measure(project),
+            "baseline_tokens":tokens(&baseline),"prototype_tokens":tokens(&prototype),"baseline_exchange":baseline,"prototype_exchange":prototype,
+            "limits":"Projection prototype only; canonical exchange is unchanged. Sampling cache behavior is not measured."}));
+    }
 }

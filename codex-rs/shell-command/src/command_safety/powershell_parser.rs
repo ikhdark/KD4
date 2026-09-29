@@ -17,6 +17,7 @@ use std::process::ChildStdout;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -24,6 +25,7 @@ use std::sync::PoisonError;
 use std::sync::TryLockError;
 use std::sync::mpsc;
 use std::time::Duration;
+use std::time::Instant;
 
 const POWERSHELL_PARSER_SCRIPT: &str = include_str!("powershell_parser.ps1");
 const POWERSHELL_PARSER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -43,6 +45,38 @@ static SPARE_PARSERS: LazyLock<Mutex<SpareParsers>> = LazyLock::new(|| Mutex::ne
 
 static PARSER_PROCESSES: LazyLock<Mutex<HashMap<PowershellFlavor, CachedParser>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static PARSER_AVAILABILITY: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+
+fn notify_parser_available() {
+    let _guard = PARSER_AVAILABILITY
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    PARSER_AVAILABILITY.1.notify_all();
+}
+
+fn wait_for_cached_parser(
+    parser: &CachedParser,
+    deadline: Instant,
+) -> Option<MutexGuard<'_, Option<PowershellParserProcess>>> {
+    let mut available = PARSER_AVAILABILITY
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        match parser.try_lock() {
+            Ok(parser) => return Some(parser),
+            Err(TryLockError::Poisoned(error)) => return Some(error.into_inner()),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        available = PARSER_AVAILABILITY
+            .1
+            .wait_timeout(available, remaining)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+}
 
 /// Warm the same trusted host used by command analysis. Speculation never
 /// waits for an occupied parser or consumes the spare foreground parser.
@@ -59,8 +93,15 @@ pub fn prewarm_powershell_parser(executable: &str) {
     if let Ok(mut parser) = parser.try_lock()
         && parser.is_none()
     {
-        let _ = parse_with_cached_process(&mut parser, executable, "", None);
+        let _ = parse_with_cached_process(
+            &mut parser,
+            executable,
+            "",
+            None,
+            Instant::now() + POWERSHELL_PARSER_RESPONSE_TIMEOUT,
+        );
     }
+    notify_parser_available();
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -149,6 +190,7 @@ fn parse_with_powershell_ast_request(
     script: &str,
     resolution: Option<&PowershellResolutionState>,
 ) -> PowershellParseOutcome {
+    let deadline = Instant::now() + POWERSHELL_PARSER_RESPONSE_TIMEOUT;
     let Some(flavor) = PowershellFlavor::from_requested_executable(executable) else {
         return PowershellParseOutcome::Failed;
     };
@@ -161,18 +203,25 @@ fn parse_with_powershell_ast_request(
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
     };
-    match acquire_cached_parser(&parser, &SPARE_PARSERS) {
+    let outcome = match acquire_cached_parser(&parser, &SPARE_PARSERS) {
         CachedParserAccess::Shared(mut parser) => {
-            parse_with_cached_process(&mut parser, executable, script, resolution)
+            parse_with_cached_process(&mut parser, executable, script, resolution, deadline)
         }
         CachedParserAccess::Spare(mut parsers) => {
             // Retain the overflow host and its syntax cache across bursts instead
             // of paying PowerShell startup on every concurrent classification.
             let parser = parsers.entry(flavor).or_default();
-            parse_with_cached_process(parser, executable, script, resolution)
+            parse_with_cached_process(parser, executable, script, resolution, deadline)
         }
-        CachedParserAccess::Saturated => PowershellParseOutcome::Failed,
-    }
+        CachedParserAccess::Saturated => match wait_for_cached_parser(&parser, deadline) {
+            Some(mut parser) => {
+                parse_with_cached_process(&mut parser, executable, script, resolution, deadline)
+            }
+            None => PowershellParseOutcome::Failed,
+        },
+    };
+    notify_parser_available();
+    outcome
 }
 
 enum CachedParserAccess<'a> {
@@ -265,8 +314,12 @@ fn parse_with_cached_process(
     executable: &str,
     script: &str,
     resolution: Option<&PowershellResolutionState>,
+    deadline: Instant,
 ) -> PowershellParseOutcome {
     for attempt in 0..=1 {
+        if Instant::now() >= deadline {
+            return PowershellParseOutcome::Failed;
+        }
         if parser_process.is_none() {
             match PowershellParserProcess::spawn(executable) {
                 Ok(process) => {
@@ -279,7 +332,7 @@ fn parse_with_cached_process(
         let Some(process) = parser_process.as_mut() else {
             return PowershellParseOutcome::Failed;
         };
-        let parse_result = process.parse_request(script, resolution);
+        let parse_result = process.parse_request_before(script, resolution, deadline);
         match parse_result {
             Ok(outcome) => return outcome,
             Err(error) => {
@@ -425,11 +478,31 @@ impl PowershellParserProcess {
         self.parse_request(script, None)
     }
 
+    #[cfg(test)]
     fn parse_request(
         &mut self,
         script: &str,
         resolution: Option<&PowershellResolutionState>,
     ) -> std::io::Result<PowershellParseOutcome> {
+        self.parse_request_before(
+            script,
+            resolution,
+            Instant::now() + POWERSHELL_PARSER_RESPONSE_TIMEOUT,
+        )
+    }
+
+    fn parse_request_before(
+        &mut self,
+        script: &str,
+        resolution: Option<&PowershellResolutionState>,
+        deadline: Instant,
+    ) -> std::io::Result<PowershellParseOutcome> {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "PowerShell parser deadline expired",
+            ));
+        }
         if resolution.is_none()
             && let Some(index) = self
                 .syntax_cache
@@ -465,22 +538,23 @@ impl PowershellParserProcess {
             .map_err(|_| {
                 std::io::Error::new(ErrorKind::BrokenPipe, "PowerShell parser worker exited")
             })?;
-        let response_line = match response_rx.recv_timeout(POWERSHELL_PARSER_RESPONSE_TIMEOUT) {
-            Ok(result) => result?,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                kill_child(&mut self.child);
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    "PowerShell parser response timed out",
-                ));
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::BrokenPipe,
-                    "PowerShell parser worker disconnected",
-                ));
-            }
-        };
+        let response_line =
+            match response_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    kill_child(&mut self.child);
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "PowerShell parser response timed out",
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "PowerShell parser worker disconnected",
+                    ));
+                }
+            };
 
         let response = deserialize_response(&response_line)?;
         // Requests are serialized today; the id still catches protocol desyncs if stdout is
@@ -1088,7 +1162,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn saturated_parser_returns_failure_without_spawning_another_host() {
+    fn saturated_parser_waits_for_primary_without_spawning_another_host() {
         let powershell = try_find_powershell_executable_blocking()
             .expect("Windows PowerShell is required for parser integration tests");
         let executable = powershell.as_path().to_str().unwrap();
@@ -1101,20 +1175,55 @@ mod tests {
             .clone();
         let primary = parser.lock().unwrap_or_else(PoisonError::into_inner);
         let temporary = SPARE_PARSERS.lock().unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(
-            parse_with_powershell_ast(executable, "Get-Content Cargo.toml"),
-            PowershellParseOutcome::Failed,
-        );
-        drop(temporary);
-        let parsed = parse_with_powershell_ast(executable, "Get-Content Cargo.toml");
+        let executable = executable.to_string();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(parse_with_powershell_ast(
+                    &executable,
+                    "Get-Content Cargo.toml",
+                ))
+                .unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
         drop(primary);
+        notify_parser_available();
+        let parsed = receiver
+            .recv_timeout(POWERSHELL_PARSER_RESPONSE_TIMEOUT)
+            .unwrap();
+        worker.join().unwrap();
+        drop(temporary);
         let PowershellParseOutcome::Analysis(parsed) = parsed else {
-            panic!("releasing temporary capacity must restore classification");
+            panic!("releasing the primary must restore classification");
         };
         assert_eq!(
             parsed.commands,
             vec![vec!["Get-Content".to_string(), "Cargo.toml".to_string()]]
         );
+    }
+
+    #[test]
+    fn saturated_parser_wait_is_bounded_and_expired_parse_fails_closed() {
+        let parser = Arc::new(Mutex::new(None));
+        let _held = parser.lock().unwrap();
+        assert!(
+            wait_for_cached_parser(&parser, Instant::now() + Duration::from_millis(20)).is_none()
+        );
+        let mut process = None;
+        assert_eq!(
+            parse_with_cached_process(
+                &mut process,
+                "pwsh",
+                "Get-Content Cargo.toml",
+                None,
+                Instant::now()
+            ),
+            PowershellParseOutcome::Failed
+        );
+        assert!(process.is_none(), "expired requests must not spawn a host");
     }
 
     #[test]

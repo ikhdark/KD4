@@ -141,7 +141,7 @@ mod tests {
         {
             let script = directory.join("delayed-marker.ps1");
             std::fs::write(directory.join("child.ps1"), concat!(
-                "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'started.txt') -Value started\n",
+                "Set-Content -Encoding ascii -LiteralPath (Join-Path $PSScriptRoot 'started.txt') -Value $PID\n",
                 "Start-Sleep -Seconds 2\n",
                 "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'escaped.txt') -Value escaped\n",
             )).expect("write descendant script");
@@ -165,7 +165,7 @@ mod tests {
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "(touch \"$1/started.txt\"; sleep 2; touch \"$1/escaped.txt\") & sleep 60"
+                "(sleep 2; touch \"$1/escaped.txt\") & printf '%s' $! > \"$1/started.txt\"; sleep 60"
                     .to_string(),
                 "codex-hook-test".to_string(),
                 directory.to_string_lossy().into_owned(),
@@ -292,8 +292,14 @@ mod tests {
         let payload = after_agent_payload(temp_dir.path());
 
         let hook_task = tokio::spawn(async move { hook.execute(&payload).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !started.exists() {
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&started)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -308,7 +314,9 @@ mod tests {
                 .is_cancelled()
         );
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        codex_utils_pty::test_support::wait_for_process_exit(pid, Duration::from_secs(2))
+            .await
+            .expect("cancelled finalizer must terminate its subprocess");
         assert!(
             !escaped.exists(),
             "mutating finalizer subprocess survived cancellation"

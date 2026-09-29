@@ -1627,6 +1627,9 @@ impl Session {
     /// Flush rollout writes and return the final durability-barrier result.
     #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
+        crate::tools::command_output_artifact::sync_tool_output_artifacts(
+            self.codex_home().await.as_path(), &self.thread_id.to_string(),
+        ).await?;
         if let Some(live_thread) = self.live_thread() {
             live_thread.flush().await.map_err(std::io::Error::other)
         } else {
@@ -5180,6 +5183,8 @@ impl Session {
                 .append_items_ordered(items)
                 .await
                 .map_err(std::io::Error::other)?;
+            // Settings persistence may hold the session-state lock. Flush this
+            // event's writer directly; the terminal barrier syncs tool artifacts.
             live_thread.flush().await.map_err(std::io::Error::other)?;
         }
         Ok(())
@@ -5453,6 +5458,21 @@ impl Session {
         }
     }
 
+    pub(crate) async fn mark_tool_history_artifact_recovered(&self, artifact_id: String) {
+        let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
+            unreachable!("session-owned tool-history reconciliation semaphore is never closed");
+        };
+        let mutation = crate::tool_history::ToolHistoryMutation::MarkArtifactRecovered { artifact_id };
+        let mut writer = self.tool_history_persistence.writer().await;
+        let mut state = self.state.lock().await;
+        if !state.apply_tool_history_mutation(&mutation) {
+            return;
+        }
+        if let Err(err) = writer.enqueue_mutation(mutation, "artifact reuse priority") {
+            tracing::warn!("failed to enqueue artifact reuse priority: {err}");
+        }
+    }
+
     pub(crate) async fn prepare_workspace_evidence_item(
         &self,
         item: &ResponseItem,
@@ -5471,21 +5491,30 @@ impl Session {
         // the session-state lock orders snapshots, and the persistence worker
         // commits those snapshots in the same order without delaying relay.
         drop(workspace_gate_guard);
+        self.register_workspace_evidence_batch(vec![observation]).await;
+    }
+
+    pub(crate) async fn register_workspace_evidence_batch(
+        &self,
+        observations: Vec<crate::tool_history::WorkspaceEvidenceObservation>,
+    ) {
+        if observations.is_empty() {
+            return;
+        }
         let Ok(_reconciliation_permit) = self.tool_history_reconciliation_gate.acquire().await
         else {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
-        let mutation =
-            crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
         let mut persistence_writer = self.tool_history_persistence.writer().await;
         let mut state = self.state.lock().await;
-        state.apply_tool_history_mutation(&mutation);
-        if let Err(err) =
-            persistence_writer.enqueue_mutation(mutation, "workspace evidence metadata")
-        {
-            tracing::warn!(
-                "failed to enqueue workspace evidence metadata; in-memory state is not durable: {err}"
-            );
+        for observation in observations {
+            let mutation = crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
+            state.apply_tool_history_mutation(&mutation);
+            if let Err(err) = persistence_writer.enqueue_mutation(mutation, "workspace evidence metadata") {
+                tracing::warn!(
+                    "failed to enqueue workspace evidence metadata; in-memory state is not durable: {err}"
+                );
+            }
         }
     }
 

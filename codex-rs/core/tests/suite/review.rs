@@ -925,8 +925,9 @@ async fn review_history_surfaces_in_parent_session() {
     let body = requests[1].body_json();
     let input = body["input"].as_array().expect("input array");
 
-    // Must include the followup as the last item for this turn
-    let last = input.last().expect("at least one item in input");
+    // Runtime developer context may follow the final user message.
+    let last = input.iter().rev().find(|item| item["role"] == "user")
+        .expect("at least one user message in input");
     assert_eq!(last["role"].as_str().unwrap(), "user");
     let last_text = last["content"][0]["text"].as_str().unwrap();
     assert_eq!(last_text, followup);

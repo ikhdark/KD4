@@ -123,6 +123,7 @@ struct ToolPlanProbe {
     authorization_classes: BTreeMap<String, TypedToolClass>,
     external_mutation_intents: BTreeMap<String, ExternalMutationIntent>,
     tool_search_texts: Vec<String>,
+    tool_search_sources: String,
     tool_search_namespace_descriptions: BTreeMap<String, String>,
     warnings: Vec<String>,
 }
@@ -207,6 +208,7 @@ impl ToolPlanProbe {
             authorization_classes,
             external_mutation_intents,
             tool_search_texts,
+            tool_search_sources: router.tool_search_sources.clone(),
             tool_search_namespace_descriptions,
             warnings,
         }
@@ -398,17 +400,20 @@ async fn retained_inventory_is_discoverable_without_loading_its_schema_upfront()
 }
 
 #[tokio::test]
-async fn update_plan_is_not_exposed_or_registered_in_plan_mode() {
+async fn planning_tools_keep_their_schemas_in_plan_mode() {
     let default_mode = probe(|_| {}).await;
-    default_mode.assert_visible_contains(&["update_plan"]);
-    default_mode.assert_registered_contains(&["update_plan"]);
+    default_mode.assert_visible_contains(&["update_plan", "context_checkpoint"]);
+    default_mode.assert_registered_contains(&["update_plan", "context_checkpoint"]);
 
     let plan_mode = probe(|turn| {
         turn.collaboration_mode.mode = ModeKind::Plan;
     })
     .await;
-    plan_mode.assert_visible_lacks(&["update_plan"]);
-    plan_mode.assert_registered_lacks(&["update_plan"]);
+    plan_mode.assert_visible_contains(&["update_plan", "context_checkpoint"]);
+    plan_mode.assert_registered_contains(&["update_plan", "context_checkpoint"]);
+    for name in ["update_plan", "context_checkpoint"] {
+        assert_eq!(default_mode.visible_spec(name), plan_mode.visible_spec(name));
+    }
 }
 
 #[tokio::test]
@@ -919,7 +924,8 @@ async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
     let mixed = probe(|turn| configure(turn, false)).await;
     let nested_only = probe(|turn| configure(turn, true)).await;
     mixed.assert_visible_contains(&["exec_command", "apply_patch"]);
-    nested_only.assert_visible_lacks(&["exec_command", "apply_patch"]);
+    nested_only.assert_visible_lacks(&["exec_command"]);
+    nested_only.assert_visible_contains(&["apply_patch"]);
     for plan in [&mixed, &nested_only] {
         plan.assert_registered_contains(&["exec_command", "apply_patch"]);
     }
@@ -942,7 +948,10 @@ async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
         };
         assert!(!description.is_empty());
         assert!(!mixed_exec.description.contains(description.trim()));
-        assert!(nested_exec.description.contains(description.trim()));
+        assert_eq!(
+            nested_exec.description.contains(description.trim()),
+            name != "apply_patch"
+        );
     }
     assert!(mixed_exec.description.contains("exec_command(args:"));
     assert!(mixed_exec.description.contains("yield_time_ms"));
@@ -1230,7 +1239,7 @@ async fn shell_command_schema_matches_the_selected_environment_runtime() {
         assert!(!has_parameter(spec, "cmd"));
         assert_eq!(has_parameter(spec, "yield_time_ms"), foreign);
         assert_eq!(has_parameter(spec, "timeout_ms"), !foreign);
-        assert_eq!(has_parameter(spec, "stall_timeout_ms"), !foreign);
+        assert!(has_parameter(spec, "stall_timeout_ms"));
         if foreign {
             plan.assert_registered_contains(&["write_stdin"]);
         }
@@ -1655,6 +1664,42 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
 }
 
 #[tokio::test]
+async fn code_mode_schema_stays_fixed_when_discovery_sources_change() {
+    let configure = |turn: &mut TurnContext| {
+        set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
+        turn.model_info.supports_search_tool = true;
+    };
+    let first = probe_with(
+        configure,
+        ToolPlanInputs {
+            deferred_mcp_tools: Some(vec![mcp_tool("docs", "mcp__docs", "lookup")]),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    let second = probe_with(
+        configure,
+        ToolPlanInputs {
+            deferred_mcp_tools: Some(vec![
+                mcp_tool("docs", "mcp__docs", "lookup"),
+                mcp_tool("browser", "mcp__browser", "navigate"),
+            ]),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        first.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME),
+        second.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME)
+    );
+    assert!(first.tool_search_sources.contains("docs"));
+    assert!(!first.tool_search_sources.contains("browser"));
+    assert!(second.tool_search_sources.contains("docs"));
+    assert!(second.tool_search_sources.contains("browser"));
+    assert_ne!(first.tool_search_sources, second.tool_search_sources);
+}
+
+#[tokio::test]
 async fn mcp_resource_tools_follow_the_aggregate_ready_server_capability() {
     for mcp_resources_available in [false, true] {
         let identity = ToolExposureIdentity {
@@ -2011,8 +2056,8 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     else {
         panic!("expected first tool_search spec");
     };
-    assert!(first_description.contains("- first: Tools from first."));
-    assert!(!first_description.contains("- second: Tools from second."));
+    assert!(first_plan.tool_search_sources.contains("- first: Tools from first."));
+    assert!(!first_plan.tool_search_sources.contains("- second: Tools from second."));
 
     let ToolSpec::ToolSearch {
         description: second_description,
@@ -2021,8 +2066,9 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     else {
         panic!("expected second tool_search spec");
     };
-    assert!(second_description.contains("- second: Tools from second."));
-    assert!(!second_description.contains("- first: Tools from first."));
+    assert!(second_plan.tool_search_sources.contains("- second: Tools from second."));
+    assert!(!second_plan.tool_search_sources.contains("- first: Tools from first."));
+    assert_eq!(first_description, second_description);
 
     let ToolSpec::ToolSearch {
         description: third_description,
@@ -2031,8 +2077,9 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     else {
         panic!("expected third tool_search spec");
     };
-    assert!(third_description.contains("- first: Tools from first."));
-    assert!(!third_description.contains("- second: Tools from second."));
+    assert!(third_plan.tool_search_sources.contains("- first: Tools from first."));
+    assert!(!third_plan.tool_search_sources.contains("- second: Tools from second."));
+    assert_eq!(first_description, third_description);
 }
 
 #[tokio::test]
@@ -2765,7 +2812,8 @@ async fn v1_multi_agent_tools_defer_when_tool_search_available() {
     let ToolSpec::ToolSearch { description, .. } = plan.visible_spec("tool_search") else {
         panic!("expected visible tool_search spec");
     };
-    assert!(description.contains("- Multi-agent tools: Spawn and manage sub-agents."));
+    assert!(description.contains("<tool_search_sources>"));
+    assert!(plan.tool_search_sources.contains("- Multi-agent tools: Spawn and manage sub-agents."));
 }
 
 #[tokio::test]
@@ -2893,6 +2941,7 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
             "exec",
             "wait",
             "request_user_input",
+            "apply_patch",
             "agents",
             // Hosted Responses tool.
             "web_search",
@@ -3016,6 +3065,7 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
             codex_code_mode::PUBLIC_TOOL_NAME,
             codex_code_mode::WAIT_TOOL_NAME,
             "request_user_input",
+            "apply_patch",
             // Multi-agent v2 tools.
             MULTI_AGENT_V2_NAMESPACE,
             // Hosted Responses tools.

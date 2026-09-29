@@ -164,12 +164,110 @@ impl From<VerbosityConfig> for OpenAiVerbosity {
     }
 }
 
+/// Request input can prepend the Responses Lite envelope without copying its
+/// shared history. Contiguous access remains available for legacy consumers,
+/// but serialization and ordinary iteration never materialize that copy.
+#[derive(Debug, Clone, Default)]
+pub struct ResponsesInput {
+    prefix: Arc<[ResponseItem]>,
+    shared: Arc<[ResponseItem]>,
+    contiguous: std::sync::OnceLock<Arc<[ResponseItem]>>,
+}
+
+impl ResponsesInput {
+    pub fn with_prefix(prefix: Vec<ResponseItem>, shared: Arc<[ResponseItem]>) -> Self {
+        Self { prefix: prefix.into(), shared, contiguous: std::sync::OnceLock::new() }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ResponseItem> + DoubleEndedIterator {
+        self.prefix.iter().chain(self.shared.iter())
+    }
+
+    pub fn len(&self) -> usize { self.prefix.len() + self.shared.len() }
+    pub fn is_empty(&self) -> bool { self.prefix.is_empty() && self.shared.is_empty() }
+    pub fn first(&self) -> Option<&ResponseItem> { self.iter().next() }
+
+    pub fn update_segments(&mut self, mut update: impl FnMut(&mut Arc<[ResponseItem]>)) {
+        update(&mut self.prefix);
+        update(&mut self.shared);
+        self.contiguous = std::sync::OnceLock::new();
+    }
+}
+
+impl From<Arc<[ResponseItem]>> for ResponsesInput {
+    fn from(shared: Arc<[ResponseItem]>) -> Self { Self::with_prefix(Vec::new(), shared) }
+}
+
+impl From<Vec<ResponseItem>> for ResponsesInput {
+    fn from(items: Vec<ResponseItem>) -> Self { Self::from(Arc::<[ResponseItem]>::from(items)) }
+}
+
+impl std::ops::Deref for ResponsesInput {
+    type Target = Arc<[ResponseItem]>;
+    fn deref(&self) -> &Self::Target {
+        if self.prefix.is_empty() { return &self.shared; }
+        self.contiguous.get_or_init(|| self.iter().cloned().collect::<Vec<_>>().into())
+    }
+}
+
+impl std::ops::DerefMut for ResponsesInput {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        if !self.prefix.is_empty() {
+            self.shared = self.contiguous.take()
+                .unwrap_or_else(|| self.iter().cloned().collect::<Vec<_>>().into());
+            self.prefix = Arc::from([]);
+        }
+        &mut self.shared
+    }
+}
+
+impl PartialEq for ResponsesInput {
+    fn eq(&self, other: &Self) -> bool { self.iter().eq(other.iter()) }
+}
+
+impl Serialize for ResponsesInput {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+        for item in self.iter() { sequence.serialize_element(item)?; }
+        sequence.end()
+    }
+}
+
+#[cfg(test)]
+mod responses_input_tests {
+    use super::*;
+
+    #[test]
+    fn prefixed_serialization_keeps_exact_bytes_without_copying_shared_history() {
+        let item = |text: &str| ResponseItem::Message {
+            id: None, role: "developer".into(),
+            content: vec![codex_protocol::models::ContentItem::InputText { text: text.into() }],
+            phase: None, internal_chat_message_metadata_passthrough: None,
+        };
+        let history: Arc<[ResponseItem]> = Arc::from([item("shared history")]);
+        for prefix in [Vec::new(), vec![item("fixed prefix")]] {
+            let expected = prefix.iter().chain(history.iter()).cloned().collect::<Vec<_>>();
+            let input = ResponsesInput::with_prefix(prefix, Arc::clone(&history));
+            for _ in 0..2 {
+                assert_eq!(serde_json::to_vec(&input.clone()).unwrap(), serde_json::to_vec(&expected).unwrap());
+                assert!(input.contiguous.get().is_none());
+                assert!(Arc::ptr_eq(&input.shared, &history));
+            }
+            let mut modified = input.clone();
+            Arc::make_mut(&mut modified)[0] = item("rewritten");
+            assert_ne!(serde_json::to_vec(&modified).unwrap(), serde_json::to_vec(&input).unwrap());
+            assert_eq!(serde_json::to_vec(&input).unwrap(), serde_json::to_vec(&expected).unwrap());
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct ResponsesApiRequest {
     pub model: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub instructions: String,
-    pub input: Arc<[ResponseItem]>,
+    pub input: ResponsesInput,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Arc<[Value]>>,
     pub tool_choice: String,
@@ -221,7 +319,7 @@ pub struct ResponseCreateWsRequest {
     pub instructions: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
-    pub input: Arc<[ResponseItem]>,
+    pub input: ResponsesInput,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Arc<[Value]>>,
     pub tool_choice: String,

@@ -31,6 +31,7 @@ use std::sync::LazyLock;
 use tokio::sync::watch::Receiver;
 use tokio::time::Duration;
 use tokio::time::Instant;
+#[cfg(test)]
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -44,7 +45,7 @@ pub use spawn_agents_on_csv::SpawnAgentsOnCsvHandler;
 
 const DEFAULT_AGENT_JOB_CONCURRENCY: usize = 16;
 const MAX_AGENT_JOB_CONCURRENCY: usize = 64;
-const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MISSING_STATUS_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_AGENT_JOB_ITEM_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 const ORPHANED_AGENT_JOB_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const PARENT_TOOL_CANCELLATION_REASON: &str = "cancelled by parent tool request";
@@ -306,8 +307,14 @@ async fn run_agent_job_loop(
     )
     .await?;
 
+    let mut job_changes = db.subscribe_agent_job_changes();
+    let mut capacity_changes = session.services.agent_control.subscribe_capacity_changes();
     let mut cancel_requested = db.is_agent_job_cancelled(job_id.as_str()).await?;
     loop {
+        // Consume notifications before inspecting state so a concurrent commit
+        // between inspection and waiting cannot be lost.
+        job_changes.borrow_and_update();
+        capacity_changes.borrow_and_update();
         let mut progressed = false;
 
         if observe_parent_job_cancellation(&cancellation_token, db.as_ref(), job_id.as_str())
@@ -474,7 +481,10 @@ async fn run_agent_job_loop(
                 break;
             }
             if !progressed {
-                wait_for_status_change(active_items).await;
+                wait_for_status_change(
+                    active_items, &mut job_changes, &mut capacity_changes,
+                    &cancellation_token, runtime_timeout,
+                ).await;
             }
             continue;
         }
@@ -804,21 +814,38 @@ fn active_item_watch_status(item: &mut ActiveJobItem) -> Option<AgentStatus> {
     Some(status_rx.borrow_and_update().clone())
 }
 
-async fn wait_for_status_change(active_items: &HashMap<ThreadId, ActiveJobItem>) {
+async fn wait_for_status_change(
+    active_items: &HashMap<ThreadId, ActiveJobItem>,
+    job_changes: &mut Receiver<u64>,
+    capacity_changes: &mut Receiver<u64>,
+    cancellation: &CancellationToken,
+    runtime_timeout: Duration,
+) {
     let mut waiters = FuturesUnordered::new();
+    // Reconcile durable changes from other processes on the existing orphan
+    // reconciliation cadence. Local commits and capacity releases wake directly.
+    let mut deadline = Instant::now() + ORPHANED_AGENT_JOB_RECONCILIATION_INTERVAL;
     for item in active_items.values() {
-        if let Some(status_rx) = item.status_rx.as_ref() {
+        deadline = deadline.min(item.started_at + runtime_timeout);
+        if let Some(status_rx) = item.status_rx.as_ref()
+            && status_rx.has_changed().is_ok()
+        {
             let mut status_rx = status_rx.clone();
             waiters.push(async move {
                 let _ = status_rx.changed().await;
             });
+        } else {
+            // Recovery for workers without a live subscription remains bounded.
+            deadline = deadline.min(Instant::now() + MISSING_STATUS_RECHECK_INTERVAL);
         }
     }
-    if waiters.is_empty() {
-        tokio::time::sleep(STATUS_POLL_INTERVAL).await;
-        return;
+    tokio::select! {
+        _ = cancellation.cancelled() => {},
+        _ = job_changes.changed() => {},
+        _ = capacity_changes.changed() => {},
+        _ = waiters.next(), if !waiters.is_empty() => {},
+        _ = tokio::time::sleep_until(deadline) => {},
     }
-    let _ = timeout(STATUS_POLL_INTERVAL, waiters.next()).await;
 }
 
 async fn reap_stale_active_items(

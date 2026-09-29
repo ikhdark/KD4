@@ -759,7 +759,7 @@ async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_c
 }
 
 #[tokio::test]
-async fn request_scaffold_separates_terminal_and_ordinary_tool_surfaces() {
+async fn request_scaffold_reuses_terminal_and_ordinary_tool_surfaces() {
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
@@ -825,8 +825,11 @@ async fn request_scaffold_separates_terminal_and_ordinary_tool_surfaces() {
         &base_instructions,
         /*terminal_completion_only*/ true,
     );
-    assert!(!terminal.locally_reused);
-    assert!(terminal.scaffold.tools.specs().is_empty());
+    assert!(terminal.locally_reused);
+    assert!(Arc::ptr_eq(
+        &ordinary.scaffold.tools,
+        &terminal.scaffold.tools
+    ));
     assert_eq!(
         terminal.scaffold.digests.tools,
         Some(terminal.scaffold.tools.digest())
@@ -834,7 +837,8 @@ async fn request_scaffold_separates_terminal_and_ordinary_tool_surfaces() {
     let mut terminal_prompt =
         build_projected_prompt_from_scaffold(&prepared, step_context.as_ref(), &terminal);
     enforce_terminal_prompt_contract(&mut terminal_prompt, true);
-    assert!(terminal_prompt.tools.specs().is_empty());
+    assert!(!terminal_prompt.tools.specs().is_empty());
+    assert!(terminal_prompt.tool_calls_disabled);
     assert_eq!(
         terminal_prompt.digests.tools,
         Some(terminal_prompt.tools.digest())
@@ -848,9 +852,9 @@ async fn request_scaffold_separates_terminal_and_ordinary_tool_surfaces() {
         &base_instructions,
         /*terminal_completion_only*/ false,
     );
-    assert!(!ordinary_again.locally_reused);
+    assert!(ordinary_again.locally_reused);
     assert!(!ordinary_again.scaffold.tools.specs().is_empty());
-    assert_eq!(cache.build_count(), 3);
+    assert_eq!(cache.build_count(), 1);
 }
 
 #[tokio::test]
@@ -2586,7 +2590,7 @@ async fn planning_failure_records_initial_input_and_emits_status_affecting_error
 }
 
 #[tokio::test]
-async fn lightweight_terminal_prompt_contract_removes_tools_and_parallel_dispatch() {
+async fn lightweight_terminal_prompt_contract_preserves_tools_and_disables_calls() {
     let (_, turn_context) = crate::session::tests::make_session_and_context().await;
     let registry = ToolRegistry::from_tools(std::iter::empty::<
         Arc<dyn crate::tools::registry::CoreToolRuntime>,
@@ -2615,11 +2619,64 @@ async fn lightweight_terminal_prompt_contract_removes_tools_and_parallel_dispatc
         BaseInstructions::default(),
     );
     assert!(!prompt.tools.specs().is_empty());
+    let tools = Arc::clone(&prompt.tools);
+    prompt.parallel_tool_calls = true;
 
     enforce_terminal_prompt_contract(&mut prompt, /*terminal_completion_only*/ true);
 
-    assert!(prompt.tools.specs().is_empty());
-    assert!(!prompt.parallel_tool_calls);
+    assert!(Arc::ptr_eq(&prompt.tools, &tools));
+    assert!(prompt.parallel_tool_calls);
+    assert!(prompt.tool_calls_disabled);
+    enforce_terminal_prompt_contract(&mut prompt, /*terminal_completion_only*/ false);
+    assert!(!prompt.tool_calls_disabled);
+}
+
+#[tokio::test]
+async fn sampling_context_notices_are_persisted_once_and_append_only() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    assert!(
+        !record_context_notice_if_changed(&session, &turn, "tool_search_sources", "")
+            .await
+            .unwrap()
+    );
+    assert!(
+        record_context_notice_if_changed(&session, &turn, "tool_search_sources", "- docs")
+            .await
+            .unwrap()
+    );
+    let first = session.clone_history().await.raw_items().to_vec();
+    assert!(
+        !record_context_notice_if_changed(&session, &turn, "tool_search_sources", "- docs")
+            .await
+            .unwrap()
+    );
+    assert_eq!(session.clone_history().await.raw_items(), first.as_slice());
+    for sources in ["- docs\n- browser", "- docs", ""] {
+        let before = session.clone_history().await.raw_items().to_vec();
+        assert!(
+            record_context_notice_if_changed(&session, &turn, "tool_search_sources", sources)
+                .await
+                .unwrap()
+        );
+        let history = session.clone_history().await;
+        assert!(history.raw_items().starts_with(&before));
+        assert_eq!(history.raw_items().len(), before.len() + 1);
+    }
+    record_sampling_notices(&session, &turn, true, true)
+        .await
+        .unwrap();
+    let notices = session.clone_history().await.raw_items().to_vec();
+    record_sampling_notices(&session, &turn, true, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        notices.as_slice()
+    );
+    let rendered = serde_json::to_string(&notices).unwrap();
+    assert_eq!(rendered.matches("<mcp_catalog_notice>").count(), 1);
+    assert_eq!(rendered.matches("<forced_terminal_notice>").count(), 1);
+    assert!(rendered.contains("Later user input may resume work"));
 }
 
 #[test]
@@ -3509,7 +3566,7 @@ fn checkpoint_lifecycle_reaches_next_model_request_without_reexecution() -> Resu
                 responses::ev_function_call("active-source", "read_file", r#"{"path":"active.txt"}"#),
                 responses::ev_completed("read"),
             ]),
-            responses::sse(vec![responses::ev_function_call("checkpoint", "context_checkpoint", r#"{"completed_call_ids":["completed-source"],"retained_evidence":["active-source"],"summary":"Completed source consumed; active source still needed.","active_work":"Use active evidence."}"#),responses::ev_completed("checkpoint")]),
+            responses::sse(vec![responses::ev_function_call("checkpoint", "context_checkpoint", r#"{"completed_call_ids":["completed-source"],"retained_evidence":["active-source"],"summary":"Completed source consumed; active source still needed.","active_work":"Use active evidence.","answered_questions":[{"question":"What does completed.txt contain?","answer":"Repeated completed source evidence."}]}"#),responses::ev_completed("checkpoint")]),
             responses::sse(vec![responses::ev_assistant_message("answer","Evidence retained."),responses::ev_completed("done")]),
         ]).await;
             let test = test_codex()
@@ -3582,6 +3639,37 @@ fn checkpoint_lifecycle_reaches_next_model_request_without_reexecution() -> Resu
                     serde_json::from_str::<serde_json::Value>(body).ok()
                 })
                 .expect("next request contains the persisted checkpoint");
+            assert_eq!(checkpoint["active_work"], "Use active evidence.");
+            assert_eq!(
+                checkpoint["answered_questions"],
+                serde_json::json!([{
+                    "question": "What does completed.txt contain?",
+                    "answer": "Repeated completed source evidence.",
+                }])
+            );
+            assert!(sent[2].message_input_texts("developer").iter().any(|text| {
+                text.contains("not host-verified facts")
+                    && text.contains("when required verification remains")
+            }));
+            assert!(
+                initial.get_rollout_items().iter().any(|item| {
+                    let codex_protocol::protocol::RolloutItem::ResponseItem(
+                        ResponseItem::Message { role, content, .. },
+                    ) = item else {
+                        return false;
+                    };
+                    role == "developer" && content.iter().any(|part| {
+                        let codex_protocol::models::ContentItem::InputText { text } = part else {
+                            return false;
+                        };
+                        text.strip_prefix("<completed_phase_checkpoint>\n")
+                            .and_then(|text| text.strip_suffix("\n</completed_phase_checkpoint>"))
+                            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                            .is_some_and(|persisted| persisted == checkpoint)
+                    })
+                }),
+                "answered state and remaining obligations must be durable"
+            );
             let retained = &checkpoint["retained_evidence"]["active-source"];
             let recovered = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
                 test.codex_home_path(),
@@ -3618,6 +3706,7 @@ fn final_prompt_injects_evidence_guidance_once_for_bundled_and_catalog_bases() -
                     .with_config(move |config| {
                         config.base_instructions = Some(base.into());
                         config.features.enable(Feature::Kd4Runtime).unwrap();
+                        config.features.enable(Feature::TaskModelGuidance).unwrap();
                         config.features.disable(Feature::CodeModeHost).unwrap();
                     })
                     .build(&server)
@@ -3638,7 +3727,7 @@ fn final_prompt_injects_evidence_guidance_once_for_bundled_and_catalog_bases() -
                 );
                 assert_eq!(
                     prompt
-                        .matches("A no-change result is valid and preferred")
+                        .matches("A no-change result is valid")
                         .count(),
                     1
                 );
@@ -3654,8 +3743,13 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
         "ordinary_exec_validation_repair_and_inflight_source_freshness",
         || async {
             let server = responses::start_mock_server().await;
+            // Build products and synchronization gates are not source evidence.
+            // Keep them outside the recursively observed workspace.
+            let scratch = tempfile::tempdir()?;
+            let ready = scratch.path().join("ready");
+            let release = scratch.path().join("release");
             let command = serde_json::json!({
-                "program":"cargo", "args":["test","--offline","--target-dir","target"],
+                "program":"cargo", "args":["test","--offline","--target-dir",scratch.path().join("target")],
                 "yield_time_ms":300000, "max_output_tokens":2000,
             })
             .to_string();
@@ -3723,6 +3817,9 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
                 "        std::thread::sleep(std::time::Duration::from_millis(10));\n",
                 "    }\n}\n",
             );
+            let source = source
+                .replace("\"ready\"", &format!("{:?}", ready.to_string_lossy()))
+                .replace("\"release\"", &format!("{:?}", release.to_string_lossy()));
             fs::write(test.workspace_path("src/lib.rs"), source)?;
             for args in [
                 vec!["init", "--quiet"],
@@ -3742,6 +3839,7 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
             ] {
                 assert!(
                     std::process::Command::new("git")
+                        .args(["-c", "core.autocrlf=false"])
                         .args(args)
                         .current_dir(test.cwd_path())
                         .status()?
@@ -3751,7 +3849,7 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
             let cwd = test.cwd_path().to_owned();
             let mutation = tokio::spawn(async move {
                 tokio::time::timeout(Duration::from_secs(30), async {
-                    while !cwd.join("ready").exists() {
+                    while !ready.exists() {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 })
@@ -3765,7 +3863,7 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
                     before.replace("fn value() -> u8 { 2 }", "fn value() -> u8 { 3 }"),
                 )
                 .unwrap();
-                fs::write(cwd.join("release"), "release").unwrap();
+                fs::write(release, "release").unwrap();
             });
             let completion = test
                 .submit_turn_and_capture_completion(
@@ -3822,14 +3920,14 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
 }
 
 #[test]
-fn generation_budget_survives_reentry_and_terminal_directive_is_request_local() -> Result<()> {
+fn generation_budget_survives_reentry_and_terminal_directive_is_persisted() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
-        "generation_budget_survives_reentry_and_terminal_directive_is_request_local",
-        generation_budget_survives_reentry_and_terminal_directive_is_request_local_impl,
+        "generation_budget_survives_reentry_and_terminal_directive_is_persisted",
+        generation_budget_survives_reentry_and_terminal_directive_is_persisted_impl,
     )
 }
 
-async fn generation_budget_survives_reentry_and_terminal_directive_is_request_local_impl()
+async fn generation_budget_survives_reentry_and_terminal_directive_is_persisted_impl()
 -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
@@ -3987,17 +4085,18 @@ else:
         let terminal = index == limit;
         assert_eq!(
             request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE),
-            terminal,
-            "the terminal instruction must appear only in request {limit}, observed request {index}"
+            index >= limit,
+            "the terminal instruction must remain in history after request {limit}"
         );
         assert_eq!(
-            request.body_json()["tools"]
-                .as_array()
-                .expect("tools array")
-                .is_empty(),
-            terminal
+            request.body_json()["tool_choice"],
+            if terminal { "none" } else { "auto" }
         );
+        assert!(!request.body_json()["tools"].as_array().unwrap().is_empty());
     }
+    assert_eq!(sent[limit].body_json()["tools"], sent[limit - 1].body_json()["tools"]);
+    assert_eq!(sent[limit].body_json()["parallel_tool_calls"], sent[limit - 1].body_json()["parallel_tool_calls"]);
+    assert!(sent[limit + 1].body_contains_text("Later user input may resume work"));
     Ok(())
 }
 

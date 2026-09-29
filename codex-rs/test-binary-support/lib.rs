@@ -25,6 +25,13 @@ pub fn configure_test_binary_dispatch(codex_home_dir_name: &str) -> Option<Arg0P
     // The helper must observe the caller's CODEX_HOME, not the alias home.
     arg0_dispatch_helper();
 
+    // Nextest lists every harness before running it. Discovery never invokes a
+    // test, so it needs neither aliases nor a temporary home. Helper dispatch
+    // remains first: a helper may legitimately receive `--list` itself.
+    if std::env::args_os().skip(1).any(|arg| arg == "--list") {
+        return None;
+    }
+
     // Guards live in `#[ctor]` statics, which are never dropped, so a per-process
     // temporary home would leak on every test process. A shared home lets the arg0
     // janitor remove alias directories whose owning process has exited.

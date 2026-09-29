@@ -13,11 +13,13 @@ import copy
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from pathlib import Path
 from typing import Any, ClassVar
@@ -96,6 +98,11 @@ MANIFEST_DATA: dict[str, Any] = {
 }
 
 METADATA_PACKAGES: list[dict[str, Any]] = [
+    {
+        "name": "codex-config",
+        "id": "path+file:///codex-config#0.0.0",
+        "targets": [{"name": "codex_config", "kind": ["lib"]}],
+    },
     {
         "name": "codex-core",
         "id": "path+file:///codex-core#0.0.0",
@@ -1313,6 +1320,94 @@ class GenericRecipeGuardTest(unittest.TestCase):
                 rust_test_runner.guard_generic_recipe_args(argv)
 
 
+class CrateValidationCommandsTest(unittest.TestCase):
+    def test_local_ladder_scopes_formatting_and_preserves_exact_selection(self):
+        self.assertEqual(
+            rust_test_runner.crate_validation_commands(
+                "local",
+                "codex-config",
+                [
+                    "--lib",
+                    "-E",
+                    "test(=schema::fixture_tests::config_schema_matches_fixture)",
+                ],
+            ),
+            [
+                [
+                    "just",
+                    "fmt-check-fast",
+                    "--only",
+                    "rust",
+                    "--rust-package",
+                    "codex-config",
+                ],
+                [
+                    "just",
+                    "test-fast",
+                    "-p",
+                    "codex-config",
+                    "--no-tests=fail",
+                    "--lib",
+                    "-E",
+                    "test(=schema::fixture_tests::config_schema_matches_fixture)",
+                ],
+            ],
+        )
+
+    def test_invalid_core_route_rejects_before_any_commands_exist(self):
+        with self.assertRaisesRegex(RunnerError, "cannot select codex-core"):
+            rust_test_runner.crate_validation_commands("full", "codex-core", ["--lib"])
+
+    def test_whole_package_requires_explicit_opt_in(self):
+        for args in (
+            [],
+            ["--test"],
+            ["--test="],
+            ["--all-targets"],
+            ["--", "--lib"],
+            ["--", "--all-tests"],
+            ["--lib", "--tests"],
+        ):
+            with (
+                self.subTest(args=args),
+                self.assertRaisesRegex(RunnerError, "select --lib"),
+            ):
+                rust_test_runner.crate_validation_commands(
+                    "focused", "codex-config", args
+                )
+        self.assertEqual(
+            rust_test_runner.crate_validation_commands(
+                "focused", "codex-config", ["--all-tests"]
+            ),
+            [["just", "test-fast", "-p", "codex-config", "--no-tests=fail"]],
+        )
+
+    def test_package_overrides_are_rejected(self):
+        with self.assertRaisesRegex(RunnerError, "override its package"):
+            rust_test_runner.crate_validation_commands(
+                "local", "codex-config", ["--lib", "-p", "codex-core"]
+            )
+
+    def test_libtest_arguments_are_not_recipe_flags(self):
+        args = ["--lib", "--", "--all-tests", "--workspace", "-p", "literal"]
+        self.assertEqual(
+            rust_test_runner.crate_validation_commands("focused", "codex-config", args),
+            [["just", "test-fast", "-p", "codex-config", "--no-tests=fail", *args]],
+        )
+
+    def test_pure_shell_ranges_require_no_helpers(self):
+        manifest = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
+        self.assertEqual(
+            manifest.targets["core_lib"].helpers_by_test_prefix[
+                "tools::handlers::shell::tests::pure::"
+            ],
+            (),
+        )
+        self.assertEqual(
+            manifest.gates["config-schema-protocol"].steps[0].target, "config_lib"
+        )
+
+
 class NextestListParsingTest(unittest.TestCase):
     def test_ignored_state_is_preserved(self) -> None:
         payload = nextest_list_payload({"a::b": False, "a::c": True})
@@ -1393,6 +1488,66 @@ class TargetDirectoryPropagationTest(RunnerTestCase):
 
 
 class RunTargetTest(RunnerTestCase):
+    def test_opt_in_helper_prefix_keeps_new_modules_helper_free(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers"] = []
+        data["targets"]["core_lib"]["helpers_by_test_prefix"] = {"process::": ["codex"]}
+        for test, expected_builds in (("new_module::case", 0), ("process::case", 1)):
+            with self.subTest(test=test):
+                executor = FakeExecutor(
+                    artifacts={"codex": self.helper_executable("codex")},
+                    default_listing={test: False},
+                )
+                runner, _ = self.runner(
+                    executor=executor, manifest=Manifest.from_data(data)
+                )
+                runner.run_target("core_lib", ["-E", f"test(={test})"])
+                self.assertEqual(
+                    len(executor.commands(["cargo", "build"])), expected_builds
+                )
+                self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+                if not expected_builds:
+                    self.assertFalse(
+                        Path(executor.last_env()["CARGO_BIN_EXE_codex"]).exists()
+                    )
+
+    def test_partial_pass_receipts_exclude_failures_duplicates_and_other_binaries(self):
+        runner, executor = self.runner(executor=self.build_executor())
+        original = runner.executor
+
+        def execute(args, **kwargs):
+            result = original(args, **kwargs)
+            if args[:3] == ["cargo", "nextest", "run"]:
+                result.returncode = 100
+                result.stdout = "\n".join(
+                    [
+                        "PASS [ 0.01s] codex-core::all suite::passed",
+                        "FAIL [ 0.01s] codex-core::all suite::failed",
+                        "PASS [ 0.01s] codex-core::all suite::duplicate",
+                        "PASS [ 0.01s] codex-core::all suite::duplicate",
+                        "PASS [ 0.01s] other::all suite::foreign",
+                        "SKIP [ 0.01s] codex-core::all suite::skipped",
+                    ]
+                )
+            return result
+
+        runner.executor = execute
+        with self.assertRaises(RunnerError) as caught:
+            runner.run_target("core_all", ["-E", "test(suite::)"])
+        self.assertEqual(
+            caught.exception.completed_tests, {"codex-core::all": ["suite::passed"]}
+        )
+        self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
+
+    def test_target_receipt_flags_precede_libtest_separator(self):
+        runner, executor = self.runner(
+            executor=self.build_executor(default_listing={"suite::one": False})
+        )
+        receipt = runner.run_target("core_all", ["--", "suite::one", "--exact"])
+        command = executor.commands(["cargo", "nextest", "run"])[0]
+        self.assertLess(command.index("--status-level"), command.index("--"))
+        self.assertEqual(receipt, {"codex-core::all": ["suite::one"]})
+
     def test_phase_report_separates_build_from_tests_without_extra_commands(
         self,
     ) -> None:
@@ -1716,7 +1871,7 @@ class RunTargetTest(RunnerTestCase):
         self.assertEqual(len(run_commands), 1)
         self.assertIn("--no-fail-fast", run_commands[0])
 
-    def test_run_streams_its_output_instead_of_capturing_it(self) -> None:
+    def test_run_retains_pass_lines_without_flooding_the_terminal(self) -> None:
         runner, executor = self.runner(executor=self.build_executor())
         runner.run_target("core_all", [])
         captures = {
@@ -1724,13 +1879,13 @@ class RunTargetTest(RunnerTestCase):
             for call in executor.calls
             if call["args"][0] == "cargo"
         }
-        # Only the helper build's machine-readable stdout is parsed; its
-        # progress and diagnostics stay on the terminal.
+        # Helper diagnostics stream; test PASS lines are retained for receipts
+        # rather than flooding the terminal. Failures still use retained logs.
         self.assertEqual(
             captures,
             {
                 "build": rust_test_runner.CAPTURE_STDOUT,
-                "nextest": rust_test_runner.CAPTURE_NONE,
+                "nextest": rust_test_runner.CAPTURE_BOTH,
             },
         )
 
@@ -1792,6 +1947,108 @@ class RunTargetTest(RunnerTestCase):
 
 
 class RunGateTest(RunnerTestCase):
+    def test_filter_only_gate_plan_preserves_module_and_exact_steps(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {
+            "module": {
+                "steps": [
+                    {
+                        "target": "core_lib",
+                        "helpers": [],
+                        "filter": "test(mod::tests::)",
+                    },
+                    {"target": "core_lib", "helpers": [], "tests": ["other::case"]},
+                ]
+            }
+        }
+        runner, executor = self.runner(manifest=Manifest.from_data(data))
+        plan = runner.plan("module")
+        command = plan["steps"][0]["run"]
+        expression = command[command.index("-E") + 1]
+        self.assertIn("test(mod::tests::)", expression)
+        self.assertIn("test(=other::case)", expression)
+        self.assertEqual(executor.calls, [])
+
+    def test_filter_only_gate_discovery_is_not_execution_proof(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {
+            "module": {
+                "steps": [
+                    {
+                        "target": "core_lib",
+                        "helpers": [],
+                        "filter": "test(mod::tests::)",
+                    }
+                ]
+            }
+        }
+        executor = FakeExecutor(
+            default_listing={"mod::tests::alpha": False, "mod::tests::new": False}
+        )
+        runner, _ = self.runner(executor=executor, manifest=Manifest.from_data(data))
+
+        def omit_new_test(args, **kwargs):
+            result = executor(args, **kwargs)
+            if args[:3] == ["cargo", "nextest", "run"]:
+                result.stdout = "PASS [ 0.001s] codex-core mod::tests::alpha"
+            return result
+
+        runner.executor = omit_new_test
+        with self.assertRaises(RunnerError) as error:
+            runner.run_gate("module")
+        self.assertEqual(error.exception.completed_gates, {})
+        self.assertEqual(error.exception.outcome, "not_executed")
+
+    def test_filter_only_gate_discovers_and_proves_new_tests(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {
+            "module": {
+                "steps": [
+                    {
+                        "target": "core_lib",
+                        "helpers": [],
+                        "filter": "test(mod::tests::)",
+                    }
+                ]
+            }
+        }
+        tests = {"mod::tests::alpha": False, "mod::tests::new_test": False}
+        executor = FakeExecutor(default_listing=tests)
+        runner, _ = self.runner(executor=executor, manifest=Manifest.from_data(data))
+        self.assertEqual(
+            runner.run_gates(["module"], quiet=True), {"module": sorted(tests)}
+        )
+        self.assertEqual(len(executor.commands(["cargo", "nextest", "list"])), 1)
+        self.assertEqual(executor.commands(["cargo", "build"]), [])
+        (command,) = executor.commands(["cargo", "nextest", "run"])
+        self.assertIn("test(=mod::tests::new_test)", command[command.index("-E") + 1])
+
+    def test_filter_only_gate_rejects_empty_or_ignored_selection_without_execution(
+        self,
+    ):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["gates"] = {
+            "module": {
+                "steps": [
+                    {
+                        "target": "core_lib",
+                        "helpers": [],
+                        "filter": "test(mod::tests::)",
+                    }
+                ]
+            }
+        }
+        for tests in ({}, {"mod::tests::ignored": True}):
+            with self.subTest(tests=tests):
+                executor = FakeExecutor(default_listing=tests)
+                runner, _ = self.runner(
+                    executor=executor, manifest=Manifest.from_data(data)
+                )
+                with self.assertRaises(RunnerError):
+                    runner.run_gate("module")
+                self.assertEqual(executor.commands(["cargo", "nextest", "run"]), [])
+                self.assertEqual(executor.commands(["cargo", "build"]), [])
+
     def test_failed_batch_retains_only_independently_proved_gates(self) -> None:
         def step(*tests):
             return {"target": "core_lib", "tests": list(tests), "helpers": []}
@@ -1919,8 +2176,7 @@ class RunGateTest(RunnerTestCase):
                 self.assertEqual(executor.calls, [])
 
     def test_large_gate_failure_reports_delta_and_retains_inventory_and_command(self):
-        repository = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
-        tests = repository.gates["tui-large-widget"].steps[0].tests
+        tests = tuple(f"large_module::tests::case_{index:03d}" for index in range(100))
         data = copy.deepcopy(MANIFEST_DATA)
         data["gates"]["demo-gate"]["steps"] = [
             {"target": "core_lib", "tests": list(tests), "helpers": []}
@@ -2624,12 +2880,14 @@ class RunGateTest(RunnerTestCase):
         data = copy.deepcopy(MANIFEST_DATA)
         data["gates"] = {}
         focused = Manifest.from_data(data)
+        focused.targets["config_lib"] = manifest.targets["config_lib"]
         focused.gates["config-schema-protocol"] = manifest.gates[
             "config-schema-protocol"
         ]
         expected = {
-            "config::schema::tests::config_schema_matches_fixture": False,
-            "config::schema::tests::config_schema_hides_unsupported_inline_mcp_bearer_token": False,
+            "schema::fixture_tests::config_schema_matches_fixture": False,
+            "schema::fixture_tests::config_schema_hides_unsupported_inline_mcp_bearer_token": False,
+            "schema::fixture_tests::config_schema_excludes_removed_code_mode_waiting_policy": False,
         }
         executor = FakeExecutor(default_listing=expected)
         runner, _ = self.runner(manifest=focused, executor=executor)
@@ -2798,15 +3056,25 @@ class RepositoryManifestTest(unittest.TestCase):
         for gate in self.manifest.gates.values():
             for step in gate.steps:
                 with self.subTest(gate=gate.name, target=step.target):
-                    self.assertIsNone(
-                        step.filterset,
-                        "redundant filters force discovery before normal gate execution",
+                    self.assertNotEqual(
+                        bool(step.tests),
+                        bool(step.filterset),
+                        "use exact IDs or a discovered module, not redundant filters",
                     )
                     if step.target == "core_lib":
                         self.assertIsNotNone(
                             step.helpers,
                             "fixed core gates must not inherit every helper binary",
                         )
+
+    def test_exact_gate_ids_have_one_owner(self):
+        owners = {}
+        for gate in self.manifest.gates.values():
+            for step in gate.steps:
+                for test in step.tests:
+                    key = (step.target, test)
+                    self.assertNotIn(key, owners, f"duplicate gate test {key}")
+                    owners[key] = gate.name
 
     def test_manifest_parses_strictly(self) -> None:
         self.assertEqual(self.manifest.version, rust_test_runner.SCHEMA_VERSION)
@@ -2865,7 +3133,6 @@ class RepositoryManifestTest(unittest.TestCase):
                 "apply_patch_cli",
                 "approvals",
                 "exec_policy",
-                "extension_sandbox",
                 "hooks_windows",
                 "permissions_messages",
                 "request_permissions",
@@ -2898,7 +3165,6 @@ class RepositoryManifestTest(unittest.TestCase):
                 "otel",
                 "responses_api_proxy_headers",
                 "responses_headers",
-                "responses_lite",
                 "websocket_fallback",
             ],
             "core_agents_review": [
@@ -3323,6 +3589,131 @@ class JustfileContractTest(unittest.TestCase):
                 elif parsed.command == "run-gate":
                     for name in parsed.names:
                         self.assertIn(name, manifest.gates)
+
+
+class TestSpeedContractTest(RunnerTestCase):
+    def test_cargo_profile_rejects_paths_before_execution_or_staging(self):
+        executor = FakeExecutor()
+        for profile in ["", "../outside", "C:\\outside", "/outside"]:
+            with (
+                self.subTest(profile=profile),
+                self.assertRaisesRegex(RunnerError, "profile name"),
+            ):
+                RustTestRunner(
+                    self.manifest(),
+                    self.metadata(),
+                    cargo_profile=profile,
+                    executor=executor,
+                )
+        self.assertEqual(executor.calls, [])
+
+    def test_cargo_profile_reaches_test_discovery_execution_and_helpers(self):
+        runner = RustTestRunner(
+            self.manifest(),
+            self.metadata(),
+            target_dir=self.target_dir,
+            cargo_profile="dev-small",
+        )
+        target = runner.target("core_all")
+        for verb in ["list", "run"]:
+            command = runner._selection_command(verb, target)
+            self.assertEqual(command[command.index("--cargo-profile") + 1], "dev-small")
+        build = runner._helper_build(runner.active_helpers(["core_all"]))
+        self.assertEqual(build[build.index("--profile") + 1], "dev-small")
+        parsed = rust_test_runner.build_parser().parse_args(
+            ["--cargo-profile", "dev-small", "run-target", "core_all"]
+        )
+        self.assertEqual(parsed.cargo_profile, "dev-small")
+
+    def test_fixture_seed_is_invocation_scoped_and_cleaned_on_failure(self):
+        seeds = []
+
+        def execute(args, *, env, **kwargs):
+            seed = Path(env["KD4_AGENT_TASK_FIXTURE_SEED"])
+            self.assertTrue(seed.is_dir())
+            self.assertEqual(list(seed.iterdir()), [])
+            (seed / "ready").mkdir()
+            seeds.append(seed)
+            raise RuntimeError("test failure")
+
+        runner = RustTestRunner(
+            self.manifest(),
+            self.metadata(),
+            executor=execute,
+            env={
+                "KD4_AGENT_TASK_FIXTURE_SEED": "stale",
+            },
+        )
+        self.assertNotIn("KD4_AGENT_TASK_FIXTURE_SEED", runner.base_env)
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "test failure"):
+                runner._execute(
+                    ["cargo", "nextest", "run", "-p", "codex-agent-task-store"],
+                    env=runner.base_env,
+                    capture=rust_test_runner.CAPTURE_BOTH,
+                )
+        self.assertNotEqual(seeds[0], seeds[1])
+        self.assertTrue(all(not seed.exists() for seed in seeds))
+
+    def test_app_server_shards_own_each_v2_module_exactly_once(self):
+        root = rust_test_runner.CODEX_RS_ROOT / "app-server" / "tests"
+        manifest = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
+        sources = [
+            root / "suite" / "v2" / "mod.rs",
+            *sorted(root.glob("app_server_*.rs")),
+        ]
+        owners = {}
+        for source in sources:
+            for module in re.findall(
+                r"\bmod (\w+);", source.read_text(encoding="utf-8")
+            ):
+                self.assertNotIn(module, owners, f"duplicate module {module}")
+                owners[module] = source
+            if source.name != "mod.rs":
+                target = manifest.targets[source.stem]
+                self.assertEqual(target.package, "codex-app-server")
+                self.assertEqual(target.selector_value, source.stem)
+        nested = set()
+        for module in owners:
+            source = root / "suite" / "v2" / f"{module}.rs"
+            for filename in re.findall(
+                r'#\[path = "([^"/]+\.rs)"\]', source.read_text(encoding="utf-8")
+            ):
+                self.assertTrue(source.with_name(filename).is_file())
+                self.assertNotIn(Path(filename).stem, nested)
+                nested.add(Path(filename).stem)
+        self.assertTrue(set(owners).isdisjoint(nested))
+        self.assertEqual(
+            set(owners) | nested,
+            {
+                path.stem
+                for path in (root / "suite" / "v2").glob("*.rs")
+                if path.name != "mod.rs"
+            },
+        )
+        for module, owner in owners.items():
+            source = root / "suite" / "v2" / f"{module}.rs"
+            for dependency in re.findall(
+                r"super::(\w+)::", source.read_text(encoding="utf-8")
+            ):
+                if dependency in owners:
+                    self.assertEqual(
+                        owners[dependency], owner, f"{module} depends on {dependency}"
+                    )
+
+    def test_slow_boundaries_remain_in_an_explicit_gate(self):
+        manifest = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
+        config = tomllib.loads(
+            (rust_test_runner.CODEX_RS_ROOT / ".config" / "nextest.toml").read_text()
+        )
+        steps = manifest.gates["test-slow-boundaries"].steps
+        self.assertEqual(len(steps), 1)
+        for step in steps:
+            self.assertEqual(len(step.tests), 1)
+            self.assertIn(
+                f"test(={step.tests[0]})", config["profile"]["fast"]["default-filter"]
+            )
+        self.assertNotIn("default-filter", config["profile"]["local"])
 
 
 if __name__ == "__main__":

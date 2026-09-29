@@ -233,7 +233,7 @@ struct DurableWakePoller {
     shutdown: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(test)]
-    poll_count: Arc<std::sync::atomic::AtomicU64>,
+    poll_progress: watch::Sender<(usize, u64)>,
 }
 
 impl DurableWakePoller {
@@ -245,9 +245,9 @@ impl DurableWakePoller {
         let (active, mut active_rx) = watch::channel(false);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         #[cfg(test)]
-        let poll_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (poll_progress, _) = watch::channel((0, 0));
         #[cfg(test)]
-        let task_poll_count = Arc::clone(&poll_count);
+        let task_poll_progress = poll_progress.clone();
         let task = tokio::spawn(async move {
             let mut watermark = watermark;
             loop {
@@ -279,7 +279,7 @@ impl DurableWakePoller {
                     }
                     _ = tokio::time::sleep(EXTERNAL_WAKE_RECHECK_INTERVAL) => {
                         #[cfg(test)]
-                        task_poll_count.fetch_add(1, Ordering::Relaxed);
+                        task_poll_progress.send_modify(|(_, polls)| *polls += 1);
                         match durable_wake_watermark(&mut connection).await {
                             Ok(next_watermark) if next_watermark != watermark => {
                                 watermark = next_watermark;
@@ -311,7 +311,7 @@ impl DurableWakePoller {
             shutdown,
             task: Mutex::new(Some(task)),
             #[cfg(test)]
-            poll_count,
+            poll_progress,
         })
     }
 
@@ -319,6 +319,8 @@ impl DurableWakePoller {
         if self.waiter_count.fetch_add(1, Ordering::AcqRel) == 0 {
             self.active.send_replace(true);
         }
+        #[cfg(test)]
+        self.poll_progress.send_modify(|(waiters, _)| *waiters += 1);
         DurableWakeWaiter {
             poller: Arc::clone(self),
         }
@@ -339,6 +341,10 @@ struct DurableWakeWaiter {
 
 impl Drop for DurableWakeWaiter {
     fn drop(&mut self) {
+        #[cfg(test)]
+        self.poller
+            .poll_progress
+            .send_modify(|(waiters, _)| *waiters -= 1);
         if self.poller.waiter_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.poller.active.send_if_modified(|active| {
                 if self.poller.waiter_count.load(Ordering::Acquire) == 0 {
@@ -445,7 +451,16 @@ impl LocalAgentTaskStore {
 
     #[cfg(test)]
     pub(crate) fn durable_wake_poll_count(&self) -> u64 {
-        self.durable_wake_poller.poll_count.load(Ordering::Relaxed)
+        self.durable_wake_poller.poll_progress.borrow().1
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_durable_wake_poll(&self, waiters: usize, after: u64) {
+        let mut progress = self.durable_wake_poller.poll_progress.subscribe();
+        progress
+            .wait_for(|&(registered, polls)| registered == waiters && polls > after)
+            .await
+            .expect("test owns the durable poller");
     }
 
     #[cfg(test)]
@@ -2866,15 +2881,34 @@ LIMIT 1
         path: String,
         confidence: AttributionConfidence,
     ) -> StoreResult<MutationEventId> {
-        let normalized = normalize_repo_path_async(repo_root, &path).await?;
+        self.begin_mutations_impl(attempt_id, repo_root, vec![path], confidence)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| StoreError::CorruptData("begin returned no mutation event".into()))
+    }
+
+    async fn begin_mutations_impl(
+        &self,
+        attempt_id: AttemptId,
+        repo_root: &Path,
+        paths: Vec<String>,
+        confidence: AttributionConfidence,
+    ) -> StoreResult<Vec<MutationEventId>> {
+        let mut normalized_paths = BTreeSet::new();
+        for path in paths {
+            normalized_paths.insert(normalize_repo_path_async(repo_root, &path).await?);
+        }
         let repository = repository_identity_async(repo_root).await?;
-        let mut snapshot_candidate = None;
-        let result: StoreResult<MutationEventId> = async {
+        let mut snapshot_candidates = Vec::new();
+        let result: StoreResult<Vec<MutationEventId>> = async {
             let mut transaction = self.pool.begin().await?;
             lock_attempt_tx(&mut transaction, attempt_id).await?;
             let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
             let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
             require_repository_identity_tx(&mut transaction, &assignment, &repository).await?;
+            let mut event_ids = Vec::with_capacity(normalized_paths.len());
+            for normalized in normalized_paths {
             let existing = sqlx::query(
                 "SELECT finalized_at FROM mutation_files WHERE attempt_id = ? AND path = ?",
             )
@@ -2914,7 +2948,7 @@ LIMIT 1
                     normalized.clone(),
                 )
                 .await?;
-                snapshot_candidate = Some((snapshot_name.clone(), snapshot_path));
+                snapshot_candidates.push((snapshot_name.clone(), snapshot_path));
                 sqlx::query("INSERT INTO mutation_files (attempt_id, assignment_id, path, pre_write_hash, pre_write_existed, attribution_confidence, snapshot_name, snapshot_retained, first_observed_at, start_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
                     .bind(attempt_id.to_string())
                     .bind(assignment.assignment_id.to_string())
@@ -2952,15 +2986,22 @@ LIMIT 1
                 None,
             )
             .await?;
+            event_ids.push(event_id);
+            }
             transaction.commit().await?;
-            Ok(event_id)
+            Ok(event_ids)
         }
         .await;
-        if result.is_err()
-            && let Some((snapshot_name, snapshot_path)) = snapshot_candidate.as_ref()
-        {
-            remove_unpublished_snapshot(&self.pool, snapshot_name, snapshot_path, "begin mutation")
+        if result.is_err() {
+            for (snapshot_name, snapshot_path) in &snapshot_candidates {
+                remove_unpublished_snapshot(
+                    &self.pool,
+                    snapshot_name,
+                    snapshot_path,
+                    "begin mutations",
+                )
                 .await;
+            }
         }
         result
     }
@@ -4194,6 +4235,52 @@ impl LocalAgentTaskStore {
         Box::pin(async move {
             let result = self
                 .finalize_mutation_impl(attempt_id, repo_root, path)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
+    }
+
+    /// Capture the command's pre-write evidence in one transaction.
+    pub fn begin_mutations<'a>(
+        &'a self,
+        attempt_id: AttemptId,
+        repo_root: &'a Path,
+        paths: Vec<String>,
+        confidence: AttributionConfidence,
+    ) -> TaskStoreFuture<'a, Vec<MutationEventId>> {
+        Box::pin(async move {
+            let result = self
+                .begin_mutations_impl(attempt_id, repo_root, paths, confidence)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
+    }
+
+    /// Finalize only this command's paths, atomically, without consuming evidence
+    /// belonging to another command in the same assignment.
+    pub fn finalize_mutations<'a>(
+        &'a self,
+        attempt_id: AttemptId,
+        repo_root: &'a Path,
+        paths: Vec<String>,
+    ) -> TaskStoreFuture<'a, Vec<MutationEvidence>> {
+        Box::pin(async move {
+            let mut normalized = BTreeSet::new();
+            for path in paths {
+                normalized.insert(normalize_repo_path_async(repo_root, &path).await?);
+            }
+            let result = self
+                .finalize_mutations_atomically_impl(
+                    attempt_id,
+                    repo_root,
+                    Some(normalized.into_iter().collect()),
+                )
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();

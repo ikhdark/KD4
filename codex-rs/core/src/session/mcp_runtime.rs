@@ -299,6 +299,7 @@ mod tests {
         // A raw manager observer does not own a runtime lease. Keeping it alive
         // ensures McpConnectionManager::drop cannot mask a missing lifecycle close.
         let old_manager = old_runtime.manager_arc();
+        assert!(old_manager.wait_for_server_ready("lifecycle", Duration::from_secs(5)).await);
         let tools =
             tokio::time::timeout(Duration::from_secs(5), old_manager.list_all_tools()).await?;
         assert_eq!(tools.len(), 1);

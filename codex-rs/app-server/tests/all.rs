@@ -1,5 +1,5 @@
 #![allow(clippy::expect_used)]
 
-// Single integration test binary that aggregates all test modules.
-// The submodules live in `tests/suite/`.
+// Remaining configuration/protocol and legacy integration tests. The other
+// app_server_* binaries own bounded v2 shards; test IDs remain unchanged.
 mod suite;

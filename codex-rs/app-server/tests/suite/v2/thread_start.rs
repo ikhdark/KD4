@@ -988,7 +988,7 @@ async fn thread_start_tracks_thread_initialized_analytics() -> Result<()> {
 
     let codex_home = TempDir::new()?;
     write_mock_responses_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
+    let capture = mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_args(&["-c", "analytics.enabled=true"])
@@ -1012,7 +1012,7 @@ async fn thread_start_tracks_thread_initialized_analytics() -> Result<()> {
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
 
-    let payload = wait_for_analytics_payload(&server, DEFAULT_READ_TIMEOUT).await?;
+    let payload = wait_for_analytics_payload(&capture, DEFAULT_READ_TIMEOUT).await?;
     assert_eq!(payload["events"].as_array().expect("events array").len(), 1);
     let event = thread_initialized_event(&payload)?;
     assert_basic_thread_initialized_event(

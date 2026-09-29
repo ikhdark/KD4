@@ -1,5 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
+use codex_app_server_protocol::generate_json_schema_fixture_subtree_for_tests;
+use codex_app_server_protocol::generate_json_schema_tree;
 use codex_app_server_protocol::generate_json_with_experimental;
 use codex_app_server_protocol::generate_typescript_schema_fixture_subtree_for_tests;
 use codex_app_server_protocol::read_schema_fixture_subtree;
@@ -71,11 +73,8 @@ fn typescript_schema_fixtures_match_generated() -> Result<()> {
 fn json_schema_fixtures_match_generated() -> Result<()> {
     let schema_root = schema_root()?;
     let fixture_tree = read_tree(&schema_root, "json")?;
-    let temp_dir = tempfile::tempdir().context("create temp dir")?;
-    let generated_root = temp_dir.path().join("json");
-    generate_json_with_experimental(&generated_root, /*experimental_api*/ false)
-        .context("generate JSON schema fixtures")?;
-    let generated_tree = read_tree(temp_dir.path(), "json")?;
+    let generated_tree = generate_json_schema_fixture_subtree_for_tests()
+        .context("generate in-memory JSON schema fixtures")?;
     assert_schema_trees_match("json", &fixture_tree, &generated_tree)?;
 
     for path in [
@@ -113,6 +112,29 @@ fn json_schema_fixtures_match_generated() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn json_schema_writer_matches_in_memory_tree() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    for experimental_api in [true, false] {
+        generate_json_with_experimental(&directory.path().join("json"), experimental_api)?;
+        let written = read_tree(directory.path(), "json")?;
+        let generated = generate_json_schema_tree(experimental_api)?;
+        assert_eq!(
+            written.keys().collect::<Vec<_>>(),
+            generated.keys().collect::<Vec<_>>()
+        );
+        for (path, bytes) in generated {
+            assert_eq!(
+                std::fs::read(directory.path().join("json").join(&path))?,
+                bytes,
+                "writer must preserve exact bytes for {}",
+                path.display()
+            );
+        }
+    }
     Ok(())
 }
 

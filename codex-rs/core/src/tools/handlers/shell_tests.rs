@@ -135,9 +135,10 @@ async fn late_validation_denial_finishes_the_started_shell_event() {
 }
 
 #[test]
-fn orchestration_correctness_stall_timeout_is_opt_in() {
+fn orchestration_correctness_stall_timeout_defaults_and_overrides() {
     assert_eq!(effective_stall_timeout_ms(None, None), None);
-    assert_eq!(effective_stall_timeout_ms(Some(60_001), None), None);
+    assert_eq!(effective_stall_timeout_ms(Some(60_001), None), Some(60_000));
+    assert_eq!(effective_stall_timeout_ms(Some(300_000), None), Some(60_000));
     assert_eq!(
         effective_stall_timeout_ms(Some(300_000), Some(25_000)),
         Some(25_000)
@@ -273,70 +274,76 @@ async fn inactive_validation_enforcement_preserves_shell_failure_diagnostics() {
     }
 }
 
-#[test]
-fn shell_failure_sampling_signal_is_stable_and_distinguishes_outcomes() {
-    let key = CommandAttemptKey::new(
-        "shell_command",
-        "local",
-        "C:/repo",
-        &["git".to_string(), "status".to_string()],
-    );
-    let first = shell_failure_sampling_signal(Some(&key), "git status", Some(1))
-        .expect("nonzero exit should carry failure evidence");
-    let repeated = shell_failure_sampling_signal(Some(&key), "git status", Some(1))
-        .expect("repeated nonzero exit should carry failure evidence");
-    let timeout = shell_failure_sampling_signal(Some(&key), "git status", None)
-        .expect("timeout should carry failure evidence");
+mod pure {
+    use super::super::validation_diagnostic_range;
+    use super::*;
+    use pretty_assertions::assert_eq;
 
-    assert_eq!(first, repeated);
-    assert_ne!(first, timeout);
-    assert!(
-        first
-            .pointer("/failure/fingerprint")
-            .and_then(JsonValue::as_str)
-            .is_some_and(|fingerprint| fingerprint.starts_with("shell."))
-    );
-    assert!(shell_failure_sampling_signal(Some(&key), "git status", Some(0)).is_none());
-}
+    #[test]
+    fn shell_failure_sampling_signal_is_stable_and_distinguishes_outcomes() {
+        let key = CommandAttemptKey::new(
+            "shell_command",
+            "local",
+            "C:/repo",
+            &["git".to_string(), "status".to_string()],
+        );
+        let first = shell_failure_sampling_signal(Some(&key), "git status", Some(1))
+            .expect("nonzero exit should carry failure evidence");
+        let repeated = shell_failure_sampling_signal(Some(&key), "git status", Some(1))
+            .expect("repeated nonzero exit should carry failure evidence");
+        let timeout = shell_failure_sampling_signal(Some(&key), "git status", None)
+            .expect("timeout should carry failure evidence");
 
-#[test]
-fn successful_shell_sampling_signal_uses_canonical_output() {
-    let key = CommandAttemptKey::new(
-        "shell_command",
-        "local",
-        "C:/repo",
-        &["git".to_string(), "status".to_string()],
-    );
-    let first = shell_sampling_signal(Some(&key), "git status", Some(0), Some(b"clean\n"));
-    let repeated = shell_sampling_signal(Some(&key), "git status", Some(0), Some(b"clean\n"));
+        assert_eq!(first, repeated);
+        assert_ne!(first, timeout);
+        assert!(
+            first
+                .pointer("/failure/fingerprint")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|fingerprint| fingerprint.starts_with("shell."))
+        );
+        assert!(shell_failure_sampling_signal(Some(&key), "git status", Some(0)).is_none());
+    }
 
-    assert!(first.is_some());
-    assert_eq!(first, repeated);
-}
+    #[test]
+    fn successful_shell_sampling_signal_uses_canonical_output() {
+        let key = CommandAttemptKey::new(
+            "shell_command",
+            "local",
+            "C:/repo",
+            &["git".to_string(), "status".to_string()],
+        );
+        let first = shell_sampling_signal(Some(&key), "git status", Some(0), Some(b"clean\n"));
+        let repeated = shell_sampling_signal(Some(&key), "git status", Some(0), Some(b"clean\n"));
 
-#[test]
-fn validation_diagnostic_ranges_are_exact_and_bounded() {
-    let range = super::validation_diagnostic_range("validation:diagnostics", b"first\nsecond\n")
-        .expect("bounded diagnostics");
-    assert_eq!(range.id, "validation:diagnostics");
-    assert_eq!((range.start_line, range.end_line), (1, 2));
+        assert!(first.is_some());
+        assert_eq!(first, repeated);
+    }
 
-    assert!(super::validation_diagnostic_range("", b"failure\n").is_none());
-    let at_byte_limit =
-        super::validation_diagnostic_range("validation:diagnostics", &vec![b'x'; 12 * 1024])
-            .expect("diagnostic exactly at the byte limit");
-    assert_eq!((at_byte_limit.start_line, at_byte_limit.end_line), (1, 1));
-    assert!(
-        super::validation_diagnostic_range("validation:diagnostics", &vec![b'x'; 12 * 1024 + 1],)
-            .is_none()
-    );
-    let too_many_lines = std::iter::repeat_n("line", 201)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let range =
-        super::validation_diagnostic_range("validation:diagnostics", too_many_lines.as_bytes())
-            .expect("large output retains a bounded range");
-    assert_eq!((range.start_line, range.end_line), (2, 201));
+    #[test]
+    fn validation_diagnostic_ranges_are_exact_and_bounded() {
+        let range = validation_diagnostic_range("validation:diagnostics", b"first\nsecond\n")
+            .expect("bounded diagnostics");
+        assert_eq!(range.id, "validation:diagnostics");
+        assert_eq!((range.start_line, range.end_line), (1, 2));
+
+        assert!(validation_diagnostic_range("", b"failure\n").is_none());
+        let at_byte_limit =
+            validation_diagnostic_range("validation:diagnostics", &vec![b'x'; 12 * 1024])
+                .expect("diagnostic exactly at the byte limit");
+        assert_eq!((at_byte_limit.start_line, at_byte_limit.end_line), (1, 1));
+        assert!(
+            validation_diagnostic_range("validation:diagnostics", &vec![b'x'; 12 * 1024 + 1],)
+                .is_none()
+        );
+        let too_many_lines = std::iter::repeat_n("line", 201)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let range =
+            validation_diagnostic_range("validation:diagnostics", too_many_lines.as_bytes())
+                .expect("large output retains a bounded range");
+        assert_eq!((range.start_line, range.end_line), (2, 201));
+    }
 }
 
 #[test]

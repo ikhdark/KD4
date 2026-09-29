@@ -43,7 +43,6 @@ use codex_rollout::read_session_meta_line;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
-use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use wiremock::Mock;
@@ -698,7 +697,7 @@ async fn thread_fork_tracks_thread_initialized_analytics() -> Result<()> {
 
     let codex_home = TempDir::new()?;
     write_mock_responses_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
+    let capture = mount_analytics_capture(&server, codex_home.path()).await?;
 
     let conversation_id = create_fake_rollout(
         codex_home.path(),
@@ -732,7 +731,7 @@ async fn thread_fork_tracks_thread_initialized_analytics() -> Result<()> {
     .await??;
     let ThreadForkResponse { thread, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
 
-    let payload = wait_for_analytics_payload(&server, DEFAULT_READ_TIMEOUT).await?;
+    let payload = wait_for_analytics_payload(&capture, DEFAULT_READ_TIMEOUT).await?;
     let event = thread_initialized_event(&payload)?;
     assert_basic_thread_initialized_event(
         event,

@@ -28,6 +28,19 @@ use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_protocol::protocol::ToolExecutionId;
 
+#[tokio::test(start_paused = true)]
+async fn trailing_output_waits_for_quiet_without_extending_the_hard_bound() {
+    let start = tokio::time::Instant::now();
+    let hard = start + super::TRAILING_OUTPUT_GRACE;
+    let quiet = super::trailing_output_deadline(start, hard);
+    assert!(quiet < hard);
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let extended = super::trailing_output_deadline(tokio::time::Instant::now(), hard);
+    assert!(extended > quiet);
+    tokio::time::advance(Duration::from_millis(85)).await;
+    assert_eq!(super::trailing_output_deadline(tokio::time::Instant::now(), hard), hard);
+}
+
 #[tokio::test]
 async fn process_exit_before_async_watcher_registration_is_observed_once() {
     let ledger = CommandExecutionLedger::default();

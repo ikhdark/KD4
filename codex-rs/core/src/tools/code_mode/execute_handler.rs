@@ -231,6 +231,14 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .record_cell_parent_call_id(&cell_id, &call_id);
+        exec.session.services.code_mode_service.record_output_budget(
+            &cell_id,
+            Some(args.max_output_tokens
+                .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+                .min(exec.turn.config.tool_output_token_limit
+                    .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL))
+                .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)),
+        );
         // Establish cleanup ownership before queuing trace work.
         let dispatch_lease = CellDispatchLease::new(Arc::clone(&exec.session), cell_id.clone());
         let trace_enabled = exec.session.services.rollout_thread_trace.is_enabled();

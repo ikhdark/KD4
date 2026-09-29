@@ -41,12 +41,15 @@ async fn legacy_metadata_streams_before_optional_late_session_meta() {
         });
         let mut file = File::create(&path).expect("create rollout");
         let mut accumulator = RolloutMetadataAccumulator::default();
-        for index in 0..1024 {
+        // Keep the large streaming regression on the imported/late-metadata
+        // path; the other cases exercise metadata semantics, not file size.
+        let large_stream = late_meta && !standard_filename;
+        for index in 0..if large_stream { 1024 } else { 3 } {
             let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
                 message: if index == 0 {
                     "first retained message".to_string()
                 } else {
-                    "later payload ".repeat(1024)
+                    "later payload ".repeat(if large_stream { 1024 } else { 1 })
                 },
                 ..Default::default()
             }));
@@ -477,7 +480,22 @@ async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
         .expect("checkpoint first watermark");
     // The production lease must still protect a worker after the former
     // one-second test-only lease would have expired.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    {
+        use sqlx::Connection;
+        let mut connection = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(codex_state::state_db_path(&codex_home)),
+        )
+        .await
+        .expect("open fixture state database");
+        let changed = sqlx::query("UPDATE backfill_state SET updated_at = ? WHERE id = 1")
+            .bind(Utc::now().timestamp() - 2)
+            .execute(&mut connection)
+            .await
+            .expect("backdate active fixture lease");
+        assert_eq!(changed.rows_affected(), 1);
+        connection.close().await.expect("close fixture connection");
+    }
     backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
     assert_eq!(
         runtime

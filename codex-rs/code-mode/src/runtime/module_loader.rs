@@ -68,7 +68,7 @@ pub(super) fn resolve_tool_response(
     id: &str,
     response: Result<JsonValue, String>,
 ) -> Result<(), String> {
-    let resolver = {
+    let (resolver, tool_name) = {
         let state = scope
             .get_slot_mut::<RuntimeState>()
             .ok_or_else(|| "runtime state unavailable".to_string())?;
@@ -83,6 +83,9 @@ pub(super) fn resolve_tool_response(
         Ok(result) => {
             let value = json_to_v8(&mut tc, &result)
                 .ok_or_else(|| "failed to serialize tool response".to_string())?;
+            if let Some(projected) = codex_code_mode_protocol::model_visible_tool_result(&tool_name, &result) {
+                super::output_projection::register(&mut tc, value, &result, &projected)?;
+            }
             resolver.resolve(&tc, value);
         }
         Err(error_text) => {

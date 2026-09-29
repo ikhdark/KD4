@@ -712,18 +712,7 @@ impl ToolSearchHandler {
                     .push(ToolSearchDocumentId(index));
             }
         }
-        let has_unnamed_tools = search_infos
-            .iter()
-            .any(|search_info| search_info.source_info.is_none());
-        let search_source_infos = search_infos
-            .iter()
-            .filter_map(|search_info| search_info.source_info.clone())
-            .collect::<Vec<_>>();
-        let spec = create_tool_search_tool(
-            &search_source_infos,
-            has_unnamed_tools,
-            TOOL_SEARCH_DEFAULT_LIMIT,
-        );
+        let spec = create_tool_search_tool(TOOL_SEARCH_DEFAULT_LIMIT);
         let search_index = Arc::new(ToolSearchIndex::new(&search_infos));
 
         Self {

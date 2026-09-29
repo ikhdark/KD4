@@ -972,6 +972,47 @@ async fn fail_and_terminate_preserves_failure_message() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn stall_timeout_resets_on_stdout_and_stderr_then_terminates() {
+    let process = remote_process(WriteStatus::Accepted, None).await;
+    process.start_stall_watchdog(Some(100));
+    tokio::task::yield_now().await;
+    for stream in [ExecOutputStream::Stdout, ExecOutputStream::Stderr, ExecOutputStream::Stdout] {
+        tokio::time::advance(Duration::from_millis(60)).await;
+        process.publish_stream_output_for_test(stream, b"progress".to_vec()).await;
+        tokio::task::yield_now().await;
+        assert!(!process.has_exited());
+        assert_eq!(process.failure_message(), None);
+    }
+    tokio::time::advance(Duration::from_millis(101)).await;
+    tokio::time::timeout(Duration::from_secs(1), process.cancellation_token().cancelled()).await.unwrap();
+    assert!(process.has_exited());
+    assert!(process.termination_was_requested());
+    assert_eq!(process.failure_message().as_deref(), Some("command stalled after 100 milliseconds without stdout or stderr"));
+    assert_eq!(process.snapshot_output().await, b"progressprogressprogress");
+}
+
+#[tokio::test(start_paused = true)]
+async fn stall_timeout_disabled_and_exited_processes_are_not_terminated() {
+    for timeout in [None, Some(0)] {
+        let process = remote_process(WriteStatus::Accepted, None).await;
+        process.start_stall_watchdog(timeout);
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(!process.has_exited());
+        assert!(!process.termination_was_requested());
+        process.terminate_confirmed().await.unwrap();
+    }
+    let process = remote_process(WriteStatus::Accepted, None).await;
+    process.start_stall_watchdog(Some(100));
+    process.signal_exit_for_test(Some(0));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(!process.termination_was_requested());
+    assert_eq!(process.failure_message(), None);
+    assert_eq!(process.exit_code(), Some(0));
+}
+
 #[tokio::test]
 async fn tool_result_correctness_exited_process_with_open_output_is_not_running() {
     let (session, turn) = make_session_and_context().await;
@@ -2135,7 +2176,13 @@ async fn local_process_exited_before_registration_closes_output_before_denial_ch
         spawn_pipe_process_no_stdin("cmd.exe", &args, temp.path(), &HashMap::new(), &None)
             .await
             .expect("quick local fixture process should spawn");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !spawned.session.has_exited() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture must exit before registration without consuming its exit receiver");
 
     let process = tokio::time::timeout(
         Duration::from_secs(1),

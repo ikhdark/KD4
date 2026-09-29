@@ -27,7 +27,7 @@ const REMOTE_IMAGE_URL_ERROR: &str =
     "remote image URLs are not supported; use an inline data URL instead";
 
 async fn assert_rejected_steer_analytics(
-    server: &wiremock::MockServer,
+    server: &super::analytics::AnalyticsCapture,
     expected_turn_id: &str,
 ) -> Result<()> {
     let event = wait_for_matching_analytics_event(server, DEFAULT_READ_TIMEOUT, |event| {
@@ -140,7 +140,7 @@ async fn turn_steer_rejections_emit_analytics_for_preflight_and_queue_failures()
         &server.uri(),
         &server.uri(),
     )?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
+    let capture = mount_analytics_capture(&server, codex_home.path()).await?;
     let mut mcp = TestAppServer::builder()
         .with_args(&["-c", "analytics.enabled=true"])
         .with_codex_home(codex_home.path())
@@ -178,7 +178,7 @@ async fn turn_steer_rejections_emit_analytics_for_preflight_and_queue_failures()
     )
     .await??;
     assert_eq!(remote_image_error.error.code, -32600);
-    assert_rejected_steer_analytics(&server, "remote-image").await?;
+    assert_rejected_steer_analytics(&capture, "remote-image").await?;
 
     let oversized_source = "s".repeat(257);
     let additional_context_request_id = mcp
@@ -200,7 +200,7 @@ async fn turn_steer_rejections_emit_analytics_for_preflight_and_queue_failures()
     )
     .await??;
     assert_eq!(additional_context_error.error.code, -32600);
-    assert_rejected_steer_analytics(&server, "additional-context").await?;
+    assert_rejected_steer_analytics(&capture, "additional-context").await?;
 
     let empty_turn_id_request_id = mcp
         .send_raw_request(
@@ -218,9 +218,10 @@ async fn turn_steer_rejections_emit_analytics_for_preflight_and_queue_failures()
     )
     .await??;
     assert_eq!(empty_turn_id_error.error.code, -32600);
-    assert_rejected_steer_analytics(&server, "").await?;
+    assert_rejected_steer_analytics(&capture, "").await?;
 
-    let queue_overload_context = (0..384)
+    // Exceed the 16 MiB per-thread admission budget before context validation.
+    let queue_overload_context = (0..1025)
         .map(|index| {
             (
                 format!("source-{index}"),
@@ -248,7 +249,7 @@ async fn turn_steer_rejections_emit_analytics_for_preflight_and_queue_failures()
         queue_overload_error.error.code,
         codex_app_server_protocol::OVERLOADED_ERROR_CODE
     );
-    assert_rejected_steer_analytics(&server, "queue-overload").await?;
+    assert_rejected_steer_analytics(&capture, "queue-overload").await?;
 
     Ok(())
 }

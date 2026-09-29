@@ -16,6 +16,10 @@ async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()
     let server = start_mock_server().await;
 
     let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .disable(Feature::CodeModeHost)
+            .expect("deprecation notices do not execute Code Mode");
         let mut features = config.features.get().clone();
         features.enable(Feature::UnifiedExec);
         features
@@ -57,6 +61,10 @@ async fn emits_deprecation_notice_for_web_search_feature_flag_values() -> anyhow
         let server = start_mock_server().await;
 
         let mut builder = test_codex().with_config(move |config| {
+            config
+                .features
+                .disable(Feature::CodeModeHost)
+                .expect("deprecation notices do not execute Code Mode");
             let mut entries = BTreeMap::new();
             entries.insert("web_search_request".to_string(), enabled);
             let mut features = config.features.get().clone();

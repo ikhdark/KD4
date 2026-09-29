@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn timeout_covers_process_admission_before_spawn() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let marker = temp_dir.path().join("spawned-after-admission-timeout.txt");
@@ -811,14 +811,21 @@ mod tests {
         #[cfg(windows)]
         let command = {
             let marker = marker.to_string_lossy().replace('\'', "''");
+            let child_script = temp_dir.path().join("child.ps1");
+            std::fs::write(
+                &child_script,
+                format!("Start-Sleep -Seconds 3; Set-Content -LiteralPath '{marker}' -Value done"),
+            )
+            .expect("write child script");
+            let child_script = child_script.to_string_lossy().replace('\'', "''");
             format!(
-                "Start-Job -ScriptBlock {{ Start-Sleep -Seconds 3; Set-Content -LiteralPath '{marker}' -Value done }} | Out-Null; Start-Sleep -Seconds 60"
+                "$child = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile -NonInteractive -File \"{child_script}\"'; Set-Content -Encoding ascii child.pid $child.Id; Start-Sleep -Seconds 60"
             )
         };
         #[cfg(not(windows))]
         let command = {
             let marker = marker.to_string_lossy().replace('\'', "'\\''");
-            format!("(sleep 3; printf done > '{marker}') & sleep 60")
+            format!("(sleep 3; printf done > '{marker}') & printf '%s' $! > child.pid; sleep 60")
         };
 
         let handler = test_handler(command, 1, &cwd);
@@ -831,7 +838,14 @@ mod tests {
         .expect("run_command should enforce its timeout");
 
         assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        let pid = std::fs::read_to_string(temp_dir.path().join("child.pid"))
+            .expect("descendant was spawned")
+            .trim()
+            .parse()
+            .expect("descendant PID");
+        codex_utils_pty::test_support::wait_for_process_exit(pid, Duration::from_secs(2))
+            .await
+            .expect("timeout must terminate the descendant");
         assert!(
             !marker.exists(),
             "a descendant survived the hook timeout and wrote {}",
@@ -845,14 +859,21 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("cwd");
         let handler = test_handler(
-            "(sleep 1; printf late > escaped.txt) </dev/null >/dev/null 2>&1 & exit 0".to_string(),
+            "(sleep 1; printf late > escaped.txt) </dev/null >/dev/null 2>&1 & printf '%s' $! > child.pid; exit 0".to_string(),
             5,
             &cwd,
         );
         let result = run_command(&explicit_test_shell(), &handler, 0, "{}", cwd.as_path()).await;
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.error, None);
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let pid = std::fs::read_to_string(temp_dir.path().join("child.pid"))
+            .expect("descendant was spawned")
+            .trim()
+            .parse()
+            .expect("descendant PID");
+        codex_utils_pty::test_support::wait_for_process_exit(pid, Duration::from_secs(2))
+            .await
+            .expect("normal completion must terminate the descendant");
         assert!(!temp_dir.path().join("escaped.txt").exists());
     }
 
@@ -861,15 +882,22 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("cwd");
         #[cfg(windows)]
-        let script = "Start-Sleep -Seconds 3; Set-Content escaped.txt late";
+        let script = "Set-Content -Encoding ascii child.pid $PID; Start-Sleep -Seconds 3; Set-Content escaped.txt late";
         #[cfg(not(windows))]
-        let script = "(sleep 3; printf late > escaped.txt) & sleep 60";
+        let script = "(sleep 3; printf late > escaped.txt) & printf '%s' $! > child.pid; sleep 60";
         let handler = test_handler(script.to_string(), 1, &cwd);
         let mut command = build_command(&explicit_test_shell(), &handler);
         command.current_dir(cwd.as_path());
         let result = super::run_finalizer_command(command, 1).await;
         assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        let pid = std::fs::read_to_string(temp_dir.path().join("child.pid"))
+            .expect("finalizer process was spawned")
+            .trim()
+            .parse()
+            .expect("finalizer PID");
+        codex_utils_pty::test_support::wait_for_process_exit(pid, Duration::from_secs(2))
+            .await
+            .expect("finalizer deadline must terminate its process tree");
         assert!(!temp_dir.path().join("escaped.txt").exists());
     }
 

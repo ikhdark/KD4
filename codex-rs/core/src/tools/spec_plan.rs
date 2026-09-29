@@ -76,7 +76,6 @@ use codex_features::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS;
 use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
 use codex_login::AuthManager;
 use codex_mcp::ToolInfo;
-use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -649,6 +648,9 @@ fn is_hidden_by_code_mode_only(
     let tool_mode = effective_tool_mode(turn_context);
     tool_mode == ToolMode::CodeModeOnly
         && exposure != ToolExposure::DirectModelOnly
+        // Keep raw patches available without JavaScript string escaping. The
+        // nested entry remains callable for compatibility with existing cells.
+        && tool_name != &ToolName::plain("apply_patch")
         && !is_excluded_from_code_mode(turn_context, tool_name)
         && codex_code_mode::is_code_mode_nested_tool(&codex_tools::code_mode_name_for_tool_name(
             tool_name,
@@ -996,13 +998,12 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         planned_tools.add_with_authorization_class(ListFilesHandler, TypedToolClass::ReadSearch);
     }
 
-    if turn_context.collaboration_mode.mode != ModeKind::Plan {
-        planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);
-        planned_tools.add_with_authorization_class(
-            crate::tools::handlers::ContextCheckpointHandler,
-            TypedToolClass::OwnTask,
-        );
-    }
+    // Mode restrictions belong in dispatch, not in the cached tool schema.
+    planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);
+    planned_tools.add_with_authorization_class(
+        crate::tools::handlers::ContextCheckpointHandler,
+        TypedToolClass::OwnTask,
+    );
 
     if features.enabled(Feature::DeferredExecutor)
         && !context.step_context.environments.starting.is_empty()

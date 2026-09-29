@@ -1037,25 +1037,24 @@ mod tests {
 
     #[test]
     fn controlling_ipc_eof_terminates_process_tree() -> anyhow::Result<()> {
+        use windows_sys::Win32::System::Threading::OpenProcess;
+        use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+
         let temp_dir = tempfile::TempDir::new()?;
         let start_marker = temp_dir.path().join("start");
         let ready_marker = temp_dir.path().join("ready");
-        let survival_marker = temp_dir.path().join("survived");
-        let descendant_script = format!(
-            "Start-Sleep -Seconds 2; Set-Content -LiteralPath '{}' -Value survived",
-            powershell_literal_path(&survival_marker)
-        );
-        let descendant_script = encode_powershell_script(&descendant_script);
+        let descendant_script = encode_powershell_script("Start-Sleep -Seconds 60");
         let root_script = format!(
             "$ErrorActionPreference = 'Stop'; \
              while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 25 }}; \
-             $null = Start-Process -FilePath 'powershell.exe' \
+             $child = Start-Process -FilePath 'powershell.exe' -PassThru \
                  -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant_script}') \
                  -WindowStyle Hidden; \
-             Set-Content -LiteralPath '{}' -Value ready; \
+             Set-Content -LiteralPath '{ready}.pending' -Value $child.Id; \
+             Move-Item -LiteralPath '{ready}.pending' -Destination '{ready}'; \
              Start-Sleep -Seconds 60",
             powershell_literal_path(&start_marker),
-            powershell_literal_path(&ready_marker)
+            ready = powershell_literal_path(&ready_marker)
         );
         let root_script = encode_powershell_script(&root_script);
         let mut root = std::process::Command::new("powershell.exe")
@@ -1080,6 +1079,18 @@ mod tests {
         assert!(
             wait_for_path(&ready_marker, Duration::from_secs(10)),
             "descendant did not start"
+        );
+        let descendant_pid: u32 = std::fs::read_to_string(&ready_marker)?.trim().parse()?;
+        // SAFETY: this PID was recorded by our child; retain the handle across
+        // termination so PID reuse cannot turn the observation into a false pass.
+        let descendant = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, descendant_pid) };
+        if descendant.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let descendant = OwnedWinHandle::new(descendant);
+        assert_eq!(
+            wait_for_process(descendant.raw(), 0),
+            ProcessWaitOutcome::TimedOut
         );
 
         let mut control_read: HANDLE = std::ptr::null_mut();
@@ -1114,9 +1125,9 @@ mod tests {
             ProcessWaitOutcome::Exited,
             "root survived control-pipe EOF"
         );
-        std::thread::sleep(Duration::from_secs(3));
-        assert!(
-            !survival_marker.exists(),
+        assert_eq!(
+            wait_for_process(descendant.raw(), 2_000),
+            ProcessWaitOutcome::Exited,
             "descendant survived control-pipe EOF"
         );
         Ok(())

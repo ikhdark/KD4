@@ -86,7 +86,7 @@ impl GeneratedSchema {
     }
 }
 
-type JsonSchemaEmitter = fn(&Path) -> Result<GeneratedSchema>;
+type JsonSchemaEmitter = fn() -> Result<GeneratedSchema>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct GenerateTsOptions {
@@ -233,42 +233,65 @@ pub fn generate_internal_json_schema(out_dir: &Path) -> Result<()> {
 
 pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -> Result<()> {
     ensure_dir(out_dir)?;
+    for (relative_path, bytes) in generate_json_schema_tree(experimental_api)? {
+        let path = out_dir.join(relative_path);
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        fs::write(&path, bytes).with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    if !experimental_api {
+        // Preserve filtering of files already present in a reused output tree.
+        filter_experimental_json_files(
+            out_dir,
+            &experimental_fields(),
+            &experimental_methods(),
+            &experimental_method_types(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Generate exactly the JSON fixture bytes without materializing a scratch tree.
+#[doc(hidden)]
+pub fn generate_json_schema_tree(experimental_api: bool) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
     let envelope_emitters: Vec<JsonSchemaEmitter> = vec![
-        |d| write_json_schema_with_return::<crate::RequestId>(d, "RequestId"),
-        |d| write_json_schema_with_return::<crate::JSONRPCMessage>(d, "JSONRPCMessage"),
-        |d| write_json_schema_with_return::<crate::JSONRPCRequest>(d, "JSONRPCRequest"),
-        |d| write_json_schema_with_return::<crate::JSONRPCNotification>(d, "JSONRPCNotification"),
-        |d| write_json_schema_with_return::<crate::JSONRPCResponse>(d, "JSONRPCResponse"),
-        |d| write_json_schema_with_return::<crate::JSONRPCError>(d, "JSONRPCError"),
-        |d| write_json_schema_with_return::<crate::JSONRPCErrorError>(d, "JSONRPCErrorError"),
-        |d| write_json_schema_with_return::<crate::OverloadErrorData>(d, "OverloadErrorData"),
-        |d| {
-            write_json_schema_with_return::<crate::PluginRemoteErrorData>(
-                d,
-                "v2::PluginRemoteErrorData",
-            )
-        },
-        |d| write_json_schema_with_return::<crate::ThreadErrorData>(d, "v2::ThreadErrorData"),
-        |d| write_json_schema_with_return::<crate::ClientRequest>(d, "ClientRequest"),
-        |d| write_json_schema_with_return::<crate::ServerRequest>(d, "ServerRequest"),
-        |d| write_json_schema_with_return::<crate::ClientNotification>(d, "ClientNotification"),
-        |d| write_json_schema_with_return::<crate::ServerNotification>(d, "ServerNotification"),
+        || generate_json_schema::<crate::RequestId>("RequestId"),
+        || generate_json_schema::<crate::JSONRPCMessage>("JSONRPCMessage"),
+        || generate_json_schema::<crate::JSONRPCRequest>("JSONRPCRequest"),
+        || generate_json_schema::<crate::JSONRPCNotification>("JSONRPCNotification"),
+        || generate_json_schema::<crate::JSONRPCResponse>("JSONRPCResponse"),
+        || generate_json_schema::<crate::JSONRPCError>("JSONRPCError"),
+        || generate_json_schema::<crate::JSONRPCErrorError>("JSONRPCErrorError"),
+        || generate_json_schema::<crate::OverloadErrorData>("OverloadErrorData"),
+        || generate_json_schema::<crate::PluginRemoteErrorData>("v2::PluginRemoteErrorData"),
+        || generate_json_schema::<crate::ThreadErrorData>("v2::ThreadErrorData"),
+        || generate_json_schema::<crate::ClientRequest>("ClientRequest"),
+        || generate_json_schema::<crate::ServerRequest>("ServerRequest"),
+        || generate_json_schema::<crate::ClientNotification>("ClientNotification"),
+        || generate_json_schema::<crate::ServerNotification>("ServerNotification"),
     ];
 
     let mut schemas: Vec<GeneratedSchema> = Vec::new();
     for emit in &envelope_emitters {
-        schemas.push(emit(out_dir)?);
+        schemas.push(emit()?);
     }
 
-    schemas.extend(export_client_param_schemas(out_dir)?);
-    schemas.extend(export_client_response_schemas(out_dir)?);
-    schemas.extend(export_server_param_schemas(out_dir)?);
-    schemas.extend(export_server_response_schemas(out_dir)?);
-    schemas.extend(export_client_notification_schemas(out_dir)?);
-    schemas.extend(export_server_notification_schemas(out_dir)?);
+    schemas.extend(export_client_param_schemas()?);
+    schemas.extend(export_client_response_schemas()?);
+    schemas.extend(export_server_param_schemas()?);
+    schemas.extend(export_server_response_schemas()?);
+    schemas.extend(export_client_notification_schemas()?);
+    schemas.extend(export_server_notification_schemas()?);
     schemas
         .retain(|schema| !schema.in_v1_dir || JSON_V1_ALLOWLIST.contains(&schema.logical_name()));
 
+    let mut tree = schemas
+        .iter()
+        .filter_map(|schema| {
+            json_schema_relative_path(schema).map(|path| (path, schema.value.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut bundle = build_schema_bundle(schemas)?;
     let registered_fields = experimental_fields();
     let method_types = experimental_method_types();
@@ -280,19 +303,32 @@ pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -
             &methods,
             &method_types,
         );
-        filter_experimental_json_files(out_dir, &registered_fields, &methods, &method_types)?;
+        for value in tree.values_mut() {
+            filter_experimental_schema_with_metadata(
+                value,
+                &registered_fields,
+                &methods,
+                &method_types,
+            );
+        }
+        for type_name in &method_types {
+            for directory in ["", "v1", "v2"] {
+                tree.remove(&Path::new(directory).join(format!("{type_name}.json")));
+            }
+        }
     }
-    write_pretty_json(
-        out_dir.join("codex_app_server_protocol.schemas.json"),
-        &bundle,
-    )?;
     let flat_v2_bundle = build_flat_v2_schema(&bundle)?;
-    write_pretty_json(
-        out_dir.join("codex_app_server_protocol.v2.schemas.json"),
-        &flat_v2_bundle,
-    )?;
-
-    Ok(())
+    tree.insert(
+        PathBuf::from("codex_app_server_protocol.schemas.json"),
+        bundle,
+    );
+    tree.insert(
+        PathBuf::from("codex_app_server_protocol.v2.schemas.json"),
+        flat_v2_bundle,
+    );
+    tree.into_iter()
+        .map(|(path, value)| Ok((path, pretty_json_bytes(&value)?)))
+        .collect()
 }
 
 fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
@@ -1468,7 +1504,7 @@ fn insert_definition(
     Ok(())
 }
 
-fn write_json_schema_with_return<T>(out_dir: &Path, name: &str) -> Result<GeneratedSchema>
+pub(crate) fn generate_json_schema<T>(name: &str) -> Result<GeneratedSchema>
 where
     T: JsonSchema,
 {
@@ -1487,22 +1523,6 @@ where
         enforce_numbered_definition_collision_overrides(file_stem, &mut schema_value);
         annotate_schema(&mut schema_value, Some(file_stem));
     }
-    // If the name looks like a namespaced path (e.g., "v2::Type"), mirror
-    // the TypeScript layout and write to out_dir/v2/Type.json. Otherwise
-    // write alongside the legacy files.
-    let out_path = if let Some(ns) = raw_namespace {
-        let dir = out_dir.join(ns);
-        ensure_dir(&dir)?;
-        dir.join(format!("{logical_name}.json"))
-    } else {
-        out_dir.join(format!("{file_stem}.json"))
-    };
-
-    if include_in_json_codegen && !IGNORED_DEFINITIONS.contains(&logical_name) {
-        write_pretty_json(out_path, &schema_value)
-            .with_context(|| format!("Failed to write JSON schema for {file_stem}"))?;
-    }
-
     let namespace = match raw_namespace {
         Some("v1") | None => None,
         Some(ns) => Some(ns.to_string()),
@@ -1513,6 +1533,35 @@ where
         logical_name: logical_name.to_string(),
         value: schema_value,
     })
+}
+
+fn json_schema_relative_path(schema: &GeneratedSchema) -> Option<PathBuf> {
+    if IGNORED_DEFINITIONS.contains(&schema.logical_name.as_str())
+        || (schema.in_v1_dir && !JSON_V1_ALLOWLIST.contains(&schema.logical_name.as_str()))
+    {
+        return None;
+    }
+    let namespace = if schema.in_v1_dir {
+        "v1"
+    } else {
+        schema.namespace.as_deref().unwrap_or("")
+    };
+    Some(Path::new(namespace).join(format!("{}.json", schema.logical_name)))
+}
+
+fn write_json_schema_with_return<T: JsonSchema>(
+    out_dir: &Path,
+    name: &str,
+) -> Result<GeneratedSchema> {
+    let schema = generate_json_schema::<T>(name)?;
+    if let Some(relative_path) = json_schema_relative_path(&schema) {
+        let path = out_dir.join(relative_path);
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        write_pretty_json(path, &schema.value)?;
+    }
+    Ok(schema)
 }
 
 fn enforce_numbered_definition_collision_overrides(schema_name: &str, schema: &mut Value) {
@@ -1685,15 +1734,18 @@ where
 }
 
 fn write_pretty_json(path: PathBuf, value: &impl Serialize) -> Result<()> {
-    let mut value = serde_json::to_value(value)
-        .with_context(|| format!("Failed to serialize JSON schema to {}", path.display()))?;
-    // Workspace feature unification can enable serde_json/preserve_order.
-    // Fixtures must retain the same canonical ordering in either build.
-    value.sort_all_objects();
-    let json = serde_json::to_vec_pretty(&value)
+    let json = pretty_json_bytes(value)
         .with_context(|| format!("Failed to serialize JSON schema to {}", path.display()))?;
     fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn pretty_json_bytes(value: &impl Serialize) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(value)?;
+    // Workspace feature unification can enable serde_json/preserve_order.
+    // Fixtures must retain the same canonical ordering in either build.
+    value.sort_all_objects();
+    Ok(serde_json::to_vec_pretty(&value)?)
 }
 
 /// Split a fully-qualified type name like "v2::Type" into its namespace and logical name.

@@ -3,6 +3,28 @@ use crate::session::step_context::StepContext;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
+#[tokio::test]
+async fn automatic_excerpts_reuse_producer_bytes_without_artifact_reread() {
+    let temp = tempfile::tempdir().unwrap();
+    let canonical = CanonicalToolResult::text("first exact line\nsecond exact line\n");
+    let id = "01900000-0000-7000-8000-000000000000";
+    let ranges = vec![ToolOutputProjectionRange { id: "source".into(), start_line: 2, end_line: 2 }];
+    // No artifact exists: a disk read would fail. Production calls this only
+    // after persisting and protecting this canonical identity.
+    let (content, receipt) = drain_predetermined_artifact_selectors(
+        temp.path(), "thread", id, &canonical.sha256, ranges.clone(), Vec::new(),
+        &[], &BTreeMap::new(), 4_000, Some(&canonical)).await;
+    assert!(receipt.is_some());
+    assert_eq!(content[0]["results"][0]["text"], "second exact line\n");
+    assert_eq!(content[0]["canonical_sha256"], canonical.sha256);
+    let (stale, receipt) = drain_predetermined_artifact_selectors(
+        temp.path(), "thread", id, "wrong-sha", ranges, Vec::new(),
+        &[], &BTreeMap::new(), 4_000, Some(&canonical)).await;
+    assert!(stale.is_empty());
+    assert!(receipt.is_none());
+    assert!(!temp.path().join("tool-output").exists());
+}
+
 fn admitted_tool_dispatch_state() -> Arc<ToolDispatchState> {
     let state = Arc::new(ToolDispatchState::new());
     assert!(state.try_admit());

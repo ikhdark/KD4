@@ -3,6 +3,12 @@
 #[path = "code_mode_owned_continuation.rs"]
 mod owned_continuation;
 
+#[path = "code_mode_output_recovery_bench.rs"]
+mod output_recovery_bench;
+
+#[path = "code_mode_token_cache_e2e.rs"]
+mod token_cache_e2e;
+
 fn workspace_invalidation(request: &ResponsesRequest, call_id: &str) -> Option<Value> {
     request.body_json()["input"]
         .as_array()?
@@ -15,6 +21,12 @@ fn workspace_invalidation(request: &ResponsesRequest, call_id: &str) -> Option<V
         .filter(|text| text.starts_with("<workspace_evidence_invalidation>"))
         .flat_map(str::lines)
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .flat_map(|notice| {
+            notice["notices"]
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| vec![notice])
+        })
         .find(|notice| notice["call_id"] == call_id)
 }
 
@@ -26,12 +38,10 @@ use codex_config::types::McpServerTransportConfig;
 use codex_core::OutOfBandElicitationLeaseId;
 use codex_core::config::Config;
 use codex_core::config::CurrentTimeReminderConfig;
-use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::CurrentTimeSource;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
-use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
@@ -43,7 +53,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
-use codex_web_search_extension::install as install_web_search_extension;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::AppsTestToolLoading;
 use core_test_support::apps_test_server::DIRECT_CALENDAR_APP_ONLY_TOOL;
@@ -227,9 +236,11 @@ fn output_recovery_receipt(req: &ResponsesRequest, call_id: &str) -> Value {
     let raw = raw_custom_tool_output_text(req, call_id);
     raw.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|value| value["output_truncated"] == true
-            && value["artifact_id"].is_string()
-            && value["recovery_tool"] == "read_tool_output")
+        .find(|value| {
+            value["output_truncated"] == true
+                && value["artifact_id"].is_string()
+                && value["recovery_tool"] == "read_tool_output"
+        })
         .unwrap_or_else(|| panic!("missing recoverable output receipt: {raw}"))
 }
 
@@ -443,25 +454,53 @@ async fn predetermined_command_drains_complete_in_one_cell_without_lost_chunks()
     let server = responses::start_mock_server().await;
     let launch_dir = tempfile::TempDir::new()?;
     let launch_marker = launch_dir.path().join("launches.txt");
+    let middle_ready = launch_dir.path().join("middle.ready");
+    let last_ready = launch_dir.path().join("last.ready");
     // Count actual launches independently of the model-facing output projection.
+    // Release each chunk only after JavaScript has observed the preceding one.
     let command = if cfg!(windows) {
-        format!("[System.IO.File]::AppendAllText('{}', 'x'); [Console]::Out.Write('first'); Start-Sleep -Milliseconds 1800; [Console]::Out.Write('middle'); Start-Sleep -Milliseconds 1800; [Console]::Out.Write('last')", powershell_single_quoted_path(&launch_marker))
+        format!(
+            "[System.IO.File]::AppendAllText('{}', 'x'); [Console]::Out.Write('first'); while (!(Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 5 }}; [Console]::Out.Write('middle'); while (!(Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 5 }}; [Console]::Out.Write('last')",
+            powershell_single_quoted_path(&launch_marker),
+            powershell_single_quoted_path(&middle_ready),
+            powershell_single_quoted_path(&last_ready)
+        )
     } else {
-        format!("printf x >> '{}'; printf first; sleep 1.8; printf middle; sleep 1.8; printf last", launch_marker.to_string_lossy().replace('\'', "'\\''"))
+        format!(
+            "printf x >> '{}'; printf first; while [ ! -f '{}' ]; do sleep 0.005; done; printf middle; while [ ! -f '{}' ]; do sleep 0.005; done; printf last",
+            launch_marker.to_string_lossy().replace('\'', "'\\''"),
+            middle_ready.to_string_lossy().replace('\'', "'\\''"),
+            last_ready.to_string_lossy().replace('\'', "'\\''")
+        )
     };
+    let release_patch = |path: &Path| {
+        format!(
+            "*** Begin Patch\n*** Add File: {}\n+ready\n*** End Patch",
+            path.to_string_lossy().replace('\\', "/")
+        )
+    };
+    let releases =
+        serde_json::to_string(&[release_patch(&middle_ready), release_patch(&last_ready)])?;
     let script = format!(
         r#"// @exec: {{"yield_time_ms": 5}}
-const deadline = Date.now() + 10000;
+const deadline = Date.now() + 30000;
 const chunks = [];
+const releases = {releases};
+let released = 0;
 let result = await tools.exec_command({{cmd:{command:?},yield_time_ms:250,max_output_tokens:1000}});
 chunks.push(result.output ?? "");
 let polls = 0;
-while (result.session_id && result.execution_state === "running" && Date.now() < deadline && polls < 4) {{
-  result = await tools.write_stdin({{session_id:result.session_id,chars:"",yield_time_ms:1000,max_output_tokens:1000}});
+while (result.session_id && result.execution_state === "running" && Date.now() < deadline && polls < 100) {{
+  const observed = chunks.join("");
+  if ((released === 0 && observed === "first") || (released === 1 && observed === "firstmiddle")) {{
+    const release = await tools.apply_patch(releases[released++]);
+    if (!release.success) throw new Error(JSON.stringify(release));
+  }}
+  result = await tools.write_stdin({{session_id:result.session_id,chars:"",yield_time_ms:250,max_output_tokens:1000}});
   chunks.push(result.output ?? "");
   polls++;
 }}
-text(JSON.stringify({{chunks,polls,exit_code:result.exit_code,session_id:result.session_id ?? null,output_complete:result.output_complete}}));"#
+text(JSON.stringify({{chunks,polls,released,exit_code:result.exit_code,session_id:result.session_id ?? null,output_complete:result.output_complete}}));"#
     );
     let (_test, completion) =
         run_code_mode_turn(&server, "Run the command and await its output", &script).await?;
@@ -471,7 +510,11 @@ text(JSON.stringify({{chunks,polls,exit_code:result.exit_code,session_id:result.
         .filter_map(|index| serde_json::from_str::<Value>(text_item(&items, index)).ok())
         .find(|value| value.get("chunks").is_some())
         .unwrap_or_else(|| panic!("cell must report its complete chunks: {items:?}"));
-    assert!(result["polls"].as_u64().unwrap() >= 1, "{result}");
+    assert!(result["polls"].as_u64().unwrap() >= 2, "{result}");
+    assert_eq!(
+        result["released"], 2,
+        "both chunks require observed progress"
+    );
     assert_eq!(result["exit_code"], 0);
     assert_eq!(result["session_id"], Value::Null);
     assert_eq!(result["output_complete"], true);
@@ -688,120 +731,6 @@ async fn missing_process_host_falls_back_to_in_process_code_mode() -> Result<()>
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_call_standalone_web_search() -> Result<()> {
-    assert_code_mode_standalone_web_search(WebSearchMode::Live, serde_json::json!(true)).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_call_indexed_standalone_web_search() -> Result<()> {
-    assert_code_mode_standalone_web_search(WebSearchMode::Indexed, serde_json::json!("indexed"))
-        .await
-}
-
-async fn assert_code_mode_standalone_web_search(
-    web_search_mode: WebSearchMode,
-    expected_external_web_access: Value,
-) -> Result<()> {
-    require_network!();
-
-    let server = responses::start_mock_server().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/alpha/search"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "output": "Search result",
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_custom_tool_call(
-                "call-1",
-                "exec",
-                r#"
-const result = await tools.web__run({
-  search_query: [{ q: "standalone web search" }],
-});
-text(result);
-"#,
-            ),
-            ev_completed("resp-1"),
-        ]),
-    )
-    .await;
-    let follow_up_mock = responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-2"),
-        ]),
-    )
-    .await;
-
-    let auth = CodexAuth::from_api_key("dummy");
-    let auth_manager = codex_core::test_support::auth_manager_from_auth(auth.clone());
-    let mut extension_builder = ExtensionRegistryBuilder::<Config>::new();
-    install_web_search_extension(&mut extension_builder, auth_manager);
-    let mut builder = test_codex()
-        .with_auth(auth)
-        .with_extensions(Arc::new(extension_builder.build()))
-        .with_model("test-gpt-5.1-codex")
-        .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::CodeMode)
-                .expect("code mode should be enabled");
-            config
-                .features
-                .enable(Feature::StandaloneWebSearch)
-                .expect("standalone web search should be enabled");
-            config
-                .web_search_mode
-                .set(web_search_mode)
-                .expect("web search mode should be accepted");
-        });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn("Search the web from code mode").await?;
-
-    let search_request = server
-        .received_requests()
-        .await
-        .expect("received requests should be available")
-        .into_iter()
-        .find(|request| request.url.path() == "/v1/alpha/search")
-        .expect("standalone search request should be sent");
-    let search_body = search_request
-        .body_json::<Value>()
-        .expect("search request body should be JSON");
-    assert_eq!(
-        search_body["model"],
-        serde_json::json!("test-gpt-5.1-codex")
-    );
-    assert_eq!(
-        search_body["commands"],
-        serde_json::json!({
-            "search_query": [{"q": "standalone web search"}],
-        })
-    );
-    assert_eq!(
-        search_body["settings"],
-        serde_json::json!({
-            "allowed_callers": ["direct"],
-            "external_web_access": expected_external_web_access,
-        })
-    );
-    assert_eq!(
-        custom_tool_output_last_non_empty_text(&follow_up_mock.single_request(), "call-1"),
-        Some("Search result".to_string())
-    );
-
-    Ok(())
-}
 
 async fn run_code_mode_turn_with_rmcp(
     server: &MockServer,
@@ -1475,7 +1404,8 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
         .expect("checkpoint output");
     let checkpoint_result: Value = serde_json::from_str(&checkpoint_output)
         .unwrap_or_else(|error| panic!("checkpoint failed: {error}: {checkpoint_output}"));
-    assert_eq!(checkpoint_result["checkpointed_call_ids"], checkpoint["completed_call_ids"], "{checkpoint_output}");
+    assert_eq!(checkpoint_result["checkpointed_call_count"], BUDGET_OUTPUT_CALLS, "{checkpoint_output}");
+    assert!(checkpoint_result.get("checkpointed_call_ids").is_none());
     let body = request.body_json();
     let input = body["input"].as_array().unwrap();
     let outputs = input
@@ -1504,14 +1434,20 @@ async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
         .sum::<usize>();
     let uncheckpointed = batches[1].single_request();
     let raw_success_tokens = (0..BUDGET_OUTPUT_CALLS)
-        .map(|index| codex_utils_output_truncation::approx_token_count(
-            &raw_custom_tool_output_text(&uncheckpointed, &format!("budget-output-{index}")),
-        ))
+        .map(|index| {
+            codex_utils_output_truncation::approx_token_count(&raw_custom_tool_output_text(
+                &uncheckpointed,
+                &format!("budget-output-{index}"),
+            ))
+        })
         .sum::<usize>();
     let failure_tokens = (0..BUDGET_FAILURE_CALLS)
-        .map(|index| codex_utils_output_truncation::approx_token_count(
-            &raw_custom_tool_output_text(&request, &format!("budget-{index:03}")),
-        ))
+        .map(|index| {
+            codex_utils_output_truncation::approx_token_count(&raw_custom_tool_output_text(
+                &request,
+                &format!("budget-{index:03}"),
+            ))
+        })
         .sum::<usize>();
     assert!(
         raw_success_tokens + failure_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET,
@@ -1602,7 +1538,8 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
         .expect("checkpoint output");
     let checkpoint_result: Value = serde_json::from_str(&checkpoint_output)
         .unwrap_or_else(|error| panic!("checkpoint failed: {error}: {checkpoint_output}"));
-    assert_eq!(checkpoint_result["checkpointed_call_ids"], checkpoint["completed_call_ids"], "{checkpoint_output}");
+    assert_eq!(checkpoint_result["checkpointed_call_count"], PRESSURE_CALLS, "{checkpoint_output}");
+    assert!(checkpoint_result.get("checkpointed_call_ids").is_none());
     let body = request.body_json();
     let input = body["input"].as_array().unwrap();
     assert_eq!(
@@ -1851,8 +1788,7 @@ text(`HEAD\n${filler}OMITTED_CELL_MIDDLE_SENTINEL\n${filler}TAIL`);
         .expect("exec output");
     assert!(raw.contains("HEAD"), "{raw}");
     assert!(!raw.contains("OMITTED_CELL_MIDDLE_SENTINEL"), "{raw}");
-    let (_, notice) = raw.rsplit_once('\n').expect("recovery notice line");
-    let notice: Value = serde_json::from_str(notice)?;
+    let notice = output_recovery_receipt(&observed.single_request(), "call-1");
     assert_eq!(notice["output_truncated"], true, "{notice}");
     assert_eq!(notice["recovery_tool"], "read_tool_output", "{notice}");
     let artifact_id = notice["artifact_id"]
@@ -2289,6 +2225,7 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
             "exec".to_string(),
             "wait".to_string(),
             "request_user_input".to_string(),
+            "apply_patch".to_string(),
             "web_search".to_string()
         ]
     );
@@ -2394,6 +2331,7 @@ if (!tool) {
             "exec".to_string(),
             "wait".to_string(),
             "request_user_input".to_string(),
+            "apply_patch".to_string(),
             "web_search".to_string()
         ]
     );
@@ -3249,13 +3187,13 @@ text("phase 3");
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
-    assert_eq!(second_items.len(), 1);
-    let second_output = text_item(&second_items, 0);
+    assert_eq!(second_items.len(), 2);
+    let second_output = format!("{}\n{}", text_item(&second_items, 0), text_item(&second_items, 1));
     assert_regex_match(
         r"\AScript running with cell ID \d+ after explicit yield\nphase 2\z",
-        second_output,
+        &second_output,
     );
-    assert_eq!(extract_running_cell_id(second_output), cell_id);
+    assert_eq!(extract_running_cell_id(&second_output), cell_id);
 
     responses::mount_sse_once(
         &server,
@@ -3882,18 +3820,18 @@ text("must not run after cancellation");
     };
     assert!(visible.contains("Script terminated"), "{visible}");
     assert!(visible.contains("progress log"), "{visible}");
-    assert_eq!(visible.matches("RETAINED_RESULT_").count(), 7, "{visible}");
-    for index in 0..7 {
+    assert_eq!(visible.matches("RETAINED_RESULT_").count(), 1, "{visible}");
+    for index in 0..1 {
         assert!(
             visible.contains(&format!("RETAINED_RESULT_{index}")),
             "{visible}"
         );
     }
     // Ten successful calls and the cancelled eleventh call produce eleven
-    // outcomes. The fallback prioritizes the cancellation plus seven successful
-    // results, and reports the other three.
+    // outcomes. The fallback prioritizes the cancellation plus one successful
+    // result, and reports the other nine.
     assert!(
-        visible.contains("3 additional nested tool results were omitted"),
+        visible.contains("9 additional nested tool results were omitted"),
         "{visible}"
     );
     let retained = visible
@@ -4953,15 +4891,11 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
                 .as_str()
                 .unwrap();
         let direct = tools.iter().find(|tool| tool["name"] == "apply_patch");
-        assert_eq!(direct.is_none(), code_mode_only);
+        let direct = direct.expect("raw apply_patch stays directly available in both modes");
         assert_eq!(exec_description.matches("declare const tools:").count(), 1);
         assert!(exec_description.contains("apply_patch(input: string"));
-        if let Some(direct) = direct {
-            assert_eq!(direct["description"], description);
-            assert!(!exec_description.contains(description));
-        } else {
-            assert!(exec_description.contains(description));
-        }
+        assert_eq!(direct["description"], description);
+        assert!(!exec_description.contains(description));
         assert_eq!(output["result"]["success"], true);
         assert_eq!(output["result"]["changes_exact"], true);
         assert_eq!(output["result"]["changes"].as_array().unwrap().len(), 1);

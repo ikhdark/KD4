@@ -2111,13 +2111,22 @@ impl CanonicalPrefixHash {
         }
     }
 
+    #[cfg(test)]
     fn from_items(items: &[ResponseItem]) -> serde_json::Result<Self> {
+        Self::from_iter(items.iter())
+    }
+
+    fn from_iter<'a>(items: impl IntoIterator<Item = &'a ResponseItem>) -> serde_json::Result<Self> {
         let mut prefix = Self::empty();
-        prefix.extend_items(items)?;
+        prefix.extend_iter(items)?;
         Ok(prefix)
     }
 
     fn extend_items(&mut self, items: &[ResponseItem]) -> serde_json::Result<()> {
+        self.extend_iter(items.iter())
+    }
+
+    fn extend_iter<'a>(&mut self, items: impl IntoIterator<Item = &'a ResponseItem>) -> serde_json::Result<()> {
         for item in items {
             let normalized = normalized_websocket_history_item(item);
             let serialized = serde_json::to_vec(&normalized)?;
@@ -2313,7 +2322,7 @@ impl WebsocketSession {
         {
             return false;
         }
-        if CanonicalPrefixHash::from_items(&request.input[..baseline.request_prefix.item_count])
+        if CanonicalPrefixHash::from_iter(request.input.iter().take(baseline.request_prefix.item_count))
             .ok()
             != Some(baseline.request_prefix)
         {
@@ -2775,8 +2784,8 @@ impl ModelClient {
         };
         let RequestSchemaCacheValue { tools, text } =
             self.request_schema_components(prompt, verbosity, model_info.use_responses_lite)?;
+        let mut prefix = Vec::new();
         let (instructions, tools) = if model_info.use_responses_lite {
-            let mut prefix = Vec::with_capacity(2 + input.len());
             if !prompt.base_instructions.text.is_empty() {
                 prefix.push(ResponseItem::Message {
                     id: None,
@@ -2793,8 +2802,6 @@ impl ModelClient {
                 role: "developer".to_string(),
                 tools: tools.to_vec(),
             });
-            prefix.extend(input.iter().cloned());
-            input = Arc::from(prefix);
             (String::new(), None)
         } else {
             (prompt.base_instructions.text.clone(), Some(tools))
@@ -2814,9 +2821,14 @@ impl ModelClient {
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
             instructions,
-            input,
+            input: codex_api::ResponsesInput::with_prefix(prefix, input),
             tools,
-            tool_choice: "auto".to_string(),
+            tool_choice: if prompt.tool_calls_disabled {
+                "none"
+            } else {
+                "auto"
+            }
+            .to_string(),
             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
             reasoning,
             store: provider.is_azure_responses_endpoint(),
@@ -2831,7 +2843,7 @@ impl ModelClient {
         Ok(request)
     }
 
-    fn prepare_response_items_for_request(&self, input: &mut Arc<[ResponseItem]>) {
+    fn prepare_response_items_for_request(&self, input: &mut codex_api::ResponsesInput) {
         let strip_all_ids = !self.state.provider.info().is_openai();
         let requires_change = input.iter().any(|item| {
             item.id()
@@ -2840,8 +2852,11 @@ impl ModelClient {
         if !requires_change {
             return;
         }
-        let input = Arc::make_mut(input);
-        for item in input.iter_mut() {
+        input.update_segments(|input| {
+        if !input.iter().any(|item| item.id().is_some_and(|id| strip_all_ids || !id.is_prefixed())) {
+            return;
+        }
+        for item in Arc::make_mut(input).iter_mut() {
             if item
                 .id()
                 .is_some_and(|id| strip_all_ids || !id.is_prefixed())
@@ -2849,6 +2864,7 @@ impl ModelClient {
                 item.set_id(/*new_id*/ None);
             }
         }
+        });
     }
 
     /// Returns whether the Responses-over-WebSocket transport is active for this session.
@@ -3210,7 +3226,7 @@ impl ModelClientSession {
         let (request_prefix, request_properties_fingerprint) = match verified {
             Some(verified) => (Ok(verified.prefix), Ok(verified.properties)),
             None => (
-                CanonicalPrefixHash::from_items(&request.input),
+                CanonicalPrefixHash::from_iter(request.input.iter()),
                 responses_request_properties_fingerprint(request),
             ),
         };
@@ -3348,13 +3364,13 @@ impl ModelClientSession {
                 )
                 .map(|items| (items, None));
             }
-            let Some((request_items_to_compare, incremental_items)) =
-                request.input.split_at_checked(expected_prefix.item_count)
-            else {
+            if request.input.len() < expected_prefix.item_count {
                 trace!("incremental request failed, incompatible request length");
                 return None;
             };
-            let request_prefix = match CanonicalPrefixHash::from_items(request_items_to_compare) {
+            let request_prefix = match CanonicalPrefixHash::from_iter(
+                request.input.iter().take(expected_prefix.item_count),
+            ) {
                 Ok(request_prefix) => request_prefix,
                 Err(err) => {
                     trace!(
@@ -3377,19 +3393,19 @@ impl ModelClientSession {
                 );
                 return None;
             }
-            if !allow_empty_delta && incremental_items.is_empty() {
+            if !allow_empty_delta && request.input.len() == expected_prefix.item_count {
                 return None;
             }
             let mut prefix = request_prefix;
             let verified =
                 prefix
-                    .extend_items(incremental_items)
+                    .extend_iter(request.input.iter().skip(expected_prefix.item_count))
                     .ok()
                     .map(|()| VerifiedRequestHistory {
                         prefix,
                         properties: current_properties_fingerprint,
                     });
-            return Some((incremental_items.to_vec(), verified));
+            return Some((request.input.iter().skip(expected_prefix.item_count).cloned().collect(), verified));
         }
 
         Self::get_incremental_items_full_compare(
@@ -3415,9 +3431,7 @@ impl ModelClientSession {
             .input
             .len()
             .checked_add(response_items.len())?;
-        let Some((request_items_to_compare, incremental_items)) =
-            request.input.split_at_checked(previous_len)
-        else {
+        if request.input.len() < previous_len {
             trace!("incremental request failed, incompatible request length");
             return None;
         };
@@ -3425,7 +3439,7 @@ impl ModelClientSession {
             .input
             .iter()
             .chain(response_items)
-            .zip(request_items_to_compare)
+            .zip(request.input.iter().take(previous_len))
             .all(|(previous, current)| {
                 previous == current
                     || normalized_websocket_history_item(previous)
@@ -3435,10 +3449,10 @@ impl ModelClientSession {
             trace!("incremental request failed, items didn't match");
             return None;
         }
-        if !allow_empty_delta && incremental_items.is_empty() {
+        if !allow_empty_delta && request.input.len() == previous_len {
             return None;
         }
-        Some(incremental_items.to_vec())
+        Some(request.input.iter().skip(previous_len).cloned().collect())
     }
 
     fn get_last_response(&mut self) -> Option<LastResponse> {
@@ -3467,7 +3481,7 @@ impl ModelClientSession {
         &mut self,
         mut payload: ResponseCreateWsRequest,
         request: &ResponsesApiRequest,
-        stable_context_fingerprint: [u8; 32],
+        _stable_context_fingerprint: [u8; 32],
         tool_history_substitutions: &[crate::tool_history::ToolHistorySubstitution],
         mut build_tool_history_fail_open_request: Option<
             Box<dyn FnOnce() -> Result<ResponsesApiRequest> + '_>,
@@ -3478,21 +3492,9 @@ impl ModelClientSession {
         Option<ResponsesApiRequest>,
         Option<VerifiedRequestHistory>,
     )> {
-        let baseline_is_stale = self
-            .websocket_session
-            .last_request
-            .as_ref()
-            .is_some_and(|_| {
-                self.websocket_session
-                    .last_request_history
-                    .as_ref()
-                    .is_none_or(|baseline| {
-                        baseline.stable_context_fingerprint != stable_context_fingerprint
-                    })
-            });
-        if baseline_is_stale {
-            self.invalidate_incremental_history("stable context changed");
-        }
+        // Appended context changes the manifest without changing the inherited
+        // prefix. The request-property and normalized-prefix checks below are
+        // authoritative; a manifest change alone must not discard that proof.
         if tool_history_substitutions.is_empty() {
             self.tool_history_fail_open_pending = false;
         }
@@ -3594,6 +3596,7 @@ impl ModelClientSession {
             Some(&last_response),
             /*allow_empty_delta*/ true,
         ) else {
+            self.invalidate_provider_history_inheritance("request no longer matches inherited history");
             return Ok((
                 ResponsesWsRequest::ResponseCreate(payload),
                 false,

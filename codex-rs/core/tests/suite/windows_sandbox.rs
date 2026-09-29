@@ -91,6 +91,11 @@ fn windows_sandbox_helper_staging_is_parallel_safe() -> anyhow::Result<()> {
             Ok((format!("{name}.exe"), std::fs::read(source)?))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    std::fs::create_dir_all(&resources_dir)?;
+    // Same size is not enough: an older helper must be replaced even when its
+    // byte length matches. Leave the other helper absent to cover first staging.
+    let (name, expected_bytes) = &expected_helpers[0];
+    std::fs::write(resources_dir.join(name), vec![0; expected_bytes.len()])?;
     let workers = (0..8)
         .map(|_| {
             let resources_dir = resources_dir.clone();
@@ -108,6 +113,10 @@ fn windows_sandbox_helper_staging_is_parallel_safe() -> anyhow::Result<()> {
             "parallel staging must copy the complete {name} helper"
         );
     }
+    let staged = resources_dir.join("codex-command-runner.exe");
+    let modified = std::fs::metadata(&staged)?.modified()?;
+    super::stage_windows_sandbox_helpers_in(&resources_dir)?;
+    assert_eq!(std::fs::metadata(staged)?.modified()?, modified);
     Ok(())
 }
 

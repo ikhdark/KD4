@@ -104,7 +104,7 @@ if ($null -eq $ProgramArgs -or $ProgramArgs.Count -eq 0) {
     throw "No command was provided."
 }
 
-$oldSccacheBaseDir = $env:SCCACHE_BASEDIR
+$oldSccacheBaseDir = $env:SCCACHE_BASEDIRS
 $oldSccacheCacheSize = $env:SCCACHE_CACHE_SIZE
 $oldCargoIncremental = $env:CARGO_INCREMENTAL
 $oldCargoTargetDir = $env:CARGO_TARGET_DIR
@@ -112,7 +112,7 @@ $oldRustcWrapper = $env:RUSTC_WRAPPER
 $oldRustcWorkspaceWrapper = $env:RUSTC_WORKSPACE_WRAPPER
 $oldWindowsMsvcLinker = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
 $oldWindowsArm64MsvcLinker = $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER
-$hadSccacheBaseDir = Test-Path Env:SCCACHE_BASEDIR
+$hadSccacheBaseDir = Test-Path Env:SCCACHE_BASEDIRS
 $hadSccacheCacheSize = Test-Path Env:SCCACHE_CACHE_SIZE
 $hadCargoIncremental = Test-Path Env:CARGO_INCREMENTAL
 $hadCargoTargetDir = Test-Path Env:CARGO_TARGET_DIR
@@ -132,7 +132,7 @@ try {
     # default when sccache is missing, explicitly disabled, or replaced.
     $env:CARGO_INCREMENTAL = "0"
     if ($NoSccache) {
-        Remove-Item Env:SCCACHE_BASEDIR -ErrorAction SilentlyContinue
+        Remove-Item Env:SCCACHE_BASEDIRS -ErrorAction SilentlyContinue
         Remove-Item Env:SCCACHE_CACHE_SIZE -ErrorAction SilentlyContinue
         $env:RUSTC_WRAPPER = ""
         $env:RUSTC_WORKSPACE_WRAPPER = ""
@@ -182,7 +182,7 @@ try {
     Write-Output ("rustPerfEnv: rustcWrapper={0}; cargoIncremental={1}; sccacheBaseDir={2}; cargoTargetDir={3}; windowsMsvcLinker={4}; windowsArm64MsvcLinker={5}; rustcWorkspaceWrapper={6}" -f `
             (Format-EnvProofValue -Name "RUSTC_WRAPPER"),
             (Format-EnvProofValue -Name "CARGO_INCREMENTAL"),
-            (Format-EnvProofValue -Name "SCCACHE_BASEDIR"),
+            (Format-EnvProofValue -Name "SCCACHE_BASEDIRS"),
             $cargoTargetDirProof,
             (Format-EnvProofValue -Name "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"),
             (Format-EnvProofValue -Name "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"),
@@ -209,7 +209,7 @@ finally {
     if ($didPushLocation) {
         Pop-Location -StackName $locationStackName
     }
-    Restore-ProcessEnvironmentVariable -Name "SCCACHE_BASEDIR" -Value $oldSccacheBaseDir -WasSet $hadSccacheBaseDir
+    Restore-ProcessEnvironmentVariable -Name "SCCACHE_BASEDIRS" -Value $oldSccacheBaseDir -WasSet $hadSccacheBaseDir
     Restore-ProcessEnvironmentVariable -Name "SCCACHE_CACHE_SIZE" -Value $oldSccacheCacheSize -WasSet $hadSccacheCacheSize
     Restore-ProcessEnvironmentVariable -Name "CARGO_INCREMENTAL" -Value $oldCargoIncremental -WasSet $hadCargoIncremental
     Restore-ProcessEnvironmentVariable -Name "CARGO_TARGET_DIR" -Value $oldCargoTargetDir -WasSet $hadCargoTargetDir

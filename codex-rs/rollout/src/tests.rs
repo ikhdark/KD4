@@ -1840,11 +1840,11 @@ async fn recency_pagination_uses_turn_start_instead_of_file_mtime() {
 }
 
 #[tokio::test]
-async fn created_time_continuation_and_ascending_start_cross_scan_cap() {
+async fn created_time_continuation_and_ascending_start_skip_newer_directories() {
     let temp = TempDir::new().unwrap();
     let recent = temp.path().join("sessions/2026/01/01");
     fs::create_dir_all(&recent).unwrap();
-    for index in 0..10_000 {
+    for index in 0..16 {
         fs::write(
             recent.join(format!(
                 "rollout-2026-01-01T00-00-00-{}.jsonl",
@@ -1897,6 +1897,15 @@ async fn created_time_continuation_and_ascending_start_cross_scan_cap() {
 
 #[tokio::test]
 async fn filesystem_listing_reaches_threads_beyond_the_former_scan_cap() {
+    assert_filesystem_listing_matrix(10_000, false).await;
+}
+
+#[tokio::test]
+async fn filesystem_listing_preserves_order_and_exclusive_cursors() {
+    assert_filesystem_listing_matrix(16, true).await;
+}
+
+async fn assert_filesystem_listing_matrix(empty_rollouts: u128, paginate: bool) {
     use crate::list::ThreadListConfig;
     use crate::list::ThreadListLayout;
     use crate::list::get_threads_in_root;
@@ -1907,7 +1916,7 @@ async fn filesystem_listing_reaches_threads_beyond_the_former_scan_cap() {
     fs::create_dir_all(&recent).unwrap();
     // Empty rollouts cannot produce list items. The matching sessions must still
     // be reachable after these candidates, including on the initial page.
-    for index in 0..10_000 {
+    for index in 0..empty_rollouts {
         fs::write(
             recent.join(format!(
                 "rollout-2026-01-01T00-00-00-{}.jsonl",
@@ -1930,6 +1939,35 @@ async fn filesystem_listing_reaches_threads_beyond_the_former_scan_cap() {
     }
 
     let nested = temp.path().join("sessions");
+    if !paginate {
+        let page = get_threads_in_root(
+            nested,
+            3,
+            None,
+            ThreadSortKey::CreatedAt,
+            ThreadListConfig {
+                allowed_sources: &[],
+                model_providers: None,
+                cwd_filters: None,
+                default_provider: TEST_PROVIDER,
+                layout: ThreadListLayout::NestedByDate,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.thread_id)
+                .collect::<Vec<_>>(),
+            [ids[1], ids[0]]
+                .map(|id| Some(thread_id_from_uuid(id)))
+                .to_vec(),
+        );
+        assert!(!page.reached_scan_cap);
+        assert!(page.next_cursor.is_none());
+        return;
+    }
     // Exercise both the active-session layout and the flat archive layout with
     // the same independently expected ordering and exclusive cursor boundary.
     let flat = temp.path().join("archived_sessions");

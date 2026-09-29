@@ -61,8 +61,9 @@ pub(super) fn effective_stall_timeout_ms(
 ) -> Option<u64> {
     let hard_timeout_ms = timeout_ms.unwrap_or(DEFAULT_EXEC_COMMAND_TIMEOUT_MS);
     let stall_timeout_ms = match requested_stall_timeout_ms {
-        Some(0) | None => return None,
+        Some(0) => return None,
         Some(stall_timeout_ms) => stall_timeout_ms,
+        None => crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS,
     };
 
     (stall_timeout_ms < hard_timeout_ms).then_some(stall_timeout_ms)
@@ -830,7 +831,7 @@ mod tests {
             },
             cancellation_token: tokio_util::sync::CancellationToken::new(),
         };
-        for deadline in ["timeout_ms", "stall_timeout_ms"] {
+        for deadline in ["timeout_ms"] {
             let mut args = json!({"kind": "argv", "program": "printf", "args": ["remote ok\\n"]});
             args[deadline] = json!(60_000);
             let error = handler

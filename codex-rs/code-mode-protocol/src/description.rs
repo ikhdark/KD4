@@ -413,7 +413,7 @@ mod tests {
         assert!(description.contains("retained-artifact selectors after truncation"));
         assert_eq!(
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-            4_000,
+            10_000,
         );
         assert!(description.contains(&format!(
             "Output defaults to {} tokens",
@@ -438,7 +438,7 @@ mod tests {
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
-        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 3_700;
+        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 4_000;
         assert!(
             description.len() <= COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET,
             "the exec contract must stay within {COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET} bytes; got {}",

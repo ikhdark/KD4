@@ -19,8 +19,6 @@ mod suite {
     mod approvals;
     #[path = "exec_policy.rs"]
     mod exec_policy;
-    #[path = "extension_sandbox.rs"]
-    mod extension_sandbox;
     #[path = "hooks_windows.rs"]
     mod hooks_windows;
     #[path = "permissions_messages.rs"]

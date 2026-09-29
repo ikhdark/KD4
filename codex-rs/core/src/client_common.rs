@@ -193,6 +193,9 @@ pub struct Prompt {
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
 
+    /// Keep schemas stable while forbidding calls on a terminal continuation.
+    pub(crate) tool_calls_disabled: bool,
+
     pub base_instructions: BaseInstructions,
 
     /// Optional the output schema for the model's response.
@@ -235,6 +238,7 @@ impl Default for Prompt {
             digests: PromptDigests::default(),
             tools: Arc::new(ToolSchemaArtifact::default()),
             parallel_tool_calls: false,
+            tool_calls_disabled: false,
             base_instructions: BaseInstructions::default(),
             output_schema: None,
             output_schema_strict: true,

@@ -103,3 +103,18 @@ fn child_alias_setup() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn discovery_does_not_create_an_alias_home() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("must-not-exist");
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--list")
+        .env(HOME, &home)
+        .env_remove(FAIL)
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("child_alias_setup: test"));
+    assert!(!home.exists(), "discovery must not create alias files");
+    Ok(())
+}

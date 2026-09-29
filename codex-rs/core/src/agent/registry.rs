@@ -19,10 +19,19 @@ use std::sync::atomic::Ordering;
 ///
 /// This structure is shared by all agents in the same user session (because the `AgentControl`
 /// is).
-#[derive(Default)]
 pub(crate) struct AgentRegistry {
     active_agents: Mutex<ActiveAgents>,
     total_count: AtomicUsize,
+    capacity_updates: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self {
+            active_agents: Mutex::default(), total_count: AtomicUsize::new(0),
+            capacity_updates: tokio::sync::watch::channel(0).0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -79,6 +88,10 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
 }
 
 impl AgentRegistry {
+    pub(crate) fn subscribe_capacity_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.capacity_updates.subscribe()
+    }
+
     pub(crate) fn reserve_spawn_slot(
         self: &Arc<Self>,
         max_threads: Option<usize>,
@@ -129,6 +142,7 @@ impl AgentRegistry {
         };
         if removed_counted_agent {
             self.total_count.fetch_sub(1, Ordering::AcqRel);
+            self.capacity_updates.send_modify(|generation| *generation = generation.wrapping_add(1));
         }
     }
 
@@ -540,6 +554,7 @@ impl Drop for SpawnReservation {
                 self.state.release_reserved_agent_path(&agent_path);
             }
             self.state.total_count.fetch_sub(1, Ordering::AcqRel);
+            self.state.capacity_updates.send_modify(|generation| *generation = generation.wrapping_add(1));
         }
     }
 }

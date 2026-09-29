@@ -130,6 +130,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         delegate: Arc<D>,
         task_failure_handler: Option<TaskFailureHandler>,
     ) -> Self {
+        crate::runtime::prewarm_runtime();
         Self {
             inner: Arc::new(Inner {
                 stored_values: Mutex::new(HashMap::new()),

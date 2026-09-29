@@ -2134,7 +2134,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
             "cmd.exe",
             "/d",
             "/c",
-            "echo wrapper=%RUSTC_WRAPPER% incremental=%CARGO_INCREMENTAL% %CARGO_HOME% %SCCACHE_BASEDIR% %SCCACHE_CACHE_SIZE%",
+            "echo wrapper=%RUSTC_WRAPPER% incremental=%CARGO_INCREMENTAL% %CARGO_HOME% %SCCACHE_BASEDIRS% %SCCACHE_CACHE_SIZE%",
             extra_env={
                 "CARGO_INCREMENTAL": "",
                 "CARGO_HOME": "",

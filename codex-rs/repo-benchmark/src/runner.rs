@@ -336,12 +336,12 @@ impl std::fmt::Display for ResetFailure {
 impl std::error::Error for ResetFailure {}
 
 /// Authentication belongs only to the native process lifetime, never retained evidence.
-struct TemporaryAuthentication {
+pub struct TemporaryAuthentication {
     path: PathBuf,
     active: bool,
 }
 impl TemporaryAuthentication {
-    fn install(source: Option<&Path>, destination: &Path) -> Result<Self> {
+    pub fn install(source: Option<&Path>, destination: &Path) -> Result<Self> {
         // Establish cleanup before copying: even a partial failed copy is temporary.
         let temporary = Self {
             path: destination.to_path_buf(),
@@ -352,7 +352,7 @@ impl TemporaryAuthentication {
         }
         Ok(temporary)
     }
-    fn remove(&mut self) -> Result<()> {
+    pub fn remove(&mut self) -> Result<()> {
         if self.active {
             match fs::remove_file(&self.path) {
                 Ok(()) => {}

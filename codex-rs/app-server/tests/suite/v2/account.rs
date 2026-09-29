@@ -45,7 +45,6 @@ use codex_protocol::account::PlanType as AccountPlanType;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use serial_test::serial;
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -63,6 +62,7 @@ mod workspace_routing;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const LOGIN_ISSUER_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
 const LOGIN_OPEN_APP_URL_ENV_VAR: &str = "CODEX_APP_SERVER_DEV_OPEN_APP_URL";
+const LOGIN_TEST_PORT_ENV_VAR: &str = "CODEX_APP_SERVER_TEST_LOGIN_PORT";
 const WORKSPACE_ID_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174000";
 const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001";
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
@@ -1404,13 +1404,12 @@ async fn login_account_chatgpt_device_code_can_be_cancelled() -> Result<()> {
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
     let mut mcp = TestAppServer::builder()
+        .with_env_overrides(&[(LOGIN_TEST_PORT_ENV_VAR, Some("0"))])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -1474,13 +1473,61 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
+async fn ephemeral_login_callbacks_do_not_cancel_another_server() -> Result<()> {
+    let mut sessions = Vec::new();
+    let mut callbacks = Vec::new();
+    for _ in 0..2 {
+        let home = TempDir::new()?;
+        create_config_toml(home.path(), CreateConfigTomlParams::default())?;
+        let mut server = TestAppServer::builder()
+            .with_codex_home(home.path())
+            .without_auto_env()
+            .with_env_overrides(&[(LOGIN_TEST_PORT_ENV_VAR, Some("0"))])
+            .build()
+            .await?;
+        timeout(DEFAULT_READ_TIMEOUT, server.initialize()).await??;
+        let request = server.send_login_account_chatgpt_request().await?;
+        let response = timeout(
+            DEFAULT_READ_TIMEOUT,
+            server.read_stream_until_response_message(RequestId::Integer(request)),
+        )
+        .await??;
+        let LoginAccountResponse::Chatgpt { auth_url, .. } = to_response(response)? else {
+            bail!("expected a browser login");
+        };
+        let url = Url::parse(&auth_url)?;
+        let callback = url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "redirect_uri").then(|| value.into_owned()))
+            .ok_or_else(|| anyhow::anyhow!("missing redirect URI"))?;
+        callbacks.push(Url::parse(&callback)?);
+        sessions.push((home, server));
+    }
+    assert_ne!(callbacks[0].port(), callbacks[1].port());
+    let client = HttpClientBuilder::new()
+        .without_redirects()
+        .build_direct()?;
+    for mut callback in callbacks {
+        callback.set_path("/isolation-probe");
+        // Starting the second login must leave the first callback worker alive.
+        let response =
+            timeout(DEFAULT_READ_TIMEOUT, client.get(callback.as_str()).send()).await??;
+        assert_eq!(response.status(), 404);
+    }
+    for (_home, mut server) in sessions {
+        server.close_stdin();
+        timeout(Duration::from_secs(5), server.wait_for_exit()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_chatgpt_login_does_not_block_app_server_shutdown() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
     let mut mcp = TestAppServer::builder()
+        .with_env_overrides(&[(LOGIN_TEST_PORT_ENV_VAR, Some("0"))])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -1503,13 +1550,12 @@ async fn active_chatgpt_login_does_not_block_app_server_shutdown() -> Result<()>
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
     let mut mcp = TestAppServer::builder()
+        .with_env_overrides(&[(LOGIN_TEST_PORT_ENV_VAR, Some("0"))])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[
@@ -1556,8 +1602,6 @@ async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_redirects_to_hosted_success_page() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
@@ -1572,6 +1616,7 @@ async fn login_account_chatgpt_redirects_to_hosted_success_page() -> Result<()> 
     let issuer = mock_server.uri();
 
     let mut mcp = TestAppServer::builder()
+        .with_env_overrides(&[(LOGIN_TEST_PORT_ENV_VAR, Some("0"))])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[
@@ -1628,13 +1673,12 @@ async fn login_account_chatgpt_redirects_to_hosted_success_page() -> Result<()> 
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn set_auth_token_cancels_active_chatgpt_login() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
     let mut mcp = TestAppServer::builder()
+        .with_env_overrides(&[(LOGIN_TEST_PORT_ENV_VAR, Some("0"))])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -1701,8 +1745,6 @@ async fn set_auth_token_cancels_active_chatgpt_login() -> Result<()> {
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_includes_forced_workspace_query_param() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(
@@ -1714,6 +1756,7 @@ async fn login_account_chatgpt_includes_forced_workspace_query_param() -> Result
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_env_overrides(&[(LOGIN_TEST_PORT_ENV_VAR, Some("0"))])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()
@@ -1739,8 +1782,6 @@ async fn login_account_chatgpt_includes_forced_workspace_query_param() -> Result
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_includes_forced_workspace_allowlist_query_param() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(
@@ -1755,6 +1796,7 @@ async fn login_account_chatgpt_includes_forced_workspace_allowlist_query_param()
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_env_overrides(&[(LOGIN_TEST_PORT_ENV_VAR, Some("0"))])
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build()

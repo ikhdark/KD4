@@ -49,7 +49,7 @@ function Set-CodexRustSccacheEnvironment {
         [string]$RepoRoot
     )
 
-    $env:SCCACHE_BASEDIR = Get-CodexRustSccacheBaseDir -RepoRoot $RepoRoot
+    $env:SCCACHE_BASEDIRS = Get-CodexRustSccacheBaseDir -RepoRoot $RepoRoot
     $env:SCCACHE_CACHE_SIZE = Get-CodexRustSccacheCacheSize
 }
 

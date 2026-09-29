@@ -2061,12 +2061,83 @@ function Get-Command($Name) {
             [["release", "create"], ["release", "view"]],
         )
 
+    def test_crate_recipes_forward_targets_before_any_side_effect(self) -> None:
+        if not shutil.which("just") or not shutil.which("pwsh"):
+            self.skipTest("just and pwsh are required")
+        source = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        start = source.index("_validate-crate mode crate *args:\n")
+        end = source.index("\n[windows]", start)
+        # Keep actual just dispatch/argument expansion and the real preflight.
+        # Only replace the subprocess loop so no formatter or Cargo can run.
+        private = (
+            "_validate-crate mode crate *args:\n"
+            "    import json, sys\n"
+            f"    sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "    from scripts.rust_test_runner import crate_validation_commands\n"
+            "    print(json.dumps(crate_validation_commands(sys.argv[1], sys.argv[2], sys.argv[3:])))\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "codex-rs").mkdir()
+            (root / "scripts").mkdir()
+            (root / "justfile").write_text(
+                source[:start] + private + source[end:], encoding="utf-8"
+            )
+            (root / "scripts" / "just-shell.py").write_text(
+                f"import runpy; runpy.run_path({str(REPO_ROOT / 'scripts' / 'just-shell.py')!r}, run_name='__main__')",
+                encoding="utf-8",
+            )
+            for recipe in (
+                "validate-crate-focused",
+                "validate-crate",
+                "validate-crate-full",
+            ):
+                result = subprocess.run(
+                    [
+                        "just",
+                        recipe,
+                        "codex-shell-command",
+                        "--lib",
+                        "-E",
+                        "test(quoted value)",
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                commands = json.loads(result.stdout)
+                self.assertEqual(
+                    commands[-1],
+                    [
+                        "just",
+                        "test-fast",
+                        "-p",
+                        "codex-shell-command",
+                        "--no-tests=fail",
+                        "--lib",
+                        "-E",
+                        "test(quoted value)",
+                    ],
+                )
+            rejected = subprocess.run(
+                ["just", "validate-crate", "codex-core", "--lib"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(rejected.stdout, "")
+            self.assertIn("core-test", rejected.stderr)
+
     def test_app_server_runtime_check_batches_the_existing_test_selections(
         self,
     ) -> None:
         result, calls = self.run_just_recipe("app-server-runtime-check")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call["program"] for call in calls], ["python", "cargo"])
+        self.assertEqual([call["program"] for call in calls], ["python"])
         self.assertEqual(
             calls[0]["args"][1:],
             [
@@ -2080,8 +2151,6 @@ function Get-Command($Name) {
                 "app-server-thread-status",
             ],
         )
-        self.assertEqual(calls[1]["args"], ["check", "-p", "codex-app-server"])
-
     def test_release_tooling_recipe_runs_from_repository_root(self) -> None:
         result, calls = self.run_just_recipe(
             "test-release-tooling", from_subdirectory=True
@@ -2324,7 +2393,7 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             (REPO_ROOT / "codex-cli" / "package.json").read_text(encoding="utf-8")
         )
 
-        self.assertIn('rust_parallelism := "2"', justfile)
+        self.assertIn('rust_parallelism := "8"', justfile)
         self.assertIn('$requiredPwshVersion = [version]"7.5"', justfile)
         self.assertIn("\ntest-release-tooling:\n", justfile)
         self.assertIn(

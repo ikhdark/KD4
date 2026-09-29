@@ -23,6 +23,36 @@ from scripts.build_tooling_test_support import (
 
 
 class BuildToolingEnvironmentTest(unittest.TestCase):
+    def test_core_package_selections_share_the_named_core_lane(self):
+        from scripts.rust_build_status import _auto_lane_base
+
+        for selection in (["-p", "codex-core"], ["-pcodex-core"], ["--package=codex-core"], ["-p", "codex-tui", "-p", "codex-core"]):
+            with self.subTest(selection=selection):
+                self.assertEqual(_auto_lane_base(["cargo", "test", *selection]), "core-tests")
+                self.assertEqual(_auto_lane_base(["cargo", "test", "--release", *selection]), "core-tests-release")
+        self.assertEqual(_auto_lane_base(["cargo", "test", "-p", "codex-tui", "--", "-p", "codex-core"]), "codex-tui")
+
+    def test_local_sccache_preserves_explicit_base_directories(self):
+        from scripts.rust_tool_env import local_rust_env
+
+        env = {"RUSTC_WRAPPER": "sccache", "SCCACHE_BASEDIRS": "C:/one;C:/two"}
+        updates = local_rust_env(env, repo_root=REPO_ROOT, which=lambda _: None)
+        self.assertNotIn("SCCACHE_BASEDIRS", updates)
+        self.assertNotIn("SCCACHE_BASEDIR", updates)
+
+    def test_workspace_dependency_build_policy(self):
+        manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
+        self.assertEqual(set(manifest["workspace"]["dependencies"]["serde_json"]["features"]), {"alloc", "arbitrary_precision", "float_roundtrip", "preserve_order", "raw_value"})
+        packages = manifest["profile"]["dev"]["package"]
+        self.assertEqual(packages["*"]["debug"], "line-tables-only")
+        for package in ("sha2", "libsqlite3-sys"):
+            self.assertEqual(packages[package]["opt-level"], 3)
+        core = load_toml(REPO_ROOT / "codex-rs" / "core" / "Cargo.toml")
+        self.assertNotIn("test-deterministic-process-ids", core["features"])
+        self.assertFalse({"codex-web-search-extension", "codex-image-generation-extension"} & core["dev-dependencies"].keys())
+        tui = load_toml(REPO_ROOT / "codex-rs" / "tui" / "Cargo.toml")
+        self.assertFalse({"codex-cli", "app_test_support"} & tui["dev-dependencies"].keys())
+
     def test_recipe_preserves_explicit_empty_compiler_wrapper(self):
         shell = load_just_shell_module()
         observed = {}
@@ -40,7 +70,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         ):
             self.assertEqual(shell.main(), 7)
         self.assertEqual(observed["RUSTC_WRAPPER"], "")
-        self.assertNotIn("SCCACHE_BASEDIR", observed)
+        self.assertNotIn("SCCACHE_BASEDIRS", observed)
         self.assertNotIn("SCCACHE_CACHE_SIZE", observed)
 
     def test_dynamic_loader_registers_postponed_dataclass_and_restores_on_failure(self):
@@ -164,7 +194,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         )
 
         self.assertEqual(updates["RUSTC_WRAPPER"], "/tools/sccache")
-        self.assertEqual(updates["SCCACHE_BASEDIR"], str(REPO_ROOT))
+        self.assertEqual(updates["SCCACHE_BASEDIRS"], str(REPO_ROOT))
         self.assertEqual(updates["SCCACHE_CACHE_SIZE"], "80G")
 
     def test_local_just_shell_sets_sccache_env_for_existing_sccache_wrapper(
@@ -179,7 +209,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         )
 
         self.assertNotIn("RUSTC_WRAPPER", updates)
-        self.assertEqual(updates["SCCACHE_BASEDIR"], str(REPO_ROOT))
+        self.assertEqual(updates["SCCACHE_BASEDIRS"], str(REPO_ROOT))
         self.assertEqual(updates["SCCACHE_CACHE_SIZE"], "80G")
 
     def test_local_just_shell_honors_sccache_cache_size_override(self) -> None:
@@ -211,7 +241,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         )
 
         self.assertNotIn("RUSTC_WRAPPER", updates)
-        self.assertNotIn("SCCACHE_BASEDIR", updates)
+        self.assertNotIn("SCCACHE_BASEDIRS", updates)
         self.assertNotIn("SCCACHE_CACHE_SIZE", updates)
 
     def test_ci_does_not_override_rust_wrapper_or_linker(self) -> None:
@@ -731,7 +761,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             justfile,
         )
         profiles = nextest["profile"]
-        self.assertEqual(profiles["default"]["test-threads"], 2)
+        self.assertEqual(profiles["default"]["test-threads"], 8)
         self.assertEqual(profiles["local"]["inherits"], "default")
         self.assertEqual(profiles["fast"]["inherits"], "local")
 
@@ -840,24 +870,26 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         cargo_config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
-        self.assertEqual(cargo_config["build"]["jobs"], 2)
+        self.assertEqual(cargo_config["build"]["jobs"], 8)
+        self.assertNotIn("incremental", cargo_config["build"])
         self.assertEqual(
             cargo_config["env"]["RUST_TEST_THREADS"],
-            {"value": "2", "force": False},
+            {"value": "4", "force": False},
         )
         nextest_config = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
-        self.assertEqual(nextest_config["profile"]["default"]["test-threads"], 2)
-        self.assertIn('rust_parallelism := "2"', justfile)
+        self.assertEqual(nextest_config["profile"]["default"]["test-threads"], 8)
+        self.assertEqual(nextest_config["test-groups"]["process_heavy"]["max-threads"], 4)
+        self.assertIn('rust_parallelism := "8"', justfile)
         self.assertIn(
             'env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)',
             justfile,
         )
         self.assertIn(
-            'env_var_or_default("RUST_TEST_THREADS", "2")',
+            'env_var_or_default("RUST_TEST_THREADS", "4")',
             justfile,
         )
         self.assertIn(
-            'env_var_or_default("NEXTEST_TEST_THREADS", "2")',
+            'env_var_or_default("NEXTEST_TEST_THREADS", "8")',
             justfile,
         )
         self.assertIn("export CARGO_BUILD_JOBS := cargo_build_jobs", justfile)

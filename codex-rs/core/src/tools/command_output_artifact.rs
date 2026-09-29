@@ -100,6 +100,27 @@ pub(crate) enum ToolOutputSelector {
         #[serde(default)]
         context_lines: usize,
     },
+    #[cfg(feature = "bench-generation-opportunities")]
+    SearchIndex {
+        query: String,
+        #[serde(default)]
+        start_byte: u64,
+        #[serde(default = "artifact_search_default_max_results")]
+        max_results: usize,
+        #[serde(default)]
+        context_lines: usize,
+    },
+}
+
+impl ToolOutputSelector {
+    pub(crate) fn is_search(&self) -> bool {
+        match self {
+            Self::Search { .. } => true,
+            #[cfg(feature = "bench-generation-opportunities")]
+            Self::SearchIndex { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 const fn artifact_search_default_max_results() -> usize {
@@ -440,6 +461,8 @@ struct RetentionRootState {
 struct RetentionRegistry {
     roots: BTreeMap<PathBuf, RetentionRootState>,
     access_clock: u64,
+    pending_sync: BTreeMap<PathBuf, u64>,
+    next_sync: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1088,15 +1111,46 @@ pub(crate) struct RawOutputArtifactWriter {
 #[cfg(test)]
 static STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST: AtomicU8 = AtomicU8::new(0);
 
-async fn sync_streaming_output_file(file: &tokio::fs::File) -> std::io::Result<()> {
-    #[cfg(test)]
-    if STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST.swap(0, Ordering::AcqRel) != 0 {
-        return Err(std::io::Error::other(
-            "injected streaming output sync failure",
-        ));
-    }
+fn defer_artifact_sync(path: &Path) {
+    let mut registry = lock_retention_registry();
+    registry.next_sync = registry.next_sync.saturating_add(1);
+    let sequence = registry.next_sync;
+    registry.pending_sync.insert(path.to_path_buf(), sequence);
+}
 
-    file.sync_all().await
+/// Flush artifacts before the rollout containing their references becomes
+/// durable. Failed barriers retain their work; concurrent writes retain a newer
+/// sequence and cannot be acknowledged by an older barrier.
+pub(crate) async fn sync_tool_output_artifacts(
+    codex_home: &Path, thread_id: &str,
+) -> std::io::Result<()> {
+    let directory = codex_home.join("tool-output").join(thread_id);
+    run_blocking_artifact_io(move || {
+        let pending = lock_retention_registry().pending_sync.iter()
+            .filter(|(path, _)| path.starts_with(&directory))
+            .map(|(path, sequence)| (path.clone(), *sequence)).collect::<Vec<_>>();
+        if pending.is_empty() { return Ok(()); }
+        #[cfg(test)]
+        if STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST.swap(0, Ordering::AcqRel) != 0 {
+            return Err(std::io::Error::other("injected artifact barrier sync failure"));
+        }
+        for (path, _) in &pending {
+            match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+                Ok(file) => file.sync_all()?,
+                // Retention may already have removed an unreferenced artifact.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error),
+            }
+        }
+        sync_directory(&directory)?;
+        let mut registry = lock_retention_registry();
+        for (path, sequence) in pending {
+            if registry.pending_sync.get(&path) == Some(&sequence) {
+                registry.pending_sync.remove(&path);
+            }
+        }
+        Ok(())
+    }).await
 }
 
 #[cfg(test)]
@@ -1391,18 +1445,6 @@ impl RawOutputArtifactWriter {
             self.lifecycle_completed = true;
             return;
         }
-        if let Err(err) = sync_streaming_output_file(&file).await {
-            let _ = unlock_output_file(file).await;
-            *state.lock().await = failed_with_owned_path(
-                path.clone(),
-                self.bytes,
-                format!("failed to sync `{}`: {err}", path.display()),
-                self.retention_token.as_ref(),
-            )
-            .await;
-            self.lifecycle_completed = true;
-            return;
-        }
         let metadata = file.metadata().await.and_then(|metadata| {
             metadata
                 .modified()
@@ -1419,19 +1461,7 @@ impl RawOutputArtifactWriter {
             self.lifecycle_completed = true;
             return;
         }
-        let sync_path = path.clone();
-        if let Err(err) = run_blocking_artifact_io(move || sync_parent_directory(&sync_path)).await
-        {
-            *state.lock().await = failed_with_owned_path(
-                path.clone(),
-                self.bytes,
-                format!("failed to sync the parent of `{}`: {err}", path.display()),
-                self.retention_token.as_ref(),
-            )
-            .await;
-            self.lifecycle_completed = true;
-            return;
-        }
+        defer_artifact_sync(&path);
         if let Some(token) = self.retention_token.as_ref() {
             match metadata {
                 Ok((bytes, modified)) => {
@@ -1766,16 +1796,6 @@ async fn create_raw_output_artifact_inner(
                 )
                 .await;
             }
-            if durable && let Err(err) = file.sync_all().await {
-                let _ = unlock_output_file(file).await;
-                return failed_with_owned_path(
-                    path.clone(),
-                    retained.len() as u64,
-                    format!("failed to sync `{}`: {err}", path.display()),
-                    Some(&retention_token),
-                )
-                .await;
-            }
             let file = file.into_std().await;
             let file = match unlock_created_output_file(file).await {
                 Ok(file) => file,
@@ -1793,18 +1813,8 @@ async fn create_raw_output_artifact_inner(
                 }
             };
             let handle = Arc::new(file);
-            let sync_path = path.clone();
-            if durable
-                && let Err(err) =
-                    run_blocking_artifact_io(move || sync_parent_directory(&sync_path)).await
-            {
-                return failed_with_owned_path(
-                    path.clone(),
-                    retained.len() as u64,
-                    format!("failed to sync artifact directory: {err}"),
-                    Some(&retention_token),
-                )
-                .await;
+            if durable {
+                defer_artifact_sync(&path);
             }
             enforce_retention_after_upsert(
                 &directory,
@@ -3267,10 +3277,42 @@ fn verified_artifact_digest(reader: impl Read, expected_bytes: u64) -> Result<St
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Ensures an exact artifact referenced by an active completed-tool receipt is
-/// protected independently from tool-history retention. The marker is only
-/// created after thread confinement, regular-file, byte-count, and digest
-/// checks all succeed.
+/// Verifies an exact artifact without creating a retention protection marker.
+pub(crate) async fn verify_tool_history_artifact(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    let id = artifact_id.parse::<ToolOutputArtifactId>()
+        .map_err(|_| "invalid tool-output artifact id".to_string())?;
+    if id.to_string() != artifact_id {
+        return Err("non-canonical tool-output artifact id".to_string());
+    }
+    let path = codex_home.join("tool-output").join(thread_id).join(format!("{id}.log"));
+    let expected_sha256 = expected_sha256.to_string();
+    tokio::task::spawn_blocking(move || verify_tool_history_artifact_blocking(&path, expected_bytes, &expected_sha256))
+        .await.map_err(|error| format!("artifact verification worker failed: {error}"))?
+}
+
+fn verify_tool_history_artifact_blocking(
+    path: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    let (file, artifact_bytes) = open_regular_artifact(path)
+        .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
+    if artifact_bytes != expected_bytes {
+        return Err("artifact byte count does not match receipt metadata".to_string());
+    }
+    if verified_artifact_digest(file, expected_bytes)? != expected_sha256 {
+        return Err("artifact digest does not match receipt metadata".to_string());
+    }
+    Ok(())
+}
+
+/// Protects an artifact only after confinement, size, and digest checks succeed.
 pub(crate) async fn protect_active_tool_history_artifact(
     codex_home: &Path,
     thread_id: &str,
@@ -3304,14 +3346,7 @@ pub(crate) async fn protect_active_tool_history_artifact(
         let path = directory.join(format!("{id}.log"));
         let marker = active_tool_history_protection_path(&path);
         let result = (|| {
-            let (file, artifact_bytes) = open_regular_artifact(&path)
-                .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
-            if artifact_bytes != expected_bytes {
-                return Err("artifact byte count does not match receipt metadata".to_string());
-            }
-            if verified_artifact_digest(file, expected_bytes)? != expected_sha256 {
-                return Err("artifact digest does not match receipt metadata".to_string());
-            }
+            verify_tool_history_artifact_blocking(&path, expected_bytes, &expected_sha256)?;
             match std::fs::symlink_metadata(&marker) {
                 Ok(_) => {
                     if !protection_marker_status(
@@ -4119,6 +4154,8 @@ fn selector_range_and_children(
             }
         }
         ToolOutputSelector::Search { .. } => Err(ToolOutputSelectorStatus::Invalid),
+        #[cfg(feature = "bench-generation-opportunities")]
+        ToolOutputSelector::SearchIndex { .. } => Err(ToolOutputSelectorStatus::Invalid),
     }
 }
 
@@ -4127,6 +4164,10 @@ fn normalized_selector_order_key(
     metadata: &LogicalArtifactMetadata,
 ) -> (u64, u64, u8, String) {
     let serialized = serde_json::to_string(selector).unwrap_or_default();
+    #[cfg(feature = "bench-generation-opportunities")]
+    if let ToolOutputSelector::SearchIndex { start_byte, .. } = selector {
+        return (*start_byte, *start_byte, 4, serialized);
+    }
     if let ToolOutputSelector::Search { start_byte, .. } = selector {
         return (*start_byte, *start_byte, 4, serialized);
     }
@@ -4138,6 +4179,8 @@ fn normalized_selector_order_key(
                 ToolOutputSelector::Section { .. } => 2,
                 ToolOutputSelector::JsonPointer { .. } => 3,
                 ToolOutputSelector::Search { .. } => unreachable!(),
+                #[cfg(feature = "bench-generation-opportunities")]
+                ToolOutputSelector::SearchIndex { .. } => unreachable!(),
             };
             (range.start, range.end, kind, serialized)
         }
@@ -4169,6 +4212,7 @@ fn merged_selector_still_completes(
         selector.clone(),
         fragment_token_ceiling,
         final_token_ceiling,
+        &[],
     );
     match selected.status {
         ToolOutputSelectorStatus::Ok => true,
@@ -4330,19 +4374,69 @@ fn invalid_selector_result(
     result
 }
 
+/// Reuse only text already delivered in this response, never a prior call or
+/// another reference. Canonical artifact bytes and recovery selectors stay intact.
+fn share_search_hydration(
+    range: CanonicalByteRange,
+    previous_results: &[ToolOutputSelectorResult],
+    reference: &mut Value,
+) -> bool {
+    #[cfg(feature = "bench-generation-opportunities")]
+    if !crate::generation_live_bench::production_enabled(12) {
+        return false;
+    }
+    if range.len() < 256 {
+        return false;
+    }
+    let previous = previous_results
+        .iter()
+        .filter(|result| result.status == ToolOutputSelectorStatus::Ok)
+        .filter_map(|result| result.value.as_ref())
+        .filter_map(|value| value["hydrated_ranges"].as_array())
+        .flatten()
+        .find(|value| {
+            value["canonical_range"] == reference["canonical_range"]
+                && (value["text"].is_string() || value["data_base64"].is_string())
+        });
+    let Some(previous) = previous else {
+        return false;
+    };
+    reference["shared"] = serde_json::json!(true);
+    if codex_utils_output_truncation::model_token_count(&reference.to_string())
+        < codex_utils_output_truncation::model_token_count(&previous.to_string())
+    {
+        #[cfg(feature = "bench-generation-opportunities")]
+        if crate::generation_live_bench::active(12) {
+            crate::generation_live_bench::record(12, "exact_hydration_shared");
+        }
+        true
+    } else {
+        if let Some(object) = reference.as_object_mut() {
+            object.remove("shared");
+        }
+        false
+    }
+}
+
 fn search_logical_artifact(
     metadata: &LogicalArtifactMetadata,
     snapshot: &[u8],
     selector: ToolOutputSelector,
     token_ceiling: usize,
+    previous_results: &[ToolOutputSelectorResult],
 ) -> ToolOutputSelectorResult {
-    let (query, start_byte, max_results, context_lines) = match &selector {
+    let (query, start_byte, max_results, context_lines, coordinates_only) = match &selector {
         ToolOutputSelector::Search {
             query,
             start_byte,
             max_results,
             context_lines,
-        } => (query.clone(), *start_byte, *max_results, *context_lines),
+        } => (query.clone(), *start_byte, *max_results, *context_lines, false),
+        #[cfg(feature = "bench-generation-opportunities")]
+        ToolOutputSelector::SearchIndex {query,start_byte,max_results,context_lines} => {
+            crate::generation_live_bench::record(10,"search_index_executed");
+            (query.clone(),*start_byte,*max_results,*context_lines,true)
+        },
         _ => unreachable!("search helper requires a search selector"),
     };
     if query.is_empty() || query.len() > ARTIFACT_SEARCH_MAX_QUERY_BYTES {
@@ -4433,8 +4527,16 @@ fn search_logical_artifact(
             max_results,
             context_lines,
         });
+        #[cfg(feature = "bench-generation-opportunities")]
+        let continuation = if coordinates_only {
+            continuation.map(|next| {
+                let ToolOutputSelector::Search {query,start_byte,max_results,context_lines} = next else {unreachable!()};
+                ToolOutputSelector::SearchIndex {query,start_byte,max_results,context_lines}
+            })
+        } else { continuation };
         let hydrated_ranges = child_selectors
             .iter()
+            .filter(|_| !coordinates_only)
             .filter_map(|child| {
                 let (range, _, _) = selector_range_and_children(child, metadata).ok()?;
                 let range = range?;
@@ -4446,6 +4548,9 @@ fn search_logical_artifact(
                     "canonical_range": range,
                     "exact_bytes": range.len(),
                 });
+                if share_search_hydration(range, previous_results, &mut hydrated) {
+                    return Some(hydrated);
+                }
                 if let Ok(text) = std::str::from_utf8(exact) {
                     hydrated["text"] = Value::String(text.to_string());
                 } else {
@@ -4470,6 +4575,7 @@ fn search_logical_artifact(
         result.child_selectors = child_selectors;
         result.continuation = continuation;
         result.message = match remaining_match_count > 0 {
+            true if coordinates_only => Some("more indexed matches are available; use continuation for the next page or child_selectors for exact text".to_string()),
             true => Some(
                 "more matches are available; exact context for this page is already hydrated and continuation advances to the next page"
                     .to_string(),
@@ -4644,6 +4750,8 @@ fn successful_exact_selector_result(
             }
         }
         ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Search { .. } => unreachable!(),
+        #[cfg(feature = "bench-generation-opportunities")]
+        ToolOutputSelector::SearchIndex { .. } => unreachable!(),
     }
     result
 }
@@ -4738,9 +4846,16 @@ fn select_logical_artifact(
     selector: ToolOutputSelector,
     fragment_token_ceiling: usize,
     final_token_ceiling: usize,
+    previous_results: &[ToolOutputSelectorResult],
 ) -> ToolOutputSelectorResult {
-    if matches!(&selector, ToolOutputSelector::Search { .. }) {
-        return search_logical_artifact(metadata, snapshot, selector, final_token_ceiling);
+    if selector.is_search() {
+        return search_logical_artifact(
+            metadata,
+            snapshot,
+            selector,
+            final_token_ceiling,
+            previous_results,
+        );
     }
     let mut result = exact_selector_result(metadata, snapshot, selector.clone());
     let range = result.canonical_range;
@@ -4946,13 +5061,27 @@ fn select_tool_output_snapshot(
         unavailable_ranges: metadata.unavailable_ranges.clone(),
         results: Vec::with_capacity(selectors.len()),
     };
-    for selector in &selectors {
+    for (index, selector) in selectors.iter().enumerate() {
+        // A search is a page, not an indivisible exact value. Share the remaining
+        // response capacity so the first query cannot starve every later query.
+        let selection_ceiling = if selector.is_search() {
+            let occupied = serde_json::to_string(&response)
+                .map(|text| codex_utils_string::approx_token_count(&text))
+                .unwrap_or(token_ceiling);
+            // Search measures the entire response, including its existing envelope.
+            occupied
+                .saturating_add(token_ceiling.saturating_sub(occupied) / (selectors.len() - index))
+                .min(token_ceiling)
+        } else {
+            token_ceiling
+        };
         let mut selected = select_logical_artifact(
             metadata,
             snapshot,
             selector.clone(),
-            token_ceiling.min(RECOVERY_FRAGMENT_TOKEN_CEILING),
-            token_ceiling,
+            selection_ceiling.min(RECOVERY_FRAGMENT_TOKEN_CEILING),
+            selection_ceiling,
+            &response.results,
         );
         if selected.status == ToolOutputSelectorStatus::SelectorTooLarge
             && let Some(completed) =
@@ -5036,16 +5165,13 @@ fn select_tool_output_snapshot(
     Ok(response)
 }
 
-/// The default file read delivers a useful page immediately; explicit selectors
-/// retain their exact-selection contract. The temporary identity is used only
-/// for response sizing and is replaced or removed before model delivery.
-pub(crate) fn select_file_snapshot(
+fn producer_snapshot_metadata(
     canonical: &CanonicalToolResult,
-    selectors: Option<Vec<ToolOutputSelector>>,
-) -> Result<(ReadToolOutputResult, Option<ToolOutputSelector>), ReadToolOutputError> {
-    let metadata = LogicalArtifactMetadata {
+    artifact_id: String,
+) -> LogicalArtifactMetadata {
+    LogicalArtifactMetadata {
         version: LOGICAL_ARTIFACT_METADATA_VERSION,
-        artifact_id: uuid::Uuid::nil().to_string(),
+        artifact_id,
         canonical_kind: canonical.kind,
         canonical_sha256: canonical.sha256.clone(),
         retained_sha256: None,
@@ -5057,7 +5183,33 @@ pub(crate) fn select_file_snapshot(
         sections: canonical.sections.clone(),
         line_starts: canonical_line_starts(&canonical.bytes),
         segments: Vec::new(),
-    };
+    }
+}
+
+/// Select exact excerpts from the canonical bytes the producer still owns.
+/// The caller must have persisted this same identity before exposing its handle.
+pub(crate) fn select_producer_snapshot(
+    canonical: &CanonicalToolResult,
+    artifact_id: &str,
+    selectors: Vec<ToolOutputSelector>,
+    token_ceiling: usize,
+) -> Result<ReadToolOutputResult, ReadToolOutputError> {
+    select_tool_output_snapshot(
+        &producer_snapshot_metadata(canonical, artifact_id.to_owned()),
+        &canonical.bytes,
+        selectors,
+        token_ceiling,
+    )
+}
+
+/// The default file read delivers a useful page immediately; explicit selectors
+/// retain their exact-selection contract. The temporary identity is used only
+/// for response sizing and is replaced or removed before model delivery.
+pub(crate) fn select_file_snapshot(
+    canonical: &CanonicalToolResult,
+    selectors: Option<Vec<ToolOutputSelector>>,
+) -> Result<(ReadToolOutputResult, Option<ToolOutputSelector>), ReadToolOutputError> {
+    let metadata = producer_snapshot_metadata(canonical, uuid::Uuid::nil().to_string());
     if let Some(selectors) = selectors {
         return select_tool_output_snapshot(
             &metadata,
@@ -5391,15 +5543,11 @@ fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .and_then(|directory| directory.sync_all())
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    // FlushFileBuffers does not support ordinary read-only directory handles.
+    // Previously this always-failing open/flush was masked by the caller. File
+    // data is synced at the barrier; Windows directory durability is best effort.
+    Ok(())
 }
 
 #[cfg(not(windows))]

@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 
 const DEFAULT_SUMMARY_AFTER_BYTES: usize = 48 * 1024;
 const DEFAULT_SUMMARY_AFTER_LINES: usize = 600;
+const VALIDATION_SUCCESS_SUMMARY_AFTER_LINES: usize = 80;
 const SUMMARY_MAX_BYTES: usize = 32 * 1024;
 const SUMMARY_MAX_LINES: usize = 240;
 // Reserve room for the retention counts and an explicit cap marker.
@@ -45,9 +46,33 @@ pub(crate) fn summarize_shell_output_for_model(
     let exceeds_token_budget = options
         .applied_token_limit
         .is_some_and(|limit| codex_utils_string::approx_token_count_exceeds(output, limit));
+    // Below even the smaller success threshold, avoid parsing a command whose
+    // output cannot need a summary. This is the common short-command path.
     if !exceeds_token_budget
         && output.len() <= DEFAULT_SUMMARY_AFTER_BYTES
-        && output.lines().take(DEFAULT_SUMMARY_AFTER_LINES).count() < DEFAULT_SUMMARY_AFTER_LINES
+        && output
+            .lines()
+            .take(VALIDATION_SUCCESS_SUMMARY_AFTER_LINES)
+            .count()
+            < VALIDATION_SUCCESS_SUMMARY_AFTER_LINES
+    {
+        return None;
+    }
+    let failed = timed_out || exit_code != 0;
+    let validation = options.command_text.is_some_and(|command| {
+        matches!(
+            classify_validation_script(command),
+            ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
+        )
+    });
+    let summary_after_lines = if validation && !failed {
+        VALIDATION_SUCCESS_SUMMARY_AFTER_LINES
+    } else {
+        DEFAULT_SUMMARY_AFTER_LINES
+    };
+    if !exceeds_token_budget
+        && output.len() <= DEFAULT_SUMMARY_AFTER_BYTES
+        && output.lines().take(summary_after_lines).count() < summary_after_lines
     {
         return None;
     }
@@ -57,13 +82,6 @@ pub(crate) fn summarize_shell_output_for_model(
         return None;
     }
 
-    let failed = timed_out || exit_code != 0;
-    let validation = options.command_text.is_some_and(|command| {
-        matches!(
-            classify_validation_script(command),
-            ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
-        )
-    });
     // A successful command with no diagnostic line has nothing to rank, so the
     // head/warning/tail policy degenerates to positional truncation that drops
     // the middle of a flat list. A summary also reads as complete in a way a

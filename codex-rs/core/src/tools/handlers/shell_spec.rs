@@ -41,6 +41,17 @@ fn command_parameters_schema(
     }
 }
 
+fn stall_timeout_schema() -> JsonSchema {
+    bounded_integer(
+        format!(
+            "Maximum time without stdout or stderr before cancellation, including between polls. Defaults to {} ms. Set zero to disable or increase for intentionally quiet or interactive commands. This is not a total runtime limit.",
+            crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS,
+        ),
+        0,
+        u64::MAX,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandToolOptions {
     pub allow_login_shell: bool,
@@ -113,10 +124,11 @@ pub(crate) fn create_exec_command_tool_for_policy(
                     .to_string(),
             )),
         ),
+        ("stall_timeout_ms".to_string(), stall_timeout_schema()),
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                format!("Wait before yielding output. Defaults to 30000 ms for recognized validation commands and 2000 ms otherwise ({} ms inside `exec`); explicit values use 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", super::unified_exec::NESTED_EXEC_YIELD_TIME_MS, crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
+                format!("Wait before yielding output. Defaults to 30000 ms for recognized validation commands, Cargo builds, and nextest discovery, and 2000 ms otherwise ({} ms inside `exec`); explicit values use 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", super::unified_exec::NESTED_EXEC_YIELD_TIME_MS, crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
@@ -325,15 +337,7 @@ pub(crate) fn create_shell_command_tool_for_policy(
                 u64::MAX,
             ),
         ),
-        (
-            "stall_timeout_ms".to_string(),
-            bounded_integer(
-                "Optional maximum time without stdout or stderr progress before cancellation. Omit or set zero to disable the stall deadline."
-                    .to_string(),
-                0,
-                u64::MAX,
-            ),
-        ),
+        ("stall_timeout_ms".to_string(), stall_timeout_schema()),
     ]);
     if options.allow_login_shell {
         properties.insert(

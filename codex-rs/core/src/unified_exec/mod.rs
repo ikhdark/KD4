@@ -59,7 +59,6 @@ mod process;
 mod process_manager;
 mod process_state;
 
-#[cfg(any(test, feature = "test-deterministic-process-ids"))]
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
 }
@@ -131,6 +130,7 @@ pub(crate) struct ExecCommandRequest {
     pub hook_command: String,
     pub process_id: u32,
     pub yield_time_ms: u64,
+    pub stall_timeout_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
     pub cwd: PathUri,
 

@@ -1,18 +1,14 @@
 [build]
 # Bound compiler fanout so local Cargo commands do not saturate the host.
 # CARGO_BUILD_JOBS or Cargo's -j/--jobs flag can opt into a different limit.
-jobs = 2
-# Incremental compilation speeds up local edits to workspace/path crates.
-# sccache can cache eligible dependency compilations, but cannot cache rustc
-# invocations with -C incremental, regardless of where it was configured.
-# This local default also applies to release/package builds. Keep it enabled
-# for repeated local packaging; isolated perf recipes explicitly disable it.
-incremental = true
+jobs = 8
+# Use Cargo's profile defaults for incremental compilation: dev/test enable it,
+# release disables it. CARGO_INCREMENTAL remains an explicit per-run override.
 
 [env]
 # Bound direct `cargo test` libtest fanout. An existing process environment
 # value or libtest's `--test-threads` flag can opt into a different limit.
-RUST_TEST_THREADS = { value = "2", force = false }
+RUST_TEST_THREADS = { value = "4", force = false }
 
 # Shared by x64 and ARM64. KD4 tooling links both with lld-link when installed
 # (scripts/rust_tool_env.py), and lld-link rejects link.exe-only arguments such

@@ -653,7 +653,7 @@ fn cargo_settings_use_the_configured_jobs_and_the_recorded_release_toolchain() {
     };
     let settings = builds::settings(&environment);
     for (key, expected) in [
-        ("jobs", "12"),
+        ("jobs", "2"),
         ("profile", "release"),
         ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3"),
         ("CARGO_PROFILE_RELEASE_LTO", "thin"),

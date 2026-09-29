@@ -11,13 +11,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "codex-write-config-schema"
 path = "src/bin/config_schema.rs"
+test = false
 
 [lints]
 workspace = true
 
 [features]
-# Enabled only by core_test_support, including for release-profile integration tests.
-test-deterministic-process-ids = []
+# Opt-in prototypes for integrated live-model measurements; never a default feature.
+bench-generation-opportunities = []
 
 [dependencies]
 codex-client = { workspace = true }
@@ -103,7 +104,7 @@ rmcp = { workspace = true, default-features = false, features = [
     "server",
 ] }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = ["raw_value"] }
+serde_json = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 shlex = { workspace = true }
@@ -138,16 +139,15 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+codex-utils-pty = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 codex-extension-items = { workspace = true }
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
 fs2 = { workspace = true }
-codex-image-generation-extension = { workspace = true }
 codex-home = { workspace = true }
 codex-otel = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
-codex-web-search-extension = { workspace = true }
 core_test_support = { workspace = true }
 insta = { workspace = true }
 maplit = { workspace = true }

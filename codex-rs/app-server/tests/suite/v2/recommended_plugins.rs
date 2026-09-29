@@ -118,7 +118,7 @@ async fn runtime_tool_suggest_disable_refreshes_active_thread() -> Result<()> {
             let turn_id = app_server.send_turn_start_request(TurnStartParams {
                 thread_id: thread.id.clone(),
                 input: vec![UserInput::Text {
-                    text: "suggest a plugin".to_string(),
+                    text: "suggest the GitHub plugin".to_string(),
                     text_elements: Vec::new(),
                 }],
                 ..Default::default()

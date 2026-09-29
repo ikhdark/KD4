@@ -145,6 +145,10 @@ pub fn write_config_schema(out_path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "schema_fixture_tests.rs"]
+mod fixture_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

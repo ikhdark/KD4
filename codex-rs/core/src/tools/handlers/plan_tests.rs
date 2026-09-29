@@ -75,6 +75,32 @@ fn plan_output_signals_governor_state() {
     assert!(signal["plan"].is_null());
 }
 
+#[tokio::test]
+async fn plan_mode_rejects_updates_without_side_effects() {
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    turn.collaboration_mode.mode = ModeKind::Plan;
+    let before = session.services.plan_store.current_for_test().await;
+    let result = PlanHandler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::new(turn)),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "plan-mode-update".into(),
+            tool_name: ToolName::plain("update_plan"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: plan_arguments("forbidden", StepStatus::InProgress),
+            },
+        })
+        .await;
+    assert!(
+        matches!(result, Err(FunctionCallError::RespondToModel(message)) if message.contains("not allowed in Plan mode"))
+    );
+    assert_eq!(session.services.plan_store.current_for_test().await, before);
+}
+
 #[test]
 fn unchanged_plan_output_remains_compact() {
     let output = PlanToolOutput {

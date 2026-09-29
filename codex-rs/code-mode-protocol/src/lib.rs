@@ -1,6 +1,7 @@
 mod cancellation;
 mod description;
 pub mod host;
+mod output_projection;
 mod response;
 mod runtime;
 mod session;
@@ -22,6 +23,7 @@ pub use description::parse_exec_source;
 pub use description::render_code_mode_sample;
 pub use description::render_code_mode_tool_bundle;
 pub use description::render_json_schema_to_typescript;
+pub use output_projection::model_visible_tool_result;
 
 /// Marks the locally constructed MCP envelope. Its structuredContent schema is
 /// an independent schema resource supplied by the server, including local refs.

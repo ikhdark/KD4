@@ -824,6 +824,7 @@ mod tests {
             .execute(&mut logs_lock)
             .await
             .unwrap();
+        logs_lock.close().await.unwrap();
         // The state layer permits a five-second SQLite busy wait. Allow that worker
         // to finish after unlocking, and avoid racing cleanup with a tight I/O poll.
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -859,7 +860,6 @@ mod tests {
                 .await,
             Err(ThreadStoreError::ThreadNotFound { .. })
         ));
-        logs_lock.close().await.unwrap();
         state.close().await;
     }
 }

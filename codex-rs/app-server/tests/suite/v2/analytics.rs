@@ -79,12 +79,68 @@ async fn app_server_default_analytics_enabled_with_flag() -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn mount_analytics_capture(server: &MockServer, codex_home: &Path) -> Result<()> {
-    Mock::given(method("POST"))
-        .and(path("/codex/analytics-events/events"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(server)
-        .await;
+#[derive(Clone)]
+pub(crate) struct AnalyticsCapture {
+    payloads: tokio::sync::watch::Sender<Vec<std::result::Result<Value, String>>>,
+}
+
+impl AnalyticsCapture {
+    pub(crate) async fn mount(server: &MockServer) -> Self {
+        let capture = Self {
+            payloads: tokio::sync::watch::channel(Vec::new()).0,
+        };
+        let responder = capture.clone();
+        Mock::given(method("POST"))
+            .and(path("/codex/analytics-events/events"))
+            .respond_with(move |request: &wiremock::Request| {
+                responder.record(&request.body);
+                ResponseTemplate::new(200)
+            })
+            .mount(server)
+            .await;
+        capture
+    }
+
+    fn record(&self, body: &[u8]) {
+        let payload = serde_json::from_slice(body)
+            .map_err(|error| format!("invalid analytics payload: {error}"));
+        self.payloads.send_modify(|payloads| payloads.push(payload));
+    }
+
+    async fn wait(
+        &self,
+        read_timeout: Duration,
+        select: impl Fn(&Value) -> Option<Value>,
+    ) -> Result<Value> {
+        let mut receiver = self.payloads.subscribe();
+        timeout(read_timeout, async {
+            loop {
+                // Mark the observed version before examining it. A POST between
+                // this borrow and changed() remains visible; payloads are never
+                // consumed, so several selectors can observe the same event.
+                {
+                    let payloads = receiver.borrow_and_update();
+                    for payload in payloads.iter() {
+                        let payload = payload
+                            .as_ref()
+                            .map_err(|error| anyhow::anyhow!("{error}"))?;
+                        if let Some(value) = select(payload) {
+                            return Ok(value);
+                        }
+                    }
+                }
+                receiver.changed().await?;
+            }
+        })
+        .await?
+    }
+}
+
+pub(crate) async fn mount_analytics_capture(
+    server: &MockServer,
+    codex_home: &Path,
+) -> Result<AnalyticsCapture> {
+    let capture = AnalyticsCapture::mount(server).await;
 
     write_chatgpt_auth(
         codex_home,
@@ -95,33 +151,20 @@ pub(crate) async fn mount_analytics_capture(server: &MockServer, codex_home: &Pa
         AuthCredentialsStoreMode::File,
     )?;
 
-    Ok(())
+    Ok(capture)
 }
 
 pub(crate) async fn wait_for_analytics_payload(
-    server: &MockServer,
+    server: &AnalyticsCapture,
     read_timeout: Duration,
 ) -> Result<Value> {
-    let body = timeout(read_timeout, async {
-        loop {
-            let Some(requests) = server.received_requests().await else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            if let Some(request) = requests.iter().find(|request| {
-                request.method == "POST" && request.url.path() == "/codex/analytics-events/events"
-            }) {
-                break request.body.clone();
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await?;
-    serde_json::from_slice(&body).map_err(|err| anyhow::anyhow!("invalid analytics payload: {err}"))
+    server
+        .wait(read_timeout, |payload| Some(payload.clone()))
+        .await
 }
 
 pub(crate) async fn wait_for_analytics_event(
-    server: &MockServer,
+    server: &AnalyticsCapture,
     read_timeout: Duration,
     event_type: &str,
 ) -> Result<Value> {
@@ -132,7 +175,7 @@ pub(crate) async fn wait_for_analytics_event(
 }
 
 pub(crate) async fn wait_for_goal_event(
-    server: &MockServer,
+    server: &AnalyticsCapture,
     read_timeout: Duration,
     event_kind: &str,
     goal_status: &str,
@@ -146,48 +189,27 @@ pub(crate) async fn wait_for_goal_event(
 }
 
 pub(crate) async fn wait_for_matching_analytics_event(
-    server: &MockServer,
+    server: &AnalyticsCapture,
     read_timeout: Duration,
     matches: impl Fn(&Value) -> bool,
 ) -> Result<Value> {
-    let result = timeout(read_timeout, async {
-        loop {
-            let Some(requests) = server.received_requests().await else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            for request in &requests {
-                if request.method != "POST"
-                    || request.url.path() != "/codex/analytics-events/events"
-                {
-                    continue;
-                }
-                let payload: Value = serde_json::from_slice(&request.body)
-                    .map_err(|err| anyhow::anyhow!("invalid analytics payload: {err}"))?;
-                let Some(events) = payload["events"].as_array() else {
-                    continue;
-                };
-                if let Some(event) = events.iter().find(|event| matches(event)) {
-                    return Ok::<Value, anyhow::Error>(event.clone());
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await;
+    let result = server
+        .wait(read_timeout, |payload| {
+            payload["events"]
+                .as_array()?
+                .iter()
+                .find(|event| matches(event))
+                .cloned()
+        })
+        .await;
     match result {
-        Ok(event) => event,
+        Ok(event) => Ok(event),
         Err(err) => {
             let event_types = server
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|request| {
-                    request.method == "POST"
-                        && request.url.path() == "/codex/analytics-events/events"
-                })
-                .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+                .payloads
+                .borrow()
+                .iter()
+                .filter_map(|payload| payload.as_ref().ok())
                 .filter_map(|payload| payload["events"].as_array().cloned())
                 .flatten()
                 .filter_map(|event| {
@@ -208,6 +230,55 @@ pub(crate) async fn wait_for_matching_analytics_event(
             ))
         }
     }
+}
+
+#[tokio::test]
+async fn analytics_capture_retains_events_and_wakes_waiters() -> Result<()> {
+    let server = MockServer::start().await;
+    let capture = AnalyticsCapture::mount(&server).await;
+    let post = |body: &'static str| {
+        let address = server.address().to_owned();
+        async move {
+            use tokio::io::AsyncReadExt;
+            use tokio::io::AsyncWriteExt;
+            let mut stream = tokio::net::TcpStream::connect(address).await?;
+            stream.write_all(format!("POST /codex/analytics-events/events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await?;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+    let deadline = Duration::from_secs(5);
+    timeout(deadline, post(r#"{"events":[{"event_type":"first"}]}"#)).await??;
+    assert_eq!(
+        wait_for_analytics_event(&capture, deadline, "first").await?["event_type"],
+        "first"
+    );
+    let mut second = std::pin::pin!(wait_for_analytics_event(&capture, deadline, "second"));
+    let mut another = std::pin::pin!(wait_for_analytics_event(&capture, deadline, "second"));
+    assert!(futures::poll!(&mut second).is_pending());
+    assert!(futures::poll!(&mut another).is_pending());
+    timeout(deadline, post(r#"{"events":[{"event_type":"second"}]}"#)).await??;
+    assert_eq!(second.await?, another.await?);
+    assert_eq!(
+        wait_for_analytics_event(&capture, deadline, "first").await?["event_type"],
+        "first"
+    );
+    let error = wait_for_analytics_event(&capture, Duration::ZERO, "absent")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("first"));
+    assert!(error.to_string().contains("second"));
+    capture.record(b"invalid json");
+    assert!(
+        wait_for_analytics_event(&capture, deadline, "absent")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid analytics payload")
+    );
+    Ok(())
 }
 
 pub(crate) fn thread_initialized_event(payload: &Value) -> Result<&Value> {

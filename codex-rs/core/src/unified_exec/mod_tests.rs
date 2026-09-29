@@ -145,6 +145,7 @@ async fn exec_command_with_tracker(
         .expect("turn environment")
         .clone();
     let request = ExecCommandRequest {
+        stall_timeout_ms: None,
         validation: None,
         attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
             "exec_command",

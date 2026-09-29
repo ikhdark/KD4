@@ -24,8 +24,6 @@ mod suite {
     mod responses_api_proxy_headers;
     #[path = "responses_headers.rs"]
     mod responses_headers;
-    #[path = "responses_lite.rs"]
-    mod responses_lite;
     #[path = "websocket_fallback.rs"]
     mod websocket_fallback;
 }

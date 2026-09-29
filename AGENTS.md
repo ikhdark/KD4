@@ -15,4 +15,5 @@
 
 ## Validation
 
-* Use the smallest check that proves the changed contract; a full suite requires an explicit request. Reuse passing evidence until relevant inputs change. Let progressing checks finish, batch relevant repairs, and rerun only affected checks. Report unrelated failures without expanding scope.
+* Use the smallest check that proves the changed contract; a full suite requires an explicit request. Reuse passing evidence until relevant inputs change. Let progressing checks finish and batch relevant repairs. Within the same validation, rerun only failed checks; do not rerun passing tests. Report unrelated failures without expanding scope.
+* Keep tests narrowly scoped to the specific task you own. Do not re-run, fix, or analyze unrelated failures in the concurrently changing checkout.
