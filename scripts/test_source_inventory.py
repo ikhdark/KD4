@@ -185,7 +185,7 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertIn("unique", contract["control_files"])
         self.assertIn("not that its scope answers the entire task", contract["delivery"])
 
-    def test_documented_powershell_stdin_preserves_unicode_and_encoding_scope(self):
+    def test_documented_powershell_stdin_preserves_unicode_scope_and_failure_status(self):
         shells = [path for name in ("powershell", "pwsh") if (path := shutil.which(name))]
         if not shells:
             self.skipTest("PowerShell is not available")
@@ -200,24 +200,35 @@ class SourceInventoryTests(unittest.TestCase):
             "$OutputEncoding = [System.Text.ASCIIEncoding]::new()\n"
             "$before = $OutputEncoding\n"
             "$result = " + example + "\n"
-            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
             "if ($OutputEncoding -ne $before) { throw 'OutputEncoding leaked' }\n"
             "$result\n"
         )
         for shell in shells:
-            with self.subTest(shell=shell):
-                result = subprocess.run(
-                    [shell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                     base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
-                    cwd=Path(inventory.__file__).resolve().parent.parent,
-                    env={**os.environ, "TEMP": self.temp.name, "TMP": self.temp.name,
-                         "TMPDIR": self.temp.name},
-                    check=True, capture_output=True, encoding="utf-8",
-                )
-                summary = json.loads(result.stdout)
-                self.assertEqual(summary["category_counts"], {"日本語": 1})
-                canonical = json.loads(Path(summary["canonical_paths"]).read_text(encoding="utf-8"))
-                self.assertEqual(canonical["paths"], ["src/templates/café.md"])
+            for invalid_regex in (False, True):
+                with self.subTest(shell=shell, invalid_regex=invalid_regex):
+                    command = script
+                    if invalid_regex:
+                        command = command.replace(
+                            '"verification":"path"', '"verification":"path","contains":"(?i)("',
+                        )
+                    result = subprocess.run(
+                        [shell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                         base64.b64encode(command.encode("utf-16-le")).decode("ascii")],
+                        cwd=Path(inventory.__file__).resolve().parent.parent,
+                        env={**os.environ, "TEMP": self.temp.name, "TMP": self.temp.name,
+                             "TMPDIR": self.temp.name},
+                        capture_output=True, encoding="utf-8",
+                    )
+                    if invalid_regex:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("unterminated subpattern", result.stderr)
+                        self.assertEqual(result.stdout.strip(), "")
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        summary = json.loads(result.stdout)
+                        self.assertEqual(summary["category_counts"], {"日本語": 1})
+                        canonical = json.loads(Path(summary["canonical_paths"]).read_text(encoding="utf-8"))
+                        self.assertEqual(canonical["paths"], ["src/templates/café.md"])
 
     def test_rejects_f1_invented_paths_and_derives_unique_counts(self):
         actual = ["codex-rs/ext/image-generation/imagegen_description.md",

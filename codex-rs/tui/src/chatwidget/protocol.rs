@@ -108,7 +108,6 @@ impl ChatWidget {
             }
             ServerNotification::TurnPlanUpdated(notification) => {
                 self.on_plan_update(UpdatePlanArgs {
-                    investigation: None,
                     explanation: notification.explanation,
                     plan: notification
                         .plan

@@ -6013,35 +6013,6 @@ impl Session {
         result
     }
 
-    /// Count an isolated side request toward total usage and the source's task
-    /// budget without replacing last-request usage, which describes this
-    /// conversation's context window and drives compaction.
-    pub(crate) async fn record_side_request_token_usage(
-        &self,
-        turn_context: &TurnContext,
-        token_usage: Option<&TokenUsage>,
-    ) {
-        let Some(token_usage) = token_usage else {
-            return;
-        };
-        {
-            let mut state = self.state.lock().await;
-            if let Some(mut info) = state.token_info() {
-                info.total_token_usage.add_assign(token_usage);
-                state.set_token_info(Some(info));
-            }
-        }
-        self.services
-            .agent_control
-            .task_coordinator()
-            .record_task_usage_for_source(
-                &turn_context.session_source,
-                token_usage.total_tokens.max(0) as u64,
-                1,
-            );
-        self.send_token_count_event(turn_context).await;
-    }
-
     pub(crate) async fn record_token_usage_info(
         &self,
         turn_context: &TurnContext,

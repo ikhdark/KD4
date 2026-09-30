@@ -1862,8 +1862,6 @@ async fn handle_any_tool(
     tool: &dyn CoreToolRuntime,
     invocation: ToolInvocation,
 ) -> Result<AnyToolResult, FunctionCallError> {
-    let investigation = Arc::clone(&invocation.session.services.plan_store.investigation);
-    let investigation_target = crate::plan_store::investigation::admit_tool(&invocation)?;
     let _tool_execution_timing_guard =
         matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler).then(|| {
             invocation
@@ -1881,13 +1879,6 @@ async fn handle_any_tool(
     let output = tool.handle(invocation.clone()).await;
     mark_tool_handler_exit();
     let output = output?;
-    if matches!(output.outcome_context().outcome, ToolOutputOutcome::Success | ToolOutputOutcome::Failure)
-        && !invocation.cancellation_token.is_cancelled()
-        && let Some(target) = investigation_target
-    {
-        investigation.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record_observation(target);
-    }
     Ok(AnyToolResult {
         call_id: invocation.call_id,
         payload: invocation.payload,
@@ -4021,7 +4012,3 @@ fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) ->
 #[cfg(test)]
 #[path = "registry_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "registry_investigation_tests.rs"]
-mod investigation_tests;

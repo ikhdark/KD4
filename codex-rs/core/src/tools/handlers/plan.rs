@@ -35,7 +35,6 @@ struct PlanToolArgs {
     explanation: Option<String>,
     plan: Option<Vec<codex_protocol::plan_tool::PlanItemArg>>,
     set: Option<Vec<PlanStatusUpdate>>,
-    investigation: Option<crate::plan_store::investigation::Investigation>,
 }
 
 pub struct PlanToolOutput {
@@ -238,7 +237,6 @@ impl PlanHandler {
             requested_args.plan,
             requested_args.set,
             requested_args.explanation,
-            requested_args.investigation,
         ).await.map_err(FunctionCallError::RespondToModel)?;
         match update.effect {
             PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),

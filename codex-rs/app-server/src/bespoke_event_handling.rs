@@ -3319,7 +3319,6 @@ mod tests {
             ThreadId::new(),
         );
         let update = UpdatePlanArgs {
-            investigation: None,
             explanation: Some("need plan".to_string()),
             plan: vec![
                 PlanItemArg {

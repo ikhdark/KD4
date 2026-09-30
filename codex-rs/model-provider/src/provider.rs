@@ -16,6 +16,7 @@ use codex_models_manager::manager::OpenAiModelsManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::account::ProviderAccount;
+use codex_protocol::auth::AuthMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::openai_models::ModelsResponse;
 use sha2::Digest;
@@ -135,8 +136,7 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     fn api_provider(&self) -> ModelProviderFuture<'_, codex_protocol::error::Result<Provider>> {
         Box::pin(async move {
             let auth = self.auth().await;
-            self.info()
-                .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))
+            request_api_provider(self.info(), auth.as_ref().map(CodexAuth::auth_mode))
         })
     }
 
@@ -210,6 +210,43 @@ fn provider_uses_first_party_auth_path(provider: &ModelProviderInfo) -> bool {
         && provider.experimental_bearer_token.is_none()
         && provider.auth.is_none()
         && provider.aws.is_none()
+}
+
+/// Converts provider metadata into the API provider used for requests.
+///
+/// The built-in OpenAI provider sends its package version in the `version`
+/// header. Source builds would report 0.0.0, which the backend rejects for
+/// models that discovery lists under the compatibility baseline, so advertise
+/// that baseline in the header and in the matching User-Agent version. Other
+/// `version` values are sent unchanged.
+pub(crate) fn request_api_provider(
+    info: &ModelProviderInfo,
+    auth_mode: Option<AuthMode>,
+) -> codex_protocol::error::Result<Provider> {
+    let mut provider = info.to_api_provider(auth_mode)?;
+    let Some(version) = provider
+        .headers
+        .get("version")
+        .and_then(|value| value.to_str().ok())
+        .and_then(codex_models_manager::source_build_client_version)
+    else {
+        return Ok(provider);
+    };
+    provider
+        .headers
+        .insert("version", http::HeaderValue::from_static(version));
+    let originator = codex_login::default_client::originator().value;
+    let user_agent = codex_login::default_client::get_codex_user_agent();
+    if let Some(rest) =
+        user_agent.strip_prefix(&format!("{originator}/{}", env!("CARGO_PKG_VERSION")))
+        && let Ok(user_agent) =
+            http::HeaderValue::from_str(&format!("{originator}/{version}{rest}"))
+    {
+        provider
+            .headers
+            .insert(http::header::USER_AGENT, user_agent);
+    }
+    Ok(provider)
 }
 
 fn model_provider_cache_identity(
@@ -409,9 +446,8 @@ impl ModelProvider for ConfiguredModelProvider {
     {
         Box::pin(async move {
             let auth = self.auth().await;
-            let api_provider = self
-                .info
-                .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
+            let api_provider =
+                request_api_provider(&self.info, auth.as_ref().map(CodexAuth::auth_mode))?;
             let resolved_auth = if provider_uses_first_party_auth_path(&self.info) {
                 resolve_provider_auth_for_scope(
                     self.auth_manager(),
@@ -794,6 +830,54 @@ mod tests {
             .expect("client setup should resolve");
 
         assert_eq!(resolves.load(Ordering::SeqCst), baseline + 1);
+    }
+
+    #[tokio::test]
+    async fn client_setup_advertises_discovery_client_version() {
+        let setup = |info| async move {
+            create_model_provider(
+                info,
+                Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                    "sk-test",
+                ))),
+            )
+            .resolve_client_setup(ProviderAuthScope {
+                agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
+                session_source: SessionSource::Cli,
+                agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+            })
+            .await
+            .expect("client setup should resolve")
+            .api_provider
+            .headers
+        };
+        let package_version = env!("CARGO_PKG_VERSION");
+        let expected = codex_models_manager::source_build_client_version(package_version)
+            .unwrap_or(package_version);
+
+        let headers = setup(ModelProviderInfo::create_openai_provider(
+            /*base_url*/ None,
+        ))
+        .await;
+        assert_eq!(headers["version"], expected);
+        if expected != package_version {
+            let user_agent = headers[http::header::USER_AGENT]
+                .to_str()
+                .expect("user agent should be text");
+            assert!(user_agent.starts_with(&format!(
+                "{}/{expected} (",
+                codex_login::default_client::originator().value
+            )));
+        }
+
+        let mut configured = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+        configured.http_headers = Some(std::collections::HashMap::from([(
+            "version".to_string(),
+            "9.9.9".to_string(),
+        )]));
+        let headers = setup(configured).await;
+        assert_eq!(headers["version"], "9.9.9");
+        assert!(!headers.contains_key(http::header::USER_AGENT));
     }
 
     #[tokio::test]

@@ -496,25 +496,8 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     turn_diff_tracker.lock().await.set_environment_display_roots(display_roots);
     let kd4_runtime = turn_context.config.features.enabled(Feature::Kd4Runtime);
-    let completion_gate_enabled = kd4_runtime
-        && turn_context.config.features.enabled(Feature::Kd4CompletionGate)
-        && turn_context.collaboration_mode.mode != ModeKind::Plan
-        && completion::applies_to_session(&turn_context.session_source);
-    let mut completion_obligation = completion_gate_enabled
-        && completion::active_obligation(sess.clone_history().await.raw_items());
-    // One generic continuation per user input for a malformed assessment;
-    // a repeated assessor failure delivers the answer instead of looping.
-    let mut completion_assessment_failed = false;
     let mut turn_execution =
         TurnExecutionControl::new_with_timing(Arc::clone(&turn_context.turn_timing_state));
-    // A new turn is new user direction: per-turn investigation pressure must not
-    // block its first tools, while the recorded causal gate itself persists.
-    sess.services
-        .plan_store
-        .investigation
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .accepted_user_input();
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -565,17 +548,6 @@ pub(crate) async fn run_turn(
             run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await?
         };
         if recorded_input.accepted_context_input {
-            if completion_gate_enabled {
-                completion_obligation =
-                    completion::active_obligation(sess.clone_history().await.raw_items());
-            }
-            completion_assessment_failed = false;
-            sess.services
-                .plan_store
-                .investigation
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .accepted_user_input();
             initial_workspace_prefetch = None;
             prefetched_workspace_identity = None;
             finalized_mutation_revision = None;
@@ -674,8 +646,6 @@ pub(crate) async fn run_turn(
         if budget_forced_terminal {
             record_forced_terminal_budget_boundary(sess.as_ref(), turn_context.as_ref()).await;
         }
-        let completion_gate_required =
-            completion_obligation && !generation_request.terminal_completion_only;
         if kd4_runtime {
             record_soft_convergence_directive(
                 sess.as_ref(),
@@ -782,7 +752,6 @@ pub(crate) async fn run_turn(
                 generation_request.clone(),
                 generation_id.clone(),
                 request_signals.clone(),
-                completion_gate_required,
                 &mut pending_continuation_cause,
                 cancellation_token.child_token(),
             )
@@ -800,7 +769,6 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
-                    mut proposed_finals,
                     settled_state,
                     tool_result_continuation,
                     server_end_turn_false,
@@ -809,12 +777,6 @@ pub(crate) async fn run_turn(
                 } = sampling_request_output;
                 prefetched_workspace_identity = next_workspace_identity;
                 if let Some(required_tool_terminal) = required_tool_terminal {
-                    completion::publish_all(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        std::mem::take(&mut proposed_finals),
-                    )
-                    .await?;
                     if required_tool_terminal.cause != RequiredToolTerminalCause::Blocked {
                         let error = CodexErrorInfo::Other;
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
@@ -982,12 +944,6 @@ pub(crate) async fn run_turn(
 
                 // Automatic compaction verifies that the replacement fits before continuing.
                 if new_context_requested || (needs_follow_up && token_limit_reached) {
-                    completion::publish_all(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        std::mem::take(&mut proposed_finals),
-                    )
-                    .await?;
                     record_convergence_decision(
                         sess.as_ref(),
                         turn_context.as_ref(),
@@ -1030,84 +986,6 @@ pub(crate) async fn run_turn(
                         surfaced_result = Some(authoritative_result);
                     } else {
                         last_agent_message = sampling_request_last_agent_message;
-                    }
-                    // A model end-of-turn is only a proposed completion. The
-                    // built-in gate is independent of optional user stop hooks.
-                    // Owner terminals and the emergency budget remain host
-                    // boundaries: without regular capacity the answer is
-                    // delivered unassessed instead of being discarded.
-                    let mut completion_receipt = None;
-                    if completion_gate_required
-                        && !generation_budget_error_reported
-                        && surfaced_result.is_none()
-                        && logical_generation_budget.has_regular_generation_capacity()
-                    {
-                        let _ = logical_generation_budget.admit(false);
-                        logical_generation_ordinal = logical_generation_ordinal.saturating_add(1);
-                        let assessment = tokio::select! {
-                            _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-                            result = completion::assess(
-                                sess.as_ref(),
-                                turn_context.as_ref(),
-                                &proposed_finals,
-                                &cancellation_token,
-                            ) => result,
-                        };
-                        let feedback = match assessment {
-                            Ok(Ok(assessment)) => {
-                                completion_receipt = assessment.resolved_receipt();
-                                assessment.continuation()
-                            }
-                            Ok(Err(feedback)) if !completion_assessment_failed => {
-                                completion_assessment_failed = true;
-                                Some(feedback)
-                            }
-                            Ok(Err(_)) => {
-                                completion::warn_unassessed(
-                                    sess.as_ref(),
-                                    turn_context.as_ref(),
-                                    "the assessment was malformed again",
-                                )
-                                .await;
-                                None
-                            }
-                            Err(CodexErr::TurnAborted) => return Err(CodexErr::TurnAborted),
-                            // Transport or provider failure of the side request
-                            // must not discard the working agent's answer.
-                            Err(error) => {
-                                completion::warn_unassessed(
-                                    sess.as_ref(),
-                                    turn_context.as_ref(),
-                                    &error.to_string(),
-                                )
-                                .await;
-                                None
-                            }
-                        };
-                        if let Some(feedback) = feedback {
-                            sess.record_conversation_items(
-                                &turn_context,
-                                &[completion::continuation_item(feedback)],
-                            )
-                            .await?;
-                            last_agent_message = None;
-                            pending_generation_request = None;
-                            pending_continuation_cause = Some(ContinuationCause::StopHook);
-                            continue 'sampling_loop;
-                        }
-                    }
-                    // Admitted (or unassessed) text is published before the
-                    // after-agent and stop hooks, exactly as without the gate, so
-                    // every later exit or continuation keeps the answer visible.
-                    completion::publish_all(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        std::mem::take(&mut proposed_finals),
-                    )
-                    .await?;
-                    if let Some(receipt) = completion_receipt {
-                        sess.record_conversation_items(&turn_context, &[receipt])
-                            .await?;
                     }
                     // C1: the direct runtime shares this completion path. It must not skip
                     // the after-agent and completion-stop hooks, because those are the
@@ -1272,15 +1150,6 @@ pub(crate) async fn run_turn(
                     }
                     break;
                 }
-                // The response is not the end of the turn (tool results,
-                // steering input, or a server continuation): held text belongs
-                // to the history the next generation continues from.
-                completion::publish_all(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    std::mem::take(&mut proposed_finals),
-                )
-                .await?;
                 pending_continuation_cause = ordinary_continuation_cause(
                     tool_result_continuation,
                     server_end_turn_false,
@@ -3866,7 +3735,6 @@ async fn run_sampling_request(
     generation_request: GenerationRequestDisposition,
     generation_id: ModelGenerationId,
     request_signals: SamplingRequestSignalCollector,
-    completion_gate_required: bool,
     pending_continuation_cause: &mut Option<ContinuationCause>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Arc<[ResponseItem]>)> {
@@ -4033,7 +3901,6 @@ async fn run_sampling_request(
             Arc::clone(&pending_tool_manifest),
             cancellation_token.child_token(),
             &mut attempt_progress,
-            completion_gate_required,
         )
         .await
         {
@@ -4609,7 +4476,6 @@ fn goal_surface_state(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
-    proposed_finals: Vec<completion::ProposedFinal>,
     settled_state: SamplingRequestSettledState,
     tool_result_continuation: bool,
     server_end_turn_false: bool,
@@ -4621,7 +4487,6 @@ struct SamplingRequestResult {
 struct UnsettledSamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
-    proposed_finals: Vec<completion::ProposedFinal>,
     tool_result_continuation: bool,
     server_end_turn_false: bool,
 }
@@ -5554,7 +5419,6 @@ async fn try_run_sampling_request(
     pending_tool_manifest: Arc<Mutex<Option<codex_protocol::protocol::ToolManifestItem>>>,
     cancellation_token: CancellationToken,
     attempt_progress: &mut SamplingAttemptProgress,
-    completion_gate_required: bool,
 ) -> CodexResult<SamplingRequestResult> {
     let mut active_without_pending_passes = 0_u8;
     let next_sample_reason = hold_sampling_readiness_for_ordered_prefix(reconcile_turn_progress(
@@ -5844,7 +5708,6 @@ async fn try_run_sampling_request(
     let mut tool_result_continuation = false;
     let mut server_end_turn_false = false;
     let mut last_agent_message: Option<String> = None;
-    let mut proposed_finals = Vec::new();
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
@@ -6017,28 +5880,6 @@ async fn try_run_sampling_request(
                     None
                 };
                 active_item_is_streaming_to_client = false;
-                if completion_gate_required && completion::is_proposed_final(&item) {
-                    if let Some(proposed) = completion::ProposedFinal::prepare(
-                        sess.as_ref(), turn_store.as_ref(), item.clone(),
-                    ).await {
-                        last_agent_message = proposed.text();
-                        proposed_finals.push(proposed);
-                        continue;
-                    }
-                    // Nothing visible to withhold: record it on the ordinary path.
-                } else if !proposed_finals.is_empty()
-                    && !matches!(item, ResponseItem::Reasoning { .. })
-                    // A later item (for example a tool call) means the held text
-                    // did not end this response; publish it in provider order.
-                    && let Err(err) = completion::publish_all(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        std::mem::take(&mut proposed_finals),
-                    )
-                    .await
-                {
-                    break Err(err);
-                }
                 if let Some(previous) = previously_streamed_item.as_ref()
                     && matches!(previous, TurnItem::AgentMessage(_))
                 {
@@ -6110,22 +5951,6 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::OutputItemAdded(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
-                // Publish held text before a following tool call starts streaming
-                // its own client events (for example patch previews).
-                if !proposed_finals.is_empty()
-                    && !matches!(
-                        item,
-                        ResponseItem::Reasoning { .. } | ResponseItem::Message { .. }
-                    )
-                    && let Err(err) = completion::publish_all(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        std::mem::take(&mut proposed_finals),
-                    )
-                    .await
-                {
-                    break Err(err);
-                }
                 if let Some((call_id, tool_name)) = tool_argument_diff_target(&item) {
                     active_tool_argument_diff_consumer = tool_runtime
                         .create_diff_consumer(&tool_name)
@@ -6140,8 +5965,7 @@ async fn try_run_sampling_request(
                 .await
                 {
                     let mut turn_item = turn_item;
-                    let stream_item_to_client = !defer_streamed_turn_items_for_contributors
-                        && !(completion_gate_required && completion::is_proposed_final(&item));
+                    let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
                     if stream_item_to_client
@@ -6299,7 +6123,6 @@ async fn try_run_sampling_request(
                 break Ok(UnsettledSamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
-                    proposed_finals,
                     tool_result_continuation,
                     server_end_turn_false,
                 });
@@ -6597,7 +6420,6 @@ async fn try_run_sampling_request(
     let outcome = outcome.map(|result| SamplingRequestResult {
         needs_follow_up: result.needs_follow_up,
         last_agent_message: result.last_agent_message,
-        proposed_finals: result.proposed_finals,
         settled_state,
         tool_result_continuation: result.tool_result_continuation,
         server_end_turn_false: result.server_end_turn_false,
@@ -6651,6 +6473,3 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
 #[cfg(test)]
 #[path = "turn_tests.rs"]
 mod tests;
-
-#[path = "turn_completion.rs"]
-mod completion;

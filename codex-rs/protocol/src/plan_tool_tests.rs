@@ -49,10 +49,18 @@ fn update_plan_rejects_blank_steps() {
 
 #[test]
 fn update_plan_accepts_empty_plan_for_existing_clear_semantics() {
-    let args = serde_json::from_value::<UpdatePlanArgs>(json!({"plan": []}))
-        .expect("empty plans remain wire-compatible");
-
-    assert!(args.plan.is_empty());
+    for persisted in [
+        json!({"plan": []}),
+        json!({"plan": [], "investigation": {"phase": "blocked"}}),
+    ] {
+        let args = serde_json::from_value::<UpdatePlanArgs>(persisted)
+            .expect("empty plans and old session checklists remain readable");
+        assert!(args.plan.is_empty());
+        assert_eq!(
+            serde_json::to_value(args).unwrap(),
+            json!({"explanation": null, "plan": []})
+        );
+    }
 }
 
 #[test]

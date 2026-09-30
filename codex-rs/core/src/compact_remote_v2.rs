@@ -1117,7 +1117,6 @@ mod tests {
         );
         let input = vec![request.clone(), correction.clone(), handoff.clone()];
         let plan = UpdatePlanArgs {
-            investigation: None,
             explanation: Some("The full contract is not yet satisfied.".to_string()),
             plan: vec![PlanItemArg {
                 step: "Finish network modeling".to_string(),

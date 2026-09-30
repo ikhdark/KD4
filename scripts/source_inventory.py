@@ -769,7 +769,7 @@ def describe_contract():
         "format": RESULT_FORMAT,
         "invocation": {
             "file": "python -X utf8 scripts/source_inventory.py --root . --query QUERY --state STATE --report REPORT",
-            "powershell_stdin": "& {\n  $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n  @'\n{\"categories\":[{\"name\":\"templates\",\"paths\":[\"templates/*.md\",\"*/templates/*.md\"],\"verification\":\"path\"}]}\n'@ | python -X utf8 scripts/source_inventory.py --root . --query -\n}",
+            "powershell_stdin": "& {\n  $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n  @'\n{\"categories\":[{\"name\":\"templates\",\"paths\":[\"templates/*.md\",\"*/templates/*.md\"],\"verification\":\"path\"}]}\n'@ | python -X utf8 scripts/source_inventory.py --root . --query -\n}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             "stdin": "--query - reads UTF-8 JSON from stdin (an optional UTF-8 BOM is accepted). The PowerShell example scopes OutputEncoding to the script block; it changes no global setting.",
             "continuation": "Reuse the query with --root ROOT --query QUERY --state ARTIFACT (or pipe it with --query -). Add --report REPORT to deliver the updated report; explicit --state does not imply a report. ARTIFACT is the returned state path. Omitting --state starts a new independent run, not a continuation.",
             "refresh": "Add --refresh to a scan with the retained state to start a new epoch and read current sources instead of continuing captured evidence.",
@@ -780,7 +780,7 @@ def describe_contract():
             "inspection_exception": "Inspect before scanning only when a concrete uncertainty cannot be expressed by query rules and its answer would change category coverage or verification. Name that uncertainty and use the smallest targeted inspection, not general repository orientation. Resolve pending scans and runtime evidence after the scan when required; do not force final delivery from insufficient evidence.",
         },
         "globs": "fnmatch.fnmatchcase on normalized repository-relative POSIX paths; case-sensitive. Both * and ? can match /, so dir/*.rs also matches dir/nested/file.rs. Backslashes and leading ./ are normalized.",
-        "contains": "Optional Python regular expression searched with re.search over UTF-8 file text, not filenames; case-sensitive unless flags such as (?i) are supplied. Non-UTF-8 content is unresolved when text matching is required.",
+        "contains": "Optional Python regular expression searched with re.search over UTF-8 file text, not filenames; case-sensitive unless flags such as (?i) are supplied. For keyword searches prefer simple alternation, e.g. (?i)prompt|instruction|guidance|template; use re.escape for literal punctuation. Non-UTF-8 content is unresolved when text matching is required.",
         "budget": {
             "max_file_bytes": MAX_FILE_BYTES,
             "max_scan_bytes": MAX_SCAN_BYTES,

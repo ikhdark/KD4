@@ -49,7 +49,8 @@ pub fn bundled_models_response() -> Result<ModelsResponse, serde_json::Error> {
 
 // The workspace uses 0.0.0 for local source builds, not as a protocol capability
 // version. The /models endpoint filters individual models by client_version:
-// 0.0.0 omits Sol 6/Luna 6, and 0.158.0 omits Sol 6.1. Use the baseline verified
+// 0.0.0 omits Sol 6/Luna 6, and 0.158.0 omits Sol 6.1. Inference rejects those
+// models for a 0.0.0 client identity the same way. Use the baseline verified
 // against rust-v0.159.1 without changing executable versions.
 const SOURCE_BUILD_MODELS_CLIENT_VERSION: &str = "0.159.1";
 
@@ -59,14 +60,23 @@ pub fn client_version_to_whole() -> String {
     model_catalog_client_version(env!("CARGO_PKG_VERSION"))
 }
 
-fn model_catalog_client_version(package_version: &str) -> String {
-    let whole = package_version
+/// Baseline to advertise in place of the 0.0.0 source-build placeholder.
+/// Release versions, including prereleases, are advertised unchanged.
+pub fn source_build_client_version(version: &str) -> Option<&'static str> {
+    (whole_version(version) == "0.0.0").then_some(SOURCE_BUILD_MODELS_CLIENT_VERSION)
+}
+
+fn whole_version(version: &str) -> &str {
+    version
         .split_once(['-', '+'])
-        .map_or(package_version, |(whole, _)| whole);
-    match whole {
-        "0.0.0" => SOURCE_BUILD_MODELS_CLIENT_VERSION.to_string(),
-        _ => whole.to_string(),
-    }
+        .map_or(version, |(whole, _)| whole)
+}
+
+fn model_catalog_client_version(package_version: &str) -> String {
+    let whole = whole_version(package_version);
+    source_build_client_version(whole)
+        .unwrap_or(whole)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -89,6 +99,11 @@ mod tests {
             );
         }
         assert_ne!(super::client_version_to_whole(), "0.0.0");
+        assert_eq!(
+            super::source_build_client_version("0.0.0-dev+local"),
+            Some("0.159.1")
+        );
+        assert_eq!(super::source_build_client_version("0.159.0-alpha.4"), None);
     }
 
     #[test]

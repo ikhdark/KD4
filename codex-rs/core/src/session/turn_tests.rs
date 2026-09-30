@@ -3392,7 +3392,9 @@ async fn assert_streamed_item_id(provider_id: &str) -> Result<()> {
     test.codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: "stream a response".to_string(),
+                // Implementation requests must stream and complete on the working
+                // model's response, without a separate completion assessment.
+                text: "Fix the timer.".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -3410,6 +3412,13 @@ async fn assert_streamed_item_id(provider_id: &str) -> Result<()> {
         _ => None,
     })
     .await;
+    let delta = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::AgentMessageContentDelta(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(delta.item_id, started_id);
+    assert_eq!(delta.delta, "streamed");
     let completed_id = core_test_support::wait_for_event_match(&test.codex, |event| match event {
         EventMsg::ItemCompleted(event) => match &event.item {
             TurnItem::AgentMessage(item) => Some(item.id.clone()),
@@ -3425,6 +3434,12 @@ async fn assert_streamed_item_id(provider_id: &str) -> Result<()> {
         id => assert_eq!(started_id, id),
     }
     assert_eq!(started_id, completed_id);
+    let completed = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(completed.last_agent_message.as_deref(), Some("streamed"));
     response_mock.single_request();
     Ok(())
 }

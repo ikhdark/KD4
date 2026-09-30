@@ -41,7 +41,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
     status_updates.min_items = Some(1);
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".to_string(),
-        description: "Updates the task checklist for work with multiple substantive dependent steps. Execute bounded read-only inventories directly. Skip plans for straightforward work; do not create single-step plans. At most one step can be in_progress at a time. For debugging, register investigation before diagnostic tools: stable hypotheses, named unknowns, and the next discriminating observation with a stable id. New reads alone are not causal progress. Report findings against an observation_id backed by completed tool evidence, not a blocked or unexecuted probe. Establish the cause before implementing; diagnostic_action permits one exact diagnostic tool/input, not production repair or permission overrides. Investigation-only work can use an empty plan."
+        description: "Updates the task checklist for work with multiple substantive dependent steps. Execute bounded read-only inventories directly. Skip plans for straightforward work; do not create single-step plans. At most one step can be in_progress at a time."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -61,8 +61,6 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     JsonSchema::array(plan_item.clone(), Some("Complete task checklist, replacing the previous plan. Omitted steps are removed; include every step you want to retain.".to_string())),
                 ),
                 ("set".to_string(), status_updates),
-                ("investigation".to_string(), serde_json::from_value(crate::plan_store::investigation::schema())
-                    .expect("valid investigation tool schema")),
             ]),
             None,
             Some(false.into()),
@@ -75,8 +73,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     "description": "The complete stored checklist after this update.",
                     "properties": {
                         "explanation": { "type": ["string", "null"] },
-                        "plan": { "type": "array", "items": plan_item },
-                        "investigation": crate::plan_store::investigation::schema()
+                        "plan": { "type": "array", "items": plan_item }
                     },
                     "required": ["explanation", "plan"],
                     "additionalProperties": false

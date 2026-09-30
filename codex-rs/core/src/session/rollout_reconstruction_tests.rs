@@ -193,7 +193,6 @@ async fn resume_rollout(session: &Session, rollout_items: Vec<RolloutItem>) {
 
 fn checklist(step: &str) -> codex_protocol::plan_tool::UpdatePlanArgs {
     codex_protocol::plan_tool::UpdatePlanArgs {
-        investigation: None,
         explanation: None,
         plan: vec![codex_protocol::plan_tool::PlanItemArg {
             step: step.to_string(),

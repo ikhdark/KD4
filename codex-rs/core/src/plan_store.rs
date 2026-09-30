@@ -9,8 +9,6 @@ use serde::Serialize;
 use std::collections::HashSet;
 use tokio::sync::Mutex;
 
-pub(crate) mod investigation;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlanUpdateEffect {
     Initial,
@@ -76,7 +74,6 @@ pub(crate) fn plan_from_tool_output(output: &FunctionCallOutputPayload) -> Optio
 #[derive(Debug, Default)]
 pub(crate) struct PlanStore {
     current: Mutex<Option<UpdatePlanArgs>>,
-    pub(crate) investigation: std::sync::Arc<std::sync::Mutex<investigation::InvestigationState>>,
 }
 
 impl PlanStore {
@@ -113,8 +110,6 @@ impl PlanStore {
 
     pub(crate) async fn restore(&self, plan: Option<UpdatePlanArgs>) {
         let mut current = self.current.lock().await;
-        self.investigation.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .restore(plan.as_ref().and_then(|plan| plan.investigation.clone()));
         *current = plan;
     }
 
@@ -124,22 +119,18 @@ impl PlanStore {
         Self::commit(&mut current, next)
     }
 
-    /// Validate checklist and investigation together before committing either.
-    /// Lock order is always checklist then investigation; neither lock crosses
-    /// tool execution, and the synchronous investigation guard never awaits.
+    /// Update the checklist atomically.
     pub(crate) async fn update_tool(
         &self,
         plan: Option<Vec<PlanItemArg>>,
         statuses: Option<Vec<PlanStatusUpdate>>,
         explanation: Option<String>,
-        investigation: Option<investigation::Investigation>,
     ) -> Result<PlanStoreUpdate, String> {
         let mut current = self.current.lock().await;
-        let mut next = if let Some(plan) = plan {
+        let next = if let Some(plan) = plan {
             UpdatePlanArgs {
                 explanation,
                 plan,
-                investigation: current.as_ref().and_then(|plan| plan.investigation.clone()),
             }
         } else if let Some(statuses) = statuses {
             Self::status_plan(&current, statuses, explanation)?
@@ -147,19 +138,12 @@ impl PlanStore {
             let mut next = current.clone().unwrap_or(UpdatePlanArgs {
                 explanation: None,
                 plan: Vec::new(),
-                investigation: None,
             });
             if explanation.is_some() {
                 next.explanation = explanation;
             }
             next
         };
-        let mut state = self.investigation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(report) = investigation {
-            let progress = state.validate(&report)?;
-            state.commit(report.clone(), progress);
-            next.investigation = Some(report);
-        }
         Ok(Self::commit(&mut current, next))
     }
 
@@ -241,7 +225,6 @@ mod tests {
 
     fn plan(step: &str, status: StepStatus) -> UpdatePlanArgs {
         UpdatePlanArgs {
-            investigation: None,
             explanation: None,
             plan: vec![PlanItemArg {
                 step: step.to_string(),

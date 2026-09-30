@@ -1514,7 +1514,6 @@ impl ToolCallRuntime {
         mut self,
         collector: SamplingRequestSignalCollector,
     ) -> Self {
-        collector.attach_investigation(Arc::clone(&self.session.services.plan_store.investigation));
         self.sampling_request_signals = Some(collector);
         self
     }

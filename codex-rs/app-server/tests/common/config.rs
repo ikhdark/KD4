@@ -17,12 +17,6 @@ pub fn write_mock_responses_config_toml(
     for (feature, enabled) in feature_flags {
         features.insert(*feature, *enabled);
     }
-    // Scripted tests describe only the working model's responses; the
-    // completion assessor is a separate request. Match core's test config and
-    // leave it off unless a test opts in explicitly.
-    features
-        .entry(Feature::Kd4CompletionGate)
-        .or_insert(false);
     let feature_entries = features
         .into_iter()
         .map(|(feature, enabled)| {
@@ -135,9 +129,6 @@ base_url = "{server_uri}/v1"
 wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
-
-[features]
-kd4_completion_gate = false
 "#
         ),
     )

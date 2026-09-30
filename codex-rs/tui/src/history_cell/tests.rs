@@ -2323,7 +2323,6 @@ fn render_uses_wrapping_for_long_url_like_line() {
 fn plan_update_with_note_and_wrapping_snapshot() {
     // Long explanation forces wrapping; include long step text to verify step wrapping and alignment.
     let update = UpdatePlanArgs {
-            investigation: None,
             explanation: Some(
                 "I’ll update Grafana call error handling by adding retries and clearer messages when the backend is unreachable."
                     .to_string(),
@@ -2354,7 +2353,6 @@ fn plan_update_with_note_and_wrapping_snapshot() {
 #[test]
 fn plan_update_without_note_snapshot() {
     let update = UpdatePlanArgs {
-        investigation: None,
         explanation: None,
         plan: vec![
             PlanItemArg {
@@ -2379,7 +2377,6 @@ fn plan_update_does_not_split_url_like_tokens_in_note_or_step() {
     let note_url = "example.test/api/v1/projects/alpha-team/releases/2026-02-17/builds/1234567890";
     let step_url = "example.test/api/v1/projects/beta-team/releases/2026-02-17/builds/0987654321/artifacts/reports/performance";
     let update = UpdatePlanArgs {
-        investigation: None,
         explanation: Some(format!(
             "Investigate failures under {note_url} immediately."
         )),

@@ -926,7 +926,6 @@ async fn plan_implementation_popup_skips_without_proposed_plan() {
 
     chat.on_task_started();
     chat.on_plan_update(UpdatePlanArgs {
-        investigation: None,
         explanation: None,
         plan: vec![PlanItemArg {
             step: "First".to_string(),
@@ -1063,7 +1062,6 @@ async fn plan_implementation_popup_skips_when_rate_limit_prompt_pending() {
 
     chat.on_task_started();
     chat.on_plan_update(UpdatePlanArgs {
-        investigation: None,
         explanation: None,
         plan: vec![PlanItemArg {
             step: "First".to_string(),
@@ -1637,7 +1635,6 @@ async fn user_turn_includes_personality_from_config() {
 async fn plan_update_renders_history_cell() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let update = UpdatePlanArgs {
-        investigation: None,
         explanation: Some("Adapting plan".to_string()),
         plan: vec![
             PlanItemArg {

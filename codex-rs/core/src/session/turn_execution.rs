@@ -4,9 +4,6 @@ use std::borrow::Cow;
 #[path = "turn_execution_evidence_tests.rs"]
 mod evidence_tests;
 #[cfg(test)]
-#[path = "turn_execution_investigation_tests.rs"]
-mod investigation_tests;
-#[cfg(test)]
 #[path = "turn_execution_cycle_tests.rs"]
 mod cycle_tests;
 use std::collections::BTreeMap;
@@ -444,7 +441,6 @@ impl DeterministicDispatchLedger {
 
 #[derive(Default)]
 struct SamplingRequestSignalState {
-    investigation: Option<Arc<Mutex<crate::plan_store::investigation::InvestigationState>>>,
     outcomes: Vec<SamplingToolOutcome>,
     structured_actions: BTreeMap<u64, StructuredActionIdentity>,
     evidence_items: BTreeMap<u64, String>,
@@ -563,14 +559,6 @@ pub(crate) struct SamplingToolCallRegistration {
 }
 
 impl SamplingRequestSignalCollector {
-    pub(crate) fn attach_investigation(
-        &self,
-        investigation: Arc<Mutex<crate::plan_store::investigation::InvestigationState>>,
-    ) {
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .investigation = Some(investigation);
-    }
-
     pub(crate) fn completion_evidence_key(&self) -> Option<String> {
         let state = self
             .state
@@ -2482,7 +2470,6 @@ impl DeliveredSourceCoverage {
 }
 
 pub(crate) struct TurnExecutionControl {
-    investigation_directive: Option<String>,
     issued_directives: BTreeSet<String>,
     soft_convergence_issued: bool,
     lightweight_handoffs: u32,
@@ -2525,7 +2512,6 @@ impl TurnExecutionControl {
 
     pub(crate) fn new_with_timing(timing: Arc<TurnTimingState>) -> Self {
         Self {
-            investigation_directive: None,
             issued_directives: BTreeSet::new(),
             soft_convergence_issued: false,
             lightweight_handoffs: 0,
@@ -2562,9 +2548,6 @@ impl TurnExecutionControl {
         &mut self,
         is_continuation: bool,
     ) -> Option<String> {
-        if is_continuation && self.investigation_directive.is_some() {
-            return self.investigation_directive.take();
-        }
         if !is_continuation
             || self.soft_convergence_issued
             || self.continuations_without_progress < SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS
@@ -2665,20 +2648,6 @@ impl TurnExecutionControl {
                     }
                 }
             }
-        }
-        if let Some((narrowed, directive)) = state.investigation.as_ref().and_then(|investigation| {
-            investigation.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                .finish_generation()
-        }) {
-            // Evidence accumulation and diagnostic setup are not causal
-            // narrowing. Credit only an accepted, tool-linked finding while
-            // debugging; ordinary implementation retains its existing rules.
-            progress.clear();
-            process_progress = false;
-            if narrowed {
-                progress.push(TurnTimingProgressKind::NewSourceEvidence);
-            }
-            self.investigation_directive = directive;
         }
         progress.sort_by_key(|kind| *kind as u8);
         progress.dedup();
@@ -3353,7 +3322,6 @@ mod tests {
 
     fn plan(statuses: &[StepStatus]) -> UpdatePlanArgs {
         UpdatePlanArgs {
-            investigation: None,
             explanation: None,
             plan: statuses
                 .iter()

@@ -104,8 +104,6 @@ pub enum Feature {
     /// Enable KD4 turn execution controls and command preflight.
     /// Other independently controlled or fixed fork differences remain separate.
     Kd4Runtime,
-    /// Assess proposed task completion before allowing a KD4 turn to finish.
-    Kd4CompletionGate,
     /// Enable the default shell tool.
     ShellTool,
     /// Enable Claude-style lifecycle hooks loaded from hooks.json files.
@@ -858,12 +856,6 @@ define_features! {
     FeatureSpec {
         id: Feature::Kd4Runtime,
         key: "kd4_runtime",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::Kd4CompletionGate,
-        key: "kd4_completion_gate",
         stage: Stage::Stable,
         default_enabled: true,
     },

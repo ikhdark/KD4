@@ -4149,9 +4149,6 @@
         "in_app_updates": {
           "type": "boolean"
         },
-        "kd4_completion_gate": {
-          "type": "boolean"
-        },
         "kd4_runtime": {
           "type": "boolean"
         },
