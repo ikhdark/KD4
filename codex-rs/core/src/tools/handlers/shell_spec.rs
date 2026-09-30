@@ -44,7 +44,7 @@ fn command_parameters_schema(
 fn stall_timeout_schema() -> JsonSchema {
     bounded_integer(
         format!(
-            "Maximum time without stdout or stderr before cancellation, including between polls. Defaults to {} ms. Set zero to disable or increase for intentionally quiet or interactive commands. This is not a total runtime limit.",
+            "Maximum time without stdout or stderr before cancellation, including between polls. Defaults to {} ms; exec_command disables this default for recognized long-running validation, build, install, and discovery commands. Set zero to disable or increase for intentionally quiet or interactive commands. This is not a total runtime limit.",
             crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS,
         ),
         0,
@@ -128,7 +128,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                format!("Wait before yielding output. Defaults to 30000 ms for recognized validation commands, Cargo builds, and nextest discovery, and 2000 ms otherwise ({} ms inside `exec`); explicit values use 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", super::unified_exec::NESTED_EXEC_YIELD_TIME_MS, crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
+                format!("Wait before yielding output. Inside `exec`, noninteractive commands default to {} ms so the host can finish the awaited command without model polling; set an explicit shorter wait for background work. Otherwise defaults to 30000 ms for recognized validation, build, install, and discovery commands (including command chains), and 2000 ms for other commands ({} ms for interactive commands inside `exec`). Explicit values are clamped to 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", super::unified_exec::NESTED_NONINTERACTIVE_EXEC_YIELD_TIME_MS, super::unified_exec::NESTED_EXEC_YIELD_TIME_MS, crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
@@ -243,7 +243,7 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
             "yield_time_ms".to_string(),
             bounded_integer(
                 format!(
-                    "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to {default_timeout_ms} ms and cap at {max_timeout_ms} ms; explicit shorter waits are honored down to 250 ms. A wait deadline does not terminate the process."
+                    "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to {default_timeout_ms} ms and cap at {max_timeout_ms} ms; waits below 5000 ms are honored down to 250 ms only when new output is pending, otherwise a 5000 ms floor applies. A wait deadline does not terminate the process."
                 ),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 max_timeout_ms.max(crate::unified_exec::MAX_YIELD_TIME_MS),
@@ -475,6 +475,17 @@ fn unified_exec_output_schema() -> Value {
                 "type": "integer",
                 "description": "Cumulative bytes retained in the raw output artifact."
             },
+            "recovery_selector": {
+                "type": "object",
+                "description": "First omitted source line range, when its coordinates are known in raw_output_artifact_id.",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["lines"]},
+                    "start": {"type": "integer", "minimum": 1},
+                    "end": {"type": "integer", "minimum": 1}
+                },
+                "required": ["kind", "start", "end"],
+                "additionalProperties": false
+            },
             "raw_output_artifact_error": {
                 "type": "string",
                 "description": "Artifact persistence failure, when retention was unavailable."
@@ -652,6 +663,8 @@ fn windows_shell_guidance() -> &'static str {
     r#"Filesystem safety: keep destructive operations in one shell, resolve recursive delete or move targets inside the intended directory first, and avoid unresolved variables or globs.
 
 Windows safety rules (apply when executing in a Windows environment, regardless of the host OS):
+- PowerShell and cmd do not expand wildcard paths for native `rg`. Search a literal parent directory with `--glob` instead, for example `rg -n "default_prompt:" skills --glob "**/agents/openai.yaml"`.
+- PowerShell `foreach` statements cannot feed a pipeline directly. Collect first: `$rows = foreach ($item in $items) { $item }; $rows | Out-String`. Changing to `script_body` does not fix invalid syntax.
 - Do not compose destructive filesystem commands across shells. Do not enumerate paths in PowerShell and then pass them to `cmd /c`, batch builtins, or another shell for deletion or moving. Use one shell end-to-end, prefer native PowerShell cmdlets such as `Remove-Item` / `Move-Item` with `-LiteralPath`, and avoid string-built shell commands for file operations.
 - Before any recursive delete or move on Windows, verify the resolved absolute target paths stay within the intended workspace or explicitly named target directory. Never issue a recursive delete or move against a computed path if the final target has not been checked.
 - When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control."#
@@ -674,6 +687,9 @@ fn filesystem_safety_guidance() -> &'static str {
 fn rg_search_admission_guidance() -> &'static str {
     r#"Search guidance:
 - Read known files directly. Use `rg -l` when only matching filenames are needed; use scoped `rg -n` when matching content is needed. Start unknown-location searches in a likely owning path and expand after a miss. For repository-wide inventories, search the requested scope and preserve the complete matching set; bound displayed evidence without treating truncated results as complete. Exclude the repository's build and dependency output directories when they are outside the requested scope.
+- For filename inventories, apply path/glob filters before printing; do not dump the whole tree to filter a truncated display later. Reuse the complete matching set for multiple views. A stored `result.output` is still truncated when `output_reduced` is true; use the retained artifact for missing matches.
+- An `rg` exit code of 1 means no matches; 2 means an error, not evidence of absence. In a batch, inspect each search's status; a later successful command does not validate an earlier search. Preserve successful results and correct only the failed search.
+- Derive search roots from observed paths instead of guessing directories. Keep independent searches separate so a missing root does not skip unrelated work; record missing paths as coverage gaps.
 - Output above the tool's output budget is truncated. For a known source file, read a bounded range that fits the tool's advertised output contract."#
 }
 

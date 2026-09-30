@@ -56,6 +56,9 @@ const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
 // Status collection and metadata capture share this aggregate allowance. A
 // single Git dependency can consume five seconds before metadata work starts.
 const WORKSPACE_GENERATION_DEADLINE: Duration = Duration::from_secs(15);
+// Coalesce bursts of transient failures, but do not make an unchanged watcher
+// epoch prevent recovery from process/resource failures indefinitely.
+const WORKSPACE_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const WORKSPACE_GENERATION_MAX_DECLARED_BYTES: u64 = 64 * 1024 * 1024;
 const WORKSPACE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(50);
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
@@ -878,6 +881,7 @@ async fn capture_workspace_metadata_cached(
     let total_paths = paths.len();
     let mut manifest = format!("total_paths={total_paths}\n").into_bytes();
     let observed_bytes = Arc::new(AtomicU64::new(0));
+    let hashing_concurrency = std::thread::available_parallelism().map_or(4, usize::from);
     // Ordered buffering bounds blocking workers and preserves the status
     // reader's sorted manifest order regardless of hash completion order.
     let results = futures::stream::iter(paths.into_iter().map(|observation| {
@@ -957,7 +961,7 @@ async fn capture_workspace_metadata_cached(
             manifest.push(b'\n');
             Some((manifest, None))
         }).await.ok()? }
-    })).buffered(4).collect::<Vec<_>>().await;
+    })).buffered(hashing_concurrency).collect::<Vec<_>>().await;
     let mut deletions = Vec::new();
     for result in results {
         let (entry, deletion) = result?;
@@ -1322,7 +1326,7 @@ struct CachedWorkspaceEvidenceIdentity {
     capture_sequence: u64,
     host_mutation_generation: u64,
     identity: Option<WorkspaceEvidenceIdentity>,
-    failed_capture: Option<(WorkspaceEvidenceCaptureKey, WorkspaceEvidenceCapture)>,
+    failed_capture: Option<(WorkspaceEvidenceCaptureKey, WorkspaceEvidenceCapture, Instant)>,
 }
 
 struct RetainedSourceWatchRegistration {
@@ -1466,6 +1470,12 @@ pub(crate) struct SourcePathChangeObservation {
     path: PathBuf,
     #[serde(default)]
     recursive: bool,
+}
+
+impl SourcePathChangeObservation {
+    pub(crate) fn source_dependency(&self) -> crate::tool_history::SourceDependencyV1 {
+        crate::tool_history::SourceDependencyV1::new(&self.path, self.recursive)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1904,11 +1914,12 @@ impl GitWorkspaceCache {
                 .repository_retention
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((failed_key, capture)) = retention
+            if let Some((failed_key, capture, failed_at)) = retention
                 .latest_workspace_evidence
                 .get(&repo_root)
                 .and_then(|cached| cached.failed_capture.as_ref())
                 && failed_key == &key
+                && failed_at.elapsed() < WORKSPACE_FAILURE_RETRY_INTERVAL
             {
                 let capture = capture.clone();
                 retention.touch(&repo_root);
@@ -2011,7 +2022,7 @@ impl GitWorkspaceCache {
                     identity: capture.identity.clone(),
                     failed_capture: capture.identity.as_ref()
                         .is_some_and(|identity| identity.unavailable)
-                        .then(|| (key.clone(), capture.clone())),
+                        .then(|| (key.clone(), capture.clone(), Instant::now())),
                 },
             );
         }

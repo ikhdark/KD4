@@ -336,6 +336,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(crate) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+    pub(crate) thread_queue_processor: Option<ThreadQueueRequestProcessor>,
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -496,6 +497,7 @@ impl ThreadRequestProcessor {
             background_tasks,
             skills_watcher,
             initial_config_warnings: Arc::new(initial_config_warnings),
+            thread_queue_processor: None,
         }
     }
 
@@ -741,6 +743,7 @@ impl ThreadRequestProcessor {
 
     fn listener_task_context(&self) -> ListenerTaskContext {
         ListenerTaskContext {
+            thread_queue_processor: self.thread_queue_processor.clone(),
             thread_manager: Arc::clone(&self.thread_manager),
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),

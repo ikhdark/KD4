@@ -948,12 +948,17 @@ fn format_runtime_response(
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
     let mut canonical_content_items = content_items.clone();
     canonical_content_items.extend(canonical_nested);
-    let (mut content_items, visible_output_truncated) = truncate_code_mode_result(
+    // The saved artifact includes a four-line status prefix (three header lines
+    // plus the item separator), and optionally one output-loss metadata line.
+    let line_offset = script_status.lines().count() + 3 + usize::from(output_loss.is_some());
+    let total_lines = line_offset + code_mode_text_content(&canonical_content_items).lines().count();
+    let (mut content_items, visible_output_truncated) = truncate_code_mode_result_at_lines(
         content_items,
         max_output_tokens,
         outcome,
         hard_limit,
         diagnostic_index,
+        Some((line_offset, total_lines)),
     );
     let semantic_evidence = serde_json::json!({
         "status": &script_status,
@@ -1054,6 +1059,17 @@ fn truncate_code_mode_result(
     hard_limit: usize,
     diagnostic_index: Option<usize>,
 ) -> (Vec<FunctionCallOutputContentItem>, bool) {
+    truncate_code_mode_result_at_lines(items, max_output_tokens, outcome, hard_limit, diagnostic_index, None)
+}
+
+fn truncate_code_mode_result_at_lines(
+    items: Vec<FunctionCallOutputContentItem>,
+    max_output_tokens: Option<usize>,
+    outcome: OutputOutcome,
+    hard_limit: usize,
+    diagnostic_index: Option<usize>,
+    source_lines: Option<(usize, usize)>,
+) -> (Vec<FunctionCallOutputContentItem>, bool) {
     let diagnostic_text = code_mode_text_content(&items);
     let requested_limit =
         max_output_tokens.unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
@@ -1066,15 +1082,17 @@ fn truncate_code_mode_result(
     );
     let policy = TruncationPolicy::Tokens(limits.applied_limit);
     if let Some(error_index) = diagnostic_index {
-        return truncate_code_mode_failure(items, error_index, limits.applied_limit);
+        return truncate_code_mode_failure(items, error_index, limits.applied_limit, source_lines);
     }
     if items
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
-        let truncated = codex_utils_output_truncation::truncate_model_text(
+        let (offset, total) = source_lines.unwrap_or((0, diagnostic_text.lines().count()));
+        let truncated = codex_utils_output_truncation::truncate_model_text_at_lines(
             &diagnostic_text,
             limits.applied_limit,
+            offset, total,
         );
         let omitted = truncated != diagnostic_text;
         return (
@@ -1092,12 +1110,16 @@ fn truncate_code_mode_failure(
     mut items: Vec<FunctionCallOutputContentItem>,
     error_index: usize,
     token_limit: usize,
+    source_lines: Option<(usize, usize)>,
 ) -> (Vec<FunctionCallOutputContentItem>, bool) {
     let FunctionCallOutputContentItem::InputText { text: error_text } = items.remove(error_index)
     else {
         unreachable!("the caller identifies a script-error text item")
     };
     let error_tokens = codex_utils_output_truncation::model_token_count(&error_text);
+    let preceding = code_mode_text_content(&items);
+    let (offset, total) = source_lines.unwrap_or((0, preceding.lines().count() + error_text.lines().count()));
+    let error_offset = offset + preceding.bytes().filter(|byte| *byte == b'\n').count() + usize::from(!items.is_empty());
     let reserved_error_tokens = error_tokens.min(token_limit);
     let other_policy = TruncationPolicy::Tokens(token_limit.saturating_sub(reserved_error_tokens));
     let (mut projected, mut omitted) = if items
@@ -1106,7 +1128,7 @@ fn truncate_code_mode_failure(
     {
         let text = code_mode_text_content(&items);
         let truncated =
-            codex_utils_output_truncation::truncate_model_text(&text, other_policy.token_budget());
+            codex_utils_output_truncation::truncate_model_text_at_lines(&text, other_policy.token_budget(), offset, total);
         let omitted = truncated != text;
         (
             vec![FunctionCallOutputContentItem::InputText { text: truncated }],
@@ -1121,7 +1143,7 @@ fn truncate_code_mode_failure(
         error_text
     } else {
         omitted = true;
-        codex_utils_output_truncation::truncate_model_text(&error_text, reserved_error_tokens)
+        codex_utils_output_truncation::truncate_model_text_at_lines(&error_text, reserved_error_tokens, error_offset, total)
     };
     if !error_text.is_empty() {
         projected.push(FunctionCallOutputContentItem::InputText { text: error_text });
@@ -1356,6 +1378,18 @@ async fn call_nested_tool(
     {
         let evidence_output = if !output_truncated && retained_output.len() <= 4_096 {
             Some(retained_output.clone())
+        } else if tool_name == ToolName::plain("read_file")
+            && result_value["retained_artifact_complete"] == true
+            && result_value["artifact_id"].is_string()
+        {
+            Some(serde_json::json!({
+                "artifact_id": result_value["artifact_id"],
+                "historical_source": true,
+                "recovery_tool": "read_tool_output",
+                "selectors": result_value["results"].as_array().into_iter().flatten()
+                    .filter_map(|result| result.get("selector").cloned()).collect::<Vec<_>>(),
+                "file_complete": result_value["file_complete"],
+            }).to_string())
         } else {
             let canonical = codex_tools::CanonicalToolResult::json(result_value.clone());
             let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
@@ -1819,11 +1853,13 @@ fn nested_command_state(
             "tool": "write_stdin", "arguments": {"session_id": session_id, "chars": ""}
         });
     }
-    if let Some(artifact_id) = result.get("raw_output_artifact_id") {
+    if let Some(artifact_id) = result.get("raw_output_artifact_id")
+        && let Some(selector) = result.get("recovery_selector")
+    {
         state["recovery"] = serde_json::json!({
             "tool": "read_tool_output", "arguments": {
                 "artifact_id": artifact_id,
-                "selectors": [{"kind": "bytes", "start": 0, "end": 1024}]
+                "selectors": [selector]
             }
         });
     }
@@ -3053,7 +3089,7 @@ mod tests {
                 projected.contains(&rendered),
                 "outer formatting must preserve the whole recovery JSON"
             );
-            assert!(!projected.contains("Warning: truncated output"));
+            assert!(!projected.contains("[omitted lines "));
             assert!(
                 !outer
                     .essential_inline
@@ -3204,7 +3240,7 @@ mod tests {
         else {
             panic!("expected one capped text item");
         };
-        assert!(capped_text.contains("Warning: truncated output"));
+        assert!(capped_text.contains("[omitted lines "));
         let capped_tokens = codex_utils_output_truncation::model_token_count(capped_text);
         assert!(
             capped_tokens <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,

@@ -976,8 +976,6 @@ pub struct ExecCommandToolOutput {
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
     pub raw_output_artifact: Option<RawOutputArtifact>,
-    /// Availability observed by the async output-preparation boundary.
-    pub raw_output_reduction_notice: Option<String>,
     pub repair_notice: Option<String>,
     /// Deferred results already in history that no request has carried yet.
     ///
@@ -1014,8 +1012,14 @@ impl ToolOutput for ExecCommandToolOutput {
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
         let outcome = self.outcome_for_logging();
-        let semantic_evidence = semantic_evidence_for_command_output(&self.raw_output);
-        match outcome {
+        // Successful observations may be source text, diffs, or external data.
+        // Diagnostic normalization must not erase their whitespace, values, or metadata.
+        let semantic_evidence = if outcome == ToolOutputOutcome::Failure {
+            semantic_evidence_for_command_output(&self.raw_output)
+        } else {
+            successful_command_evidence(&self.raw_output, self.hook_command.as_deref())
+        };
+        let mut signal = match outcome {
             ToolOutputOutcome::Success => Some(serde_json::json!({
                 "kind": "semantic_evidence",
                 "semantic_evidence": semantic_evidence,
@@ -1026,10 +1030,15 @@ impl ToolOutput for ExecCommandToolOutput {
                 "failure_signature": command_failure_signature(&semantic_evidence, self.exit_code),
                 "semantic_evidence": semantic_evidence,
             })),
+            ToolOutputOutcome::Yielded => Some(serde_json::json!({})),
             ToolOutputOutcome::TimedOut
-            | ToolOutputOutcome::Yielded
             | ToolOutputOutcome::Skipped => None,
-        }
+        }?;
+        signal["process_observation_progress"] =
+            serde_json::json!(!self.raw_output.is_empty() || self.process_exited);
+        signal["empty_output"] = serde_json::json!(self.raw_output.is_empty());
+        signal["command_evidence"] = serde_json::json!(true);
+        Some(signal)
     }
 
     fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
@@ -1130,6 +1139,8 @@ impl ToolOutput for ExecCommandToolOutput {
             output_decoding_notice: Option<&'static str>,
             output: String,
             #[serde(skip_serializing_if = "Option::is_none")]
+            recovery_selector: Option<JsonValue>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             validation: Option<JsonValue>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             pending_deferred_completions: Vec<String>,
@@ -1154,8 +1165,13 @@ impl ToolOutput for ExecCommandToolOutput {
         );
         let output_reduced = model_output.reduced;
         let output = model_output.text;
+        let recovery_selector = (raw_output_artifact_bytes == Some(self.raw_output.len() as u64))
+            .then(|| codex_utils_output_truncation::first_omitted_line_range(&raw_output, &output))
+            .flatten()
+            .map(|(start, end)| serde_json::json!({"kind": "lines", "start": start, "end": end}));
 
         let result = UnifiedExecCodeModeResult {
+            recovery_selector,
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
             wall_time_seconds: self.wall_time.as_secs_f64(),
             exit_code: self.exit_code,
@@ -1251,7 +1267,8 @@ pub(crate) fn semantic_evidence_for_command_output(raw_output: &[u8]) -> Vec<Str
             in_diff = false;
             in_diff_hunk = false;
         }
-        if let Some(fact) = normalize_semantic_fact_line(line, compiler_framing) {
+        let diagnostic = normalize_command_diagnostic_line(line);
+        if let Some(fact) = normalize_semantic_fact_line(&diagnostic, compiler_framing) {
             facts.push(crate::tool_history::sha256(fact.as_bytes()));
         }
     }
@@ -1295,6 +1312,20 @@ fn canonical_output_evidence(raw_output: &[u8]) -> Vec<String> {
     )]
 }
 
+pub(crate) fn successful_command_evidence(raw_output: &[u8], command: Option<&str>) -> Vec<String> {
+    // The executor owns the command string (also retained for live-process
+    // polls). Only a recognized validation producer may normalize diagnostic
+    // framing on success; ordinary reads still identify the exact source bytes.
+    if command.is_some_and(|command| matches!(
+        crate::validation_admission::classify_validation_script(command),
+        crate::validation_admission::ValidationClassification::Validation { .. }
+    )) {
+        semantic_evidence_for_command_output(raw_output)
+    } else {
+        canonical_output_evidence(raw_output)
+    }
+}
+
 fn command_failure_signature(semantic_evidence: &[String], exit_code: Option<i32>) -> String {
     format!(
         "command-failure-v1:{}",
@@ -1321,6 +1352,56 @@ fn normalize_semantic_fact_line(line: &str, compiler_framing: bool) -> Option<St
         return None;
     }
     Some(line.to_string())
+}
+
+/// Normalize only recognizable producer framing. Durations in source, diffs,
+/// application data, or assertion messages remain substantive evidence.
+fn normalize_command_diagnostic_line(line: &str) -> String {
+    static RUNNER_DURATION: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(concat!(
+            r"^(?P<prefix>\s*(?:",
+            r"test result: (?:ok|FAILED)\. .+; finished in ",
+            r"|Finished (?:test|(?:`[^`]+`|\w+) profile.*) in ",
+            r"|(?:=+\s*)?\d+ (?:passed|failed|skipped|error|errors|xfailed|xpassed)",
+            r"(?:, \d+ (?:passed|failed|skipped|error|errors|xfailed|xpassed))* in ",
+            r"|Summary \[\s*)",
+            r")(?P<duration>\d+(?:\.\d+)?(?:ms|s| seconds?))",
+            r"(?P<suffix>\s*(?:=+)?|\].*)$"
+        )).expect("valid runner duration regex")
+    });
+    static LOG_TIMESTAMP: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(concat!(
+            r"^(?P<prefix>\s*)",
+            r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?",
+            r"(?P<suffix>\s+(?:TRACE|DEBUG|INFO|WARN|ERROR|trace|debug|info|warn|error)\b.*)$"
+        )).expect("valid diagnostic log prefix regex")
+    });
+    let line = RUNNER_DURATION.replace(line, "${prefix}<time>${suffix}");
+    LOG_TIMESTAMP.replace(&line, "${prefix}<time>${suffix}").into_owned()
+}
+
+/// Remove volatile diagnostics, not substantive counts or error messages.
+/// Shared by tool-error and stop-hook fingerprinting; command output uses
+/// producer-specific framing above so source data retains its timing values.
+pub(crate) fn normalize_observation_text(text: &str) -> String {
+    static VOLATILE: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(concat!(
+            r"(?ix)\b(?:",
+            r"\d{4}-\d{2}-\d{2}[T\x20]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?",
+            r"|\d{2}:\d{2}:\d{2}(?:\.\d+)?",
+            r"|\d+(?:\.\d+)?\s*(?:ns|us|µs|ms|seconds?|secs?|s|minutes?|mins?|hours?|hrs?)\b",
+            r")"
+        )).expect("valid diagnostic normalization regex")
+    });
+    VOLATILE.replace_all(text, "<time>").into_owned()
+}
+
+pub(crate) fn normalize_tool_failure_text(text: &str) -> String {
+    static LOCATION: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(r"(?i)(:\d+(?::\d+)?|line \d+(?: column \d+)?)")
+            .expect("valid diagnostic location regex")
+    });
+    LOCATION.replace_all(&normalize_observation_text(text), "<location>").into_owned()
 }
 
 fn is_compiler_location_line(line: &str) -> bool {
@@ -1496,26 +1577,6 @@ impl ExecCommandToolOutput {
         self.validation.as_ref().map(declared_validation_metadata)
     }
 
-    /// Refresh before exposing an output whose raw artifact or projection inputs
-    /// have changed. Synchronous ToolOutput formatting consumes this observation
-    /// and never performs filesystem I/O.
-    pub(crate) async fn prepare_reduction_notice(&mut self) {
-        self.raw_output_reduction_notice = None;
-        let raw_output = String::from_utf8_lossy(&self.raw_output);
-        if self
-            .projected_model_output(raw_output.as_ref(), None)
-            .reduced
-            && let Some(artifact) = &self.raw_output_artifact
-        {
-            self.raw_output_reduction_notice = artifact.reduction_notice().await;
-        }
-    }
-
-    pub(crate) async fn with_prepared_reduction_notice(mut self) -> Self {
-        self.prepare_reduction_notice().await;
-        self
-    }
-
     fn projection_metadata_from_raw(&self, raw_output: &str) -> ToolOutputProjectionMetadata {
         let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) = self
             .raw_output_artifact
@@ -1561,10 +1622,15 @@ impl ExecCommandToolOutput {
                 .with_id("output_decoding_notice"),
             );
         }
+        let summary = self.summarized_output(raw_output, self.model_output_limits(raw_output, None).applied_limit);
         fragments.push(
             ToolOutputProjectionFragment::new(
-                ToolOutputProjectionFragmentKind::ContextualSpillableText,
-                raw_output.replace("\r\n", "\n"),
+                if summary.is_some() {
+                    ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
+                } else {
+                    ToolOutputProjectionFragmentKind::ContextualSpillableText
+                },
+                summary.clone().unwrap_or_else(|| raw_output.replace("\r\n", "\n")),
             )
             .with_id("output"),
         );
@@ -1613,10 +1679,11 @@ impl ExecCommandToolOutput {
                 metadata
             },
             requested_limit: self.requested_model_output_tokens(),
-            predetermined_ranges: predetermined_validation_ranges(
-                raw_output,
-                self.hook_command.as_deref(),
-            ),
+            predetermined_ranges: if summary.is_some() {
+                Vec::new()
+            } else {
+                predetermined_validation_ranges(raw_output, self.hook_command.as_deref())
+            },
             predetermined_json_pointers: Vec::new(),
         }
     }
@@ -1661,6 +1728,25 @@ impl ExecCommandToolOutput {
         formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens))
     }
 
+    fn summarized_output(&self, raw_output: &str, token_limit: usize) -> Option<String> {
+        if codex_utils_string::approx_token_count(raw_output) <= token_limit {
+            return None;
+        }
+        match (self.process_id, self.exit_code) {
+            (None, Some(exit_code)) => summarize_shell_output_for_model(
+                raw_output,
+                exit_code,
+                false,
+                ShellOutputSummaryOptions {
+                    enabled: true,
+                    applied_token_limit: Some(token_limit),
+                    command_text: self.hook_command.as_deref(),
+                },
+            ),
+            _ => None,
+        }
+    }
+
     fn projected_model_output(
         &self,
         raw_output: &str,
@@ -1675,24 +1761,7 @@ impl ExecCommandToolOutput {
             raw_output
         };
         let limits = self.model_output_limits(raw_output, hard_limit_cap);
-        let summarized =
-            if codex_utils_string::approx_token_count(raw_output) <= limits.applied_limit {
-                None
-            } else {
-                match (self.process_id, self.exit_code) {
-                    (None, Some(exit_code)) => summarize_shell_output_for_model(
-                        raw_output,
-                        exit_code,
-                        /*timed_out*/ false,
-                        ShellOutputSummaryOptions {
-                            enabled: true,
-                            applied_token_limit: Some(limits.applied_limit),
-                            command_text: self.hook_command.as_deref(),
-                        },
-                    ),
-                    _ => None,
-                }
-            };
+        let summarized = self.summarized_output(raw_output, limits.applied_limit);
         let content = summarized.as_deref().unwrap_or(raw_output);
         let truncated = formatted_truncate_text_with_output_limit(content, limits);
         let was_truncated = truncated.was_truncated;
@@ -1793,26 +1862,12 @@ fn predetermined_validation_ranges(
     if total_lines <= 200 {
         return Vec::new();
     }
-    let tail_start = total_lines - 71;
-    let middle_start =
-        (total_lines.saturating_sub(64) / 2 + 1).clamp(65, tail_start.saturating_sub(64));
-    vec![
-        ToolOutputProjectionRange {
-            id: "validation-head".to_string(),
-            start_line: 1,
-            end_line: 64,
-        },
-        ToolOutputProjectionRange {
-            id: "validation-middle".to_string(),
-            start_line: middle_start,
-            end_line: middle_start + 63,
-        },
-        ToolOutputProjectionRange {
-            id: "validation-tail".to_string(),
-            start_line: tail_start,
-            end_line: total_lines,
-        },
-    ]
+    crate::tools::handlers::validation_diagnostic_range(
+        "validation:diagnostics",
+        raw_output.as_bytes(),
+    )
+    .into_iter()
+    .collect()
 }
 
 struct ProjectedModelOutput {

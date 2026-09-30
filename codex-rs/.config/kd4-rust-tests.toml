@@ -116,6 +116,7 @@ helpers = [
 [targets.core_lib.helpers_by_test_prefix]
 "tools::handlers::context_checkpoint::tests::" = []
 "session::context_window::tests::" = []
+"session::turn::completion::tests::" = []
 "state::auto_compact_window::tests::" = []
 "agent::task_capabilities::tests::" = []
 "client::tests::" = []
@@ -126,7 +127,13 @@ helpers = [
 "tools::handlers::shell_spec::tests::" = []
 "tools::handlers::shell::tests::pure::" = []
 "tools::command_output_artifact::tests::" = []
+"tools::command_output_artifact::hardening_tests::" = []
 "tools::handlers::read_tool_output::tests::" = []
+"tools::handlers::read_tool_output::paging_regressions::" = []
+# Registry projection and turn timing tests use the in-process session fixture
+# or pure state; neither executes code-mode cells nor spawns processes.
+"tools::registry::tests::" = []
+"turn_timing::tests::" = []
 "tools::handlers::apply_patch_retries::tests::" = []
 "tools::handlers::apply_patch::tests::" = []
 "tools::spec_plan::tests::" = []

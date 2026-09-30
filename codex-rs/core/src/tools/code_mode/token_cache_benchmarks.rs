@@ -133,7 +133,6 @@ async fn nested_budget() {
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: Some(artifact),
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };

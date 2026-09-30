@@ -4492,6 +4492,66 @@ class ThreadProjectUpdatedNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadQueueChangedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadQueueDeleteParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    queued_submission_id: Annotated[str, Field(alias="queuedSubmissionId")]
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadQueueDeleteResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    deleted: bool
+
+
+class ThreadQueueListParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    cursor: str | None = None
+    limit: Annotated[int | None, Field(ge=0)] = None
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadQueueReorderParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    queued_submission_ids: Annotated[
+        list[str],
+        Field(
+            alias="queuedSubmissionIds",
+            description="Listed entries move to the front; omitted entries retain their relative order.",
+        ),
+    ]
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadQueueReorderResponse(BaseModel):
+    pass
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+
+
+class ThreadQueueStartParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    queued_submission_id: Annotated[str, Field(alias="queuedSubmissionId")]
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
 class ThreadReadParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5175,6 +5235,7 @@ class TurnTimingProgressKind(Enum):
     workspace_mutation = "workspace_mutation"
     validation_result = "validation_result"
     failure_observation = "failure_observation"
+    new_source_evidence = "new_source_evidence"
 
 
 class TurnTimingProviderTokenUsage(BaseModel):
@@ -5771,6 +5832,46 @@ class ThreadRollbackRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["thread/rollback"], Field(title="Thread/rollbackRequestMethod")]
     params: ThreadRollbackParams
+
+
+class ThreadQueueListRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[Literal["thread/queue/list"], Field(title="Thread/queue/listRequestMethod")]
+    params: ThreadQueueListParams
+
+
+class ThreadQueueDeleteRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/queue/delete"], Field(title="Thread/queue/deleteRequestMethod")
+    ]
+    params: ThreadQueueDeleteParams
+
+
+class ThreadQueueReorderRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/queue/reorder"], Field(title="Thread/queue/reorderRequestMethod")
+    ]
+    params: ThreadQueueReorderParams
+
+
+class ThreadQueueStartRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[Literal["thread/queue/start"], Field(title="Thread/queue/startRequestMethod")]
+    params: ThreadQueueStartParams
 
 
 class ThreadLoadedListRequest(BaseModel):
@@ -7262,6 +7363,15 @@ class Project(BaseModel):
     updated_at: Annotated[int, Field(alias="updatedAt")]
 
 
+class QueuedSubmission(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    client_user_message_id: Annotated[str | None, Field(alias="clientUserMessageId")] = None
+    id: str
+    input: list[UserInput]
+
+
 class RateLimitResetCredit(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7365,6 +7475,16 @@ class ThreadStatusChangedServerNotification(BaseModel):
         Literal["thread/status/changed"], Field(title="Thread/status/changedNotificationMethod")
     ]
     params: ThreadStatusChangedNotification
+
+
+class ThreadQueueChangedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[
+        Literal["thread/queue/changed"], Field(title="Thread/queue/changedNotificationMethod")
+    ]
+    params: ThreadQueueChangedNotification
 
 
 class ThreadArchivedServerNotification(BaseModel):
@@ -7908,6 +8028,46 @@ class ThreadListParams(BaseModel):
     ] = None
 
 
+class ThreadQueueAddParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    client_user_message_id: Annotated[str | None, Field(alias="clientUserMessageId")] = None
+    input: list[UserInput]
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadQueueAddResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    queued_submission: Annotated[QueuedSubmission, Field(alias="queuedSubmission")]
+
+
+class ThreadQueueListResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    data: list[QueuedSubmission]
+    next_cursor: Annotated[str | None, Field(alias="nextCursor")] = None
+
+
+class ThreadQueueUpdateParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    input: list[UserInput]
+    queued_submission_id: Annotated[str, Field(alias="queuedSubmissionId")]
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadQueueUpdateResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    queued_submission: Annotated[QueuedSubmission, Field(alias="queuedSubmission")]
+
+
 class ThreadResumeInitialTurnsPageParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -8146,7 +8306,7 @@ class TurnTimingCounters(BaseModel):
         int | None,
         Field(
             alias="attributableRecoveryGenerationCount",
-            description="Tool-result generations immediately following an observed `read_tool_output` recovery transaction. This is independent of whether the recovered projection was truncated again.",
+            description="Tool-result generations immediately following an observed direct `read_tool_output` recovery transaction. In-cell reads are counted separately. This is independent of whether the recovered projection was truncated again.",
             ge=0,
         ),
     ] = 0
@@ -8237,14 +8397,6 @@ class TurnTimingCounters(BaseModel):
     projection_source_dependencies_reuse_count: Annotated[
         int | None, Field(alias="projectionSourceDependenciesReuseCount", ge=0)
     ] = 0
-    proven_avoided_model_requests: Annotated[
-        int | None,
-        Field(
-            alias="provenAvoidedModelRequests",
-            description="Model handoffs suppressed at an instrumented runtime decision, not inferred from wait observations or receipts. Null denotes older telemetry.",
-            ge=0,
-        ),
-    ] = None
     proven_loop_activation_count: Annotated[
         int | None, Field(alias="provenLoopActivationCount", ge=0)
     ] = 0
@@ -8322,6 +8474,14 @@ class TurnTimingCounters(BaseModel):
     ] = 0
     tool_output_canonical_token_count: Annotated[
         int | None, Field(alias="toolOutputCanonicalTokenCount", ge=0)
+    ] = 0
+    tool_output_in_cell_recovery_call_count: Annotated[
+        int | None,
+        Field(
+            alias="toolOutputInCellRecoveryCallCount",
+            description="Recovery transactions performed inside code-mode cells, without a separate provider tool-result generation.",
+            ge=0,
+        ),
     ] = 0
     tool_output_model_byte_count: Annotated[
         int | None, Field(alias="toolOutputModelByteCount", ge=0)
@@ -8812,6 +8972,26 @@ class ThreadGoalSetRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["thread/goal/set"], Field(title="Thread/goal/setRequestMethod")]
     params: ThreadGoalSetParams
+
+
+class ThreadQueueAddRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[Literal["thread/queue/add"], Field(title="Thread/queue/addRequestMethod")]
+    params: ThreadQueueAddParams
+
+
+class ThreadQueueUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/queue/update"], Field(title="Thread/queue/updateRequestMethod")
+    ]
+    params: ThreadQueueUpdateParams
 
 
 class ThreadListRequest(BaseModel):
@@ -9549,7 +9729,11 @@ class TurnTimingModelRequest(BaseModel):
         ),
     ] = 0
     next_structured_action_changed: Annotated[
-        bool | None, Field(alias="nextStructuredActionChanged")
+        bool | None,
+        Field(
+            alias="nextStructuredActionChanged",
+            description="False only after the next completed continuation is observed choosing the same complete ordered tool actions (names and arguments). True also covers an unknown or unobserved next action; this is not a completion test.",
+        ),
     ] = False
     output_tokens: Annotated[int | None, Field(alias="outputTokens", ge=0)] = 0
     physical_attempt_ids: Annotated[
@@ -9939,6 +10123,12 @@ class ClientRequest(
         | ThreadCompactStartRequest
         | ThreadShellCommandRequest
         | ThreadRollbackRequest
+        | ThreadQueueListRequest
+        | ThreadQueueAddRequest
+        | ThreadQueueUpdateRequest
+        | ThreadQueueDeleteRequest
+        | ThreadQueueReorderRequest
+        | ThreadQueueStartRequest
         | ThreadListRequest
         | ThreadLoadedListRequest
         | ThreadReadRequest
@@ -10035,6 +10225,12 @@ class ClientRequest(
         | ThreadCompactStartRequest
         | ThreadShellCommandRequest
         | ThreadRollbackRequest
+        | ThreadQueueListRequest
+        | ThreadQueueAddRequest
+        | ThreadQueueUpdateRequest
+        | ThreadQueueDeleteRequest
+        | ThreadQueueReorderRequest
+        | ThreadQueueStartRequest
         | ThreadListRequest
         | ThreadLoadedListRequest
         | ThreadReadRequest
@@ -10410,6 +10606,13 @@ class ThreadMetadataUpdateResponse(BaseModel):
     thread: Thread
 
 
+class ThreadQueueStartResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    turn: Turn
+
+
 class ThreadReadResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10518,6 +10721,7 @@ class ServerNotification(
         ErrorServerNotification
         | ThreadStartedServerNotification
         | ThreadStatusChangedServerNotification
+        | ThreadQueueChangedServerNotification
         | ThreadArchivedServerNotification
         | ThreadDeletedServerNotification
         | ThreadUnarchivedServerNotification
@@ -10582,6 +10786,7 @@ class ServerNotification(
         ErrorServerNotification
         | ThreadStartedServerNotification
         | ThreadStatusChangedServerNotification
+        | ThreadQueueChangedServerNotification
         | ThreadArchivedServerNotification
         | ThreadDeletedServerNotification
         | ThreadUnarchivedServerNotification

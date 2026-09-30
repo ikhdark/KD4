@@ -6,6 +6,10 @@ pub fn model_token_count(text: &str) -> usize {
 
 /// Keep the head and failure tail, counting the complete rendered packet.
 pub fn truncate_model_text(text: &str, limit: usize) -> String {
+    truncate_model_text_at_lines(text, limit, 0, text.lines().count())
+}
+
+pub fn truncate_model_text_at_lines(text: &str, limit: usize, line_offset: usize, total_lines: usize) -> String {
     // Silent projections need neither the vocabulary nor a token vector for
     // output that will be discarded, including logs preceding a script error.
     if limit == 0 {
@@ -44,6 +48,12 @@ pub fn truncate_model_text(text: &str, limit: usize) -> String {
         {
             tail_start += 1;
         }
+        if marker != "…" {
+            marker = crate::omitted_line_marker_at_lines(
+                text, head_end, text.len() - (tail_bytes.len() - tail_start),
+                line_offset, total_lines,
+            );
+        }
         let result = format!(
             "{}{}{}",
             std::str::from_utf8(&head_bytes[..head_end]).unwrap_or_default(),
@@ -73,7 +83,7 @@ mod tests {
         assert!(model_token_count(&output) > 9_800);
         assert!(output.len() > 30_000);
         assert!(output.ends_with("assertion failed: expected 7, got 3\n"));
-        assert!(output.contains("Warning: truncated output"));
+        assert!(output.contains("[omitted lines "));
     }
 
     #[test]

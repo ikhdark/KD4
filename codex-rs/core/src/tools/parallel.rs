@@ -1008,6 +1008,47 @@ fn bypasses_outer_workspace_gate(tool_name: &codex_tools::ToolName) -> bool {
     crate::tools::code_mode::is_orchestration_tool_name(tool_name)
 }
 
+/// Resolve native file dependencies using the same ready environment as the
+/// handler. Remote/starting/unknown environments have no host-watcher proof.
+fn native_file_classification(
+    original: crate::tool_history::WorkspaceCallClassification,
+    tool_identity: &str,
+    payload: &ToolPayload,
+    environments: &crate::environment_selection::TurnEnvironmentSnapshot,
+) -> crate::tool_history::WorkspaceCallClassification {
+    if !matches!(tool_identity, "read_file" | "list_files") {
+        return original;
+    }
+    let mut conservative = original;
+    conservative.source_dependencies.clear();
+    let ToolPayload::Function { arguments } = payload else {
+        return conservative;
+    };
+    let Ok(mut arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return conservative;
+    };
+    let environment = match arguments.get("environment_id") {
+        None | Some(serde_json::Value::Null) => environments.primary(),
+        Some(serde_json::Value::String(id)) => environments.turn_environments.iter()
+            .find(|environment| environment.environment_id == *id),
+        _ => None,
+    };
+    let Some(environment) = environment.filter(|environment| !environment.environment.is_remote()) else {
+        return conservative;
+    };
+    let Ok(cwd) = environment.cwd().to_abs_path() else {
+        return conservative;
+    };
+    if let Some(arguments) = arguments.as_object_mut() {
+        arguments.remove("environment_id");
+    }
+    crate::tool_history::classify_workspace_tool_call(
+        tool_identity,
+        &ToolPayload::Function { arguments: arguments.to_string() },
+        cwd.as_path(),
+    )
+}
+
 fn workspace_tool_call_classifications_for_dispatch(
     source: &ToolCallSource,
     tool_identity: &str,
@@ -1052,11 +1093,12 @@ async fn executed_workspace_classification(
     tool_identity: &str,
     executed_payload: Option<&ToolPayload>,
     default_cwd: &std::path::Path,
+    environments: &crate::environment_selection::TurnEnvironmentSnapshot,
 ) -> Result<crate::tool_history::WorkspaceCallClassification, FunctionCallError> {
     let Some(payload) = executed_payload else { return Ok(original.clone()); };
     crate::tool_history::classify_workspace_tool_call_at_admission(
         tool_identity.to_string(), payload.clone(), default_cwd.to_path_buf(),
-    ).await.map(|(classification, _)| classification)
+    ).await.map(|(classification, _)| native_file_classification(classification, tool_identity, payload, environments))
         .map_err(|error| FunctionCallError::Fatal(format!("executed payload analysis failed: {error}")))
 }
 
@@ -1219,6 +1261,26 @@ enum WorkspaceGateGuard {
         _resource: WorkspaceResourceGateGuard,
         _global: OwnedRwLockReadGuard<()>,
     },
+}
+
+impl WorkspaceGateGuard {
+    fn downgrade_for_observation(self) -> Self {
+        match self {
+            Self::ResourceScoped {
+                _resource: WorkspaceResourceGateGuard::Exclusive { _guard },
+                _global,
+            } => Self::ResourceScoped {
+                _resource: WorkspaceResourceGateGuard::Shared {
+                    _guard: OwnedRwLockWriteGuard::downgrade(_guard),
+                },
+                _global,
+            },
+            // Resource-scoped writers hold a shared global guard. Downgrading
+            // an unknown-resource exclusive guard would admit those writers,
+            // so retain that barrier until the observation is published.
+            other => other,
+        }
+    }
 }
 
 async fn acquire_shared_workspace_gate(
@@ -1452,8 +1514,29 @@ impl ToolCallRuntime {
         mut self,
         collector: SamplingRequestSignalCollector,
     ) -> Self {
+        collector.attach_investigation(Arc::clone(&self.session.services.plan_store.investigation));
         self.sampling_request_signals = Some(collector);
         self
+    }
+
+    pub(crate) fn record_rejected_tool_call(
+        &self,
+        tool_name: &codex_tools::ToolName,
+        payload: &ToolPayload,
+        call_id: &str,
+        message: &str,
+    ) {
+        if let Some(collector) = &self.sampling_request_signals {
+            let registration =
+                collector.register_deterministic_tool_call(tool_name, payload, call_id);
+            // A parse rejection is diagnostic evidence, not task termination
+            // and not permission to suppress future potentially effectful work.
+            collector.record_failure(
+                registration.ordinal,
+                &format!("argument-parse:{message}"),
+                false,
+            );
+        }
     }
 
     #[cfg(test)]
@@ -1582,6 +1665,8 @@ impl ToolCallRuntime {
             drop(workspace_gate_guard);
             return true;
         }
+        let workspace_gate_guard =
+            workspace_gate_guard.map(WorkspaceGateGuard::downgrade_for_observation);
         let (revision, captured_current) = match baseline.as_ref() {
             Some(baseline) if !mutation_advanced => {
                 finish_workspace_evidence_capture(baseline, mutation_advanced)
@@ -1663,6 +1748,10 @@ impl ToolCallRuntime {
         };
         // Dispatch already attached scoped evidence using the executed payload.
         // In particular, None is not an unscoped workspace observation.
+        let parent = self.session.services.code_mode_service.cell_parent_call_id(
+            &codex_code_mode::CellId::new(result.cell_id.to_string()),
+        );
+        collector.record_code_mode_parent(result.cell_id, parent.as_deref());
         collector.record_code_mode_result(result);
         collector.record_accepted_deterministic_continuation_receipts(receipts);
     }
@@ -1677,6 +1766,10 @@ impl ToolCallRuntime {
         let Some(collector) = &self.sampling_request_signals else {
             return;
         };
+        let parent = self.session.services.code_mode_service.cell_parent_call_id(
+            &codex_code_mode::CellId::new(cell_id.to_string()),
+        );
+        collector.record_code_mode_parent(cell_id, parent.as_deref());
         // A rejected payload never reached dispatch and cannot add a workspace
         // observation. For dispatched failures, use the same command-aware
         // classification as successful results (including known writers).
@@ -1873,6 +1966,10 @@ impl ToolCallRuntime {
                     "workspace admission analysis failed: {error}"
                 )))?.0,
             };
+            let workspace_call_classification = native_file_classification(
+                workspace_call_classification, call.tool_name.name.as_str(), &call.payload,
+                &self.step_context.environments,
+            );
             if !self.session.hooks().has_handler_for(codex_protocol::protocol::HookEventName::PreToolUse)
                 && let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.suppressed_failure.as_ref()
@@ -1909,6 +2006,7 @@ impl ToolCallRuntime {
                     &self.step_context.turn, &workspace_call_classification.workspace_cwd,
                 ).await.identity;
                 if guard.is_fresh(revision, self.session.services.git_workspace.as_ref(), workspace_revision.as_ref())
+                    && guard.matches_source_dependencies(&workspace_call_classification.source_dependencies)
                     && let Some(response) = guard.response_for_call(&call.call_id)
                 {
                     timing.record_outcome("success");
@@ -2082,6 +2180,7 @@ impl ToolCallRuntime {
                             owner_tool_name.name.as_str(),
                             Some(&response.payload).filter(|payload| *payload != &owner_payload),
                             self.step_context.turn.config.cwd.as_path(),
+                            &self.step_context.environments,
                         ).await.map_err(|error| CodexErr::Fatal(error.to_string()))?;
                     let code_mode_exec = crate::tools::code_mode::is_exec_tool_name(&owner_tool_name);
                     let source_dependencies_override = owner_key.as_deref().and_then(|owner_key| {
@@ -2464,6 +2563,10 @@ impl ToolCallRuntime {
                         "workspace admission analysis failed: {error}"
                     )))?.0,
                 };
+                let admission = native_file_classification(
+                    admission, dispatch_call.tool_name.name.as_str(), &dispatch_call.payload,
+                    &step_context.environments,
+                );
                 let (workspace_admission_classification, workspace_call_classification) =
                     workspace_tool_call_classifications_for_dispatch(
                         &source, dispatch_call.tool_name.name.as_str(), &dispatch_call.payload,
@@ -2498,6 +2601,10 @@ impl ToolCallRuntime {
                         ).await.map_err(|error| FunctionCallError::Fatal(format!(
                             "rewritten workspace admission analysis failed: {error}"
                         )))?.0;
+                        let classification = native_file_classification(
+                            classification, dispatch_call.tool_name.name.as_str(), &dispatch_call.payload,
+                            &step_context.environments,
+                        );
                         workspace_tool_call_classifications_for_dispatch(
                             &source,
                             dispatch_call.tool_name.name.as_str(),
@@ -2713,6 +2820,7 @@ impl ToolCallRuntime {
                         result.as_ref().ok().map(|result| &result.payload)
                             .filter(|payload| *payload != &evidence_call.payload),
                         turn.config.cwd.as_path(),
+                        &step_context.environments,
                     ).await?),
                     None => None,
                 };
@@ -3489,6 +3597,38 @@ mod tests {
     use tokio::sync::oneshot;
     use tracing_test::internal::MockWriter;
 
+    #[tokio::test]
+    async fn post_call_downgrade_admits_resource_readers_but_not_writers() {
+        let global = Arc::new(RwLock::new(()));
+        let resource = Arc::new(RwLock::new(()));
+        let guard = WorkspaceGateGuard::ResourceScoped {
+            _resource: WorkspaceResourceGateGuard::Exclusive {
+                _guard: Arc::clone(&resource).write_owned().await,
+            },
+            _global: Arc::clone(&global).read_owned().await,
+        };
+        assert!(Arc::clone(&resource).try_read_owned().is_err());
+        let guard = guard.downgrade_for_observation();
+        assert!(Arc::clone(&resource).try_read_owned().is_ok());
+        assert!(Arc::clone(&resource).try_write_owned().is_err());
+        assert!(Arc::clone(&global).try_write_owned().is_err());
+        drop(guard);
+        assert!(resource.try_write_owned().is_ok());
+        assert!(global.try_write_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn post_call_unknown_resource_guard_remains_exclusive() {
+        let global = Arc::new(RwLock::new(()));
+        let guard = WorkspaceGateGuard::Exclusive {
+            _guard: Arc::clone(&global).write_owned().await,
+        }
+        .downgrade_for_observation();
+        assert!(Arc::clone(&global).try_read_owned().is_err());
+        drop(guard);
+        assert!(global.try_read_owned().is_ok());
+    }
+
     #[test]
     fn workspace_observers_are_serialized_without_an_enforced_read_boundary() {
         assert!(workspace_tool_may_use_parallel_gate(true, false));
@@ -4005,6 +4145,57 @@ mod tests {
 
         assert_eq!(admission, admission_hint);
         assert_eq!(inner_evidence, None);
+    }
+
+    #[tokio::test]
+    async fn evidence_reuse_native_dependencies_resolve_the_selected_environment() {
+        use std::collections::BTreeSet;
+        use crate::environment_selection::TurnEnvironmentSnapshot;
+        use crate::session::turn_context::TurnEnvironment;
+        use crate::tool_history::SourceDependencyV1;
+        use codex_utils_path_uri::PathUri;
+
+        let primary = tempfile::tempdir().unwrap();
+        let selected = tempfile::tempdir().unwrap();
+        let environments = TurnEnvironmentSnapshot {
+            turn_environments: vec![
+                TurnEnvironment::new(
+                    "primary".into(), Arc::new(codex_exec_server::Environment::default_for_tests()),
+                    PathUri::from_host_native_path(primary.path()).unwrap(), None,
+                ),
+                TurnEnvironment::new(
+                    "selected".into(), Arc::new(codex_exec_server::Environment::default_for_tests()),
+                    PathUri::from_host_native_path(selected.path()).unwrap(), None,
+                ),
+            ],
+            ..Default::default()
+        };
+        for name in ["read_file", "list_files"] {
+            for (environment_id, expected) in [
+                (None, Some(primary.path())),
+                (Some("selected"), Some(selected.path())),
+                (Some("unknown"), None),
+            ] {
+                let mut arguments = serde_json::json!({"path":"source"});
+                if let Some(id) = environment_id {
+                    arguments["environment_id"] = serde_json::json!(id);
+                }
+                let payload = ToolPayload::Function { arguments: arguments.to_string() };
+                let original = crate::tool_history::classify_workspace_tool_call(
+                    name, &payload, primary.path(),
+                );
+                let classified = native_file_classification(
+                    original.clone(), name, &payload, &environments,
+                );
+                assert_eq!(classified.source_dependencies, expected.map(|cwd| {
+                    BTreeSet::from([SourceDependencyV1::new(&cwd.join("source"), name == "list_files")])
+                }).unwrap_or_default());
+                // Hook-rewritten payloads must resolve through the same snapshot.
+                assert_eq!(executed_workspace_classification(
+                    &original, name, Some(&payload), primary.path(), &environments,
+                ).await.unwrap(), classified);
+            }
+        }
     }
 
     #[test]

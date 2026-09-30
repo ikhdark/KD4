@@ -980,14 +980,61 @@ pub fn classify_script(script: &str) -> ValidationClassification {
 
 /// Build and inventory commands may compile, but do not establish a test pass.
 pub fn is_build_or_discovery(program: &str, args: &[String]) -> bool {
-    if normalized_program_name(program) != "cargo" {
-        return false;
+    let program = normalized_program_name(program);
+    if program != "cargo" {
+        let subcommand = args.first().map(String::as_str);
+        return match program.as_str() {
+            "npm" | "pnpm" | "yarn" | "bun" => {
+                matches!(subcommand, Some("install" | "ci" | "add" | "build"))
+                    || (subcommand == Some("run")
+                        && args.get(1).is_some_and(|arg| arg == "build"))
+            }
+            "go" => matches!(subcommand, Some("build" | "install" | "generate")),
+            "dotnet" => matches!(subcommand, Some("build" | "restore" | "publish")),
+            "git" => matches!(subcommand, Some("clone" | "fetch")),
+            "just" => {
+                // Recipe arguments and option values are not recipe names.
+                // Publishing is long-running work, never validation evidence.
+                let mut index = 0;
+                while let Some(argument) = args.get(index) {
+                    let value_count = just_option_value_count(argument);
+                    if value_count > 0 {
+                        index += value_count + 1;
+                    } else if argument.starts_with('-') || argument.contains('=') {
+                        index += 1;
+                    } else {
+                        return argument == "publish-local-codex-final";
+                    }
+                }
+                false
+            }
+            "make" | "ninja" | "msbuild" => true,
+            "cmake" => matches!(subcommand, Some("--build" | "--install")),
+            _ => false,
+        };
     }
     let Ok(Some(index)) = cargo_subcommand_index(args) else {
         return false;
     };
     matches!(args[index].as_str(), "build" | "b")
         || (args[index] == "nextest" && args.get(index + 1).is_some_and(|arg| arg == "list"))
+}
+
+/// Reuse the shell classifier's quote-aware command splitting for observation
+/// policy. This does not authorize execution or establish validation coverage.
+pub fn script_has_build_or_discovery(script: &str) -> bool {
+    let Some((commands, _)) = split_deterministic_script(script) else {
+        return false;
+    };
+    commands.into_iter().any(|command| {
+        let Some(words) = shlex::split(command) else {
+            return false;
+        };
+        let Some(index) = words.iter().position(|word| !is_shell_assignment(word)) else {
+            return false;
+        };
+        is_build_or_discovery(&words[index], &words[index + 1..])
+    })
 }
 
 #[cfg(test)]
@@ -1006,6 +1053,64 @@ mod tests {
 
     fn is_validation(classification: &ValidationClassification) -> bool {
         matches!(classification, ValidationClassification::Validation { .. })
+    }
+
+    #[test]
+    fn publishing_observation_policy_does_not_claim_validation() {
+        for args in [
+            vec!["publish-local-codex-final"],
+            vec![
+                "--justfile",
+                "justfile",
+                "publish-local-codex-final",
+                "-Verbose",
+            ],
+            vec![
+                "--set",
+                "profile",
+                "local-release",
+                "publish-local-codex-final",
+            ],
+        ] {
+            let strings = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+            assert!(is_build_or_discovery("just.exe", &strings));
+            // Preserve the conservative classification for an uninspected
+            // recipe; observation policy must not turn it into a test pass.
+            assert_eq!(argv("just", &args), ValidationClassification::Opaque);
+        }
+        for args in [
+            vec!["--justfile", "publish-local-codex-final"],
+            vec!["--set", "recipe", "publish-local-codex-final", "help"],
+            vec!["help", "publish-local-codex-final"],
+            vec!["not-publish-local-codex-final"],
+        ] {
+            let strings = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+            assert!(!is_build_or_discovery("just", &strings));
+        }
+        assert!(script_has_build_or_discovery(
+            "cd repo; just --justfile justfile publish-local-codex-final -Verbose"
+        ));
+        assert!(!script_has_build_or_discovery(
+            "echo 'just publish-local-codex-final'"
+        ));
+    }
+
+    #[test]
+    fn observation_policy_handles_compound_long_running_commands() {
+        for script in [
+            "cd x && cargo build",
+            "cd 'space dir'; npm install",
+            "go build ./...",
+            "dotnet build",
+            "git clone repo",
+            "pnpm run build",
+            "cargo +stable --locked nextest list",
+        ] {
+            assert!(script_has_build_or_discovery(script), "{script}");
+        }
+        for script in ["echo 'cargo build'", "cat build.rs", "git status", "echo 'x && npm install'"] {
+            assert!(!script_has_build_or_discovery(script), "{script}");
+        }
     }
 
     #[test]

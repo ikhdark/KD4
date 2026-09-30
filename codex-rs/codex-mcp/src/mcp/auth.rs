@@ -193,6 +193,55 @@ pub async fn compute_auth_statuses<'a, I>(
 where
     I: IntoIterator<Item = (&'a String, &'a EffectiveMcpServer)>,
 {
+    compute_auth_statuses_inner(
+        servers,
+        codex_home,
+        store_mode,
+        keyring_backend_kind,
+        auth,
+        runtime_context,
+        true,
+    )
+    .await
+}
+
+/// Captures credential state before server startup can refresh or remove it,
+/// omitting only entries that need network discovery.
+pub async fn compute_cached_auth_statuses<'a, I>(
+    servers: I,
+    codex_home: &Path,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+    auth: Option<&CodexAuth>,
+    runtime_context: &McpRuntimeContext,
+) -> HashMap<String, McpAuthStatusEntry>
+where
+    I: IntoIterator<Item = (&'a String, &'a EffectiveMcpServer)>,
+{
+    compute_auth_statuses_inner(
+        servers,
+        codex_home,
+        store_mode,
+        keyring_backend_kind,
+        auth,
+        runtime_context,
+        false,
+    )
+    .await
+}
+
+async fn compute_auth_statuses_inner<'a, I>(
+    servers: I,
+    codex_home: &Path,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+    auth: Option<&CodexAuth>,
+    runtime_context: &McpRuntimeContext,
+    discover: bool,
+) -> HashMap<String, McpAuthStatusEntry>
+where
+    I: IntoIterator<Item = (&'a String, &'a EffectiveMcpServer)>,
+{
     let futures = servers.into_iter().map(|(name, server)| {
         let name = name.clone();
         let codex_home = codex_home.to_path_buf();
@@ -222,6 +271,7 @@ where
                         keyring_backend_kind,
                         has_runtime_auth,
                         &runtime_context,
+                        discover,
                     )
                     .await
                     {
@@ -230,20 +280,21 @@ where
                             warn!(
                                 "failed to determine auth status for MCP server `{name}`: {error:?}"
                             );
-                            McpAuthState::Unsupported
+                            Some(McpAuthState::Unsupported)
                         }
                     }
                 }
-                None => McpAuthState::Unsupported,
-            };
+                None => Some(McpAuthState::Unsupported),
+            }?;
             let entry = McpAuthStatusEntry { config, auth_state };
-            (name, entry)
+            Some((name, entry))
         }
     });
 
-    join_all(futures).await.into_iter().collect()
+    join_all(futures).await.into_iter().flatten().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn compute_auth_status(
     server_name: &str,
     codex_home: &Path,
@@ -252,31 +303,52 @@ async fn compute_auth_status(
     keyring_backend_kind: AuthKeyringBackendKind,
     has_runtime_auth: bool,
     runtime_context: &McpRuntimeContext,
-) -> Result<McpAuthState> {
+    discover: bool,
+) -> Result<Option<McpAuthState>> {
     if !config.enabled {
-        return Ok(McpAuthState::Unsupported);
+        return Ok(Some(McpAuthState::Unsupported));
     }
 
     if has_runtime_auth {
-        return Ok(McpAuthState::BearerToken);
+        return Ok(Some(McpAuthState::BearerToken));
     }
 
     match &config.transport {
-        McpServerTransportConfig::Stdio { .. } => Ok(McpAuthState::Unsupported),
+        McpServerTransportConfig::Stdio { .. } => Ok(Some(McpAuthState::Unsupported)),
         McpServerTransportConfig::StreamableHttp {
             url,
             bearer_token_env_var,
             http_headers,
             env_http_headers,
         } => {
-            let http_client = runtime_context
-                .resolve_http_client(server_name, config)
-                .map_err(anyhow::Error::msg)?;
-            // Session startup waits for this discovery, which belongs to starting
-            // this server, so it may not outlast the server's own startup budget.
             let startup_timeout = config
                 .startup_timeout_sec
                 .unwrap_or(crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT);
+            if !discover {
+                return tokio::time::timeout(
+                    startup_timeout,
+                    codex_rmcp_client::determine_streamable_http_auth_status_without_discovery(
+                        codex_home,
+                        server_name,
+                        url,
+                        bearer_token_env_var.as_deref(),
+                        http_headers.clone(),
+                        env_http_headers.clone(),
+                        store_mode,
+                        keyring_backend_kind,
+                    )
+                    .boxed(),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!(
+                    "Credential status did not finish within the {startup_timeout:?} startup timeout"
+                ))?;
+            }
+            let http_client = runtime_context
+                .resolve_http_client(server_name, config)
+                .map_err(anyhow::Error::msg)?;
+            // Discovery belongs to this server, so bound it by that server's
+            // startup budget even when only diagnosing a startup failure.
             tokio::time::timeout(
                 startup_timeout,
                 determine_streamable_http_auth_status_with_http_client(
@@ -298,6 +370,7 @@ async fn compute_auth_status(
                     "OAuth discovery did not finish within the {startup_timeout:?} startup timeout"
                 )
             })?
+            .map(Some)
         }
     }
 }
@@ -365,11 +438,38 @@ mod tests {
             oauth_resource: None,
             tools: HashMap::new(),
         });
-        let servers = HashMap::from([("stalled".to_string(), server)]);
+        let mut bearer = server.configured_config().unwrap().clone();
+        if let McpServerTransportConfig::StreamableHttp { http_headers, .. } = &mut bearer.transport {
+            *http_headers = Some(HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer fixture".to_string(),
+            )]));
+        }
+        let servers = HashMap::from([
+            ("stalled".to_string(), server),
+            ("bearer".to_string(), EffectiveMcpServer::configured(bearer)),
+        ]);
         let runtime_context = McpRuntimeContext::new(
             Arc::new(EnvironmentManager::without_environments()),
             codex_home.path().to_path_buf(),
         );
+
+        let cached = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::compute_cached_auth_statuses(
+                &servers,
+                codex_home.path(),
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct,
+                /*auth*/ None,
+                &runtime_context,
+            ),
+        )
+        .await
+        .expect("cached status must not wait for network discovery");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached["bearer"].auth_state, McpAuthState::BearerToken);
+        assert!(!cached.contains_key("stalled"));
 
         let started = std::time::Instant::now();
         let statuses = super::compute_auth_statuses(

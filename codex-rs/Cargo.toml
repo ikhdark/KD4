@@ -567,6 +567,14 @@ codegen-units = 4
 [profile.local-release]
 inherits = "release"
 lto = false
+# Local publishes rebuild the serial core -> app-server -> tui -> cli chain
+# after core edits. Parallelize and reuse workspace codegen; dependencies keep
+# the release settings so their artifacts and sccache entries stay valid.
+codegen-units = 16
+incremental = true
+
+[profile.local-release.package."*"]
+codegen-units = 4
 
 [profile.profiling]
 inherits = "release"

@@ -68,6 +68,7 @@ pub use mcp::McpOAuthLoginSupport;
 pub use mcp::McpOAuthScopesSource;
 pub use mcp::ResolvedMcpOAuthScopes;
 pub use mcp::compute_auth_statuses;
+pub use mcp::compute_cached_auth_statuses;
 pub use mcp::discover_supported_scopes;
 pub use mcp::discover_supported_scopes_with_http_client;
 pub use mcp::oauth_login_support;

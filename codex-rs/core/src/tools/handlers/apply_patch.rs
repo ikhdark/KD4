@@ -551,13 +551,15 @@ impl ApplyPatchHandler {
                 require_environment_id(args.environment_id.as_deref(), self.multi_environment)?;
 
             // Verify the parsed patch against the selected environment filesystem.
-            let Some(turn_environment) = resolve_tool_environment(
+            let turn_environment = crate::tools::handlers::wait_for_tool_environment(
                 &step_context.environments,
                 selected_environment_id.as_deref(),
-            )?
+                &cancellation_token,
+            ).await?;
+            let Some(turn_environment) = turn_environment.as_ref()
             else {
                 return Err(FunctionCallError::RespondToModel(
-                    "apply_patch requires a ready execution environment. If an environment is starting, call wait_for_environment with its id first.".to_string(),
+                    "apply_patch requires a selected execution environment.".to_string(),
                 ));
             };
             if retry_scope.as_ref().is_some_and(|(id, cwd)| {

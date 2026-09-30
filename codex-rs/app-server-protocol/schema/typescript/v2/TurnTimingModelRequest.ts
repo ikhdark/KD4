@@ -33,7 +33,13 @@ samplingRequestId?: string,
  * Physical provider attempts observed for this logical request, including
  * retries and transport fallbacks.
  */
-physicalAttemptIds?: Array<string>, progressKinds?: Array<TurnTimingProgressKind>, nextStructuredActionChanged: boolean, unchangedRelevantState: boolean, attemptKind: TurnTimingAttemptKind, isContinuation: boolean,
+physicalAttemptIds?: Array<string>, progressKinds?: Array<TurnTimingProgressKind>,
+/**
+ * False only after the next completed continuation is observed choosing
+ * the same complete ordered tool actions (names and arguments). True also
+ * covers an unknown or unobserved next action; this is not a completion test.
+ */
+nextStructuredActionChanged: boolean, unchangedRelevantState: boolean, attemptKind: TurnTimingAttemptKind, isContinuation: boolean,
 /**
  * Directly observed model-stream wait for this physical attempt.
  */

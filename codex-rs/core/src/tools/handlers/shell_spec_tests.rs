@@ -43,6 +43,22 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
                 .contains("search the requested scope and preserve the complete matching set")
         );
         assert!(description.contains("without treating truncated results as complete"));
+        assert!(description.contains("apply path/glob filters before printing"));
+        assert!(description.contains("Reuse the complete matching set for multiple views"));
+        assert!(description.contains("A stored `result.output` is still truncated"));
+        assert!(description.contains("2 means an error, not evidence of absence"));
+        assert!(
+            description.contains("a later successful command does not validate an earlier search")
+        );
+        assert!(description.contains("correct only the failed search"));
+        assert!(description.contains("Derive search roots from observed paths"));
+        assert!(description.contains("record missing paths as coverage gaps"));
+        assert!(description.contains("PowerShell and cmd do not expand wildcard paths"));
+        assert!(description.contains("PowerShell `foreach` statements cannot feed a pipeline"));
+        assert!(
+            description.contains("$rows = foreach ($item in $items) { $item }; $rows | Out-String")
+        );
+        assert!(description.contains(r#"--glob "**/agents/openai.yaml""#));
         assert!(!description.contains("then `rg -n"));
         assert!(!description.contains("is rejected"));
         assert!(!description.contains("read the complete enclosing"));
@@ -57,6 +73,44 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
         assert!(description.contains(
             "resolve recursive delete or move targets inside the intended directory first"
         ));
+    }
+}
+
+#[test]
+fn posix_command_descriptions_keep_search_guidance_without_windows_glob_rules() {
+    for mut tool in [
+        create_exec_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+        create_shell_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+    ] {
+        omit_windows_shell_guidance(&mut tool);
+        let ToolSpec::Function(tool) = tool else {
+            panic!("expected command function");
+        };
+        assert!(
+            !tool
+                .description
+                .contains("PowerShell and cmd do not expand wildcard paths")
+        );
+        assert!(
+            tool.description
+                .contains("apply path/glob filters before printing")
+        );
+        assert!(
+            tool.description
+                .contains("2 means an error, not evidence of absence")
+        );
+        assert!(tool.description.contains("Filesystem safety:"));
+        assert!(!tool.description.contains("PowerShell `foreach`"));
+        assert!(
+            tool.description
+                .contains("record missing paths as coverage gaps")
+        );
     }
 }
 
@@ -253,7 +307,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Defaults to 30000 ms for recognized validation commands, Cargo builds, and nextest discovery, and 2000 ms otherwise (10000 ms inside `exec`); explicit values use 250-300000 ms. On Windows, waits are floored to 2000 ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.".to_string(),
+                "Wait before yielding output. Inside `exec`, noninteractive commands default to 285000 ms so the host can finish the awaited command without model polling; set an explicit shorter wait for background work. Otherwise defaults to 30000 ms for recognized validation, build, install, and discovery commands (including command chains), and 2000 ms for other commands (10000 ms for interactive commands inside `exec`). Explicit values are clamped to 250-300000 ms. On Windows, waits are floored to 2000 ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
@@ -365,7 +419,7 @@ fn write_stdin_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to 300000 ms and cap at 300000 ms; explicit shorter waits are honored down to 250 ms. A wait deadline does not terminate the process.".to_string(),
+                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to 300000 ms and cap at 300000 ms; waits below 5000 ms are honored down to 250 ms only when new output is pending, otherwise a 5000 ms floor applies. A wait deadline does not terminate the process.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
             ),
@@ -759,7 +813,6 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
             original_token_count: Some(2),
             hook_command: None,
             raw_output_artifact: None,
-            raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
         };

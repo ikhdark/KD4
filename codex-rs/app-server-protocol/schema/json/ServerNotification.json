@@ -4460,6 +4460,17 @@
       ],
       "type": "object"
     },
+    "ThreadQueueChangedNotification": {
+      "properties": {
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
     "ThreadSettings": {
       "properties": {
         "activePermissionProfile": {
@@ -5435,7 +5446,7 @@
         },
         "attributableRecoveryGenerationCount": {
           "default": 0,
-          "description": "Tool-result generations immediately following an observed `read_tool_output` recovery transaction. This is independent of whether the recovered projection was truncated again.",
+          "description": "Tool-result generations immediately following an observed direct `read_tool_output` recovery transaction. In-cell reads are counted separately. This is independent of whether the recovered projection was truncated again.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -5721,6 +5732,13 @@
         "toolOutputCanonicalTokenCount": {
           "default": 0,
           "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolOutputInCellRecoveryCallCount": {
+          "default": 0,
+          "description": "Recovery transactions performed inside code-mode cells, without a separate provider tool-result generation.",
+          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -6629,6 +6647,7 @@
         },
         "nextStructuredActionChanged": {
           "default": false,
+          "description": "False only after the next completed continuation is observed choosing the same complete ordered tool actions (names and arguments). True also covers an unknown or unobserved next action; this is not a completion test.",
           "type": "boolean"
         },
         "outputTokens": {
@@ -6810,7 +6829,8 @@
       "enum": [
         "workspace_mutation",
         "validation_result",
-        "failure_observation"
+        "failure_observation",
+        "new_source_evidence"
       ],
       "type": "string"
     },
@@ -8122,6 +8142,26 @@
         "params"
       ],
       "title": "Thread/status/changedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "thread/queue/changed"
+          ],
+          "title": "Thread/queue/changedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadQueueChangedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/queue/changedNotification",
       "type": "object"
     },
     {

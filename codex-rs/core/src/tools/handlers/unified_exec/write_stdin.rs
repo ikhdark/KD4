@@ -185,7 +185,7 @@ impl WriteStdinHandler {
         }
 
         Ok(boxed_tool_output(
-            response.with_prepared_reduction_notice().await,
+            response,
         ))
     }
 }
@@ -196,8 +196,9 @@ fn owner_wait_yield_time_ms(
     nested: bool,
 ) -> u64 {
     if chars.is_empty() {
-        // Omitted deadlines favor unattended waits. An explicit short poll may
-        // be needed before a decision and must reach the process manager intact.
+        // Omitted deadlines favor unattended waits. The process manager permits
+        // a short empty poll only when output is pending; otherwise it floors
+        // the requested wait at five seconds.
         // A nested poll must still return before its code-mode cell yields.
         requested_yield_time_ms.unwrap_or(if nested {
             u64::try_from(crate::tools::code_mode::NESTED_DEFAULT_POLL.as_millis())

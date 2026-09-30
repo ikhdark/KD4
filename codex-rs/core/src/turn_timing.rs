@@ -62,7 +62,7 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 28;
+const TIMING_SCHEMA_VERSION: u16 = 29;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -522,14 +522,18 @@ impl TurnTimingSnapshot {
                 }
             })
             .collect();
+        // A different next command is not itself external or causal progress.
+        // Keep action-change telemetry, but do not let it hide unchanged state.
         let observational_nonprogress_tokens = diagnostic_token_aggregate(
             &profile.model_requests,
-            |request| request.unchanged_relevant_state && !request.next_structured_action_changed,
+            |request| request.progress_kinds.is_empty()
+                && request.unchanged_relevant_state,
             /*input_only*/ false,
         );
         let observational_nonprogress_latency = diagnostic_latency_aggregate(
             &profile.model_requests,
-            |request| request.unchanged_relevant_state && !request.next_structured_action_changed,
+            |request| request.progress_kinds.is_empty()
+                && request.unchanged_relevant_state,
             &mut saturation_count,
         );
         let purpose_aggregates = purpose_aggregates(&profile.model_requests, &mut saturation_count);
@@ -638,6 +642,7 @@ impl TurnTimingSnapshot {
                 .tool_output_projection_truncation_count,
             tool_output_omitted_section_count: profile.counters.tool_output_omitted_section_count,
             tool_output_recovery_call_count: profile.counters.tool_output_recovery_call_count,
+            tool_output_in_cell_recovery_call_count: profile.counters.tool_output_in_cell_recovery_call_count,
             tool_output_recovery_retruncation_count: profile
                 .counters
                 .tool_output_recovery_retruncation_count,
@@ -721,6 +726,7 @@ pub(crate) struct ModelRequestTiming {
     sampling_request_id: Option<String>,
     physical_attempt_ids: Vec<String>,
     progress_kinds: Vec<TurnTimingProgressKind>,
+    structured_action_fingerprint: Option<String>,
     next_structured_action_changed: bool,
     unchanged_relevant_state: bool,
     attempt_kind: TurnTimingAttemptKind,
@@ -922,6 +928,7 @@ pub(crate) struct TimingCounters {
     pub(crate) tool_output_projection_truncation_count: u32,
     pub(crate) tool_output_omitted_section_count: u64,
     pub(crate) tool_output_recovery_call_count: u32,
+    pub(crate) tool_output_in_cell_recovery_call_count: u32,
     pub(crate) tool_output_recovery_retruncation_count: u32,
     pub(crate) attributable_recovery_generation_count: u32,
     pub(crate) truncation_induced_continuation_count: u32,
@@ -2489,22 +2496,39 @@ impl TurnTimingState {
     pub(crate) fn record_generation_outcome(
         &self,
         progress_kinds: Vec<TurnTimingProgressKind>,
-        next_structured_action_changed: bool,
+        structured_action_fingerprint: Option<String>,
         unchanged_relevant_state: bool,
     ) {
         let mut state = self.state();
         let Some(generation_index) = state.current_generation_index else {
             return;
         };
-        if let Some(request) = state.model_requests.iter_mut().find(|request| {
+        if let Some(index) = state.model_requests.iter().position(|request| {
             request.generation_index == generation_index
                 && request.attempt_kind == TurnTimingAttemptKind::Primary
         }) {
+            let (previous, current) = state.model_requests.split_at_mut(index);
+            let request = &mut current[0];
+            if request.is_continuation
+                && let Some(previous) = previous.iter_mut().rev().find(|previous| {
+                    previous.attempt_kind == TurnTimingAttemptKind::Primary
+                        && previous.generation_index.checked_add(1) == Some(generation_index)
+                })
+            {
+                previous.next_structured_action_changed = previous
+                    .structured_action_fingerprint
+                    .as_ref()
+                    .zip(structured_action_fingerprint.as_ref())
+                    .is_none_or(|(previous, current)| previous != current);
+            }
             request.progress_kinds = progress_kinds
                 .into_iter()
                 .take(MAX_MODEL_REQUEST_PROGRESS_KINDS)
                 .collect();
-            request.next_structured_action_changed = next_structured_action_changed;
+            request.structured_action_fingerprint = structured_action_fingerprint;
+            // The next continuation has not been observed yet. Do not count a
+            // terminal, interrupted, or unclassified request as a proven repeat.
+            request.next_structured_action_changed = true;
             request.unchanged_relevant_state = unchanged_relevant_state;
         }
     }
@@ -2894,6 +2918,10 @@ impl TurnTimingState {
     }
 
     pub(crate) fn record_tool_output_recovery(&self, retruncation_count: u32) {
+        self.record_tool_output_recovery_source(retruncation_count, false);
+    }
+
+    pub(crate) fn record_tool_output_recovery_source(&self, retruncation_count: u32, in_cell: bool) {
         let mut state = self.state();
         state.counters.tool_output_recovery_call_count = state
             .counters
@@ -2903,7 +2931,12 @@ impl TurnTimingState {
             .counters
             .tool_output_recovery_retruncation_count
             .saturating_add(retruncation_count);
-        state.tool_output_recovery_read_pending_continuation = true;
+        if in_cell {
+            state.counters.tool_output_in_cell_recovery_call_count =
+                state.counters.tool_output_in_cell_recovery_call_count.saturating_add(1);
+        } else {
+            state.tool_output_recovery_read_pending_continuation = true;
+        }
     }
 
     pub(crate) fn record_tool_output_artifact_reread(&self) {
@@ -2958,6 +2991,7 @@ impl TurnTimingState {
                 failure_fingerprint,
                 attempt_kind,
                 is_continuation,
+                next_structured_action_changed: true,
                 ..Default::default()
             });
         }

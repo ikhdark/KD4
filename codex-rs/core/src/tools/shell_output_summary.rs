@@ -16,7 +16,7 @@ const SUCCESS_HEAD_LINES: usize = 24;
 const SUCCESS_TAIL_LINES: usize = 64;
 const VALIDATION_SUCCESS_TAIL_LINES: usize = 16;
 const FAILURE_TAIL_LINES: usize = 140;
-const FOCUS_CONTEXT_LINES: usize = 3;
+pub(crate) const FOCUS_CONTEXT_LINES: usize = 3;
 // Keep the selected ranges below the summary line ceiling even when every
 // match is disjoint and receives the full context window. This leaves room for
 // the failure tail, final statuses, separators, and summary metadata.
@@ -685,16 +685,19 @@ fn contains_ascii_case(line: &str, needle: &str) -> bool {
 }
 
 fn find_ascii_case(line: &str, needle: &str) -> Option<usize> {
-    let (&first, _) = needle.as_bytes().split_first()?;
+    find_ascii_case_bytes(line.as_bytes(), needle.as_bytes())
+}
+
+pub(crate) fn find_ascii_case_bytes(line: &[u8], needle: &[u8]) -> Option<usize> {
+    let (&first, _) = needle.split_first()?;
     memchr::memchr2_iter(
         first.to_ascii_lowercase(),
         first.to_ascii_uppercase(),
-        line.as_bytes(),
+        line,
     )
     .find(|&index| {
-        line.as_bytes()
-            .get(index..index + needle.len())
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
+        line.get(index..index + needle.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
     })
 }
 

@@ -14,7 +14,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::resolve_tool_environment;
+use crate::tools::handlers::wait_for_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 
@@ -43,12 +43,10 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
             "Maximum descendant depth, 0 for an immediate directory listing; default 8.".into(),
         ));
         depth.minimum = Some(0.into());
-        depth.maximum = Some((MAX_DEPTH as u64).into());
         let mut entries = JsonSchema::integer(Some(
             "Maximum entries examined, including directories; default 2000.".into(),
         ));
         entries.minimum = Some(1.into());
-        entries.maximum = Some((MAX_ENTRIES as u64).into());
         ToolSpec::Function(ResponsesApiTool {
             name: "list_files".into(),
             description: "List files and directories through the selected environment's sandboxed filesystem without shell quoting. Start at a narrow path. Directory symlinks are not followed; hidden directories are listed but not traversed unless include_hidden is true. This does not apply gitignore rules. Check complete, truncated, and errors before claiming coverage. A bounded walk is a partial observation, not a stable page: narrow path or increase limits if truncated. Large output can be recovered with read_tool_output; repeat list_files for current filesystem state.".into(),
@@ -77,15 +75,15 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                 ));
             };
             let args: ListFilesArgs = parse_arguments(arguments)?;
-            let max_depth = args.max_depth.unwrap_or(8);
-            let max_entries = args.max_entries.unwrap_or(2000);
-            if max_depth > MAX_DEPTH || !(1..=MAX_ENTRIES).contains(&max_entries) {
+            let max_depth = args.max_depth.unwrap_or(8).min(MAX_DEPTH);
+            let max_entries = args.max_entries.unwrap_or(2000).min(MAX_ENTRIES);
+            if max_entries == 0 {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "list_files requires max_depth 0-{MAX_DEPTH} and max_entries 1-{MAX_ENTRIES}"
                 )));
             }
-            let environment = resolve_tool_environment(&invocation.step_context.environments, args.environment_id.as_deref())?
-                .ok_or_else(|| FunctionCallError::RespondToModel("list_files requires a ready execution environment; use wait_for_environment if one is starting".into()))?;
+            let environment = wait_for_tool_environment(&invocation.step_context.environments, args.environment_id.as_deref(), &invocation.cancellation_token).await?
+                .ok_or_else(|| FunctionCallError::RespondToModel("list_files requires a selected execution environment".into()))?;
             let path = environment
                 .cwd()
                 .join(&args.path)
@@ -110,14 +108,20 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                 result = filesystem.walk(&path, options, Some(&sandbox)) => result
                     .map_err(|error| FunctionCallError::RespondToModel(format!("unable to list {}: {error}", path.inferred_native_path_string())))?,
             };
-            Ok(boxed_tool_output(JsonToolOutput::new(json!({
+            let value = json!({
                 "path": path.inferred_native_path_string(),
                 "environment_id": environment.environment_id,
                 "entries": outcome.entries,
                 "errors": outcome.errors,
                 "truncated": outcome.truncated,
                 "complete": !outcome.truncated && outcome.errors.is_empty(),
-            }))))
+            });
+            let evidence = crate::tools::context::semantic_evidence_sampling_signal(json!({
+                "source": "list_files",
+                "scope": value["path"],
+                "identity": crate::tool_history::sha256(value.to_string().as_bytes()),
+            }));
+            Ok(boxed_tool_output(JsonToolOutput::new(value).with_sampling_request_signal(evidence)))
         })
     }
 }

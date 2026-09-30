@@ -433,7 +433,7 @@ fn wait_agent_tool_v1_advertises_first_and_all() {
             .and_then(|properties| properties.get("timeout_ms"))
             .and_then(|schema| schema.description.as_deref()),
         Some(
-            "Explicit caller deadline in milliseconds. Omit to wait without a caller deadline until the requested target condition or input activity. Explicit values must be between 10000 and 3600000. Completed targets return immediately."
+            "Explicit caller deadline in milliseconds. Omit to wait without a caller deadline until the requested target condition or input activity. Values below 10000 use that normal wait; values above 3600000 are capped. Completed targets return immediately."
         )
     );
     let timeout = parameters
@@ -445,11 +445,8 @@ fn wait_agent_tool_v1_advertises_first_and_all() {
         timeout.schema_type,
         Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Integer))
     );
-    assert_eq!(timeout.minimum, Some(serde_json::Number::from(10_000_i64)));
-    assert_eq!(
-        timeout.maximum,
-        Some(serde_json::Number::from(3_600_000_i64))
-    );
+    assert_eq!(timeout.minimum, None);
+    assert_eq!(timeout.maximum, None);
     assert_wait_timeout_schema_matches_runtime_bounds(parameters);
 }
 
@@ -495,7 +492,7 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
             .get("timeout_ms")
             .and_then(|schema| schema.description.as_deref()),
         Some(
-            "Explicit caller deadline in milliseconds. Omit to keep waiting; the default 30000 ms interval is internal maintenance cadence only and does not return an unchanged result. Explicit values must be between 10000 and 3600000. Use list_agents or get_agent_task for an immediate status snapshot."
+            "Explicit caller deadline in milliseconds. Omit to keep waiting; the default 30000 ms interval is internal maintenance cadence only and does not return an unchanged result. Values below 10000 use that normal wait; values above 3600000 are capped. Use list_agents or get_agent_task for an immediate status snapshot."
         )
     );
     let timeout = properties.get("timeout_ms").expect("timeout_ms schema");
@@ -503,11 +500,8 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
         timeout.schema_type,
         Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Integer))
     );
-    assert_eq!(timeout.minimum, Some(serde_json::Number::from(10_000_i64)));
-    assert_eq!(
-        timeout.maximum,
-        Some(serde_json::Number::from(3_600_000_i64))
-    );
+    assert_eq!(timeout.minimum, None);
+    assert_eq!(timeout.maximum, None);
     assert_wait_timeout_schema_matches_runtime_bounds(&parameters);
     assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(
@@ -531,8 +525,8 @@ fn assert_wait_timeout_schema_matches_runtime_bounds(parameters: &JsonSchema) {
     };
     for (timeout, expected) in [
         (json!(10_000), true),
-        (json!(3_600_001), false),
-        (json!(9_999), false),
+        (json!(3_600_001), true),
+        (json!(9_999), true),
         (json!(10_000.5), false),
     ] {
         arguments["timeout_ms"] = timeout;

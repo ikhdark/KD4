@@ -151,11 +151,6 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
                 FunctionToolOutput::from_text(
                     format!("Wall time: {wall_time_seconds:.4} seconds\n{message}"),
                     /*success*/ Some(true),
-                )
-                .with_sampling_request_signal(
-                    crate::tools::context::semantic_evidence_sampling_signal(
-                        serde_json::json!({ "interrupted": interrupted }),
-                    ),
                 ),
             ))
         })

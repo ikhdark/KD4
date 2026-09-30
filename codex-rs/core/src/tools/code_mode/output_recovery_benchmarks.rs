@@ -122,7 +122,6 @@ fn command(
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: Some(artifact),
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     }
@@ -290,7 +289,7 @@ async fn in_memory_selection(home: &Path) {
 }
 
 fn search(query: &str) -> ToolOutputSelector {
-    ToolOutputSelector::Search {
+    ToolOutputSelector::Search { case_insensitive: false,
         query: query.into(),
         start_byte: 0,
         max_results: 100,

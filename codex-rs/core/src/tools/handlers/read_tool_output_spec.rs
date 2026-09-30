@@ -83,8 +83,12 @@ fn selector_schema(include_structured: bool) -> JsonSchema {
                     (
                         "query".to_string(),
                         JsonSchema::string(Some(format!(
-                            "Case-sensitive fixed string to find; at most {ARTIFACT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes."
+                            "Fixed string to find, case-sensitive unless case_insensitive is true; at most {ARTIFACT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes."
                         ))),
+                    ),
+                    (
+                        "case_insensitive".to_string(),
+                        JsonSchema::boolean(Some("Match ASCII letters without regard to case; defaults to false. Non-ASCII bytes remain exact.".to_string())),
                     ),
                     (
                         "start_byte".to_string(),
@@ -98,9 +102,9 @@ fn selector_schema(include_structured: bool) -> JsonSchema {
                         "max_results".to_string(),
                         bounded_integer(
                             1,
-                            ARTIFACT_SEARCH_MAX_RESULTS as u64,
+                            u64::MAX,
                             format!(
-                                "Maximum matches to index; defaults to 20 and may not exceed {ARTIFACT_SEARCH_MAX_RESULTS}."
+                                "Maximum matches to index; defaults to 20 and is capped at {ARTIFACT_SEARCH_MAX_RESULTS}."
                             ),
                         ),
                     ),
@@ -108,9 +112,9 @@ fn selector_schema(include_structured: bool) -> JsonSchema {
                         "context_lines".to_string(),
                         bounded_integer(
                             0,
-                            ARTIFACT_SEARCH_MAX_CONTEXT_LINES as u64,
+                            u64::MAX,
                             format!(
-                                "Lines of context to include in returned exact line selectors; may not exceed {ARTIFACT_SEARCH_MAX_CONTEXT_LINES}."
+                                "Lines of context to include in returned exact line selectors; defaults to 3 and is capped at {ARTIFACT_SEARCH_MAX_CONTEXT_LINES}."
                             ),
                         ),
                     ),
@@ -152,6 +156,8 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
             BTreeMap::from([
                 ("artifact_id".to_string(), artifact_id),
                 ("selectors".to_string(), selectors),
+                ("max_bytes".to_string(), bounded_integer(1, u64::MAX,
+                    format!("Compatibility byte budget, capped at {READ_TOOL_OUTPUT_MAX_BYTES}."))),
             ]),
             Some(vec!["artifact_id".to_string(), "selectors".to_string()]),
             Some(false.into()),
@@ -197,7 +203,8 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                     ]},
                     "selector": {"anyOf": [{"$ref": "#/$defs/selector"}, {"type": "null"}]},
                     "resumable": {"type": "boolean"},
-                    "message": {"type": "string"}
+                    "message": {"type": "string"},
+                    "page_selectors": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/selector"}, "description": "First up to eight independent pages of the unconsumed selector. Fetch in parallel; selector still describes the full remainder."}
                 },
                 "required": ["version", "reason", "selector", "resumable"],
                 "additionalProperties": false
@@ -390,7 +397,7 @@ mod tests {
             tool.pointer(
                 "/parameters/properties/selectors/items/oneOf/4/properties/max_results/maximum"
             ),
-            Some(&serde_json::json!(ARTIFACT_SEARCH_MAX_RESULTS)),
+            Some(&serde_json::json!((1_u64 << 53) - 1)),
         );
         let validator = jsonschema::validator_for(&tool["parameters"]).expect("artifact schema");
         for selector in [

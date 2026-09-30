@@ -1197,10 +1197,8 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "timeout_ms".to_string(),
             JsonSchema {
-                minimum: Some(serde_json::Number::from(options.min_timeout_ms)),
-                maximum: Some(serde_json::Number::from(options.max_timeout_ms)),
                 ..JsonSchema::integer(Some(format!(
-                    "Explicit caller deadline in milliseconds. Omit to wait without a caller deadline until the requested target condition or input activity. Explicit values must be between {} and {}. Completed targets return immediately.",
+                    "Explicit caller deadline in milliseconds. Omit to wait without a caller deadline until the requested target condition or input activity. Values below {} use that normal wait; values above {} are capped. Completed targets return immediately.",
                     options.min_timeout_ms, options.max_timeout_ms,
                 )))
             },
@@ -1229,10 +1227,8 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "timeout_ms".to_string(),
             JsonSchema {
-                minimum: Some(serde_json::Number::from(options.min_timeout_ms)),
-                maximum: Some(serde_json::Number::from(options.max_timeout_ms)),
                 ..JsonSchema::integer(Some(format!(
-                    "Explicit caller deadline in milliseconds. Omit to keep waiting; the default {} ms interval is internal maintenance cadence only and does not return an unchanged result. Explicit values must be between {} and {}. Use list_agents or get_agent_task for an immediate status snapshot.",
+                    "Explicit caller deadline in milliseconds. Omit to keep waiting; the default {} ms interval is internal maintenance cadence only and does not return an unchanged result. Values below {} use that normal wait; values above {} are capped. Use list_agents or get_agent_task for an immediate status snapshot.",
                     options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
                 )))
             },

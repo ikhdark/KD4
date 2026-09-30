@@ -1,6 +1,9 @@
+import base64
 import contextlib
 import io
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,6 +33,191 @@ class SourceInventoryTests(unittest.TestCase):
         if tracked:
             self.git("add", "--", path)
         return dest
+
+    def scan_stdin(self, query, *args, root=None):
+        # An ASCII text wrapper proves that stdin bytes are decoded as UTF-8
+        # independently of the caller's locale.
+        stream = io.TextIOWrapper(
+            io.BytesIO(json.dumps(query, ensure_ascii=False).encode("utf-8")),
+            encoding="ascii",
+        )
+        with (stream, mock.patch.object(sys, "stdin", stream),
+              mock.patch.object(tempfile, "tempdir", self.temp.name),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            self.assertEqual(inventory.main([
+                "--root", str(root or self.root), "--query", "-", *args,
+            ]), 0)
+        return json.loads(stdout.getvalue())
+
+    def test_stdin_utf8_matches_file_query_and_preserves_explicit_paths(self):
+        self.file("src/café.md", "日本語")
+        query = {"categories": [{"name": "日本語", "paths": ["src/*.md"],
+                                 "contains": "日本語", "verification": "path"}]}
+        query_path = Path(self.temp.name) / "query.json"
+        query_path.write_text(json.dumps(query, ensure_ascii=False), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            inventory.main(["--root", str(self.root), "--query", str(query_path),
+                            "--state", str(Path(self.temp.name) / "file-state.json"),
+                            "--paths"])
+        file_result = json.loads(stdout.getvalue())
+        stdin_result = self.scan_stdin(
+            query, "--state", str(Path(self.temp.name) / "stdin-state.json"), "--paths",
+        )
+        for key in ("count", "paths", "category_counts", "query_id", "ready_to_render"):
+            self.assertEqual(stdin_result[key], file_result[key])
+        self.assertEqual(stdin_result["paths"], ["src/café.md"])
+        self.assertEqual(stdin_result["category_counts"], {"日本語": 1})
+        self.assertNotIn("report", stdin_result)
+        self.assertNotIn("report", file_result)
+
+    def test_default_runs_are_unique_across_queries_and_repositories(self):
+        self.file("a.md")
+        query = {"categories": [{"name": "docs", "paths": ["*.md"],
+                                 "verification": "path"}]}
+        other = Path(self.temp.name) / "other"
+        other.mkdir()
+        subprocess.run(["git", "init", "-q", str(other)], check=True, capture_output=True)
+        results = [self.scan_stdin(query), self.scan_stdin(query),
+                   self.scan_stdin(query, root=other)]
+        self.assertEqual(len({r["artifact"] for r in results}), 3)
+        self.assertEqual([r["count"] for r in results], [1, 1, 0])
+        for result in results:
+            state = Path(result["artifact"])
+            self.assertEqual(state.name, "state.json")
+            self.assertEqual(state.parent.parent, Path(self.temp.name))
+            self.assertTrue(state.parent.name.startswith("source-inventory-"))
+            self.assertTrue((state.parent / "inventory.md").is_file())
+            for key in ("artifact", "report", "canonical_paths"):
+                self.assertTrue(Path(result[key]).is_absolute())
+                self.assertTrue(Path(result[key]).is_file())
+            self.assertEqual(result["next_action"], "deliver_report")
+
+    def test_default_state_honors_explicit_report(self):
+        self.file("a.md")
+        query = {"categories": [{"name": "docs", "paths": ["*.md"],
+                                 "verification": "path"}]}
+        report = Path(self.temp.name) / "chosen.md"
+        result = self.scan_stdin(query, "--report", str(report))
+        self.assertEqual(Path(result["report"]).read_bytes(), report.read_bytes())
+        self.assertFalse((Path(result["artifact"]).parent / "inventory.md").exists())
+
+    def test_stdin_continuation_advances_evidence_and_can_render_without_rescan(self):
+        self.file("a.md", "aaaa")
+        self.file("b.md", "bbbb")
+        query = {"categories": [{"name": "docs", "paths": ["*.md"],
+                                 "verification": "path"}]}
+        with mock.patch.object(inventory, "MAX_SCAN_BYTES", 4):
+            first = self.scan_stdin(query, "--paths")
+            self.assertEqual(first["scan_pending"], 1)
+            self.assertEqual(first["paths"], ["a.md"])
+            report = Path(first["artifact"]).parent / "inventory.md"
+            second = self.scan_stdin(
+                query, "--state", first["artifact"], "--report", str(report), "--paths",
+            )
+        self.assertEqual(second["scan_epoch"], first["scan_epoch"])
+        self.assertEqual(second["scan_pending"], 0)
+        self.assertEqual(second["paths"], ["a.md", "b.md"])
+        self.assertEqual(second["source_bytes_read"], 4)
+        self.assertEqual(second["next_action"], "deliver_report")
+        saved = Path(second["artifact"]).read_bytes()
+        with (mock.patch.object(inventory, "inventory", side_effect=AssertionError("rescan")),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            inventory.main(["--state", second["artifact"], "--render-only", "--paths"])
+        self.assertEqual(json.loads(stdout.getvalue())["paths"], second["paths"])
+        self.assertEqual(Path(second["artifact"]).read_bytes(), saved)
+
+    def test_stdin_malformed_or_non_utf8_query_does_not_create_run(self):
+        for raw in (b"", b"{", b"\xff"):
+            with self.subTest(raw=raw):
+                stream = io.TextIOWrapper(io.BytesIO(raw))
+                with (stream, mock.patch.object(sys, "stdin", stream),
+                      mock.patch.object(tempfile, "mkdtemp") as create,
+                      self.assertRaises(ValueError)):
+                    inventory.main(["--query", "-"])
+                create.assert_not_called()
+
+    def test_stdin_accepts_utf8_bom(self):
+        query = {"categories": [{"name": "docs", "paths": ["*.md"],
+                                 "verification": "path"}]}
+        stream = io.TextIOWrapper(io.BytesIO(b"\xef\xbb\xbf" + json.dumps(query).encode()))
+        with (stream, mock.patch.object(sys, "stdin", stream),
+              mock.patch.object(tempfile, "tempdir", self.temp.name),
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(inventory.main(["--root", str(self.root), "--query", "-"]), 0)
+
+    def test_stdin_controls_still_protect_sources_and_state(self):
+        self.file("a.md")
+        query = {"categories": [{"name": "docs", "paths": ["*.md"],
+                                 "verification": "path"}]}
+        state = Path(self.temp.name) / "state.json"
+        with self.assertRaisesRegex(ValueError, "state file overlaps"):
+            self.scan_stdin(query, "--state", str(self.root / "state.md"))
+        for report in (state, self.root / "a.md"):
+            with (self.subTest(report=report), contextlib.redirect_stderr(io.StringIO()),
+                  self.assertRaises(SystemExit)):
+                self.scan_stdin(query, "--state", str(state), "--report", str(report))
+            self.assertFalse(state.exists())
+        self.assertEqual((self.root / "a.md").read_text(), "prompt evidence")
+        with (contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit),
+              mock.patch.object(tempfile, "mkdtemp") as create):
+            inventory.main(["--render-only"])
+        create.assert_not_called()
+
+    def test_describe_exposes_complete_contract_without_io(self):
+        with (mock.patch.object(inventory, "inventory", side_effect=AssertionError("scan")),
+              mock.patch.object(Path, "read_text", side_effect=AssertionError("read")),
+              mock.patch.object(tempfile, "mkdtemp", side_effect=AssertionError("temp")),
+              mock.patch.object(sys, "stdin", None),
+              mock.patch.object(inventory, "MAX_FILE_BYTES", 123),
+              mock.patch.object(inventory, "MAX_SCAN_BYTES", 456),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            self.assertEqual(inventory.main(["--describe"]), 0)
+        contract = json.loads(stdout.getvalue())
+        self.assertEqual(contract["budget"]["max_file_bytes"], 123)
+        self.assertEqual(contract["budget"]["max_scan_bytes"], 456)
+        self.assertIn("--query -", contract["invocation"]["powershell_stdin"])
+        self.assertIn("$OutputEncoding", contract["invocation"]["powershell_stdin"])
+        self.assertIn("--state STATE --report REPORT", contract["invocation"]["file"])
+        self.assertIn("fnmatch.fnmatchcase", contract["globs"])
+        self.assertIn("re.search", contract["contains"])
+        self.assertIn("--refresh", contract["invocation"]["refresh"])
+        self.assertIn("--render-only", contract["paging"])
+        self.assertIn("unique", contract["control_files"])
+        self.assertIn("not that its scope answers the entire task", contract["delivery"])
+
+    def test_documented_powershell_stdin_preserves_unicode_and_encoding_scope(self):
+        shells = [path for name in ("powershell", "pwsh") if (path := shutil.which(name))]
+        if not shells:
+            self.skipTest("PowerShell is not available")
+        self.file("src/templates/café.md", "日本語")
+        example = inventory.describe_contract()["invocation"]["powershell_stdin"]
+        example = example.replace('"name":"templates"', '"name":"日本語"')
+        example = example.replace(
+            "python -X utf8", "& '" + sys.executable.replace("'", "''") + "' -X utf8",
+        ).replace("--root .", "--root '" + str(self.root).replace("'", "''") + "'")
+        script = (
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+            "$OutputEncoding = [System.Text.ASCIIEncoding]::new()\n"
+            "$before = $OutputEncoding\n"
+            "$result = " + example + "\n"
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
+            "if ($OutputEncoding -ne $before) { throw 'OutputEncoding leaked' }\n"
+            "$result\n"
+        )
+        for shell in shells:
+            with self.subTest(shell=shell):
+                result = subprocess.run(
+                    [shell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                     base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
+                    cwd=Path(inventory.__file__).resolve().parent.parent,
+                    env={**os.environ, "TEMP": self.temp.name, "TMP": self.temp.name,
+                         "TMPDIR": self.temp.name},
+                    check=True, capture_output=True, encoding="utf-8",
+                )
+                summary = json.loads(result.stdout)
+                self.assertEqual(summary["category_counts"], {"日本語": 1})
+                canonical = json.loads(Path(summary["canonical_paths"]).read_text(encoding="utf-8"))
+                self.assertEqual(canonical["paths"], ["src/templates/café.md"])
 
     def test_rejects_f1_invented_paths_and_derives_unique_counts(self):
         actual = ["codex-rs/ext/image-generation/imagegen_description.md",
@@ -401,6 +589,37 @@ class SourceInventoryTests(unittest.TestCase):
         for text in (result.stdout, Path(summary["canonical_paths"]).read_text(encoding="utf-8"), report.read_text(encoding="utf-8")):
             self.assertNotIn("PRIVATE PROMPT CONTENT", text)
         self.assertLess(len(result.stdout), 3000)
+
+    def test_describe_example_discovers_unknown_layout_in_one_stdin_scan(self):
+        with (mock.patch.object(inventory, "repository_source_records",
+                                side_effect=AssertionError("describe must not discover paths")),
+              mock.patch.object(Path, "read_text",
+                                side_effect=AssertionError("describe must not read files")),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            self.assertEqual(inventory.main(["--describe"]), 0)
+        contract = json.loads(stdout.getvalue())
+        self.assertIn("describe -> scan -> final", contract["workflow"]["default"])
+        self.assertIn("restricted request", contract["workflow"]["scope"])
+        self.assertIn("uncertainty", contract["workflow"]["inspection_exception"])
+        expected = [
+            "models.json",
+            "packages/unknown/deep/models.json",
+            "packages/unknown/deep/templates/nested/a.md",
+            "templates/a.md",
+        ]
+        for path in expected:
+            self.file(path, "{}" if path.endswith(".json") else "template")
+        self.file("packages/unknown/deep/not-models.json", "{}")
+        self.file("docs/a.md")
+        result = self.scan_stdin(contract["example"])
+        self.assertEqual(result["count"], len(expected))
+        self.assertEqual(result["category_counts"], {"templates": 2, "catalog": 2})
+        self.assertEqual(result["scan_pending"], 0)
+        self.assertEqual(result["unresolved_count"], 0)
+        self.assertTrue(result["ready_to_render"])
+        self.assertEqual(result["next_action"], "deliver_report")
+        delivered = json.loads(Path(result["canonical_paths"]).read_text(encoding="utf-8"))
+        self.assertEqual(delivered["paths"], expected)
 
     def test_successful_evidence_excludes_unresolved_and_reviewed_exclusions(self):
         self.file("include.json", '{"prompt":"included"}')

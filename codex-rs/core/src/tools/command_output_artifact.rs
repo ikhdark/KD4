@@ -56,12 +56,16 @@ const STREAMING_ARTIFACT_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RETENTION_INDEX_ROOTS: usize = 4;
-const MAX_RETENTION_INDEX_RECORDS: usize = 8_192;
+// Artifacts referenced by durable thread history stay protected, so a root
+// holds far more records than the unprotected retention limit. Past this cap
+// every commit falls back to full-root scans (~0.3s each on Windows at 11K
+// records), so size it for protected growth; memory tracks actual records.
+const MAX_RETENTION_INDEX_RECORDS: usize = 65_536;
 const RETENTION_RECONCILIATION_INTERVAL: u64 = 128;
 const RETENTION_BYTE_GUARD_BAND: u64 = MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
 pub(crate) const RECOVERY_AGGREGATE_TOKEN_CEILING: usize = 10_000;
 const RECOVERY_FRAGMENT_TOKEN_CEILING: usize = 1_000;
-const RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN: usize = 128;
+pub(crate) const RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN: usize = 128;
 const MAX_AUTOMATIC_SUBDIVISIONS: u64 = 64;
 const MAX_AUTOMATIC_SUBDIVISION_BYTES: u64 = 64 * 1_024;
 pub(crate) const ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS: usize = 20;
@@ -93,21 +97,25 @@ pub(crate) enum ToolOutputSelector {
     },
     Search {
         query: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        case_insensitive: bool,
         #[serde(default)]
         start_byte: u64,
         #[serde(default = "artifact_search_default_max_results")]
         max_results: usize,
-        #[serde(default)]
+        #[serde(default = "artifact_search_default_context_lines")]
         context_lines: usize,
     },
     #[cfg(feature = "bench-generation-opportunities")]
     SearchIndex {
         query: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        case_insensitive: bool,
         #[serde(default)]
         start_byte: u64,
         #[serde(default = "artifact_search_default_max_results")]
         max_results: usize,
-        #[serde(default)]
+        #[serde(default = "artifact_search_default_context_lines")]
         context_lines: usize,
     },
 }
@@ -125,6 +133,10 @@ impl ToolOutputSelector {
 
 const fn artifact_search_default_max_results() -> usize {
     ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS
+}
+
+const fn artifact_search_default_context_lines() -> usize {
+    crate::tools::shell_output_summary::FOCUS_CONTEXT_LINES
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -201,6 +213,96 @@ pub(crate) struct ReadToolOutputResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_ranges: Vec<CanonicalByteRange>,
     pub results: Vec<ToolOutputSelectorResult>,
+}
+
+impl ReadToolOutputResult {
+    /// Exact bytes delivered in this response, including hydrated search context.
+    /// Coordinates, recovery handles, and shared references alone are not delivery.
+    pub(crate) fn delivered_ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        for result in &self.results {
+            if result.status != ToolOutputSelectorStatus::Ok {
+                continue;
+            }
+            if let Some(range) = result.canonical_range
+                && (result.text.is_some() || result.data_base64.is_some()
+                    || matches!(result.selector, ToolOutputSelector::JsonPointer { .. })
+                        && result.value.is_some())
+            {
+                ranges.push((range.start, range.end));
+            }
+            if let Some(hydrated) = result.value.as_ref()
+                .and_then(|value| value["hydrated_ranges"].as_array())
+            {
+                for value in hydrated {
+                    if (value["text"].is_string() || value["data_base64"].is_string())
+                        && let (Some(start), Some(end)) = (
+                            value["canonical_range"]["start"].as_u64(),
+                            value["canonical_range"]["end"].as_u64(),
+                        )
+                        && start <= end && end <= self.canonical_bytes
+                    {
+                        ranges.push((start, end));
+                    }
+                }
+            }
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        merged
+    }
+
+    /// Evidence describes delivered coverage, never requested or merely retained bytes.
+    /// Equivalent line/byte selectors and overlapping ranges have the same identity.
+    pub(crate) fn delivered_evidence(&self) -> Option<Value> {
+        let ranges = self.delivered_ranges();
+        let mut values = Vec::new();
+        for result in &self.results {
+            if result.status != ToolOutputSelectorStatus::Ok {
+                continue;
+            }
+            if result.canonical_range.is_some()
+                && (result.text.is_some() || result.data_base64.is_some())
+            {
+                continue;
+            }
+            if let Some(value) = &result.value {
+                // Search values include the query and scanned coverage, including
+                // successful negative searches. JSON selections retain their location.
+                if matches!(result.selector, ToolOutputSelector::Search { .. }) {
+                    let mut proof = value.clone();
+                    if let Some(fields) = proof.as_object_mut() {
+                        fields.remove("hydrated_ranges");
+                    }
+                    values.push(proof);
+                } else {
+                    values.push(serde_json::json!({
+                        "selector": result.selector,
+                        "value": value,
+                    }));
+                }
+            }
+        }
+        if ranges.is_empty() && values.is_empty() {
+            return None;
+        }
+        values.sort_by_key(Value::to_string);
+        values.dedup();
+        Some(serde_json::json!({
+            "sha256": self.canonical_sha256,
+            "ranges": ranges,
+            "values": values,
+        }))
+    }
 }
 
 impl Serialize for ReadToolOutputResult {
@@ -1666,35 +1768,20 @@ impl RawOutputArtifact {
         }
     }
 
-    pub(crate) async fn reduction_notice(&self) -> Option<String> {
+    pub(crate) fn reduction_notice(&self, source: &str, projection: &str) -> Option<String> {
         let Self::Stored {
             id,
-            path,
             bytes,
-            truncated,
             ..
         } = self
         else {
             return None;
         };
-        let path = path.clone();
-        let id = *id;
-        let end = (*bytes).min(1024);
-        let truncated = *truncated;
-        run_blocking_artifact_io(move || {
-            open_regular_artifact(&path)
-                .map_err(|error| std::io::Error::other(error.for_model()))?;
-            let scope = if truncated {
-                "the retained prefix"
-            } else {
-                "the retained output"
-            };
-            Ok(format!(
-                "[command output reduced; read a bounded selection from {scope} with read_tool_output: {{\"artifact_id\":\"{id}\",\"selectors\":[{{\"kind\":\"bytes\",\"start\":0,\"end\":{end}}}]}}. Selection completeness does not mean full artifact delivery. Batch exact ranges when possible; do not rerun the producer.]"
-            ))
-        })
-        .await
-        .ok()
+        if *bytes != source.len() as u64 { return None; }
+        let (start, end) = codex_utils_output_truncation::first_omitted_line_range(source, projection)?;
+        Some(format!(
+            "[command output reduced; recover the first omitted lines with read_tool_output: {{\"artifact_id\":\"{id}\",\"selectors\":[{{\"kind\":\"lines\",\"start\":{start},\"end\":{end}}}]}}. Selection completeness does not mean full artifact delivery; do not rerun the producer.]"
+        ))
     }
 
     pub(crate) fn retained_bytes(&self) -> Option<u64> {
@@ -2366,6 +2453,10 @@ fn largest_fitting_byte_prefix(
         snapshot.get(start..end).unwrap_or_default()
     };
     let fits = |candidate_bytes: u64| {
+        // Measure the same readable bytes we will deliver. A probe ending
+        // inside a code point is serialized as base64, whose token cost can
+        // differ from the text produced after boundary alignment.
+        let candidate_bytes = align_to_char_boundary(snapshot, range.start, candidate_bytes);
         let candidate_range = CanonicalByteRange::new(range.start, range.start + candidate_bytes);
         let result = ReadToolOutputResult {
             artifact_id: artifact_id.to_string(),
@@ -2388,7 +2479,7 @@ fn largest_fitting_byte_prefix(
         if fits(candidate) {
             best = candidate;
             if candidate == range.len() {
-                return candidate;
+                return align_to_char_boundary(snapshot, range.start, candidate);
             }
         } else {
             first_failure = candidate;
@@ -3880,6 +3971,13 @@ fn load_logical_metadata(
     path: &Path,
     id: ToolOutputArtifactId,
 ) -> Result<LogicalArtifactMetadata, ReadToolOutputError> {
+    load_logical_metadata_with_snapshot(path, id).map(|(metadata, _)| metadata)
+}
+
+fn load_logical_metadata_with_snapshot(
+    path: &Path,
+    id: ToolOutputArtifactId,
+) -> Result<(LogicalArtifactMetadata, Option<Vec<u8>>), ReadToolOutputError> {
     match std::fs::symlink_metadata(logical_transaction_path(path)) {
         Ok(_) => return Err(ReadToolOutputError::StillWriting),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -3906,19 +4004,23 @@ fn load_logical_metadata(
                     "artifact metadata identity mismatch".to_string(),
                 ));
             }
-            Ok(metadata)
+            Ok((metadata, None))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let (_, bytes) = open_regular_artifact(path)?;
-            let contents = std::fs::read(path).map_err(|err| {
+            let (mut file, _) = open_regular_artifact(path)?;
+            file.try_lock_shared().map_err(|_| ReadToolOutputError::StillWriting)?;
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents).map_err(|err| {
                 ReadToolOutputError::Io(format!("failed to read artifact: {err}"))
             })?;
-            Ok(LogicalArtifactMetadata {
+            let bytes = contents.len() as u64;
+            let sha256 = format!("{:x}", Sha256::digest(&contents));
+            let metadata = LogicalArtifactMetadata {
                 version: LOGICAL_ARTIFACT_METADATA_VERSION,
                 artifact_id: id.to_string(),
                 canonical_kind: CanonicalToolResultKind::Bytes,
-                canonical_sha256: format!("{:x}", Sha256::digest(&contents)),
-                retained_sha256: Some(format!("{:x}", Sha256::digest(&contents))),
+                canonical_sha256: sha256.clone(),
+                retained_sha256: Some(sha256),
                 canonical_bytes: bytes,
                 retained_bytes: bytes,
                 complete: true,
@@ -3930,7 +4032,8 @@ fn load_logical_metadata(
                     index: 0,
                     range: CanonicalByteRange::new(0, bytes),
                 }],
-            })
+            };
+            Ok((metadata, Some(contents)))
         }
         Err(err) => Err(ReadToolOutputError::Io(format!(
             "failed to read artifact metadata: {err}"
@@ -4425,17 +4528,18 @@ fn search_logical_artifact(
     token_ceiling: usize,
     previous_results: &[ToolOutputSelectorResult],
 ) -> ToolOutputSelectorResult {
-    let (query, start_byte, max_results, context_lines, coordinates_only) = match &selector {
+    let (query, start_byte, max_results, context_lines, case_insensitive, coordinates_only) = match &selector {
         ToolOutputSelector::Search {
             query,
             start_byte,
             max_results,
             context_lines,
-        } => (query.clone(), *start_byte, *max_results, *context_lines, false),
+            case_insensitive,
+        } => (query.clone(), *start_byte, *max_results, *context_lines, *case_insensitive, false),
         #[cfg(feature = "bench-generation-opportunities")]
-        ToolOutputSelector::SearchIndex {query,start_byte,max_results,context_lines} => {
+        ToolOutputSelector::SearchIndex {query,start_byte,max_results,context_lines,case_insensitive} => {
             crate::generation_live_bench::record(10,"search_index_executed");
-            (query.clone(),*start_byte,*max_results,*context_lines,true)
+            (query.clone(),*start_byte,*max_results,*context_lines,*case_insensitive,true)
         },
         _ => unreachable!("search helper requires a search selector"),
     };
@@ -4445,18 +4549,14 @@ fn search_logical_artifact(
             format!("search query must contain 1..={ARTIFACT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes"),
         );
     }
-    if max_results == 0 || max_results > ARTIFACT_SEARCH_MAX_RESULTS {
+    if max_results == 0 {
         return invalid_selector_result(
             selector,
             format!("max_results must be between 1 and {ARTIFACT_SEARCH_MAX_RESULTS}"),
         );
     }
-    if context_lines > ARTIFACT_SEARCH_MAX_CONTEXT_LINES {
-        return invalid_selector_result(
-            selector,
-            format!("context_lines must not exceed {ARTIFACT_SEARCH_MAX_CONTEXT_LINES}"),
-        );
-    }
+    let max_results = max_results.min(ARTIFACT_SEARCH_MAX_RESULTS);
+    let context_lines = context_lines.min(ARTIFACT_SEARCH_MAX_CONTEXT_LINES);
     if start_byte > metadata.retained_bytes {
         return invalid_selector_result(
             selector,
@@ -4471,8 +4571,15 @@ fn search_logical_artifact(
     let search_bytes = snapshot.get(search_offset..).unwrap_or_default();
     let mut total_matches = 0_usize;
     let mut indexed_matches = Vec::with_capacity(max_results);
-    for relative_match_start in memchr::memmem::find_iter(search_bytes, query_bytes) {
+    let mut cursor = 0;
+    while let Some(offset) = if case_insensitive {
+        crate::tools::shell_output_summary::find_ascii_case_bytes(&search_bytes[cursor..], query_bytes)
+    } else {
+        memchr::memmem::find(&search_bytes[cursor..], query_bytes)
+    } {
+        let relative_match_start = cursor + offset;
         let relative_match_end = relative_match_start.saturating_add(query_bytes.len());
+        cursor = relative_match_end;
         let match_start = search_offset.saturating_add(relative_match_start);
         let match_end = search_offset.saturating_add(relative_match_end);
         total_matches = total_matches.saturating_add(1);
@@ -4519,6 +4626,7 @@ fn search_logical_artifact(
         let remaining_match_count = total_matches.saturating_sub(matches_returned);
         let continuation = (remaining_match_count > 0).then(|| ToolOutputSelector::Search {
             query: query.clone(),
+            case_insensitive,
             start_byte: indexed_matches
                 .get(..matches_returned)
                 .and_then(|delivered| delivered.last())
@@ -4530,8 +4638,8 @@ fn search_logical_artifact(
         #[cfg(feature = "bench-generation-opportunities")]
         let continuation = if coordinates_only {
             continuation.map(|next| {
-                let ToolOutputSelector::Search {query,start_byte,max_results,context_lines} = next else {unreachable!()};
-                ToolOutputSelector::SearchIndex {query,start_byte,max_results,context_lines}
+                let ToolOutputSelector::Search {query,start_byte,max_results,context_lines,case_insensitive} = next else {unreachable!()};
+                ToolOutputSelector::SearchIndex {query,start_byte,max_results,context_lines,case_insensitive}
             })
         } else { continuation };
         let hydrated_ranges = child_selectors
@@ -4917,7 +5025,7 @@ pub(crate) async fn read_complete_canonical_snapshot(
         .join(thread_id)
         .join(format!("{id}.log"));
     tokio::task::spawn_blocking(move || {
-        let metadata = load_logical_metadata(&path, id)?;
+        let (metadata, snapshot) = load_logical_metadata_with_snapshot(&path, id)?;
         if !metadata.complete
             || metadata.canonical_bytes != metadata.retained_bytes
             || !metadata.unavailable_ranges.is_empty()
@@ -4929,7 +5037,7 @@ pub(crate) async fn read_complete_canonical_snapshot(
             ));
         }
         open_regular_artifact(&path)?;
-        load_validated_logical_snapshot(&path, &metadata)
+        snapshot.map_or_else(|| load_validated_logical_snapshot(&path, &metadata), Ok)
     })
     .await
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
@@ -4991,6 +5099,10 @@ pub(crate) struct ToolOutputSnapshot {
 }
 
 impl ToolOutputSnapshot {
+    pub(crate) fn page_selectors(&self, start: u64, end: u64, token_ceiling: usize) -> Vec<ToolOutputSelector> {
+        bounded_page_selectors(&self.metadata.artifact_id, &self.bytes, start, end, token_ceiling)
+    }
+
     pub(crate) async fn select(
         self: &Arc<Self>,
         selectors: Vec<ToolOutputSelector>,
@@ -5026,9 +5138,9 @@ pub(crate) async fn load_tool_output_snapshot(
         .join(thread_id)
         .join(format!("{id}.log"));
     tokio::task::spawn_blocking(move || {
-        let metadata = load_logical_metadata(&path, id)?;
+        let (metadata, snapshot) = load_logical_metadata_with_snapshot(&path, id)?;
         open_regular_artifact(&path)?;
-        let bytes = load_validated_logical_snapshot(&path, &metadata)?;
+        let bytes = snapshot.map_or_else(|| load_validated_logical_snapshot(&path, &metadata), Ok)?;
         Ok(Arc::new(ToolOutputSnapshot { metadata, bytes }))
     })
     .await
@@ -5205,17 +5317,32 @@ pub(crate) fn select_producer_snapshot(
 /// The default file read delivers a useful page immediately; explicit selectors
 /// retain their exact-selection contract. The temporary identity is used only
 /// for response sizing and is replaced or removed before model delivery.
+#[cfg(test)]
 pub(crate) fn select_file_snapshot(
     canonical: &CanonicalToolResult,
     selectors: Option<Vec<ToolOutputSelector>>,
 ) -> Result<(ReadToolOutputResult, Option<ToolOutputSelector>), ReadToolOutputError> {
+    select_file_snapshot_with_ceiling(
+        canonical,
+        selectors,
+        RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000),
+    )
+}
+
+pub(crate) fn select_file_snapshot_with_ceiling(
+    canonical: &CanonicalToolResult,
+    selectors: Option<Vec<ToolOutputSelector>>,
+    token_ceiling: usize,
+) -> Result<(ReadToolOutputResult, Option<ToolOutputSelector>), ReadToolOutputError> {
+    let token_ceiling =
+        token_ceiling.min(RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000));
     let metadata = producer_snapshot_metadata(canonical, uuid::Uuid::nil().to_string());
     if let Some(selectors) = selectors {
         return select_tool_output_snapshot(
             &metadata,
             &canonical.bytes,
             selectors,
-            RECOVERY_AGGREGATE_TOKEN_CEILING,
+            token_ceiling,
         )
         .map(|result| (result, None));
     }
@@ -5226,7 +5353,7 @@ pub(crate) fn select_file_snapshot(
         canonical.exact_bytes,
         CanonicalByteRange::new(0, canonical.exact_bytes),
         &canonical.bytes,
-        RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000),
+        token_ceiling,
     );
     let range = CanonicalByteRange::new(0, page_bytes);
     let continuation = (page_bytes < canonical.exact_bytes).then_some(ToolOutputSelector::Bytes {
@@ -5248,6 +5375,34 @@ pub(crate) fn select_file_snapshot(
         },
         continuation,
     ))
+}
+
+/// Advertise a bounded window of independently readable pages. The original
+/// continuation still describes the entire remaining extent.
+pub(crate) fn bounded_page_selectors(
+    artifact_id: &str,
+    bytes: &[u8],
+    mut start: u64,
+    end: u64,
+    token_ceiling: usize,
+) -> Vec<ToolOutputSelector> {
+    let mut pages = Vec::new();
+    let end = end.min(bytes.len() as u64);
+    while start < end && pages.len() < 8 {
+        let length = largest_fitting_byte_prefix(
+            artifact_id,
+            bytes.len() as u64,
+            CanonicalByteRange::new(start, end),
+            bytes,
+            token_ceiling,
+        );
+        if length == 0 {
+            break;
+        }
+        pages.push(ToolOutputSelector::Bytes { start, end: start + length });
+        start += length;
+    }
+    pages
 }
 
 #[cfg(test)]

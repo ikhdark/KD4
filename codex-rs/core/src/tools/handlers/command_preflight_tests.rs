@@ -1254,6 +1254,14 @@ fn rg_literal_glob_path_in_a_script_runs_with_an_advisory() {
         .expect("advisory explains the literal path");
     assert!(notice.contains("rg_literal_glob_path"), "{notice}");
     assert!(notice.contains("`src/runner*`"), "{notice}");
+    assert!(notice.contains("The script is unchanged."), "{notice}");
+    assert!(
+        notice.contains("a path error is not evidence of no matches"),
+        "{notice}"
+    );
+    assert!(notice.contains("correct only the failed search"), "{notice}");
+    assert!(notice.contains(r#"--glob "**/SKILL.md""#), "{notice}");
+    assert!(!notice.contains("that path produced no results"), "{notice}");
     assert!(
         notice.contains("pass wildcards through `--glob`"),
         "{notice}"
@@ -1530,6 +1538,29 @@ fn preflight_preserves_each_plain_pipeline_stage_for_validation() {
             },
         ]
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn preflight_repairs_read_only_cmdlets_but_rejects_invalid_source() {
+    let invocation = CommandInvocation::Argv {
+        program: "Get-Content".into(), args: vec!["a file.txt".into()],
+    };
+    let outcome = preflight_invocation_with_equivalent_repair(
+        &invocation, &strings(&["Get-Content", "a file.txt"]), None,
+    ).unwrap();
+    assert!(outcome.repaired());
+    assert!(outcome.invocation.is_powershell_script());
+    let error = preflight_invocation_with_equivalent_repair(
+        &CommandInvocation::PowerShellScript("Get-Content '".into()),
+        &strings(&["pwsh", "-NoProfile", "-Command", "Get-Content '"]),
+        Some(ShellType::PowerShell),
+    ).unwrap_err();
+    assert!(error.contains("invalid script syntax"));
+    assert!(preflight_invocation_with_equivalent_repair(
+        &CommandInvocation::Argv { program: "Remove-Item".into(), args: vec!["file".into()] },
+        &strings(&["Remove-Item", "file"]), None,
+    ).is_err());
 }
 
 #[tokio::test(flavor = "current_thread")]

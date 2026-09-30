@@ -1247,12 +1247,9 @@ impl UnifiedExecProcessManager {
                     original_token_count: Some(hit.original_token_count()),
                     hook_command: Some(request.hook_command.clone()),
                     raw_output_artifact: Some(hit.raw_output_artifact().clone()),
-                    raw_output_reduction_notice: None,
                     repair_notice: None,
                     pending_deferred_completions: Vec::new(),
-                }
-                .with_prepared_reduction_notice()
-                .await);
+                });
             }
         };
         process.set_validation(request.validation.clone());
@@ -1600,7 +1597,6 @@ impl UnifiedExecProcessManager {
                     .flatten(),
                 None => process.raw_output_artifact().await,
             },
-            raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
         };
@@ -1642,13 +1638,6 @@ impl UnifiedExecProcessManager {
                 duration: response.wall_time,
                 event_call_id: Some(response.event_call_id.clone()),
             });
-        }
-        let mut response = response;
-        match poll_bound {
-            Some(bound) => {
-                let _ = tokio::time::timeout_at(bound, response.prepare_reduction_notice()).await;
-            }
-            None => response.prepare_reduction_notice().await,
         }
         let mut response =
             finish_exited_process_result(Some(&process), Ok(response), start.elapsed(), poll_bound)
@@ -1774,7 +1763,20 @@ impl UnifiedExecProcessManager {
         let yield_time_ms = {
             // Empty polls use configurable background timeout bounds. Non-empty
             // writes keep a fixed max cap so interactive stdin remains responsive.
-            let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
+            // Only undelivered output justifies a sub-five-second empty poll.
+            // The interaction guard serializes this check with acknowledgement.
+            let new_output = {
+                let output = output_buffer.lock().await;
+                output.has_uncollected_output()
+                    || output.pending_output().is_some_and(|pending| pending.has_uncollected_output())
+            };
+            let minimum = if request.input.is_empty() && !new_output
+            {
+                crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS
+            } else {
+                MIN_YIELD_TIME_MS
+            };
+            let time_ms = request.yield_time_ms.max(minimum);
             if request.input.is_empty() {
                 time_ms.min(self.max_write_stdin_yield_time_ms)
             } else {
@@ -1963,18 +1965,10 @@ impl UnifiedExecProcessManager {
                     .flatten(),
                 None => process.raw_output_artifact().await,
             },
-            raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
         };
 
-        let mut response = response;
-        match poll_bound {
-            Some(bound) => {
-                let _ = tokio::time::timeout_at(bound, response.prepare_reduction_notice()).await;
-            }
-            None => response.prepare_reduction_notice().await,
-        }
         let mut response =
             finish_exited_process_result(Some(&process), Ok(response), start.elapsed(), poll_bound)
                 .await?;
@@ -2112,7 +2106,6 @@ impl UnifiedExecProcessManager {
             original_token_count: Some(0),
             hook_command: Some(handles.hook_command),
             raw_output_artifact: handles.process.raw_output_artifact().await,
-            raw_output_reduction_notice: None,
             repair_notice: Some(notice),
             pending_deferred_completions: Vec::new(),
         })

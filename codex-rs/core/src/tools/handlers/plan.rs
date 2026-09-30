@@ -35,6 +35,7 @@ struct PlanToolArgs {
     explanation: Option<String>,
     plan: Option<Vec<codex_protocol::plan_tool::PlanItemArg>>,
     set: Option<Vec<PlanStatusUpdate>>,
+    investigation: Option<crate::plan_store::investigation::Investigation>,
 }
 
 pub struct PlanToolOutput {
@@ -233,26 +234,12 @@ impl PlanHandler {
         #[cfg(test)]
         pause_at_plan_commit_boundary(&_call_id, &cancellation_token).await;
 
-        let update = if let Some(plan) = requested_args.plan {
-            session
-                .services
-                .plan_store
-                .update(UpdatePlanArgs {
-                    explanation: requested_args.explanation,
-                    plan,
-                })
-                .await
-        } else {
-            session
-                .services
-                .plan_store
-                .update_statuses(
-                    requested_args.set.unwrap_or_default(),
-                    requested_args.explanation,
-                )
-                .await
-                .map_err(FunctionCallError::RespondToModel)?
-        };
+        let update = session.services.plan_store.update_tool(
+            requested_args.plan,
+            requested_args.set,
+            requested_args.explanation,
+            requested_args.investigation,
+        ).await.map_err(FunctionCallError::RespondToModel)?;
         match update.effect {
             PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
             PlanUpdateEffect::StructuralRevision => {

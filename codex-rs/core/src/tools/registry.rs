@@ -66,7 +66,6 @@ use codex_tools::ToolProjectionInclusion;
 use codex_tools::ToolProjectionSection;
 use codex_tools::ToolProjectionV1;
 use codex_tools::ToolSpec;
-use codex_utils_output_truncation::DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS;
 use codex_utils_output_truncation::OutputDiagnosticClass;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::approx_token_count;
@@ -388,7 +387,48 @@ impl AnyToolResult {
     }
 
     pub(crate) fn sampling_request_signal(&self) -> Option<serde_json::Value> {
-        self.result.sampling_request_signal()
+        let mut signal = self.result.sampling_request_signal()?;
+        if signal.get("command_evidence") != Some(&Value::Bool(true))
+            || self.outcome_for_logging() != ToolOutputOutcome::Success
+        {
+            return Some(signal);
+        }
+        // Admission/dispatch owns these dependencies, including repaired commands.
+        // Text equality without provenance cannot establish cross-tool equivalence.
+        let Some(dependencies) = self.source_dependencies.as_ref().filter(|set| !set.is_empty()) else {
+            // Unknown provenance prevents cross-action reuse, not progress.
+            // The collector binds unscoped evidence to its action identity.
+            return Some(signal);
+        };
+        let ToolPayload::Function { arguments } = &self.payload else {
+            return Some(signal);
+        };
+        let arguments: Value = serde_json::from_str(arguments).ok()?;
+        let identity = signal.get("semantic_evidence")?.clone();
+        let mut scope = serde_json::json!({"dependencies": dependencies});
+        if let Some(environment) = arguments.get("environment_id") {
+            scope["environment"] = environment.clone();
+        }
+        // Dependencies identify sources, not which query/selection was observed.
+        // Preserve that distinction even when two queries return identical text.
+        // Only the command-field alias differs between the two shell routes;
+        // output limits and observation deadlines do not create coverage.
+        let mut operation = serde_json::Map::new();
+        for key in ["program", "args", "script_body", "shell", "login", "tty"] {
+            if let Some(value) = arguments.get(key) {
+                operation.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(command) = arguments.get("cmd").or_else(|| arguments.get("command")) {
+            operation.insert("command".to_string(), command.clone());
+        }
+        scope["operation"] = Value::Object(operation);
+        signal["semantic_evidence"] = serde_json::json!({
+            "source": "workspace-command",
+            "scope": scope,
+            "identity": identity,
+        });
+        Some(signal)
     }
 
     pub(crate) fn requires_canonical_artifact(&self) -> bool {
@@ -1822,6 +1862,8 @@ async fn handle_any_tool(
     tool: &dyn CoreToolRuntime,
     invocation: ToolInvocation,
 ) -> Result<AnyToolResult, FunctionCallError> {
+    let investigation = Arc::clone(&invocation.session.services.plan_store.investigation);
+    let investigation_target = crate::plan_store::investigation::admit_tool(&invocation)?;
     let _tool_execution_timing_guard =
         matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler).then(|| {
             invocation
@@ -1839,6 +1881,13 @@ async fn handle_any_tool(
     let output = tool.handle(invocation.clone()).await;
     mark_tool_handler_exit();
     let output = output?;
+    if matches!(output.outcome_context().outcome, ToolOutputOutcome::Success | ToolOutputOutcome::Failure)
+        && !invocation.cancellation_token.is_cancelled()
+        && let Some(target) = investigation_target
+    {
+        investigation.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_observation(target);
+    }
     Ok(AnyToolResult {
         call_id: invocation.call_id,
         payload: invocation.payload,
@@ -1850,6 +1899,7 @@ async fn handle_any_tool(
 }
 
 struct ModelProjectionInput {
+    fragments: Vec<ToolOutputProjectionFragment>,
     spillable_text: String,
     outcome: ToolOutputOutcome,
     essential_inline: Value,
@@ -1990,6 +2040,14 @@ async fn prepare_model_projection(
     force_inline_carrier: bool,
     track_for_admission: bool,
 ) -> Option<ModelProjectionInput> {
+    // JS consumes the native nested result, not this hidden projection. Its
+    // outer cell and nested-evidence owner retain the actually visible packet.
+    if !projection_is_provider_visible(&invocation.source)
+        && !force_inline_carrier
+        && !result.result.requires_canonical_artifact()
+    {
+        return None;
+    }
     // Exact artifact reads are already bounded and must never recursively spill.
     // Code mode also performs its own coherent outer projection after merging
     // native nested results. Keep the first `exec`/`wait` result byte-for-byte
@@ -2054,11 +2112,11 @@ async fn prepare_model_projection(
         diagnostic_class,
         if matches!(
             invocation.tool_name.name.as_str(),
-            "exec_command" | "write_stdin"
+            "exec_command" | "write_stdin" | "read_file"
         ) {
             10_000
         } else {
-            DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS
+            8_000
         },
     );
     let generic_projection = formatted_truncate_text_with_output_limit(&spillable_text, limits);
@@ -2132,7 +2190,7 @@ async fn prepare_model_projection(
             )
         } else if metadata.fragments.is_empty() {
             (
-                generic_projection.text,
+                spillable_text.clone(),
                 ProjectionSelectionFacts {
                     mode: "generic_fallback",
                     available_fragments: 0,
@@ -2144,7 +2202,8 @@ async fn prepare_model_projection(
                 },
             )
         } else {
-            select_typed_projection_fragments(&metadata.fragments, applied_token_limit)
+            // Select from original fragments only after the rendered header is sized.
+            select_typed_projection_fragments(&metadata.fragments, usize::MAX)
         };
 
     let mut canonical = result
@@ -2217,6 +2276,7 @@ async fn prepare_model_projection(
     let invocation_sha256 =
         canonical_tool_invocation_sha256(&invocation.payload, parsed_function_arguments);
     Some(ModelProjectionInput {
+        fragments: metadata.fragments,
         spillable_text,
         outcome: metadata.outcome,
         essential_inline: metadata.essential_inline,
@@ -2641,7 +2701,12 @@ fn select_typed_projection_fragments(
                 break;
             }
             remaining_budget = remaining_budget.saturating_sub(separator_tokens);
-            let bounded = bounded_fragment_text(&fragment.text, remaining_budget);
+            let bounded = if fragment.id.as_deref() == Some("output")
+                && fragment.kind == ToolOutputProjectionFragmentKind::ContextualSpillableText {
+                codex_utils_output_truncation::truncate_text_with_line_markers(&fragment.text, remaining_budget)
+            } else {
+                bounded_fragment_text(&fragment.text, remaining_budget)
+            };
             if bounded.is_empty() {
                 continue;
             }
@@ -2666,9 +2731,11 @@ fn select_typed_projection_fragments(
     }
 
     let selected_text = sections.join("\n\n");
-    let projected = truncate_text_to_token_ceiling(&selected_text, token_limit);
-    if projected != selected_text {
-        partial_ids = selected_ids.clone();
+    let selected_tokens = approx_token_count(&selected_text);
+    if selected_tokens > token_limit && token_limit > 0 {
+        return select_typed_projection_fragments(
+            fragments, token_limit.saturating_sub(selected_tokens - token_limit),
+        );
     }
     let selected_id_set = selected_ids.iter().collect::<HashSet<_>>();
     let omitted_inline_ids = unique
@@ -2678,7 +2745,7 @@ fn select_typed_projection_fragments(
         .cloned()
         .collect();
     (
-        projected,
+        selected_text,
         ProjectionSelectionFacts {
             mode: "typed_fragments",
             available_fragments: fragments.len(),
@@ -2722,6 +2789,7 @@ fn fragment_section_heading(kind: ToolOutputProjectionFragmentKind) -> &'static 
 
 async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolProjection> {
     let ModelProjectionInput {
+        fragments,
         spillable_text: _spillable_text,
         outcome,
         essential_inline,
@@ -2881,6 +2949,12 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             applied_token_limit: total_applied_token_limit,
         });
     }
+    // Admission preserves the producer's packet rather than applying the
+    // hypothetical generic projection. Count its actual truncation, including
+    // when artifact storage fails, without projecting nested results twice.
+    let visible_output_truncated = essential_inline
+        .get(crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY)
+        == Some(&Value::Bool(true));
     let admission_only_fallback = || {
         let bounded = BoundedModelProjection::Fallback {
             value: serde_json::from_str(&original_output_text)
@@ -2900,7 +2974,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             model_bytes: original_output_text.len().saturating_add(non_text_bytes) as u64,
             artifact_created: false,
             artifact_reused: false,
-            projection_truncated: false,
+            projection_truncated: visible_output_truncated,
             omitted_sections: 0,
             deterministic_continuation_receipt: None,
             deterministic_continuation_content: Vec::new(),
@@ -2918,10 +2992,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         // Code mode bounds its own packet before admission. When that packet
         // dropped output, name the durable canonical artifact so the omitted
         // range is recoverable without rerunning the producer.
-        let (original_response, original_output_text) = if essential_inline
-            .get(crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY)
-            == Some(&Value::Bool(true))
-        {
+        let (original_response, original_output_text) = if visible_output_truncated {
             let text = format!(
                 "{original_output_text}\n{}",
                 serde_json::json!({
@@ -2975,7 +3046,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             model_bytes: original_output_text.len().saturating_add(non_text_bytes) as u64,
             artifact_created,
             artifact_reused: !artifact_created,
-            projection_truncated: false,
+            projection_truncated: visible_output_truncated,
             omitted_sections: 0,
             deterministic_continuation_receipt: None,
             deterministic_continuation_content: Vec::new(),
@@ -3026,7 +3097,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         omitted_sections,
         result: result_value,
     };
-    let fitted = serialize_projection_with_limit(envelope, &projected_text, applied_token_limit)?;
+    let fitted = serialize_projection_fragments(envelope, &projected_text, &fragments, applied_token_limit)?;
     envelope = fitted.envelope()?.clone();
     let (predetermined_ranges, predetermined_json_pointers) =
         validated_omitted_predetermined_selectors(
@@ -3062,13 +3133,13 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         );
     }
     let mut bounded =
-        serialize_projection_with_limit(envelope, &projected_text, applied_token_limit)?;
+        serialize_projection_fragments(envelope, &projected_text, &fragments, applied_token_limit)?;
     if bounded.envelope().is_none_or(|envelope| {
         !drained_content_survived(envelope, preserved_content_start, &drained_content)
     }) {
         deterministic_continuation_receipt = None;
         bounded =
-            serialize_projection_with_limit(base_envelope, &projected_text, applied_token_limit)?;
+            serialize_projection_fragments(base_envelope, &projected_text, &fragments, applied_token_limit)?;
     }
     let final_envelope = bounded.envelope()?;
     let omitted_section_count = final_envelope.omitted_sections.len() as u64;
@@ -3592,8 +3663,17 @@ fn drained_content_survived(
 }
 
 fn serialize_projection_with_limit(
+    envelope: ToolProjectionV1,
+    output: &str,
+    token_limit: usize,
+) -> Option<BoundedModelProjection> {
+    serialize_projection_fragments(envelope, output, &[], token_limit)
+}
+
+fn serialize_projection_fragments(
     mut envelope: ToolProjectionV1,
     output: &str,
+    fragments: &[ToolOutputProjectionFragment],
     token_limit: usize,
 ) -> Option<BoundedModelProjection> {
     // Spillable text remains subject to the requested limit. Structured control
@@ -3601,12 +3681,31 @@ fn serialize_projection_with_limit(
     // `essential` defines a safe floor when that carrier alone exceeds the
     // request.
     let effective_limit = token_limit.max(1);
-    let mut output_limit = effective_limit;
+    envelope.result["selected_text"] = Value::String(String::new());
+    // The recovery directory can grow when fitting marks sections omitted.
+    // Reserve it up front, so payload selection never truncates an earlier cut.
+    let mut header = envelope.clone();
+    header.omitted_sections = header.sections.iter().map(|section| section.id.clone()).collect();
+    let header_tokens = approx_token_count(&render_projection_with_exact_metrics(&mut header)?);
+    let mut output_limit = effective_limit.saturating_sub(header_tokens.saturating_add(1));
     loop {
-        let retained = truncate_text_to_token_ceiling(output, output_limit);
+        let retained = if fragments.is_empty() {
+            codex_utils_output_truncation::truncate_text_with_line_markers(output, output_limit)
+        } else {
+            let (text, selection) = select_typed_projection_fragments(fragments, output_limit);
+            for section in &mut envelope.sections {
+                section.inclusion = if selection.selected_ids.contains(&section.id)
+                    && !selection.partial_ids.contains(&section.id) {
+                    ToolProjectionInclusion::Included
+                } else {
+                    ToolProjectionInclusion::Omitted
+                };
+            }
+            text
+        };
         if retained != output {
             for section in &mut envelope.sections {
-                if section.inclusion == ToolProjectionInclusion::Included {
+                if fragments.is_empty() && section.inclusion == ToolProjectionInclusion::Included {
                     section.inclusion = ToolProjectionInclusion::Omitted;
                 }
             }
@@ -3703,6 +3802,9 @@ fn render_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Opti
             "artifact_id".to_string(),
             Value::String(artifact_id.clone()),
         );
+        if !envelope.omitted_sections.is_empty() {
+            fields.insert("omitted_sections".to_string(), serde_json::json!(envelope.omitted_sections));
+        }
     }
     let mut parts = Vec::new();
     if !fields.is_empty() {
@@ -3830,9 +3932,13 @@ impl CodeModeArgumentPreflight {
             return Ok(());
         };
         if tool_name.namespace.is_none() && tool_name.name == "exec_command" {
-            crate::tools::handlers::validate_exec_command_arguments(arguments).map_err(
+            return crate::tools::handlers::validate_exec_command_arguments(arguments).map_err(
                 |message| format!("tool `{tool_name}` argument preflight failed: {message}"),
-            )?;
+            );
+        }
+        if tool_name.namespace.is_none() && tool_name.name == "read_file" {
+            return crate::tools::handlers::validate_read_file_arguments(arguments)
+                .map_err(|message| format!("tool `{tool_name}` argument preflight failed: {message}"));
         }
         let value = parsed_function_arguments
             .and_then(|parsed| parsed.value().ok())
@@ -3915,3 +4021,7 @@ fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) ->
 #[cfg(test)]
 #[path = "registry_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "registry_investigation_tests.rs"]
+mod investigation_tests;

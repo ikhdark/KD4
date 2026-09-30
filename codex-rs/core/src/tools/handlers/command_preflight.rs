@@ -16,6 +16,7 @@ pub(crate) enum CommandPreflightIssueCode {
     DirectArgvPowerShellCmdlet,
     KnownFlagTypo,
     RgLiteralGlobPath,
+    PowerShellSyntax,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +117,7 @@ impl CommandPreflightIssue {
             rendered.push_str(" To search it, ");
             rendered.push_str(guidance);
         }
-        rendered.push_str(" The script ran as written, so that path produced no results.");
+        rendered.push_str(" The script is unchanged. Inspect this search's exit status and stderr; a path error is not evidence of no matches. Preserve successful results from other commands and correct only the failed search.");
         rendered
     }
 }
@@ -127,6 +128,7 @@ impl CommandPreflightIssueCode {
             Self::DirectArgvPowerShellCmdlet => "direct_argv_powershell_cmdlet",
             Self::KnownFlagTypo => "known_flag_typo",
             Self::RgLiteralGlobPath => "rg_literal_glob_path",
+            Self::PowerShellSyntax => "powershell_syntax",
         }
     }
 }
@@ -184,6 +186,17 @@ fn preflight_command_issues(
     mut literal_glob_advisories: Option<&mut Vec<CommandPreflightIssue>>,
 ) -> Result<Vec<Vec<String>>, CommandPreflightIssue> {
     let preflight_shell_type = shell_type.or_else(|| infer_direct_shell_type(command));
+    if preflight_shell_type == Some(ShellType::PowerShell)
+        && codex_shell_command::powershell_command_has_syntax_error(command)
+    {
+        return Err(CommandPreflightIssue::reject(
+            CommandPreflightIssueCode::PowerShellSyntax,
+            CommandPreflightRejected::Argv(command.to_vec()),
+            "PowerShell reported invalid script syntax; no command was started.".into(),
+            Some("Correct the script syntax. Changing to script_body cannot repair invalid source.".into()),
+            None,
+        ));
+    }
     // Parsing here extracts validation metadata; the target shell owns script
     // syntax and expansion. Heuristic quote/name/path checks can reject valid scripts.
     let argv_commands = argv_commands(command, preflight_shell_type).unwrap_or_default();
@@ -322,6 +335,26 @@ fn preflight_invocation_with_equivalent_repair_detailed(
     // command even when the first parsed argv happens to look read-only.
     if !invocation.is_argv() {
         return Err(issue);
+    }
+
+    if let Some(CommandPreflightRetry::PowerShellScript { script_body }) = issue.retry.as_ref()
+        && issue.code == CommandPreflightIssueCode::DirectArgvPowerShellCmdlet
+    {
+        let Some(shell) = crate::shell::get_shell(ShellType::PowerShell, None) else {
+            return Err(issue);
+        };
+        let repaired = CommandInvocation::PowerShellScript(script_body.clone());
+        let repaired_command = repaired.to_safety_args(&shell, false).map_err(|_| issue.clone())?;
+        if !codex_shell_command::is_safe_command::is_known_safe_command(&repaired_command) {
+            return Err(issue);
+        }
+        let commands = preflight_command_issue(&repaired_command, Some(ShellType::PowerShell))?;
+        return Ok(CommandPreflightOutcome {
+            validation_invocations: validation_invocations(commands, &repaired),
+            repair_notice: Some(read_only_repair_notice(issue.code, invocation, &repaired)),
+            invocation: repaired,
+            advisory: None,
+        });
     }
 
     let Some(CommandPreflightRetry::Argv { program, args }) = issue.retry.as_ref() else {
@@ -711,7 +744,7 @@ fn lint_rg_literal_glob_paths(
                 CommandPreflightRejected::Argv(argv.to_vec()),
                 detail,
                 Some(
-                    "search the parent directory and pass wildcards through `--glob`, for example `rg --files .codex/skills --glob '*/SKILL.md'`."
+                    "search the parent directory and pass wildcards through `--glob`, for example `rg --files .codex/skills --glob \"**/SKILL.md\"`."
                         .to_string(),
                 ),
                 None,

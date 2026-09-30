@@ -11,6 +11,7 @@ use std::fmt::Write;
 mod tokenizer;
 pub use tokenizer::model_token_count;
 pub use tokenizer::truncate_model_text;
+pub use tokenizer::truncate_model_text_at_lines;
 
 pub use codex_protocol::protocol::TruncationPolicy;
 
@@ -24,8 +25,8 @@ pub use codex_protocol::protocol::TruncationPolicy;
 /// trace is not worth more room than the search results that answer the task.
 pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 10_000;
 pub const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 10_000;
-/// Diagnostics fit inside a nested command's output ceiling.
-pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 8_000;
+/// Nested consumers apply their own ceiling independently.
+pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputOutcome {
@@ -159,6 +160,51 @@ fn truncate_text_to_token_ceiling_cow(content: &str, max_tokens: usize) -> Cow<'
 }
 
 fn truncate_over_budget_text(content: &str, max_tokens: usize) -> String {
+    truncate_over_budget_text_with_markers(content, max_tokens, false)
+}
+
+/// Projection-boundary truncation. Line coordinates refer to the original text,
+/// including CRLF input; a seam within a long line is explicitly labelled partial.
+pub fn truncate_text_with_line_markers(content: &str, max_tokens: usize) -> String {
+    if !approx_token_count_exceeds(content, max_tokens) {
+        return content.to_string();
+    }
+    truncate_over_budget_text_with_markers(content, max_tokens, true)
+}
+
+pub fn omitted_line_marker(content: &str, start: usize, end: usize) -> String {
+    omitted_line_marker_at_lines(content, start, end, 0, content.lines().count())
+}
+
+fn omitted_line_marker_at_lines(content: &str, start: usize, end: usize, offset: usize, total: usize) -> String {
+    let first = offset + content[..start].bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let last = first + content[start..end].bytes().filter(|byte| *byte == b'\n').count()
+        - usize::from(content[..end].ends_with('\n'));
+    let partial = (start > 0 && content.as_bytes()[start - 1] != b'\n')
+        || (end < content.len() && end > 0 && content.as_bytes()[end - 1] != b'\n');
+    format!("\n[omitted lines {first}-{last} of {total}{}]\n",
+        if partial { "; boundary lines partially retained" } else { "" })
+}
+
+/// First bounded source-line run absent from the displayed projection. Summary
+/// line prefixes do not affect matching; repeated already-visible lines need
+/// no speculative recovery hint.
+pub fn first_omitted_line_range(source: &str, projection: &str) -> Option<(usize, usize)> {
+    let mut start = None;
+    let mut end = 0;
+    for (index, line) in source.lines().enumerate() {
+        if !line.is_empty() && !projection.contains(line) {
+            let first = *start.get_or_insert(index + 1);
+            end = index + 1;
+            if end - first >= 199 { break; }
+        } else if start.is_some() {
+            break;
+        }
+    }
+    start.map(|start| (start, end))
+}
+
+fn truncate_over_budget_text_with_markers(content: &str, max_tokens: usize, line_markers: bool) -> String {
     const BEFORE_MIDDLE: &str = "\n[omitted before retained middle]\n";
     const AFTER_MIDDLE: &str = "\n[omitted after retained middle]\n";
     let marker_tokens = approx_token_count(BEFORE_MIDDLE) + approx_token_count(AFTER_MIDDLE);
@@ -176,20 +222,21 @@ fn truncate_over_budget_text(content: &str, max_tokens: usize) -> String {
         let tail = retained_bytes - head - middle;
         let middle_start = (content.len() - middle) / 2;
         candidate.clear();
+        let head_text = retained_text(content, 0, content.floor_char_boundary(head));
+        let middle_text = retained_text(content,
+            content.ceil_char_boundary(middle_start),
+            content.floor_char_boundary(middle_start + middle));
+        let tail_text = retained_text(content,
+            content.ceil_char_boundary(content.len() - tail), content.len());
+        let middle_offset = middle_text.as_ptr() as usize - content.as_ptr() as usize;
+        let tail_offset = tail_text.as_ptr() as usize - content.as_ptr() as usize;
+        let before = line_markers.then(|| omitted_line_marker(content, head_text.len(), middle_offset));
+        let after = line_markers.then(|| omitted_line_marker(content, middle_offset + middle_text.len(), tail_offset));
         let _ = write!(
             candidate,
-            "{}{BEFORE_MIDDLE}{}{AFTER_MIDDLE}{}",
-            retained_text(content, 0, content.floor_char_boundary(head)),
-            retained_text(
-                content,
-                content.ceil_char_boundary(middle_start),
-                content.floor_char_boundary(middle_start + middle)
-            ),
-            retained_text(
-                content,
-                content.ceil_char_boundary(content.len() - tail),
-                content.len()
-            )
+            "{}{}{}{}{}",
+            head_text, before.as_deref().unwrap_or(BEFORE_MIDDLE),
+            middle_text, after.as_deref().unwrap_or(AFTER_MIDDLE), tail_text
         );
         let actual_tokens = approx_token_count(&candidate);
         if actual_tokens <= max_tokens {

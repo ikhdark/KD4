@@ -3,6 +3,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use ts_rs::TS;
 
+pub mod investigation;
+
 // Types for the TODO tool arguments matching codex-vscode/todo-mcp/src/main.rs
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +29,9 @@ pub struct UpdatePlanArgs {
     #[serde(default)]
     pub explanation: Option<String>,
     pub plan: Vec<PlanItemArg>,
+    /// Optional causal investigation state; absent in legacy checklists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<investigation::Investigation>,
 }
 
 impl<'de> Deserialize<'de> for PlanItemArg {
@@ -62,6 +67,8 @@ impl<'de> Deserialize<'de> for UpdatePlanArgs {
             #[serde(default)]
             explanation: Option<String>,
             plan: Vec<PlanItemArg>,
+            #[serde(default)]
+            investigation: Option<investigation::Investigation>,
         }
 
         let raw = RawUpdatePlanArgs::deserialize(deserializer)?;
@@ -70,6 +77,7 @@ impl<'de> Deserialize<'de> for UpdatePlanArgs {
         Ok(Self {
             explanation: raw.explanation,
             plan: raw.plan,
+            investigation: raw.investigation,
         })
     }
 }

@@ -506,6 +506,73 @@ class SharedTimingAnalysisTest(unittest.TestCase):
                     expected,
                 )
 
+    def test_source_only_cost_is_visible_without_claiming_nonprogress_or_savings(self):
+        timing = timing_profile()
+        timing["observationalNonprogressLatency"] = {"logicalGenerations": 0}
+        timing["modelRequests"] = [
+            {
+                "generationIndex": 0,
+                "attemptKind": "primary",
+                "progressKinds": ["new_source_evidence"],
+                "unchangedRelevantState": False,
+                "nextStructuredActionChanged": True,
+                "modelStreamWaitNs": 300_000_000,
+            },
+            {
+                "generationIndex": 0,
+                "attemptKind": "retry",
+                "modelStreamWaitNs": 100_000_000,
+            },
+            {
+                "generationIndex": 1,
+                "attemptKind": "primary",
+                "progressKinds": ["workspace_mutation", "new_source_evidence"],
+                "modelStreamWaitNs": 900_000_000,
+            },
+            {"generationIndex": 2, "attemptKind": "primary"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for recorded, complete in ((4, True), (5, False), (None, None)):
+                with self.subTest(recorded=recorded):
+                    timing["counters"]["modelRequestCount"] = recorded
+                    source = Path(directory) / "rollout.jsonl"
+                    source.write_text(
+                        json.dumps({
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "task_complete",
+                                "turn_id": "turn-1",
+                                "timing": timing,
+                            },
+                        }),
+                        encoding="utf-8",
+                    )
+                    report = audit.analyze_session_path(
+                        source, Path(directory), include_tokens=False,
+                        runner_evidence=self.evidence(timing),
+                    )
+                    bounded = audit.bounded_summary(report)
+                    for owner in (
+                        report["perTurn"][0],
+                        report["populations"]["all"],
+                        report["runnerDiagnostics"]["runtime"],
+                        bounded["perTurn"][0],
+                        bounded["populations"]["all"],
+                    ):
+                        metric = owner["sourceEvidenceOnlyLatency"]
+                        self.assertEqual(metric["logicalGenerations"], 1)
+                        self.assertEqual(metric["physicalAttempts"], 2)
+                        self.assertEqual(metric["modelStreamWaitNs"], 400_000_000)
+                        self.assertIs(metric["retentionComplete"], complete)
+                        self.assertIn("not proven waste or savings", metric["definition"])
+                    self.assertIn("source_evidence_only", report["perTurn"][0]["signals"])
+                    self.assertEqual(
+                        report["populations"]["all"]["observationalNonprogressLatency"][
+                            "logicalGenerations"
+                        ],
+                        0,
+                    )
+
     def test_captured_request_volume_flows_through_audit_without_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

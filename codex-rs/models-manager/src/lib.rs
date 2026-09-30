@@ -47,18 +47,50 @@ pub fn bundled_models_response() -> Result<ModelsResponse, serde_json::Error> {
     Ok(bundled_models()?.clone())
 }
 
-/// Convert the client version string to a whole version string (e.g. "1.2.3-alpha.4" -> "1.2.3").
+// The workspace uses 0.0.0 for local source builds, not as a protocol capability
+// version. The /models endpoint filters individual models by client_version:
+// 0.0.0 omits Sol 6/Luna 6, and 0.158.0 omits Sol 6.1. Use the baseline verified
+// against rust-v0.159.1 without changing executable versions.
+const SOURCE_BUILD_MODELS_CLIENT_VERSION: &str = "0.159.1";
+
+/// Whole client version used consistently for model discovery and cache eligibility.
+/// Source builds use the supported catalog baseline instead of the 0.0.0 placeholder.
 pub fn client_version_to_whole() -> String {
-    format!(
-        "{}.{}.{}",
-        env!("CARGO_PKG_VERSION_MAJOR"),
-        env!("CARGO_PKG_VERSION_MINOR"),
-        env!("CARGO_PKG_VERSION_PATCH")
-    )
+    model_catalog_client_version(env!("CARGO_PKG_VERSION"))
+}
+
+fn model_catalog_client_version(package_version: &str) -> String {
+    let whole = package_version
+        .split_once(['-', '+'])
+        .map_or(package_version, |(whole, _)| whole);
+    match whole {
+        "0.0.0" => SOURCE_BUILD_MODELS_CLIENT_VERSION.to_string(),
+        _ => whole.to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_catalog_client_version_handles_source_and_release_builds() {
+        for (package_version, expected) in [
+            ("0.0.0", "0.159.1"),
+            ("0.0.0-dev+local", "0.159.1"),
+            ("0.158.0", "0.158.0"),
+            ("0.159.0-alpha.4", "0.159.0"),
+            ("0.159.1", "0.159.1"),
+            ("1.2.3+local", "1.2.3"),
+            ("1.2.3-alpha.4+local", "1.2.3"),
+            ("0.99.0", "0.99.0"),
+        ] {
+            assert_eq!(
+                super::model_catalog_client_version(package_version),
+                expected
+            );
+        }
+        assert_ne!(super::client_version_to_whole(), "0.0.0");
+    }
+
     #[test]
     fn bundled_luna_6_preserves_runtime_metadata_and_local_prompt() {
         use codex_protocol::openai_models::ModelPreset;

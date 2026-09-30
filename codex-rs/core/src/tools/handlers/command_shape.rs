@@ -434,21 +434,23 @@ pub(crate) fn powershell_script_failure_advisory(
         );
     }
 
-    let looks_like_parser_or_quoting_failure = [
+    let looks_like_syntax_failure = [
         "parsererror",
         "unexpected token",
         "missing expression",
         "missing closing",
         "the string is missing the terminator",
         "terminatorexpectedatendofstring",
-        "positionalparameternotfound",
-        "parameter cannot be processed",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
 
-    (!is_powershell_script && looks_like_parser_or_quoting_failure).then_some(
-        "Hint: if this failed because of PowerShell quoting or parser handling, retry with `script_body` so Codex encodes the script body instead of nesting quotes.",
+    if looks_like_syntax_failure {
+        return Some("Hint: correct the PowerShell script syntax at the reported location; script_body encoding does not repair invalid source.");
+    }
+    (!is_powershell_script && (lower.contains("positionalparameternotfound")
+        || lower.contains("parameter cannot be processed"))).then_some(
+        "Hint: check PowerShell parameter binding and quoting; use script_body only when nested shell quoting changed the intended script.",
     )
 }
 

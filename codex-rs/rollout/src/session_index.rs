@@ -161,13 +161,13 @@ pub async fn find_thread_name_by_id(
     thread_id: &ThreadId,
 ) -> std::io::Result<Option<String>> {
     let path = session_index_path(codex_home);
-    if !path.exists() {
-        return Ok(None);
-    }
     let id = *thread_id;
-    let entry = tokio::task::spawn_blocking(move || scan_index_from_end_by_id(&path, &id))
-        .await
-        .map_err(std::io::Error::other)??;
+    let entry = tokio::task::spawn_blocking(move || match scan_index_from_end_by_id(&path, &id) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        result => result,
+    })
+    .await
+    .map_err(std::io::Error::other)??;
     Ok(entry.map(|entry| entry.thread_name))
 }
 
@@ -197,15 +197,16 @@ pub async fn find_thread_meta_by_name_str(
         return Ok(None);
     }
     let path = session_index_path(codex_home);
-    if !path.exists() {
-        return Ok(None);
-    }
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let name = name.to_string();
     // Stream matching ids newest-first instead of stopping at the first name hit: the newest entry
     // may point at a thread whose rollout was never materialized.
-    let scan =
-        tokio::task::spawn_blocking(move || stream_thread_ids_from_end_by_name(&path, &name, tx));
+    let scan = tokio::task::spawn_blocking(move || {
+        match stream_thread_ids_from_end_by_name(&path, &name, tx) {
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    });
 
     while let Some(thread_id) = rx.recv().await {
         // Keep walking until a matching id resolves to a loadable rollout so an unsaved or partial

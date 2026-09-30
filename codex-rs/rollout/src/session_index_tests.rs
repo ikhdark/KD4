@@ -19,6 +19,28 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 #[tokio::test]
+async fn name_lookups_treat_missing_index_as_empty_but_propagate_open_errors() -> std::io::Result<()>
+{
+    let home = TempDir::new()?;
+    let id = ThreadId::new();
+    assert_eq!(find_thread_name_by_id(home.path(), &id).await?, None);
+    assert!(
+        find_thread_meta_by_name_str(home.path(), "name", None)
+            .await?
+            .is_none()
+    );
+    // An existing directory is not an absent index and must not be swallowed.
+    std::fs::create_dir(session_index_path(home.path()))?;
+    assert!(find_thread_name_by_id(home.path(), &id).await.is_err());
+    assert!(
+        find_thread_meta_by_name_str(home.path(), "name", None)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn removing_thread_names_preserves_other_entries_and_cleans_replacement() {
     let home = TempDir::new().expect("tempdir");
     let removed = ThreadId::new();

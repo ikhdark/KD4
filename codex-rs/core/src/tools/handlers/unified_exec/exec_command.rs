@@ -30,7 +30,6 @@ use crate::tools::handlers::normalize_and_validate_additional_permissions_uri;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_search_repository_root;
-use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::known_delta_store;
@@ -289,13 +288,15 @@ impl ExecCommandHandler {
             source,
         );
         let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;
-        let Some(turn_environment) = resolve_tool_environment(
+        let turn_environment = crate::tools::handlers::wait_for_tool_environment(
             &step_context.environments,
             environment_args.environment_id.as_deref(),
-        )?
+            &cancellation_token,
+        ).await?;
+        let Some(turn_environment) = turn_environment.as_ref()
         else {
             return Err(FunctionCallError::RespondToModel(
-                "unified exec is unavailable in this session".to_string(),
+                "exec_command requires a selected execution environment".to_string(),
             ));
         };
         let native_environment_cwd = turn_environment.cwd().clone();
@@ -396,7 +397,11 @@ impl ExecCommandHandler {
             ))
         })?;
         let repaired = preflight.repaired();
-        let repair_notice = preflight.model_notice();
+        let repair_notice = {
+            let mut notices = args.argument_notices.clone();
+            notices.extend(preflight.model_notice());
+            (!notices.is_empty()).then(|| notices.join("\n"))
+        };
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
         let invocation_changed = &command_invocation != original_invocation;
@@ -528,10 +533,9 @@ impl ExecCommandHandler {
         let shell_wrapper_is_owned = !command_invocation.is_argv();
         let command_for_display = hook_command.clone();
 
+        let yield_time_ms = args.observation_yield_time_ms(nested);
         let ExecCommandArgs {
             tty,
-            yield_time_ms,
-            yield_time_requested,
             stall_timeout_ms,
             max_output_tokens,
             sandbox_permissions,
@@ -541,11 +545,6 @@ impl ExecCommandHandler {
             force_fresh,
             ..
         } = args;
-        let yield_time_ms = if nested && !yield_time_requested {
-            yield_time_ms.max(super::NESTED_EXEC_YIELD_TIME_MS)
-        } else {
-            yield_time_ms
-        };
 
         let max_output_tokens = max_output_tokens.or_else(|| {
             crate::tools::shell_output_summary::source_read_output_budget(&hook_command)
@@ -802,12 +801,9 @@ impl ExecCommandHandler {
                         original_token_count: None,
                         hook_command: Some(hook_command),
                         raw_output_artifact,
-                        raw_output_reduction_notice: None,
                         repair_notice,
                         pending_deferred_completions: Vec::new(),
-                    }
-                    .with_prepared_reduction_notice()
-                    .await,
+                    },
                 ));
             }
             Ok(None) => {}
@@ -935,7 +931,7 @@ impl ExecCommandHandler {
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 Ok(boxed_tool_output(
-                    response.with_prepared_reduction_notice().await,
+                    response,
                 ))
             }
             Err(UnifiedExecError::SandboxDenied {
@@ -997,13 +993,12 @@ impl ExecCommandHandler {
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(finalized_artifact),
-                    raw_output_reduction_notice: None,
                     repair_notice,
                     pending_deferred_completions: Vec::new(),
                 };
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 Ok(boxed_tool_output(
-                    response.with_prepared_reduction_notice().await,
+                    response,
                 ))
             }
             Err(UnifiedExecError::ToolHistoryPersistence {

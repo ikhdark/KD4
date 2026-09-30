@@ -395,6 +395,7 @@ mod tests {
 
     fn inner() -> Arc<Inner> {
         Arc::new(Inner {
+            unsupported_bounded_read: StdMutex::new(None),
             file_read_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::file_read::MAX_OPEN_FILE_READS,
             )),

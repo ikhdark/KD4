@@ -361,6 +361,7 @@ fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
     let defaults = Features::with_defaults();
     for (feature, key) in [
         (Feature::Kd4Runtime, "kd4_runtime"),
+        (Feature::Kd4CompletionGate, "kd4_completion_gate"),
         (Feature::CodeModeHost, "code_mode_host"),
         (Feature::ToolSuggest, "tool_suggest"),
         (Feature::SecretAuthStorage, "secret_auth_storage"),

@@ -73,6 +73,7 @@ mod recovery;
 mod remote_control;
 #[cfg(test)]
 mod test_support;
+mod thread_queues;
 mod threads;
 
 async fn file_modified_time_utc(path: &Path) -> Option<DateTime<Utc>> {

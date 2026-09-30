@@ -96,11 +96,7 @@ impl Handler {
         }
 
         let timeout_ms = match args.timeout_ms {
-            Some(ms) if ms < MULTI_AGENT_MIN_WAIT_TIMEOUT_MS => {
-                return Err(FunctionCallError::RespondToModel(
-                    "Omit timeout_ms for the normal wait. wait_agent returns immediately when a target has already completed.".to_owned(),
-                ));
-            }
+            Some(ms) if ms < MULTI_AGENT_MIN_WAIT_TIMEOUT_MS => None,
             Some(ms) => Some(ms.clamp(
                 MULTI_AGENT_MIN_WAIT_TIMEOUT_MS,
                 MULTI_AGENT_MAX_WAIT_TIMEOUT_MS,

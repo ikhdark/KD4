@@ -39,6 +39,87 @@ async fn search_threads_rejects_zero_page_size_before_scanning() {
     assert!(error.to_string().contains("page size"));
 }
 
+#[tokio::test]
+async fn search_result_names_batch_titles_and_preserve_legacy_fallback()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let home = TempDir::new()?;
+    let config = test_config(home.path());
+    let runtime = codex_state::StateRuntime::init(
+        home.path().to_path_buf(),
+        config.default_model_provider_id.clone(),
+    )
+    .await?;
+    let chosen = ThreadId::new();
+    let default = ThreadId::new();
+    let missing = ThreadId::new();
+    let resolved = ThreadId::new();
+    for (id, title) in [
+        (chosen, "  chosen name  "),
+        (default, "Hello from user"),
+        (resolved, "stale"),
+    ] {
+        let builder = codex_state::ThreadMetadataBuilder::new(
+            id,
+            home.path().join(format!("{id}.jsonl")),
+            Utc::now(),
+            SessionSource::Cli,
+        );
+        let mut metadata = builder.build(config.default_model_provider_id.as_str());
+        metadata.title = title.to_string();
+        metadata.first_user_message = Some("Hello from user".to_string());
+        runtime.upsert_thread(&metadata).await?;
+    }
+    for (id, name) in [
+        (chosen, "old legacy name"),
+        (default, "legacy default"),
+        (missing, "legacy missing"),
+    ] {
+        codex_rollout::append_thread_name(home.path(), id, name).await?;
+    }
+    let mut items = [chosen, default, missing, resolved]
+        .into_iter()
+        .map(|id| {
+            let thread = crate::local::helpers::stored_thread_from_rollout_item(
+                ThreadItem {
+                    thread_id: Some(id),
+                    first_user_message: Some("Hello from user".to_string()),
+                    ..Default::default()
+                },
+                false,
+                config.default_model_provider_id.as_str(),
+            )
+            .expect("thread");
+            crate::StoredThreadSearchResult {
+                thread,
+                snippet: "snippet".to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let store = LocalThreadStore::new(config, Some(runtime));
+    super::set_thread_search_result_names(
+        &store,
+        &mut items,
+        [(resolved, "already resolved".to_string())]
+            .into_iter()
+            .collect(),
+        [resolved].into_iter().collect(),
+    )
+    .await;
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.thread.name.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some("chosen name"),
+            Some("legacy default"),
+            Some("legacy missing"),
+            Some("already resolved")
+        ]
+    );
+    Ok(())
+}
+
 #[test]
 fn recency_cursor_includes_thread_id_tie_breaker() {
     let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000123")

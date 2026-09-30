@@ -2164,6 +2164,55 @@ fn completion_pending_input_stays_in_the_sampling_loop_when_capacity_remains() {
 }
 
 #[tokio::test]
+async fn batching_advisory_is_delivered_once_without_loop_or_generation_accounting() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let mut control = TurnExecutionControl::new();
+    for generation in 0..3 {
+        let baselines = control.baselines(0);
+        let collector = control.collector(&baselines);
+        let id = format!("short-{generation}");
+        let call = collector.register_deterministic_tool_call(
+            &codex_tools::ToolName::plain("exec_command"),
+            &codex_tools::ToolPayload::Function {
+                arguments: serde_json::json!({"cmd": format!("inspect-{generation}")}).to_string(),
+            },
+            &id,
+        );
+        collector.record_response_result(
+            call.ordinal,
+            codex_tools::ToolOutputOutcomeContext::new(codex_tools::ToolOutputOutcome::Success),
+            Some(crate::tools::context::semantic_evidence_sampling_signal(serde_json::json!(
+                crate::tools::context::semantic_evidence_for_command_output(id.as_bytes())
+            ))),
+            &codex_protocol::models::ResponseInputItem::FunctionCallOutput {
+                call_id: id.clone(),
+                output: codex_protocol::models::FunctionCallOutputPayload::from_text(id),
+            },
+            false,
+        );
+        collector.record_child_runtime(100);
+        control.observe_progress(
+            &baselines, &collector,
+            &SamplingRequestSettledState { mutation_revision: 0, tool_exposure_revision: 0 },
+        );
+    }
+    let before = session.clone_history().await;
+    record_soft_convergence_directive(&session, &turn_context, &mut control, false).await.unwrap();
+    assert_eq!(session.clone_history().await.raw_items(), before.raw_items());
+    record_soft_convergence_directive(&session, &turn_context, &mut control, true).await.unwrap();
+    record_soft_convergence_directive(&session, &turn_context, &mut control, true).await.unwrap();
+    let after = session.clone_history().await;
+    assert_eq!(after.raw_items().len(), before.raw_items().len() + 1);
+    assert!(matches!(after.raw_items().last(), Some(ResponseItem::Message { role, content, .. })
+        if role == "developer" && content.iter().any(|item| matches!(item,
+            ContentItem::InputText { text } if text.starts_with("Execution-efficiency advisory:")))));
+    let counters = turn_context.turn_timing_state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.logical_generation_count, 0);
+    assert_eq!(counters.no_progress_directive_count, 0);
+    assert_eq!(counters.proven_loop_activation_count, 0);
+}
+
+#[tokio::test]
 async fn soft_convergence_records_one_instruction_without_requesting_a_generation() {
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
     tokio::time::pause();
@@ -2235,16 +2284,17 @@ async fn soft_convergence_records_one_instruction_without_requesting_a_generatio
 async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
     let (session, turn_context, events) =
         crate::session::tests::make_session_and_context_with_rx().await;
+    let mut control = TurnExecutionControl::new();
     let mut decision = SamplingConvergenceDecision {
         continuation: ContinuationDisposition::TerminalCompletionRequired,
         directive: Some("Report the remaining work.".to_string()),
         proven_loop_activated: true,
         authoritative_wait: None,
     };
-    record_convergence_decision(&session, &turn_context, Some(&mut decision))
+    record_convergence_decision(&session, &turn_context, &mut control, Some(&mut decision))
         .await
         .unwrap();
-    record_convergence_decision(&session, &turn_context, Some(&mut decision))
+    record_convergence_decision(&session, &turn_context, &mut control, Some(&mut decision))
         .await
         .unwrap();
     let mut advisory = SamplingConvergenceDecision {
@@ -2253,7 +2303,7 @@ async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
         proven_loop_activated: false,
         authoritative_wait: None,
     };
-    record_convergence_decision(&session, &turn_context, Some(&mut advisory))
+    record_convergence_decision(&session, &turn_context, &mut control, Some(&mut advisory))
         .await
         .unwrap();
     let mut repeated_advisory = SamplingConvergenceDecision {
@@ -2262,12 +2312,19 @@ async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
         proven_loop_activated: false,
         authoritative_wait: None,
     };
-    record_convergence_decision(&session, &turn_context, Some(&mut repeated_advisory))
+    record_convergence_decision(&session, &turn_context, &mut control, Some(&mut repeated_advisory))
         .await
         .unwrap();
     assert_eq!(session.clone_history().await.raw_items().iter().filter(|item| {
         matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text == "Try a different method.")))
     }).count(), 1, "separate decisions must not accumulate identical advice");
+    let mut next_turn = TurnExecutionControl::new();
+    repeated_advisory.directive = Some("Try a different method.".to_string());
+    record_convergence_decision(&session, &turn_context, &mut next_turn, Some(&mut repeated_advisory))
+        .await.unwrap();
+    assert_eq!(session.clone_history().await.raw_items().iter().filter(|item| {
+        matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text == "Try a different method.")))
+    }).count(), 2, "a later turn must receive its own warning");
     let mut warnings = Vec::new();
     while let Ok(event) = events.try_recv() {
         if let EventMsg::Warning(warning) = event.msg {
@@ -2296,7 +2353,7 @@ fn logical_generation_budget_terminal_attempt_is_exactly_once() {
 }
 
 #[test]
-fn logical_generation_budget_new_user_input_reopens_terminal_without_resetting_regular_limit() {
+fn logical_generation_budget_new_user_input_renews_the_regular_limit() {
     let mut budget = LogicalGenerationBudget::default();
     for _ in 0..3 {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
@@ -2308,7 +2365,7 @@ fn logical_generation_budget_new_user_input_reopens_terminal_without_resetting_r
     assert!(!budget.can_admit(true));
     budget.accepted_user_input();
     assert!(budget.can_admit(true));
-    for _ in 3..MAX_REGULAR_LOGICAL_GENERATIONS {
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
     }
     assert_eq!(
@@ -2677,34 +2734,6 @@ async fn sampling_context_notices_are_persisted_once_and_append_only() {
     assert_eq!(rendered.matches("<mcp_catalog_notice>").count(), 1);
     assert_eq!(rendered.matches("<forced_terminal_notice>").count(), 1);
     assert!(rendered.contains("Later user input may resume work"));
-}
-
-#[test]
-fn structured_action_change_compares_the_full_generation_disposition() {
-    let request = GenerationRequestDisposition {
-        purpose: Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning),
-        sampling: SamplingGenerationDisposition::DecisionBearing,
-        relevant_state_fingerprint: "state-a".to_string(),
-        failure_fingerprint: None,
-        terminal_completion_only: false,
-    };
-
-    assert!(generation_request_action_changed(&request, None));
-    assert!(!generation_request_action_changed(&request, Some(&request)));
-
-    let mut changed_state = request.clone();
-    changed_state.relevant_state_fingerprint = "state-b".to_string();
-    assert!(generation_request_action_changed(
-        &request,
-        Some(&changed_state)
-    ));
-
-    let mut changed_terminal_contract = request.clone();
-    changed_terminal_contract.terminal_completion_only = true;
-    assert!(generation_request_action_changed(
-        &request,
-        Some(&changed_terminal_contract)
-    ));
 }
 
 #[test]

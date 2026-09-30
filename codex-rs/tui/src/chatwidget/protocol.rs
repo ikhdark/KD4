@@ -108,6 +108,7 @@ impl ChatWidget {
             }
             ServerNotification::TurnPlanUpdated(notification) => {
                 self.on_plan_update(UpdatePlanArgs {
+                    investigation: None,
                     explanation: notification.explanation,
                     plan: notification
                         .plan
@@ -191,6 +192,7 @@ impl ChatWidget {
             | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)
             | ServerNotification::ThreadStatusChanged(_)
+            | ServerNotification::ThreadQueueChanged(_)
             | ServerNotification::ThreadArchived(_)
             | ServerNotification::ThreadDeleted(_)
             | ServerNotification::ThreadUnarchived(_)

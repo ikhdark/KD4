@@ -4452,6 +4452,11 @@ fn create_config_toml_with_sandbox(
     for (feature, enabled) in feature_flags {
         features.insert(*feature, *enabled);
     }
+    // These scripts mock only the working model; keep the separate
+    // completion-assessor request off unless a test opts in.
+    features
+        .entry(Feature::Kd4CompletionGate)
+        .or_insert(false);
     let feature_entries = features
         .into_iter()
         .map(|(feature, enabled)| {

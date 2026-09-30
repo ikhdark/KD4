@@ -503,6 +503,7 @@ impl McpConnectionManager {
                 } else {
                     chatgpt_auth_provider_for_server(&server, chatgpt_auth_provider)
                 };
+            let auth_server = server.clone();
             let async_managed_client = AsyncManagedClient::new(
                 server_name.clone(),
                 codex_home.clone(),
@@ -526,8 +527,31 @@ impl McpConnectionManager {
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let auth_entry = auth_entries.get(&server_name).cloned();
+            let auth = auth.cloned();
+            let auth_codex_home = codex_home.clone();
+            let auth_runtime_context = runtime_context.clone();
             join_set.spawn(async move {
                 let mut outcome = async_managed_client.client().await;
+                // Discovery is diagnostic only: the transport performs actual
+                // authentication. Healthy servers need no extra OAuth request,
+                // and a slow provider must not block session initialization.
+                let auth_entry = if auth_entry.is_none()
+                    && outcome.as_ref().err().is_some_and(|error| error.is_authentication_required())
+                {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => None,
+                        mut entries = crate::compute_auth_statuses(
+                            std::iter::once((&server_name, &auth_server)),
+                            &auth_codex_home,
+                            store_mode,
+                            keyring_backend_kind,
+                            auth.as_ref(),
+                            &auth_runtime_context,
+                        ) => entries.remove(&server_name),
+                    }
+                } else {
+                    auth_entry
+                };
                 if cancel_token.is_cancelled() {
                     outcome = Err(StartupOutcomeError::Cancelled);
                 }

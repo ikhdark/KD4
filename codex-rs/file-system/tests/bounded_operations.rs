@@ -19,6 +19,7 @@ use std::task::Poll;
 struct TestFileSystem {
     reads: Mutex<VecDeque<Vec<io::Result<Bytes>>>>,
     batches: Mutex<VecDeque<ReadDirectoryOutcome>>,
+    metadata_batches: Mutex<VecDeque<ReadDirectoryOutcome<WalkDirectoryEntry>>>,
     limits: Mutex<Vec<(PathUri, usize)>>,
     active: AtomicUsize,
     peak: AtomicUsize,
@@ -173,6 +174,70 @@ impl ExecutorFileSystem for TestFileSystem {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no bounded backend"))
         })
     }
+
+    fn read_directory_bounded_for_walk<'a>(
+        &'a self,
+        path: &'a PathUri,
+        limit: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
+        Box::pin(async move {
+            if let Some(batch) = self.metadata_batches.lock().unwrap().pop_front() {
+                self.limits.lock().unwrap().push((path.clone(), limit));
+                return Ok(batch);
+            }
+            let batch = self.read_directory_bounded(path, limit, sandbox).await?;
+            Ok(ReadDirectoryOutcome {
+                entries: batch
+                    .entries
+                    .into_iter()
+                    .map(|entry| WalkDirectoryEntry {
+                        file_name: entry.file_name,
+                        metadata: None,
+                    })
+                    .collect(),
+                entries_examined: batch.entries_examined,
+                limit_reached: batch.limit_reached,
+            })
+        })
+    }
+}
+
+#[test]
+fn walk_reuses_enumerated_metadata_without_followup_probes() {
+    assert!(std::mem::size_of::<WalkDirectoryEntry>() <= std::mem::size_of::<ReadDirectoryEntry>());
+    let metadata = WalkEntryMetadata {
+        is_directory: false,
+        is_file: true,
+        is_symlink: false,
+    };
+    let fs = TestFileSystem {
+        metadata_batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
+            entries: ["b", "a"]
+                .into_iter()
+                .map(|name| WalkDirectoryEntry {
+                    file_name: name.into(),
+                    metadata: Some(metadata),
+                })
+                .collect(),
+            entries_examined: 3,
+            limit_reached: false,
+        }])),
+        ..Default::default()
+    };
+    let outcome = block_on(fs.walk(&root(), options(5), None)).unwrap();
+    assert_eq!(
+        outcome
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>(),
+        [root().join("a").unwrap(), root().join("b").unwrap()]
+    );
+    assert_eq!(fs.peak.load(Ordering::SeqCst), 0);
+    assert_eq!(*fs.limits.lock().unwrap(), [(root(), 5)]);
+    assert!(outcome.errors.is_empty());
+    assert!(!outcome.truncated);
 }
 
 fn read_with(

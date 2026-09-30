@@ -34,9 +34,11 @@ use crate::request_processors::PendingThreadUnloads;
 use crate::request_processors::PluginRequestProcessor;
 use crate::request_processors::ProcessExecRequestProcessor;
 use crate::request_processors::ProjectRequestProcessor;
+use crate::request_processors::QueueOrigin;
 use crate::request_processors::RemoteControlRequestProcessor;
 use crate::request_processors::SearchRequestProcessor;
 use crate::request_processors::ThreadGoalRequestProcessor;
+use crate::request_processors::ThreadQueueRequestProcessor;
 use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
@@ -185,6 +187,7 @@ pub(crate) struct MessageProcessor {
     pub(crate) thread_processor: ThreadRequestProcessor,
     pub(crate) thread_manager: Arc<ThreadManager>,
     turn_processor: TurnRequestProcessor,
+    thread_queue_processor: ThreadQueueRequestProcessor,
     bug_worker_shutdown: CancellationToken,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
@@ -467,7 +470,7 @@ impl MessageProcessor {
             outgoing.clone(),
             Arc::clone(&thread_list_state_permit),
         );
-        let thread_processor = ThreadRequestProcessor::new(
+        let mut thread_processor = ThreadRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
             outgoing.clone(),
@@ -497,6 +500,12 @@ impl MessageProcessor {
             bug_worker_shutdown.clone(),
             thread_processor.background_tasks.clone(),
         );
+        let thread_queue_processor = ThreadQueueRequestProcessor::new(
+            state_db.clone(),
+            &thread_processor,
+            turn_processor.clone(),
+        );
+        thread_processor.thread_queue_processor = Some(thread_queue_processor.clone());
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
             // Keep plugin startup warmups aligned at app-server startup.
             let on_effective_plugins_changed =
@@ -564,6 +573,7 @@ impl MessageProcessor {
             thread_processor,
             thread_manager,
             turn_processor,
+            thread_queue_processor,
             bug_worker_shutdown,
             windows_sandbox_processor,
             request_serialization_queues: RequestSerializationQueues::default(),
@@ -1232,6 +1242,52 @@ impl MessageProcessor {
                     .thread_rollback(&request_id, params, app_server_client_name.as_deref())
                     .await
             }
+            ClientRequest::ThreadQueueList { params, .. } => self
+                .thread_queue_processor
+                .list(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadQueueAdd { params, .. } => self
+                .thread_queue_processor
+                .add(
+                    params,
+                    QueueOrigin {
+                        request_id: request_id.clone(),
+                        client_name: app_server_client_name.clone(),
+                        client_version: client_version.clone(),
+                        supports_openai_form_elicitation,
+                    },
+                )
+                .await
+                .map(|()| None),
+            ClientRequest::ThreadQueueUpdate { params, .. } => self
+                .thread_queue_processor
+                .update(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadQueueDelete { params, .. } => self
+                .thread_queue_processor
+                .delete(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadQueueReorder { params, .. } => self
+                .thread_queue_processor
+                .reorder(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadQueueStart { params, .. } => self
+                .thread_queue_processor
+                .start(
+                    params,
+                    QueueOrigin {
+                        request_id: request_id.clone(),
+                        client_name: app_server_client_name.clone(),
+                        client_version: client_version.clone(),
+                        supports_openai_form_elicitation,
+                    },
+                )
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadList { params, .. } => self
                 .thread_processor
                 .thread_list(params)

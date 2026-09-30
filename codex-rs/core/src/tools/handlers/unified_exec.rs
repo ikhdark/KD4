@@ -40,10 +40,10 @@ pub(crate) struct ExecCommandArgs {
     prefix_rule: Option<Vec<String>>,
     force_fresh: bool,
     validation: Option<codex_protocol::validation::ValidationCommandContext>,
+    argument_notices: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawExecCommandArgs {
     #[serde(default)]
     cmd: Option<String>,
@@ -62,7 +62,7 @@ struct RawExecCommandArgs {
     #[serde(default = "default_tty")]
     tty: bool,
     #[serde(default)]
-    yield_time_ms: Option<u64>,
+    yield_time_ms: Option<i128>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
     #[serde(default)]
@@ -77,40 +77,28 @@ struct RawExecCommandArgs {
     force_fresh: bool,
     #[serde(default)]
     validation: Option<codex_protocol::validation::ValidationCommandContext>,
-    // Decode the unsupported hard deadline to report an explicit error, including when
-    // they arrive through the foreign-environment shell_command adapter.
+    // Legacy hard deadlines are ignored, never used to kill a command.
     #[serde(default)]
-    timeout_ms: Option<u64>,
+    timeout_ms: Option<serde_json::Value>,
     #[serde(default)]
     stall_timeout_ms: Option<u64>,
     #[serde(default)]
     environment_id: Option<String>,
     #[serde(default)]
     workdir: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
     type Error = String;
 
     fn try_from(raw: RawExecCommandArgs) -> Result<Self, Self::Error> {
+        let mut argument_notices = raw.extra.keys()
+            .map(|field| format!("Ignored unsupported exec_command field `{field}`."))
+            .collect::<Vec<_>>();
         if raw.timeout_ms.is_some() {
-            return Err(
-                "exec_command does not support `timeout_ms`; no command was started. `yield_time_ms` controls the observation wait, not a process deadline."
-                    .to_string(),
-            );
-        }
-
-        if let Some(yield_time_ms) = raw.yield_time_ms
-            && !(crate::unified_exec::MIN_YIELD_TIME_MS
-                ..=crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS)
-                .contains(&yield_time_ms)
-        {
-            return Err(format!(
-                "exec_command schema error at `$.yield_time_ms`: actual value {} violates the inclusive bound {}..={}",
-                yield_time_ms,
-                crate::unified_exec::MIN_YIELD_TIME_MS,
-                crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
-            ));
+            argument_notices.push("Ignored `timeout_ms`; `yield_time_ms` controls observation, not a process deadline.".to_string());
         }
 
         let command = CommandInvocation::from_parts(
@@ -129,13 +117,21 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
         // that shared surface without retaining either value internally.
         let _compatibility_only_fields = (&raw.environment_id, &raw.workdir);
 
-        let yield_time_ms = raw.yield_time_ms.unwrap_or_else(|| {
-            if crate::validation_admission::prefers_long_observation_wait(&command) {
-                crate::unified_exec::MAX_YIELD_TIME_MS
+        let long_running = crate::validation_admission::prefers_long_observation_wait(&command);
+        let requested_yield_time_ms = raw.yield_time_ms.unwrap_or_else(|| {
+            if long_running {
+                i128::from(crate::unified_exec::MAX_YIELD_TIME_MS)
             } else {
-                default_exec_yield_time_ms()
+                i128::from(default_exec_yield_time_ms())
             }
         });
+        let yield_time_ms = requested_yield_time_ms.clamp(
+            i128::from(crate::unified_exec::MIN_YIELD_TIME_MS),
+            i128::from(crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS),
+        ) as u64;
+        if raw.yield_time_ms.is_some_and(|requested| requested != i128::from(yield_time_ms)) {
+            argument_notices.push(format!("Adjusted `yield_time_ms` to {yield_time_ms}."));
+        }
         Ok(Self {
             command,
             shell: raw.shell,
@@ -145,7 +141,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             yield_time_requested: raw.yield_time_ms.is_some(),
             stall_timeout_ms: raw
                 .stall_timeout_ms
-                .or(Some(crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS))
+                .or_else(|| (!long_running).then_some(crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS))
                 .filter(|timeout| *timeout != 0),
             max_output_tokens: raw.max_output_tokens,
             sandbox_permissions: raw.sandbox_permissions,
@@ -154,6 +150,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             prefix_rule: raw.prefix_rule,
             force_fresh: raw.force_fresh,
             validation: raw.validation,
+            argument_notices,
         })
     }
 }
@@ -165,6 +162,17 @@ impl ExecCommandArgs {
 
     pub(crate) fn replace_command_invocation(&mut self, invocation: &CommandInvocation) {
         self.command = invocation.clone();
+    }
+
+    fn observation_yield_time_ms(&self, nested: bool) -> u64 {
+        if !nested || self.yield_time_requested {
+            return self.yield_time_ms;
+        }
+        if self.tty {
+            self.yield_time_ms.max(NESTED_EXEC_YIELD_TIME_MS)
+        } else {
+            NESTED_NONINTERACTIVE_EXEC_YIELD_TIME_MS
+        }
     }
 }
 
@@ -188,11 +196,14 @@ fn default_exec_yield_time_ms() -> u64 {
     2_000
 }
 
-/// Default observation window for a command started by a code-mode cell.
-/// The cell already waits on the call, so the short direct default only turns
-/// a command that ends moments later into a live session that costs the model
-/// a turn to poll.
+/// Interactive nested commands retain their short observation window.
 pub(super) const NESTED_EXEC_YIELD_TIME_MS: u64 = 10_000;
+
+/// An awaiting cell already owns noninteractive work. Use the same bounded
+/// window as its terminal polls instead of requiring the model to write a
+/// polling loop. Explicit yields still allow deliberate background work.
+pub(super) const NESTED_NONINTERACTIVE_EXEC_YIELD_TIME_MS: u64 =
+    crate::tools::code_mode::NESTED_DEFAULT_POLL.as_millis() as u64;
 
 fn default_write_stdin_yield_time_ms() -> u64 {
     250

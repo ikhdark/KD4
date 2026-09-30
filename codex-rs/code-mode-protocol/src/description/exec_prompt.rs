@@ -7,14 +7,15 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - `text(...)` emits values; on failure/no output, the host retains up to two nested-tool results, each capped at 1024 bytes, and reports omissions. Emit needed results explicitly.
 - Reuse current schemas and results; resolve missing/stale schemas before calls.
 - Nested tools: use a present schema; filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally; use `resolve_tool(name)` to obtain a missing schema and callable with `.name`/`.description`. Search only if local discovery fails.
-- Await `Promise.allSettled` for independent known calls in the same exec and inspect every result. Do not split a known independent batch into one-call execs. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results. Do mechanical checks, such as exit codes, in JS and continue in the same exec.
+- Await `Promise.allSettled` for independent known calls in the same exec and inspect every result. Do not split a known independent batch into one-call execs. Use `await notify(...)` in a handler for useful early results; still await the batch. At evaluation end, unawaited work is discarded. Sequence dependent calls only after checking prerequisite results. Do mechanical checks, such as exit codes, in JS and continue in the same exec. Compute paths and necessary existence checks within the operation that consumes them, not a separate exec.
 - For command output, prefer `text(result.output)` and inspect `result.exit_code`; live-session and recovery controls are preserved by the host. Use `text(result)` only when the complete object is needed.
 - Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. Resume only an actually returned live session/cell ID; otherwise check the outcome before retrying uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
 - `text(...)` buffers output while awaited work continues in the same awaited evaluation; `yield_control()` is only for a new model decision. Input and host deadlines can yield.
 - An exec cell and a command process have separate lifecycles. A resolved `exec_command` call may still return a running command session. Resume a running cell with `wait(cell_id)`; resume a returned command session with `write_stdin(session_id)`. When no new model decision is needed, continue that session within the current evaluation. Completion of the cell does not establish completion of every process it started. Command lifecycle and recovery metadata survive text-only output and zero-token text budgets.
 - Empty `write_stdin` polls: use default waits; avoid one-second loops.
 - Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
-- Output defaults to 10000 tokens, with a 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin results carry at most 8000 output tokens, bounded by the cell hard cap. Read whole useful regions; use retained-artifact selectors after truncation.
+- When required missing ranges or continuations are already known, recover them with bounded calls in the same exec before returning to the model. Retain full results; emit only the needed projection plus completeness and continuation controls. Stop on no progress, cancellation, or a new decision; do not drain unrelated output or exceed the combined output budget.
+- Output defaults to 10000 tokens, with a 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin results carry at most 8000 output tokens, bounded by the cell hard cap. Budget the combined emitted output, not each nested call independently; use `store` to retain results and emit only the evidence needed for the next decision. Read whole useful regions; after truncation, select only missing evidence from the retained artifact. If recovery stops at its budget, follow its unconsumed selector rather than repeating the original range; preserve completion and continuation metadata when filtering recovered output.
 
 Helpers:
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
@@ -127,6 +128,7 @@ mod tests {
                 for required in [
                     "Sequence dependent calls only after checking prerequisite results.",
                     "Do mechanical checks, such as exit codes, in JS and continue in the same exec.",
+                    "Compute paths and necessary existence checks within the operation that consumes them, not a separate exec.",
                     "Await `Promise.allSettled`",
                     "for independent known calls in the same exec and inspect every result.",
                     "Do not split a known independent batch into one-call execs.",
@@ -137,6 +139,14 @@ mod tests {
                     "A resolved `exec_command` call may still return a running command session.",
                     "continue that session within the current evaluation.",
                     "bounded by the cell hard cap.",
+                    "Budget the combined emitted output, not each nested call independently;",
+                    "use `store` to retain results",
+                    "select only missing evidence from the retained artifact.",
+                    "follow its unconsumed selector rather than repeating the original range;",
+                    "preserve completion and continuation metadata when filtering recovered output.",
+                    "recover them with bounded calls in the same exec before returning to the model.",
+                    "Stop on no progress, cancellation, or a new decision;",
+                    "do not drain unrelated output or exceed the combined output budget.",
                     "host-configured default deadline",
                     "Expiry cancels the nested call and may return only an error, without a live handle.",
                     "Resume only an actually returned live session/cell ID;",

@@ -79,17 +79,8 @@ impl Handler {
         let max_timeout_ms = turn.config.multi_agent_v2.max_wait_timeout_ms;
         let default_timeout_ms = turn.config.multi_agent_v2.default_wait_timeout_ms;
         let explicit_timeout_ms = match args.timeout_ms {
-            Some(ms) if ms < min_timeout_ms => {
-                return Err(FunctionCallError::RespondToModel(
-                    "Omit timeout_ms for the normal wait. Use list_agents or get_agent_task for an immediate status snapshot.".to_owned(),
-                ));
-            }
-            Some(ms) if ms > max_timeout_ms => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "timeout_ms must be at most {max_timeout_ms}"
-                )));
-            }
-            Some(ms) => Some(ms),
+            Some(ms) if ms < min_timeout_ms => None,
+            Some(ms) => Some(ms.min(max_timeout_ms)),
             None => None,
         };
         let maintenance_interval =

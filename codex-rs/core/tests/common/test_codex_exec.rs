@@ -30,7 +30,10 @@ impl TestCodexExecBuilder {
                 "model_providers.exec_fixture={{ name='Exec HTTP fixture', base_url={}, wire_api='responses', requires_openai_auth=true, supports_websockets=false }}",
                 toml_string_literal(&base)
             ))
-            .args(["-c", "model_provider='exec_fixture'"]);
+            .args(["-c", "model_provider='exec_fixture'"])
+            // Scripted exec tests mock only the working model; keep the
+            // separate completion-assessor request off, as core's test config does.
+            .args(["-c", "features.kd4_completion_gate=false"]);
         cmd
     }
 

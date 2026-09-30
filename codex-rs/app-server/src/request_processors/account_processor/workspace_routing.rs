@@ -42,6 +42,7 @@ impl AccountRequestProcessor {
             .find(|account| account.id == account_id)?;
         routing_from_account(
             account,
+            &self.config.chatgpt_base_url,
             self.config.enforce_residency.value(),
             auth.is_fedramp_account(),
         )
@@ -50,10 +51,25 @@ impl AccountRequestProcessor {
 
 fn routing_from_account(
     account: AccountEntry,
+    chatgpt_base_url: &str,
     residency: Option<ResidencyRequirement>,
     is_fedramp: bool,
 ) -> Option<WorkspaceRouting> {
-    let backend_origin = account.workspace_backend_origin?;
+    let backend_origin = match account.workspace_backend_origin?.as_str() {
+        // The accounts API uses this sentinel when the workspace does not
+        // override the configured backend. Desktop still requires an origin URL.
+        "NO_CONSTRAINT" => {
+            let base_url = url::Url::parse(chatgpt_base_url).ok()?;
+            if base_url.scheme() != "https"
+                || !base_url.username().is_empty()
+                || base_url.password().is_some()
+            {
+                return None;
+            }
+            base_url.origin().ascii_serialization()
+        }
+        origin => origin.to_string(),
+    };
     let url = url::Url::parse(&backend_origin).ok()?;
     if url.scheme() != "https" || url.origin().ascii_serialization() != backend_origin {
         return None;
@@ -124,7 +140,12 @@ mod tests {
                 "account_routing_override": override_
             }))
             .unwrap();
-            let routing = routing_from_account(account, residency, fedramp);
+            let routing = routing_from_account(
+                account,
+                codex_config::DEFAULT_CHATGPT_BASE_URL,
+                residency,
+                fedramp,
+            );
             assert_eq!(
                 serde_json::to_value(routing).unwrap(),
                 expected.map_or(serde_json::Value::Null, |value| serde_json::json!({
@@ -139,9 +160,68 @@ mod tests {
             serde_json::json!({"id":"workspace", "workspace_backend_origin":"https://chatgpt.com"}),
         ] {
             assert_eq!(
-                routing_from_account(serde_json::from_value(payload).unwrap(), None, false),
+                routing_from_account(
+                    serde_json::from_value(payload).unwrap(),
+                    codex_config::DEFAULT_CHATGPT_BASE_URL,
+                    None,
+                    false,
+                ),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn workspace_routing_resolves_unconstrained_backend_from_accounts_response() {
+        for (base_url, expected_origin) in [
+            (
+                codex_config::DEFAULT_CHATGPT_BASE_URL,
+                Some("https://chatgpt.com"),
+            ),
+            (
+                "https://chatgpt-staging.com/backend-api",
+                Some("https://chatgpt-staging.com"),
+            ),
+            (
+                "https://backend.example:8443/backend-api",
+                Some("https://backend.example:8443"),
+            ),
+            ("http://backend.example/backend-api", None),
+            ("https://user:password@backend.example/backend-api", None),
+            ("invalid", None),
+        ] {
+            let accounts: codex_backend_client::AccountsCheckResponse =
+                serde_json::from_value(serde_json::json!({
+                    "accounts": [{
+                        "id": "workspace",
+                        "workspace_backend_origin": "NO_CONSTRAINT",
+                        "account_routing_override": "NO_CONSTRAINT"
+                    }],
+                    "account_ordering": ["workspace"],
+                    "default_account_id": "workspace"
+                }))
+                .unwrap();
+            let account = accounts.accounts.into_iter().next().unwrap();
+            let routing = routing_from_account(account.clone(), base_url, None, false);
+            assert_eq!(
+                serde_json::to_value(routing).unwrap(),
+                expected_origin.map_or(serde_json::Value::Null, |origin| serde_json::json!({
+                    "chatgptAccountId": "workspace",
+                    "backendOrigin": origin,
+                    "accountRoutingOverride": "NO_CONSTRAINT"
+                })),
+                "{base_url}"
+            );
+            assert_eq!(
+                routing_from_account(
+                    account.clone(),
+                    base_url,
+                    Some(ResidencyRequirement::Us),
+                    false
+                ),
+                None
+            );
+            assert_eq!(routing_from_account(account, base_url, None, true), None);
         }
     }
 }

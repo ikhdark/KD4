@@ -2349,6 +2349,9 @@ pub struct TurnTimingModelRequest {
     pub physical_attempt_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub progress_kinds: Vec<TurnTimingProgressKind>,
+    /// False only after the next completed continuation is observed choosing
+    /// the same complete ordered tool actions (names and arguments). True also
+    /// covers an unknown or unobserved next action; this is not a completion test.
     #[serde(default)]
     pub next_structured_action_changed: bool,
     #[serde(default)]
@@ -2756,8 +2759,6 @@ pub struct TurnTimingDiagnosticLatencyAggregate {
 #[ts(rename_all = "snake_case", export_to = "v2/")]
 pub enum TurnTimingProgressKind {
     #[serde(
-        alias = "new_named_evidence",
-        alias = "source_closure",
         alias = "new_input",
         alias = "plan_change",
         alias = "completion_state",
@@ -2766,6 +2767,8 @@ pub enum TurnTimingProgressKind {
     WorkspaceMutation,
     ValidationResult,
     FailureObservation,
+    #[serde(alias = "new_named_evidence", alias = "source_closure")]
+    NewSourceEvidence,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3131,12 +3134,17 @@ pub struct TurnTimingCounters {
     pub tool_output_omitted_section_count: u64,
     #[serde(default)]
     pub tool_output_recovery_call_count: u32,
+    /// Recovery transactions performed inside code-mode cells, without a
+    /// separate provider tool-result generation.
+    #[serde(default)]
+    pub tool_output_in_cell_recovery_call_count: u32,
     #[serde(default)]
     pub tool_output_recovery_retruncation_count: u32,
     #[serde(default)]
     pub tool_output_recursive_spill_count: u32,
     /// Tool-result generations immediately following an observed
-    /// `read_tool_output` recovery transaction. This is independent of
+    /// direct `read_tool_output` recovery transaction. In-cell reads are
+    /// counted separately. This is independent of
     /// whether the recovered projection was truncated again.
     #[serde(default)]
     pub attributable_recovery_generation_count: u32,
@@ -8236,6 +8244,7 @@ mod tests {
             TurnTimingProgressKind::WorkspaceMutation,
             TurnTimingProgressKind::ValidationResult,
             TurnTimingProgressKind::FailureObservation,
+            TurnTimingProgressKind::NewSourceEvidence,
         ];
         assert_eq!(
             kinds
@@ -8246,11 +8255,10 @@ mod tests {
                 serde_json::json!("workspace_mutation"),
                 serde_json::json!("validation_result"),
                 serde_json::json!("failure_observation"),
+                serde_json::json!("new_source_evidence"),
             ]
         );
         for historical in [
-            "new_named_evidence",
-            "source_closure",
             "new_input",
             "plan_change",
             "completion_state",
@@ -8262,6 +8270,19 @@ mod tests {
                 TurnTimingProgressKind::WorkspaceMutation,
             );
         }
+        for historical in ["new_named_evidence", "source_closure"] {
+            assert_eq!(
+                serde_json::from_value::<TurnTimingProgressKind>(serde_json::json!(historical)).unwrap(),
+                TurnTimingProgressKind::NewSourceEvidence,
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<TurnTimingProgressKind>(
+                serde_json::json!("new_source_evidence")
+            )
+            .expect("new source evidence progress kind"),
+            TurnTimingProgressKind::NewSourceEvidence,
+        );
     }
 
     #[test]

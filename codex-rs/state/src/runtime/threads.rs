@@ -35,6 +35,29 @@ impl std::error::Error for ThreadSpawnEdgeWriteError {
 }
 
 impl StateRuntime {
+    /// Fetches `(id, title, first_user_message)` for existing requested threads.
+    /// A JSON array keeps this to one query without SQLite's bind-variable limit.
+    pub async fn get_thread_titles(
+        &self,
+        ids: &[ThreadId],
+    ) -> anyhow::Result<Vec<(ThreadId, String, Option<String>)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, title, first_user_message FROM threads \
+             WHERE id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(serde_json::to_string(ids)?)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        rows.into_iter()
+            .map(|(id, title, first_user_message)| {
+                Ok((ThreadId::try_from(id)?, title, first_user_message))
+            })
+            .collect()
+    }
+
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
         let mut connection = self.pool.acquire().await?;
         Self::get_thread_on_connection(&mut connection, id).await
@@ -1580,6 +1603,37 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn batch_thread_titles_preserve_values_and_ignore_missing_ids() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let first = ThreadId::new();
+        let second = ThreadId::new();
+        let unrelated = ThreadId::new();
+        for (id, title, message) in [
+            (first, "  chosen title  ", Some("first message")),
+            (second, "default title", Some("default title")),
+            (unrelated, "unrelated", None),
+        ] {
+            let mut metadata = test_thread_metadata(home.path(), id, home.path().to_path_buf());
+            metadata.title = title.to_string();
+            metadata.first_user_message = message.map(str::to_string);
+            runtime.upsert_thread(&metadata).await?;
+        }
+        assert!(runtime.get_thread_titles(&[]).await?.is_empty());
+        let rows = runtime
+            .get_thread_titles(&[first, second, first, ThreadId::new()])
+            .await?;
+        assert_eq!(rows.len(), 2);
+        for (id, title, message) in rows {
+            let expected = runtime.get_thread(id).await?.expect("requested thread");
+            assert_eq!(title, expected.title);
+            assert_eq!(message, expected.first_user_message);
+            assert!(id == first || id == second);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn builder_timestamps_round_trip_with_millisecond_and_archive_precision() -> Result<()> {

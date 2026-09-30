@@ -13,6 +13,10 @@ use tokio::process::Child;
 #[cfg(unix)]
 pub async fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
     let pid = checked_process_id(pid)?;
+    // Subscribe before checking status so an exit between waitid and recv
+    // cannot be lost. SIGCHLD can coalesce or belong to a different child;
+    // only waitid establishes that this owned child has exited.
+    let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
     loop {
         // SAFETY: zero is a valid initial siginfo_t representation; waitid writes
         // only to this live value. WNOWAIT leaves the owned child unreaped.
@@ -36,7 +40,10 @@ pub async fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
         if unsafe { info.si_pid() } != 0 {
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        exits
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("SIGCHLD stream closed before child exit"))?;
     }
 }
 
@@ -195,6 +202,47 @@ pub fn kill_child_process_group(_child: &mut Child) -> io::Result<()> {
 mod tests {
     use super::checked_process_id;
     use std::io;
+
+    #[tokio::test]
+    async fn exit_notification_retains_child_for_reaping() -> io::Result<()> {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::wait_for_exit_without_reaping(child.id().unwrap()),
+        )
+        .await??;
+        assert_eq!(child.wait().await?.code(), Some(7));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_exited_child_does_not_need_another_signal() -> io::Result<()> {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 9"])
+            .spawn()?;
+        // Observe exit without consuming it, before installing the async waiter.
+        // SAFETY: zero is valid initial storage for waitid's output.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: this live child remains owned and unreaped; info is writable.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(result, 0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::wait_for_exit_without_reaping(child.id()),
+        )
+        .await??;
+        assert_eq!(child.wait()?.code(), Some(9));
+        Ok(())
+    }
 
     #[test]
     fn process_id_conversion_rejects_group_selectors_and_overflow() {

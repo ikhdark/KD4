@@ -1,0 +1,687 @@
+use super::thread_goal_processor::parse_thread_id_for_request;
+use super::*;
+use codex_app_server_protocol::QueuedSubmission;
+use codex_app_server_protocol::ThreadQueueAddParams;
+use codex_app_server_protocol::ThreadQueueAddResponse;
+use codex_app_server_protocol::ThreadQueueChangedNotification;
+use codex_app_server_protocol::ThreadQueueDeleteParams;
+use codex_app_server_protocol::ThreadQueueDeleteResponse;
+use codex_app_server_protocol::ThreadQueueListParams;
+use codex_app_server_protocol::ThreadQueueListResponse;
+use codex_app_server_protocol::ThreadQueueReorderParams;
+use codex_app_server_protocol::ThreadQueueReorderResponse;
+use codex_app_server_protocol::ThreadQueueStartParams;
+use codex_app_server_protocol::ThreadQueueStartResponse;
+use codex_app_server_protocol::ThreadQueueUpdateParams;
+use codex_app_server_protocol::ThreadQueueUpdateResponse;
+use serde::Deserialize;
+use serde::Serialize;
+use std::fs::File;
+use std::fs::TryLockError;
+use std::sync::Mutex as StdMutex;
+
+const MAX_QUEUE_ENTRIES: usize = 100;
+const MAX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Separate from the wire DTO: this payload is versioned and includes admission
+/// recovery state. A pending start keeps the prompt until core accepts it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Queue {
+    version: u32,
+    revision: u64,
+    submissions: Vec<QueuedSubmission>,
+    paused: bool,
+    pending_start: Option<PendingStart>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingStart {
+    submission_id: String,
+    turn_id: String,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            revision: 0,
+            submissions: Vec::new(),
+            paused: false,
+            pending_start: None,
+        }
+    }
+}
+
+impl Queue {
+    fn add(&mut self, params: ThreadQueueAddParams) -> Result<QueuedSubmission, JSONRPCErrorError> {
+        if let Some(client_id) = &params.client_user_message_id
+            && let Some(existing) = self
+                .submissions
+                .iter()
+                .find(|item| item.client_user_message_id.as_ref() == Some(client_id))
+        {
+            if existing.input != params.input {
+                return Err(invalid_params(
+                    "clientUserMessageId already has different queued input",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        if self.submissions.len() >= MAX_QUEUE_ENTRIES {
+            return Err(invalid_params("thread queue is full"));
+        }
+        let submission = QueuedSubmission {
+            id: uuid::Uuid::new_v4().to_string(),
+            client_user_message_id: params.client_user_message_id,
+            input: params.input,
+        };
+        self.submissions.push(submission.clone());
+        Ok(submission)
+    }
+
+    fn reorder(&mut self, ids: &[String]) -> Result<(), JSONRPCErrorError> {
+        let mut seen = HashSet::new();
+        for id in ids {
+            if !seen.insert(id) || !self.submissions.iter().any(|item| &item.id == id) {
+                return Err(invalid_params(
+                    "queuedSubmissionIds contains duplicate or unknown ids",
+                ));
+            }
+        }
+        self.submissions.sort_by_key(|item| {
+            ids.iter()
+                .position(|id| id == &item.id)
+                .unwrap_or(ids.len())
+        });
+        Ok(())
+    }
+
+    fn page(
+        &self,
+        params: &ThreadQueueListParams,
+    ) -> Result<ThreadQueueListResponse, JSONRPCErrorError> {
+        let offset = match params.cursor.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                let (revision, offset) = cursor
+                    .split_once(':')
+                    .ok_or_else(|| invalid_params("invalid queue cursor"))?;
+                let revision = revision
+                    .parse::<u64>()
+                    .map_err(|_| invalid_params("invalid queue cursor"))?;
+                let offset = offset
+                    .parse::<usize>()
+                    .map_err(|_| invalid_params("invalid queue cursor"))?;
+                if revision != self.revision || offset > self.submissions.len() {
+                    return Err(invalid_params("queue changed; restart pagination"));
+                }
+                offset
+            }
+        };
+        let limit = params.limit.unwrap_or(100).clamp(1, 100) as usize;
+        let end = offset.saturating_add(limit).min(self.submissions.len());
+        Ok(ThreadQueueListResponse {
+            data: self.submissions[offset..end].to_vec(),
+            next_cursor: (end < self.submissions.len()).then(|| format!("{}:{end}", self.revision)),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct QueueOrigin {
+    pub(crate) request_id: ConnectionRequestId,
+    pub(crate) client_name: Option<String>,
+    pub(crate) client_version: Option<String>,
+    pub(crate) supports_openai_form_elicitation: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct ThreadQueueRequestProcessor {
+    state_db: Option<StateDbHandle>,
+    codex_home: PathBuf,
+    thread_manager: Arc<ThreadManager>,
+    thread_store: Arc<dyn ThreadStore>,
+    thread_state_manager: ThreadStateManager,
+    outgoing: Arc<OutgoingMessageSender>,
+    turn_processor: TurnRequestProcessor,
+    background_tasks: TaskTracker,
+    // Connection capabilities are never persisted or reused across restarts.
+    origins: Arc<StdMutex<HashMap<ThreadId, QueueOrigin>>>,
+}
+
+impl ThreadQueueRequestProcessor {
+    pub(crate) fn new(
+        state_db: Option<StateDbHandle>,
+        thread_processor: &ThreadRequestProcessor,
+        turn_processor: TurnRequestProcessor,
+    ) -> Self {
+        Self {
+            state_db,
+            codex_home: thread_processor.config.codex_home.to_path_buf(),
+            thread_manager: thread_processor.thread_manager.clone(),
+            thread_store: thread_processor.thread_store.clone(),
+            thread_state_manager: thread_processor.thread_state_manager.clone(),
+            outgoing: thread_processor.outgoing.clone(),
+            turn_processor,
+            background_tasks: thread_processor.background_tasks.clone(),
+            origins: Arc::default(),
+        }
+    }
+
+    fn db(&self) -> Result<&StateDbHandle, JSONRPCErrorError> {
+        self.state_db
+            .as_ref()
+            .ok_or_else(|| internal_error("thread queue requires the state database"))
+    }
+
+    async fn load(&self, id: ThreadId) -> Result<Queue, JSONRPCErrorError> {
+        let db = self.db()?;
+        let metadata = db.get_thread(id).await.map_err(queue_error)?;
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.archived_at.is_some())
+        {
+            return Err(invalid_params("thread is archived"));
+        }
+        if metadata.is_none() {
+            let thread = self
+                .thread_manager
+                .get_thread(id)
+                .await
+                .map_err(|_| invalid_params("thread not found"))?;
+            if thread.rollout_path().is_none() {
+                return Err(invalid_params("ephemeral threads do not support queues"));
+            }
+        }
+        let queue: Queue = match db.read_thread_queue(id).await.map_err(queue_error)? {
+            Some(payload) => serde_json::from_str(&payload).map_err(queue_error)?,
+            None => Queue::default(),
+        };
+        if queue.version != 1 {
+            return Err(internal_error("unsupported persisted thread queue version"));
+        }
+        Ok(queue)
+    }
+
+    async fn save(&self, id: ThreadId, queue: &mut Queue) -> Result<(), JSONRPCErrorError> {
+        // A pause protects the prompts queued when a turn was interrupted; it
+        // must not outlive them and silently disable later automatic follow-ups.
+        if queue.submissions.is_empty() && queue.pending_start.is_none() {
+            queue.paused = false;
+        }
+        queue.revision = queue
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| internal_error("queue revision overflow"))?;
+        let payload = serde_json::to_string(queue).map_err(queue_error)?;
+        if payload.len() > MAX_QUEUE_BYTES {
+            return Err(invalid_params("thread queue exceeds its storage limit"));
+        }
+        let db = self.db()?;
+        if db.get_thread(id).await.map_err(queue_error)?.is_none() {
+            let thread = self
+                .thread_manager
+                .get_thread(id)
+                .await
+                .map_err(queue_error)?;
+            thread.ensure_rollout_materialized().await;
+            thread.flush_rollout().await.map_err(queue_error)?;
+        }
+        db.write_thread_queue(id, &payload)
+            .await
+            .map_err(queue_error)
+    }
+
+    /// File locks span SQLite writes *and* core admission without holding a DB
+    /// transaction while core itself writes state. OS release on exit also lets
+    /// another process safely reconcile an interrupted admission.
+    async fn lock(&self, id: ThreadId) -> Result<File, JSONRPCErrorError> {
+        let directory = self.codex_home.join("thread-queue-locks");
+        let file = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&directory)?;
+            File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(directory.join(format!("{id}.lock")))
+        })
+        .await
+        .map_err(queue_error)?
+        .map_err(queue_error)?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match file.try_lock() {
+                    Ok(()) => return Ok(file),
+                    Err(TryLockError::WouldBlock) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(TryLockError::Error(error)) => return Err(queue_error(error)),
+                }
+            }
+        })
+        .await
+        .map_err(|_| invalid_request("thread queue is busy; retry the request"))?
+    }
+
+    async fn changed(&self, id: ThreadId) {
+        let connections = self
+            .thread_state_manager
+            .subscribed_connection_ids(id)
+            .await;
+        self.outgoing
+            .send_server_notification_to_connections(
+                &connections,
+                ServerNotification::ThreadQueueChanged(ThreadQueueChangedNotification {
+                    thread_id: id.to_string(),
+                }),
+            )
+            .await;
+    }
+
+    async fn recover(&self, id: ThreadId, queue: &mut Queue) -> Result<(), JSONRPCErrorError> {
+        let Some(pending) = &queue.pending_start else {
+            return Ok(());
+        };
+        // No other queue admission can still own this attempt: we hold its OS lock.
+        // Consult both live and persisted history before restoring an unaccepted prompt.
+        let live = self.thread_state_manager.thread_state(id).await;
+        let active = live.lock().await.in_progress_turn_id().map(str::to_owned);
+        let history = self
+            .thread_store
+            .read_thread(codex_thread_store::ReadThreadParams {
+                thread_id: id,
+                include_archived: false,
+                include_history: true,
+            })
+            .await
+            .map_err(queue_error)?;
+        let accepted = active.as_deref() == Some(&pending.turn_id)
+            || history.history.as_ref().is_some_and(|history| history.items.iter().any(|item| {
+                matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(event)) if event.turn_id == pending.turn_id)
+            }));
+        if accepted {
+            queue
+                .submissions
+                .retain(|item| item.id != pending.submission_id);
+        }
+        queue.pending_start = None;
+        // Recovery never silently executes a prompt after a process failure.
+        queue.paused = true;
+        self.save(id, queue).await
+    }
+
+    async fn mutate<R>(
+        &self,
+        id: ThreadId,
+        mutation: impl FnOnce(&mut Queue) -> Result<R, JSONRPCErrorError>,
+    ) -> Result<R, JSONRPCErrorError> {
+        let guard = self.lock(id).await?;
+        let mut queue = self.load(id).await?;
+        self.recover(id, &mut queue).await?;
+        let result = mutation(&mut queue)?;
+        self.save(id, &mut queue).await?;
+        drop(guard);
+        self.changed(id).await;
+        Ok(result)
+    }
+
+    pub(crate) async fn list(
+        &self,
+        params: ThreadQueueListParams,
+    ) -> Result<ThreadQueueListResponse, JSONRPCErrorError> {
+        let id = parse_thread_id_for_request(&params.thread_id)?;
+        let _guard = self.lock(id).await?;
+        let mut queue = self.load(id).await?;
+        self.recover(id, &mut queue).await?;
+        queue.page(&params)
+    }
+
+    pub(crate) async fn add(
+        &self,
+        params: ThreadQueueAddParams,
+        origin: QueueOrigin,
+    ) -> Result<(), JSONRPCErrorError> {
+        TurnRequestProcessor::validate_queue_input(&params.input)?;
+        let id = parse_thread_id_for_request(&params.thread_id)?;
+        let queued_submission = self.mutate(id, |queue| queue.add(params)).await?;
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, origin.clone());
+        // The client must see acceptance before a fast automatic start removes the entry.
+        self.outgoing
+            .send_response(
+                origin.request_id,
+                ThreadQueueAddResponse { queued_submission },
+            )
+            .await;
+        if let Ok(thread) = self.thread_manager.get_thread(id).await
+            && !matches!(thread.agent_status().await, AgentStatus::Running)
+        {
+            self.kick(id);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn update(
+        &self,
+        params: ThreadQueueUpdateParams,
+    ) -> Result<ThreadQueueUpdateResponse, JSONRPCErrorError> {
+        TurnRequestProcessor::validate_queue_input(&params.input)?;
+        let id = parse_thread_id_for_request(&params.thread_id)?;
+        let queued_submission = self
+            .mutate(id, |queue| {
+                let item = queue
+                    .submissions
+                    .iter_mut()
+                    .find(|item| item.id == params.queued_submission_id)
+                    .ok_or_else(|| invalid_params("queued submission not found"))?;
+                item.input = params.input;
+                Ok(item.clone())
+            })
+            .await?;
+        Ok(ThreadQueueUpdateResponse { queued_submission })
+    }
+
+    pub(crate) async fn delete(
+        &self,
+        params: ThreadQueueDeleteParams,
+    ) -> Result<ThreadQueueDeleteResponse, JSONRPCErrorError> {
+        let id = parse_thread_id_for_request(&params.thread_id)?;
+        let deleted = self
+            .mutate(id, |queue| {
+                let before = queue.submissions.len();
+                queue
+                    .submissions
+                    .retain(|item| item.id != params.queued_submission_id);
+                Ok(before != queue.submissions.len())
+            })
+            .await?;
+        Ok(ThreadQueueDeleteResponse { deleted })
+    }
+
+    pub(crate) async fn reorder(
+        &self,
+        params: ThreadQueueReorderParams,
+    ) -> Result<ThreadQueueReorderResponse, JSONRPCErrorError> {
+        let id = parse_thread_id_for_request(&params.thread_id)?;
+        self.mutate(id, |queue| queue.reorder(&params.queued_submission_ids))
+            .await?;
+        Ok(ThreadQueueReorderResponse {})
+    }
+
+    pub(crate) async fn start(
+        &self,
+        params: ThreadQueueStartParams,
+        origin: QueueOrigin,
+    ) -> Result<ThreadQueueStartResponse, JSONRPCErrorError> {
+        let id = parse_thread_id_for_request(&params.thread_id)?;
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, origin.clone());
+        let processor = self.clone();
+        // Own the entire durable claim -> submit -> consume sequence on disconnect.
+        self.background_tasks
+            .spawn(async move {
+                processor
+                    .start_inner(id, Some(&params.queued_submission_id), origin)
+                    .await?
+                    .ok_or_else(|| invalid_params("queued submission not found"))
+            })
+            .await
+            .map_err(queue_error)?
+    }
+
+    async fn start_inner(
+        &self,
+        id: ThreadId,
+        selected: Option<&str>,
+        origin: QueueOrigin,
+    ) -> Result<Option<ThreadQueueStartResponse>, JSONRPCErrorError> {
+        let guard = self.lock(id).await?;
+        let mut queue = self.load(id).await?;
+        self.recover(id, &mut queue).await?;
+        if selected.is_none() && queue.paused {
+            return Ok(None);
+        }
+        let item = match selected {
+            Some(selected) => queue.submissions.iter().find(|item| item.id == selected),
+            None => queue.submissions.first(),
+        };
+        let Some(item) = item.cloned() else {
+            self.origins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            return Ok(None);
+        };
+        let thread = self
+            .thread_manager
+            .get_thread(id)
+            .await
+            .map_err(queue_error)?;
+        let turn_id = thread.reserve_turn_id();
+        queue.pending_start = Some(PendingStart {
+            submission_id: item.id.clone(),
+            turn_id: turn_id.clone(),
+        });
+        self.save(id, &mut queue).await?;
+        let result = self
+            .turn_processor
+            .start_queued_turn(
+                origin.request_id,
+                TurnStartParams {
+                    thread_id: id.to_string(),
+                    client_user_message_id: item.client_user_message_id,
+                    input: item.input,
+                    ..Default::default()
+                },
+                origin.client_name,
+                origin.client_version,
+                origin.supports_openai_form_elicitation,
+                turn_id,
+            )
+            .await;
+        match result {
+            Ok(response) => {
+                queue.submissions.retain(|entry| entry.id != item.id);
+                queue.pending_start = None;
+                queue.paused = false;
+                self.save(id, &mut queue).await?;
+                drop(guard);
+                self.changed(id).await;
+                Ok(Some(ThreadQueueStartResponse {
+                    turn: response.turn,
+                }))
+            }
+            Err(error) => {
+                queue.pending_start = None;
+                self.save(id, &mut queue).await?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) async fn pause(&self, id: ThreadId) {
+        let Some(db) = self.state_db.as_ref() else {
+            return;
+        };
+        if let Ok(thread) = self.thread_manager.get_thread(id).await
+            && thread.rollout_path().is_none()
+        {
+            return;
+        }
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+        // This runs before the listener forwards every interrupted or failed
+        // turn. Without queued prompts there is nothing to protect: skip the
+        // lock file, queue write, and change notification.
+        let has_queued = match db.read_thread_queue(id).await {
+            Ok(Some(payload)) => match serde_json::from_str::<Queue>(&payload) {
+                Ok(queue) => !queue.submissions.is_empty() || queue.pending_start.is_some(),
+                // Let the locked path report an unreadable queue.
+                Err(_) => true,
+            },
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        if !has_queued {
+            return;
+        }
+        if let Err(error) = self
+            .mutate(id, |queue| {
+                queue.paused = true;
+                Ok(())
+            })
+            .await
+        {
+            tracing::warn!(%id, error = %error.message, "failed to pause thread queue");
+        }
+    }
+
+    pub(super) fn kick(&self, id: ThreadId) {
+        let origin = self
+            .origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .cloned();
+        let Some(mut origin) = origin else { return };
+        let processor = self.clone();
+        self.background_tasks.spawn(async move {
+            let Ok(thread) = processor.thread_manager.get_thread(id).await else {
+                return;
+            };
+            let mut status = thread.subscribe_status();
+            // Core emits completion before publishing its final agent status.
+            // Observe that existing watch rather than polling or starting in the listener.
+            let ready = {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    status.wait_for(|state| !matches!(state, AgentStatus::Running)),
+                )
+                .await;
+                matches!(result, Ok(Ok(_)))
+            };
+            if !ready {
+                return;
+            }
+            if matches!(
+                thread.agent_status().await,
+                AgentStatus::Shutdown | AgentStatus::Errored(_) | AgentStatus::Interrupted
+            ) {
+                return;
+            }
+            let connections = processor
+                .thread_state_manager
+                .subscribed_connection_ids(id)
+                .await;
+            if !connections.contains(&origin.request_id.connection_id) {
+                return;
+            }
+            origin.request_id.request_id =
+                RequestId::String(format!("thread-queue-{}", uuid::Uuid::new_v4()));
+            if let Err(error) = processor.start_inner(id, None, origin).await {
+                tracing::warn!(%id, error = %error.message, "queued follow-up was not started");
+            }
+        });
+    }
+}
+
+fn queue_error(error: impl std::fmt::Display) -> JSONRPCErrorError {
+    internal_error(format!("thread queue: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(text: &str) -> Vec<V2UserInput> {
+        vec![V2UserInput::Text {
+            text: text.to_string(),
+            text_elements: vec![],
+        }]
+    }
+
+    fn add(queue: &mut Queue, text: &str) -> QueuedSubmission {
+        queue
+            .add(ThreadQueueAddParams {
+                thread_id: "unused".to_string(),
+                client_user_message_id: Some(text.to_string()),
+                input: input(text),
+            })
+            .expect("queue add")
+    }
+
+    #[test]
+    fn thread_queue_preserves_input_and_deduplicates_client_retries() {
+        let mut queue = Queue::default();
+        let first = add(&mut queue, "first");
+        assert_eq!(add(&mut queue, "first"), first);
+        assert_eq!(queue.submissions.len(), 1);
+        assert!(
+            queue
+                .add(ThreadQueueAddParams {
+                    thread_id: "unused".to_string(),
+                    client_user_message_id: Some("first".to_string()),
+                    input: input("different"),
+                })
+                .is_err()
+        );
+        assert_eq!(queue.submissions, vec![first]);
+    }
+
+    #[test]
+    fn thread_queue_reorder_is_atomic_and_preserves_omitted_items() {
+        let mut queue = Queue::default();
+        let first = add(&mut queue, "first");
+        let second = add(&mut queue, "second");
+        let third = add(&mut queue, "third");
+        queue
+            .reorder(std::slice::from_ref(&third.id))
+            .expect("partial reorder");
+        let expected = vec![third.clone(), first, second];
+        assert_eq!(queue.submissions, expected);
+        assert!(queue.reorder(&[third.id.clone(), third.id]).is_err());
+        assert!(queue.reorder(&["unknown".to_string()]).is_err());
+        assert_eq!(queue.submissions, expected);
+    }
+
+    #[test]
+    fn thread_queue_pagination_rejects_stale_and_invalid_cursors() {
+        let mut queue = Queue::default();
+        let first = add(&mut queue, "first");
+        let second = add(&mut queue, "second");
+        let mut params = ThreadQueueListParams {
+            thread_id: "unused".to_string(),
+            cursor: None,
+            limit: Some(1),
+        };
+        let page = queue.page(&params).expect("first page");
+        assert_eq!(page.data, vec![first]);
+        params.cursor = page.next_cursor;
+        let page = queue.page(&params).expect("last page");
+        assert_eq!(page.data, vec![second]);
+        assert_eq!(page.next_cursor, None);
+        queue.revision += 1;
+        assert!(queue.page(&params).is_err());
+        params.cursor = Some("garbage".to_string());
+        assert!(queue.page(&params).is_err());
+    }
+
+    #[test]
+    fn thread_queue_rejects_empty_and_remote_image_input() {
+        assert!(TurnRequestProcessor::validate_queue_input(&[]).is_err());
+        let input: Vec<V2UserInput> = serde_json::from_value(serde_json::json!([
+            {"type":"image", "url":"https://example.com/image.png"}
+        ]))
+        .expect("image input");
+        assert!(TurnRequestProcessor::validate_queue_input(&input).is_err());
+    }
+}

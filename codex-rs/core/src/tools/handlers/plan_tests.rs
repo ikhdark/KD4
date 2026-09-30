@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 fn plan_update_args(step: &str, status: StepStatus) -> UpdatePlanArgs {
     UpdatePlanArgs {
+        investigation: None,
         explanation: None,
         plan: vec![PlanItemArg {
             step: step.to_string(),
@@ -59,6 +60,7 @@ fn assert_plan_output_schema(response: &serde_json::Value) {
 fn plan_output_signals_governor_state() {
     let output = PlanToolOutput {
         current_plan: UpdatePlanArgs {
+            investigation: None,
             explanation: None,
             plan: Vec::new(),
         },
@@ -105,6 +107,7 @@ async fn plan_mode_rejects_updates_without_side_effects() {
 fn unchanged_plan_output_remains_compact() {
     let output = PlanToolOutput {
         current_plan: UpdatePlanArgs {
+            investigation: None,
             explanation: None,
             plan: Vec::new(),
         },
@@ -161,7 +164,7 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
 
     assert_eq!(
         properties.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["explanation", "plan", "set"]
+        vec!["explanation", "investigation", "plan", "set"]
     );
     assert_eq!(
         item_properties
@@ -180,6 +183,10 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
     );
     let validator = jsonschema::validator_for(&tool["parameters"]).unwrap();
     assert!(validator.is_valid(&serde_json::json!({"plan": []})));
+    assert!(validator.is_valid(&serde_json::json!({
+        "plan": [],
+        "investigation": crate::plan_store::investigation::tests::report(),
+    })));
     assert!(validator.is_valid(&serde_json::json!({"set": [{"index": 0, "status": "completed"}]})));
     for invalid in [
         serde_json::json!({}),
@@ -345,6 +352,7 @@ async fn update_plan_rejects_unknown_arguments_at_runtime() {
 async fn status_deltas_preserve_steps_and_reject_invalid_updates_atomically() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
     let initial = UpdatePlanArgs {
+        investigation: None,
         explanation: Some("retained explanation".to_string()),
         plan: vec![
             PlanItemArg {

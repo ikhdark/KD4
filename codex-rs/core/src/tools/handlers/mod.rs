@@ -41,6 +41,7 @@ mod request_user_input;
 pub(crate) mod request_user_input_spec;
 mod retained_inventory;
 mod shell;
+pub(crate) use shell::validation_diagnostic_range;
 #[cfg(test)]
 pub(crate) use shell::validation_environment_hash;
 pub(crate) mod shell_spec;
@@ -111,6 +112,7 @@ pub use unified_exec::ExecCommandHandler;
 pub(crate) use unified_exec::ExecCommandHandlerOptions;
 pub use unified_exec::WriteStdinHandler;
 pub(crate) use unified_exec::validate_exec_command_arguments;
+pub(crate) use read_file::validate_read_file_arguments;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 
@@ -346,6 +348,40 @@ pub(crate) fn resolve_tool_environment<'a>(
                 })
         },
     )
+}
+
+/// Resolve the same selected environment without forcing a model round trip
+/// while its shared startup future is still running.
+pub(crate) async fn wait_for_tool_environment(
+    environments: &TurnEnvironmentSnapshot,
+    environment_id: Option<&str>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Option<TurnEnvironment>, FunctionCallError> {
+    let ready = match environment_id {
+        Some(id) => environments.turn_environments.iter()
+            .find(|environment| environment.environment_id == id),
+        None => environments.primary(),
+    };
+    if let Some(ready) = ready {
+        return Ok(Some(ready.clone()));
+    }
+    let starting = match environment_id {
+        Some(id) => environments.starting.iter()
+            .find(|environment| environment.selection.environment_id == id),
+        None => environments.starting.first(),
+    };
+    let Some(starting) = starting else {
+        return resolve_tool_environment(environments, environment_id)
+            .map(|environment| environment.cloned());
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(FunctionCallError::RespondToModel(
+            "Cancelled while waiting for execution environment startup; no operation was started.".into())),
+        result = starting.wait_until_ready() => result.map(Some).map_err(|error|
+            FunctionCallError::RespondToModel(format!(
+                "environment `{}` failed to start: {error}", starting.selection.environment_id))),
+    }
 }
 
 /// Whether a fresh inline sandbox override may reach its approval flow.

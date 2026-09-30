@@ -540,9 +540,40 @@ impl TurnRequestProcessor {
             app_server_client_name,
             app_server_client_version,
             /*supports_openai_form_elicitation*/ supports_openai_form_elicitation,
+            None,
         )
         .await
         .map(|response| Some(response.into()))
+    }
+
+    pub(super) fn validate_queue_input(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
+        if input.is_empty() {
+            return Err(invalid_params("queued input must not be empty"));
+        }
+        validate_user_input_image_urls(input)?;
+        Self::validate_v2_input_limit(input)
+    }
+
+    pub(super) async fn start_queued_turn(
+        &self,
+        request_id: ConnectionRequestId,
+        params: TurnStartParams,
+        client_name: Option<String>,
+        client_version: Option<String>,
+        supports_openai_form_elicitation: bool,
+        turn_id: String,
+    ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        Self::validate_queue_input(&params.input)?;
+        self.turn_start_inner(
+            request_id,
+            params,
+            IndexMap::new(),
+            client_name,
+            client_version,
+            supports_openai_form_elicitation,
+            Some(turn_id),
+        )
+        .await
     }
 
     pub(crate) async fn turn_steer(
@@ -799,6 +830,7 @@ impl TurnRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
+        reserved_turn_id: Option<String>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) = self.load_thread(&params.thread_id).await.inspect_err(|_| {
             self.track_error_response(&request_id, /*error_type*/ None);
@@ -872,7 +904,7 @@ impl TurnRequestProcessor {
             additional_context,
             thread_settings,
         };
-        let turn_id = thread.reserve_turn_id();
+        let turn_id = reserved_turn_id.unwrap_or_else(|| thread.reserve_turn_id());
 
         // The RPC handler is cancelled on disconnect. Own admission through core
         // submission together so a dropped caller cannot strand a claimed turn.

@@ -1566,7 +1566,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 28);
+    assert_eq!(timing.schema_version, 29);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -1788,7 +1788,21 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
         reasoning_output_tokens: 4,
         total_tokens: 110,
     }));
-    state.record_generation_outcome(Vec::new(), false, true);
+    state.record_generation_outcome(Vec::new(), Some("same-action".to_string()), true);
+    assert!(
+        state.state().model_requests[0].next_structured_action_changed,
+        "no next action has been observed yet"
+    );
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation_with_metadata(
+        &mut pending,
+        &SessionSource::Cli,
+        Some(TurnTimingGenerationPurpose::Wait),
+        TurnTimingGenerationDisposition::DecisionBearing,
+        Some("trusted-state".to_string()),
+    );
+    drop(state.begin_model_request_wait());
+    state.record_generation_outcome(Vec::new(), Some("same-action".to_string()), true);
     let timing = state.complete_snapshot().protocol_timing();
     let usage = timing.model_requests[0]
         .token_usage
@@ -1809,13 +1823,13 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
     assert_eq!(timing.counters.generations_by_disposition.deterministic, 1);
     assert_eq!(
         timing.counters.generations_by_disposition.decision_bearing,
-        0
+        1
     );
     assert_eq!(timing.counters.generations_by_disposition.unknown, 0);
 
     assert_eq!(
         timing.observational_nonprogress_tokens.logical_generations,
-        1
+        2
     );
     assert_eq!(timing.observational_nonprogress_tokens.input_tokens, 100);
     assert_eq!(
@@ -1832,11 +1846,11 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
     assert_eq!(timing.observational_nonprogress_tokens.total_tokens, 110);
     assert_eq!(
         timing.observational_nonprogress_latency.logical_generations,
-        1
+        2
     );
     assert_eq!(
         timing.observational_nonprogress_latency.physical_attempts,
-        2
+        3
     );
     assert_eq!(
         timing
@@ -1853,6 +1867,60 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
     assert_eq!(
         timing.observational_nonprogress_latency.decision_latency_ns,
         15 * NS_PER_MS as u64
+    );
+}
+
+#[test]
+fn progress_telemetry_compares_completed_actions_across_purposes_and_retries() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    for (index, (purpose, action)) in [
+        (TurnTimingGenerationPurpose::Wait, Some("first-action")),
+        (TurnTimingGenerationPurpose::Wait, Some("second-action")),
+        (
+            TurnTimingGenerationPurpose::InitialReasoning,
+            Some("second-action"),
+        ),
+        (TurnTimingGenerationPurpose::Wait, None),
+        (TurnTimingGenerationPurpose::Wait, Some("second-action")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut pending = (index > 0).then_some(ContinuationCause::ToolResult);
+        state.begin_model_generation_with_metadata(
+            &mut pending,
+            &SessionSource::Cli,
+            Some(purpose),
+            TurnTimingGenerationDisposition::DecisionBearing,
+            None,
+        );
+        drop(state.begin_model_request_wait());
+        if index == 2 {
+            state.record_model_retry();
+            drop(state.begin_model_request_wait());
+        }
+        state.record_generation_outcome(Vec::new(), action.map(str::to_string), true);
+    }
+    let timing = state.complete_snapshot().protocol_timing();
+    let primary = timing
+        .model_requests
+        .iter()
+        .filter(|request| request.attempt_kind == TurnTimingAttemptKind::Primary)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary
+            .iter()
+            .map(|request| request.next_structured_action_changed)
+            .collect::<Vec<_>>(),
+        vec![true, false, true, true, true]
+    );
+    assert_eq!(timing.model_requests.len(), 6);
+    // Different command arguments do not establish progress when the relevant
+    // state and evidence are unchanged. All five logical generations count.
+    assert_eq!(
+        timing.observational_nonprogress_tokens.logical_generations,
+        5
     );
 }
 
@@ -2028,7 +2096,7 @@ fn validation_failure_diagnosis_repair_and_rereview_remain_decision_bearing() {
             } else {
                 TurnTimingProgressKind::ValidationResult
             }],
-            true,
+            Some(format!("action-{index}")),
             false,
         );
     }
@@ -2297,7 +2365,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 28);
+    assert_eq!(profile.schema_version, 29);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -2883,7 +2951,7 @@ fn timing_histories_evict_oldest_entries_at_their_caps() {
     }
     state.record_generation_outcome(
         vec![TurnTimingProgressKind::WorkspaceMutation; MAX_MODEL_REQUEST_PROGRESS_KINDS + 1],
-        false,
+        Some("latest-action".to_string()),
         false,
     );
 
@@ -3142,4 +3210,15 @@ fn overlapping_legacy_guards_do_not_invalidate_modern_model_tool_overlap() {
     assert!(profile.profile_valid);
     assert_eq!(profile.counters.invalid_transition_count, 0);
     assert_eq!(profile.exclusive.model_tool_overlap_ns, 10 * NS_PER_MS);
+}
+#[test]
+fn in_cell_recovery_does_not_attribute_a_model_generation() {
+    let (_clock, state) = timing();
+    state.record_tool_output_recovery_source(0, true);
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.tool_output_recovery_call_count, 1);
+    assert_eq!(counters.tool_output_in_cell_recovery_call_count, 1);
+    assert_eq!(counters.attributable_recovery_generation_count, 0);
 }

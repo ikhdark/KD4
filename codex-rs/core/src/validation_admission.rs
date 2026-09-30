@@ -544,21 +544,14 @@ pub(crate) fn prefers_long_observation_wait(invocation: &CommandInvocation) -> b
     ) {
         return true;
     }
-    let words;
-    let (program, args) = match invocation {
-        CommandInvocation::Argv { program, args } => (program.as_str(), args.as_slice()),
-        CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => {
-            words = match shlex::split(script) {
-                Some(words) => words,
-                None => return false,
-            };
-            let Some((program, args)) = words.split_first() else {
-                return false;
-            };
-            (program.as_str(), args)
+    match invocation {
+        CommandInvocation::Argv { program, args } => {
+            codex_shell_command::validation::is_build_or_discovery(program, args)
         }
-    };
-    codex_shell_command::validation::is_build_or_discovery(program, args)
+        CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => {
+            codex_shell_command::validation::script_has_build_or_discovery(script)
+        }
+    }
 }
 
 #[cfg(test)]

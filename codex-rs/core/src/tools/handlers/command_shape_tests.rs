@@ -524,15 +524,14 @@ fn failure_advisory_only_mentions_powershell_parser_failures() {
 
 #[test]
 fn failure_advisory_respects_the_active_powershell_script_mode() {
-    assert_eq!(
-        powershell_script_failure_advisory(
+    let syntax_advisory = powershell_script_failure_advisory(
             Some(ShellType::PowerShell),
             Some(1),
             true,
             "ParserError: Unexpected token 'foo'",
-        ),
-        None
-    );
+        ).expect("invalid source needs a syntax hint even in encoded mode");
+    assert!(syntax_advisory.contains("correct the PowerShell script syntax"));
+    assert!(!syntax_advisory.contains("retry with"));
 
     let advisory = powershell_script_failure_advisory(
         Some(ShellType::PowerShell),

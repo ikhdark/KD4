@@ -163,11 +163,15 @@ pub(super) fn shell_sampling_signal(
     shell_failure_sampling_signal(attempt_key, command, exit_code).or_else(|| {
         (exit_code == Some(0) || attempt_key.is_some_and(|key| key.is_search_no_match(exit_code)))
             .then(|| {
-                crate::tools::context::semantic_evidence_sampling_signal(serde_json::json!(
-                    crate::tools::context::semantic_evidence_for_command_output(
+                let mut signal = crate::tools::context::semantic_evidence_sampling_signal(serde_json::json!(
+                    crate::tools::context::successful_command_evidence(
                         canonical_output.unwrap_or_default(),
+                        Some(command),
                     )
-                ))
+                ));
+                signal["command_evidence"] = json!(true);
+                signal["empty_output"] = json!(canonical_output.unwrap_or_default().is_empty());
+                signal
             })
     })
 }
@@ -396,7 +400,7 @@ pub(super) async fn run_exec_like(
     })
 }
 
-fn validation_diagnostic_range(
+pub(crate) fn validation_diagnostic_range(
     id: &str,
     canonical_output: &[u8],
 ) -> Option<ToolOutputProjectionRange> {
@@ -1082,6 +1086,12 @@ async fn run_exec_like_with_exit_code_inner(
     } else {
         None
     };
+    let reduction_notice = raw_output_artifact.as_ref()
+        .zip(execution_output)
+        .zip(model_projection.as_ref())
+        .and_then(|((artifact, source), projection)| {
+            artifact.reduction_notice(&source.aggregated_output.text, &projection.text)
+        });
     let canonical_output = canonical_exec_output_bytes(&out);
     let output_bearing_result = shell_result_has_execution_output(&out);
     let tool_outcome = if out.is_ok()
@@ -1113,14 +1123,16 @@ async fn run_exec_like_with_exit_code_inner(
         content.push_str("\n\n");
         content.push_str(&repair_notice);
     }
+    let mut essential_inline = serde_json::Map::new();
     if let Some(raw_output_artifact) = raw_output_artifact {
+        if let Some(id) = raw_output_artifact.model_projection().0 {
+            essential_inline.insert("raw_output_artifact_id".to_string(), json!(id.to_string()));
+        }
         insert_metadata_before_output(
             &mut content,
             &raw_output_artifact.render_for_model_with_source_truncation(source_capture_truncated),
         );
-        if model_projection.is_some_and(|projection| projection.reduced)
-            && let Some(notice) = raw_output_artifact.reduction_notice().await
-        {
+        if let Some(notice) = reduction_notice {
             content.push('\n');
             content.push_str(&notice);
         }
@@ -1135,7 +1147,7 @@ async fn run_exec_like_with_exit_code_inner(
         Some(_) | None => ValidationExecutionOutcome::ExecutedFailure,
     };
     let output = FunctionToolOutput {
-        essential_inline: Default::default(),
+        essential_inline,
         body: vec![
             codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
         ],

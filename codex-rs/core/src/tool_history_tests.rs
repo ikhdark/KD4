@@ -4070,6 +4070,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
         untracked_consumption: BTreeMap::new(),
         exposed_representations: BTreeMap::new(),
         recovered_call_ids: BTreeSet::new(),
+        recovered_ranges: BTreeMap::new(),
         workspace_evidence: BTreeMap::new(),
         non_workspace_code_mode_calls: BTreeSet::new(),
         code_mode_nested_evidence: BTreeMap::new(),
@@ -4092,6 +4093,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
         serde_json::from_value(serialized).expect("legacy fields should be ignored");
     assert!(restored.candidates.contains_key("call-1"));
     assert!(restored.untracked_consumption.is_empty());
+    assert!(restored.recovered_ranges.is_empty());
 }
 
 #[tokio::test]
@@ -5921,4 +5923,33 @@ async fn generation_bench_18() {
             "baseline_tokens":tokens(&baseline),"prototype_tokens":tokens(&prototype),"baseline_exchange":baseline,"prototype_exchange":prototype,
             "limits":"Projection prototype only; canonical exchange is unchanged. Sampling cache behavior is not measured."}));
     }
+}
+#[test]
+fn recovery_priority_and_exact_selectors_survive_compaction_metadata() {
+    let mut state = ToolHistoryState::default();
+    let record = candidate("origin", bounded_output());
+    let artifact_id = record.artifact_id.clone();
+    state.register(record);
+    let selector = serde_json::json!({"kind": "bytes", "start": 100, "end": 200});
+    let mutation = ToolHistoryMutation::RecordArtifactRecovery {
+        artifact_id: artifact_id.clone(), recovery_call_id: "recovery".into(),
+        selectors: vec![selector.clone()],
+    };
+    assert!(mutation.apply(&mut state));
+    assert!(!mutation.apply(&mut state));
+    let mut restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    restored.rebuild_artifact_index();
+    assert!(restored.reuse_priority("recovery", 2) < restored.reuse_priority("cold", 2));
+    let output = text_output("recovery", serde_json::json!({
+        "artifact_id": artifact_id,
+        "results": [{"selector": selector, "status": "ok", "text": "exact"}],
+    }).to_string());
+    let (receipt, _) = restored.tool_result_budget_receipt(&output, "recovery").unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(receipt["recovery"]["artifact_id"], artifact_id);
+    assert_eq!(receipt["recovery"]["selectors"], serde_json::json!([selector]));
+    let pin: serde_json::Value = serde_json::from_str(&restored.artifact_pin_payload_for_items(&[
+        function_call("origin"), text_output("origin", bounded_output())
+    ]).unwrap()).unwrap();
+    assert_eq!(pin["artifacts"][0]["recovered_selectors"], serde_json::json!([selector]));
 }

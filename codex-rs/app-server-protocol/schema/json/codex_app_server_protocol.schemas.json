@@ -649,6 +649,150 @@
             },
             "method": {
               "enum": [
+                "thread/queue/list"
+              ],
+              "title": "Thread/queue/listRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadQueueListParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/queue/listRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/queue/add"
+              ],
+              "title": "Thread/queue/addRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadQueueAddParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/queue/addRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/queue/update"
+              ],
+              "title": "Thread/queue/updateRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadQueueUpdateParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/queue/updateRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/queue/delete"
+              ],
+              "title": "Thread/queue/deleteRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadQueueDeleteParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/queue/deleteRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/queue/reorder"
+              ],
+              "title": "Thread/queue/reorderRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadQueueReorderParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/queue/reorderRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/queue/start"
+              ],
+              "title": "Thread/queue/startRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadQueueStartParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/queue/startRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/list"
               ],
               "title": "Thread/listRequestMethod",
@@ -4512,6 +4656,26 @@
             "params"
           ],
           "title": "Thread/status/changedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/queue/changed"
+              ],
+              "title": "Thread/queue/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadQueueChangedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/queue/changedNotification",
           "type": "object"
         },
         {
@@ -15092,6 +15256,31 @@
         ],
         "type": "object"
       },
+      "QueuedSubmission": {
+        "description": "A durable follow-up, in queue order. Starting it uses the current thread settings.",
+        "properties": {
+          "clientUserMessageId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "input": {
+            "items": {
+              "$ref": "#/definitions/v2/UserInput"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "input"
+        ],
+        "type": "object"
+      },
       "RateLimitReachedType": {
         "enum": [
           "rate_limit_reached",
@@ -19155,6 +19344,230 @@
         "title": "ThreadProjectUpdatedNotification",
         "type": "object"
       },
+      "ThreadQueueAddParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "clientUserMessageId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input": {
+            "items": {
+              "$ref": "#/definitions/v2/UserInput"
+            },
+            "type": "array"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "input",
+          "threadId"
+        ],
+        "title": "ThreadQueueAddParams",
+        "type": "object"
+      },
+      "ThreadQueueAddResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "queuedSubmission": {
+            "$ref": "#/definitions/v2/QueuedSubmission"
+          }
+        },
+        "required": [
+          "queuedSubmission"
+        ],
+        "title": "ThreadQueueAddResponse",
+        "type": "object"
+      },
+      "ThreadQueueChangedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadQueueChangedNotification",
+        "type": "object"
+      },
+      "ThreadQueueDeleteParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "queuedSubmissionId": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "queuedSubmissionId",
+          "threadId"
+        ],
+        "title": "ThreadQueueDeleteParams",
+        "type": "object"
+      },
+      "ThreadQueueDeleteResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "title": "ThreadQueueDeleteResponse",
+        "type": "object"
+      },
+      "ThreadQueueListParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadQueueListParams",
+        "type": "object"
+      },
+      "ThreadQueueListResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/definitions/v2/QueuedSubmission"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ThreadQueueListResponse",
+        "type": "object"
+      },
+      "ThreadQueueReorderParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "queuedSubmissionIds": {
+            "description": "Listed entries move to the front; omitted entries retain their relative order.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "queuedSubmissionIds",
+          "threadId"
+        ],
+        "title": "ThreadQueueReorderParams",
+        "type": "object"
+      },
+      "ThreadQueueReorderResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "ThreadQueueReorderResponse",
+        "type": "object"
+      },
+      "ThreadQueueStartParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "queuedSubmissionId": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "queuedSubmissionId",
+          "threadId"
+        ],
+        "title": "ThreadQueueStartParams",
+        "type": "object"
+      },
+      "ThreadQueueStartResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "turn": {
+            "$ref": "#/definitions/v2/Turn"
+          }
+        },
+        "required": [
+          "turn"
+        ],
+        "title": "ThreadQueueStartResponse",
+        "type": "object"
+      },
+      "ThreadQueueUpdateParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "input": {
+            "items": {
+              "$ref": "#/definitions/v2/UserInput"
+            },
+            "type": "array"
+          },
+          "queuedSubmissionId": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "input",
+          "queuedSubmissionId",
+          "threadId"
+        ],
+        "title": "ThreadQueueUpdateParams",
+        "type": "object"
+      },
+      "ThreadQueueUpdateResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "queuedSubmission": {
+            "$ref": "#/definitions/v2/QueuedSubmission"
+          }
+        },
+        "required": [
+          "queuedSubmission"
+        ],
+        "title": "ThreadQueueUpdateResponse",
+        "type": "object"
+      },
       "ThreadReadParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -21003,7 +21416,7 @@
           },
           "attributableRecoveryGenerationCount": {
             "default": 0,
-            "description": "Tool-result generations immediately following an observed `read_tool_output` recovery transaction. This is independent of whether the recovered projection was truncated again.",
+            "description": "Tool-result generations immediately following an observed direct `read_tool_output` recovery transaction. In-cell reads are counted separately. This is independent of whether the recovered projection was truncated again.",
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
@@ -21289,6 +21702,13 @@
           "toolOutputCanonicalTokenCount": {
             "default": 0,
             "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOutputInCellRecoveryCallCount": {
+            "default": 0,
+            "description": "Recovery transactions performed inside code-mode cells, without a separate provider tool-result generation.",
+            "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
           },
@@ -22197,6 +22617,7 @@
           },
           "nextStructuredActionChanged": {
             "default": false,
+            "description": "False only after the next completed continuation is observed choosing the same complete ordered tool actions (names and arguments). True also covers an unknown or unobserved next action; this is not a completion test.",
             "type": "boolean"
           },
           "outputTokens": {
@@ -22378,7 +22799,8 @@
         "enum": [
           "workspace_mutation",
           "validation_result",
-          "failure_observation"
+          "failure_observation",
+          "new_source_evidence"
         ],
         "type": "string"
       },

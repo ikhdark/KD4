@@ -5421,6 +5421,12 @@ impl Session {
         let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
+        if let Err(error) = crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+            self.codex_home().await.as_path(), &self.thread_id.to_string(),
+            &artifact_id, bytes, &sha256,
+        ).await {
+            tracing::warn!(%error, %artifact_id, "failed to protect artifact provenance");
+        }
         let mutation = crate::tool_history::ToolHistoryMutation::RegisterArtifactOrigin {
             artifact_id,
             call_id,
@@ -5435,6 +5441,13 @@ impl Session {
         if let Err(err) = writer.enqueue_mutation(mutation, "internal artifact provenance") {
             tracing::warn!("failed to enqueue internal artifact provenance: {err}");
         }
+    }
+
+    pub(crate) async fn reusable_tool_artifact(&self, bytes: u64, sha256: &str) -> Option<String> {
+        self.state.lock().await.tool_history_state().artifact_references()
+            .into_iter().find_map(|(id, (size, digest))| {
+                (size == bytes && digest == sha256).then_some(id)
+            })
     }
 
     pub(crate) async fn register_tool_history_candidate(
@@ -5458,11 +5471,11 @@ impl Session {
         }
     }
 
-    pub(crate) async fn mark_tool_history_artifact_recovered(&self, artifact_id: String) {
+    pub(crate) async fn record_tool_history_recovery(&self, artifact_id: String, recovery_call_id: String, selectors: Vec<serde_json::Value>) {
         let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
-        let mutation = crate::tool_history::ToolHistoryMutation::MarkArtifactRecovered { artifact_id };
+        let mutation = crate::tool_history::ToolHistoryMutation::RecordArtifactRecovery { artifact_id, recovery_call_id, selectors };
         let mut writer = self.tool_history_persistence.writer().await;
         let mut state = self.state.lock().await;
         if !state.apply_tool_history_mutation(&mutation) {
@@ -5998,6 +6011,35 @@ impl Session {
             .await;
         self.send_token_count_event(turn_context).await;
         result
+    }
+
+    /// Count an isolated side request toward total usage and the source's task
+    /// budget without replacing last-request usage, which describes this
+    /// conversation's context window and drives compaction.
+    pub(crate) async fn record_side_request_token_usage(
+        &self,
+        turn_context: &TurnContext,
+        token_usage: Option<&TokenUsage>,
+    ) {
+        let Some(token_usage) = token_usage else {
+            return;
+        };
+        {
+            let mut state = self.state.lock().await;
+            if let Some(mut info) = state.token_info() {
+                info.total_token_usage.add_assign(token_usage);
+                state.set_token_info(Some(info));
+            }
+        }
+        self.services
+            .agent_control
+            .task_coordinator()
+            .record_task_usage_for_source(
+                &turn_context.session_source,
+                token_usage.total_tokens.max(0) as u64,
+                1,
+            );
+        self.send_token_count_event(turn_context).await;
     }
 
     pub(crate) async fn record_token_usage_info(

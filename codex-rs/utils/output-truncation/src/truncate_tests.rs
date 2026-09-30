@@ -451,7 +451,7 @@ fn byte_count_conversion_clamps_non_positive_values() {
 fn optimization_priority_coherent_packet_defaults_precede_trimming() {
     assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
     assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
-    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 8_000);
+    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
     assert_eq!(
         resolve_output_limits(None, OutputOutcome::Success, Some("echo ok"), "ok", 20_000),
         OutputLimitResolution {
@@ -627,7 +627,7 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
     );
     // Outcome no longer changes the budget: successful discovery output is the
     // evidence a turn is built on, so it gets the same room as a failure. The
-    // diagnostic class uses the nested-command ceiling.
+    // nested consumer supplies its own hard ceiling independently.
     for outcome in [
         OutputOutcome::Success,
         OutputOutcome::Failure,
@@ -646,7 +646,8 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
         .applied_limit;
         assert_eq!(normal, DEFAULT_SUCCESS_OUTPUT_TOKENS, "{outcome:?}");
         assert_eq!(high_signal, DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, "{outcome:?}");
-        assert!(high_signal <= 8_000, "diagnostics must fit the nested command ceiling");
+        assert_eq!(high_signal, normal, "diagnostics must not lose direct-call capacity");
+        assert_eq!(resolve_projected_output_limits(None, outcome, OutputDiagnosticClass::HighSignal, 8_000).applied_limit, 8_000);
     }
     assert_eq!(
         resolve_projected_output_limits(
@@ -800,7 +801,7 @@ fn diagnostic_output_receives_budget_without_command_metadata() {
         "project.csproj: error MSB1009: Project file does not exist.",
     ] {
         let limits = resolve_output_limits(None, OutputOutcome::Success, None, diagnostic, 20_000);
-        assert_eq!(limits.applied_limit, 8_000, "{diagnostic}");
+        assert_eq!(limits.applied_limit, 10_000, "{diagnostic}");
     }
 }
 
@@ -1072,4 +1073,21 @@ fn actual_diagnostics_after_rust_paths_keep_diagnostic_projection() {
         OutputDiagnosticClass::HighSignal,
         "an actual validation command keeps its diagnostic budget"
     );
+}
+#[test]
+fn projection_line_markers_cover_exact_crlf_gaps() {
+    let source = (1..=3000).map(|line| format!("source line {line:04}\r\n")).collect::<String>();
+    let output = crate::truncate_text_with_line_markers(&source, 1000);
+    assert!(crate::approx_token_count(&output) <= 1000);
+    assert_eq!(output.matches("[omitted lines ").count(), 2);
+    for marker in output.lines().filter_map(|line| line.strip_prefix("[omitted lines ")) {
+        let (span, total) = marker.trim_end_matches(']').split_once(" of ").unwrap();
+        assert_eq!(total, "3000");
+        let (start, end) = span.split_once('-').unwrap();
+        for line in start.parse::<usize>().unwrap()..=end.parse::<usize>().unwrap() {
+            assert!(!output.contains(&format!("source line {line:04}")));
+        }
+    }
+    let (start, end) = crate::first_omitted_line_range(&source, &output).unwrap();
+    assert!(start > 1 && end >= start);
 }

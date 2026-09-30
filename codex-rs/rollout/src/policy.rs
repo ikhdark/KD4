@@ -259,6 +259,7 @@ mod tests {
     #[test]
     fn committed_checklist_updates_are_durable_in_both_history_modes() {
         let event = EventMsg::PlanUpdate(codex_protocol::plan_tool::UpdatePlanArgs {
+            investigation: None,
             explanation: None,
             plan: Vec::new(),
         });

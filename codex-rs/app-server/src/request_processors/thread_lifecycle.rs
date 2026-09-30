@@ -329,6 +329,7 @@ fn listener_generation_is_newer(candidate: u64, current: u64) -> bool {
 
 #[derive(Clone)]
 pub(super) struct ListenerTaskContext {
+    pub(super) thread_queue_processor: Option<ThreadQueueRequestProcessor>,
     pub(super) thread_manager: Arc<ThreadManager>,
     pub(super) thread_state_manager: ThreadStateManager,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
@@ -836,6 +837,14 @@ async fn process_thread_listener_event(
     thread_state: &Arc<Mutex<ThreadState>>,
     event: codex_protocol::protocol::Event,
 ) {
+    let queue_completed = matches!(&event.msg, EventMsg::TurnComplete(_));
+    let queue_paused = matches!(&event.msg, EventMsg::TurnAborted(_))
+        || matches!(&event.msg, EventMsg::TurnComplete(completed)
+            if completed.error.is_some())
+        || queue_completed && thread_state.lock().await.turn_summary.last_error.is_some();
+    if queue_paused && let Some(queue) = &context.thread_queue_processor {
+        queue.pause(conversation_id).await;
+    }
     let (active_turn_id, raw_events_enabled, reconciled_wait_items) = {
         let mut state = thread_state.lock().await;
         let reconciled_wait_items =
@@ -891,6 +900,12 @@ async fn process_thread_listener_event(
         context.fallback_model_provider.clone(),
     )
     .await;
+    if queue_completed
+        && !queue_paused
+        && let Some(queue) = &context.thread_queue_processor
+    {
+        queue.kick(conversation_id);
+    }
 }
 
 async fn wait_for_thread_shutdown_with_timeout(
@@ -1674,6 +1689,7 @@ mod tests {
             let mut fixture = LateShutdownFixture::new().await;
             let config = fixture.thread.config().await;
             let context = ListenerTaskContext {
+                thread_queue_processor: None,
                 thread_manager: Arc::clone(&fixture.thread_manager),
                 thread_state_manager: fixture.thread_state_manager.clone(),
                 outgoing: Arc::clone(&fixture.outgoing),
@@ -1984,6 +2000,7 @@ mod tests {
             Arc::clone(&fixture.outgoing),
         );
         let context = ListenerTaskContext {
+            thread_queue_processor: None,
             thread_manager: Arc::clone(&fixture.thread_manager),
             thread_state_manager: fixture.thread_state_manager.clone(),
             outgoing: Arc::clone(&fixture.outgoing),
@@ -2153,6 +2170,7 @@ mod tests {
             Arc::clone(&fixture.outgoing),
         );
         let context = ListenerTaskContext {
+            thread_queue_processor: None,
             thread_manager: Arc::clone(&fixture.thread_manager),
             thread_state_manager: fixture.thread_state_manager.clone(),
             outgoing: Arc::clone(&fixture.outgoing),
@@ -2326,6 +2344,7 @@ mod tests {
             Arc::clone(&fixture.outgoing),
         );
         let context = ListenerTaskContext {
+            thread_queue_processor: None,
             thread_manager: Arc::clone(&fixture.thread_manager),
             thread_state_manager: fixture.thread_state_manager.clone(),
             outgoing: Arc::clone(&fixture.outgoing),
@@ -2401,6 +2420,7 @@ mod tests {
         let mut fixture = LateShutdownFixture::new().await;
         let config = fixture.thread.config().await;
         let context = ListenerTaskContext {
+            thread_queue_processor: None,
             thread_manager: Arc::clone(&fixture.thread_manager),
             thread_state_manager: fixture.thread_state_manager.clone(),
             outgoing: Arc::clone(&fixture.outgoing),

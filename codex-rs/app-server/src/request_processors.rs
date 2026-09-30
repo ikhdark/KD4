@@ -497,6 +497,7 @@ mod projects;
 mod remote_control_processor;
 mod search;
 mod thread_processor;
+mod thread_queue;
 mod token_usage_replay;
 mod turn_processor;
 mod windows_sandbox_processor;
@@ -522,6 +523,8 @@ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
 pub(crate) use search::SearchRequestProcessor;
 pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
 pub(crate) use thread_processor::ThreadRequestProcessor;
+pub(crate) use thread_queue::QueueOrigin;
+pub(crate) use thread_queue::ThreadQueueRequestProcessor;
 pub(crate) use turn_processor::TurnRequestProcessor;
 pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
 

@@ -204,7 +204,6 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -336,11 +335,10 @@ async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
                 "cargo test".to_string()
             }),
             raw_output_artifact: None,
-            raw_output_reduction_notice: None,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
         };
-        if exit_code == 1 {
+        if exit_code == 1 && line_count == 300 {
             assert!(
                 !output
                     .projection_metadata()
@@ -369,7 +367,8 @@ async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
                 .as_ref()
                 .expect("oversized result projection");
             assert!(projection.projection_truncated);
-            assert!(!result.deterministic_continuation_receipts().is_empty());
+            assert!(result.deterministic_continuation_receipts().is_empty());
+            assert!(projection.bounded.rendered().contains("error: exact evidence"));
             let candidate = projection
                 .candidate
                 .as_ref()
@@ -682,6 +681,16 @@ fn exec_command_code_mode_preflight_preserves_prescriptive_boundary_errors() {
     assert!(error.contains("argument preflight failed"), "{error}");
     assert!(error.contains("`argv` branch"), "{error}");
     assert!(error.contains("$.cmd"), "{error}");
+
+    let compatible = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "cmd": "echo ok", "timeout_ms": 50, "old_option": true, "yield_time_ms": 1,
+        }).to_string(),
+    };
+    let parsed = ParsedFunctionArguments::from_payload(&compatible);
+    CodeModeArgumentPreflight::default()
+        .validate(&name, &spec, &compatible, parsed.as_ref())
+        .expect("the handler owns ignored fields and adjusted bounds in code mode too");
 }
 
 #[tokio::test]
@@ -970,6 +979,7 @@ async fn projection_source_dependency_decision_records_reuse_and_fallback() {
     let output = "bounded output".to_string();
     let canonical = CanonicalToolResult::text(output.clone());
     let projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: output.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
@@ -1222,6 +1232,7 @@ async fn structured_projection_artifact_recovers_original_bytes() {
     let original_output_tokens = canonical.approximate_tokens;
 
     let projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: full_output.clone(),
         outcome: ToolOutputOutcome::Failure,
         essential_inline: serde_json::json!({"coverage_status": "partial"}),
@@ -1295,6 +1306,7 @@ async fn canonical_projection_reuses_existing_artifact_id() {
     let artifact_id = artifact.artifact_id().expect("existing artifact ID");
 
     let projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: full_output.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({
@@ -1502,6 +1514,7 @@ async fn projection_owner_recovery_drains_exact_json_pointer_in_original_return(
     });
     let canonical = CanonicalToolResult::json(value.clone());
     let projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: value.to_string(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({"summary": "bounded"}),
@@ -1592,6 +1605,7 @@ async fn one_predetermined_range_is_recovered_in_the_original_return() {
         recovery_chunk_bytes: None,
     }];
     let projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: full_output.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
@@ -1703,6 +1717,7 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
     let original_output_sha256 = canonical.sha256.clone();
     let original_output_tokens = canonical.approximate_tokens;
     let projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: full_output.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
@@ -1845,6 +1860,7 @@ async fn small_code_mode_owner_result_uses_artifact_free_inline_carrier() {
     });
     let canonical = CanonicalToolResult::text(outer_text.clone());
     let mut projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: outer_text.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
@@ -1974,6 +1990,7 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
     }];
     let inner_text = String::from_utf8(inner_canonical.bytes.clone()).expect("canonical JSON text");
     let inner_projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: inner_text.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
@@ -2084,6 +2101,7 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
     let outer_text = "outer code-mode output ".repeat(200);
     let outer_canonical = CanonicalToolResult::text(outer_text.clone());
     let outer_projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: outer_text.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
@@ -2195,6 +2213,7 @@ async fn fresh_corpus_replays_real_producer_handler_and_functions_exec_carrier()
     let outer_text = "fresh corpus functions.exec carrier".to_string();
     let outer_canonical = CanonicalToolResult::text(outer_text.clone());
     let mut outer_projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: outer_text.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
@@ -4062,6 +4081,7 @@ async fn admission_only_projection_preserves_original_response_and_registers_can
     };
     let invocation_sha256 = crate::tool_history::sha256(b"normalized invocation");
     let projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: output.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
@@ -4100,6 +4120,7 @@ async fn admission_only_projection_preserves_original_response_and_registers_can
     .expect("admission-only projection");
 
     assert_eq!(projection.response(), original_response);
+    assert!(!projection.projection_truncated);
     let candidate = projection.candidate.expect("admission candidate");
     assert_eq!(candidate.bounded_model_output, output);
     assert_eq!(candidate.preserved_non_text_tokens, Some(0));
@@ -4134,6 +4155,7 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
     let mut essential_inline = serde_json::json!({"success": true});
     essential_inline[crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY] = Value::Bool(true);
     let projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: canonical_text.clone(),
         outcome: ToolOutputOutcome::Success,
         essential_inline,
@@ -4171,6 +4193,7 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
     .await
     .expect("admission-only projection");
 
+    assert!(projection.projection_truncated);
     let ResponseInputItem::CustomToolCallOutput { output, .. } = projection.response() else {
         panic!("expected exec output");
     };
@@ -4210,6 +4233,11 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
 
 #[tokio::test]
 async fn admission_only_projection_preserves_original_response_when_artifact_storage_fails() {
+    admission_only_storage_failure(false).await;
+    admission_only_storage_failure(true).await;
+}
+
+async fn admission_only_storage_failure(visible_output_truncated: bool) {
     let temp = tempfile::tempdir().expect("temporary directory");
     let blocked_home = temp.path().join("not-a-directory");
     tokio::fs::write(&blocked_home, b"blocked")
@@ -4223,9 +4251,12 @@ async fn admission_only_projection_preserves_original_response_when_artifact_sto
     };
 
     let projection = project_model_output(ModelProjectionInput {
+        fragments: Vec::new(),
         spillable_text: output.clone(),
         outcome: ToolOutputOutcome::Success,
-        essential_inline: serde_json::json!({}),
+        essential_inline: serde_json::json!({
+            (crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY): visible_output_truncated,
+        }),
         origin_call_id: "wait-call".to_string(),
         selection_facts: ProjectionSelectionFacts {
             mode: "generic_fallback",
@@ -4250,8 +4281,8 @@ async fn admission_only_projection_preserves_original_response_when_artifact_sto
         semantic_class: "tool_output".to_string(),
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
-        projection_truncated: false,
-        canonical_artifact_required: false,
+        projection_truncated: visible_output_truncated,
+        canonical_artifact_required: true,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: Vec::new(),
         original_response: original_response.clone(),
@@ -4261,6 +4292,7 @@ async fn admission_only_projection_preserves_original_response_when_artifact_sto
     .expect("admission-only projection should fall back to the received response");
 
     assert_eq!(projection.response(), original_response);
+    assert_eq!(projection.projection_truncated, visible_output_truncated);
     assert!(projection.candidate.is_none());
     assert!(!projection.artifact_created);
 }
@@ -4357,5 +4389,53 @@ async fn disabled_history_projection_skips_artifacts_for_complete_inline_results
                     .to_response_item(&result.call_id, &result.payload)
             );
         }
+    }
+}
+#[test]
+fn projection_reserves_header_and_advertises_sections_without_recurring_cuts() {
+    let text = (1..=3000).map(|line| format!("unique source line {line}\r\n")).collect::<String>();
+    let envelope = ToolProjectionV1 {
+        version: 1, tool: "exec_command".into(), outcome: "success".into(),
+        canonical_sha256: "hash".into(), canonical_bytes: text.len() as u64,
+        canonical_approximate_tokens: approx_token_count(&text) as u64,
+        canonical_complete: true, model_bytes: 0, model_approximate_tokens: 0,
+        artifact_id: Some("retained-source".into()),
+        sections: vec![omitted_projection_section("output".into(), CanonicalByteRange::new(0, text.len() as u64))],
+        omitted_sections: vec!["output".into()],
+        result: serde_json::json!({"essential": {"exit_code": 0}}),
+    };
+    let fragments = vec![ToolOutputProjectionFragment::new(
+        ToolOutputProjectionFragmentKind::ContextualSpillableText, text.clone()).with_id("output")];
+    let projected = serialize_projection_fragments(envelope, &text, &fragments, 1000).unwrap();
+    assert!(approx_token_count(projected.rendered()) <= 1000);
+    assert_eq!(projected.rendered().matches("[omitted lines ").count(), 2);
+    let (header, _) = model_projection_parts(projected.rendered());
+    assert_eq!(header["omitted_sections"], serde_json::json!(["output"]));
+    assert_eq!(header["artifact_id"], "retained-source");
+}
+
+#[tokio::test]
+async fn direct_read_file_page_keeps_original_snapshot_and_complete_json() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let invocation = test_invocation(Arc::new(session), Arc::new(turn), "page-budget", ToolName::plain("read_file"));
+    let canonical = CanonicalToolResult::text("unique file line\n".repeat(20_000));
+    for selectors in [None, Some(vec![ToolOutputSelector::Lines { start: 1, end: 20_000 }])] {
+        let (page, continuation) = crate::tools::command_output_artifact::select_file_snapshot(&canonical, selectors).unwrap();
+        let mut value = serde_json::to_value(page).unwrap();
+        value["path"] = serde_json::json!("source.txt");
+        value["continuation"] = serde_json::json!(continuation);
+        let output = codex_tools::JsonToolOutput::new(value.clone());
+        let mut result = AnyToolResult {
+            call_id: invocation.call_id.clone(), payload: invocation.payload.clone(),
+            result: Box::new(output), model_projection: None, source_dependencies: None,
+            code_mode_feedback: Vec::new(),
+        };
+        let original = result.response();
+        if let Some(input) = prepare_model_projection(&invocation, &mut result, None, None, false, true).await {
+            assert_eq!(input.applied_token_limit, 10_000);
+            result.install_model_projection(project_model_output(input).await, None);
+        }
+        assert_eq!(result.response(), original);
+        assert_eq!(result.code_mode_result(), value);
     }
 }

@@ -1,4 +1,14 @@
 use std::borrow::Cow;
+
+#[cfg(test)]
+#[path = "turn_execution_evidence_tests.rs"]
+mod evidence_tests;
+#[cfg(test)]
+#[path = "turn_execution_investigation_tests.rs"]
+mod investigation_tests;
+#[cfg(test)]
+#[path = "turn_execution_cycle_tests.rs"]
+mod cycle_tests;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
@@ -35,10 +45,12 @@ use crate::validation_admission::classify_validation;
 
 const TURN_EFFICIENCY_TOOL_CALL_THRESHOLD: usize = 8;
 const TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL: u64 = 500;
+const LIGHTWEIGHT_HANDOFF_ADVISORY_GENERATIONS: u32 = 3;
+const LIGHTWEIGHT_HANDOFF_ADVISORY: &str = "Execution-efficiency advisory: several consecutive model handoffs each ran only one or two short tools. This is orchestration overhead, not evidence of a loop or task completion. For the next necessary work, batch already-known independent calls and keep deterministic dependent steps in the same exec after checking prerequisites. Reuse delivered contracts and evidence instead of exploring their implementation without a concrete correctness gap. If the requested result is already supported, deliver it rather than adding optional verification. Do not skip required reading, implementation, or validation; do not combine conflicting mutations or cancel progressing work. Keep tools available and preserve the user's scope.";
 const DISTINCT_FAILURE_RECOVERY_ADVISORY_THRESHOLD: u32 = 2;
 const SUCCESSFUL_REPLAY_GATE_LIMIT: usize = 32;
+const RECENT_CYCLE_LIMIT: usize = 32;
 const SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT: usize = 64 * 1024;
-const SOFT_CONVERGENCE_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
 // Elapsed time alone does not distinguish a long investigation from a stall:
 // the intervention fired two minutes into recorded implementation turns that
 // were still reading new files. Require that this many completed generations
@@ -94,6 +106,13 @@ pub(crate) struct SamplingRequestBaselines {
 }
 
 impl SamplingRequestBaselines {
+    fn authority_revision_key(&self) -> String {
+        format!(
+            "plan={};input={};tool_exposure={}",
+            self.plan_revision, self.input_revision, self.tool_exposure_revision,
+        )
+    }
+
     fn revision_key(&self) -> String {
         format!(
             "mutation={};plan={};input={};tool_exposure={}",
@@ -134,13 +153,17 @@ struct SamplingToolOutcome {
     skip_disposition: Option<ToolOutputSkipDisposition>,
     plan: Option<UpdatePlanArgs>,
     source_evidence: Option<Value>,
+    source_artifact_id: Option<String>,
     failure_fingerprint: Option<String>,
     failure_is_terminal: bool,
     failure_diagnosis_reused: bool,
     canonical_artifact_required: bool,
     nested_in_code_mode: bool,
+    code_mode_cell_id: Option<String>,
     wraps_nested_terminal: bool,
     tests_executed: bool,
+    process_observation_progress: bool,
+    empty_output: bool,
 }
 
 impl SamplingToolOutcome {
@@ -157,16 +180,23 @@ impl SamplingToolOutcome {
             skip_disposition: outcome_context.skip_disposition,
             plan,
             source_evidence: sampling_source_evidence(signal),
+            source_artifact_id: signal
+                .and_then(|signal| signal["source_artifact_id"].as_str())
+                .map(str::to_string),
             failure_fingerprint: sampling_failure_fingerprint(signal),
             failure_is_terminal: sampling_failure_is_terminal(signal),
             failure_diagnosis_reused: false,
             canonical_artifact_required: false,
             nested_in_code_mode: false,
+            code_mode_cell_id: None,
             wraps_nested_terminal: signal
                 .and_then(|signal| signal.get("nested_ordinal"))
                 .and_then(Value::as_u64)
                 .is_some(),
             tests_executed: false,
+            process_observation_progress: signal
+                .is_some_and(|signal| signal["process_observation_progress"] == true),
+            empty_output: signal.is_some_and(|signal| signal["empty_output"] == true),
         }
     }
 
@@ -270,6 +300,7 @@ pub(crate) struct SuccessfulReplayGuard {
 
 #[derive(Clone, Debug)]
 struct SuccessfulReplayEvidence {
+    path_scoped: bool,
     mutation_revision: u64,
     workspace_revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     source_paths: Vec<crate::git_workspace::SourcePathChangeObservation>,
@@ -287,15 +318,29 @@ impl SuccessfulReplayGuard {
         cache: &crate::git_workspace::GitWorkspaceCache,
         workspace_revision: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
     ) -> bool {
-        self.evidence.workspace_revision.as_ref() == workspace_revision
+        let same_workspace = if self.evidence.path_scoped {
+            self.evidence.workspace_revision.as_ref().map(|revision| &revision.repository_root)
+                == workspace_revision.map(|revision| &revision.repository_root)
+        } else {
+            self.evidence.workspace_revision.as_ref() == workspace_revision
+        };
+        same_workspace
+            && self.evidence.workspace_revision.as_ref().is_none_or(|revision| !revision.unavailable)
             && workspace_revision.is_none_or(|revision| !revision.unavailable)
-            && self.evidence.mutation_revision == mutation_revision
+            && (self.evidence.path_scoped || self.evidence.mutation_revision == mutation_revision)
             && !self.evidence.source_paths.is_empty()
             && self
                 .evidence
                 .source_paths
                 .iter()
                 .all(|path| cache.source_path_change_observation_is_current(path))
+    }
+
+    pub(crate) fn matches_source_dependencies(&self, dependencies: &BTreeSet<SourceDependencyV1>) -> bool {
+        !dependencies.is_empty()
+            && self.evidence.source_paths.iter()
+                .map(crate::git_workspace::SourcePathChangeObservation::source_dependency)
+                .collect::<BTreeSet<_>>() == *dependencies
     }
 
     pub(crate) fn response_for_call(&self, call_id: &str) -> Option<ResponseInputItem> {
@@ -333,6 +378,7 @@ struct RepeatedFailureGate {
 #[derive(Clone, Debug)]
 struct SuccessfulReplayGate {
     state_revision: String,
+    authority_revision: String,
     action_identity: String,
     response: ResponseInputItem,
     evidence: SuccessfulReplayEvidence,
@@ -342,12 +388,14 @@ struct SuccessfulReplayGate {
 enum StructuredActionClass {
     BroadSource,
     PreciseSource,
+    InvalidArguments,
     Other,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StructuredActionIdentity {
     identity: String,
+    evidence_identity: String,
     class: StructuredActionClass,
 }
 
@@ -366,6 +414,7 @@ struct DeterministicCycle {
     key: String,
     kind: DeterministicCycleKind,
     failure_only: bool,
+    failure_fingerprint: Option<String>,
     repeated_failure: Option<(String, String)>,
 }
 
@@ -395,11 +444,13 @@ impl DeterministicDispatchLedger {
 
 #[derive(Default)]
 struct SamplingRequestSignalState {
+    investigation: Option<Arc<Mutex<crate::plan_store::investigation::InvestigationState>>>,
     outcomes: Vec<SamplingToolOutcome>,
     structured_actions: BTreeMap<u64, StructuredActionIdentity>,
     evidence_items: BTreeMap<u64, String>,
     successful_replay_responses: BTreeMap<u64, ResponseInputItem>,
     successful_replay_evidence: BTreeMap<u64, SuccessfulReplayEvidence>,
+    path_scoped_ordinals: BTreeSet<u64>,
     replayed_ordinals: BTreeSet<u64>,
     validation_ordinals: BTreeSet<u64>,
     validation_proof_ordinals: BTreeSet<u64>,
@@ -419,6 +470,8 @@ struct SamplingRequestSignalState {
     direct_wait_agent_count: usize,
     direct_code_mode_exec_count: usize,
     code_mode_nested_tool_count: usize,
+    code_mode_call_ordinals: BTreeMap<String, u64>,
+    code_mode_cell_owners: BTreeMap<String, u64>,
     code_mode_source_dependencies: BTreeMap<String, BTreeSet<SourceDependencyV1>>,
     authoritative_wait_observations: Vec<AuthoritativeWaitObservation>,
     child_runtime_ms: u64,
@@ -426,6 +479,19 @@ struct SamplingRequestSignalState {
 }
 
 impl SamplingRequestSignalState {
+    fn wrapper_ordinals(&self) -> BTreeSet<u64> {
+        self.outcomes.iter()
+            .filter_map(|outcome| outcome.code_mode_cell_id.as_ref())
+            .filter_map(|cell| self.code_mode_cell_owners.get(cell))
+            .copied()
+            .filter(|ordinal| self.outcomes.iter().any(|outcome| {
+                outcome.ordinal == *ordinal
+                    && (matches!(outcome.kind, SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Yielded)
+                        || outcome.wraps_nested_terminal)
+            }))
+            .collect()
+    }
+
     fn accumulate_code_mode_source_dependencies(
         &mut self,
         cell_id: &str,
@@ -485,6 +551,7 @@ pub(crate) struct SamplingRequestSignalCollector {
     state: Arc<Mutex<SamplingRequestSignalState>>,
     dispatch_ledger: Option<Arc<Mutex<DeterministicDispatchLedger>>>,
     request_state_revision: String,
+    request_authority_revision: String,
     request_mutation_revision: u64,
 }
 
@@ -496,6 +563,14 @@ pub(crate) struct SamplingToolCallRegistration {
 }
 
 impl SamplingRequestSignalCollector {
+    pub(crate) fn attach_investigation(
+        &self,
+        investigation: Arc<Mutex<crate::plan_store::investigation::InvestigationState>>,
+    ) {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .investigation = Some(investigation);
+    }
+
     pub(crate) fn completion_evidence_key(&self) -> Option<String> {
         let state = self
             .state
@@ -535,13 +610,15 @@ impl SamplingRequestSignalCollector {
         &self,
         tool_name: &ToolName,
         payload: &ToolPayload,
-        _current_call_id: &str,
+        current_call_id: &str,
     ) -> SamplingToolCallRegistration {
         let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
-        let wait = is_wait_tool(tool_name);
         let live_process_poll = tool_name_matches(tool_name, "write_stdin");
         let direct_code_mode_exec = crate::tools::code_mode::is_exec_tool_name(tool_name);
         let canonical = canonical_tool_action(payload);
+        let wait = is_wait_tool(tool_name)
+            || (live_process_poll && canonical.value.get("chars")
+                .and_then(Value::as_str).is_none_or(str::is_empty));
         let action_identity = deterministic_action_identity(tool_name, &canonical);
         let structured_action =
             structured_action_identity_from_canonical(tool_name, payload, &canonical);
@@ -592,7 +669,9 @@ impl SamplingRequestSignalCollector {
                             .iter()
                             .rev()
                             .find(|gate| {
-                                gate.state_revision == self.request_state_revision
+                                (gate.state_revision == self.request_state_revision
+                                    || gate.evidence.path_scoped
+                                        && gate.authority_revision == self.request_authority_revision)
                                     && gate.action_identity == action.identity
                             })
                             .map(|gate| SuccessfulReplayGuard {
@@ -609,6 +688,9 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.registered_count = state.registered_count.saturating_add(1);
+        if tool_name_matches(tool_name, "read_file") || tool_name_matches(tool_name, "list_files") {
+            state.path_scoped_ordinals.insert(ordinal);
+        }
         if wait {
             state.wait_call_count = state.wait_call_count.saturating_add(1);
         }
@@ -617,6 +699,11 @@ impl SamplingRequestSignalCollector {
         }
         if direct_code_mode_exec {
             state.direct_code_mode_exec_count = state.direct_code_mode_exec_count.saturating_add(1);
+            state.code_mode_call_ordinals.insert(current_call_id.to_string(), ordinal);
+        } else if crate::tools::code_mode::is_orchestration_tool_name(tool_name)
+            && let Some(cell_id) = canonical.value.get("cell_id").and_then(Value::as_str)
+        {
+            state.code_mode_cell_owners.insert(cell_id.to_string(), ordinal);
         }
         state.saw_artifact_read |= tool_name_matches(tool_name, "read_tool_output");
         state.saw_validation |= validation;
@@ -774,6 +861,13 @@ impl SamplingRequestSignalCollector {
         state.authoritative_wait_observations.push(observation);
     }
 
+    pub(crate) fn record_code_mode_parent(&self, cell_id: &str, parent_call_id: Option<&str>) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ordinal) = parent_call_id.and_then(|parent| state.code_mode_call_ordinals.get(parent)).copied() {
+            state.code_mode_cell_owners.insert(cell_id.to_string(), ordinal);
+        }
+    }
+
     pub(crate) fn record_code_mode_result(&self, result: CodeModeToolResult<'_>) {
         let CodeModeToolResult {
             cell_id,
@@ -795,6 +889,7 @@ impl SamplingRequestSignalCollector {
         }
         outcome.canonical_artifact_required = canonical_artifact_required;
         outcome.nested_in_code_mode = true;
+        outcome.code_mode_cell_id = Some(cell_id.to_string());
         let output = result
             .get("output")
             .and_then(Value::as_str)
@@ -817,6 +912,11 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.code_mode_nested_tool_count = state.code_mode_nested_tool_count.saturating_add(1);
+        if is_wait_tool(tool_name) || (tool_name_matches(tool_name, "write_stdin")
+            && canonical.value.get("chars").and_then(Value::as_str).is_none_or(str::is_empty))
+        {
+            state.wait_call_count = state.wait_call_count.saturating_add(1);
+        }
         if tool_name_matches(tool_name, "write_stdin") {
             state.process_monitor_ordinals.insert(ordinal);
         }
@@ -887,6 +987,7 @@ impl SamplingRequestSignalCollector {
             SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
         outcome.failure_fingerprint = Some(failure_fingerprint);
         outcome.nested_in_code_mode = true;
+        outcome.code_mode_cell_id = Some(cell_id.to_string());
         let canonical = payload.map(canonical_tool_action);
         let structured_action = payload
             .zip(canonical.as_ref())
@@ -938,14 +1039,17 @@ impl SamplingRequestSignalCollector {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let direct_owner = state.registered_count == 1
+        let plan_calls = state.outcomes.iter().filter(|outcome|
+            outcome.kind == SamplingToolOutcomeKind::Success && outcome.plan.is_some()
+        ).count();
+        let direct_owner = state.registered_count == 1 + plan_calls
             && state.direct_wait_agent_count == 1
             && state.direct_code_mode_exec_count == 0
             && state.code_mode_nested_tool_count == 0;
         let code_mode_owner = state.registered_count == 1
             && state.direct_wait_agent_count == 0
             && state.direct_code_mode_exec_count == 1
-            && state.code_mode_nested_tool_count == 1;
+            && state.code_mode_nested_tool_count == 1 + plan_calls;
         if !(direct_owner || code_mode_owner) || state.authoritative_wait_observations.len() != 1 {
             return None;
         }
@@ -964,7 +1068,7 @@ impl SamplingRequestSignalCollector {
             SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
         outcome.failure_fingerprint = Some(format!(
             "direct_tool.{:x}",
-            Sha256::digest(failure.as_bytes())
+            Sha256::digest(crate::tools::context::normalize_tool_failure_text(failure).as_bytes())
         ));
         outcome.failure_is_terminal = failure_is_terminal;
         let mut state = self
@@ -997,9 +1101,11 @@ impl SamplingRequestSignalCollector {
         if state.successful_replay_evidence.len() >= SUCCESSFUL_REPLAY_GATE_LIMIT {
             state.successful_replay_evidence.pop_first();
         }
+        let path_scoped = state.path_scoped_ordinals.contains(&ordinal);
         state.successful_replay_evidence.insert(
             ordinal,
             SuccessfulReplayEvidence {
+                path_scoped,
                 mutation_revision,
                 workspace_revision,
                 source_paths,
@@ -1122,8 +1228,7 @@ impl SamplingRequestSignalCollector {
 
     fn failure_fingerprint(&self) -> Option<String> {
         self.deterministic_cycle()
-            .and_then(|cycle| cycle.repeated_failure)
-            .map(|(_, fingerprint)| fingerprint)
+            .and_then(|cycle| cycle.failure_fingerprint)
     }
 
     fn deterministic_cycle(&self) -> Option<DeterministicCycle> {
@@ -1136,24 +1241,16 @@ impl SamplingRequestSignalCollector {
                 key: "empty".to_string(),
                 kind: DeterministicCycleKind::Empty,
                 failure_only: false,
+                failure_fingerprint: None,
                 repeated_failure: None,
             });
         }
-        let mut outer_code_mode_outcomes = state
-            .outcomes
-            .iter()
-            .filter(|outcome| !outcome.nested_in_code_mode);
-        let outer_code_mode_wrapper = outer_code_mode_outcomes.next().is_some_and(|outcome| {
-            outcome.kind == SamplingToolOutcomeKind::Success || outcome.wraps_nested_terminal
-        }) && outer_code_mode_outcomes.next().is_none();
-        let code_mode_owned = state.code_mode_nested_tool_count > 0
-            && state.registered_count == 1
-            && state.direct_code_mode_exec_count == 1
-            && outer_code_mode_wrapper;
+        let wrappers = state.wrapper_ordinals();
+        let expected_outcomes = state.registered_count + state.code_mode_nested_tool_count - wrappers.len();
         let outcomes = state
             .outcomes
             .iter()
-            .filter(|outcome| !code_mode_owned || outcome.nested_in_code_mode)
+            .filter(|outcome| !wrappers.contains(&outcome.ordinal))
             .collect::<Vec<_>>();
         let failures = outcomes
             .iter()
@@ -1162,13 +1259,8 @@ impl SamplingRequestSignalCollector {
             .collect::<Vec<_>>();
         if !failures.is_empty() {
             let suppressible_failure = failures.iter().all(|outcome| outcome.failure_is_terminal);
-            let failure_only = if code_mode_owned {
-                outcomes.len() == state.code_mode_nested_tool_count
-                    && outcomes.iter().all(|outcome| outcome.is_failure_evidence())
-            } else {
-                state.outcomes.len() == state.registered_count
-                    && outcomes.iter().all(|outcome| outcome.is_failure_evidence())
-            };
+            let failure_only = outcomes.len() == expected_outcomes
+                && outcomes.iter().all(|outcome| outcome.is_failure_evidence());
             let nested_only = failures.iter().all(|outcome| outcome.nested_in_code_mode);
             let mut fingerprints = failures
                 .iter()
@@ -1177,14 +1269,12 @@ impl SamplingRequestSignalCollector {
             fingerprints.sort_unstable();
             fingerprints.dedup();
             let failure_fingerprint = fingerprints.into_iter().collect::<Vec<_>>().join("|");
-            let repeated_action_identity = if code_mode_owned {
-                state
-                    .outcomes
-                    .iter()
-                    .filter(|outcome| !outcome.nested_in_code_mode)
-                    .find_map(|outcome| state.structured_actions.get(&outcome.ordinal))
-                    .map(|action| action.identity.clone())
-            } else if failures.len() == 1 {
+            // Nested diagnostics belong to the actual nested action, never the
+            // surrounding script. A script can contain other effectful work,
+            // so it must not become a failure-suppression target.
+            let repeated_action_identity = if failures.len() == 1
+                && !failures[0].nested_in_code_mode
+            {
                 state
                     .structured_actions
                     .get(&failures[0].ordinal)
@@ -1192,30 +1282,17 @@ impl SamplingRequestSignalCollector {
             } else {
                 None
             };
-            let mut failure_action_bindings = if code_mode_owned {
-                let action_identity = repeated_action_identity.clone()?;
-                failures
-                    .iter()
-                    .map(|outcome| {
-                        Some((
-                            action_identity.clone(),
-                            outcome.failure_fingerprint.as_deref()?.to_string(),
-                        ))
-                    })
-                    .collect::<Option<Vec<_>>>()?
-            } else {
-                failures
+            let mut failure_action_bindings = failures
                     .iter()
                     .map(|outcome| {
                         let action_identity = state
                             .structured_actions
                             .get(&outcome.ordinal)
-                            .map(|action| action.identity.clone())?;
+                            .map(|action| action.evidence_identity.clone())?;
                         let fingerprint = outcome.failure_fingerprint.as_deref()?.to_string();
                         Some((action_identity, fingerprint))
                     })
-                    .collect::<Option<Vec<_>>>()?
-            };
+                    .collect::<Option<Vec<_>>>()?;
             failure_action_bindings.sort_unstable();
             let failure_action_identity = format!(
                 "{:x}",
@@ -1233,6 +1310,7 @@ impl SamplingRequestSignalCollector {
                 key: format!("{key_prefix}:{failure_fingerprint}:{failure_action_identity}"),
                 kind,
                 failure_only,
+                failure_fingerprint: Some(failure_fingerprint.clone()),
                 repeated_failure: if suppressible_failure {
                     repeated_action_identity
                         .map(|action_identity| (action_identity, failure_fingerprint))
@@ -1246,23 +1324,14 @@ impl SamplingRequestSignalCollector {
         // unchanged until output or termination, so it is not a failed or
         // no-progress reasoning attempt. Actual write/poll errors were handled
         // by the failure branch above and remain eligible for deduplication.
-        if state.process_monitor_ordinals.len() == state.registered_count {
+        if !outcomes.is_empty()
+            && outcomes.iter().all(|outcome| state.process_monitor_ordinals.contains(&outcome.ordinal))
+        {
             return None;
         }
-        let incomplete_code_mode_outcomes = code_mode_owned
-            && (outcomes.len() != state.code_mode_nested_tool_count
-                || !outcomes
-                    .iter()
-                    .all(|outcome| outcome.kind == SamplingToolOutcomeKind::Success));
-        let incomplete_direct_outcomes = !code_mode_owned
-            && (state.outcomes.len() != state.registered_count
-                || state.structured_actions.len() != state.registered_count
-                || state.evidence_items.len() != state.registered_count
-                || !state
-                    .outcomes
-                    .iter()
-                    .all(|outcome| outcome.kind == SamplingToolOutcomeKind::Success));
-        if incomplete_code_mode_outcomes || incomplete_direct_outcomes {
+        if outcomes.len() != expected_outcomes
+            || !outcomes.iter().all(|outcome| outcome.kind == SamplingToolOutcomeKind::Success)
+        {
             return None;
         }
 
@@ -1284,6 +1353,9 @@ impl SamplingRequestSignalCollector {
             .into_iter()
             .map(|outcome| {
                 let action = state.structured_actions.get(&outcome.ordinal)?;
+                if action.class == StructuredActionClass::InvalidArguments {
+                    return None;
+                }
                 let evidence = state.evidence_items.get(&outcome.ordinal)?;
                 Some((outcome.ordinal, action, evidence))
             })
@@ -1300,7 +1372,7 @@ impl SamplingRequestSignalCollector {
         ordered.sort_by_key(|(ordinal, _, _)| *ordinal);
         let mut action_evidence = ordered
             .iter()
-            .map(|(_, action, evidence)| format!("{}:{evidence}", action.identity))
+            .map(|(_, action, evidence)| format!("{}:{evidence}", action.evidence_identity))
             .collect::<Vec<_>>();
         // Reordering the same broad reads does not establish progress. Keep
         // each result bound to its action and preserve duplicate observations.
@@ -1337,6 +1409,7 @@ impl SamplingRequestSignalCollector {
             ),
             kind,
             failure_only: false,
+            failure_fingerprint: None,
             repeated_failure: None,
         })
     }
@@ -1346,7 +1419,9 @@ impl SamplingRequestSignalCollector {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.registered_count > 0 && state.wait_call_count == state.registered_count
+        let calls = state.registered_count.saturating_sub(state.direct_code_mode_exec_count)
+            .saturating_add(state.code_mode_nested_tool_count);
+        calls > 0 && state.wait_call_count == calls
     }
 
     #[cfg(test)]
@@ -1359,25 +1434,34 @@ impl SamplingRequestSignalCollector {
     }
 
     pub(crate) fn observed_successful_process_monitor(&self) -> bool {
+        self.monitoring_only_generation(false)
+    }
+
+    pub(crate) fn observed_yielded_execution(&self) -> bool {
+        self.monitoring_only_generation(true)
+    }
+
+    fn monitoring_only_generation(&self, yielded_only: bool) -> bool {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.outcomes.iter().any(|outcome| {
-            matches!(
+        let wrappers = state.wrapper_ordinals();
+        let expected = state.registered_count + state.code_mode_nested_tool_count - wrappers.len();
+        let outcomes = state.outcomes.iter()
+            .filter(|outcome| !wrappers.contains(&outcome.ordinal))
+            .collect::<Vec<_>>();
+        expected > 0 && outcomes.len() == expected && outcomes.iter().all(|outcome| {
+            let eligible = if yielded_only {
+                outcome.kind == SamplingToolOutcomeKind::Yielded
+            } else {
+                state.process_monitor_ordinals.contains(&outcome.ordinal) && matches!(
                 outcome.kind,
                 SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Yielded
-            ) && state.process_monitor_ordinals.contains(&outcome.ordinal)
+                )
+            };
+            eligible && outcome.process_observation_progress
         })
-    }
-
-    pub(crate) fn observed_yielded_execution(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .outcomes
-            .iter()
-            .any(|outcome| outcome.kind == SamplingToolOutcomeKind::Yielded)
     }
 
     #[cfg(test)]
@@ -1550,7 +1634,9 @@ impl SamplingRequestSignalCollector {
             })
         } else if state.saw_coordination {
             Some(TurnTimingGenerationPurpose::Coordination)
-        } else if state.registered_count > 0 && state.wait_call_count == state.registered_count {
+        } else if state.wait_call_count > 0
+            && state.wait_call_count == state.registered_count.saturating_sub(state.direct_code_mode_exec_count)
+                .saturating_add(state.code_mode_nested_tool_count) {
             Some(TurnTimingGenerationPurpose::Wait)
         } else if observed_new_failure {
             Some(TurnTimingGenerationPurpose::FailureDiagnosis)
@@ -1573,36 +1659,35 @@ impl SamplingRequestSignalCollector {
         }
     }
 
-    pub(crate) fn progress_kinds(
-        &self,
-        baselines: &SamplingRequestBaselines,
-        settled: &SamplingRequestSettledState,
-    ) -> Vec<TurnTimingProgressKind> {
+    /// Identity of the actual ordered tool actions, independent of outcomes,
+    /// request purpose, and provider call IDs. Missing identities are unknown,
+    /// not proof that two generations chose the same actions.
+    pub(crate) fn structured_action_fingerprint(&self) -> Option<String> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut progress = Vec::new();
-        if settled.mutation_revision != baselines.mutation_revision {
-            progress.push(TurnTimingProgressKind::WorkspaceMutation);
-        }
-        if state
-            .validation_ordinals
-            .iter()
-            .any(|ordinal| !state.replayed_ordinals.contains(ordinal))
+        if state.structured_actions.len()
+            != usize::try_from(self.next_ordinal.load(Ordering::Acquire)).ok()?
         {
-            progress.push(TurnTimingProgressKind::ValidationResult);
+            return None;
         }
+        // Malformed arguments keep an identity only for argument-error
+        // diagnosis; they are not a comparable structured action.
         if state
-            .outcomes
-            .iter()
-            .any(SamplingToolOutcome::is_failure_evidence)
+            .structured_actions
+            .values()
+            .any(|action| action.class == StructuredActionClass::InvalidArguments)
         {
-            progress.push(TurnTimingProgressKind::FailureObservation);
+            return None;
         }
-        progress.sort_by_key(|kind| *kind as u8);
-        progress.dedup();
-        progress
+        serialized_evidence_identity(
+            &state
+                .structured_actions
+                .values()
+                .map(|action| action.identity.as_str())
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[cfg(test)]
@@ -1766,6 +1851,18 @@ fn structured_action_identity_from_canonical(
     payload: &ToolPayload,
     canonical: &CanonicalToolAction,
 ) -> Option<StructuredActionIdentity> {
+    if canonical.identity_payload.is_none() {
+        // Retain invalid bytes only for argument-error diagnosis. Do not give
+        // malformed input a successful replay or wait identity.
+        let identity = format!("{:x}", Sha256::digest(
+            serde_json::to_vec(&(tool_name, "invalid_function_arguments", &canonical.value)).ok()?
+        ));
+        return Some(StructuredActionIdentity {
+            evidence_identity: identity.clone(),
+            identity,
+            class: StructuredActionClass::InvalidArguments,
+        });
+    }
     // Fresh execution must bypass both replay lookup and storage, including
     // consecutive calls that all explicitly request force_fresh.
     if canonical.value.get("force_fresh").and_then(Value::as_bool) == Some(true) {
@@ -1775,7 +1872,18 @@ fn structured_action_identity_from_canonical(
     let action =
         serde_json::to_string(&(tool_name, canonical.identity_payload.as_deref()?)).ok()?;
     let identity = format!("{:x}", Sha256::digest(action.as_bytes()));
-    Some(StructuredActionIdentity { identity, class })
+    let mut evidence_arguments = canonical.value.clone();
+    if ["exec_command", "shell_command", "write_stdin"].iter()
+        .any(|name| tool_name_matches(tool_name, name))
+        && let Some(arguments) = evidence_arguments.as_object_mut()
+    {
+        arguments.remove("max_output_tokens");
+        arguments.remove("yield_time_ms");
+    }
+    let evidence_identity = format!("{:x}", Sha256::digest(
+        serde_json::to_vec(&(tool_name, evidence_arguments)).ok()?
+    ));
+    Some(StructuredActionIdentity { identity, evidence_identity, class })
 }
 
 fn output_proves_test_execution(text: &str) -> bool {
@@ -1929,13 +2037,14 @@ fn code_mode_result_failure_fingerprint(
         return fingerprint;
     }
     let action = canonical_tool_action(payload);
-    let canonical = serde_json::to_vec(&serde_json::json!({
+    let canonical = serde_json::to_string(&serde_json::json!({
         "tool_name": tool_name,
         "payload": canonical_tool_payload(&action),
         "result": canonicalize_json(result),
     }))
     .unwrap_or_default();
-    format!("code_mode.nested_tool.{:x}", Sha256::digest(canonical))
+    format!("code_mode.nested_tool.{:x}", Sha256::digest(
+        crate::tools::context::normalize_tool_failure_text(&canonical).as_bytes()))
 }
 
 fn canonical_response_body(response: &ResponseInputItem) -> Option<Value> {
@@ -2345,9 +2454,38 @@ fn tool_name_matches(tool_name: &ToolName, candidate: &str) -> bool {
     tool_name.namespace.is_none() && tool_name.name == candidate
 }
 
+#[derive(Clone, Default, Eq, PartialEq)]
+struct DeliveredSourceCoverage {
+    ranges: Vec<(u64, u64)>,
+    query_proofs: BTreeSet<String>,
+}
+
+impl DeliveredSourceCoverage {
+    fn merge(&mut self, other: &Self) -> bool {
+        let previous = self.clone();
+        self.ranges.extend_from_slice(&other.ranges);
+        self.ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for &(start, end) in &self.ranges {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        self.ranges = merged;
+        self.query_proofs.extend(other.query_proofs.iter().cloned());
+        *self != previous
+    }
+}
+
 pub(crate) struct TurnExecutionControl {
-    soft_convergence_started_at: tokio::time::Instant,
+    investigation_directive: Option<String>,
+    issued_directives: BTreeSet<String>,
     soft_convergence_issued: bool,
+    lightweight_handoffs: u32,
     /// Completed generations since the last one that produced new evidence,
     /// a workspace mutation, or a plan/input change.
     continuations_without_progress: u32,
@@ -2357,7 +2495,7 @@ pub(crate) struct TurnExecutionControl {
     dispatch_ledger: Arc<Mutex<DeterministicDispatchLedger>>,
     consecutive_no_progress: u32,
     consecutive_obligation_no_progress: u32,
-    last_cycle: Option<String>,
+    recent_cycles: VecDeque<String>,
     last_state_revision: Option<String>,
     directive_issued: bool,
     proven_loop_active: bool,
@@ -2367,6 +2505,8 @@ pub(crate) struct TurnExecutionControl {
     turn_efficiency_tool_calls: usize,
     turn_efficiency_child_runtime_ms: u64,
     budget_progress_evidence: BTreeSet<String>,
+    delivered_coverage: BTreeMap<String, DeliveredSourceCoverage>,
+    artifact_source_coverage: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -2385,8 +2525,10 @@ impl TurnExecutionControl {
 
     pub(crate) fn new_with_timing(timing: Arc<TurnTimingState>) -> Self {
         Self {
-            soft_convergence_started_at: tokio::time::Instant::now(),
+            investigation_directive: None,
+            issued_directives: BTreeSet::new(),
             soft_convergence_issued: false,
+            lightweight_handoffs: 0,
             continuations_without_progress: 0,
             plan: None,
             plan_revision: 0,
@@ -2394,7 +2536,7 @@ impl TurnExecutionControl {
             dispatch_ledger: Arc::new(Mutex::new(DeterministicDispatchLedger::new(timing))),
             consecutive_no_progress: 0,
             consecutive_obligation_no_progress: 0,
-            last_cycle: None,
+            recent_cycles: VecDeque::new(),
             last_state_revision: None,
             directive_issued: false,
             proven_loop_active: false,
@@ -2404,16 +2546,27 @@ impl TurnExecutionControl {
             turn_efficiency_tool_calls: 0,
             turn_efficiency_child_runtime_ms: 0,
             budget_progress_evidence: BTreeSet::new(),
+            delivered_coverage: BTreeMap::new(),
+            artifact_source_coverage: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn batching_advisory(&self, is_continuation: bool) -> Option<String> {
+        (is_continuation
+            && self.lightweight_handoffs >= LIGHTWEIGHT_HANDOFF_ADVISORY_GENERATIONS
+            && !self.issued_directives.contains(LIGHTWEIGHT_HANDOFF_ADVISORY))
+        .then(|| LIGHTWEIGHT_HANDOFF_ADVISORY.to_string())
     }
 
     pub(crate) fn take_soft_convergence_directive(
         &mut self,
         is_continuation: bool,
     ) -> Option<String> {
+        if is_continuation && self.investigation_directive.is_some() {
+            return self.investigation_directive.take();
+        }
         if !is_continuation
             || self.soft_convergence_issued
-            || self.soft_convergence_started_at.elapsed() < SOFT_CONVERGENCE_AFTER
             || self.continuations_without_progress < SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS
         {
             return None;
@@ -2422,28 +2575,47 @@ impl TurnExecutionControl {
         Some(SOFT_CONVERGENCE_DIRECTIVE.to_string())
     }
 
-    /// Renew the emergency allowance only for new evidence, not new call IDs,
-    /// wrapper formatting, replayed results, or repeated validation failures.
-    pub(crate) fn observe_budget_progress(
+    /// Share one novelty decision between the emergency allowance and telemetry.
+    /// New call IDs, replayed results, and repeated validation/failure evidence
+    /// must not be reported as progress just because an observation occurred.
+    pub(crate) fn observe_progress(
         &mut self,
         baselines: &SamplingRequestBaselines,
         signals: &SamplingRequestSignalCollector,
         settled: &SamplingRequestSettledState,
-    ) -> bool {
+    ) -> Vec<TurnTimingProgressKind> {
+        let (tool_calls, child_runtime_ms, runtime_samples) = signals.turn_efficiency_sample();
         let state = signals
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut progressed = settled.mutation_revision != baselines.mutation_revision;
+        let mut progress = Vec::new();
+        if settled.mutation_revision != baselines.mutation_revision {
+            progress.push(TurnTimingProgressKind::WorkspaceMutation);
+        }
+        let wrappers = state.wrapper_ordinals();
+        let mut process_progress = false;
         for outcome in &state.outcomes {
             if state.replayed_ordinals.contains(&outcome.ordinal)
                 || outcome.failure_diagnosis_reused
-                || (state.code_mode_nested_tool_count > 0 && !outcome.nested_in_code_mode)
-                || matches!(
-                    outcome.kind,
-                    SamplingToolOutcomeKind::Skipped | SamplingToolOutcomeKind::Yielded
-                )
+                || wrappers.contains(&outcome.ordinal)
+                || outcome.kind == SamplingToolOutcomeKind::Skipped
             {
+                continue;
+            }
+            if outcome.kind == SamplingToolOutcomeKind::Yielded {
+                // Monitoring can advance without a terminal source result. Keep
+                // the existing generation refund and soft convergence in agreement.
+                process_progress |= outcome.process_observation_progress;
+                continue;
+            }
+            if !outcome.is_failure_evidence()
+                && let Some(novel) = outcome.source_evidence.as_ref()
+                    .and_then(|evidence| self.observe_delivered_coverage(evidence, outcome.source_artifact_id.as_deref()))
+            {
+                if novel {
+                    progress.push(TurnTimingProgressKind::NewSourceEvidence);
+                }
                 continue;
             }
             let evidence = if outcome.is_failure_evidence() {
@@ -2462,30 +2634,149 @@ impl TurnExecutionControl {
                     })
             };
             if let Some(evidence) = evidence {
-                // Identical bytes from a different source/selector establish
-                // new coverage. Repeating the same action and bytes does not.
+                // Producer-scoped coverage is independent of execution/presentation.
+                // Unscoped legacy evidence remains bound to its semantic action:
+                // a command marker alone cannot establish common provenance.
                 let evidence = if outcome.is_failure_evidence() {
                     format!("failure:{evidence}")
-                } else {
+                } else if !outcome.source_evidence.as_ref().is_some_and(|evidence| {
+                    evidence.get("source").is_some() && evidence.get("scope").is_some()
+                        && evidence.get("identity").is_some()
+                }) {
                     format!(
                         "source:{}:{evidence}",
                         state
                             .structured_actions
                             .get(&outcome.ordinal)
-                            .map(|action| action.identity.as_str())
+                            .map(|action| action.evidence_identity.as_str())
                             .unwrap_or_default()
                     )
+                } else {
+                    format!("content:{evidence}")
                 };
-                progressed |= self.budget_progress_evidence.insert(evidence);
+                if self.budget_progress_evidence.insert(evidence) {
+                    if state.validation_ordinals.contains(&outcome.ordinal) {
+                        progress.push(TurnTimingProgressKind::ValidationResult);
+                    }
+                    if outcome.is_failure_evidence() {
+                        progress.push(TurnTimingProgressKind::FailureObservation);
+                    } else if !state.validation_ordinals.contains(&outcome.ordinal) {
+                        progress.push(TurnTimingProgressKind::NewSourceEvidence);
+                    }
+                }
             }
         }
-        if progressed {
+        if let Some((narrowed, directive)) = state.investigation.as_ref().and_then(|investigation| {
+            investigation.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .finish_generation()
+        }) {
+            // Evidence accumulation and diagnostic setup are not causal
+            // narrowing. Credit only an accepted, tool-linked finding while
+            // debugging; ordinary implementation retains its existing rules.
+            progress.clear();
+            process_progress = false;
+            if narrowed {
+                progress.push(TurnTimingProgressKind::NewSourceEvidence);
+            }
+            self.investigation_directive = directive;
+        }
+        progress.sort_by_key(|kind| *kind as u8);
+        progress.dedup();
+        // Novel evidence still counts as progress. Fragmented execution is an
+        // independent advisory, never authority to suppress a call or finish.
+        // Require measured, completed, non-mutating work; do not confuse a
+        // large batch, validation, or process monitoring with serial overhead.
+        let lightweight = (1..=2).contains(&tool_calls)
+            && runtime_samples == tool_calls
+            && child_runtime_ms
+                <= tool_calls as u64 * TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL
+            && state.wait_call_count == 0
+            && state.process_monitor_ordinals.is_empty()
+            && state.mutation_ordinals.is_empty()
+            && state.validation_ordinals.is_empty()
+            && state.replayed_ordinals.is_empty()
+            && settled.mutation_revision == baselines.mutation_revision
+            && settled.tool_exposure_revision == baselines.tool_exposure_revision
+            && self.plan_revision == baselines.plan_revision
+            && self.input_revision == baselines.input_revision
+            && !state.outcomes.is_empty()
+            && state.outcomes.iter().filter(|outcome| !wrappers.contains(&outcome.ordinal))
+                .all(|outcome| outcome.kind == SamplingToolOutcomeKind::Success);
+        self.lightweight_handoffs = if lightweight {
+            self.lightweight_handoffs.saturating_add(1)
+        } else {
+            0
+        };
+        if !progress.is_empty() || process_progress {
             self.continuations_without_progress = 0;
         } else {
             self.continuations_without_progress =
                 self.continuations_without_progress.saturating_add(1);
         }
-        progressed
+        progress
+    }
+
+    /// Native file snapshots and their retained artifacts share delivered bytes,
+    /// not freshness. A new source hash or path always starts independent coverage.
+    fn observe_delivered_coverage(&mut self, evidence: &Value, artifact_id: Option<&str>) -> Option<bool> {
+        let source = evidence["source"].as_str()?;
+        if !matches!(source, "read_file" | "artifact") {
+            return None;
+        }
+        let identity = evidence.get("identity")?;
+        let sha256 = identity["sha256"].as_str()?;
+        let scope = evidence.get("scope")?;
+        let ranges = identity["ranges"].as_array()?.iter().map(|range| {
+            let range = range.as_array()?;
+            if range.len() != 2 {
+                return None;
+            }
+            let start = range[0].as_u64()?;
+            let end = range[1].as_u64()?;
+            (start <= end).then_some((start, end))
+        }).collect::<Option<Vec<_>>>()?;
+        let values = identity["values"].as_array()?;
+        let key = value_evidence_identity(&serde_json::json!([source, scope, sha256]))?;
+        let delivered = DeliveredSourceCoverage {
+            ranges,
+            query_proofs: values.iter().filter_map(value_evidence_identity).collect(),
+        };
+        let sources = self.artifact_source_coverage.get(&key).cloned().unwrap_or_default();
+        // Other reads may have filled holes since this artifact was created.
+        // Import their coverage before deciding whether recovery adds evidence.
+        if source == "artifact" {
+            for source in &sources {
+                if let Some(coverage) = self.delivered_coverage.get(source).cloned() {
+                    self.delivered_coverage.entry(key.clone()).or_default().merge(&coverage);
+                }
+            }
+        }
+        let novel = self.delivered_coverage.entry(key.clone()).or_default().merge(&delivered);
+        if source == "read_file" {
+            if let Some(id) = artifact_id {
+                let artifact_key = value_evidence_identity(&serde_json::json!(["artifact", id, sha256]))?;
+                let coverage = self.delivered_coverage.get(&key)?.clone();
+                self.delivered_coverage.entry(artifact_key.clone()).or_default().merge(&coverage);
+                self.artifact_source_coverage.entry(artifact_key).or_default().insert(key);
+            }
+        } else {
+            // Recovery delivered the exact bytes of these authenticated snapshots.
+            // It does not refresh their paths or authorize replay of stale files.
+            for source in sources {
+                self.delivered_coverage.entry(source).or_default().merge(&delivered);
+            }
+        }
+        Some(novel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_budget_progress(
+        &mut self,
+        baselines: &SamplingRequestBaselines,
+        signals: &SamplingRequestSignalCollector,
+        settled: &SamplingRequestSettledState,
+    ) -> bool {
+        !self.observe_progress(baselines, signals, settled).is_empty()
     }
 
     #[cfg(test)]
@@ -2515,6 +2806,7 @@ impl TurnExecutionControl {
             state: Arc::new(Mutex::new(SamplingRequestSignalState::default())),
             dispatch_ledger: Some(Arc::clone(&self.dispatch_ledger)),
             request_state_revision: baselines.revision_key(),
+            request_authority_revision: baselines.authority_revision_key(),
             request_mutation_revision: baselines.mutation_revision,
         }
     }
@@ -2556,7 +2848,11 @@ impl TurnExecutionControl {
     }
 
     pub(crate) fn accepted_user_input(&mut self) {
+        self.issued_directives.clear();
+        self.lightweight_handoffs = 0;
         self.input_revision = self.input_revision.saturating_add(1);
+        self.continuations_without_progress = 0;
+        self.soft_convergence_issued = false;
         self.reset_convergence();
         let mut ledger = self
             .dispatch_ledger
@@ -2565,6 +2861,10 @@ impl TurnExecutionControl {
         let timing = Arc::clone(&ledger.timing);
         *ledger = DeterministicDispatchLedger::new(timing);
         drop(ledger);
+    }
+
+    pub(crate) fn admit_directive(&mut self, directive: &str) -> bool {
+        self.issued_directives.insert(directive.to_string())
     }
 
     pub(crate) fn evaluate_convergence(
@@ -2577,10 +2877,12 @@ impl TurnExecutionControl {
         // Validation proves only its observed execution. It cannot prove that
         // all user-requested changes, checks, or child lifecycle actions are done.
         if settled.mutation_revision != baselines.mutation_revision
-            || self.plan_revision != baselines.plan_revision
+            || (self.plan_revision != baselines.plan_revision
+                && collector.authoritative_wait_observation().is_none())
             || self.input_revision != baselines.input_revision
             || settled.tool_exposure_revision != baselines.tool_exposure_revision
         {
+            self.continuations_without_progress = 0;
             self.reset_convergence();
             self.last_state_revision = Some(settled_revision);
             return SamplingConvergenceDecision::default();
@@ -2591,8 +2893,7 @@ impl TurnExecutionControl {
             .as_deref()
             .is_some_and(|previous| previous != settled_revision)
         {
-            self.reset_turn_efficiency_guard();
-            self.reset_distinct_failure_recovery();
+            self.reset_convergence();
         }
         let efficiency_sample_eligible = collector.authoritative_wait_observation().is_none();
         let (request_tool_calls, request_child_runtime_ms, runtime_samples) =
@@ -2612,9 +2913,19 @@ impl TurnExecutionControl {
             .flatten();
         let request_deterministic_cycle = request_cycle.as_ref().map(|cycle| cycle.key.clone());
         let repeated_cycle = request_cycle.as_ref().is_some_and(|cycle| {
-            self.last_cycle.as_deref() == Some(cycle.key.as_str())
-                && self.last_state_revision.as_deref() == Some(settled_revision.as_str())
+            self.recent_cycles.contains(&cycle.key)
         });
+        // Keep a bounded set of observations, not just the adjacent one.
+        // Relevant state changes above invalidate the entire window.
+        if let Some(cycle) = request_cycle.as_ref()
+            && cycle.kind != DeterministicCycleKind::Empty
+        {
+            self.recent_cycles.retain(|key| key != &cycle.key);
+            self.recent_cycles.push_back(cycle.key.clone());
+            if self.recent_cycles.len() > RECENT_CYCLE_LIMIT {
+                self.recent_cycles.pop_front();
+            }
+        }
         let failure_only_cycle = request_cycle.as_ref().is_some_and(|cycle| {
             cycle.failure_only
                 && matches!(
@@ -2646,7 +2957,6 @@ impl TurnExecutionControl {
             // Different actions or failure fingerprints are not a proven
             // loop. Keep the latest identity so an exact retry still
             // converges, but leave tools available for a narrower recovery.
-            self.last_cycle = request_deterministic_cycle;
             self.last_state_revision = Some(settled_revision);
             self.directive_issued = true;
             return SamplingConvergenceDecision {
@@ -2731,7 +3041,7 @@ impl TurnExecutionControl {
             // attempts and must not advance the failure/no-progress breaker.
             self.consecutive_no_progress = 0;
             self.consecutive_obligation_no_progress = 0;
-            self.last_cycle = None;
+            self.recent_cycles.clear();
             self.last_state_revision = Some(settled_revision);
             self.directive_issued = false;
             self.proven_loop_active = false;
@@ -2785,7 +3095,7 @@ impl TurnExecutionControl {
                             "The authoritative owner is terminal and its state is unchanged. Complete now from the existing owner result; do not call another tool."
                                 .to_string(),
                         ),
-                        proven_loop_activated: true,
+                        proven_loop_activated: false,
                         authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
                             observation.result,
                         )),
@@ -2809,7 +3119,7 @@ impl TurnExecutionControl {
                             "The authoritative owner is blocked and requires main-agent action. Do not repeat the unchanged wait. Act on the blocker now, or truthfully report it if no in-scope action can resolve it."
                                 .to_string(),
                         ),
-                        proven_loop_activated: true,
+                        proven_loop_activated: false,
                         authoritative_wait: Some(AuthoritativeWaitResolution::Blocked(
                             observation.result,
                         )),
@@ -2835,8 +3145,9 @@ impl TurnExecutionControl {
         }
 
         let Some(cycle) = request_cycle else {
-            // Missing or ambiguous structured identity is possible progress.
-            self.reset_convergence();
+            // Unknown semantics cannot prove a repeat, but do not erase the
+            // independent soft-advisory accounting or prior observations.
+            self.reset_cycle_advisory();
             self.last_state_revision = Some(settled_revision);
             return SamplingConvergenceDecision::default();
         };
@@ -2845,7 +3156,7 @@ impl TurnExecutionControl {
             // action/result cycle. It provides no semantic identity that the
             // host can prove repeated, so it must never spend the convergence
             // budget or escalate tool restrictions.
-            self.reset_convergence();
+            self.reset_cycle_advisory();
             self.last_state_revision = Some(settled_revision);
             return SamplingConvergenceDecision::default();
         }
@@ -2879,7 +3190,6 @@ impl TurnExecutionControl {
                 failure_fingerprint: failure_fingerprint.clone(),
             });
         }
-        self.last_cycle = Some(cycle.key.clone());
         self.last_state_revision = Some(settled_revision);
 
         // The first successful structured observation initializes the counter
@@ -2925,11 +3235,14 @@ impl TurnExecutionControl {
     }
 
     fn reset_convergence(&mut self) {
+        self.recent_cycles.clear();
+        self.last_state_revision = None;
+        self.reset_cycle_advisory();
+    }
+
+    fn reset_cycle_advisory(&mut self) {
         self.consecutive_no_progress = 0;
         self.consecutive_obligation_no_progress = 0;
-        self.continuations_without_progress = 0;
-        self.last_cycle = None;
-        self.last_state_revision = None;
         self.directive_issued = false;
         self.proven_loop_active = false;
         self.reset_distinct_failure_recovery();
@@ -3006,6 +3319,7 @@ impl TurnExecutionControl {
                     .successful_replay_gates
                     .push_back(SuccessfulReplayGate {
                         state_revision: state_revision.clone(),
+                        authority_revision: baselines.authority_revision_key(),
                         action_identity,
                         response,
                         evidence,
@@ -3039,6 +3353,7 @@ mod tests {
 
     fn plan(statuses: &[StepStatus]) -> UpdatePlanArgs {
         UpdatePlanArgs {
+            investigation: None,
             explanation: None,
             plan: statuses
                 .iter()
@@ -3156,6 +3471,103 @@ mod tests {
         control.settle(&baselines, &collector, &settled(0));
     }
 
+    fn lightweight_handoff_collector(
+        control: &TurnExecutionControl,
+        baselines: &SamplingRequestBaselines,
+        generation: usize,
+        calls: usize,
+        runtime_ms: Option<u64>,
+    ) -> SamplingRequestSignalCollector {
+        let collector = control.collector(baselines);
+        for call in 0..calls {
+            let id = format!("short-{generation}-{call}");
+            let registration = collector.register_deterministic_tool_call(
+                &ToolName::plain("exec_command"),
+                &ToolPayload::Function {
+                    arguments: json!({"cmd": format!("inspect-{generation}-{call}")}).to_string(),
+                },
+                &id,
+            );
+            collector.record_response_result(
+                registration.ordinal,
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                Some(crate::tools::context::semantic_evidence_sampling_signal(json!(
+                    crate::tools::context::semantic_evidence_for_command_output(id.as_bytes())
+                ))),
+                &successful_tool_response(&id, &id),
+                false,
+            );
+            if let Some(runtime) = runtime_ms {
+                collector.record_child_runtime(runtime);
+            }
+        }
+        collector
+    }
+
+    #[test]
+    fn lightweight_handoff_advisory_preserves_novel_progress_and_tool_access() {
+        let mut control = TurnExecutionControl::new();
+        let (baselines, settled) = unchanged_state(&control);
+        for generation in 1..=3 {
+            let collector = lightweight_handoff_collector(
+                &control, &baselines, generation, 1, Some(100),
+            );
+            assert_eq!(
+                control.observe_progress(&baselines, &collector, &settled),
+                vec![TurnTimingProgressKind::NewSourceEvidence],
+            );
+            assert_eq!(
+                control.batching_advisory(true).is_some(),
+                generation == 3,
+            );
+            assert!(control.batching_advisory(false).is_none());
+            let decision = control.evaluate_convergence(&baselines, &collector, &settled);
+            assert_eq!(decision.continuation, ContinuationDisposition::ModelRequired);
+            assert!(!decision.proven_loop_activated);
+            assert!(!control.continuation_generation_request(
+                &baselines, &collector, &settled, false,
+            ).terminal_completion_only);
+        }
+        let directive = control.batching_advisory(true).unwrap();
+        assert!(directive.contains("Do not skip required reading"));
+        assert!(control.admit_directive(&directive));
+        assert!(control.batching_advisory(true).is_none());
+        assert!(control.take_soft_convergence_directive(true).is_none());
+        control.accepted_user_input();
+        assert!(control.batching_advisory(true).is_none());
+    }
+
+    #[test]
+    fn lightweight_handoff_window_resets_for_unmeasured_slow_batched_or_mutating_work() {
+        for (calls, runtime, mutation_revision) in [
+            (1, None, 0),
+            (1, Some(501), 0),
+            (3, Some(100), 0),
+            (1, Some(100), 1),
+        ] {
+            let mut control = TurnExecutionControl::new();
+            let baselines = control.baselines(0);
+            for generation in 0..2 {
+                let collector = lightweight_handoff_collector(
+                    &control, &baselines, generation, 1, Some(100),
+                );
+                control.observe_progress(&baselines, &collector, &settled(0));
+            }
+            let boundary = lightweight_handoff_collector(
+                &control, &baselines, 2, calls, runtime,
+            );
+            control.observe_progress(&baselines, &boundary, &settled(mutation_revision));
+            assert!(control.batching_advisory(true).is_none());
+            for generation in 3..6 {
+                let collector = lightweight_handoff_collector(
+                    &control, &baselines, generation, 1, Some(100),
+                );
+                control.observe_progress(&baselines, &collector, &settled(0));
+                assert_eq!(control.batching_advisory(true).is_some(), generation == 5);
+            }
+        }
+    }
+
     fn observe_no_progress(control: &mut TurnExecutionControl) {
         let baselines = control.baselines(0);
         assert!(!control.observe_budget_progress(
@@ -3169,12 +3581,9 @@ mod tests {
     async fn soft_convergence_is_once_per_turn_and_only_on_a_needed_continuation() {
         let mut control = TurnExecutionControl::new();
         assert!(control.take_soft_convergence_directive(true).is_none());
-        tokio::time::advance(SOFT_CONVERGENCE_AFTER - std::time::Duration::from_millis(1)).await;
         for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
             observe_no_progress(&mut control);
         }
-        assert!(control.take_soft_convergence_directive(true).is_none());
-        tokio::time::advance(std::time::Duration::from_millis(1)).await;
         assert!(control.take_soft_convergence_directive(false).is_none());
         let directive = control
             .take_soft_convergence_directive(true)
@@ -3186,7 +3595,6 @@ mod tests {
         assert!(directive.contains("abandon obtainable required evidence"));
         assert!(directive.contains("does not interrupt an in-flight request"));
         control.reset_convergence();
-        tokio::time::advance(SOFT_CONVERGENCE_AFTER).await;
         assert!(control.take_soft_convergence_directive(true).is_none());
         assert!(
             !control
@@ -3195,7 +3603,6 @@ mod tests {
         );
         let mut next_turn = TurnExecutionControl::new();
         assert!(next_turn.take_soft_convergence_directive(true).is_none());
-        tokio::time::advance(SOFT_CONVERGENCE_AFTER).await;
         for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
             observe_no_progress(&mut next_turn);
         }
@@ -3208,7 +3615,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn soft_convergence_waits_for_generations_without_progress() {
         let mut control = TurnExecutionControl::new();
-        tokio::time::advance(SOFT_CONVERGENCE_AFTER).await;
         // Time alone is not a stall: an investigation that keeps producing new
         // evidence or mutations must not be told to stop exploring.
         for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS - 1 {
@@ -3284,8 +3690,185 @@ mod tests {
     }
 
     #[test]
+    fn progress_telemetry_fingerprints_actual_actions_not_call_ids_or_outcomes() {
+        let fingerprint = |tool: &str, arguments: &str, call_id: &str| {
+            let collector = SamplingRequestSignalCollector::default();
+            let registration = collector.register_deterministic_tool_call(
+                &ToolName::plain(tool),
+                &ToolPayload::Function {
+                    arguments: arguments.to_string(),
+                },
+                call_id,
+            );
+            collector.record_failure(registration.ordinal, call_id, false);
+            collector.structured_action_fingerprint()
+        };
+        let first = fingerprint(
+            "read_file",
+            r#"{"path":"a","environment_id":"local"}"#,
+            "one",
+        );
+        assert!(first.is_some());
+        assert_eq!(
+            first,
+            fingerprint(
+                "read_file",
+                r#"{"environment_id":"local","path":"a"}"#,
+                "two"
+            )
+        );
+        assert_ne!(first, fingerprint("read_file", r#"{"path":"b"}"#, "one"));
+        assert_ne!(
+            first,
+            fingerprint(
+                "list_files",
+                r#"{"path":"a","environment_id":"local"}"#,
+                "one"
+            )
+        );
+        assert_eq!(fingerprint("read_file", "{", "invalid"), None);
+        assert_ne!(
+            first,
+            SamplingRequestSignalCollector::default().structured_action_fingerprint()
+        );
+    }
+
+    #[test]
+    fn progress_telemetry_counts_new_source_evidence_and_repeated_read_generations() {
+        let timing = Arc::new(TurnTimingState::default());
+        timing.mark_turn_started();
+        let mut control = TurnExecutionControl::new_with_timing(Arc::clone(&timing));
+        let baselines = control.baselines(0);
+        // Unscoped command output is bound to the command that produced it:
+        // the same bytes from another path are new provenance, repeats are not.
+        for (index, (path, text, novel)) in [
+            ("a", "first", true),
+            ("a", "first", false),
+            ("a", "changed", true),
+            ("b", "changed", true),
+            ("b", "changed", false),
+            ("b", "changed", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut pending = (index > 0).then_some(crate::turn_timing::ContinuationCause::ToolResult);
+            timing.begin_model_generation_with_metadata(
+                &mut pending,
+                &codex_protocol::protocol::SessionSource::Cli,
+                Some(TurnTimingGenerationPurpose::ArtifactContinuation),
+                TurnTimingGenerationDisposition::DecisionBearing,
+                Some(baselines.relevant_state_fingerprint()),
+            );
+            drop(timing.begin_model_request_wait());
+            let collector = control.collector(&baselines);
+            let call_id = format!("read-{index}");
+            let registration = collector.register_deterministic_tool_call(
+                &ToolName::plain("shell_command"),
+                &ToolPayload::Function {
+                    arguments: json!({"command": format!("cat {path}")}).to_string(),
+                },
+                &call_id,
+            );
+            collector.record_response_result(
+                registration.ordinal,
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                Some(crate::tools::context::semantic_evidence_sampling_signal(json!(
+                    crate::tools::context::semantic_evidence_for_command_output(text.as_bytes())
+                ))),
+                &successful_tool_response(&call_id, text),
+                false,
+            );
+            let progress = control.observe_progress(&baselines, &collector, &settled(0));
+            assert_eq!(
+                progress,
+                if novel {
+                    vec![TurnTimingProgressKind::NewSourceEvidence]
+                } else {
+                    Vec::new()
+                }
+            );
+            timing.record_generation_outcome(
+                progress.clone(),
+                collector.structured_action_fingerprint(),
+                progress.is_empty(),
+            );
+        }
+        let timing = timing.complete_snapshot().protocol_timing();
+        assert_eq!(
+            timing.observational_nonprogress_latency.logical_generations,
+            3
+        );
+        assert_eq!(
+            timing
+                .model_requests
+                .iter()
+                .map(|request| request.unchanged_relevant_state)
+                .collect::<Vec<_>>(),
+            vec![false, true, false, false, true, true]
+        );
+        assert!(
+            timing
+                .model_requests
+                .last()
+                .unwrap()
+                .next_structured_action_changed
+        );
+    }
+
+    #[test]
+    fn progress_telemetry_reports_only_novel_validation_and_failure_evidence() {
+        for failed in [false, true] {
+            let mut control = TurnExecutionControl::new();
+            let baselines = control.baselines(0);
+            for (index, (evidence, novel)) in [
+                ("first result", true),
+                ("first result", false),
+                ("changed result", true),
+                ("changed result", false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let collector = control.collector(&baselines);
+                let call_id = format!("validation-{index}");
+                let registration = collector.register_deterministic_tool_call(
+                    &ToolName::plain("exec_command"),
+                    &validation_proof_payload(),
+                    &call_id,
+                );
+                collector.record_response_result(
+                    registration.ordinal,
+                    ToolOutputOutcomeContext::new(if failed {
+                        ToolOutputOutcome::Failure
+                    } else {
+                        ToolOutputOutcome::Success
+                    }),
+                    failed.then(|| json!({"failure_signature": evidence})),
+                    &runner_tool_response(&call_id, evidence),
+                    false,
+                );
+                let expected = if !novel {
+                    Vec::new()
+                } else if failed {
+                    vec![
+                        TurnTimingProgressKind::ValidationResult,
+                        TurnTimingProgressKind::FailureObservation,
+                    ]
+                } else {
+                    vec![TurnTimingProgressKind::ValidationResult]
+                };
+                assert_eq!(
+                    control.observe_progress(&baselines, &collector, &settled(0)),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn replayed_validation_is_not_new_execution_or_external_progress() {
-        let control = TurnExecutionControl::new();
+        let mut control = TurnExecutionControl::new();
         let baselines = control.baselines(0);
         let collector = control.collector(&baselines);
         let registration = collector.register_deterministic_tool_call(
@@ -3297,8 +3880,8 @@ mod tests {
         collector.record_replayed_response_result(registration.ordinal, &response);
         assert_eq!(collector.executed_validation_summary().count, 0);
         assert!(
-            !collector
-                .progress_kinds(&baselines, &settled(0))
+            !control
+                .observe_progress(&baselines, &collector, &settled(0))
                 .contains(&TurnTimingProgressKind::ValidationResult)
         );
         assert_eq!(
@@ -3322,8 +3905,8 @@ mod tests {
         );
         assert_eq!(executed.executed_validation_summary().count, 1);
         assert!(
-            executed
-                .progress_kinds(&baselines, &settled(0))
+            control
+                .observe_progress(&baselines, &executed, &settled(0))
                 .contains(&TurnTimingProgressKind::ValidationResult)
         );
     }
@@ -5696,7 +6279,7 @@ mod tests {
             collector.record_response_result(
                 registration.ordinal,
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
-                Some(json!({"semantic_evidence": ["identical file content"]})),
+                Some(json!({"command_evidence": true, "semantic_evidence": ["identical file content"]})),
                 &successful_tool_response("read-source", "identical file content"),
                 false,
             );
@@ -5743,7 +6326,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_write_stdin_observation_is_relevant_progress() {
+    fn silent_successful_write_stdin_does_not_refund_a_generation() {
         let control = TurnExecutionControl::new();
         let (baselines, _) = unchanged_state(&control);
         let collector = control.collector(&baselines);
@@ -5763,7 +6346,7 @@ mod tests {
         );
 
         assert!(collector.has_process_monitor());
-        assert!(collector.observed_successful_process_monitor());
+        assert!(!collector.observed_successful_process_monitor());
     }
 
     #[test]
@@ -5794,7 +6377,7 @@ mod tests {
     }
 
     #[test]
-    fn yielded_write_stdin_observation_is_relevant_progress() {
+    fn yielded_write_stdin_with_new_output_refunds_a_generation() {
         let control = TurnExecutionControl::new();
         let (baselines, _) = unchanged_state(&control);
         let collector = control.collector(&baselines);
@@ -5808,7 +6391,7 @@ mod tests {
         collector.record_response_result(
             registration.ordinal,
             ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
-            None,
+            Some(json!({"process_observation_progress": true})),
             &successful_tool_response("poll-yielded", r#"{"session_id":7,"running":true}"#),
             false,
         );
@@ -6504,7 +7087,7 @@ mod tests {
             decision.authoritative_wait,
             Some(AuthoritativeWaitResolution::Blocked(_))
         ));
-        assert!(decision.proven_loop_activated);
+        assert!(!decision.proven_loop_activated);
 
         let repeated = control.collector(&baselines);
         let registration = repeated.register_deterministic_tool_call(
@@ -6515,6 +7098,33 @@ mod tests {
             "repeated-wait-call",
         );
         assert!(registration.blocked_wait_guard.is_some());
+    }
+
+    #[test]
+    fn blocked_wait_batched_with_plan_still_installs_its_owner_guard() {
+        let mut control = TurnExecutionControl::new();
+        let (baselines, settled) = unchanged_state(&control);
+        let collector = control.collector(&baselines);
+        blocked_wait(&collector, "receipt-1");
+        let registration = collector.register_deterministic_tool_call(
+            &ToolName::plain("update_plan"),
+            &ToolPayload::Function { arguments: r#"{"plan":[]}"#.into() },
+            "plan",
+        );
+        collector.push(SamplingToolOutcome::plain(
+            registration.ordinal, SamplingToolOutcomeKind::Success,
+            Some(plan(&[StepStatus::InProgress])),
+        ));
+        control.settle(&baselines, &collector, &settled);
+        let decision = control.evaluate_convergence(&baselines, &collector, &settled);
+        assert!(matches!(decision.authoritative_wait, Some(AuthoritativeWaitResolution::Blocked(_))));
+        assert!(!decision.proven_loop_activated);
+        let repeated = control.collector(&control.baselines(7));
+        assert!(repeated.register_deterministic_tool_call(
+            &ToolName::plain("wait_agent"),
+            &ToolPayload::Function { arguments: r#"{"cursor":"cursor-1"}"#.into() },
+            "repeat",
+        ).blocked_wait_guard.is_some());
     }
 
     #[test]
@@ -6697,6 +7307,7 @@ mod tests {
             )
             .ordinal;
         let nested_plan = plan(&[StepStatus::Pending]);
+        collector.record_code_mode_parent("cell-1", Some("exec-call"));
         let source_evidence = json!({
             "owner": "planning-architecture-runtime",
             "omitted_relationships": 0,
@@ -6976,6 +7587,7 @@ mod tests {
             )
             .ordinal;
         let nested_plan = plan(&[StepStatus::InProgress]);
+        collector.record_code_mode_parent("cell-1", Some("exec-call"));
         collector.record_code_mode_result(CodeModeToolResult {
             cell_id: "cell-1",
             tool_name: &ToolName::plain("update_plan"),

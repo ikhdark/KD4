@@ -446,13 +446,22 @@ async fn immutable_git_show_identity_with_authorization_scope(
     } else {
         ProjectNamespaceHint::Discover
     };
-    let project_namespace = match project_namespace_hint {
-        ProjectNamespaceHint::Resolved(Some(namespace)) => namespace.to_owned(),
-        ProjectNamespaceHint::Resolved(None) => return None,
-        ProjectNamespaceHint::Discover => git_project_namespace(cwd).await?,
-    };
-    let cwd_position = git_stdout(cwd, &["rev-parse", "--show-prefix"]).await?;
-    let resolved_blob = git_resolve_blob(cwd, &normalized_requested).await?;
+    if matches!(project_namespace_hint, ProjectNamespaceHint::Resolved(None)) {
+        return None;
+    }
+    let (project_namespace, cwd_position, resolved_blob) = tokio::join!(
+        async {
+            match project_namespace_hint {
+                ProjectNamespaceHint::Resolved(namespace) => namespace.map(str::to_owned),
+                ProjectNamespaceHint::Discover => git_project_namespace(cwd).await,
+            }
+        },
+        git_stdout(cwd, &["rev-parse", "--show-prefix"]),
+        git_resolve_blob(cwd, &normalized_requested),
+    );
+    let project_namespace = project_namespace?;
+    let cwd_position = cwd_position?;
+    let resolved_blob = resolved_blob?;
     let program_identity = program.replace('\\', "/");
     let lineage_key = digest(
         format!("git_show_resolved_object\0program={program_identity}\0{normalized_suffix}")

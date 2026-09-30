@@ -275,6 +275,16 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
 
 #[tokio::test]
 async fn malformed_client_tool_search_records_correlated_tool_search_output() {
+    use crate::session::turn_execution::SamplingRequestSettledState;
+    use crate::session::turn_execution::TurnExecutionControl;
+
+    let mut control = TurnExecutionControl::new();
+    let baselines = control.baselines(0);
+    let settled = SamplingRequestSettledState {
+        mutation_revision: 0,
+        tool_exposure_revision: 0,
+    };
+    let collector = control.collector(&baselines);
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
@@ -293,7 +303,8 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     ));
     let step_context = step_context.with_tool_router_for_test(router);
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    let tool_runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker);
+    let tool_runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker)
+        .with_sampling_request_signals(collector.clone());
     let item = ResponseItem::ToolSearchCall {
         id: None,
         call_id: Some("search-malformed".to_string()),
@@ -312,13 +323,15 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     };
 
     let output = handle_output_item_done(
-        &mut ctx, item, /*previously_active_item*/ None, &mut true,
+        &mut ctx, item.clone(), /*previously_active_item*/ None, &mut true,
     )
     .await
     .expect("malformed tool_search call should be recorded for model recovery");
 
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_none());
+    assert!(control.observe_budget_progress(&baselines, &collector, &settled));
+    assert!(control.evaluate_convergence(&baselines, &collector, &settled).directive.is_none());
     ctx.response_item_recorder.flush().await.unwrap();
     let history = session.clone_history().await;
     let [
@@ -358,6 +371,19 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
         tools.is_empty(),
         "failed searches must not publish invalid tool declarations"
     );
+
+    let repeated = control.collector(&baselines);
+    ctx.tool_runtime = ctx.tool_runtime.clone().with_sampling_request_signals(repeated.clone());
+    let mut item = item;
+    if let ResponseItem::ToolSearchCall { call_id, .. } = &mut item {
+        *call_id = Some("search-malformed-again".into());
+    }
+    let output = handle_output_item_done(&mut ctx, item, None, &mut true).await.unwrap();
+    assert!(output.needs_follow_up);
+    assert!(output.tool_future.is_none());
+    assert!(!control.observe_budget_progress(&baselines, &repeated, &settled));
+    assert!(control.evaluate_convergence(&baselines, &repeated, &settled).directive.is_some());
+    ctx.response_item_recorder.flush().await.unwrap();
 }
 
 #[tokio::test]

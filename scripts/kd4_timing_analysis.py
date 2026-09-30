@@ -1152,6 +1152,7 @@ def _population_report(
         "toolActiveUnionNs": 0,
     }
     deterministic = dict(nonprogress)
+    source_evidence_only = dict(nonprogress)
     residual_measurements: list[int] = []
     decision_ready_attempts = 0
     decision_latency_ns = 0
@@ -1322,6 +1323,13 @@ def _population_report(
                 ),
             )
         _sum_metric(
+            source_evidence_only,
+            _request_metric(
+                requests,
+                lambda request: request.get("progressKinds") == ["new_source_evidence"],
+            ),
+        )
+        _sum_metric(
             deterministic,
             _request_metric(
                 requests,
@@ -1415,6 +1423,16 @@ def _population_report(
         else {},
         "toolRelay": _tool_relay_report(all_tool_calls, tool_call_timing_overflow),
         "observationalNonprogressLatency": nonprogress,
+        "sourceEvidenceOnlyLatency": {
+            **source_evidence_only,
+            "retentionComplete": retention["complete"],
+            "definition": (
+                "Retained generations whose only recorded progress is new source "
+                "evidence, including their retries. Novelty does not establish "
+                "decision progress; these costs are not proven waste or savings. "
+                "Independent of the runtime nonprogress counter and next-action changes."
+            ),
+        },
         "toolResultInterpretationLatency": deterministic,
     }
 

@@ -294,8 +294,15 @@ pub(super) fn permission_profile_to_metadata_value(
 }
 
 pub(super) fn distinct_thread_metadata_title(metadata: &ThreadMetadata) -> Option<String> {
-    let title = metadata.title.trim();
-    if title.is_empty() || metadata.first_user_message.as_deref().map(str::trim) == Some(title) {
+    distinct_thread_title(&metadata.title, metadata.first_user_message.as_deref())
+}
+
+pub(super) fn distinct_thread_title(
+    title: &str,
+    first_user_message: Option<&str>,
+) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() || first_user_message.map(str::trim) == Some(title) {
         None
     } else {
         Some(title.to_string())

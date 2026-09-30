@@ -3,6 +3,7 @@ mod confined_file;
 mod find_up;
 
 pub use confined_file::open_confined_file;
+pub use confined_file::open_confined_file_with_metadata;
 pub use find_up::FindUpErrorPolicy;
 pub use find_up::find_nearest_ancestor_with_markers;
 pub use find_up::find_nearest_native_ancestor_with_markers;
@@ -76,8 +77,8 @@ pub struct ReadDirectoryEntry {
 
 /// A producer-bounded directory read.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReadDirectoryOutcome {
-    pub entries: Vec<ReadDirectoryEntry>,
+pub struct ReadDirectoryOutcome<T = ReadDirectoryEntry> {
+    pub entries: Vec<T>,
     /// Number of raw directory entries consumed from the filesystem.
     pub entries_examined: usize,
     /// Whether the read stopped because it exhausted its entry budget.
@@ -85,6 +86,33 @@ pub struct ReadDirectoryOutcome {
     /// This is conservative: it may be true when the directory contains
     /// exactly `entries_examined` entries.
     pub limit_reached: bool,
+}
+
+/// Walk classification captured by the enumerating backend, when available.
+/// This is an observation, not a stable snapshot or an authorization decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalkDirectoryEntry {
+    pub file_name: String,
+    pub metadata: Option<WalkEntryMetadata>,
+}
+
+/// Only the classification bits a walk consumes. Retaining full metadata for
+/// every entry would increase the memory cost of large bounded batches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalkEntryMetadata {
+    pub is_directory: bool,
+    pub is_file: bool,
+    pub is_symlink: bool,
+}
+
+impl From<FileMetadata> for WalkEntryMetadata {
+    fn from(metadata: FileMetadata) -> Self {
+        Self {
+            is_directory: metadata.is_directory,
+            is_file: metadata.is_file,
+            is_symlink: metadata.is_symlink,
+        }
+    }
 }
 
 /// Bounds for a recursive filesystem walk.
@@ -432,6 +460,34 @@ pub trait ExecutorFileSystem: Send + Sync {
         })
     }
 
+    /// Like [`Self::read_directory_bounded`], optionally retaining link-aware
+    /// metadata already obtained during enumeration. Backends without that
+    /// information retain the walker's bounded metadata-probe fallback.
+    fn read_directory_bounded_for_walk<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
+        Box::pin(async move {
+            let batch = self
+                .read_directory_bounded(path, max_entries, sandbox)
+                .await?;
+            Ok(ReadDirectoryOutcome {
+                entries: batch
+                    .entries
+                    .into_iter()
+                    .map(|entry| WalkDirectoryEntry {
+                        file_name: entry.file_name,
+                        metadata: None,
+                    })
+                    .collect(),
+                entries_examined: batch.entries_examined,
+                limit_reached: batch.limit_reached,
+            })
+        })
+    }
+
     /// Recursively lists descendants, optionally following directory symlinks.
     fn walk<'a>(
         &'a self,
@@ -521,7 +577,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
             return Ok(outcome);
         }
         let batch = match file_system
-            .read_directory_bounded(&directory, options.max_entries - entry_count, sandbox)
+            .read_directory_bounded_for_walk(&directory, options.max_entries - entry_count, sandbox)
             .await
         {
             Ok(batch) => batch,
@@ -544,12 +600,18 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
         entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
 
         let mut probes = futures::stream::iter(entries)
-            .map(|entry| {
+            .map(|mut entry| {
                 let path = directory.join(&entry.file_name);
                 async move {
                     match path {
                         Ok(path) => {
-                            let metadata = file_system.get_metadata(&path, sandbox).await;
+                            let metadata = match entry.metadata.take() {
+                                Some(metadata) => Ok(metadata),
+                                None => file_system
+                                    .get_metadata(&path, sandbox)
+                                    .await
+                                    .map(Into::into),
+                            };
                             (entry, Ok((path, metadata)))
                         }
                         Err(error) => (entry, Err(error)),

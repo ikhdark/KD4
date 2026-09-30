@@ -212,7 +212,7 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
         codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
     );
     assert!(
-        instructions_text.contains("Add tests only for concrete coverage gaps, assert observable behavior, and do not weaken assertions.")
+        instructions_text.contains("Tests must prevent a concrete behavioral failure or meaningful regression.")
     );
     assert!(!instructions_text.contains("{{ personality }}"));
 

@@ -927,6 +927,48 @@ mod request_setting_tests {
     }
 
     #[tokio::test]
+    async fn unchanged_high_reasoning_reuses_prefix_but_effort_switches_do_not() {
+        let digests = crate::client_common::PromptDigests {
+            instructions: Some([1; 32]),
+            tools: Some([2; 32]),
+            history: None,
+        };
+        let mut baseline = None;
+        let mut items = vec![history_test_item("task", Some("turn-1"))];
+        for (index, effort) in [
+            ReasoningEffort::High,
+            ReasoningEffort::High,
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut request = history_test_request(items.clone());
+            request.reasoning = Some(codex_api::Reasoning {
+                effort: Some(effort),
+                summary: None,
+                context: None,
+            });
+            let mut measured = measured_after_dispatch(request, true).await;
+            measured.compare_and_remember_prompt_context(&mut baseline, Some("cache-key"), digests);
+            assert_eq!(measured.fixed_prefix_reuse_eligible, index == 1);
+            let changed = measured
+                .request_token_categories()
+                .fixed_prefix_changed_categories;
+            if index >= 2 {
+                assert_eq!(changed, vec!["request.reasoning".to_string()]);
+            } else {
+                assert!(changed.is_empty());
+            }
+            items.push(history_test_tool_output(
+                &format!("call-{index}"),
+                "new tool result",
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn dispatched_request_settings_gate_fixed_prefix_reuse() {
         let digests = crate::client_common::PromptDigests {
             instructions: Some([1; 32]),
@@ -2757,6 +2799,7 @@ async fn terminal_request_disables_calls_without_changing_cached_tools() {
     for lite in [false, true] {
         let mut model = test_model_info();
         model.use_responses_lite = lite;
+        model.supports_reasoning_summaries = true;
         let mut prompt = request_schema_cache_test_prompt();
         prompt.parallel_tool_calls = true;
         let build = |prompt: &Prompt| {
@@ -2765,7 +2808,7 @@ async fn terminal_request_disables_calls_without_changing_cached_tools() {
                     &setup.api_provider,
                     prompt,
                     &model,
-                    None,
+                    Some(ReasoningEffort::High),
                     codex_protocol::config_types::ReasoningSummary::None,
                     None,
                     &metadata,
@@ -2780,6 +2823,10 @@ async fn terminal_request_disables_calls_without_changing_cached_tools() {
         assert_eq!(ordinary.tools, terminal.tools);
         assert_eq!(ordinary.input, terminal.input);
         assert_eq!(ordinary.parallel_tool_calls, terminal.parallel_tool_calls);
+        for request in [ordinary, terminal] {
+            let wire = serde_json::to_value(request).unwrap();
+            assert_eq!(wire["reasoning"]["effort"], "high");
+        }
     }
 }
 

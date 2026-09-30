@@ -19,14 +19,17 @@ use anyhow::Context;
 use anyhow::Result;
 use std::ffi::c_void;
 use std::fs::File;
+use std::io::Read;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
 use windows_sys::Win32::Foundation::DuplicateHandle;
@@ -37,7 +40,6 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
-use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetCurrentThread;
@@ -49,11 +51,6 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const RUNNER_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNNER_PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-// A runner normally acknowledges within tens of milliseconds, and every elevated command waits
-// here, so poll briskly at first and only fall back to the slow cadence for a slow start.
-const RUNNER_SPAWN_READY_FAST_POLL_WINDOW: Duration = Duration::from_millis(250);
-const RUNNER_SPAWN_READY_FAST_POLL_INTERVAL: Duration = Duration::from_millis(2);
-const RUNNER_SPAWN_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RUNNER_ERROR_MODE_FLAGS: u32 = 0x0001 | 0x0002;
 const WAIT_OBJECT_0: u32 = 0;
 
@@ -162,8 +159,7 @@ impl RunnerTransport {
     }
 
     pub(crate) fn read_spawn_ready(&mut self) -> Result<()> {
-        wait_for_complete_frame(&self.pipe_read, RUNNER_SPAWN_READY_TIMEOUT)?;
-        let msg = read_frame(&mut self.pipe_read)?
+        let msg = read_frame_with_timeout(&self.pipe_read, RUNNER_SPAWN_READY_TIMEOUT)?
             .ok_or_else(|| anyhow::anyhow!("runner pipe closed before spawn_ready"))?;
         match msg.message {
             Message::SpawnReady { .. } => Ok(()),
@@ -481,59 +477,58 @@ pub(crate) fn spawn_runner_transport(
     Ok(transport)
 }
 
-fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
-    let handle = pipe_read.as_raw_handle() as HANDLE;
-    let started = Instant::now();
-    let deadline = started + timeout;
-    let mut len_buf = [0u8; 4];
+struct StartupReader {
+    pipe: File,
+    cancelled: Arc<AtomicBool>,
+}
 
-    loop {
-        let mut bytes_read = 0u32;
-        let mut total_available = 0u32;
-        // SAFETY: pipe_read retains its valid pipe handle; len_buf and both count slots are
-        // writable and the requested peek size is exactly len_buf.len().
-        let ok = unsafe {
-            PeekNamedPipe(
-                handle,
-                len_buf.as_mut_ptr() as *mut c_void,
-                len_buf.len() as u32,
-                &mut bytes_read,
-                &mut total_available,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            // SAFETY: Read the thread-local error immediately after PeekNamedPipe reports failure;
-            // this call takes no pointers.
-            let err = unsafe { GetLastError() } as i32;
-            return Err(anyhow::anyhow!(
-                "PeekNamedPipe failed while waiting for spawn_ready: {err}"
+impl Read for StartupReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "runner startup read cancelled",
             ));
         }
+        self.pipe.read(bytes)
+    }
+}
 
-        if bytes_read == len_buf.len() as u32 {
-            let frame_len = u32::from_le_bytes(len_buf) as usize;
-            let total_len = frame_len
-                .checked_add(len_buf.len())
-                .ok_or_else(|| anyhow::anyhow!("runner frame length overflow"))?;
-            if total_available as usize >= total_len {
-                return Ok(());
+fn read_frame_with_timeout(pipe_read: &File, timeout: Duration) -> Result<Option<FramedMessage>> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut reader = StartupReader {
+        pipe: pipe_read.try_clone()?,
+        cancelled: Arc::clone(&cancelled),
+    };
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("codex-runner-spawn-ready".into())
+        .spawn(move || {
+            let _ = result_tx.send(read_frame(&mut reader));
+        })?;
+    match result_rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let _ = worker.join();
+            result
+        }
+        Err(error) => {
+            cancelled.store(true, Ordering::Release);
+            // SAFETY: the JoinHandle keeps this exact native thread handle
+            // alive. The worker owns a duplicate pipe handle until read exits.
+            unsafe { CancelSynchronousIo(worker.as_raw_handle() as HANDLE) };
+            // Do not join on failure. spawn_runner_transport terminates the
+            // runner and closes its writer, releasing even a read that entered
+            // just after cancellation. The flag prevents subsequent frame reads.
+            match error {
+                mpsc::RecvTimeoutError::Timeout => Err(anyhow::anyhow!(
+                    "timed out after {}ms waiting for runner spawn_ready",
+                    timeout.as_millis()
+                )),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    Err(anyhow::anyhow!("runner startup reader exited without a result"))
+                }
             }
         }
-
-        if Instant::now() >= deadline {
-            return Err(anyhow::anyhow!(
-                "timed out after {}ms waiting for runner spawn_ready",
-                timeout.as_millis()
-            ));
-        }
-
-        let poll_interval = if started.elapsed() < RUNNER_SPAWN_READY_FAST_POLL_WINDOW {
-            RUNNER_SPAWN_READY_FAST_POLL_INTERVAL
-        } else {
-            RUNNER_SPAWN_READY_POLL_INTERVAL
-        };
-        std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -548,6 +543,76 @@ mod tests {
     use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
     use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
     use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+
+    fn startup_test_pipe() -> (std::fs::File, std::fs::File) {
+        use std::os::windows::io::FromRawHandle;
+        let mut read = std::ptr::null_mut();
+        let mut write = std::ptr::null_mut();
+        // SAFETY: both handle output slots are live; null security attributes
+        // make the new handles non-inheritable. Each transfers to one File.
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::System::Pipes::CreatePipe(
+                    &mut read,
+                    &mut write,
+                    std::ptr::null(),
+                    0,
+                )
+            },
+            0
+        );
+        // SAFETY: CreatePipe succeeded and each new handle is transferred once.
+        unsafe {
+            (
+                std::fs::File::from_raw_handle(read),
+                std::fs::File::from_raw_handle(write),
+            )
+        }
+    }
+
+    #[test]
+    fn startup_reader_delivers_frame_and_leaves_following_frame_unread() {
+        let (read, mut write) = startup_test_pipe();
+        let message = crate::ipc_framed::FramedMessage {
+            version: crate::ipc_framed::IPC_PROTOCOL_VERSION,
+            message: crate::ipc_framed::Message::SpawnReady {
+                payload: crate::ipc_framed::SpawnReady { process_id: 42 },
+            },
+        };
+        crate::ipc_framed::write_frame(&mut write, &message).unwrap();
+        crate::ipc_framed::write_frame(&mut write, &message).unwrap();
+        for _ in 0..2 {
+            let received = super::read_frame_with_timeout(&read, std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                received.message,
+                crate::ipc_framed::Message::SpawnReady { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn startup_reader_bounds_partial_frames_and_rejects_oversized_headers() {
+        use std::io::Write;
+        for header in [4_u32, 8_388_609] {
+            let (read, mut write) = startup_test_pipe();
+            write.write_all(&header.to_le_bytes()).unwrap();
+            let timeout = if header == 4 {
+                std::time::Duration::from_millis(50)
+            } else {
+                std::time::Duration::from_secs(2)
+            };
+            let error = super::read_frame_with_timeout(&read, timeout).unwrap_err();
+            if header == 4 {
+                assert!(error.to_string().contains("timed out"));
+            } else {
+                assert!(error.to_string().contains("exceeding"));
+            }
+            // Mirrors startup rollback closing the runner's writer.
+            drop(write);
+        }
+    }
 
     #[test]
     fn refreshable_sandbox_creds_error_recognizes_credential_and_child_start_failures() {

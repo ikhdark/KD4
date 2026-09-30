@@ -117,8 +117,6 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
     let validator = jsonschema::validator_for(&schema).unwrap();
     for arguments in [
         json!({"path": ".", "max_entries": 0}),
-        json!({"path": ".", "max_entries": 50_001}),
-        json!({"path": ".", "max_depth": 65}),
         json!({"path": ".", "max_depth": -1}),
         json!({"path": ".", "typo": true}),
     ] {
@@ -129,6 +127,16 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
                 .await
                 .is_err()
         );
+    }
+    for arguments in [
+        json!({"path": ".", "max_entries": 50_001}),
+        json!({"path": ".", "max_depth": 65}),
+    ] {
+        assert!(validator.is_valid(&arguments));
+        let call = invocation(root.path(), arguments).await;
+        let payload = call.payload.clone();
+        let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+        assert_eq!(output["complete"], true);
     }
     assert!(
         ListFilesHandler

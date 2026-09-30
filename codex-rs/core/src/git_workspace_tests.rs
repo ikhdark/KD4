@@ -22,6 +22,42 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell_snapshot::ShellSnapshot;
 
 #[tokio::test]
+async fn evidence_reuse_transient_capture_failure_expires_without_a_workspace_change() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let initial = cache.workspace_evidence_identity_with_attribution(repo.as_path()).await;
+    assert!(initial.identity.as_ref().is_some_and(|identity| !identity.unavailable));
+    let root = cache.resolve_workspace_root(repo.as_path()).await.unwrap().unwrap();
+    let key = WorkspaceEvidenceCaptureKey {
+        repo_root: root.clone(),
+        watcher_generation: cache.watcher_generation.load(Ordering::Acquire),
+        source_watcher_generation: cache.source_capture_generation.load(Ordering::Acquire),
+        host_mutation_generation: cache.host_mutation_generation.load(Ordering::Acquire),
+    };
+    let failed = WorkspaceEvidenceCapture {
+        identity: Some(WorkspaceEvidenceIdentity::unavailable(Some(&root))),
+        timed_out_git_dependencies: Vec::new(),
+    };
+    {
+        let mut retention = cache.repository_retention.lock().unwrap();
+        let entry = retention.latest_workspace_evidence.get_mut(&root).unwrap();
+        entry.failed_capture = Some((key, failed, Instant::now()));
+    }
+    let captures = cache.workspace_evidence_capture_count();
+    let cached = cache.workspace_evidence_identity_with_attribution(repo.as_path()).await;
+    assert!(cached.identity.unwrap().unavailable);
+    assert_eq!(cache.workspace_evidence_capture_count(), captures);
+    {
+        let mut retention = cache.repository_retention.lock().unwrap();
+        let entry = retention.latest_workspace_evidence.get_mut(&root).unwrap();
+        entry.failed_capture.as_mut().unwrap().2 = Instant::now() - WORKSPACE_FAILURE_RETRY_INTERVAL;
+    }
+    let recovered = cache.workspace_evidence_identity_with_attribution(repo.as_path()).await;
+    assert_eq!(recovered.identity, initial.identity);
+    assert_eq!(cache.workspace_evidence_capture_count(), captures + 1);
+}
+
+#[tokio::test]
 async fn ignored_build_events_are_journaled_without_changing_capture_keys() {
     let (_temp, repo) = create_clean_git_repo().await;
     std::fs::write(repo.join(".gitignore"), "/target/\n/lanes/\n").unwrap();

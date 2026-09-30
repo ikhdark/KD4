@@ -64,10 +64,16 @@ purposeAggregates?: Array<TurnTimingGenerationPurposeAggregate>, samePurposeCont
  * Wait generations sharing coarse revisions; this does not establish that
  * the wait action, cursor, or owner state repeated.
  */
-waitGenerationsWithSameRevisionCount: number, planningGenerationCount: number, planRevisionGenerationCount: number, planningFixedPointIterationCount: number, planningInvalidationCount: number, planningSemanticEffectCount: number, planningFailureCount: number, failureSignatureCount: number, failureDiagnosisCount: number, attemptsByKind: TurnTimingAttemptKindCounts, modelRequestCount: number, modelRetryCount: number, modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolRouterReuseCount: number, toolRouterRebuildCount: number, projectionSourceDependenciesReuseCount: number, projectionSourceDependenciesFallbackCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: bigint, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: bigint, toolOutputCanonicalTokenCount: bigint, toolOutputModelByteCount: bigint, toolOutputModelTokenCount: bigint, toolOutputArtifactCreationCount: number, toolOutputArtifactReuseCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: bigint, toolOutputRecoveryCallCount: number, toolOutputRecoveryRetruncationCount: number, toolOutputRecursiveSpillCount: number,
+waitGenerationsWithSameRevisionCount: number, planningGenerationCount: number, planRevisionGenerationCount: number, planningFixedPointIterationCount: number, planningInvalidationCount: number, planningSemanticEffectCount: number, planningFailureCount: number, failureSignatureCount: number, failureDiagnosisCount: number, attemptsByKind: TurnTimingAttemptKindCounts, modelRequestCount: number, modelRetryCount: number, modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolRouterReuseCount: number, toolRouterRebuildCount: number, projectionSourceDependenciesReuseCount: number, projectionSourceDependenciesFallbackCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: bigint, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: bigint, toolOutputCanonicalTokenCount: bigint, toolOutputModelByteCount: bigint, toolOutputModelTokenCount: bigint, toolOutputArtifactCreationCount: number, toolOutputArtifactReuseCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: bigint, toolOutputRecoveryCallCount: number,
+/**
+ * Recovery transactions performed inside code-mode cells, without a
+ * separate provider tool-result generation.
+ */
+toolOutputInCellRecoveryCallCount: number, toolOutputRecoveryRetruncationCount: number, toolOutputRecursiveSpillCount: number,
 /**
  * Tool-result generations immediately following an observed
- * `read_tool_output` recovery transaction. This is independent of
+ * direct `read_tool_output` recovery transaction. In-cell reads are
+ * counted separately. This is independent of
  * whether the recovered projection was truncated again.
  */
 attributableRecoveryGenerationCount: number,

@@ -65,7 +65,6 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                         original_token_count: None,
                         hook_command: None,
                         raw_output_artifact: None,
-                        raw_output_reduction_notice: None,
                         repair_notice: None,
                         pending_deferred_completions: Vec::new(),
                     },

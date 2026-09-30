@@ -1182,6 +1182,8 @@ def _turn_report(
         signals.append("partial_token_coverage")
     if int(nonprogress.get("logicalGenerations", 0)):
         signals.append("observational_nonprogress")
+    if analysis["sourceEvidenceOnlyLatency"]["logicalGenerations"]:
+        signals.append("source_evidence_only")
     sampling_passes = int(timing.get("counters", {}).get("logicalGenerationCount", 0))
     if sampling_passes > _SAMPLING_PASS_TARGET_PER_COMPLETED_TURN:
         signals.append("sampling_pass_target_exceeded")
@@ -1258,6 +1260,7 @@ def _turn_report(
         if include_tokens
         else {},
         "observationalNonprogressLatency": nonprogress,
+        "sourceEvidenceOnlyLatency": analysis["sourceEvidenceOnlyLatency"],
         "toolRelay": relay,
         "commandOrchestration": orchestration,
         "signals": signals,
@@ -2529,6 +2532,7 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 "samplingPassTarget",
                 "tokens",
                 "observationalNonprogressTokens",
+                "sourceEvidenceOnlyLatency",
                 "signals",
             )
         }
@@ -2614,6 +2618,7 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 "tokens",
                 "observationalNonprogressLatency",
                 "observationalNonprogressTokens",
+                "sourceEvidenceOnlyLatency",
                 "waitOnlyGenerationCount",
                 "internallyDrainedWaitCount",
                 "provenLoopActivationCount",

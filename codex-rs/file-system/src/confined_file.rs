@@ -10,6 +10,14 @@ use std::path::Path;
 /// representation returned by `std::fs::canonicalize`. Callers should check
 /// confinement before calling; this helper checks again using the opened handle.
 pub fn open_confined_file(root: &Path, path: &Path) -> io::Result<File> {
+    open_confined_file_with_metadata(root, path).map(|(file, _)| file)
+}
+
+/// Like [`open_confined_file`], retaining the opened file's validation metadata.
+pub fn open_confined_file_with_metadata(
+    root: &Path,
+    path: &Path,
+) -> io::Result<(File, std::fs::Metadata)> {
     let relative = path.strip_prefix(root).map_err(|_| outside_root_error())?;
     let components = relative
         .components()
@@ -38,21 +46,22 @@ fn outside_root_error() -> io::Error {
     )
 }
 
-fn ensure_regular_file(file: File, path: &Path) -> io::Result<File> {
-    if !file.metadata()?.is_file() {
+fn ensure_regular_file(file: File, path: &Path) -> io::Result<(File, std::fs::Metadata)> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("path `{}` is not a regular file", path.display()),
         ));
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
 fn open_confined_file_impl(
     root: &Path,
     path: &Path,
     _components: &[&std::ffi::OsStr],
-) -> io::Result<File> {
+) -> io::Result<(File, std::fs::Metadata)> {
     use std::ffi::OsString;
     use std::fs::OpenOptions;
     use std::os::windows::ffi::OsStringExt;
@@ -66,7 +75,7 @@ fn open_confined_file_impl(
     options
         .read(true)
         .security_qos_flags(SECURITY_IDENTIFICATION);
-    let file = ensure_regular_file(options.open(path)?, path)?;
+    let (file, metadata) = ensure_regular_file(options.open(path)?, path)?;
     let handle = file.as_raw_handle() as HANDLE;
     let mut capacity = 260u32;
     let resolved = loop {
@@ -87,5 +96,5 @@ fn open_confined_file_impl(
     if !resolved.starts_with(root) {
         return Err(outside_root_error());
     }
-    Ok(file)
+    Ok((file, metadata))
 }

@@ -5,10 +5,21 @@ use std::collections::BTreeSet;
 
 use crate::prompt_resolver::LOCAL_PROMPT_POLICY_SLUGS;
 
+// Legacy models retain their prompt policy without being added to the catalog.
+const BUNDLED_LOCAL_POLICY_SLUGS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+];
+
 #[test]
 fn local_policy_models_use_one_canonical_prompt() {
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
-    let prompts = LOCAL_PROMPT_POLICY_SLUGS
+    let prompts = BUNDLED_LOCAL_POLICY_SLUGS
         .iter()
         .map(|slug| {
             response
@@ -33,7 +44,7 @@ fn bundled_local_policy_catalog_defers_prompt_to_local_policy() {
         .as_array()
         .expect("bundled models.json should contain a models array");
 
-    for slug in LOCAL_PROMPT_POLICY_SLUGS {
+    for slug in BUNDLED_LOCAL_POLICY_SLUGS {
         let model = models
             .iter()
             .find(|model| model["slug"].as_str() == Some(slug))
@@ -49,6 +60,9 @@ fn bundled_local_policy_catalog_defers_prompt_to_local_policy() {
 
 #[test]
 fn bundled_local_policy_models_match_prompt_policy_registration() {
+    for slug in BUNDLED_LOCAL_POLICY_SLUGS {
+        assert!(LOCAL_PROMPT_POLICY_SLUGS.contains(slug));
+    }
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
     let bundled_slugs = response
         .models
@@ -67,7 +81,7 @@ fn bundled_local_policy_models_match_prompt_policy_registration() {
             ) || slug.starts_with("gpt-5.6-")
         })
         .collect::<BTreeSet<_>>();
-    let registered_slugs = LOCAL_PROMPT_POLICY_SLUGS
+    let registered_slugs = BUNDLED_LOCAL_POLICY_SLUGS
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
@@ -78,7 +92,7 @@ fn bundled_local_policy_models_match_prompt_policy_registration() {
 #[test]
 fn behavior_identical_instruction_templates_are_removed() {
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
-    for slug in LOCAL_PROMPT_POLICY_SLUGS.iter().copied() {
+    for slug in BUNDLED_LOCAL_POLICY_SLUGS.iter().copied() {
         let model = response
             .models
             .iter()

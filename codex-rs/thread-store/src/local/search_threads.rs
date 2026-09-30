@@ -4,13 +4,12 @@ use std::collections::HashSet;
 use codex_install_context::InstallContext;
 use codex_protocol::ThreadId;
 use codex_rollout::RolloutConfig;
+use codex_rollout::RolloutSearchQuery;
 use codex_rollout::find_thread_names_by_ids;
-use codex_rollout::first_rollout_content_match_snippet;
 use codex_rollout::parse_cursor;
-use codex_rollout::search_rollout_matches;
 
 use super::LocalThreadStore;
-use super::helpers::distinct_thread_metadata_title;
+use super::helpers::distinct_thread_title;
 use super::helpers::set_thread_name_from_title;
 use super::helpers::stored_thread_from_rollout_item;
 use super::helpers::thread_item_titles;
@@ -64,16 +63,19 @@ pub(super) async fn search_threads(
         model_provider_id: store.config.default_model_provider_id.clone(),
     };
     let rg_command = InstallContext::current().rg_command();
-    let matching_rollouts = search_rollout_matches(
-        rg_command.as_path(),
-        store.config.codex_home.as_path(),
-        params.archived,
-        search_term,
-    )
-    .await
-    .map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to search rollout contents: {err}"),
+    let query = RolloutSearchQuery::new(search_term).map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to prepare rollout search: {err}"),
     })?;
+    let matching_rollouts = query
+        .search_matches(
+            rg_command.as_path(),
+            store.config.codex_home.as_path(),
+            params.archived,
+        )
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to search rollout contents: {err}"),
+        })?;
     if matching_rollouts.is_empty() {
         return Ok(ThreadSearchPage {
             items: Vec::new(),
@@ -121,7 +123,8 @@ pub(super) async fn search_threads(
             let logical_path = codex_rollout::plain_rollout_path(item.path.as_path());
             let Some(snippet) = (match remaining_rollouts.remove(logical_path.as_path()) {
                 Some(Some(snippet)) => Some(snippet),
-                Some(None) => first_rollout_content_match_snippet(item.path.as_path(), search_term)
+                Some(None) => query
+                    .first_content_match_snippet(item.path.as_path())
                     .await
                     .map_err(|err| ThreadStoreError::Internal {
                         message: format!("failed to read rollout search match: {err}"),
@@ -222,12 +225,14 @@ async fn set_thread_search_result_names(
         .difference(&resolved_title_ids)
         .copied()
         .collect::<HashSet<_>>();
-    if let Some(state_db_ctx) = store.state_db().await {
-        for thread_id in unresolved_thread_ids.clone() {
-            let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await else {
-                continue;
-            };
-            if let Some(title) = distinct_thread_metadata_title(&metadata) {
+    if !unresolved_thread_ids.is_empty()
+        && let Some(state_db_ctx) = store.state_db().await
+        && let Ok(titles) = state_db_ctx
+            .get_thread_titles(&unresolved_thread_ids.iter().copied().collect::<Vec<_>>())
+            .await
+    {
+        for (thread_id, title, first_user_message) in titles {
+            if let Some(title) = distinct_thread_title(&title, first_user_message.as_deref()) {
                 unresolved_thread_ids.remove(&thread_id);
                 names.insert(thread_id, title);
             }

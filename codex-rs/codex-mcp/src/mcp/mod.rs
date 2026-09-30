@@ -4,6 +4,7 @@ pub use auth::McpOAuthLoginSupport;
 pub use auth::McpOAuthScopesSource;
 pub use auth::ResolvedMcpOAuthScopes;
 pub use auth::compute_auth_statuses;
+pub use auth::compute_cached_auth_statuses;
 pub use auth::discover_supported_scopes;
 pub use auth::discover_supported_scopes_with_http_client;
 pub use auth::oauth_login_support;

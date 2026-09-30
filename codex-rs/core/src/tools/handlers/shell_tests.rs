@@ -1,4 +1,29 @@
 use std::path::PathBuf;
+
+#[test]
+fn successful_shell_sampling_signal_identifies_command_evidence() {
+    let signal = super::shell_sampling_signal(None, "Get-Content source.txt", Some(0), Some(b"source\n"))
+        .expect("successful command evidence");
+    assert_eq!(signal["command_evidence"], true);
+    assert_eq!(signal["empty_output"], false);
+    assert_eq!(signal["semantic_evidence"], serde_json::json!(
+        crate::tools::context::successful_command_evidence(b"source\n", Some("Get-Content source.txt"))));
+    let empty = super::shell_sampling_signal(None, "Get-Content source.txt", Some(0), Some(b""))
+        .expect("empty command evidence");
+    assert_eq!(empty["empty_output"], true);
+}
+
+#[test]
+fn shell_validation_timing_is_stable_without_normalizing_source_reads() {
+    let first = b"test result: ok. 1 passed; 0 failed; finished in 0.10s";
+    let second = b"test result: ok. 1 passed; 0 failed; finished in 0.90s";
+    for (command, same) in [("cargo test -p example", true), ("cat results.txt", false)] {
+        let signal = |bytes: &[u8]| {
+            super::shell_sampling_signal(None, command, Some(0), Some(bytes)).unwrap()
+        };
+        assert_eq!(signal(first)["semantic_evidence"] == signal(second)["semantic_evidence"], same);
+    }
+}
 use std::sync::Arc;
 
 use codex_exec_server::Environment;

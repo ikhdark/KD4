@@ -1,14 +1,99 @@
-"""Dump a Codex rollout JSONL as a full, readable transcript (analysis scratch script)."""
+"""Render rollout reports; the default human-readable view is intentionally lossy.
+
+Use --complete OUTDIR ROLLOUT... for a complete plaintext snapshot report.
+Reports retain every JSON field except opaque encrypted_content strings, recorded
+by UTF-8 length and SHA-256 instead. Exact duplicate subtrees become null with an
+entry in references: RFC 6901 pointers into records map to earlier source nodes.
+Resolve references before treating a placeholder as a source null. Counts prove
+report construction, not that a model has read the report. Read retained reports
+in bounded batches rather than regenerating them for each page.
+"""
+import argparse
+import contextlib
+import hashlib
 import json
-import sys
 import datetime
 import os
 from pathlib import Path
 
 try:
+    from scripts.atomic_json import write_json_atomic
     from scripts.rollout_snapshot import read_rollout_records
+    from scripts.rollout_snapshot import read_rollout_snapshot
 except ImportError:
+    from atomic_json import write_json_atomic
     from rollout_snapshot import read_rollout_records
+    from rollout_snapshot import read_rollout_snapshot
+
+
+def dump_complete(path, out_path):
+    """Build one deduplicated report from one immutable snapshot; never truncate."""
+    snapshot = read_rollout_snapshot(Path(path))
+    with contextlib.closing(snapshot.stream):
+        output = Path(out_path)
+        if output.resolve() == snapshot.path or (
+            output.exists() and output.samefile(snapshot.path)
+        ):
+            raise ValueError("report output must not overwrite the source rollout")
+        seen = {}
+        references = {}
+        opaque = {}
+
+        def render(value, pointer, key=None):
+            if key == "encrypted_content" and isinstance(value, str):
+                raw = value.encode("utf-8")
+                opaque[pointer] = {
+                    "utf8Bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+                return None
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded) >= 256:
+                if encoded in seen:
+                    references[pointer] = seen[encoded]
+                    return None
+                seen[encoded] = pointer
+            if isinstance(value, dict):
+                return {
+                    name: render(
+                        child,
+                        pointer + "/" + name.replace("~", "~0").replace("/", "~1"),
+                        name,
+                    )
+                    for name, child in value.items()
+                }
+            if isinstance(value, list):
+                return [
+                    render(child, f"{pointer}/{index}")
+                    for index, child in enumerate(value)
+                ]
+            return value
+
+        records = []
+        with snapshot.open_lines() as lines:
+            for number, line in enumerate(lines, 1):
+                try:
+                    row = json.loads(line.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    raise ValueError(
+                        f"incomplete or invalid rollout record {snapshot.path}:{number}"
+                    ) from error
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f"rollout record {snapshot.path}:{number} is not an object"
+                    )
+                records.append(render(row, f"/{number - 1}"))
+        write_json_atomic(
+            output,
+            {
+                "format": "codex-rollout-plaintext-v1",
+                "snapshot": snapshot.metadata(),
+                "recordCount": len(records),
+                "references": references,
+                "opaqueEncryptedFields": opaque,
+                "records": records,
+            },
+        )
 
 
 def ts(o):
@@ -259,10 +344,20 @@ def dump(path, out_path):
     w.close()
 
 
-if __name__ == '__main__':
-    outdir = sys.argv[1]
-    os.makedirs(outdir, exist_ok=True)
-    for a in sys.argv[2:]:
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--complete", action="store_true")
+    parser.add_argument("outdir", type=Path)
+    parser.add_argument("rollouts", nargs="+")
+    args = parser.parse_args(argv)
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    for a in args.rollouts:
         name = os.path.basename(a).replace('.jsonl', '.txt')
-        dump(a, os.path.join(outdir, name))
-        print('wrote', os.path.join(outdir, name), os.path.getsize(os.path.join(outdir, name)))
+        output = args.outdir / name
+        (dump_complete if args.complete else dump)(a, output)
+        print('wrote', output, output.stat().st_size)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

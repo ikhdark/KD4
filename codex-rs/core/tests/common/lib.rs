@@ -205,6 +205,13 @@ pub async fn load_default_config_for_test_with_cloud_config_bundle(
     // Do not let a developer-level CODEX_SQLITE_HOME override make otherwise
     // hermetic integration tests share one state database.
     config.sqlite_home = codex_home.path().join("sqlite");
+    // Scripted tests normally describe only the working model's responses.
+    // Completion-gate tests explicitly enable the separate assessor and script
+    // both streams; keep unrelated request-count/transport tests isolated.
+    config
+        .features
+        .disable(codex_features::Feature::Kd4CompletionGate)
+        .expect("test completion gate override");
     config
 }
 

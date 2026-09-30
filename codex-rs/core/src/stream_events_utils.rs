@@ -350,12 +350,13 @@ pub(crate) enum TurnItemContributorPolicy<'a> {
     Run(&'a ExtensionData),
 }
 
+#[derive(Debug)]
 pub(crate) struct FinalizedTurnItem {
     pub(crate) turn_item: TurnItem,
     pub(crate) facts: FinalizedTurnItemFacts,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct FinalizedTurnItemFacts {
     pub(crate) last_agent_message: Option<String>,
     pub(crate) defers_mailbox_delivery_to_next_turn: bool,
@@ -584,6 +585,16 @@ pub(crate) async fn handle_output_item_done(
         }
         // Preserve the tool-search response shape and call ID when argument parsing fails.
         Err(ToolCallBuildError::ToolSearchArguments { call_id, message }) => {
+            if let ResponseItem::ToolSearchCall { arguments, .. } = &item {
+                ctx.tool_runtime.record_rejected_tool_call(
+                    &codex_tools::ToolName::plain("tool_search"),
+                    &codex_tools::ToolPayload::Function {
+                        arguments: arguments.to_string(),
+                    },
+                    &call_id,
+                    &message,
+                );
+            }
             let failure_detail = ToolCallRuntime::search_failure_detail_for_call_id(
                 &call_id,
                 &crate::FunctionCallError::RespondToModel(message),
@@ -675,7 +686,7 @@ pub(crate) async fn handle_non_tool_response_item(
 /// Clients treat assistant text as an incremental stream. An item that produced no deltas
 /// would otherwise appear only at completion, so replay its finalized text as one delta
 /// between the started and completed events. Items with no visible text emit nothing.
-async fn emit_finalized_assistant_text_replay(
+pub(crate) async fn emit_finalized_assistant_text_replay(
     sess: &Session,
     turn_context: &TurnContext,
     turn_item: &TurnItem,

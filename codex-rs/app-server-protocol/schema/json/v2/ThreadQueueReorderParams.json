@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "queuedSubmissionIds": {
+      "description": "Listed entries move to the front; omitted entries retain their relative order.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "queuedSubmissionIds",
+    "threadId"
+  ],
+  "title": "ThreadQueueReorderParams",
+  "type": "object"
+}

@@ -50,8 +50,15 @@ fn nested_tool_timeout_override(
     terminal_poll_ms: u64,
 ) -> Option<u64> {
     mcp_timeouts.get(tool).copied().or_else(|| {
-        (tool == &ToolName::plain("write_stdin"))
-            .then(|| extended_nested_tool_timeout_ms(terminal_poll_ms))
+        if tool == &ToolName::plain("exec_command") {
+            Some(extended_nested_tool_timeout_ms(
+                crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
+            ))
+        } else if tool == &ToolName::plain("write_stdin") {
+            Some(extended_nested_tool_timeout_ms(terminal_poll_ms))
+        } else {
+            None
+        }
     })
 }
 
@@ -461,6 +468,11 @@ mod tests {
         assert_eq!(
             nested_tool_timeout_override(&ToolName::plain("write_stdin"), &timeouts, 300_000),
             Some(315_000)
+        );
+        assert_eq!(
+            nested_tool_timeout_override(&ToolName::plain("exec_command"), &timeouts, 5_000),
+            Some(315_000),
+            "initial command observation is independent of the terminal poll cap"
         );
         assert_eq!(
             nested_tool_timeout_override(&ToolName::plain("mcp_test"), &timeouts, 300_000),

@@ -510,7 +510,7 @@ fn goal_service_error(err: GoalServiceError) -> JSONRPCErrorError {
     }
 }
 
-fn parse_thread_id_for_request(thread_id: &str) -> Result<ThreadId, JSONRPCErrorError> {
+pub(super) fn parse_thread_id_for_request(thread_id: &str) -> Result<ThreadId, JSONRPCErrorError> {
     ThreadId::from_string(thread_id)
         .map_err(|err| invalid_request(format!("invalid thread id: {err}")))
 }

@@ -24,6 +24,7 @@ mod project;
 mod remote_control;
 mod thread;
 mod thread_data;
+mod thread_queue;
 mod turn;
 mod windows_sandbox;
 
@@ -52,6 +53,7 @@ pub use remote_control::*;
 pub use shared::*;
 pub use thread::*;
 pub use thread_data::*;
+pub use thread_queue::*;
 pub use turn::*;
 pub use windows_sandbox::*;
 

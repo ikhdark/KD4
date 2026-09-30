@@ -2417,6 +2417,28 @@ mod tests {
         assert_eq!(instructions.text.trim(), instructions.text);
     }
 
+    #[test]
+    fn default_base_instructions_deliver_inventory_coverage_and_report_guidance() {
+        let instructions = BaseInstructions::default();
+        for required in [
+            "use their documented contract (`--describe`, `--help`, AGENTS.md)",
+            "read implementation only for a specific missing fact",
+            "When a tool returns sufficient evidence for delivery, answer from that result",
+            "do not reopen internal state merely to re-derive returned information",
+            "Further inspection must resolve a concrete scope or correctness question",
+            "collect candidates once",
+            "retain deduplicated paths, categories, evidence, unresolved items, and coverage",
+            "inspect content only to resolve classification uncertainty",
+            "Reuse existing inventory/report tooling",
+            "when file output is permitted",
+            "render the complete records deterministically",
+            "Honor requests for inline output",
+            "do not trade completeness for brevity",
+        ] {
+            assert!(instructions.text.contains(required), "missing: {required}");
+        }
+    }
+
     // A tiny valid PNG (1x1) so image conversion tests don't depend on cross-crate
     // file paths or external fixture layouts.
     const TINY_PNG_BYTES: &[u8] = &[

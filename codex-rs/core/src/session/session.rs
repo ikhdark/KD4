@@ -1348,6 +1348,43 @@ impl Session {
             session_init.ephemeral = config.ephemeral,
         ));
 
+        let default_shell_fut = async {
+            let default_shell = if let Some(user_shell_override) =
+                session_configuration.user_shell_override.clone()
+            {
+                user_shell_override
+            } else {
+                tokio::task::spawn_blocking(shell::default_user_shell)
+                    .await
+                    .context("default shell discovery task failed")?
+            };
+            if default_shell.shell_type == shell::ShellType::PowerShell {
+                let executable = default_shell.shell_path.to_string_lossy().into_owned();
+                drop(tokio::task::spawn_blocking(move || {
+                    codex_shell_command::prewarm_powershell_parser(&executable);
+                }));
+            }
+            Ok::<_, anyhow::Error>(default_shell)
+        };
+        let tool_history_fut = async {
+            if !config.completed_tool_history_projection || !restores_initial_tool_history {
+                return None;
+            }
+            Some(if let Some(source_thread_id) = tool_history_fork_source {
+                crate::tool_history::load_tool_history_state_for_fork(
+                    config.codex_home.as_path(),
+                    &source_thread_id.to_string(),
+                )
+                .await
+            } else {
+                crate::tool_history::load_tool_history_state(
+                    config.codex_home.as_path(),
+                    &thread_id.to_string(),
+                )
+                .await
+            })
+        };
+
         let auth_manager_clone = Arc::clone(&auth_manager);
         let config_for_mcp = Arc::clone(&config);
         let mcp_manager_for_mcp = Arc::clone(&mcp_manager);
@@ -1381,7 +1418,7 @@ impl Session {
             let mcp_config = &mcp_projection.config;
             let mcp_servers = codex_mcp::effective_mcp_servers(mcp_config, auth.as_ref());
             let tool_plugin_provenance = codex_mcp::tool_plugin_provenance(mcp_config);
-            let auth_statuses = compute_auth_statuses(
+            let auth_statuses = codex_mcp::compute_cached_auth_statuses(
                 mcp_servers.iter(),
                 &config_for_mcp.codex_home,
                 config_for_mcp.mcp_oauth_credentials_store_mode,
@@ -1408,7 +1445,17 @@ impl Session {
             thread_persistence_result,
             state_db_ctx,
             (auth, mcp_projection, mcp_servers, auth_statuses, tool_plugin_provenance),
-        ) = tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
+            default_shell_result,
+            initial_tool_history,
+            config_validation,
+        ) = tokio::join!(
+            thread_persistence_fut,
+            state_db_fut,
+            auth_and_mcp_fut,
+            default_shell_fut,
+            tool_history_fut,
+            validate_config_lock_if_configured(&session_configuration),
+        );
 
         let mut live_thread_init = thread_persistence_result.map_err(|e| {
             error!("failed to initialize thread persistence: {e:#}");
@@ -1564,21 +1611,7 @@ impl Session {
                 mcp_servers.keys().map(String::as_str).collect(),
             );
 
-            let default_shell = if let Some(user_shell_override) =
-                session_configuration.user_shell_override.clone()
-            {
-                user_shell_override
-            } else {
-                tokio::task::spawn_blocking(shell::default_user_shell)
-                    .await
-                    .context("default shell discovery task failed")?
-            };
-            if default_shell.shell_type == shell::ShellType::PowerShell {
-                let executable = default_shell.shell_path.to_string_lossy().into_owned();
-                drop(tokio::task::spawn_blocking(move || {
-                    codex_shell_command::prewarm_powershell_parser(&executable);
-                }));
-            }
+            let default_shell = default_shell_result?;
             let shell_snapshot = if config.features.enabled(Feature::ShellSnapshot) {
                 ShellSnapshot::new(
                     config.codex_home.clone(),
@@ -1605,7 +1638,14 @@ impl Session {
             // `snapshot()` honors the DeferredExecutor policy configured above: normal
             // sessions still wait for their selected executor, while deferred sessions
             // retain a `starting` entry and finish initializing without blocking on it.
-            let resolved_environments = turn_environments.snapshot().await;
+            let (resolved_environments, thread_name) = tokio::join!(
+                turn_environments.snapshot(),
+                thread_title_from_thread_store(live_thread_init.as_ref(), &thread_store, thread_id)
+                    .instrument(info_span!(
+                        "session_init.thread_name_lookup",
+                        otel.name = "session_init.thread_name_lookup",
+                    )),
+            );
             let git_workspace = GitWorkspaceCache::new();
             let initial_git_workspace = git_workspace
                 .snapshot_with_project_discovery(
@@ -1647,34 +1687,14 @@ impl Session {
                     err.message
                 );
             }
-            let thread_name =
-                thread_title_from_thread_store(live_thread_init.as_ref(), &thread_store, thread_id)
-                    .instrument(info_span!(
-                        "session_init.thread_name_lookup",
-                        otel.name = "session_init.thread_name_lookup",
-                    ))
-                    .await;
             session_configuration.thread_name = thread_name.clone();
-            validate_config_lock_if_configured(&session_configuration).await?;
+            config_validation?;
             export_config_lock_if_configured(&session_configuration, thread_id).await?;
             let mut state = SessionState::new_with_auto_compact_window_ids(
                 session_configuration.clone(),
                 initial_auto_compact_window_ids,
             );
-            if config.completed_tool_history_projection && restores_initial_tool_history {
-                let tool_history = if let Some(source_thread_id) = tool_history_fork_source {
-                    crate::tool_history::load_tool_history_state_for_fork(
-                        config.codex_home.as_path(),
-                        &source_thread_id.to_string(),
-                    )
-                    .await
-                } else {
-                    crate::tool_history::load_tool_history_state(
-                        config.codex_home.as_path(),
-                        &thread_id.to_string(),
-                    )
-                    .await
-                };
+            if let Some(tool_history) = initial_tool_history {
                 let (tool_history, ledger_warning) = tool_history.into_state_and_warning();
                 if let Some(message) = ledger_warning {
                     tracing::warn!("{message}");

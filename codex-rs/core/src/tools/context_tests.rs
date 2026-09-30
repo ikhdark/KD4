@@ -5,6 +5,106 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
+fn command_evidence_ignores_durations_and_timestamps() {
+    for (first, second) in [
+        ("Finished test in 2.31s", "Finished test in 9.84s"),
+        ("1 failed in 0.12s", "1 failed in 1.55s"),
+        ("2026-09-29T12:03:01.555Z error: broken", "2026-09-30T01:02:03Z error: broken"),
+        ("2026-09-29 12:03:01 error: broken", "2026-09-30 01:02:03 error: broken"),
+    ] {
+        assert_eq!(semantic_evidence_for_command_output(first.as_bytes()),
+            semantic_evidence_for_command_output(second.as_bytes()));
+    }
+    assert_ne!(semantic_evidence_for_command_output(b"1 failed in 0.12s"),
+        semantic_evidence_for_command_output(b"2 failed in 0.12s"));
+    assert_ne!(semantic_evidence_for_command_output(b"localhost:8080"),
+        semantic_evidence_for_command_output(b"localhost:9090"));
+    assert_eq!(normalize_tool_failure_text("invalid at line 12 column 9 in 1.5s"),
+        normalize_tool_failure_text("invalid at line 30 column 2 in 8.0s"));
+}
+
+#[test]
+fn command_timing_normalization_preserves_substantive_data_and_failure_status() {
+    for (first, second) in [
+        (
+            "test result: FAILED. 2 passed; 1 failed; 0 ignored; finished in 0.01s",
+            "test result: FAILED. 2 passed; 1 failed; 0 ignored; finished in 4.25s",
+        ),
+        ("Finished `test` profile [unoptimized] in 0.12s", "Finished `test` profile [unoptimized] in 9.13s"),
+        ("================ 2 passed, 1 skipped in 0.12s ================", "================ 2 passed, 1 skipped in 8.32s ================"),
+        ("Summary [0.112s] 2 tests run: 1 passed, 1 failed", "Summary [2.541s] 2 tests run: 1 passed, 1 failed"),
+    ] {
+        let first_evidence = semantic_evidence_for_command_output(first.as_bytes());
+        let second_evidence = semantic_evidence_for_command_output(second.as_bytes());
+        assert_eq!(first_evidence, second_evidence, "{first}");
+        assert_eq!(
+            command_failure_signature(&first_evidence, Some(1)),
+            command_failure_signature(&second_evidence, Some(1)),
+        );
+        assert_ne!(
+            command_failure_signature(&first_evidence, Some(1)),
+            command_failure_signature(&second_evidence, Some(2)),
+        );
+    }
+    for (first, second) in [
+        ("timeout = 1s", "timeout = 2s"),
+        ("assertion failed: expected 1s", "assertion failed: expected 2s"),
+        ("error: deadline was 1s", "error: deadline was 2s"),
+        ("2026-09-29T12:00:00Z", "2026-09-30T12:00:00Z"),
+        ("test result: ok. 1 passed; finished in 1s", "test result: ok. 2 passed; finished in 1s"),
+        ("2026-09-29T12:00:00Z ERROR timeout = 1s", "2026-09-29T12:00:00Z ERROR timeout = 2s"),
+        (
+            "diff --git a/a b/a\n@@ -1 +1 @@\n+Finished test in 1s",
+            "diff --git a/a b/a\n@@ -1 +1 @@\n+Finished test in 2s",
+        ),
+    ] {
+        assert_ne!(
+            semantic_evidence_for_command_output(first.as_bytes()),
+            semantic_evidence_for_command_output(second.as_bytes()),
+            "{first}",
+        );
+    }
+}
+
+#[test]
+fn exec_validation_timing_is_stable_without_normalizing_source_reads() {
+    let output = |command: &str, seconds: &str, exit_code: i32| ExecCommandToolOutput {
+        validation: None,
+        event_call_id: "timing".into(),
+        chunk_id: "chunk".into(),
+        wall_time: std::time::Duration::from_secs(1),
+        raw_output: format!("test result: ok. 1 passed; 0 failed; finished in {seconds}s").into_bytes(),
+        truncation_policy: TruncationPolicy::Tokens(1000),
+        max_output_tokens: None,
+        process_id: None,
+        session_capabilities: None,
+        exit_code: Some(exit_code),
+        process_exited: true,
+        search_no_match: false,
+        original_token_count: None,
+        hook_command: Some(command.into()),
+        raw_output_artifact: None,
+        repair_notice: None,
+        pending_deferred_completions: Vec::new(),
+    };
+    for (command, exit_code, same) in [
+        ("cargo test -p example", 0, true),
+        ("cargo test -p example", 1, true),
+        ("cat results.txt", 0, false),
+    ] {
+        let first = output(command, "0.10", exit_code);
+        let second = output(command, "0.90", exit_code);
+        assert_ne!(first.raw_output, second.raw_output);
+        let first = first.sampling_request_signal().unwrap();
+        let second = second.sampling_request_signal().unwrap();
+        assert_eq!(first["semantic_evidence"] == second["semantic_evidence"], same);
+        if exit_code == 1 {
+            assert_eq!(first["failure_signature"], second["failure_signature"]);
+        }
+    }
+}
+
+#[test]
 fn orchestration_audit_tool_dispatch_state_has_one_terminal_transition_owner() {
     let completed = ToolDispatchState::new();
     assert!(completed.try_admit());
@@ -1045,7 +1145,6 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         original_token_count: Some(100),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     }
@@ -1097,7 +1196,6 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
         original_token_count: Some(3),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -1146,7 +1244,6 @@ fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
         original_token_count: Some(3),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -1186,7 +1283,6 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -1270,7 +1366,6 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
         original_token_count: Some(2),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -1309,7 +1404,6 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
         original_token_count: Some(300),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -1358,7 +1452,6 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
         original_token_count: Some(100),
         hook_command: Some("echo ok".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -1394,7 +1487,6 @@ fn exec_command_projection_reports_reduction_from_per_call_limit() {
         original_token_count: Some(10),
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -1428,7 +1520,6 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         original_token_count: Some(codex_utils_string::approx_token_count(&raw_output)),
         hook_command: Some("enumerate evidence".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -1440,7 +1531,7 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
 }
 
 #[test]
-fn high_signal_validation_exposes_three_bounded_predetermined_ranges() {
+fn high_signal_validation_exposes_failure_anchored_predetermined_range() {
     let raw_output = (1..=300)
         .map(|line| format!("error[E0001]: focused diagnostic line {line}"))
         .collect::<Vec<_>>()
@@ -1452,19 +1543,9 @@ fn high_signal_validation_exposes_three_bounded_predetermined_ranges() {
         ranges,
         vec![
             ToolOutputProjectionRange {
-                id: "validation-head".to_string(),
+                id: "validation:diagnostics".to_string(),
                 start_line: 1,
-                end_line: 64,
-            },
-            ToolOutputProjectionRange {
-                id: "validation-middle".to_string(),
-                start_line: 119,
-                end_line: 182,
-            },
-            ToolOutputProjectionRange {
-                id: "validation-tail".to_string(),
-                start_line: 229,
-                end_line: 300,
+                end_line: 200,
             },
         ]
     );
@@ -1517,7 +1598,6 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     }
@@ -1568,7 +1648,6 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
             truncated: false,
             handle: std::sync::Arc::new(tempfile::tempfile().expect("artifact handle")),
         }),
-        raw_output_reduction_notice: None,
         repair_notice: Some("Command preflight applied one repair".to_string()),
         pending_deferred_completions: Vec::new(),
     };
@@ -1666,12 +1745,9 @@ async fn artifact_backed_exec_output(
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: Some(artifact),
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
-    }
-    .with_prepared_reduction_notice()
-    .await;
+    };
     (output, artifact_id, artifact_path, retained_root)
 }
 
@@ -1709,7 +1785,6 @@ async fn exec_code_mode_exposes_artifact_id_not_path() {
         owned_path: Some(artifact_path.clone()),
         bytes: 7,
     });
-    output.prepare_reduction_notice().await;
     let failed_result = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".to_string(),
     });
@@ -1836,10 +1911,9 @@ async fn exec_reduction_notice_is_absent_for_complete_output() {
 #[tokio::test]
 async fn exec_reduction_notice_is_absent_after_artifact_is_evicted() {
     let raw_output = "word ".repeat(200);
-    let (mut output, _, artifact_path, _retained_root) =
+    let (output, _, artifact_path, _retained_root) =
         artifact_backed_exec_output(raw_output.as_bytes(), Some(4)).await;
     std::fs::remove_file(&artifact_path).expect("evict retained artifact");
-    output.prepare_reduction_notice().await;
 
     let response = output.response_text();
 
@@ -1847,7 +1921,6 @@ async fn exec_reduction_notice_is_absent_after_artifact_is_evicted() {
     assert!(!response.contains("full retained output is available"));
 
     std::fs::create_dir(&artifact_path).expect("replace artifact with nonregular entry");
-    output.prepare_reduction_notice().await;
     let nonregular_response = output.response_text();
     assert!(!nonregular_response.contains("[command output reduced;"));
     assert!(!nonregular_response.contains("full retained output is available"));
@@ -1870,4 +1943,20 @@ async fn audit_tiny_recovery_budget_preserves_process_state() {
             .response_text()
             .contains("Process exited without an available exit code")
     );
+}
+#[tokio::test]
+async fn exec_projection_retains_diagnostics_outside_generic_cut_regions() {
+    let mut raw = "ordinary build progress\n".repeat(2000);
+    raw.push_str("error[E0123]: unique important failure\n");
+    raw.push_str(&"ordinary build progress\n".repeat(8000));
+    let (mut output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(1000)).await;
+    output.exit_code = Some(1);
+    output.hook_command = Some("cargo check".into());
+    let metadata = output.projection_metadata_from_raw(&raw);
+    assert!(metadata.fragments.iter().any(|fragment|
+        fragment.kind == ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
+        && fragment.text.contains("unique important failure")));
+    assert!(metadata.predetermined_ranges.is_empty());
+    let ranges = predetermined_validation_ranges(&raw, Some("cargo check"));
+    assert_eq!(ranges[0].start_line, 2001);
 }

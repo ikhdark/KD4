@@ -613,6 +613,7 @@ where
 pub struct JsonToolOutput {
     value: JsonValue,
     model_value: Option<JsonValue>,
+    sampling_signal: Option<JsonValue>,
     success: Option<bool>,
     outcome: Option<ToolOutputOutcome>,
     skip_disposition: Option<ToolOutputSkipDisposition>,
@@ -625,6 +626,7 @@ impl std::fmt::Debug for JsonToolOutput {
             .debug_struct("JsonToolOutput")
             .field("value", &self.value)
             .field("model_value", &self.model_value)
+            .field("sampling_signal", &self.sampling_signal)
             .field("success", &self.success)
             .field("outcome", &self.outcome)
             .field("skip_disposition", &self.skip_disposition)
@@ -636,6 +638,7 @@ impl PartialEq for JsonToolOutput {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
             && self.model_value == other.model_value
+            && self.sampling_signal == other.sampling_signal
             && self.success == other.success
             && self.outcome == other.outcome
             && self.skip_disposition == other.skip_disposition
@@ -652,6 +655,7 @@ impl JsonToolOutput {
         Self {
             value,
             model_value: None,
+            sampling_signal: None,
             success: Some(true),
             outcome: None,
             skip_disposition: None,
@@ -663,6 +667,7 @@ impl JsonToolOutput {
         Self {
             value,
             model_value: None,
+            sampling_signal: None,
             success,
             outcome: None,
             skip_disposition: None,
@@ -674,6 +679,7 @@ impl JsonToolOutput {
         Self {
             value,
             model_value: None,
+            sampling_signal: None,
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: None,
@@ -688,6 +694,7 @@ impl JsonToolOutput {
         Self {
             value,
             model_value: None,
+            sampling_signal: None,
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: Some(disposition),
@@ -699,6 +706,12 @@ impl JsonToolOutput {
     pub fn with_model_value(mut self, value: JsonValue) -> Self {
         self.model_value = Some(value);
         self.serialized = Arc::new(OnceLock::new());
+        self
+    }
+
+    /// Private evidence metadata, independent of presentation and artifact IDs.
+    pub fn with_sampling_request_signal(mut self, signal: JsonValue) -> Self {
+        self.sampling_signal = Some(signal);
         self
     }
 
@@ -900,6 +913,9 @@ impl ToolOutput for JsonToolOutput {
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
+        if let Some(signal) = &self.sampling_signal {
+            return Some(signal.clone());
+        }
         if self.outcome_for_logging() == ToolOutputOutcome::Success {
             return None;
         }

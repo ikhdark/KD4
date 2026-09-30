@@ -182,10 +182,11 @@ impl ModelsEndpointClient for TestModelsEndpoint {
 
     fn list_models<'a>(
         &'a self,
-        _client_version: &'a str,
+        client_version: &'a str,
         http_client_factory: HttpClientFactory,
     ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
         Box::pin(async move {
+            assert_eq!(client_version, crate::client_version_to_whole());
             *self
                 .observed_proxy_policy
                 .lock()
@@ -1064,7 +1065,7 @@ async fn offline_refresh_revalidates_identity_at_cache_and_catalog_boundaries() 
         );
         assert_eq!(endpoint.eligibility_count.load(Ordering::SeqCst), 0);
         assert_eq!(endpoint.fetch_count(), 0);
-        assert!(catalog.models.iter().any(|model| model.slug == "gpt-5.4"));
+        assert!(catalog.models.iter().any(|model| model.slug == "gpt-5.5"));
     }
 }
 
@@ -1081,7 +1082,7 @@ async fn unchanged_identity_model_lookup_does_not_need_exclusive_state_access() 
     );
     let _reader = manager.state.read().await;
     let config = ModelsManagerConfig::default();
-    let lookup = manager.get_model_info("gpt-5.4", &config);
+    let lookup = manager.get_model_info("gpt-5.5", &config);
     tokio::pin!(lookup);
     let model = std::future::poll_fn(|cx| match lookup.as_mut().poll(cx) {
         std::task::Poll::Ready(model) => std::task::Poll::Ready(model),
@@ -1090,7 +1091,7 @@ async fn unchanged_identity_model_lookup_does_not_need_exclusive_state_access() 
         }
     })
     .await;
-    assert_eq!(model.slug, "gpt-5.4");
+    assert_eq!(model.slug, "gpt-5.5");
     assert!(!model.used_fallback_model_metadata);
 }
 
@@ -1602,6 +1603,109 @@ async fn refresh_available_models_uses_cached_remote_only_catalog_for_chatgpt_au
         0,
         "fresh cache should avoid a model fetch"
     );
+}
+
+#[tokio::test]
+async fn refresh_available_models_preserves_explicit_remote_sol_6() {
+    for visibility in ["list", "hide"] {
+        let mut sol = remote_model_with_visibility("gpt-6-sol", "Server Sol", 3, visibility);
+        crate::prompt_resolver::apply_prompt_policy(std::slice::from_mut(&mut sol));
+        let remote_models = vec![remote_model("server-default", "Default", 0), sol.clone()];
+        let codex_home = tempdir().expect("temp dir");
+        let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
+        let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
+
+        let models = manager
+            .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+            .expect("remote picker models");
+        assert_eq!(manager.get_remote_models().await, remote_models);
+        let entries: Vec<_> = models
+            .iter()
+            .filter(|model| model.model == "gpt-6-sol")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].display_name, "Server Sol");
+        assert_eq!(entries[0].show_in_picker, visibility == "list");
+        assert_eq!(
+            manager
+                .get_model_info("gpt-6-sol", &ModelsManagerConfig::default())
+                .await,
+            sol
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_available_models_replaces_old_version_cache_with_sol_6_1() {
+    for old_version in ["0.0.0", "0.158.0"] {
+        let codex_home = tempdir().expect("temp dir");
+        let mut remote_models = vec![
+            remote_model("gpt-6.1-sol", "Server Sol 6.1", 1),
+            remote_model("gpt-6-astra", "Server Astra", 2),
+            remote_model("gpt-6-sol", "Server Sol", 3),
+            remote_model("gpt-6-luna", "Server Luna", 4),
+        ];
+        crate::prompt_resolver::apply_prompt_policy(&mut remote_models);
+        let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
+        let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+        let old_models = if old_version == "0.0.0" {
+            &remote_models[1..2]
+        } else {
+            &remote_models[1..]
+        };
+        manager
+            .cache_manager
+            .persist_cache(old_models, None, old_version.to_string())
+            .await;
+
+        let models = manager
+            .list_models(
+                RefreshStrategy::OnlineIfUncached,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await
+            .expect("refresh the old-version catalog");
+        assert_eq!(endpoint.fetch_count(), 1);
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
+        );
+        assert!(models.iter().all(|model| model.show_in_picker));
+        assert!(models[0].is_default);
+        for expected in &remote_models {
+            assert_eq!(
+                manager
+                    .get_model_info(&expected.slug, &ModelsManagerConfig::default())
+                    .await,
+                *expected
+            );
+        }
+        let cache = manager
+            .cache_manager
+            .load_fresh(&crate::client_version_to_whole())
+            .await
+            .expect("read cache")
+            .expect("cache uses the discovery version");
+        assert_eq!(cache.models, remote_models);
+
+        let cached_manager =
+            openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+        assert_eq!(
+            cached_manager
+                .list_models(
+                    RefreshStrategy::OnlineIfUncached,
+                    DEFAULT_HTTP_CLIENT_FACTORY
+                )
+                .await
+                .expect("reuse refreshed catalog"),
+            models
+        );
+        assert_eq!(endpoint.fetch_count(), 1);
+    }
 }
 
 #[tokio::test]
@@ -2517,13 +2621,13 @@ async fn static_manager_reads_latest_auth_mode() {
 }
 
 #[test]
-fn bundled_gpt_5_2_uses_the_catalog_token_output_budget() {
+fn bundled_gpt_5_5_uses_the_catalog_token_output_budget() {
     let response = crate::bundled_models_response().expect("bundled catalog");
     let model = response
         .models
         .iter()
-        .find(|model| model.slug == "gpt-5.2")
-        .expect("GPT-5.2 catalog entry");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("GPT-5.5 catalog entry");
     assert_eq!(
         model.truncation_policy,
         codex_protocol::openai_models::TruncationPolicyConfig::tokens(10_000)
@@ -2637,6 +2741,35 @@ async fn local_policy_remote_refresh_keeps_fork_prompt_and_server_capabilities()
 }
 
 #[tokio::test]
+async fn upstream_hidden_models_keep_instructions_without_personality() {
+    let codex_home = tempdir().expect("temp dir");
+    let manager = openai_manager_for_tests_with_auth(
+        codex_home.path().to_path_buf(),
+        TestModelsEndpoint::without_refresh(Vec::new()),
+        None,
+    );
+    let catalog = crate::bundled_models_response().expect("bundled catalog");
+    for slug in [
+        "gpt-daybreak-blue-latest",
+        "gpt-daybreak-red-latest",
+        "codex-auto-review",
+    ] {
+        let original = catalog
+            .models
+            .iter()
+            .find(|model| model.slug == slug)
+            .unwrap();
+        let expected = original.get_model_instructions(None);
+        assert!(!expected.is_empty());
+        let model = manager
+            .get_model_info(slug, &ModelsManagerConfig::default())
+            .await;
+        assert_eq!(model.visibility, ModelVisibility::Hide);
+        assert_eq!(model.get_model_instructions(None), expected);
+    }
+}
+
+#[tokio::test]
 async fn astra_is_the_bundled_default_with_runtime_capabilities_and_local_instructions() {
     use codex_protocol::openai_models::ToolMode;
     use codex_protocol::protocol::MultiAgentVersion;
@@ -2729,31 +2862,38 @@ async fn astra_is_the_bundled_default_with_runtime_capabilities_and_local_instru
 }
 
 #[test]
-fn bundled_api_models_advertise_none_reasoning_effort() {
+fn bundled_catalog_preserves_upstream_membership_and_reasoning_efforts() {
     let response = crate::bundled_models_response()
         .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
 
-    for slug in [
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.2",
-    ] {
-        let model = response
+    assert_eq!(
+        response
             .models
             .iter()
-            .find(|model| model.slug == slug)
-            .unwrap_or_else(|| panic!("bundled models.json should contain {slug}"));
+            .map(|model| model.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-daybreak-blue-latest",
+            "gpt-daybreak-red-latest",
+            "gpt-5.5",
+            "codex-auto-review",
+        ]
+    );
 
+    for model in &response.models {
         assert!(
-            model
+            !model
                 .supported_reasoning_levels
                 .iter()
                 .any(|preset| preset.effort == ReasoningEffort::None),
-            "{slug} should advertise the provider-supported none reasoning effort"
+            "{} should not advertise locally invented reasoning levels",
+            model.slug
         );
     }
 }

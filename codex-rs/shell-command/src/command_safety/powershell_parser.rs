@@ -185,6 +185,18 @@ pub(super) fn parse_with_powershell_ast(executable: &str, script: &str) -> Power
     parse_with_powershell_ast_request(executable, script, None)
 }
 
+/// Only a positive syntax-error report is a rejection. An unavailable parser
+/// or an unsupported (but possibly valid) AST remains the target shell's job.
+pub fn powershell_command_has_syntax_error(command: &[String]) -> bool {
+    let Some((executable, args)) = command.split_first() else {
+        return false;
+    };
+    let PowershellInvocation::InlineCommand { script, .. } = parse_powershell_invocation(args) else {
+        return false;
+    };
+    matches!(parse_with_powershell_ast(executable, script), PowershellParseOutcome::SyntaxError)
+}
+
 fn parse_with_powershell_ast_request(
     executable: &str,
     script: &str,
@@ -253,7 +265,7 @@ pub(crate) fn try_parse_powershell_ast_commands(
 ) -> Option<Vec<Vec<String>>> {
     match parse_with_powershell_ast(executable, script) {
         PowershellParseOutcome::Analysis(analysis) => Some(analysis.commands),
-        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed => None,
+        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError => None,
     }
 }
 
@@ -277,7 +289,7 @@ pub(crate) fn try_parse_powershell_ast_analysis(
 ) -> Option<PowershellParseAnalysis> {
     match parse_with_powershell_ast(executable, script) {
         PowershellParseOutcome::Analysis(analysis) => Some(analysis),
-        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed => None,
+        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError => None,
     }
 }
 
@@ -288,7 +300,7 @@ pub(crate) fn try_parse_powershell_ast_analysis_with_resolution(
 ) -> Option<PowershellParseAnalysis> {
     match parse_with_powershell_ast_request(executable, script, Some(resolution)) {
         PowershellParseOutcome::Analysis(analysis) => Some(analysis),
-        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed => None,
+        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError => None,
     }
 }
 
@@ -306,6 +318,7 @@ pub(crate) fn is_trusted_powershell_host(executable: &str) -> bool {
 pub(super) enum PowershellParseOutcome {
     Analysis(PowershellParseAnalysis),
     Unsupported,
+    SyntaxError,
     Failed,
 }
 
@@ -860,6 +873,7 @@ impl PowershellParserResponse {
                 })
                 .unwrap_or(PowershellParseOutcome::Unsupported),
             "unsupported" => PowershellParseOutcome::Unsupported,
+            "parse_errors" => PowershellParseOutcome::SyntaxError,
             _ => PowershellParseOutcome::Failed,
         }
     }
@@ -1076,7 +1090,7 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 parser.parse("Get-Content '").unwrap(),
-                PowershellParseOutcome::Failed
+                PowershellParseOutcome::SyntaxError
             );
         }
         assert_eq!(parser.next_request_id, 2, "syntax errors must be cached");

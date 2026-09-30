@@ -240,6 +240,36 @@ pub async fn determine_streamable_http_auth_status_with_http_client(
     )
 }
 
+/// Returns locally known auth state without making OAuth discovery requests.
+/// `None` means the server's OAuth support still needs network discovery.
+#[allow(clippy::too_many_arguments)]
+pub async fn determine_streamable_http_auth_status_without_discovery(
+    codex_home: &Path,
+    server_name: &str,
+    url: &str,
+    bearer_token_env_var: Option<&str>,
+    http_headers: Option<HashMap<String, String>>,
+    env_http_headers: Option<HashMap<String, String>>,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+) -> Result<Option<McpAuthState>> {
+    Ok(match auth_status_before_discovery(
+        codex_home,
+        server_name,
+        url,
+        bearer_token_env_var,
+        http_headers,
+        env_http_headers,
+        store_mode,
+        keyring_backend_kind,
+    )
+    .await?
+    {
+        AuthStatusCheck::Complete(status) => Some(status),
+        AuthStatusCheck::Discover(_) => None,
+    })
+}
+
 // These arguments mirror the persisted MCP configuration fields and are kept
 // separate so callers do not need to construct a second public configuration type.
 #[allow(clippy::too_many_arguments)]

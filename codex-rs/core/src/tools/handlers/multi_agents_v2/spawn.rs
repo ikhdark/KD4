@@ -968,6 +968,7 @@ impl Drop for IsolatedWorkspace {
 
 #[derive(Debug, Eq, PartialEq)]
 struct WorkspaceOverlay {
+    head: String,
     tracked_diff: Vec<u8>,
     untracked_files: Vec<(PathBuf, Vec<u8>)>,
 }
@@ -979,7 +980,7 @@ async fn create_isolated_worktree(
     cancellation_token: &CancellationToken,
     terminal_tasks: &TaskTracker,
 ) -> Result<IsolatedWorkspace, FunctionCallError> {
-    let initial_overlay =
+    let mut initial_overlay =
         capture_workspace_overlay(repo_root, cancellation_token, terminal_tasks).await?;
     let repository_key = format!(
         "{:x}",
@@ -1008,19 +1009,20 @@ async fn create_isolated_worktree(
         ))
     })?;
     let path = parent.join(leaf);
-    let workspace = IsolatedWorkspace {
+    let workspace = Arc::new(IsolatedWorkspace {
         main_repo_root: repo_root.to_path_buf(),
         path,
         cleanup_required: AtomicBool::new(true),
         terminal_tasks: terminal_tasks.clone(),
-    };
+    });
     let mut command = Command::new("git");
     command
         .arg("-C")
         .arg(repo_root)
+        .args(["-c", "checkout.workers=0"])
         .args(["worktree", "add", "--detach"])
         .arg(&workspace.path)
-        .arg("HEAD");
+        .arg(&initial_overlay.head);
     let output = run_worktree_git(command, None, cancellation_token, terminal_tasks).await;
     let error = match output {
         Ok(output) if output.status.success() => None,
@@ -1039,12 +1041,25 @@ async fn create_isolated_worktree(
         return Err(FunctionCallError::RespondToModel(error));
     }
     let populate_result = Box::pin(async {
-        let current_overlay = capture_workspace_overlay(repo_root, cancellation_token, terminal_tasks).await?;
-        if current_overlay != initial_overlay {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: the shared worktree changed while its isolated snapshot was being created; retry after the current writer finishes"
-                    .to_string(),
-            ));
+        // Nothing has been applied yet. Absorb a short writer burst here rather
+        // than spending a model generation recreating the same empty worktree.
+        for attempt in 0..=2 {
+            let current_overlay = capture_workspace_overlay(repo_root, cancellation_token, terminal_tasks).await?;
+            if current_overlay == initial_overlay {
+                break;
+            }
+            if attempt == 2 || current_overlay.head != initial_overlay.head {
+                return Err(FunctionCallError::RespondToModel(
+                    "spawn_agent: the shared worktree did not stabilize during bounded snapshot retries; retry after the current writer finishes".to_string(),
+                ));
+            }
+            initial_overlay = current_overlay;
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel(
+                    "spawn_agent: cancelled while waiting for a stable workspace snapshot".into())),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
         }
         if !initial_overlay.tracked_diff.is_empty() {
             let mut command = Command::new("git");
@@ -1065,20 +1080,40 @@ async fn create_isolated_worktree(
                 )));
             }
         }
-        for (relative_path, bytes) in initial_overlay.untracked_files {
-            let target = workspace.path.join(relative_path);
-            if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "spawn_agent: could not create an isolated snapshot directory: {error}"
-                    ))
-                })?;
+        use futures::StreamExt;
+        let copies = futures::stream::iter(initial_overlay.untracked_files.into_iter().map(|(relative_path, bytes)| {
+            let workspace = Arc::clone(&workspace);
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    // Keep rollback ownership in the blocking worker, including
+                    // when the caller is cancelled while this write is in flight.
+                    let target = workspace.path.join(relative_path);
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent).map_err(|error| {
+                            FunctionCallError::RespondToModel(format!(
+                                "spawn_agent: could not create an isolated snapshot directory: {error}"
+                            ))
+                        })?;
+                    }
+                    std::fs::write(&target, bytes).map_err(|error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "spawn_agent: could not copy an untracked file into the isolated snapshot: {error}"
+                        ))
+                    })
+                })
+                .await
+                .map_err(|error| FunctionCallError::RespondToModel(format!(
+                    "spawn_agent: isolated snapshot copy worker failed: {error}"
+                )))?
             }
-            tokio::fs::write(&target, bytes).await.map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "spawn_agent: could not copy an untracked file into the isolated snapshot: {error}"
-                ))
-            })?;
+        }))
+        .buffer_unordered(std::thread::available_parallelism().map_or(4, usize::from))
+        .collect::<Vec<_>>()
+        .await;
+        // Drain every write before rollback: dropping an in-flight Tokio file
+        // operation does not cancel the underlying blocking filesystem call.
+        for result in copies {
+            result?;
         }
         Ok(())
     })
@@ -1093,7 +1128,9 @@ async fn create_isolated_worktree(
         }
         return Err(error);
     }
-    Ok(workspace)
+    Arc::into_inner(workspace).ok_or_else(|| FunctionCallError::RespondToModel(
+        "spawn_agent: isolated snapshot copy is still in progress".to_string(),
+    ))
 }
 
 async fn capture_workspace_overlay(
@@ -1101,36 +1138,46 @@ async fn capture_workspace_overlay(
     cancellation_token: &CancellationToken,
     terminal_tasks: &TaskTracker,
 ) -> Result<WorkspaceOverlay, FunctionCallError> {
-    let mut command = Command::new("git");
-    command
+    let mut head_command = Command::new("git");
+    head_command.arg("-C").arg(repo_root).args(["rev-parse", "--verify", "HEAD"]);
+    let head = run_worktree_git(head_command, None, cancellation_token, terminal_tasks).await
+        .map_err(|error| FunctionCallError::RespondToModel(format!("spawn_agent: could not capture snapshot HEAD: {error}")))?;
+    if !head.status.success() {
+        return Err(FunctionCallError::RespondToModel("spawn_agent: could not resolve snapshot HEAD".into()));
+    }
+    let head = String::from_utf8(head.stdout).map_err(|error|
+        FunctionCallError::RespondToModel(format!("spawn_agent: invalid snapshot HEAD: {error}")))?;
+    let head = head.trim().to_string();
+    let mut diff_command = Command::new("git");
+    diff_command
         .arg("-C")
         .arg(repo_root)
-        .args(["diff", "--binary", "--no-ext-diff", "HEAD", "--"]);
-    let diff = run_worktree_git(command, None, cancellation_token, terminal_tasks)
-        .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "spawn_agent: could not capture tracked workspace changes: {error}"
-            ))
-        })?;
+        .args(["diff", "--binary", "--no-ext-diff", &head, "--"]);
+    let mut untracked_command = Command::new("git");
+    untracked_command
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"]);
+    let (diff, untracked) = tokio::join!(
+        run_worktree_git(diff_command, None, cancellation_token, terminal_tasks),
+        run_worktree_git(untracked_command, None, cancellation_token, terminal_tasks),
+    );
+    let diff = diff.map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agent: could not capture tracked workspace changes: {error}"
+        ))
+    })?;
     if !diff.status.success() {
         return Err(FunctionCallError::RespondToModel(format!(
             "spawn_agent: git diff failed while creating an isolated snapshot: {}",
             String::from_utf8_lossy(&diff.stderr).trim()
         )));
     }
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(repo_root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"]);
-    let untracked = run_worktree_git(command, None, cancellation_token, terminal_tasks)
-        .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "spawn_agent: could not enumerate untracked workspace files: {error}"
-            ))
-        })?;
+    let untracked = untracked.map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agent: could not enumerate untracked workspace files: {error}"
+        ))
+    })?;
     if !untracked.status.success() {
         return Err(FunctionCallError::RespondToModel(format!(
             "spawn_agent: git ls-files failed while creating an isolated snapshot: {}",
@@ -1209,6 +1256,7 @@ async fn capture_workspace_overlay(
     }
     untracked_files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(WorkspaceOverlay {
+        head,
         tracked_diff: diff.stdout,
         untracked_files,
     })
@@ -2129,5 +2177,60 @@ mod output_schema_tests {
             .unwrap();
             assert!(validator.is_valid(&reused));
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parallel_snapshot_preserves_tracked_and_untracked_bytes() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-c")
+                .arg(format!("core.hooksPath={}", repo.path().join("no-hooks").display()))
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("tracked.txt"), b"before\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&[
+            "-c", "user.name=Snapshot Test", "-c", "user.email=snapshot@example.invalid",
+            "commit", "-qm", "fixture",
+        ]);
+        std::fs::write(repo.path().join("tracked.txt"), b"after\n").unwrap();
+        std::fs::create_dir_all(repo.path().join("nested/files")).unwrap();
+        for index in 0..16_u8 {
+            std::fs::write(
+                repo.path().join(format!("nested/files/{index}.bin")),
+                [0, index, 255, b'\n'],
+            )
+            .unwrap();
+        }
+        let tasks = TaskTracker::new();
+        let workspace = create_isolated_worktree(
+            repo.path(), home.path(), "snapshot", &CancellationToken::new(), &tasks,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(workspace.path.join("tracked.txt")).unwrap(), b"after\n");
+        for index in 0..16_u8 {
+            assert_eq!(
+                std::fs::read(workspace.path.join(format!("nested/files/{index}.bin"))).unwrap(),
+                [0, index, 255, b'\n'],
+            );
+        }
+        cleanup_isolated_worktree(&workspace).await.unwrap();
+        assert!(!workspace.path.exists());
+        tasks.close();
+        tasks.wait().await;
     }
 }

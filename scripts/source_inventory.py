@@ -15,6 +15,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path, PurePosixPath
 
@@ -766,6 +767,25 @@ def describe_contract():
     """Describe the supported interface without reading repository or state files."""
     return {
         "format": RESULT_FORMAT,
+        "invocation": {
+            "file": "python -X utf8 scripts/source_inventory.py --root . --query QUERY --state STATE --report REPORT",
+            "powershell_stdin": "& {\n  $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n  @'\n{\"categories\":[{\"name\":\"templates\",\"paths\":[\"templates/*.md\",\"*/templates/*.md\"],\"verification\":\"path\"}]}\n'@ | python -X utf8 scripts/source_inventory.py --root . --query -\n}",
+            "stdin": "--query - reads UTF-8 JSON from stdin (an optional UTF-8 BOM is accepted). The PowerShell example scopes OutputEncoding to the script block; it changes no global setting.",
+            "continuation": "Reuse the query with --root ROOT --query QUERY --state ARTIFACT (or pipe it with --query -). Add --report REPORT to deliver the updated report; explicit --state does not imply a report. ARTIFACT is the returned state path. Omitting --state starts a new independent run, not a continuation.",
+            "refresh": "Add --refresh to a scan with the retained state to start a new epoch and read current sources instead of continuing captured evidence.",
+        },
+        "workflow": {
+            "default": "describe -> scan -> final when the scan supplies sufficient evidence. Build the query directly from the requested categories and known scope; the initial scan performs file discovery, so do not first list the repository or probe example directories.",
+            "scope": "Use known roots for a restricted request. For repository-wide filename/rule inventories with unknown layout, use layout-independent globs: *.rs matches Rust files at any depth; templates/*.md plus */templates/*.md covers root and nested templates directories; models.json plus */models.json covers that basename at any depth. Examples are illustrative, not a complete semantic inventory or permission to broaden a restricted request. Use contains for content criteria and retain runtime verification for activation claims.",
+            "inspection_exception": "Inspect before scanning only when a concrete uncertainty cannot be expressed by query rules and its answer would change category coverage or verification. Name that uncertainty and use the smallest targeted inspection, not general repository orientation. Resolve pending scans and runtime evidence after the scan when required; do not force final delivery from insufficient evidence.",
+        },
+        "globs": "fnmatch.fnmatchcase on normalized repository-relative POSIX paths; case-sensitive. Both * and ? can match /, so dir/*.rs also matches dir/nested/file.rs. Backslashes and leading ./ are normalized.",
+        "contains": "Optional Python regular expression searched with re.search over UTF-8 file text, not filenames; case-sensitive unless flags such as (?i) are supplied. Non-UTF-8 content is unresolved when text matching is required.",
+        "budget": {
+            "max_file_bytes": MAX_FILE_BYTES,
+            "max_scan_bytes": MAX_SCAN_BYTES,
+            "continuation": "When scan_pending > 0, continue with the returned artifact and the same query. Oversized files remain unresolved; continuation does not lift the per-file limit. A continuation returning no newly required inventory evidence is unnecessary unless needed to establish completion.",
+        },
         "query": {
             "required_categories": "Names whose coverage must be retained; defaults to all declared categories.",
             "categories": [
@@ -808,12 +828,12 @@ def describe_contract():
             "categories": [
                 {
                     "name": "templates",
-                    "paths": ["src/templates/*.md"],
+                    "paths": ["templates/*.md", "*/templates/*.md"],
                     "verification": "path",
                 },
                 {
                     "name": "catalog",
-                    "paths": ["src/models.json"],
+                    "paths": ["models.json", "*/models.json"],
                     "verification": "path",
                     "json_summary": True,
                 },
@@ -828,6 +848,10 @@ def describe_contract():
             "category_counts": "tracked counts keyed by category; categories can overlap",
             "searched_records": "rules evaluated this scan",
             "reused_records": "unchanged rule results reused",
+            "scan_epoch": "identity of the captured scan epoch",
+            "scan_pending": "number of files awaiting another scan batch",
+            "source_bytes_read": "source bytes read in this batch",
+            "evidence_scope": "captured evidence freshness and scope",
             "unresolved_count": "records requiring inspection",
             "missing_categories": "required undeclared categories",
             "earlier_scope_count": "retained scope changes",
@@ -849,13 +873,13 @@ def describe_contract():
             ],
             "json_summary_count": "successful JSON records; present when nonzero",
             "json_summary_next_offset": "next summary offset or null",
-            "report": "with --report: immutable Markdown path",
+            "report": "with --report or defaulted state/report: immutable Markdown path",
             "canonical_paths": "immutable JSON path",
             "delivery_sha256": "hash of canonical JSON bytes",
         },
         "paging": f"Use --state STATE --render-only --offset N without rescanning. Paths and remaining pages hold {PAGE_RECORDS} records; JSON summaries also have a {SUMMARY_PAGE_BYTES}-byte target. Each next-offset field advances its own list.",
-        "control_files": "Query and state must be distinct files outside the selected source paths, even when a state file does not exist yet. Pruned directories are outside discovery scope.",
-        "delivery": "Canonical JSON contains all paths, categories, json_summaries, unresolved/excluded records and prior scope. Prefer its link to rereading or reprinting the report. A ready result proves only the declared query, not that its scope answers the entire task.",
+        "control_files": "Without --state, each scan creates a unique source-inventory-* directory under the system temporary directory, containing state.json and, unless --report is supplied, inventory.md. State is never selected by query hash. Explicit --state preserves explicit-path behavior: no report unless requested. --render-only requires explicit --state and no query. Query files and state must be distinct and outside selected sources; stdin has no query path. Reports must be outside the source tree. Pruned directories are outside discovery scope.",
+        "delivery": "Canonical JSON contains all paths, categories, json_summaries, unresolved/excluded records and prior scope. Deliver sufficient returned counts and report/canonical-path links without another call. State is internal; use --render-only with --paths or --remaining only for newly required evidence, not to re-derive returned counts. A ready result proves only the declared query, not that its scope answers the entire task. When this contract supplies the needed facts, do not read or search source_inventory.py.",
     }
 
 
@@ -918,11 +942,11 @@ def main(argv=None):
         help="Print the versioned query/result contract without reading the repository",
     )
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--query", type=Path)
+    parser.add_argument("--query", type=Path, help="Query JSON file, or - for UTF-8 stdin")
     parser.add_argument(
         "--state",
         type=Path,
-        help="Task-owned retained records and coverage; reused on subsequent calls",
+        help="Task-owned retained records; omit to create a unique temporary run",
     )
     parser.add_argument(
         "--instructions",
@@ -938,7 +962,7 @@ def main(argv=None):
     parser.add_argument(
         "--report",
         type=Path,
-        help="Write a readable Markdown report from the retained records",
+        help="Write a Markdown report; defaults to inventory.md only when --state is omitted",
     )
     parser.add_argument(
         "--render-only",
@@ -999,9 +1023,27 @@ def main(argv=None):
         parser.error(
             "offset must be nonnegative; --remaining cannot be combined with --paths"
         )
-    if not args.state:
-        parser.error("--state is required for an inventory")
-    if args.query and args.state.resolve() == args.query.resolve():
+    query_path = args.query if args.query != Path("-") else None
+    if args.render_only and not args.state:
+        parser.error("--render-only requires an explicit --state")
+    if args.render_only and args.query:
+        parser.error("--render-only requires a version 2 or 3 state and no --query")
+    if not args.render_only:
+        if not args.query:
+            parser.error("--query is required unless --render-only is used")
+        if query_path is not None:
+            query = json.loads(query_path.read_text(encoding="utf-8"))
+        else:
+            text = getattr(sys.stdin, "buffer", sys.stdin).read()
+            if isinstance(text, bytes):
+                text = text.decode("utf-8-sig")
+            query = json.loads(text)
+        if not args.state:
+            run_dir = Path(tempfile.mkdtemp(prefix="source-inventory-"))
+            args.state = run_dir / "state.json"
+            if not args.report:
+                args.report = run_dir / "inventory.md"
+    if query_path and args.state.resolve() == query_path.resolve():
         parser.error("state must not overwrite the query")
     previous = (
         json.loads(args.state.read_text(encoding="utf-8"))
@@ -1014,14 +1056,14 @@ def main(argv=None):
         state = previous
         output = state["output"]
     else:
-        if not args.query:
-            parser.error("--query is required unless --render-only is used")
-        query = json.loads(args.query.read_text(encoding="utf-8"))
-        validate_control_paths(args.root, query, query=args.query, state=args.state)
+        controls = {"state": args.state}
+        if query_path is not None:
+            controls["query"] = query_path
+        validate_control_paths(args.root, query, **controls)
         output, state = inventory(args.root, query, previous, refresh=args.refresh)
     delivery = {}
     if args.report:
-        protected = [args.state, args.query] if args.query else [args.state]
+        protected = [args.state, query_path] if query_path else [args.state]
         if any(args.report.resolve() == p.resolve() for p in protected):
             parser.error("report must not overwrite the query or state")
         if args.report.resolve().is_relative_to(Path(state["root"]).resolve()):

@@ -8,7 +8,7 @@ async fn recovery_searches_share_remaining_capacity_and_keep_exact_evidence() {
         ["ALPHA", "BETA", "GAMMA"][i / 60], "exact evidence ".repeat(12))).collect::<String>();
     let temp = tempfile::tempdir().unwrap();
     let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
-    let selectors = ["ALPHA", "BETA", "GAMMA"].map(|query| ToolOutputSelector::Search {
+    let selectors = ["ALPHA", "BETA", "GAMMA"].map(|query| ToolOutputSelector::Search { case_insensitive: false,
         query: query.into(), start_byte: 0, max_results: 60, context_lines: 0,
     });
     let result = select_tool_output_snapshot(&metadata, &snapshot, selectors.to_vec(), 4_000).unwrap();
@@ -60,7 +60,7 @@ async fn shared_search_hydration_preserves_evidence_and_independent_recovery() {
         "λ verified signed value -7; ".repeat(25)
     );
     let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
-    let selectors = ["ALPHA", "BETA"].map(|query| ToolOutputSelector::Search {
+    let selectors = ["ALPHA", "BETA"].map(|query| ToolOutputSelector::Search { case_insensitive: false,
         query: query.into(),
         start_byte: 0,
         max_results: 100,
@@ -128,7 +128,7 @@ fn shared_search_hydration_rejects_missing_tiny_or_non_saving_evidence() {
     let mut hydrated = reference.clone();
     hydrated["text"] = serde_json::json!("verified evidence ".repeat(30));
     let mut previous = ToolOutputSelectorResult::state(
-        ToolOutputSelector::Search {
+        ToolOutputSelector::Search { case_insensitive: false,
             query: "first".into(),
             start_byte: 0,
             max_results: 1,
@@ -729,9 +729,9 @@ async fn token_efficiency_reduced_output_notice_delivers_its_exact_bounded_selec
     let temp = tempfile::tempdir().expect("tempdir");
     for body in [b"retained output".to_vec(), vec![b'x'; 2048]] {
         let artifact = create_raw_output_artifact(temp.path(), "thread", &body).await;
+        let source = std::str::from_utf8(&body).expect("UTF-8 fixture");
         let notice = artifact
-            .reduction_notice()
-            .await
+            .reduction_notice(source, "")
             .expect("stored artifact reduction notice");
         assert!(notice.contains("with read_tool_output"));
         assert!(notice.contains(&artifact.artifact_id().expect("artifact ID").to_string()));
@@ -743,8 +743,10 @@ async fn token_efficiency_reduced_output_notice_delivers_its_exact_bounded_selec
         let end = notice.rfind("}]}").expect("recovery invocation end") + 3;
         let args: serde_json::Value =
             serde_json::from_str(&notice[start..end]).expect("recovery JSON");
-        let selected_bytes = body.len().min(1024);
-        assert_eq!(args["selectors"][0]["end"], selected_bytes);
+        assert_eq!(
+            args["selectors"],
+            serde_json::json!([{"kind": "lines", "start": 1, "end": 1}])
+        );
         let output = read_tool_output_selectors(
             temp.path(),
             "thread",
@@ -756,7 +758,7 @@ async fn token_efficiency_reduced_output_notice_delivers_its_exact_bounded_selec
         assert!(output.complete);
         assert_eq!(
             output.results[0].text.as_deref(),
-            Some(std::str::from_utf8(&body[..selected_bytes]).unwrap())
+            Some(source)
         );
         assert_eq!(output.canonical_bytes, body.len() as u64);
     }
@@ -1242,7 +1244,7 @@ async fn artifact_recovery_search_returns_batched_exact_selectors_and_continuati
     );
     let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
     let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
-    let search = ToolOutputSelector::Search {
+    let search = ToolOutputSelector::Search { case_insensitive: false,
         query: "needle".to_string(),
         start_byte: 0,
         max_results: 2,
@@ -1314,7 +1316,7 @@ async fn artifact_recovery_search_preserves_nonoverlapping_utf8_byte_offsets() {
         temp.path(),
         "thread",
         &artifact_id,
-        vec![ToolOutputSelector::Search {
+        vec![ToolOutputSelector::Search { case_insensitive: false,
             query: "aa".to_string(),
             start_byte: 0,
             max_results: 2,
@@ -1371,7 +1373,7 @@ async fn artifact_recovery_search_page_fits_its_ceiling_and_advances() {
     );
     let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
     let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
-    let search = ToolOutputSelector::Search {
+    let search = ToolOutputSelector::Search { case_insensitive: false,
         query: "needle".to_string(),
         start_byte: 0,
         max_results: ARTIFACT_SEARCH_MAX_RESULTS,
@@ -1429,7 +1431,7 @@ async fn artifact_recovery_sparse_search_avoids_a_historical_line_sweep() {
         temp.path(),
         "thread",
         &artifact_id,
-        vec![ToolOutputSelector::Search {
+        vec![ToolOutputSelector::Search { case_insensitive: false,
             query: "recovery target".to_string(),
             start_byte: 0,
             max_results: ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS,
@@ -2824,17 +2826,18 @@ async fn stale_generation_invalidates_a_rebuilt_scan_only_root() {
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 async fn oversized_root_is_sticky_scan_only_until_an_authoritative_in_capacity_scan() {
+    const CAPACITY: usize = 8;
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("tool-output");
     let directory = root.join("thread");
     tokio::fs::create_dir_all(&directory)
         .await
         .expect("artifact directory");
-    for index in 0..=MAX_RETENTION_INDEX_RECORDS {
+    for index in 0..=CAPACITY {
         std::fs::write(directory.join(format!("{index:05}.log")), b"x")
             .expect("write indexed artifact");
     }
-    let _ = capture_retention_token(&directory);
+    set_retention_index_capacity_for_test(&root, CAPACITY);
 
     assert_eq!(
         force_retention_reconciliation_for_test(&root).await,
@@ -2843,7 +2846,7 @@ async fn oversized_root_is_sticky_scan_only_until_an_authoritative_in_capacity_s
     let entered = retention_diagnostics_for_test(&root);
     assert_eq!(entered.oversized_root_fallbacks, 1);
     assert_eq!(entered.scan_only_entries, 1);
-    assert_eq!(entered.candidates_visited, 8_193);
+    assert_eq!(entered.candidates_visited, CAPACITY as u64 + 1);
     for _ in 0..5 {
         assert_eq!(
             prepare_retention_mode(&root, false).await,
@@ -2857,7 +2860,8 @@ async fn oversized_root_is_sticky_scan_only_until_an_authoritative_in_capacity_s
         entered.scan_only_operations + 5
     );
 
-    std::fs::remove_file(directory.join("08192.log")).expect("shrink oversized root");
+    std::fs::remove_file(directory.join(format!("{CAPACITY:05}.log")))
+        .expect("shrink oversized root");
     assert_eq!(
         force_retention_reconciliation_for_test(&root).await,
         RetentionModeKind::Indexed
@@ -3758,7 +3762,7 @@ fn raw_retention_worker_keeps_ownership_after_caller_and_runtime_cancellation() 
 
 #[test]
 #[serial_test::serial(command_output_artifact)]
-fn reduction_notice_queues_filesystem_work_and_rejects_deleted_artifacts() {
+fn reduction_notice_avoids_filesystem_work_and_recovery_rejects_deleted_artifacts() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
@@ -3766,7 +3770,8 @@ fn reduction_notice_queues_filesystem_work_and_rejects_deleted_artifacts() {
         .expect("single-worker runtime");
     runtime.block_on(async {
         let temp = tempfile::tempdir().expect("artifact home");
-        let artifact = create_raw_output_artifact(temp.path(), "notice", b"recover these bytes\n").await;
+        let source = "visible\nrecover these bytes\n";
+        let artifact = create_raw_output_artifact(temp.path(), "notice", source.as_bytes()).await;
         let RawOutputArtifact::Stored { path, .. } = &artifact else {
             panic!("normal artifact creation failed");
         };
@@ -3781,23 +3786,34 @@ fn reduction_notice_queues_filesystem_work_and_rejects_deleted_artifacts() {
             worker_released.store(true, Ordering::Release);
         });
         entered_rx.recv().expect("sole blocking worker occupied");
-        let notice = tokio::spawn(async move {
-            let text = artifact.reduction_notice().await;
-            (artifact, text)
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let runtime_advanced_before_worker_release = !released.load(Ordering::Acquire);
-        let notice_waited_for_worker = !notice.is_finished();
+        let text = artifact.reduction_notice(source, "visible\n");
+        let notice_finished_before_worker_release = !released.load(Ordering::Acquire);
         let _ = release_tx.send(());
         occupied.await.expect("blocking worker released");
-        let (artifact, text) = notice.await.expect("notice task");
-        assert!(runtime_advanced_before_worker_release);
-        assert!(notice_waited_for_worker, "the actual path check must enter the blocking pool");
-        let expected = format!("[command output reduced; read a bounded selection from the retained output with read_tool_output: {{\"artifact_id\":\"{}\",\"selectors\":[{{\"kind\":\"bytes\",\"start\":0,\"end\":20}}]}}. Selection completeness does not mean full artifact delivery. Batch exact ranges when possible; do not rerun the producer.]", artifact.artifact_id().expect("artifact identity"));
+        assert!(
+            notice_finished_before_worker_release,
+            "formatting must not queue filesystem work"
+        );
+        let id = artifact.artifact_id().expect("artifact identity").to_string();
+        let expected = format!("[command output reduced; recover the first omitted lines with read_tool_output: {{\"artifact_id\":\"{id}\",\"selectors\":[{{\"kind\":\"lines\",\"start\":2,\"end\":2}}]}}. Selection completeness does not mean full artifact delivery; do not rerun the producer.]");
         assert_eq!(text.as_deref(), Some(expected.as_str()));
-        assert_eq!(tokio::fs::read(&path).await.expect("retained output"), b"recover these bytes\n");
+        let selectors = vec![ToolOutputSelector::Lines { start: 2, end: 2 }];
+        let recovered = read_tool_output_selectors(temp.path(), "notice", &id, selectors.clone())
+            .await
+            .expect("advertised omitted line");
+        assert!(recovered.complete);
+        assert_eq!(
+            recovered.results[0].text.as_deref(),
+            Some("recover these bytes\n")
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("retained output"),
+            source.as_bytes()
+        );
         tokio::fs::remove_file(&path).await.expect("expire artifact");
-        assert_eq!(artifact.reduction_notice().await, None, "expired output must not advertise recovery");
+        read_tool_output_selectors(temp.path(), "notice", &id, selectors)
+            .await
+            .expect_err("recovery must reject an expired artifact");
     });
 }
 
@@ -4092,7 +4108,7 @@ async fn audit_search_oversized_context_delivers_coordinates_without_skipping_ma
     let temp = tempfile::tempdir().unwrap();
     let content = format!("needle{}\nneedle short\n", "x".repeat(100_000));
     let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &content).await;
-    let selector = ToolOutputSelector::Search {
+    let selector = ToolOutputSelector::Search { case_insensitive: false,
         query: "needle".into(),
         start_byte: 0,
         max_results: 20,
@@ -4301,7 +4317,7 @@ async fn generation_search_case(finding:u32, queries:&[&str], dense:bool) {
     let home = tempfile::tempdir().unwrap();
     let text = (0..24).map(|i|format!("line {i:03} {} {} {}\n",if dense {"ALPHA BETA GAMMA"} else if i%3 == 0 {"ALPHA"} else if i%3 == 1 {"BETA"} else {"GAMMA"},"source evidence ".repeat(5),"é")).collect::<String>();
     let (metadata,snapshot) = logical_artifact_for_test(home.path(),&text).await;
-    let selectors = queries.iter().map(|query|ToolOutputSelector::Search{query:(*query).into(),start_byte:0,max_results:100,context_lines:0}).collect::<Vec<_>>();
+    let selectors = queries.iter().map(|query|ToolOutputSelector::Search{ case_insensitive: false,query:(*query).into(),start_byte:0,max_results:100,context_lines:0}).collect::<Vec<_>>();
     let select = ||select_tool_output_snapshot(&metadata,&snapshot,selectors.clone(),10_000).unwrap();
     let baseline_result = select();
     assert!(baseline_result.complete);
@@ -4337,4 +4353,53 @@ async fn generation_bench_12() {
 async fn generation_bench_10() {
     generation_search_case(10,&["ALPHA"],true).await;
     generation_search_case(10,&["MISSING"],true).await;
+}
+#[test]
+fn recovery_pages_are_independently_sized_against_original_utf8_bytes() {
+    let text = (0..20_000).map(|i| format!("line {i}: λ😀\r\n")).collect::<String>();
+    let canonical = CanonicalToolResult::text(text.clone());
+    let (first, continuation) = select_file_snapshot(&canonical, None).unwrap();
+    let ToolOutputSelector::Bytes { mut start, end } = continuation.unwrap() else { panic!("byte continuation") };
+    assert_eq!(first.results[0].text.as_deref(), Some(&text[..start as usize]));
+    let pages = bounded_page_selectors(&first.artifact_id, &canonical.bytes, start, end, 8_000);
+    assert!(!pages.is_empty() && pages.len() <= 8);
+    for page in pages {
+        let ToolOutputSelector::Bytes { start: next_start, end: next_end } = page else { panic!("byte page") };
+        assert_eq!(next_start, start);
+        let result = select_producer_snapshot(&canonical, &first.artifact_id,
+            vec![ToolOutputSelector::Bytes { start: next_start, end: next_end }], 8_000).unwrap();
+        assert!(result.complete);
+        assert_eq!(result.results[0].text.as_deref(), Some(&text[next_start as usize..next_end as usize]));
+        start = next_end;
+    }
+    assert!(start <= end);
+}
+
+#[test]
+fn search_defaults_hydrate_context_and_ascii_case_option_survives_continuation() {
+    let canonical = CanonicalToolResult::text("before\nERROR first\nafter\nerror second\nend\n");
+    let selector: ToolOutputSelector = serde_json::from_value(serde_json::json!({
+        "kind": "search", "query": "error", "case_insensitive": true, "max_results": 1
+    })).unwrap();
+    let result = select_producer_snapshot(&canonical, "test", vec![selector], 9_000).unwrap();
+    let search = result.results[0].value.as_ref().unwrap();
+    assert_eq!(search["total_matches"], 2);
+    assert_eq!(search["hydrated_ranges"][0]["text"], "before\nERROR first\nafter\nerror second\nend\n");
+    assert!(matches!(result.results[0].continuation, Some(ToolOutputSelector::Search {case_insensitive: true, context_lines: 3, ..})));
+}
+
+#[test]
+fn evidence_reuse_search_delivery_excludes_coordinate_only_context() {
+    let canonical = CanonicalToolResult::text("first\nneedle\nlast\n");
+    let selector: ToolOutputSelector = serde_json::from_value(serde_json::json!({
+        "kind":"search", "query":"needle", "context_lines":1
+    })).unwrap();
+    let mut result = select_producer_snapshot(&canonical, "test", vec![selector], 9_000).unwrap();
+    assert_eq!(result.delivered_ranges(), vec![(0, 18)]);
+    let ranges = result.results[0].value.as_mut().unwrap()["hydrated_ranges"].as_array_mut().unwrap();
+    for range in ranges {
+        range.as_object_mut().unwrap().remove("text");
+    }
+    assert!(result.delivered_ranges().is_empty(), "coordinates do not deliver source bytes");
+    assert!(result.delivered_evidence().is_some(), "the completed search remains new query evidence");
 }

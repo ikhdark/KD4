@@ -16,6 +16,40 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 
 #[tokio::test(start_paused = true)]
+async fn short_empty_polls_require_unreported_output() {
+    use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
+    use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted, None,
+    ).await;
+    crate::unified_exec::process_tests::store_process_for_test(
+        manager, &session, &turn, 1000, Arc::clone(&process),
+    ).await;
+    for (has_output, expected) in [(false, 5_000), (true, 250), (false, 5_000)] {
+        if has_output {
+            process.output_handles().output_buffer.lock().await.push_chunk(b"new output\n");
+        }
+        let timing = Arc::new(ToolDispatchTiming::new(Instant::now(), false));
+        let result = scope_tool_dispatch_timing(Arc::clone(&timing),
+            manager.write_stdin(WriteStdinRequest {
+                process_id: 1000, input: "", yield_time_ms: 250,
+                max_output_tokens: None,
+                truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+                nested_deadline: None,
+            })
+        ).await.unwrap();
+        assert_eq!(!result.raw_output.is_empty(), has_output);
+        let waits = timing.snapshot(Instant::now()).timer_waits;
+        assert_eq!(waits.iter().find(|wait| wait.wait_kind == "write_stdin_yield").unwrap().effective_timeout_ms,
+            Some(expected));
+    }
+    manager.process_store.lock().await.remove(1000);
+    process.terminate_confirmed().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn poll_advertises_noninteractive_session_capabilities() {
     use codex_tools::ToolOutput;
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
@@ -314,7 +348,7 @@ fn coherent_packet_budget_uses_bounded_defaults_and_honors_override() {
 
     assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
     assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
-    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 8_000);
+    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
     assert_eq!(
         resolve_output_limits(
             None,
@@ -2746,7 +2780,6 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };

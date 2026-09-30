@@ -63,6 +63,11 @@ fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
         ("cargo build -p codex-config", 30_000),
         ("cargo +stable --locked build", 30_000),
         ("cargo nextest list -p codex-config", 30_000),
+        ("cd x && cargo build", 30_000),
+        ("npm install", 30_000),
+        ("go build ./...", 30_000),
+        ("dotnet build", 30_000),
+        ("git clone repo", 30_000),
         ("echo cargo build", 2_000),
         ("just test-fast -p codex-config --lib", 30_000),
         ("just app-server-runtime-check", 30_000),
@@ -81,18 +86,39 @@ fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
 }
 
 #[test]
-fn exec_command_boundary_rejects_unsupported_deadlines() {
+fn nested_exec_observation_window_preserves_explicit_and_interactive_handoffs() {
+    for (command, direct_default, interactive_default) in
+        [("rg --files", 2_000, 10_000), ("cargo build", 30_000, 30_000)]
+    {
+        for tty in [false, true] {
+            let mut arguments = serde_json::json!({"cmd": command, "tty": tty});
+            let decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
+            assert_eq!(decoded.observation_yield_time_ms(false), direct_default);
+            assert_eq!(
+                decoded.observation_yield_time_ms(true),
+                if tty { interactive_default } else { 285_000 }
+            );
+            for requested in [250, 60_000, 300_000] {
+                arguments["yield_time_ms"] = serde_json::json!(requested);
+                let decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
+                for nested in [false, true] {
+                    assert_eq!(decoded.observation_yield_time_ms(nested), requested);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exec_command_boundary_reports_ignored_deadlines_and_fields() {
     for field in ["timeout_ms"] {
         for value in [0, 60_000] {
             let mut arguments = serde_json::json!({"cmd": "long-running"});
             arguments[field] = serde_json::json!(value);
-            let error = validate_exec_command_arguments(&arguments.to_string())
-                .expect_err("deadlines must not be silently ignored");
-            assert!(
-                error.contains(&format!("does not support `{field}`")),
-                "{error}"
-            );
-            assert!(error.contains("not a process deadline"), "{error}");
+            arguments["legacy_option"] = serde_json::json!(true);
+            let decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
+            assert!(decoded.argument_notices.iter().any(|notice| notice.contains(field)));
+            assert!(decoded.argument_notices.iter().any(|notice| notice.contains("legacy_option")));
         }
     }
 }
@@ -110,6 +136,33 @@ fn stall_timeout_exec_command_defaults_and_overrides() {
     assert!(validate_exec_command_arguments(
         &serde_json::json!({"cmd": "must-not-run", "stall_timeout_ms": -1}).to_string()
     ).is_err());
+    for command in ["cd x && cargo build", "npm install", "go build ./...", "dotnet build", "git clone repo"] {
+        let decoded: ExecCommandArgs = parse_arguments(&serde_json::json!({"cmd": command}).to_string()).unwrap();
+        assert_eq!(decoded.stall_timeout_ms, None);
+        let decoded: ExecCommandArgs = parse_arguments(&serde_json::json!({"cmd": command, "stall_timeout_ms": 123}).to_string()).unwrap();
+        assert_eq!(decoded.stall_timeout_ms, Some(123));
+    }
+}
+
+#[test]
+fn publishing_exec_command_preserves_explicit_observation_and_stall_overrides() {
+    for command in [
+        serde_json::json!({"cmd": "just publish-local-codex-final"}),
+        serde_json::json!({"script_body": "cd repo; just publish-local-codex-final -Verbose"}),
+        serde_json::json!({"program": "just.exe", "args": ["--justfile", "justfile", "publish-local-codex-final"]}),
+    ] {
+        let decoded: ExecCommandArgs = parse_arguments(&command.to_string()).unwrap();
+        assert_eq!(decoded.stall_timeout_ms, None);
+        assert_eq!(decoded.yield_time_ms, crate::unified_exec::MAX_YIELD_TIME_MS);
+        for (requested, expected) in [(0, None), (123, Some(123))] {
+            let mut explicit = command.clone();
+            explicit["yield_time_ms"] = serde_json::json!(1000);
+            explicit["stall_timeout_ms"] = serde_json::json!(requested);
+            let decoded: ExecCommandArgs = parse_arguments(&explicit.to_string()).unwrap();
+            assert_eq!(decoded.stall_timeout_ms, expected);
+            assert_eq!(decoded.yield_time_ms, 1000);
+        }
+    }
 }
 
 #[tokio::test]
@@ -179,13 +232,12 @@ fn exec_command_boundary_reports_branch_field_and_bound_errors() {
     assert!(mixed_branch.contains("`argv` branch"), "{mixed_branch}");
     assert!(mixed_branch.contains("$.cmd"), "{mixed_branch}");
 
-    let invalid_bound = validate_exec_command_arguments(
+    let adjusted: ExecCommandArgs = parse_arguments(
         &serde_json::json!({"cmd": "rg --files", "yield_time_ms": 50}).to_string(),
     )
-    .expect_err("out-of-range yield must be rejected");
-    assert!(invalid_bound.contains("$.yield_time_ms"), "{invalid_bound}");
-    assert!(invalid_bound.contains("actual value 50"), "{invalid_bound}");
-    assert!(invalid_bound.contains("250..=300000"), "{invalid_bound}");
+    .unwrap();
+    assert_eq!(adjusted.yield_time_ms, 250);
+    assert!(adjusted.argument_notices.iter().any(|notice| notice.contains("250")));
 }
 
 #[test]
@@ -197,11 +249,14 @@ fn exec_command_boundary_accepts_long_observation_without_a_process_deadline() {
         .expect("long observation should be accepted");
         assert_eq!(decoded.yield_time_ms, wait);
     }
-    let error = validate_exec_command_arguments(
+    let adjusted: ExecCommandArgs = parse_arguments(
         &serde_json::json!({"cmd": "cargo test", "yield_time_ms": 300_001}).to_string(),
     )
-    .expect_err("the observation ceiling must still be enforced");
-    assert!(error.contains("250..=300000"), "{error}");
+    .unwrap();
+    assert_eq!(adjusted.yield_time_ms, 300_000);
+    assert!(adjusted.argument_notices.iter().any(|notice| notice.contains("300000")));
+    let negative: ExecCommandArgs = parse_arguments(r#"{"cmd":"echo ok","yield_time_ms":-1}"#).unwrap();
+    assert_eq!(negative.yield_time_ms, 250);
 }
 
 #[tokio::test]
@@ -515,7 +570,6 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         original_token_count: None,
         hook_command: Some("broken command".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: Some(existing_repair_notice.to_string()),
         pending_deferred_completions: Vec::new(),
     };
@@ -601,7 +655,6 @@ fn terminal_powershell_nonterminating_error_exposes_recovery_hint_after_success(
         original_token_count: None,
         hook_command: None,
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -1058,8 +1111,8 @@ async fn yielded_validation_records_full_lifetime_once(exit_code: i32) {
 
 #[tokio::test]
 async fn nested_exec_default_yield_outlasts_a_brief_command() {
-    // Nested reads of 2.6-2.8 s missed the 2 s direct default by half a
-    // second, so their cells ended with live sessions the model had to poll.
+    // Cross the former ten-second nested window, not just the two-second
+    // direct default. Progress output must not force a model handoff either.
     let python = which::which("python")
         .or_else(|_| which::which("python3"))
         .unwrap();
@@ -1075,11 +1128,14 @@ async fn nested_exec_default_yield_outlasts_a_brief_command() {
         nested_deadline: None,
         cancellation_cause: None,
     };
-    for (source, marker, completes) in [
-        (nested, "NESTED_BRIEF_DONE", true),
-        (ToolCallSource::Direct, "DIRECT_BRIEF_DONE", false),
+    for (source, marker, delay, explicit_yield, completes) in [
+        (nested.clone(), "NESTED_BRIEF_DONE", 11, None, true),
+        (nested, "NESTED_EXPLICIT_DONE", 3, Some(250), false),
+        (ToolCallSource::Direct, "DIRECT_BRIEF_DONE", 3, None, false),
     ] {
-        let script = format!("import time; time.sleep(3); print('{marker}')");
+        let script = format!(
+            "import time; print('STARTED', flush=True); time.sleep({delay}); print('{marker}')"
+        );
         session
             .services
             .exec_policy
@@ -1093,8 +1149,12 @@ async fn nested_exec_default_yield_outlasts_a_brief_command() {
             )
             .await
             .unwrap();
+        let mut arguments = serde_json::json!({"program": python, "args": ["-c", script]});
+        if let Some(yield_time_ms) = explicit_yield {
+            arguments["yield_time_ms"] = serde_json::json!(yield_time_ms);
+        }
         let payload = ToolPayload::Function {
-            arguments: serde_json::json!({"program": python, "args": ["-c", script]}).to_string(),
+            arguments: arguments.to_string(),
         };
         let output = ExecCommandHandler::default()
             .handle(ToolInvocation {
@@ -1112,6 +1172,11 @@ async fn nested_exec_default_yield_outlasts_a_brief_command() {
 
         let result = output.code_mode_result(&payload);
         assert_eq!(result["session_id"].is_null(), completes, "{result}");
+        if completes {
+            assert_eq!(result["exit_code"], 0, "{result}");
+            assert_eq!(result["process_exited"], true, "{result}");
+            assert!(result["output"].as_str().unwrap().contains("STARTED"));
+        }
         assert_eq!(
             result["output"]
                 .as_str()
@@ -1119,6 +1184,24 @@ async fn nested_exec_default_yield_outlasts_a_brief_command() {
             completes,
             "{result}"
         );
+        if let Some(process_id) = result["session_id"].as_u64() {
+            let completed = session
+                .services
+                .unified_exec_manager
+                .write_stdin(crate::unified_exec::WriteStdinRequest {
+                    process_id: u32::try_from(process_id).unwrap(),
+                    input: "",
+                    yield_time_ms: 10_000,
+                    max_output_tokens: None,
+                    truncation_policy: turn.model_info.truncation_policy.into(),
+                    nested_deadline: None,
+                })
+                .await
+                .expect("collect the deliberately yielded process");
+            assert_eq!(completed.exit_code, Some(0));
+            assert!(completed.process_id.is_none());
+            assert!(String::from_utf8_lossy(&completed.raw_output).contains(marker));
+        }
     }
 }
 
@@ -1859,9 +1942,9 @@ async fn mutating_preflight_rejection_does_not_reserve_process_id() {
 }
 
 #[tokio::test]
-async fn unsupported_deadlines_reject_before_execution() {
+async fn ignored_deadlines_execute_once_and_report_the_adjustment() {
     let temp = tempfile::tempdir().expect("deadline rejection directory");
-    let marker = temp.path().join("must-not-exist");
+    let marker = temp.path().join("executed");
     let marker_literal = serde_json::to_string(&marker.to_string_lossy()).unwrap();
     for field in ["timeout_ms"] {
         let mut arguments = serde_json::json!({
@@ -1877,29 +1960,12 @@ async fn unsupported_deadlines_reject_before_execution() {
             },
         )
         .await;
-        let session = Arc::clone(&invocation.session);
-        let error = match ExecCommandHandler::default().handle(invocation).await {
-            Ok(_) => panic!("unsupported deadline must prevent execution"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("does not support `{field}`")),
-            "{error}"
-        );
-        assert!(!marker.exists(), "rejected commands must not run");
-        let process_id = session
-            .services
-            .unified_exec_manager
-            .allocate_process_id()
-            .await;
-        assert_eq!(process_id, 1000);
-        session
-            .services
-            .unified_exec_manager
-            .release_process_id(process_id)
-            .await;
+        let payload = invocation.payload.clone();
+        let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+        let value = output.code_mode_result(&payload);
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["repair"].as_str().unwrap().contains(field));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "started");
     }
 }
 
@@ -2640,7 +2706,6 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -2678,7 +2743,6 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -2717,7 +2781,6 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -2751,7 +2814,6 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         original_token_count: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -2820,7 +2882,6 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         original_token_count: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };
@@ -2840,7 +2901,6 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         original_token_count: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
         raw_output_artifact: None,
-        raw_output_reduction_notice: None,
         repair_notice: None,
         pending_deferred_completions: Vec::new(),
     };

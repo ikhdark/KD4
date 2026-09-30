@@ -289,34 +289,47 @@ async fn spawn_process_portable(
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_handle = tokio::spawn(async move {
-        let mut warned = false;
-        let code = loop {
-            // Native status checks are short; an idle child never occupies a blocking
-            // worker needed to deliver the input that will let it exit.
-            let result = match tokio::task::spawn_blocking(move || {
-                let result = child.try_wait();
-                (child, result)
-            })
-            .await
+        let code = 'wait: {
+            #[cfg(windows)]
+            if let Some(native_child) =
+                (child.as_mut() as &mut dyn portable_pty::Child).downcast_mut::<crate::win::WinChild>()
             {
-                Ok(result) => result,
-                Err(error) => {
-                    log::error!("PTY status worker failed: {error}");
-                    return;
-                }
-            };
-            child = result.0;
-            match result.1 {
-                Ok(Some(status)) => break status.exit_code() as i32,
-                Ok(None) => {}
-                Err(error) => {
-                    if !warned {
-                        log::warn!("failed to observe PTY exit; retaining child: {error}");
-                        warned = true;
-                    }
+                match native_child.await {
+                    Ok(status) => break 'wait status.exit_code() as i32,
+                    // Keep ownership and the conservative retry path if native
+                    // waiter setup fails; never report a live child as exited.
+                    Err(error) => log::warn!("native PTY exit waiter failed: {error}"),
                 }
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut warned = false;
+            loop {
+                // Native status checks are short; an idle child never occupies a blocking
+                // worker needed to deliver the input that will let it exit.
+                let result = match tokio::task::spawn_blocking(move || {
+                    let result = child.try_wait();
+                    (child, result)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        log::error!("PTY status worker failed: {error}");
+                        return;
+                    }
+                };
+                child = result.0;
+                match result.1 {
+                    Ok(Some(status)) => break status.exit_code() as i32,
+                    Ok(None) => {}
+                    Err(error) => {
+                        if !warned {
+                            log::warn!("failed to observe PTY exit; retaining child: {error}");
+                            warned = true;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         };
         publish_exit_status(&wait_exit_status, &wait_exit_code, code);
         let _ = exit_tx.send(code);

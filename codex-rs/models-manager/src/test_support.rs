@@ -56,14 +56,14 @@ mod tests {
     #[test]
     fn offline_helper_uses_bundled_metadata_and_honors_explicit_empty_catalogs() {
         let known =
-            construct_model_info_offline_for_tests("gpt-5.4", &ModelsManagerConfig::default());
+            construct_model_info_offline_for_tests("gpt-5.5", &ModelsManagerConfig::default());
         assert!(!known.used_fallback_model_metadata);
         assert_eq!(
             known.truncation_policy,
             TruncationPolicyConfig::tokens(10_000)
         );
         let empty = construct_model_info_offline_for_tests(
-            "gpt-5.4",
+            "gpt-5.5",
             &ModelsManagerConfig {
                 model_catalog: Some(ModelsResponse { models: Vec::new() }),
                 ..Default::default()

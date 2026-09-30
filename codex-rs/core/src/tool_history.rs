@@ -606,6 +606,8 @@ pub(crate) struct ToolHistoryState {
     /// Call IDs survive fork reminting; legacy ledgers start without reuse hints.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     recovered_call_ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    recovered_ranges: BTreeMap<String, Vec<serde_json::Value>>,
     #[serde(default)]
     workspace_evidence: BTreeMap<String, WorkspaceEvidenceObservation>,
     /// Current runtimes record completed code-mode carriers that authoritatively
@@ -739,6 +741,11 @@ impl WorkspaceEvidenceObservation {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ToolHistoryMutation {
+    RecordArtifactRecovery {
+        artifact_id: String,
+        recovery_call_id: String,
+        selectors: Vec<serde_json::Value>,
+    },
     MarkArtifactRecovered {
         artifact_id: String,
     },
@@ -780,6 +787,23 @@ pub(crate) enum ToolHistoryMutation {
 impl ToolHistoryMutation {
     pub(crate) fn apply(&self, state: &mut ToolHistoryState) -> bool {
         match self {
+            Self::RecordArtifactRecovery { artifact_id, recovery_call_id, selectors } => {
+                let Some(origin) = state.artifact_call_ids.get(artifact_id) else { return false };
+                let mut changed = state.recovered_call_ids.insert(origin.clone());
+                changed |= state.recovered_call_ids.insert(recovery_call_id.clone());
+                let ranges = state.recovered_ranges.entry(origin.clone()).or_default();
+                for selector in selectors {
+                    if !ranges.contains(selector) {
+                        ranges.push(selector.clone());
+                        changed = true;
+                    }
+                }
+                // Keep the newest bounded recovery directory per source.
+                if ranges.len() > 64 {
+                    ranges.drain(..ranges.len() - 64);
+                }
+                changed
+            }
             Self::MarkArtifactRecovered { artifact_id } => {
                 let Some(call_id) = state.artifact_call_ids.get(artifact_id) else {
                     return false;
@@ -989,6 +1013,7 @@ impl ToolHistoryState {
             && self.code_mode_nested_evidence.is_empty()
             && self.exposed_representations.is_empty()
             && self.recovered_call_ids.is_empty()
+            && self.recovered_ranges.is_empty()
     }
 
     pub(crate) fn register(&mut self, mut candidate: ToolHistoryCandidate) {
@@ -2437,7 +2462,15 @@ impl ToolHistoryState {
                     return None;
                 }
                 let (_, output) = canonical_textual_output_identity(item)?;
-                let receipt = serde_json::json!({
+                let recovery = serde_json::from_str::<serde_json::Value>(&output).ok()
+                    .filter(|value| value["artifact_id"].is_string() && value["results"].is_array())
+                    .map(|value| serde_json::json!({
+                        "artifact_id": value["artifact_id"],
+                        "canonical_sha256": value["canonical_sha256"],
+                        "selectors": value["results"].as_array().into_iter().flatten()
+                            .filter_map(|result| result.get("selector").cloned()).collect::<Vec<_>>(),
+                    }));
+                let mut receipt = serde_json::json!({
                     "kind": if self.output_was_consumed(call_id) {
                         "observed_tool_outcome"
                     } else {
@@ -2448,7 +2481,11 @@ impl ToolHistoryState {
                     "digest": truncate_text_to_token_ceiling(&output, RECEIPT_DIGEST_TARGET_TOKENS),
                     "control": truncate_text_to_token_ceiling(&output.lines().filter(|line| line.contains("session ID") || line.contains("Session ID") || line.contains("session_id") || line.contains("Exit code")).collect::<Vec<_>>().join("\n"), RECEIPT_DIGEST_TARGET_TOKENS),
                     "output_omitted": true
-                }).to_string();
+                });
+                if let Some(recovery) = recovery {
+                    receipt["recovery"] = recovery;
+                }
+                let receipt = receipt.to_string();
                 let cost = approx_token_count(&receipt);
                 Some((receipt, cost))
             })?;
@@ -2809,6 +2846,7 @@ impl ToolHistoryState {
         self.exposed_representations
             .retain(|call_id, _| live.contains(call_id));
         self.recovered_call_ids.retain(|call_id| live.contains(call_id));
+        self.recovered_ranges.retain(|call_id, _| live.contains(call_id));
         self.workspace_evidence
             .retain(|call_id, _| live.contains(call_id));
         self.non_workspace_code_mode_calls
@@ -2927,6 +2965,12 @@ impl ToolHistoryState {
         // Charge the serialized envelope as well as the pins. Do not truncate JSON or a
         // recovery handle, and prefer the newest references rather than call-id ordering.
         for mut pin in pins.into_iter().take(COMPACTION_ARTIFACT_PIN_MAX_ITEMS) {
+            if let Some(origin) = pin["artifact_id"].as_str()
+                .and_then(|id| self.artifact_call_ids.get(id))
+                && let Some(ranges) = self.recovered_ranges.get(origin)
+            {
+                pin["recovered_selectors"] = serde_json::json!(ranges);
+            }
             // The sidecar explains retrieval once for all pins. Standalone pins
             // still carry their own instructions when projected without it.
             pin.as_object_mut()?.remove("retrieval");
@@ -2962,6 +3006,7 @@ impl ToolHistoryState {
         self.recovered_call_ids.retain(|call_id| {
             retrievable_calls.contains(call_id)
         });
+        self.recovered_ranges.retain(|call_id, _| retrievable_calls.contains(call_id));
     }
 }
 
@@ -3495,6 +3540,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
         untracked_consumption: state.untracked_consumption,
         exposed_representations: state.exposed_representations,
         recovered_call_ids: state.recovered_call_ids,
+        recovered_ranges: state.recovered_ranges,
         workspace_evidence,
         non_workspace_code_mode_calls,
         code_mode_nested_evidence,
@@ -4671,6 +4717,7 @@ fn workspace_call_observes_from_arguments(
     if tool_identity == "read_file" {
         return !arguments
             .get("path")
+            .or_else(|| arguments.get("file_path"))
             .and_then(serde_json::Value::as_str)
             .is_some_and(|path| path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX));
     }
@@ -4726,7 +4773,9 @@ fn source_dependencies_from_arguments(
     cwd: &Path,
 ) -> BTreeSet<SourceDependencyV1> {
     if matches!(tool_identity, "read_file" | "list_files") {
-        let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
+        let Some(path) = arguments.get("path")
+            .or_else(|| (tool_identity == "read_file").then(|| arguments.get("file_path")).flatten())
+            .and_then(serde_json::Value::as_str) else {
             return BTreeSet::new();
         };
         if path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX) {

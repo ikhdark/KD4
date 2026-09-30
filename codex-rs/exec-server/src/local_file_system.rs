@@ -1,3 +1,5 @@
+use codex_file_system::WalkDirectoryEntry;
+use codex_file_system::WalkEntryMetadata;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::path::Path;
@@ -9,6 +11,7 @@ use std::time::UNIX_EPOCH;
 use tokio::io;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::CopyOptions;
 use crate::CreateDirectoryOptions;
@@ -630,6 +633,18 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         ))
     }
 
+    fn walk<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: WalkOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
+        Box::pin(async move {
+            reject_platform_sandbox_context(sandbox)?;
+            self.file_system.walk(path, options, None).await
+        })
+    }
+
     fn remove<'a>(
         &'a self,
         path: &'a PathUri,
@@ -684,8 +699,9 @@ impl DirectFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<u8>> {
-        let file = self.open_file_for_read(path, sandbox).await?;
-        let metadata = file.metadata().await?;
+        reject_sandbox_context(sandbox)?;
+        let path = path.to_abs_path()?;
+        let (file, metadata) = regular_file::open_with_metadata(path.as_path()).await?;
         if metadata.len() > MAX_READ_FILE_BYTES {
             return Err(file_too_large_error());
         }
@@ -707,30 +723,14 @@ impl DirectFileSystem {
     ) -> FileSystemResult<Option<Vec<u8>>> {
         reject_sandbox_context(sandbox)?;
         let path = path.to_abs_path()?;
-        let Some(first) = read_bounded_file_snapshot(path.as_path(), max_bytes).await? else {
-            return Ok(None);
-        };
-        let Some(second) = (match read_bounded_file_snapshot(path.as_path(), max_bytes).await {
-            Ok(snapshot) => snapshot,
-            Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
-            Err(err) => return Err(err),
-        }) else {
-            return Ok(None);
-        };
-        let final_state = match read_native_file_state(path.as_path()).await {
-            Ok(state) => state,
-            Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
-            Err(err) => return Err(err),
-        };
-        if first.bytes != second.bytes
-            || native_file_metadata_changed(&first.metadata, &second.metadata)
-            || first.identity != second.identity
-            || native_file_metadata_changed(&second.metadata, &final_state.metadata)
-            || second.identity != final_state.identity
-        {
-            return Ok(None);
-        }
-        Ok(Some(first.bytes))
+        run_cancellable_file_system_task(move |cancel| {
+            read_bounded_file_sync(
+                || regular_file::open_sync(path.as_path()),
+                max_bytes,
+                &cancel,
+            )
+        })
+        .await
     }
 
     async fn read_file_bounded_confined(
@@ -743,46 +743,28 @@ impl DirectFileSystem {
         reject_sandbox_context(sandbox)?;
         let path = path.to_abs_path()?;
         let root = root.to_abs_path()?;
-        let canonical_root = tokio::fs::canonicalize(root.as_path()).await?;
-        let canonical_path = tokio::fs::canonicalize(path.as_path()).await?;
-        if !canonical_path.starts_with(&canonical_root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "file resolves outside the confined root",
-            ));
-        }
-        let Some(first) =
-            read_bounded_confined_file_snapshot(&canonical_root, &canonical_path, max_bytes)
-                .await?
-        else {
-            return Ok(None);
-        };
-        let Some(second) =
-            (match read_bounded_confined_file_snapshot(&canonical_root, &canonical_path, max_bytes)
-                .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
-                Err(err) => return Err(err),
-            })
-        else {
-            return Ok(None);
-        };
-        let final_state =
-            match read_confined_native_file_state(&canonical_root, &canonical_path).await {
-                Ok(state) => state,
-                Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
-                Err(err) => return Err(err),
-            };
-        if first.bytes != second.bytes
-            || native_file_metadata_changed(&first.metadata, &second.metadata)
-            || first.identity != second.identity
-            || native_file_metadata_changed(&second.metadata, &final_state.metadata)
-            || second.identity != final_state.identity
-        {
-            return Ok(None);
-        }
-        Ok(Some(first.bytes))
+        run_cancellable_file_system_task(move |cancel| {
+            check_file_system_cancelled(&cancel)?;
+            let canonical_root = std::fs::canonicalize(root.as_path())?;
+            let canonical_path = std::fs::canonicalize(path.as_path())?;
+            if !canonical_path.starts_with(&canonical_root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "file resolves outside the confined root",
+                ));
+            }
+            read_bounded_file_sync(
+                || {
+                    codex_file_system::open_confined_file_with_metadata(
+                        &canonical_root,
+                        &canonical_path,
+                    )
+                },
+                max_bytes,
+                &cancel,
+            )
+        })
+        .await
     }
 
     async fn read_file_stream(
@@ -843,14 +825,7 @@ impl DirectFileSystem {
         })
         .await
         .map_err(io::Error::other)??;
-        Ok(FileMetadata {
-            is_directory: metadata.is_dir(),
-            is_file: metadata.is_file(),
-            is_symlink,
-            size: metadata.len(),
-            created_at_ms: metadata.created().ok().map_or(0, system_time_to_unix_ms),
-            modified_at_ms: metadata.modified().ok().map_or(0, system_time_to_unix_ms),
-        })
+        Ok(file_metadata(&metadata, is_symlink))
     }
 
     async fn read_directory(
@@ -860,10 +835,11 @@ impl DirectFileSystem {
     ) -> FileSystemResult<Vec<ReadDirectoryEntry>> {
         reject_sandbox_context(sandbox)?;
         let path = path.to_abs_path()?;
-        tokio::task::spawn_blocking(move || read_directory_sync(path.as_path(), None))
-            .await
-            .map_err(io::Error::other)?
-            .map(|outcome| outcome.entries)
+        run_cancellable_file_system_task(move |cancel| {
+            read_directory_sync(path.as_path(), None, &cancel, directory_entry)
+        })
+        .await
+        .map(|outcome| outcome.entries)
     }
 
     async fn read_directory_bounded(
@@ -880,9 +856,10 @@ impl DirectFileSystem {
             ));
         }
         let path = path.to_abs_path()?;
-        tokio::task::spawn_blocking(move || read_directory_sync(path.as_path(), Some(max_entries)))
-            .await
-            .map_err(io::Error::other)?
+        run_cancellable_file_system_task(move |cancel| {
+            read_directory_sync(path.as_path(), Some(max_entries), &cancel, directory_entry)
+        })
+        .await
     }
 
     async fn remove(
@@ -926,7 +903,7 @@ impl DirectFileSystem {
         reject_sandbox_context(sandbox)?;
         let source_path = source_path.to_abs_path()?.into_path_buf();
         let destination_path = destination_path.to_abs_path()?.into_path_buf();
-        tokio::task::spawn_blocking(move || -> FileSystemResult<()> {
+        run_cancellable_file_system_task(move |cancel| {
             let metadata = std::fs::symlink_metadata(source_path.as_path())?;
             let file_type = metadata.file_type();
 
@@ -938,16 +915,18 @@ impl DirectFileSystem {
                     ));
                 }
                 let source_root = std::fs::canonicalize(&source_path)?;
-                copy_dir_recursive(&source_path, &destination_path, &source_root)?;
+                copy_dir_recursive(&source_path, &destination_path, &source_root, &cancel)?;
                 return Ok(());
             }
 
             if file_type.is_symlink() {
+                check_file_system_cancelled(&cancel)?;
                 copy_symlink(source_path.as_path(), destination_path.as_path())?;
                 return Ok(());
             }
 
             if file_type.is_file() {
+                check_file_system_cancelled(&cancel)?;
                 std::fs::copy(source_path.as_path(), destination_path.as_path())?;
                 return Ok(());
             }
@@ -958,7 +937,6 @@ impl DirectFileSystem {
             ))
         })
         .await
-        .map_err(|err| io::Error::other(format!("filesystem task failed: {err}")))?
     }
 }
 
@@ -1060,6 +1038,47 @@ impl ExecutorFileSystem for DirectFileSystem {
         ))
     }
 
+    fn read_directory_bounded_for_walk<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
+        Box::pin(async move {
+            reject_sandbox_context(sandbox)?;
+            if max_entries == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bounded directory read limit must be greater than zero",
+                ));
+            }
+            let path = path.to_abs_path()?;
+            run_cancellable_file_system_task(move |cancel| {
+                read_directory_sync(
+                    path.as_path(),
+                    Some(max_entries),
+                    &cancel,
+                    |name, metadata, is_symlink| {
+                        // Lossy names must still be probed through the URI the
+                        // walker will report, not classified as a different file.
+                        let snapshot = name.to_str().and_then(|_| {
+                            is_symlink.map(|is_symlink| WalkEntryMetadata {
+                                is_directory: metadata.is_dir(),
+                                is_file: metadata.is_file(),
+                                is_symlink,
+                            })
+                        });
+                        WalkDirectoryEntry {
+                            file_name: name.to_string_lossy().into_owned(),
+                            metadata: snapshot,
+                        }
+                    },
+                )
+            })
+            .await
+        })
+    }
+
     fn remove<'a>(
         &'a self,
         path: &'a PathUri,
@@ -1086,95 +1105,161 @@ impl ExecutorFileSystem for DirectFileSystem {
     }
 }
 
-struct BoundedFileSnapshot {
-    bytes: Vec<u8>,
-    metadata: std::fs::Metadata,
-    identity: NativeFileIdentity,
-}
-
 struct NativeFileState {
     metadata: std::fs::Metadata,
     identity: NativeFileIdentity,
 }
 
-async fn read_bounded_file_snapshot(
-    path: &Path,
-    max_bytes: usize,
-) -> io::Result<Option<BoundedFileSnapshot>> {
-    let file = regular_file::open(path).await?;
-    read_bounded_file_snapshot_from_file(file, max_bytes).await
+/// Keep the drop guard in the awaiting task: dropping a caller stops queued work
+/// before it starts, and running work at its next cooperative checkpoint.
+async fn run_cancellable_file_system_task<T: Send + 'static>(
+    work: impl FnOnce(CancellationToken) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let cancel = CancellationToken::new();
+    let _guard = cancel.clone().drop_guard();
+    tokio::task::spawn_blocking(move || {
+        check_file_system_cancelled(&cancel)?;
+        work(cancel)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
-async fn read_bounded_confined_file_snapshot(
-    root: &Path,
-    path: &Path,
-    max_bytes: usize,
-) -> io::Result<Option<BoundedFileSnapshot>> {
-    let file = open_confined_native_file(root, path).await?;
-    read_bounded_file_snapshot_from_file(file, max_bytes).await
+fn check_file_system_cancelled(cancel: &CancellationToken) -> io::Result<()> {
+    if cancel.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "filesystem operation cancelled",
+        ));
+    }
+    Ok(())
 }
 
-async fn read_bounded_file_snapshot_from_file(
-    mut file: tokio::fs::File,
+fn read_bounded_file_sync(
+    mut open: impl FnMut() -> io::Result<(std::fs::File, std::fs::Metadata)>,
     max_bytes: usize,
-) -> io::Result<Option<BoundedFileSnapshot>> {
-    let metadata_before = file.metadata().await?;
+    cancel: &CancellationToken,
+) -> io::Result<Option<Vec<u8>>> {
+    check_file_system_cancelled(cancel)?;
+    let (file, metadata) = open()?;
+    let expected_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    let capacity = if expected_len <= max_bytes {
+        expected_len.min(FILE_READ_CHUNK_SIZE)
+    } else {
+        0
+    };
+    let mut bytes = Vec::with_capacity(capacity);
+    let Some(first) = read_bounded_file_snapshot(file, metadata, max_bytes, cancel, |chunk| {
+        bytes.extend_from_slice(chunk)
+    })?
+    else {
+        return Ok(None);
+    };
+    // A replacement/disappearance after the first read is a changed snapshot.
+    let verification: io::Result<bool> = (|| {
+        check_file_system_cancelled(cancel)?;
+        let (file, metadata) = open()?;
+        let mut offset = 0usize;
+        let mut matches = true;
+        let Some(second) =
+            read_bounded_file_snapshot(file, metadata, max_bytes, cancel, |chunk| {
+                let end = offset + chunk.len();
+                matches &= bytes.get(offset..end) == Some(chunk);
+                offset = end;
+                // Do not short-circuit: later I/O errors still take precedence.
+            })?
+        else {
+            return Ok(false);
+        };
+        check_file_system_cancelled(cancel)?;
+        let (file, metadata) = open()?;
+        let final_state = NativeFileState {
+            identity: native_file_identity(&file, &metadata)?,
+            metadata,
+        };
+        Ok(matches
+            && offset == bytes.len()
+            && !native_file_metadata_changed(&first.metadata, &second.metadata)
+            && first.identity == second.identity
+            && !native_file_metadata_changed(&second.metadata, &final_state.metadata)
+            && second.identity == final_state.identity)
+    })();
+    match verification {
+        Ok(true) => Ok(Some(bytes)),
+        Ok(false) => Ok(None),
+        Err(err) if is_changed_file_race_error(err.kind()) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn read_bounded_file_snapshot(
+    mut file: std::fs::File,
+    metadata_before: std::fs::Metadata,
+    max_bytes: usize,
+    cancel: &CancellationToken,
+    consume: impl FnMut(&[u8]),
+) -> io::Result<Option<NativeFileState>> {
     let identity_before = native_file_identity(&file, &metadata_before)?;
     let expected_len = usize::try_from(metadata_before.len()).unwrap_or(usize::MAX);
     if expected_len > max_bytes {
         return Ok(None);
     }
 
-    let mut bytes = Vec::with_capacity(expected_len.min(FILE_READ_CHUNK_SIZE));
-    let read_limit = u64::try_from(max_bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    AsyncReadExt::take(&mut file, read_limit)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() > max_bytes {
+    let Some(bytes_read) =
+        read_bounded_chunks(&mut file, expected_len, max_bytes, cancel, consume)?
+    else {
         return Ok(None);
-    }
+    };
 
-    let metadata_after = file.metadata().await?;
+    let metadata_after = file.metadata()?;
     let identity_after = native_file_identity(&file, &metadata_after)?;
-    if bytes.len() != expected_len
+    if bytes_read != expected_len
         || native_file_metadata_changed(&metadata_before, &metadata_after)
         || identity_before != identity_after
     {
         return Ok(None);
     }
-    Ok(Some(BoundedFileSnapshot {
-        bytes,
+    Ok(Some(NativeFileState {
         metadata: metadata_before,
         identity: identity_before,
     }))
 }
 
-async fn read_native_file_state(path: &Path) -> io::Result<NativeFileState> {
-    let file = regular_file::open(path).await?;
-    native_file_state(file).await
-}
-
-async fn read_confined_native_file_state(root: &Path, path: &Path) -> io::Result<NativeFileState> {
-    let file = open_confined_native_file(root, path).await?;
-    native_file_state(file).await
-}
-
-async fn open_confined_native_file(root: &Path, path: &Path) -> io::Result<tokio::fs::File> {
-    let root = root.to_path_buf();
-    let path = path.to_path_buf();
-    let file =
-        tokio::task::spawn_blocking(move || codex_file_system::open_confined_file(&root, &path))
-            .await
-            .map_err(|err| io::Error::other(format!("filesystem task failed: {err}")))??;
-    Ok(tokio::fs::File::from_std(file))
-}
-
-async fn native_file_state(file: tokio::fs::File) -> io::Result<NativeFileState> {
-    let metadata = file.metadata().await?;
-    let identity = native_file_identity(&file, &metadata)?;
-    Ok(NativeFileState { metadata, identity })
+fn read_bounded_chunks(
+    reader: &mut impl std::io::Read,
+    expected_len: usize,
+    max_bytes: usize,
+    cancel: &CancellationToken,
+    mut consume: impl FnMut(&[u8]),
+) -> io::Result<Option<usize>> {
+    // Small files should not allocate a full transfer block. Grow if the file
+    // grows, but never retain a second file-sized buffer.
+    let capacity = expected_len
+        .saturating_add(1)
+        .clamp(32, FILE_READ_CHUNK_SIZE)
+        .min(max_bytes.saturating_add(1));
+    let mut scratch = vec![0u8; capacity];
+    let mut total = 0usize;
+    loop {
+        check_file_system_cancelled(cancel)?;
+        let len = scratch
+            .len()
+            .min(max_bytes.saturating_sub(total).saturating_add(1));
+        let read = match reader.read(&mut scratch[..len]) {
+            Ok(0) => return Ok(Some(total)),
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if read > max_bytes.saturating_sub(total) {
+            return Ok(None);
+        }
+        consume(&scratch[..read]);
+        total += read;
+        if read == scratch.len() && scratch.len() < FILE_READ_CHUNK_SIZE && total < max_bytes {
+            scratch.resize((scratch.len() * 2).min(FILE_READ_CHUNK_SIZE), 0);
+        }
+    }
 }
 
 fn native_file_metadata_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
@@ -1194,7 +1279,7 @@ struct NativeFileIdentity {
 }
 
 fn native_file_identity(
-    file: &tokio::fs::File,
+    file: &std::fs::File,
     _metadata: &std::fs::Metadata,
 ) -> io::Result<NativeFileIdentity> {
     use std::mem::MaybeUninit;
@@ -1256,14 +1341,41 @@ fn reject_platform_sandbox_context(sandbox: Option<&FileSystemSandboxContext>) -
     Ok(())
 }
 
-fn read_directory_sync(
+fn file_metadata(metadata: &std::fs::Metadata, is_symlink: bool) -> FileMetadata {
+    FileMetadata {
+        is_directory: metadata.is_dir(),
+        is_file: metadata.is_file(),
+        is_symlink,
+        size: metadata.len(),
+        created_at_ms: metadata.created().ok().map_or(0, system_time_to_unix_ms),
+        modified_at_ms: metadata.modified().ok().map_or(0, system_time_to_unix_ms),
+    }
+}
+
+fn directory_entry(
+    name: std::ffi::OsString,
+    metadata: &std::fs::Metadata,
+    _is_symlink: Option<bool>,
+) -> ReadDirectoryEntry {
+    ReadDirectoryEntry {
+        file_name: name.to_string_lossy().into_owned(),
+        is_directory: metadata.is_dir(),
+        is_file: metadata.is_file(),
+    }
+}
+
+fn read_directory_sync<T>(
     path: &Path,
     max_entries: Option<usize>,
-) -> io::Result<ReadDirectoryOutcome> {
+    cancel: &CancellationToken,
+    mut classify: impl FnMut(std::ffi::OsString, &std::fs::Metadata, Option<bool>) -> T,
+) -> io::Result<ReadDirectoryOutcome<T>> {
+    check_file_system_cancelled(cancel)?;
     let mut entries = Vec::new();
     let mut entries_examined = 0;
     let mut read_dir = std::fs::read_dir(path)?;
     while max_entries.is_none_or(|limit| entries_examined < limit) {
+        check_file_system_cancelled(cancel)?;
         let Some(entry) = read_dir.next() else {
             return Ok(ReadDirectoryOutcome {
                 entries,
@@ -1276,18 +1388,18 @@ fn read_directory_sync(
         // Enumeration already describes an entry that is not a link. Links
         // follow their target; entries whose target cannot be read (dangling
         // links) are skipped but still counted.
-        let metadata = match entry.file_type() {
-            Ok(file_type) if !file_type.is_symlink() => entry.metadata(),
+        let is_symlink = entry
+            .file_type()
+            .ok()
+            .map(|file_type| file_type.is_symlink());
+        let metadata = match is_symlink {
+            Some(false) => entry.metadata(),
             _ => std::fs::metadata(entry.path()),
         };
         let Ok(metadata) = metadata else {
             continue;
         };
-        entries.push(ReadDirectoryEntry {
-            file_name: entry.file_name().to_string_lossy().into_owned(),
-            is_directory: metadata.is_dir(),
-            is_file: metadata.is_file(),
-        });
+        entries.push(classify(entry.file_name(), &metadata, is_symlink));
     }
     Ok(ReadDirectoryOutcome {
         entries,
@@ -1296,25 +1408,35 @@ fn read_directory_sync(
     })
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path, source_root: &Path) -> io::Result<()> {
+fn copy_dir_recursive(
+    source: &Path,
+    target: &Path,
+    source_root: &Path,
+    cancel: &CancellationToken,
+) -> io::Result<()> {
+    check_file_system_cancelled(cancel)?;
     reject_destination_in_source(target, source_root)?;
+    check_file_system_cancelled(cancel)?;
     std::fs::create_dir_all(target)?;
     for entry in std::fs::read_dir(source)? {
+        check_file_system_cancelled(cancel)?;
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let file_type = entry.file_type()?;
 
         if file_type.is_dir() {
-            copy_dir_recursive(&source_path, &target_path, source_root)?;
+            copy_dir_recursive(&source_path, &target_path, source_root, cancel)?;
         } else if file_type.is_file() {
             reject_destination_in_source(&target_path, source_root)?;
+            check_file_system_cancelled(cancel)?;
             std::fs::copy(&source_path, &target_path)?;
         } else if file_type.is_symlink() {
+            check_file_system_cancelled(cancel)?;
             copy_symlink(&source_path, &target_path)?;
         }
     }
-    Ok(())
+    check_file_system_cancelled(cancel)
 }
 
 fn reject_destination_in_source(destination: &Path, source_root: &Path) -> io::Result<()> {
@@ -1386,6 +1508,14 @@ fn system_time_to_unix_ms(time: SystemTime) -> i64 {
 #[cfg(test)]
 #[path = "local_file_system_path_uri_tests.rs"]
 mod path_uri_tests;
+
+#[cfg(test)]
+#[path = "local_file_system_latency_tests.rs"]
+mod latency_tests;
+
+#[cfg(test)]
+#[path = "local_copy_cancellation_tests.rs"]
+mod copy_cancellation_tests;
 
 #[cfg(test)]
 mod tests {

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -206,6 +207,8 @@ struct HttpBodyStreams {
 
 struct Inner {
     file_read_slots: Arc<tokio::sync::Semaphore>,
+    // Key negative capability evidence to the transport, not the recoverable client.
+    unsupported_bounded_read: StdMutex<Option<(Weak<RpcClient>, String)>>,
     connection: StdMutex<ConnectionState>,
     connection_changed: watch::Sender<()>,
     // The remote transport delivers one shared notification stream for every
@@ -770,7 +773,37 @@ impl ExecServerClient {
         &self,
         params: FsReadFileBoundedParams,
     ) -> Result<FsReadFileBoundedResponse, ExecServerError> {
-        self.call(FS_READ_FILE_BOUNDED_METHOD, &params).await
+        const METHOD_NOT_FOUND: i64 = -32601;
+        let rpc_client = self.rpc_client().await?;
+        {
+            let unsupported = self
+                .inner
+                .unsupported_bounded_read
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((connection, message)) = unsupported.as_ref()
+                && connection.ptr_eq(&Arc::downgrade(&rpc_client))
+            {
+                return Err(ExecServerError::Server {
+                    code: METHOD_NOT_FOUND,
+                    message: message.clone(),
+                });
+            }
+        }
+        let result = self
+            .call_rpc(&rpc_client, FS_READ_FILE_BOUNDED_METHOD, &params)
+            .await;
+        if let Err(ExecServerError::Server { code, message }) = &result
+            && *code == METHOD_NOT_FOUND
+        {
+            *self
+                .inner
+                .unsupported_bounded_read
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((Arc::downgrade(&rpc_client), message.clone()));
+        }
+        result
     }
 
     pub async fn fs_open(&self, params: FsOpenParams) -> Result<FsOpenResponse, ExecServerError> {
@@ -995,6 +1028,7 @@ impl ExecServerClient {
         let session_id = OnceLock::new();
         let (connection_changed, _connection_changed_rx) = watch::channel(());
         let inner = Arc::new(Inner {
+            unsupported_bounded_read: StdMutex::new(None),
             file_read_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::file_read::MAX_OPEN_FILE_READS,
             )),
@@ -1642,6 +1676,10 @@ async fn handle_server_notification(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "client_fs_capability_tests.rs"]
+mod fs_capability_tests;
 
 #[cfg(test)]
 mod tests {

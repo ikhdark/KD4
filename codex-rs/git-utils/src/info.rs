@@ -121,13 +121,19 @@ pub async fn discover_repository_context(cwd: &Path) -> Option<RepositoryContext
         return None;
     }
     let stdout = String::from_utf8(output.stdout).ok()?;
-    let mut lines = stdout.lines();
-    let repo_root = resolve_git_identity_path(cwd, lines.next()?)?;
-    let common_dir = resolve_git_identity_path(cwd, lines.next()?)?;
-    let worktree_git_dir = resolve_git_identity_path(cwd, lines.next()?)?;
-    if lines.next().is_some() {
-        return None;
-    }
+    let native_cwd = cwd.to_path_buf();
+    let (repo_root, common_dir, worktree_git_dir) = tokio::task::spawn_blocking(move || {
+        let mut lines = stdout.lines();
+        let repo_root = resolve_git_identity_path(&native_cwd, lines.next()?)?;
+        let common_dir = resolve_git_identity_path(&native_cwd, lines.next()?)?;
+        let worktree_git_dir = resolve_git_identity_path(&native_cwd, lines.next()?)?;
+        if lines.next().is_some() {
+            return None;
+        }
+        Some((repo_root, common_dir, worktree_git_dir))
+    })
+    .await
+    .ok()??;
 
     Some(RepositoryContext {
         repo_root,

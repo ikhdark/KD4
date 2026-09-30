@@ -1333,6 +1333,52 @@ function Get-RunningCodexTargetProcesses {
     )
 }
 
+function Get-CodexTurnHostProcess {
+    param(
+        [string[]]$BundlePaths
+    )
+
+    # Commands started by a Codex agent turn inherit CODEX_THREAD_ID. When an
+    # ancestor is a bundle binary or Desktop, replacing or restarting it ends
+    # that turn before it can verify or report the publish.
+    if ([string]::IsNullOrWhiteSpace($env:CODEX_THREAD_ID)) {
+        return $null
+    }
+    $hostFullPaths = @(
+        foreach ($hostPath in @($BundlePaths) + @(Get-CodexDesktopExecutableProof)) {
+            if (-not [string]::IsNullOrWhiteSpace($hostPath) -and -not $hostPath.StartsWith("<")) {
+                [System.IO.Path]::GetFullPath($hostPath)
+            }
+        }
+    )
+    $processesById = @{}
+    try {
+        foreach ($process in @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, ExecutablePath -ErrorAction Stop)) {
+            $processesById[[int]$process.ProcessId] = $process
+        }
+    }
+    catch {
+        # Fail closed: an unverifiable ancestry must not stop a possible host.
+        return [pscustomobject]@{ Id = "<unknown>"; Path = "<unavailable: $($_.Exception.Message)>" }
+    }
+    $visited = [System.Collections.Generic.HashSet[int]]::new()
+    $processId = $PID
+    while ($processesById.ContainsKey($processId) -and $visited.Add($processId)) {
+        $process = $processesById[$processId]
+        $processPath = [string]$process.ExecutablePath
+        if (-not [string]::IsNullOrWhiteSpace($processPath)) {
+            $processFullPath = [System.IO.Path]::GetFullPath($processPath)
+            foreach ($hostFullPath in $hostFullPaths) {
+                if ([string]::Equals($processFullPath, $hostFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return [pscustomobject]@{ Id = [int]$process.ProcessId; Path = $processFullPath }
+                }
+            }
+        }
+        $processId = [int]$process.ParentProcessId
+    }
+    return $null
+}
+
 function Format-ProcessProof {
     param(
         [object[]]$Processes
@@ -1519,7 +1565,7 @@ function Write-ProofLine {
     if ($Concise -and $VerbosePreference -ne "Continue" -and $Name -notin @(
         "action", "targetPath", "buildCommand", "replace", "publishCommitted",
         "desktopRestart", "restartRequired", "rollback", "bundleTransactionRecovery",
-        "doctorCommand"
+        "doctorCommand", "activation", "activationCommand"
     )) {
         return
     }
@@ -3994,6 +4040,23 @@ else {
     Write-ProofLine "commandRunnerBackupPath" "<none: target missing>"
 }
 
+$turnHostProcess = Get-CodexTurnHostProcess -BundlePaths @($targetPath, $codeModeHostTargetPath)
+if ($null -ne $turnHostProcess) {
+    $turnHostProof = "Codex thread $env:CODEX_THREAD_ID runs under pid=$($turnHostProcess.Id) ($($turnHostProcess.Path))"
+    if ($binaryChanged -and -not $DryRun -and -not $skipBuildBlockedByStaleSource) {
+        # The build and its content-bound stamp are complete; stopping the host
+        # here would end the turn before it can report.
+        Write-ProofLine "activation" "deferred: $turnHostProof; replacing the bundle would end that turn"
+        Write-ProofLine "activationCommand" "just publish-local-codex-final (run outside this Codex session; it reuses the stamped build while sources are unchanged)"
+        Write-ProofLine "publishCommitted" "false"
+        Write-Output "Build ready; activation deferred. Run just publish-local-codex-final outside this Codex session to replace the bundle and restart Desktop."
+        exit 0
+    }
+    if ($binaryChanged -and $DryRun) {
+        Write-ProofLine "activation" "would defer: $turnHostProof; the real run builds and stamps, then leaves activation to a run outside this session"
+    }
+}
+
 $desktopRoutingResult = [pscustomobject]@{
     Changed = $false
     RestartRequired = $false
@@ -4026,6 +4089,10 @@ if ($RestartDesktopIfNeeded -and -not $RestartDesktop) {
     if (-not $RestartDesktop) {
         Write-ProofLine "desktopRestart" "skipped: current runtime or dry-run no-op"
     }
+}
+if ($RestartDesktop -and $null -ne $turnHostProcess) {
+    $RestartDesktop = $false
+    Write-ProofLine "desktopRestart" "deferred: $turnHostProof; restart Codex Desktop after this turn"
 }
 
 if ($DryRun) {
