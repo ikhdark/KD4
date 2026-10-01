@@ -278,26 +278,8 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
     match fs::rename(&tmp_path, path) {
         Ok(()) => Ok(()),
         Err(initial_error) => {
-            #[cfg(target_os = "windows")]
-            {
-                if path.exists() {
-                    fs::remove_file(path).with_context(|| {
-                        format!(
-                            "failed to remove existing secrets file at {} before replace",
-                            path.display()
-                        )
-                    })?;
-                    fs::rename(&tmp_path, path).with_context(|| {
-                        format!(
-                            "failed to replace secrets file at {} with {}",
-                            path.display(),
-                            tmp_path.display()
-                        )
-                    })?;
-                    return Ok(());
-                }
-            }
-
+            // Never delete the committed file to retry a failed atomic replace.
+            // Preserve it and clean up only this attempted write.
             let _ = fs::remove_file(&tmp_path);
             Err(initial_error).with_context(|| {
                 format!(
@@ -433,6 +415,24 @@ mod tests {
         let name = SecretName::new("TEST_SECRET")?;
         backend.set(&scope, &name, "one")?;
         backend.set(&scope, &name, "two")?;
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            let path = backend.secrets_path();
+            let original = fs::read(&path)?;
+            // Allow reads but deny replacement and deletion while the file is open.
+            let reader = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1) // FILE_SHARE_READ
+                .open(&path)?;
+            let result = backend.set(&scope, &name, "three");
+            drop(reader);
+
+            assert!(result.is_err(), "a locked secrets file must not be replaced");
+            assert_eq!(fs::read(&path)?, original);
+        }
 
         let secrets_dir = backend.secrets_dir();
         let entries = fs::read_dir(&secrets_dir)

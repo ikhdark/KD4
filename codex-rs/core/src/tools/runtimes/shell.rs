@@ -72,7 +72,7 @@ pub struct ShellRequest {
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub(crate) known_delta: Option<PreparedKnownDelta>,
-    pub(crate) validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
+    pub(crate) validation_launch: bool,
     pub(crate) workspace_operation_root: Option<PathBuf>,
 }
 
@@ -390,25 +390,11 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .await
             .map_err(ToolError::Codex)?;
         env.windows_sandbox_additional_read_roots = additional_read_roots;
-        let authorization_guard = if let Some(launch) = req.validation_launch.as_ref() {
-            let guard = Arc::clone(&ctx.turn.validation_authorization)
-                .read_owned()
-                .await;
-            if let Some(skipped) =
-                crate::validation_admission::recheck_validation_launch(&guard, launch)
-            {
-                return Err(ToolError::ValidationSkipped(skipped));
-            }
-            Some(guard)
-        } else {
-            None
-        };
         let validation_attempt_started = Arc::new(AtomicBool::new(false));
-        let after_spawn = authorization_guard.map(|guard| {
+        let after_spawn = req.validation_launch.then(|| {
             let validation_attempt_started = Arc::clone(&validation_attempt_started);
             Box::new(move || {
                 validation_attempt_started.store(true, Ordering::Release);
-                drop(guard);
             }) as Box<dyn FnOnce() + Send>
         });
         let progress = req.stall_timeout_ms.map(|_| CommandProgress::new());
@@ -442,7 +428,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             Err(CodexErr::Sandbox(SandboxErr::Timeout { output })) if stalled => *output,
             Err(err) => {
                 self.remember_validation_attempt_error(
-                    req.validation_launch.is_some(),
+                    req.validation_launch,
                     validation_attempt_started.load(Ordering::Acquire),
                     &err,
                 );

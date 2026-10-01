@@ -46,6 +46,7 @@ mod tests {
             ParsedExecSource {
                 code: "text('hi')",
                 max_output_tokens: None,
+                deliver: false,
             }
         );
     }
@@ -57,6 +58,7 @@ mod tests {
             ParsedExecSource {
                 code: "text('hi')",
                 max_output_tokens: None,
+                deliver: false,
             }
         );
     }

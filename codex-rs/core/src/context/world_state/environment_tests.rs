@@ -11,6 +11,37 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
+fn session_visualization_roots_do_not_change_the_prompt_or_runtime_permissions() -> Result<()> {
+    use codex_utils_absolute_path::AbsolutePathBuf;
+
+    let home = tempfile::tempdir()?;
+    let project = AbsolutePathBuf::try_from(home.path().join("project"))?;
+    let user_visualization = AbsolutePathBuf::try_from(home.path().join("visualizations/user"))?;
+    let mut rendered = Vec::new();
+    for id in [
+        "01a0f3c5-18aa-79e2-86f0-10bf6108b5f7",
+        "01a0f3c5-18aa-79e2-86f0-10bf6108b5f8",
+    ] {
+        let internal = AbsolutePathBuf::try_from(
+            home.path().join("visualizations/2026/09/30").join(id),
+        )?;
+        let roots = vec![project.clone(), user_visualization.clone(), internal.clone()];
+        let original = FileSystemContext::from_permission_profile(
+            &PermissionProfile::Disabled,
+            &roots,
+        );
+        let visible = original.clone().without_session_visualizations(home.path());
+        assert!(original.render().contains(id));
+        assert_eq!(roots[2], internal);
+        assert!(!visible.render().contains(id));
+        assert!(visible.render().contains("visualizations"));
+        rendered.push(visible.render());
+    }
+    assert_eq!(rendered[0], rendered[1]);
+    Ok(())
+}
+
+#[test]
 fn renders_full_environment_state() -> Result<()> {
     let context = EnvironmentsState {
         environments: [

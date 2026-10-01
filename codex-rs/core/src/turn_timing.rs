@@ -190,6 +190,7 @@ impl TurnClock for SystemTurnClock {
 }
 
 pub(crate) struct TurnTimingState {
+    checkout_snapshot: tokio::sync::OnceCell<Option<String>>,
     clock: Arc<dyn TurnClock>,
     state: StdMutex<TurnTimingStateInner>,
     relay_queue_depth: AtomicU32,
@@ -216,6 +217,7 @@ impl std::fmt::Debug for TurnTimingState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TurnTimingSnapshot {
+    pub(crate) checkout_snapshot_sha256: Option<String>,
     pub(crate) started_at_unix_ms: Option<i64>,
     pub(crate) completed_at_unix_ms: Option<i64>,
     pub(crate) completed_at_unix_secs: Option<i64>,
@@ -473,6 +475,9 @@ impl TurnTimingSnapshot {
                         categories
                     });
                 TurnTimingModelRequest {
+                    request_sha256_by_attempt: request.request_sha256_by_attempt.clone(),
+                    request_section_sha256_by_attempt: request.request_section_sha256_by_attempt.clone(),
+                    response_id_by_attempt: request.response_id_by_attempt.clone(),
                     generation_index: request.generation_index,
                     generation_reason: request.generation_reason,
                     generation_purpose: request.generation_purpose,
@@ -659,6 +664,7 @@ impl TurnTimingSnapshot {
         };
 
         TurnTiming {
+            checkout_snapshot_sha256: self.checkout_snapshot_sha256.clone(),
             schema_version: profile.schema_version,
             profile_valid,
             classification_complete: profile.classification_complete,
@@ -717,6 +723,9 @@ pub(crate) struct TurnTimingProfile {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ModelRequestTiming {
+    request_sha256_by_attempt: BTreeMap<String, String>,
+    request_section_sha256_by_attempt: BTreeMap<String, BTreeMap<String, String>>,
+    response_id_by_attempt: BTreeMap<String, String>,
     generation_index: u32,
     generation_reason: TurnTimingGenerationReason,
     generation_purpose: Option<TurnTimingGenerationPurpose>,
@@ -939,6 +948,7 @@ pub(crate) struct TimingCounters {
 
 #[derive(Debug, Default)]
 struct TurnTimingStateInner {
+    checkout_snapshot_sha256: Option<String>,
     started_sample: Option<ClockSample>,
     last_monotonic_ns: Option<u128>,
     activity: ActiveSet,
@@ -1406,6 +1416,7 @@ impl Drop for TurnPreparationPhaseGuard<'_> {
 impl TurnTimingState {
     fn new(clock: Arc<dyn TurnClock>) -> Self {
         Self {
+            checkout_snapshot: Default::default(),
             clock,
             state: StdMutex::new(TurnTimingStateInner::default()),
             relay_queue_depth: AtomicU32::new(0),
@@ -1507,6 +1518,49 @@ impl TurnTimingState {
         let mut state = self.state();
         let sample = self.clock.sample();
         state.start(sample)
+    }
+
+    pub(crate) async fn capture_checkout_snapshot(&self, cwd: &std::path::Path) {
+        self.checkout_snapshot.get_or_init(|| async {
+            let hash = crate::git_workspace::capture_checkout_snapshot(cwd).await;
+            self.state().checkout_snapshot_sha256 = hash.clone();
+            hash
+        }).await;
+    }
+
+    /// Capture the dispatched bytes independently of optional post-dispatch
+    /// token accounting, so cancelled/failed attempts still have an identity.
+    pub(crate) fn record_model_request_payload(
+        &self,
+        sampling_request_id: &str,
+        physical_attempt_id: &str,
+        bytes: &[u8],
+    ) {
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let sections = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(bytes)
+            .ok()
+            .map(|fields| fields.into_iter().map(|(key, value)| {
+                (key, format!("{:x}", Sha256::digest(value.to_string().as_bytes())))
+            }).collect());
+        let mut state = self.state();
+        if let Some(request) = state.model_requests.iter_mut().find(|request| {
+            request.sampling_request_id.as_deref() == Some(sampling_request_id)
+                && request.physical_attempt_ids.iter().any(|id| id == physical_attempt_id)
+        }) {
+            request.request_sha256_by_attempt.insert(physical_attempt_id.to_owned(), hash);
+            if let Some(sections) = sections {
+                request.request_section_sha256_by_attempt.insert(physical_attempt_id.to_owned(), sections);
+            }
+        }
+    }
+
+    pub(crate) fn record_model_response_id(&self, attempt_id: &str, response_id: &str) {
+        let mut state = self.state();
+        if let Some(request) = state.model_requests.iter_mut().rev()
+            .find(|request| request.physical_attempt_ids.iter().any(|id| id == attempt_id))
+        {
+            request.response_id_by_attempt.insert(attempt_id.to_owned(), response_id.to_owned());
+        }
     }
 
     pub(crate) async fn started_at_unix_secs(&self) -> Option<i64> {
@@ -2479,14 +2533,6 @@ impl TurnTimingState {
         self.record_executed_validation_duration(Duration::from_millis(duration_ms));
     }
 
-    pub(crate) fn record_suppressed_validation_output(&self) {
-        let mut state = self.state();
-        state.counters.suppressed_validation_output_count = state
-            .counters
-            .suppressed_validation_output_count
-            .saturating_add(1);
-    }
-
     pub(crate) fn record_ready_startup_prewarm(&self) {
         let mut state = self.state();
         state.counters.ready_startup_prewarm_count =
@@ -2779,6 +2825,17 @@ impl TurnTimingState {
         {
             tracing::error!(%error, "failed to record projection source dependency fallback");
         }
+    }
+
+    /// Count reduction at the native command -> JavaScript boundary separately
+    /// from outer projection. The script can recover it in-cell, so this does
+    /// not attribute a provider continuation or count the same tokens twice.
+    pub(crate) fn record_nested_tool_output_reduction(&self) {
+        let mut state = self.state();
+        state.counters.tool_output_truncation_count = state
+            .counters
+            .tool_output_truncation_count
+            .saturating_add(1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3779,6 +3836,7 @@ impl TurnTimingStateInner {
             .legacy
             .complete(self.last_monotonic_ns.unwrap_or(sample.time.monotonic_ns));
         let snapshot = TurnTimingSnapshot {
+            checkout_snapshot_sha256: self.checkout_snapshot_sha256.clone(),
             started_at_unix_ms: started_sample.map(|started| started.time.wall_unix_ms),
             completed_at_unix_ms: started_sample.map(|_| sample.time.wall_unix_ms),
             completed_at_unix_secs: started_sample.map(|_| sample.time.wall_unix_ms / 1_000),

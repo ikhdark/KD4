@@ -9,8 +9,6 @@ Keep rules in their active owning surfaces:
 
 - `protocol/src/prompts/base_instructions/default.md`: scope, change contracts,
   shared workspace safety, validation, and completion for roots and workers.
-- `core/src/context/task_model_guidance.rs`: evidence provenance and task-state
-  tracking; `core/src/session/turn.rs` selects whether to inject this fragment.
 - `code-mode-protocol/src/description/exec_prompt.rs`: JavaScript execution,
   awaited calls, nested-tool discovery, and cell lifecycles.
 - `core/src/tools/handlers/shell_spec.rs`: command arguments and session contracts.

@@ -23,7 +23,7 @@ tests = [
 ]
 
 [gates.context-contracts]
-description = "Checkpoint admission, next-request lifecycle, routing, guidance, and ordinary validation freshness."
+description = "Checkpoint admission, next-request lifecycle, routing, and ordinary validation freshness."
 
 [[gates.context-contracts.steps]]
 target = "core_lib"
@@ -33,7 +33,6 @@ tests = [
   "tool_history::tests::checkpoint_handler_boundaries_and_retained_artifacts",
   "tools::router::tests::final_router_manifest_and_dispatch_cover_context_tools",
   "session::turn::tests::checkpoint_lifecycle_reaches_next_model_request_without_reexecution",
-  "session::turn::tests::final_prompt_injects_evidence_guidance_once_for_bundled_and_catalog_bases",
   "session::turn::tests::ordinary_exec_validation_repair_and_inflight_source_freshness",
 ]
 
@@ -120,7 +119,7 @@ helpers = [
 "state::auto_compact_window::tests::" = []
 "agent::task_capabilities::tests::" = []
 "client::tests::" = []
-"validation_admission::tests::" = []
+"validation::tests::" = []
 "context_manager::history::tests::" = []
 "tools::handlers::tool_search::tests::" = []
 "tools::handlers::mcp::search_tests::" = []
@@ -154,7 +153,6 @@ helpers = [
 # Tool specs, routing, file reads, event conversion, and guidance text; none
 # launches a helper or a sandboxed command.
 "context::multi_agent_mode_instructions::tests::" = []
-"context::task_model_guidance::tests::" = []
 "stream_events_utils::tests::" = []
 "tools::handlers::multi_agents_spec::tests::" = []
 "tools::handlers::read_file::tests::" = []
@@ -669,8 +667,8 @@ tests = [
   "client::tests::fixed_prefix_reuse_requires_comparable_setting_digests",
   "client::tests::encoded_setting_digests_preserve_null_omission_and_incremental_transport",
   "tool_history::tests::phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence",
-  "validation_admission::tests::arbitrary_validate_scripts_are_not_classified_by_filename",
-  "validation_admission::tests::conditional_powershell_is_opaque_for_execution_proof",
+  "validation::tests::arbitrary_validate_scripts_are_not_classified_by_filename",
+  "validation::tests::conditional_powershell_is_opaque_for_execution_proof",
   "tools::handlers::unified_exec::tests::unexecuted_powershell_branch_is_not_validation_evidence",
   "turn_timing::tests::wait_and_tool_output_counters_are_additive",
   "turn_timing::tests::optimization_activation_decision_counters_are_additive",

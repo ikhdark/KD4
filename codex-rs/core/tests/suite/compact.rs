@@ -313,14 +313,6 @@ fn instruction_fragments_in_items(items: &[Value]) -> Vec<String> {
         .collect()
 }
 
-fn user_texts_without_task_model_guidance(request: &responses::ResponsesRequest) -> Vec<String> {
-    request
-        .message_input_texts("user")
-        .into_iter()
-        .filter(|text| !text.starts_with("<task_model_guidance>"))
-        .collect()
-}
-
 fn expected_instruction_fragment(contents: &str) -> String {
     format!(
         "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>"
@@ -1258,13 +1250,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                 }
                 if role == Some("user") {
                     let normalized = strip_agents_parts_from_user_message(value)?;
-                    let is_task_model_guidance = normalized
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .and_then(|content| content.first())
-                        .and_then(|item| item.get("text"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| text.starts_with("<task_model_guidance>"));
                     let is_consumed_original_user = normalized
                         .get("content")
                         .and_then(Value::as_array)
@@ -1272,8 +1257,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                         .and_then(|item| item.get("text"))
                         .and_then(Value::as_str)
                         == Some("create an app");
-                    return (!is_task_model_guidance && !is_consumed_original_user)
-                        .then_some(normalized);
+                    return (!is_consumed_original_user).then_some(normalized);
                 }
                 Some(value.clone())
             })
@@ -3884,9 +3868,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         first_compact_has_prompt, second_compact_has_prompt,
         "compact requests should consistently include or omit the summarization prompt"
     );
-    let final_request_user_texts = user_texts_without_task_model_guidance(
-        requests.last().expect("final turn request missing"),
-    );
+    let final_request_user_texts = requests
+        .last()
+        .expect("final turn request missing")
+        .message_input_texts("user");
     assert!(
         final_request_user_texts.contains(&expected_second_summary),
         "final request user texts: {final_request_user_texts:#?}"

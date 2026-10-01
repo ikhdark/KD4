@@ -117,7 +117,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
         // that shared surface without retaining either value internally.
         let _compatibility_only_fields = (&raw.environment_id, &raw.workdir);
 
-        let long_running = crate::validation_admission::prefers_long_observation_wait(&command);
+        let long_running = crate::validation::prefers_long_observation_wait(&command);
         let requested_yield_time_ms = raw.yield_time_ms.unwrap_or_else(|| {
             if long_running {
                 i128::from(crate::unified_exec::MAX_YIELD_TIME_MS)

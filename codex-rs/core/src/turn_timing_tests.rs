@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::time::Duration;
+use sha2::Digest;
 
 use codex_analytics::TurnProfile;
 use codex_protocol::items::AgentMessageItem;
@@ -1657,6 +1658,9 @@ fn late_request_diagnostics_update_only_the_original_sampling_request() {
     state.record_model_attempt_identity("old", "old-attempt");
     drop(state.begin_model_request_wait());
     state.record_model_attempt_identity("new", "new-attempt");
+    state.record_model_request_payload("new", "new-attempt", br#"{"instructions":"two","input":[]}"#);
+    state.record_model_request_payload("old", "old-attempt", br#"{"instructions":"one","input":[]}"#);
+    state.record_model_response_id("old-attempt", "response-one");
     state.record_model_request_token_categories(
         "old",
         "old-attempt",
@@ -1685,6 +1689,16 @@ fn late_request_diagnostics_update_only_the_original_sampling_request() {
         123
     );
     assert_eq!(old.fixed_prefix_reuse_eligible, Some(true));
+    assert_eq!(old.response_id_by_attempt["old-attempt"], "response-one");
+    assert!(new.response_id_by_attempt.is_empty());
+    assert_eq!(old.request_sha256_by_attempt["old-attempt"],
+        format!("{:x}", sha2::Sha256::digest(br#"{"instructions":"one","input":[]}"#)));
+    assert_eq!(new.request_sha256_by_attempt["new-attempt"],
+        format!("{:x}", sha2::Sha256::digest(br#"{"instructions":"two","input":[]}"#)));
+    let old_sections = &old.request_section_sha256_by_attempt["old-attempt"];
+    let new_sections = &new.request_section_sha256_by_attempt["new-attempt"];
+    assert_eq!(old_sections["input"], new_sections["input"]);
+    assert_ne!(old_sections["instructions"], new_sections["instructions"]);
     assert!(new.request_token_categories.is_none());
     assert!(new.fixed_prefix_reuse_eligible.is_none());
 }
@@ -2619,7 +2633,6 @@ fn wait_and_tool_output_counters_are_additive() {
     state.record_residual_deterministic_generation();
     state.record_owner_drained_continuation();
     state.record_executed_validation(125);
-    state.record_suppressed_validation_output();
     state.record_ready_startup_prewarm();
     state.record_no_progress_directive();
     state.record_proven_loop_activation();
@@ -2636,7 +2649,7 @@ fn wait_and_tool_output_counters_are_additive() {
     assert_eq!(counters.owner_drained_continuation_count, 1);
     assert_eq!(counters.executed_validation_count, 1);
     assert_eq!(counters.executed_validation_duration_ns, 125_000_000);
-    assert_eq!(counters.suppressed_validation_output_count, 1);
+    assert_eq!(counters.suppressed_validation_output_count, 0);
     assert_eq!(counters.ready_startup_prewarm_count, 1);
     assert_eq!(counters.suppressed_deterministic_continuation_count, 0);
     assert_eq!(counters.no_progress_directive_count, 1);
@@ -2737,12 +2750,15 @@ fn fully_visible_tool_output_does_not_count_as_truncation_recovery() {
 fn non_provider_visible_truncation_does_not_attribute_a_recovery_generation() {
     let (_clock, state) = timing();
 
+    state.record_nested_tool_output_reduction();
     state.record_tool_output_projection_facts(800, 200, 400, 100, false, false, true, 2, false);
     let mut pending = Some(ContinuationCause::ToolResult);
     state.begin_model_generation(&mut pending, &SessionSource::Cli);
 
     let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.tool_output_truncation_count, 2);
     assert_eq!(counters.tool_output_projection_truncation_count, 1);
+    assert_eq!(counters.tool_output_model_token_count, 100);
     assert_eq!(counters.tool_output_omitted_section_count, 2);
     assert_eq!(counters.generations_by_reason.tool_continuation, 1);
     assert_eq!(counters.truncation_induced_continuation_count, 0);

@@ -162,6 +162,8 @@ impl std::fmt::Debug for TurnEnvironment {
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
+    pub(crate) mcp_runtime: Arc<OnceLock<Arc<super::McpRuntimeSnapshot>>>,
+    pub(crate) mcp_tool_snapshot: Arc<tokio::sync::OnceCell<super::step_context::McpToolSnapshot>>,
     pub(crate) hook_context_budget: Arc<Mutex<codex_context_fragments::ModelContextBudget>>,
     pub(crate) sub_id: String,
     pub(crate) trace_id: Option<String>,
@@ -206,7 +208,6 @@ pub struct TurnContext {
     pub(crate) workspace_execution_coordinator:
         Arc<crate::tools::parallel::WorkspaceExecutionCoordinator>,
     pub(crate) deferred_tool_activations: Arc<std::sync::RwLock<DeferredToolActivationState>>,
-    pub(crate) validation_authorization: crate::validation_admission::SharedValidationAuthorization,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     /// Shared by model variants of this turn; tool dispatch and ordered delivery
@@ -319,18 +320,6 @@ impl TurnContext {
             .primary()
             .map(|environment| environment.cwd().clone())
             .unwrap_or_else(|| PathUri::from_abs_path(self.cwd()))
-    }
-
-    pub(crate) async fn update_validation_authorization(
-        &self,
-        input: &[codex_protocol::user_input::UserInput],
-    ) {
-        let mut authorization = self.validation_authorization.write().await;
-        for item in input {
-            if let codex_protocol::user_input::UserInput::Text { text, .. } = item {
-                authorization.update_from_user_input(text);
-            }
-        }
     }
 
     pub(crate) fn update_multi_agent_spawn_authorization(
@@ -557,6 +546,8 @@ impl TurnContext {
 
         Self {
             hook_context_budget: Arc::clone(&self.hook_context_budget),
+            mcp_runtime: Arc::clone(&self.mcp_runtime),
+            mcp_tool_snapshot: Arc::clone(&self.mcp_tool_snapshot),
             sub_id: self.sub_id.clone(),
             trace_id: self.trace_id.clone(),
             config: Arc::new(config),
@@ -599,7 +590,6 @@ impl TurnContext {
             dynamic_tools: self.dynamic_tools.clone(),
             workspace_execution_coordinator: Arc::clone(&self.workspace_execution_coordinator),
             deferred_tool_activations: Arc::clone(&self.deferred_tool_activations),
-            validation_authorization: Arc::clone(&self.validation_authorization),
             turn_metadata_state: self.turn_metadata_state.clone(),
             extension_data: Arc::clone(&self.extension_data),
             pending_post_tool_contexts: Arc::clone(&self.pending_post_tool_contexts),
@@ -871,6 +861,8 @@ impl Session {
         let effective_workspace_roots = per_turn_config.effective_workspace_roots().into();
         TurnContext {
             hook_context_budget: Default::default(),
+            mcp_runtime: Default::default(),
+            mcp_tool_snapshot: Default::default(),
             sub_id,
             trace_id: current_span_trace_id(),
             config: per_turn_config,
@@ -906,9 +898,6 @@ impl Session {
             workspace_execution_coordinator: Arc::default(),
             deferred_tool_activations: Arc::new(std::sync::RwLock::new(
                 DeferredToolActivationState::default(),
-            )),
-            validation_authorization: Arc::new(tokio::sync::RwLock::new(
-                crate::validation_admission::ValidationAuthorization::default(),
             )),
             turn_metadata_state,
             extension_data,

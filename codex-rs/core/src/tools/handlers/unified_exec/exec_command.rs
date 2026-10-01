@@ -43,10 +43,8 @@ use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::generate_chunk_id;
-use crate::validation_admission::ValidationAdmission;
-use crate::validation_admission::ValidationLaunchPlan;
-use crate::validation_admission::ValidationSkippedToolOutput;
-use crate::validation_admission::admit_validation_invocations;
+use crate::validation::ValidationClassification;
+use crate::validation::classify_validation_invocations;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
@@ -62,7 +60,6 @@ use codex_utils_path_uri::PathConvention;
 use serde::Deserialize;
 
 use super::super::shell::validation_environment_hash;
-use super::super::shell::validation_structured_output;
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_exec_command_tool_for_policy;
 use super::ExecCommandArgs;
@@ -134,18 +131,6 @@ pub(crate) struct ExecCommandHandlerOptions {
 
 pub struct ExecCommandHandler {
     options: ExecCommandHandlerOptions,
-}
-
-pub(super) fn record_late_validation_skip(
-    turn: &crate::session::turn_context::TurnContext,
-    skipped: &ValidationSkippedToolOutput,
-) {
-    if matches!(
-        skipped.skip_disposition,
-        codex_tools::ToolOutputSkipDisposition::Suppressed
-    ) {
-        turn.turn_timing_state.record_suppressed_validation_output();
-    }
 }
 
 impl Default for ExecCommandHandler {
@@ -421,40 +406,13 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
-        let validation_launch = if direct_runtime {
-            None
-        } else {
-            match admit_validation_invocations(
-                &turn.validation_authorization,
-                &validation_invocations,
-                args.validation.is_some(),
-            )
-            .await
-            {
-                ValidationAdmission::Skip(skipped) => {
-                    if matches!(
-                        skipped.skip_disposition,
-                        codex_tools::ToolOutputSkipDisposition::Suppressed
-                    ) {
-                        turn.turn_timing_state.record_suppressed_validation_output();
-                    }
-                    tracing::info!(reason = ?skipped.reason, "validation command skipped");
-                    return Ok(boxed_tool_output(validation_structured_output(
-                        serde_json::to_value(skipped).unwrap_or_default(),
-                    )));
-                }
-                ValidationAdmission::Execute {
-                    authorization_revision,
-                    is_validation,
-                    classification,
-                } => is_validation.then(|| ValidationLaunchPlan {
-                    classification,
-                    authorization_revision,
-                    explicitly_tagged: args.validation.is_some(),
-                }),
-            }
-        };
-        let search_narrowing = if validation_launch.is_none() && !environment_is_remote {
+        let validation_launch = !direct_runtime
+            && (args.validation.is_some()
+                || matches!(
+                    classify_validation_invocations(&validation_invocations),
+                    ValidationClassification::Validation { .. }
+                ));
+        let search_narrowing = if !validation_launch && !environment_is_remote {
             if let Some(native_cwd) = native_cwd.as_ref() {
                 let search_command = resolved_command.safety_command.clone();
                 let search_shell_type = resolved_command.preflight_shell_type;
@@ -664,7 +622,7 @@ impl ExecCommandHandler {
             attempt_key
         }
         .with_search_environment(&effective_environment);
-        if validation_launch.is_none() {
+        if !validation_launch {
             session
                 .services
                 .command_execution
@@ -675,7 +633,7 @@ impl ExecCommandHandler {
         let mut known_delta = if session.features().enabled(Feature::KnownDeltaStore)
             && !environment_is_remote
             && !tty
-            && validation_launch.is_none()
+            && !validation_launch
             && let Some(native_cwd) = native_cwd.as_ref()
             && let CommandInvocation::Argv { program, args } = &command_invocation
             && known_delta_store::is_immutable_git_show_candidate(program, args)
@@ -725,7 +683,7 @@ impl ExecCommandHandler {
         let known_delta_hit = known_delta
             .as_ref()
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
-        let validation_attempt = validation_launch.is_some();
+        let validation_attempt = validation_launch;
         // Validation shares ordinary attempt accounting. Only input-state
         // determined failures are replayed; a failing test remains rerunnable.
         if !known_delta_hit
@@ -1035,14 +993,6 @@ impl ExecCommandHandler {
                     }
                 }
                 Err(FunctionCallError::Fatal(message))
-            }
-            Err(UnifiedExecError::ValidationSkipped(skipped)) => {
-                record_late_validation_skip(&turn, &skipped);
-                let skip_disposition = skipped.skip_disposition;
-                Ok(boxed_tool_output(
-                    validation_structured_output(serde_json::to_value(skipped).unwrap_or_default())
-                        .with_skip_disposition(skip_disposition),
-                ))
             }
             Err(err) => {
                 let retry_failure = matches!(

@@ -39,9 +39,8 @@ use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
-use crate::validation_admission::ValidationAdmission;
-use crate::validation_admission::ValidationLaunchPlan;
-use crate::validation_admission::admit_validation_invocations;
+use crate::validation::ValidationClassification;
+use crate::validation::classify_validation_invocations;
 use codex_tools::ToolSpec;
 
 use super::super::shell_spec::CommandToolOptions;
@@ -53,7 +52,6 @@ use super::RunExecLikeArgs;
 use super::parse_shell_command_hook_invocation;
 use super::run_exec_like;
 use super::validation_environment_hash;
-use super::validation_structured_output;
 
 pub(super) fn effective_stall_timeout_ms(
     timeout_ms: Option<u64>,
@@ -375,35 +373,11 @@ impl ShellCommandHandler {
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
         let invocation_changed = command_invocation != original_invocation;
-        let validation_admission = admit_validation_invocations(
-            &turn.validation_authorization,
-            &validation_invocations,
-            params.validation.is_some(),
-        )
-        .await;
-        let validation_launch = match validation_admission {
-            ValidationAdmission::Skip(skipped) => {
-                if matches!(
-                    skipped.skip_disposition,
-                    codex_tools::ToolOutputSkipDisposition::Suppressed
-                ) {
-                    turn.turn_timing_state.record_suppressed_validation_output();
-                }
-                tracing::info!(reason = ?skipped.reason, "validation command skipped");
-                return Ok(boxed_tool_output(validation_structured_output(
-                    serde_json::to_value(skipped).unwrap_or_default(),
-                )));
-            }
-            ValidationAdmission::Execute {
-                authorization_revision,
-                is_validation,
-                classification,
-            } => is_validation.then(|| ValidationLaunchPlan {
-                classification,
-                authorization_revision,
-                explicitly_tagged: params.validation.is_some(),
-            }),
-        };
+        let validation_launch = params.validation.is_some()
+            || matches!(
+                classify_validation_invocations(&validation_invocations),
+                ValidationClassification::Validation { .. }
+            );
         let hook_command = command_invocation.display_command();
         maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &hook_command, &cwd)
             .await;
@@ -472,7 +446,7 @@ impl ShellCommandHandler {
             )
             .await;
         let validation_cwd = PathUri::from_abs_path(&exec_params.cwd).to_string();
-        let attempt_key = if validation_launch.is_none() {
+        let attempt_key = if !validation_launch {
             let attempt_key = CommandAttemptKey::new(
                 tool_name.name.as_str(),
                 &turn_environment.environment_id,

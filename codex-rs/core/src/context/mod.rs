@@ -21,7 +21,6 @@ mod prompt_provenance;
 mod recommended_plugins_instructions;
 mod subagent_notification;
 mod task_capsule;
-mod task_model_guidance;
 mod turn_aborted;
 mod token_budget_context;
 pub(crate) use token_budget_context::{
@@ -73,8 +72,6 @@ pub(crate) use prompt_provenance::PromptProvenanceSidecar;
 pub(crate) use recommended_plugins_instructions::RecommendedPluginsInstructions;
 pub(crate) use subagent_notification::SubagentNotification;
 pub(crate) use task_capsule::TaskCapsuleFragment;
-pub(crate) use task_model_guidance::TaskModelGuidance;
-pub(crate) use task_model_guidance::base_instructions_own_task_model_guidance;
 pub(crate) use turn_aborted::TurnAborted;
 pub(crate) use user_instructions::UserInstructions;
 pub(crate) use user_shell_command::UserShellCommand;

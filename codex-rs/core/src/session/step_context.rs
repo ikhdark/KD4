@@ -34,7 +34,7 @@ async fn bounded_mcp_snapshot(
             tracing::warn!("MCP catalog did not stabilize before the sampling deadline");
             // Advertise no MCP capabilities when a coherent catalog is unavailable.
             // This distinct identity prevents reuse of a router from a real catalog.
-            // The next step gets a new capture attempt.
+            // The next turn gets a new capture attempt.
             McpToolSnapshot {
                 temporarily_unavailable: true,
                 revision: u64::MAX,
@@ -54,8 +54,8 @@ pub(crate) struct StepContext {
     pub(crate) selected_capability_roots: Vec<ResolvedSelectedCapabilityRoot>,
     /// The exact MCP config and manager used to advertise and execute tools for this step.
     pub(crate) mcp: Arc<McpRuntimeSnapshot>,
-    /// The fixed MCP tool list used for this exact sampling request.
-    mcp_tool_snapshot: OnceCell<McpToolSnapshot>,
+    /// Shared by all steps and retries of the turn.
+    mcp_tool_snapshot: Arc<OnceCell<McpToolSnapshot>>,
     /// The finalized tool plan advertised and executed for this exact sampling request.
     tool_router: OnceLock<Arc<ToolRouter>>,
     /// Workspace evidence shared by every direct and nested call accepted in
@@ -109,12 +109,14 @@ impl StepContext {
         agents_md_stable_context: Option<RepositoryStableContextBundle>,
         agents_md_freshness: AgentsMdFreshness,
     ) -> Self {
+        let mcp = Arc::clone(turn.mcp_runtime.get_or_init(|| mcp));
+        let mcp_tool_snapshot = Arc::clone(&turn.mcp_tool_snapshot);
         Self {
             turn,
             environments,
             selected_capability_roots,
             mcp,
-            mcp_tool_snapshot: OnceCell::new(),
+            mcp_tool_snapshot,
             tool_router: OnceLock::new(),
             workspace_evidence_generation_batch: Arc::new(WorkspaceEvidenceGenerationBatch::new()),
             loaded_agents_md,
@@ -125,7 +127,8 @@ impl StepContext {
 
     pub(crate) async fn mcp_tool_snapshot(&self) -> &McpToolSnapshot {
         self.mcp_tool_snapshot
-            .get_or_init(|| {
+            .get_or_init(|| async {
+                self.mcp.manager().wait_for_startup().await;
                 bounded_mcp_snapshot(async {
                     loop {
                         let revision = self.mcp.manager().tool_catalog_revision();
@@ -144,6 +147,7 @@ impl StepContext {
                         tokio::task::yield_now().await;
                     }
                 })
+                .await
             })
             .await
     }
@@ -191,6 +195,21 @@ impl StepContext {
 #[cfg(test)]
 mod snapshot_deadline_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catalog_is_shared_across_steps_but_not_turns() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let first = session.capture_step_context(Arc::clone(&turn)).await.unwrap();
+        first.seed_mcp_tool_snapshot_for_test(17, Vec::new(), true).await;
+        let next = session.capture_step_context(turn).await.unwrap();
+        assert!(std::ptr::eq(first.mcp_tool_snapshot().await, next.mcp_tool_snapshot().await));
+        assert!(next.mcp_tool_snapshot().await.resources_available);
+        let (_, other_turn) = crate::session::tests::make_session_and_context().await;
+        let other = session.capture_step_context(Arc::new(other_turn)).await.unwrap();
+        assert!(!Arc::ptr_eq(&first.mcp_tool_snapshot, &other.mcp_tool_snapshot));
+    }
 
     #[tokio::test]
     async fn retry_attempt_replaces_sealed_evidence_but_preserves_capabilities() {

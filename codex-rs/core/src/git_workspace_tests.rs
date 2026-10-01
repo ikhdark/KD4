@@ -22,6 +22,23 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell_snapshot::ShellSnapshot;
 
 #[tokio::test]
+async fn checkout_content_snapshot_covers_clean_tracked_and_untracked_files() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    std::fs::write(repo.join("tracked.txt"), b"one").unwrap();
+    run_git(repo.as_path(), &["add", "tracked.txt"]).await;
+    run_git(repo.as_path(), &["commit", "-m", "snapshot"]).await;
+    let first = capture_checkout_snapshot(repo.as_path()).await.unwrap();
+    assert_eq!(capture_checkout_snapshot(repo.as_path()).await.as_ref(), Some(&first));
+    run_git(repo.as_path(), &["update-index", "--assume-unchanged", "tracked.txt"]).await;
+    std::fs::write(repo.join("tracked.txt"), b"two").unwrap();
+    let tracked_change = capture_checkout_snapshot(repo.as_path()).await.unwrap();
+    assert_ne!(first, tracked_change);
+    std::fs::write(repo.join("new.txt"), b"new").unwrap();
+    let untracked_change = capture_checkout_snapshot(repo.as_path()).await.unwrap();
+    assert_ne!(tracked_change, untracked_change);
+}
+
+#[tokio::test]
 async fn evidence_reuse_transient_capture_failure_expires_without_a_workspace_change() {
     let (_temp, repo) = create_clean_git_repo().await;
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();

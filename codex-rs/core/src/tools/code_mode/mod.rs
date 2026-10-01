@@ -1349,6 +1349,14 @@ async fn call_nested_tool(
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let failure_is_error = result.code_mode_failure_is_error();
     let result_value = result.code_mode_result();
+    if (tool_name == ToolName::plain("exec_command")
+        || tool_name == ToolName::plain("write_stdin"))
+        && result_value.get("output_reduced") == Some(&JsonValue::Bool(true))
+    {
+        exec.turn
+            .turn_timing_state
+            .record_nested_tool_output_reduction();
+    }
     // Reuse source artifacts already retained by read_file. No duplicate blob,
     // no assertion that a truncated fallback contains the omitted evidence.
     #[cfg(feature = "bench-generation-opportunities")]
@@ -1434,6 +1442,9 @@ async fn call_nested_tool(
                 .await;
         }
     }
+    let script_result = script_visible_nested_result(
+        &tool_name, result_value.clone(), &nested_call_id, packet_ordinal,
+    );
     let nested_result = CodeModeNestedResultEvidence {
         failed: !matches!(
             outcome_context.outcome,
@@ -1493,13 +1504,40 @@ async fn call_nested_tool(
             ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut
         )
     {
-        return Err(FunctionCallError::RespondToModel(result_value.to_string()));
+        return Err(FunctionCallError::RespondToModel(script_result.to_string()));
     }
     // This value is consumed by JavaScript, not rendered directly to the model.
     // Preserve the owning tool's structured contract so a cell can inspect
     // process completion, recover omitted output, and use patch change metadata
     // without returning to the model for another decision.
-    Ok(result_value)
+    Ok(script_result)
+}
+
+/// Remove nondeterministic diagnostics, not lifecycle or recovery controls.
+/// The unprojected result has already been retained for session diagnostics.
+fn script_visible_nested_result(
+    tool: &ToolName,
+    mut value: JsonValue,
+    call_id: &str,
+    position: usize,
+) -> JsonValue {
+    if tool.namespace.is_none()
+        && matches!(tool.name.as_str(), "exec_command" | "write_stdin")
+        && let Some(object) = value.as_object_mut()
+    {
+        for key in ["wall_time_seconds", "original_token_count", "original_token_count_is_approximate"] {
+            object.remove(key);
+        }
+        if object.contains_key("chunk_id") {
+            let mut hash = Sha256::new();
+            hash.update(b"command-chunk-v1\0");
+            hash.update((call_id.len() as u64).to_be_bytes());
+            hash.update(call_id.as_bytes());
+            hash.update((position as u64).to_be_bytes());
+            object.insert("chunk_id".to_string(), format!("{:x}", hash.finalize()).into());
+        }
+    }
+    value
 }
 
 /// Retained evidence of a completed nested call: a command's exit code and
@@ -2945,6 +2983,34 @@ mod tests {
             nested_failure_fingerprint(&tool_name, "request 17 failed"),
             nested_failure_fingerprint(&ToolName::plain("other"), "request 17 failed")
         );
+    }
+
+    #[test]
+    fn script_command_results_are_stable_without_losing_recovery_or_lifecycle() {
+        let raw = serde_json::json!({
+            "chunk_id": "random", "wall_time_seconds": 1.2,
+            "original_token_count": 42, "original_token_count_is_approximate": true,
+            "execution_state": "running", "process_exited": false,
+            "session_id": 7, "session_capabilities": {"polling": true},
+            "output": "progress", "output_reduced": true,
+            "raw_output_artifact_id": "retained", "recovery_selector": {"kind": "lines", "start": 2, "end": 9}
+        });
+        let tool = ToolName::plain("exec_command");
+        let projected = super::script_visible_nested_result(&tool, raw.clone(), "call-1", 0);
+        let mut different = raw.clone();
+        different["chunk_id"] = "other".into();
+        different["wall_time_seconds"] = 9.4.into();
+        different["original_token_count"] = 99.into();
+        assert_eq!(projected, super::script_visible_nested_result(&tool, different, "call-1", 0));
+        for key in ["session_id", "session_capabilities", "execution_state", "process_exited",
+            "output", "output_reduced", "raw_output_artifact_id", "recovery_selector"] {
+            assert_eq!(projected[key], raw[key]);
+        }
+        assert!(projected.get("wall_time_seconds").is_none());
+        assert!(projected.get("original_token_count").is_none());
+        assert_ne!(projected["chunk_id"],
+            super::script_visible_nested_result(&tool, raw.clone(), "call-1", 1)["chunk_id"]);
+        assert_eq!(super::script_visible_nested_result(&ToolName::plain("other"), raw.clone(), "call-1", 0), raw);
     }
 
     #[test]

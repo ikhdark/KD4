@@ -821,7 +821,6 @@ async fn http_network_approval_preserves_foreign_environment_cwd_uri() -> anyhow
             bypass_sandbox: false,
             proposed_execpolicy_amendment: None,
         },
-        validation_launch: None,
         known_delta_hit: None,
     };
     let runtime = crate::tools::runtimes::unified_exec::UnifiedExecRuntime::new(

@@ -420,7 +420,6 @@ pub(crate) enum ToolError {
     Denied(String),
     /// An operational failure that prevents the tool request from running.
     Rejected(String),
-    ValidationSkipped(crate::validation_admission::ValidationSkippedToolOutput),
     Codex(CodexErr),
 }
 

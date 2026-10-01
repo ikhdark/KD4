@@ -906,6 +906,7 @@ async fn wait_is_always_registered_when_code_mode_is_enabled() {
 }
 
 #[tokio::test]
+#[allow(clippy::print_stdout)]
 async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
     let configure = |turn: &mut TurnContext, code_mode_only| {
         set_features(
@@ -953,8 +954,18 @@ async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
             name != "apply_patch"
         );
     }
-    assert!(mixed_exec.description.contains("exec_command(args:"));
-    assert!(mixed_exec.description.contains("yield_time_ms"));
+    assert!(mixed_exec.description.contains("exec_command(args: unknown"));
+    assert!(!mixed_exec.description.contains("yield_time_ms"));
+    assert!(nested_exec.description.contains("yield_time_ms"));
+    let ToolSpec::Function(command) = mixed.visible_spec("exec_command") else {
+        panic!("expected direct command schema");
+    };
+    assert!(
+        serde_json::to_string(&command.parameters)
+            .unwrap()
+            .contains("yield_time_ms"),
+        "the authoritative direct argument contract must remain available"
+    );
     assert!(mixed_exec.description.contains("apply_patch(input: string"));
     for exec in [mixed_exec, nested_exec] {
         assert_eq!(exec.description.matches("declare const tools").count(), 1);
@@ -977,6 +988,45 @@ async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
         assert!(exec.description.contains("Return the current time in UTC."));
     }
     assert!(mixed_exec.description.len() < nested_exec.description.len());
+    // Compare the same command/source/artifact contracts, not task-specific
+    // prompts. The old mixed-mode projection retained these argument schemas.
+    for name in ["exec_command", "read_file", "read_tool_output"] {
+        let spec = mixed.visible_spec(name);
+        let mut before = codex_tools::code_mode_tool_definition_for_spec(spec).unwrap();
+        before.description.clear();
+        if matches!(name, "read_file" | "read_tool_output") {
+            before.output_schema = None;
+        }
+        let mut after = before.clone();
+        after.input_schema = None;
+        let before = codex_code_mode::render_code_mode_tool_bundle(&[before]);
+        let after = codex_code_mode::render_code_mode_tool_bundle(&[after]);
+        let before_tokens = codex_utils_output_truncation::model_token_count(&before);
+        let after_tokens = codex_utils_output_truncation::model_token_count(&after);
+        assert!(after_tokens < before_tokens, "{name} arguments duplicated");
+        assert!(
+            mixed_exec.description.contains(&format!("{name}(args: unknown")),
+            "{name} projection did not reach the model-visible exec contract"
+        );
+        let record = json!({
+            "tool": name,
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+            "before_bytes": before.len(),
+            "after_bytes": after.len(),
+            "scope": "duplicate declaration only; direct schema remains unchanged"
+        });
+        println!("MIXED_SCHEMA_BENCH {record}");
+        if let Some(path) = std::env::var_os("KD4_TOKEN_CACHE_BENCH_OUTPUT") {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            writeln!(file, "{record}").unwrap();
+        }
+    }
 }
 
 #[test]

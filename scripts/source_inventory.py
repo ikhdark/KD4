@@ -16,7 +16,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import uuid
 from pathlib import Path, PurePosixPath
 
 if __package__:
@@ -336,6 +335,16 @@ def consumer_evidence(root, references, cache):
     return None
 
 
+def source_revision(path):
+    """Cheap race/continuation guard; content hashes remain the evidence identity."""
+    try:
+        stat = path.lstat()
+        return [stat.st_dev, stat.st_ino, stat.st_mode, stat.st_size,
+                stat.st_mtime_ns, stat.st_ctime_ns]
+    except FileNotFoundError:
+        return None
+
+
 def inventory(root, query, previous=None, *, refresh=False):
     root = root.resolve()
     categories = compile_categories(query)
@@ -385,13 +394,25 @@ def inventory(root, query, previous=None, *, refresh=False):
         decisions[key] = decision
     evidence_cache = {}
     states = repository_source_records(root, prune=PRUNE, paths=discovery_paths(query))
+    # Freeze the discovered scope as well as each selected file's revision.
+    # A pending scan must never silently combine observations from two epochs.
+    def selected_sources(sources):
+        return {
+            path: tracking for path, tracking in sources.items()
+            if any(fnmatch.fnmatchcase(path, pattern)
+                   for rule, _ in categories.values() for pattern in rule["paths"])
+        }
+
+    source_set = selected_sources(states)
     old_files = previous.get("files", {}) if previous.get("root") == str(root) else {}
     continuing = (
         not refresh
         and bool(previous.get("scan", {}).get("pending"))
         and query_identity(previous["query"]) == query_id
     )
-    epoch = previous["scan"]["epoch"] if continuing else uuid.uuid4().hex
+    if continuing and previous["scan"].get("source_set") != source_set:
+        raise ValueError("source set changed or legacy pending epoch; use --refresh")
+    source_revisions = {}
     pending = []
     records = {}
     files = {}
@@ -418,6 +439,10 @@ def inventory(root, query, previous=None, *, refresh=False):
         state = states.get(path, "not_enumerated")
         full_path = root / path
         excluded = any(part in PRUNE for part in PurePosixPath(path).parts[:-1])
+        if not excluded:
+            source_revisions[path] = source_revision(full_path)
+            if continuing and previous["scan"].get("source_revisions", {}).get(path) != source_revisions[path]:
+                raise ValueError(f"source changed during retained epoch: {path}; use --refresh")
         # Do not follow symlinks outside the inventory boundary or probe an
         # explicitly excluded candidate inside a pruned tree.
         exists = None if excluded else full_path.is_file()
@@ -559,6 +584,14 @@ def inventory(root, query, previous=None, *, refresh=False):
         if content_hash is not None:
             files[path] = {"sha256": content_hash, "categories": entries}
 
+    for path, revision in source_revisions.items():
+        if source_revision(root / path) != revision:
+            raise ValueError(f"source changed during scan: {path}; use --refresh")
+    if selected_sources(repository_source_records(
+        root, prune=PRUNE, paths=discovery_paths(query),
+    )) != source_set:
+        raise ValueError("source set changed during scan; use --refresh")
+
     result = list(records.values())
     validated = [
         record
@@ -581,6 +614,17 @@ def inventory(root, query, previous=None, *, refresh=False):
         )
         for name in categories
     }
+    source_hash = digest(json.dumps(
+        [[path, source_set.get(path), value["sha256"]]
+         for path, value in sorted(files.items())],
+        ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8"))
+    # Partial evidence has its own identity; completing it converges to the
+    # same identity as a fresh full scan, regardless of batching or timestamps.
+    epoch = digest(json.dumps(
+        [query_id, source_hash, sorted(pending)],
+        separators=(",", ":"),
+    ).encode("utf-8"))
     output = {
         "query_id": query_id,
         "scope_changes": scope_changes,
@@ -612,12 +656,17 @@ def inventory(root, query, previous=None, *, refresh=False):
     output["next_action"] = (
         "render" if output["ready_to_render"] else "resolve_remaining"
     )
+    if output["ready_to_render"]:
+        # Include negative matches: identical results alone do not establish
+        # identical source inputs. Exclude timestamps, epochs and host paths.
+        output["source_snapshot_sha256"] = source_hash
     state = {
         "version": 3,
         "root": str(root),
         "files": files,
         "records": result,
-        "scan": {"epoch": epoch, "pending": pending},
+        "scan": {"epoch": epoch, "pending": pending,
+                 "source_set": source_set, "source_revisions": source_revisions},
         "scope_changes": scope_changes,
         "query": query,
         "output": output,
@@ -767,6 +816,7 @@ def describe_contract():
     """Describe the supported interface without reading repository or state files."""
     return {
         "format": RESULT_FORMAT,
+        "snapshot": "Scans reject source/revision drift within a retained epoch. Complete results include source_snapshot_sha256 over all selected source hashes, including negative matches. This identifies captured evidence, not an atomic filesystem snapshot; --render-only replays it without reading live sources.",
         "invocation": {
             "file": "python -X utf8 scripts/source_inventory.py --root . --query QUERY --state STATE --report REPORT",
             "powershell_stdin": "& {\n  $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n  @'\n{\"categories\":[{\"name\":\"templates\",\"paths\":[\"templates/*.md\",\"*/templates/*.md\"],\"verification\":\"path\"}]}\n'@ | python -X utf8 scripts/source_inventory.py --root . --query -\n}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
@@ -777,6 +827,8 @@ def describe_contract():
         "workflow": {
             "default": "describe -> scan -> final when the scan supplies sufficient evidence. Build the query directly from the requested categories and known scope; the initial scan performs file discovery, so do not first list the repository or probe example directories.",
             "scope": "Use known roots for a restricted request. For repository-wide filename/rule inventories with unknown layout, use layout-independent globs: *.rs matches Rust files at any depth; templates/*.md plus */templates/*.md covers root and nested templates directories; models.json plus */models.json covers that basename at any depth. Examples are illustrative, not a complete semantic inventory or permission to broaden a restricted request. Use contains for content criteria and retain runtime verification for activation claims.",
+            "classification": "For prompt/guidance inventories, separate dedicated assets from keyword-matched source, documentation, configuration and test candidates. A mention is not a definition. Include known guidance directories explicitly so keyword-free skill references are retained; do not replace a text filter with every *.md or *.txt file, which also selects animation frames and patch fixtures. Confirm inline definitions with targeted evidence before promoting candidates to the primary list.",
+            "scope_changes": "Choose inclusion rules before scanning. Revise them only for a demonstrated coverage gap or query error; repair that specific rule without changing unrelated categories. Reuse retained evidence and deliver sufficient counts/report links rather than reopening state or dumping complete categories to polish the answer.",
             "inspection_exception": "Inspect before scanning only when a concrete uncertainty cannot be expressed by query rules and its answer would change category coverage or verification. Name that uncertainty and use the smallest targeted inspection, not general repository orientation. Resolve pending scans and runtime evidence after the scan when required; do not force final delivery from insufficient evidence.",
         },
         "globs": "fnmatch.fnmatchcase on normalized repository-relative POSIX paths; case-sensitive. Both * and ? can match /, so dir/*.rs also matches dir/nested/file.rs. Backslashes and leading ./ are normalized.",
@@ -787,14 +839,14 @@ def describe_contract():
             "continuation": "When scan_pending > 0, continue with the returned artifact and the same query. Oversized files remain unresolved; continuation does not lift the per-file limit. A continuation returning no newly required inventory evidence is unnecessary unless needed to establish completion.",
         },
         "query": {
-            "required_categories": "Names whose coverage must be retained; defaults to all declared categories.",
+            "required_categories": "Optional names whose coverage must be retained; defaults to all declared categories. Omit unless overriding that default. Raw queries and retained state.query may omit this key; adding a category does not require appending to an absent list.",
             "categories": [
                 {
                     "name": "unique category name",
                     "paths": ["repository-relative globs; backslash separators and leading ./ are normalized"],
                     "verification": "path | runtime (default runtime)",
                     "contains": "optional Python regular expression",
-                    "json_summary": "optional boolean; expose fields, types and lengths, never string bodies",
+                    "json_summary": "optional boolean; omit for file listings. Enable only when JSON structure is needed, in a JSON-only category; TOML/YAML are not JSON. Exposes fields, types and lengths, never string bodies",
                     "unresolved": "legacy boolean; true requires runtime verification, false does not waive it",
                 }
             ],
@@ -824,7 +876,6 @@ def describe_contract():
             },
         },
         "example": {
-            "required_categories": ["templates", "catalog"],
             "categories": [
                 {
                     "name": "templates",
@@ -835,7 +886,20 @@ def describe_contract():
                     "name": "catalog",
                     "paths": ["models.json", "*/models.json"],
                     "verification": "path",
-                    "json_summary": True,
+                },
+                {
+                    "name": "guidance_assets",
+                    "paths": [
+                        "AGENTS.md", "*/AGENTS.md", "SKILL.md", "*/SKILL.md",
+                        "skills/*.md", "*/skills/*.md",
+                    ],
+                    "verification": "path",
+                },
+                {
+                    "name": "related_text_candidates",
+                    "paths": ["*.rs", "*.md", "*.txt", "*.json", "*.toml", "*.yaml", "*.yml"],
+                    "contains": "(?i)prompt|instruction|guidance|template",
+                    "verification": "path",
                 },
             ],
         },
@@ -848,7 +912,8 @@ def describe_contract():
             "category_counts": "tracked counts keyed by category; categories can overlap",
             "searched_records": "rules evaluated this scan",
             "reused_records": "unchanged rule results reused",
-            "scan_epoch": "identity of the captured scan epoch",
+            "scan_epoch": "SHA-256 of query identity, selected source hashes and pending paths; changes as partial evidence advances and converges to the fresh full-scan identity",
+            "source_snapshot_sha256": "complete-scan identity over selected paths, tracking and source hashes, including negative matches; omitted for legacy or partial states",
             "scan_pending": "number of files awaiting another scan batch",
             "source_bytes_read": "source bytes read in this batch",
             "evidence_scope": "captured evidence freshness and scope",
@@ -878,13 +943,21 @@ def describe_contract():
             "delivery_sha256": "hash of canonical JSON bytes",
         },
         "paging": f"Use --state STATE --render-only --offset N without rescanning. Paths and remaining pages hold {PAGE_RECORDS} records; JSON summaries also have a {SUMMARY_PAGE_BYTES}-byte target. Each next-offset field advances its own list.",
-        "control_files": "Without --state, each scan creates a unique source-inventory-* directory under the system temporary directory, containing state.json and, unless --report is supplied, inventory.md. State is never selected by query hash. Explicit --state preserves explicit-path behavior: no report unless requested. --render-only requires explicit --state and no query. Query files and state must be distinct and outside selected sources; stdin has no query path. Reports must be outside the source tree. Pruned directories are outside discovery scope.",
+        "control_files": "Without --state, each scan creates a unique task-owned state.json under the system temporary directory. Default reports are permanent under ~/.cache/codex/source-inventory/<scan_epoch>/inventory.md, with the directory derived from query and scanned-file hashes. Reports use repository-relative paths and are identical across isolated copies. State retains the actual source root and is never selected by query hash. Explicit --state preserves explicit-path behavior: no report unless requested. --render-only requires explicit --state and no query. Query files and state must be distinct and outside selected sources; stdin has no query path. Reports must be outside the source tree. Pruned directories are outside discovery scope.",
         "delivery": "Canonical JSON contains all paths, categories, json_summaries, unresolved/excluded records and prior scope. Deliver sufficient returned counts and report/canonical-path links without another call. State is internal; use --render-only with --paths or --remaining only for newly required evidence, not to re-derive returned counts. A ready result proves only the declared query, not that its scope answers the entire task. When this contract supplies the needed facts, do not read or search source_inventory.py.",
     }
 
 
+def report_directory(state):
+    """Permanent content-addressed reports, outside the source checkout."""
+    return Path.home() / ".cache" / "codex" / "source-inventory" / state["scan"]["epoch"]
+
+
 def export_delivery(state, report):
     """Content-addressed delivery survives later state/report revisions."""
+    # Reports describe repository-relative paths and can be shared by isolated
+    # copies. The task-owned continuation state retains the actual source root.
+    state = {**state, "root": "."}
     output = state["output"]
     document = {
         "format": RESULT_FORMAT,
@@ -911,6 +984,13 @@ def export_delivery(state, report):
         "scope_changes": state.get("scope_changes", []),
         "json_summaries": successful_json_summaries(state),
     }
+    if "source_snapshot_sha256" in output:
+        document["source_snapshot_sha256"] = output["source_snapshot_sha256"]
+        document["sources"] = [
+            {"path": path, "tracking": state["scan"]["source_set"].get(path),
+             "sha256": value["sha256"]}
+            for path, value in sorted(state["files"].items())
+        ]
     data = (
         json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
@@ -1024,6 +1104,7 @@ def main(argv=None):
             "offset must be nonnegative; --remaining cannot be combined with --paths"
         )
     query_path = args.query if args.query != Path("-") else None
+    default_report = not args.state and not args.report
     if args.render_only and not args.state:
         parser.error("--render-only requires an explicit --state")
     if args.render_only and args.query:
@@ -1061,6 +1142,8 @@ def main(argv=None):
             controls["query"] = query_path
         validate_control_paths(args.root, query, **controls)
         output, state = inventory(args.root, query, previous, refresh=args.refresh)
+    if default_report:
+        args.report = report_directory(state) / "inventory.md"
     delivery = {}
     if args.report:
         protected = [args.state, query_path] if query_path else [args.state]
@@ -1095,6 +1178,7 @@ def main(argv=None):
                 "scan_pending",
                 "source_bytes_read",
                 "evidence_scope",
+                "source_snapshot_sha256",
             )
             if key in output
         }

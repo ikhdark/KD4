@@ -16,18 +16,15 @@ use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_shell;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecApprovalRequest;
-use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
-use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
-use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::apply_granted_turn_permissions;
@@ -48,7 +45,6 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 
 use crate::tools::sandboxing::same_exec_authorization_envelope;
-use crate::validation_admission::ValidationSkippedToolOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_shell_command::is_safe_command::is_known_safe_command;
@@ -120,7 +116,7 @@ pub(super) struct RunExecLikeArgs {
     pub(super) repair_notice: Option<String>,
     pub(super) command_repaired: bool,
     pub(super) force_fresh: bool,
-    pub(super) validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
+    pub(super) validation_launch: bool,
 }
 
 pub(super) struct RunExecLikeResult {
@@ -181,60 +177,6 @@ pub(super) enum ValidationExecutionOutcome {
     ExecutedSuccess,
     ExecutedFailure,
     NotExecuted,
-}
-
-impl ValidationExecutionOutcome {
-    pub(super) fn success(self) -> Option<bool> {
-        match self {
-            Self::ExecutedSuccess => Some(true),
-            Self::ExecutedFailure => Some(false),
-            Self::NotExecuted => None,
-        }
-    }
-
-    pub(super) fn from_value(value: &serde_json::Value) -> Option<Self> {
-        match value.get("execution_outcome")?.as_str()? {
-            "executed_success" => Some(Self::ExecutedSuccess),
-            "executed_failure" => Some(Self::ExecutedFailure),
-            "not_executed" => Some(Self::NotExecuted),
-            _ => None,
-        }
-    }
-
-    pub(super) fn tool_outcome(self) -> codex_tools::ToolOutputOutcome {
-        match self {
-            Self::ExecutedSuccess => codex_tools::ToolOutputOutcome::Success,
-            Self::ExecutedFailure => codex_tools::ToolOutputOutcome::Failure,
-            Self::NotExecuted => codex_tools::ToolOutputOutcome::Skipped,
-        }
-    }
-}
-
-pub(super) fn validation_structured_output(value: serde_json::Value) -> FunctionToolOutput {
-    let text = value
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| value.to_string());
-    let execution_outcome = ValidationExecutionOutcome::from_value(&value)
-        .unwrap_or(ValidationExecutionOutcome::NotExecuted);
-    let skip_disposition = value
-        .get("skip_disposition")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok());
-    let mut output = FunctionToolOutput::from_text(text, execution_outcome.success())
-        .with_outcome(execution_outcome.tool_outcome());
-    if let Some(skip_disposition) = skip_disposition {
-        output = output.with_skip_disposition(skip_disposition);
-    } else if value
-        .get("execution_outcome")
-        .and_then(serde_json::Value::as_str)
-        == Some("not_executed")
-    {
-        output = output.with_outcome(codex_tools::ToolOutputOutcome::Skipped);
-    }
-    output.post_tool_use_response = Some(value);
-    output
 }
 
 pub(super) struct LegacyShellToolOutput {
@@ -376,7 +318,7 @@ pub(super) async fn run_exec_like(
 ) -> Result<LegacyShellToolOutput, FunctionCallError> {
     let call_id = args.call_id.clone();
     let validation = args.validation.clone();
-    let validation_output_owned = args.validation_launch.is_some();
+    let validation_output_owned = args.validation_launch;
     let max_output_tokens = args.max_output_tokens;
     let mut result = run_exec_like_with_exit_code(args).await?;
     if let Some(validation) = validation.as_ref() {
@@ -498,7 +440,7 @@ pub(super) async fn run_exec_like_with_exit_code(
     }
 
     let repository_root = resolve_repository_root(args.exec_params.cwd.as_path());
-    let is_validation = args.validation_launch.is_some();
+    let is_validation = args.validation_launch;
     run_exec_like_with_exit_code_inner(args, is_validation, inspection_command, repository_root)
         .await
 }
@@ -516,78 +458,15 @@ pub(crate) fn validation_environment_hash(env: &HashMap<String, String>) -> Stri
     format!("{:x}", digest.finalize())
 }
 
-async fn finish_validation_skip_after_begin(
-    emitter: &ToolEmitter,
-    session: &Arc<Session>,
-    turn: &Arc<TurnContext>,
-    call_id: &str,
-    tool_call_source: &ToolCallSource,
-    event_tracker: Option<&SharedTurnDiffTracker>,
-    skipped: ValidationSkippedToolOutput,
-) -> Result<RunExecLikeResult, FunctionCallError> {
-    let skip_disposition = skipped.skip_disposition;
-    if matches!(
-        skip_disposition,
-        codex_tools::ToolOutputSkipDisposition::Suppressed
-    ) {
-        turn.turn_timing_state.record_suppressed_validation_output();
-    }
-    let value = serde_json::to_value(&skipped).unwrap_or_default();
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, event_tracker)
-        .with_call_source(tool_call_source);
-    let content = emitter
-        .finish(event_ctx, Err(ToolError::ValidationSkipped(skipped)), None)
-        .await?;
-    let mut output =
-        FunctionToolOutput::from_text(content, None).with_skip_disposition(skip_disposition);
-    output.post_tool_use_response = Some(value);
-    Ok(RunExecLikeResult {
-        output,
-        exit_code: None,
-        validation_execution_outcome: ValidationExecutionOutcome::NotExecuted,
-        canonical_output: None,
-    })
-}
-
-fn unexecuted_validation_skip(
-    out: &Result<ExecToolCallOutput, ToolError>,
-    validation_attempt_started: bool,
-) -> Option<&ValidationSkippedToolOutput> {
-    if validation_attempt_started {
-        return None;
-    }
-    match out {
-        Err(ToolError::ValidationSkipped(skipped)) => Some(skipped),
-        Ok(_) | Err(_) => None,
-    }
-}
-
 fn restore_retained_validation_attempt(
     out: Result<ExecToolCallOutput, ToolError>,
     retained_validation_attempt: Option<&ExecToolCallOutput>,
 ) -> Result<ExecToolCallOutput, ToolError> {
     match (&out, retained_validation_attempt) {
-        (
-            Err(ToolError::Denied(_) | ToolError::ValidationSkipped(_)),
-            Some(retained_validation_attempt),
-        ) => Ok(retained_validation_attempt.clone()),
+        (Err(ToolError::Denied(_)), Some(retained_validation_attempt)) => {
+            Ok(retained_validation_attempt.clone())
+        }
         _ => out,
-    }
-}
-
-fn record_retained_validation_skip(
-    turn_timing_state: &crate::turn_timing::TurnTimingState,
-    out: &Result<ExecToolCallOutput, ToolError>,
-    retained_validation_attempt: Option<&ExecToolCallOutput>,
-) {
-    if retained_validation_attempt.is_some()
-        && let Err(ToolError::ValidationSkipped(skipped)) = out
-        && matches!(
-            skipped.skip_disposition,
-            codex_tools::ToolOutputSkipDisposition::Suppressed
-        )
-    {
-        turn_timing_state.record_suppressed_validation_output();
     }
 }
 
@@ -779,7 +658,7 @@ async fn run_exec_like_with_exit_code_inner(
     // Intercept apply_patch if present.
     let apply_patch_cwd = PathUri::from_abs_path(&exec_params.cwd);
     let intercepted = intercept_apply_patch(
-        validation_launch.is_some(),
+        validation_launch,
         &exec_params.command,
         &apply_patch_cwd,
         fs.as_ref(),
@@ -972,23 +851,6 @@ async fn run_exec_like_with_exit_code_inner(
         && (retained_validation_attempt.is_some()
             || runtime_validation_attempt_started
             || shell_validation_execution_output(&out, None).is_some());
-    if let Some(skipped) = unexecuted_validation_skip(&out, validation_attempt_started) {
-        return finish_validation_skip_after_begin(
-            &emitter,
-            &session,
-            &turn,
-            &call_id,
-            &tool_call_source,
-            event_tracker,
-            skipped.clone(),
-        )
-        .await;
-    }
-    record_retained_validation_skip(
-        turn.turn_timing_state.as_ref(),
-        &out,
-        retained_validation_attempt.as_ref(),
-    );
     let out = restore_retained_validation_attempt(out, retained_validation_attempt.as_ref());
     if validation_attempt_started {
         let duration = shell_validation_execution_output(&out, None)
@@ -1207,7 +1069,6 @@ fn shell_tool_outcome(
         Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { .. }))) => {
             codex_tools::ToolOutputOutcome::TimedOut
         }
-        Err(ToolError::ValidationSkipped(_)) => codex_tools::ToolOutputOutcome::Skipped,
         Err(_) => codex_tools::ToolOutputOutcome::Failure,
     }
 }
@@ -1222,7 +1083,6 @@ fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
         Err(ToolError::Codex(_)) => Some(-1),
         Err(ToolError::Denied(_)) => None,
         Err(ToolError::Rejected(_)) => Some(-1),
-        Err(ToolError::ValidationSkipped(_)) => None,
     }
 }
 

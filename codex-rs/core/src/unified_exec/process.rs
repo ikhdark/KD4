@@ -274,6 +274,25 @@ impl std::fmt::Debug for UnifiedExecProcess {
 }
 
 impl UnifiedExecProcess {
+    pub(super) fn hold_workspace_operation_until_exit(
+        &self,
+        permit: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) {
+        let mut state = self.state_rx.clone();
+        // Spawn registration transfers ownership before the first cancellable
+        // startup wait. A returned session handle or cancelled observer must not
+        // release the workspace while its validation process is still running.
+        let release = async move {
+            let _ = state.wait_for(|state| state.has_exited).await;
+            drop(permit);
+        };
+        if let Some(owner) = self.termination_owner.get() {
+            owner.tasks.spawn_on(release, &owner.runtime);
+        } else {
+            tokio::spawn(release);
+        }
+    }
+
     pub(super) fn start_stall_watchdog(self: &Arc<Self>, stall_timeout_ms: Option<u64>) {
         let Some(stall_timeout_ms) = stall_timeout_ms.filter(|timeout| *timeout != 0) else {
             return;

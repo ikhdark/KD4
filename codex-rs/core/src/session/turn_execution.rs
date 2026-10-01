@@ -36,9 +36,9 @@ use sha2::Sha256;
 use crate::tool_history::SourceDependencyV1;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::turn_timing::TurnTimingState;
-use crate::validation_admission::ValidationClassification;
-use crate::validation_admission::ValidationOperation;
-use crate::validation_admission::classify_validation;
+use crate::validation::ValidationClassification;
+use crate::validation::ValidationOperation;
+use crate::validation::classify_validation;
 
 const TURN_EFFICIENCY_TOOL_CALL_THRESHOLD: usize = 8;
 const TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL: u64 = 500;
@@ -100,6 +100,7 @@ pub(crate) struct SamplingRequestBaselines {
     plan_revision: u64,
     input_revision: u64,
     tool_exposure_revision: u64,
+    evidence_fingerprint: String,
 }
 
 impl SamplingRequestBaselines {
@@ -121,7 +122,15 @@ impl SamplingRequestBaselines {
     }
 
     pub(crate) fn relevant_state_fingerprint(&self) -> String {
-        format!("{:x}", Sha256::digest(self.revision_key().as_bytes()))
+        // Authority revisions govern admission; observed evidence governs the
+        // next decision too. Do not confuse this semantic identity with an
+        // exact provider-request digest.
+        let state = format!(
+            "v2;{};evidence={}",
+            self.revision_key(),
+            self.evidence_fingerprint,
+        );
+        format!("{:x}", Sha256::digest(state.as_bytes()))
     }
 }
 
@@ -465,6 +474,7 @@ struct SamplingRequestSignalState {
     saw_coordination: bool,
     direct_wait_agent_count: usize,
     direct_code_mode_exec_count: usize,
+    explicit_completion: Option<(u64, String)>,
     code_mode_nested_tool_count: usize,
     code_mode_call_ordinals: BTreeMap<String, u64>,
     code_mode_cell_owners: BTreeMap<String, u64>,
@@ -1127,6 +1137,19 @@ impl SamplingRequestSignalCollector {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if outcome.kind == SamplingToolOutcomeKind::Success
+            && state
+                .code_mode_call_ordinals
+                .values()
+                .any(|value| *value == ordinal)
+            && let Some(message) = signal
+                .as_ref()
+                .and_then(|signal| signal.get("explicit_completion_message"))
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+        {
+            state.explicit_completion = Some((ordinal, message.to_string()));
+        }
         let replayable = state
             .structured_actions
             .get(&ordinal)
@@ -1177,6 +1200,38 @@ impl SamplingRequestSignalCollector {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .replayed_ordinals
             .insert(ordinal);
+    }
+
+    fn explicit_completion(&self) -> Option<AuthoritativeWaitOwnerResult> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (ordinal, message) = state.explicit_completion.as_ref()?;
+        // A model-authored delivery cell is an explicit final response, not a
+        // guess that an arbitrary successful tool completed the user's task.
+        // Sibling calls, unfinished work and failed nested calls still need a
+        // decision; do not let one cell finish their shared turn.
+        if state.registered_count != 1
+            || state.direct_code_mode_exec_count != 1
+            || state
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.kind != SamplingToolOutcomeKind::Success)
+            || state
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.ordinal == *ordinal)
+                .count()
+                != 1
+        {
+            return None;
+        }
+        Some(AuthoritativeWaitOwnerResult {
+            adapter: "code_mode_delivery".to_string(),
+            value: serde_json::json!({"message": message}),
+            surfaceable_message: Some(message.clone()),
+        })
     }
 
     fn successful_replay_candidates(
@@ -2442,7 +2497,7 @@ fn tool_name_matches(tool_name: &ToolName, candidate: &str) -> bool {
     tool_name.namespace.is_none() && tool_name.name == candidate
 }
 
-#[derive(Clone, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq, Serialize)]
 struct DeliveredSourceCoverage {
     ranges: Vec<(u64, u64)>,
     query_proofs: BTreeSet<String>,
@@ -2763,6 +2818,16 @@ impl TurnExecutionControl {
             plan_revision: self.plan_revision,
             input_revision: self.input_revision,
             tool_exposure_revision,
+            evidence_fingerprint: format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&(
+                        &self.budget_progress_evidence,
+                        &self.delivered_coverage,
+                    ))
+                    .expect("ordered evidence contains only JSON-serializable values"),
+                ),
+            ),
         }
     }
 
@@ -2800,10 +2865,12 @@ impl TurnExecutionControl {
         settled: &SamplingRequestSettledState,
         has_pending_input: bool,
     ) -> GenerationRequestDisposition {
-        let relevant_state_fingerprint = format!(
-            "{:x}",
-            Sha256::digest(self.settled_revision_key(settled).as_bytes())
-        );
+        let relevant_state_fingerprint = self
+            .baselines_with_tool_exposure_revision(
+                settled.mutation_revision,
+                settled.tool_exposure_revision,
+            )
+            .relevant_state_fingerprint();
         GenerationRequestDisposition {
             // A server-requested continuation can finish reasoning or issue a
             // tool even when the preceding response changed no tracked state.
@@ -2842,6 +2909,15 @@ impl TurnExecutionControl {
         collector: &SamplingRequestSignalCollector,
         settled: &SamplingRequestSettledState,
     ) -> SamplingConvergenceDecision {
+        if self.input_revision == baselines.input_revision
+            && let Some(result) = collector.explicit_completion()
+        {
+            return SamplingConvergenceDecision {
+                continuation: ContinuationDisposition::SurfaceExistingResult,
+                authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(result)),
+                ..Default::default()
+            };
+        }
         let settled_revision = self.settled_revision_key(settled);
         // Validation proves only its observed execution. It cannot prove that
         // all user-requested changes, checks, or child lifecycle actions are done.
@@ -3720,6 +3796,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
+            let evidence_before = control.baselines(0).relevant_state_fingerprint();
             let mut pending = (index > 0).then_some(crate::turn_timing::ContinuationCause::ToolResult);
             timing.begin_model_generation_with_metadata(
                 &mut pending,
@@ -3748,6 +3825,14 @@ mod tests {
                 false,
             );
             let progress = control.observe_progress(&baselines, &collector, &settled(0));
+            let evidence_after = control.baselines(0).relevant_state_fingerprint();
+            assert_eq!(evidence_before != evidence_after, novel);
+            assert_eq!(
+                control
+                    .continuation_generation_request(&baselines, &collector, &settled(0), false)
+                    .relevant_state_fingerprint,
+                evidence_after,
+            );
             assert_eq!(
                 progress,
                 if novel {

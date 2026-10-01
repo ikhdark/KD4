@@ -34,8 +34,6 @@ use crate::context::ContextualUserFragment;
 use crate::context::PermissionsInstructions;
 use crate::context::PromptContextCategory;
 use crate::context::RecommendedPluginsInstructions;
-use crate::context::TaskModelGuidance;
-use crate::context::base_instructions_own_task_model_guidance;
 use crate::context::is_startup_contextual_user_fragment;
 use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
@@ -2158,23 +2156,6 @@ async fn build_pure_pending_turn_plan(
                 .as_ref()
                 .is_none_or(|prompts| !prompts.contains_path(&skill.path))
         }));
-    let base_instructions = Arc::clone(&turn_context.base_instructions);
-    // The task-model guidance fragment is opt-in: every request re-sends it
-    // and its provenance labels leak into final answers. Base instructions
-    // that own the policy never receive the duplicate either way.
-    if turn_context
-        .config
-        .features
-        .enabled(Feature::TaskModelGuidance)
-        && !base_instructions_own_task_model_guidance(&base_instructions.text)
-    {
-        injection_items.insert(
-            0,
-            ContextualUserFragment::into(TaskModelGuidance::for_base_instructions(
-                &base_instructions.text,
-            )),
-        );
-    }
     injection_items.extend(recommended_plugin_items);
     injection_items.extend(plugin_items);
     injection_items.extend(extension_injection_items);
@@ -5500,8 +5481,6 @@ async fn try_run_sampling_request(
         turn_context.provider.info().name.as_str(),
     ).with_request_metadata(|| serde_json::json!({
         "enabled_features": sess.features.enabled_features().into_iter().map(Feature::key).collect::<Vec<_>>(),
-        "task_model_guidance_enabled": sess.features.enabled(Feature::TaskModelGuidance),
-        "base_instructions_own_task_model_guidance": crate::context::base_instructions_own_task_model_guidance(&prompt.base_instructions.text),
         "configured_reasoning_effort": turn_context.configured_reasoning_effort,
         "resolved_reasoning_effort": request_effort,
         "reasoning_summary": turn_context.reasoning_summary,
@@ -6070,10 +6049,16 @@ async fn try_run_sampling_request(
                 latest_models_etag = Some(etag);
             }
             ResponseEvent::Completed {
+                response_id,
                 token_usage,
                 end_turn,
                 ..
             } => {
+                if let Some(identity) = attempt_identity.as_ref() {
+                    turn_context.turn_timing_state.record_model_response_id(
+                        &identity.physical_attempt_id, &response_id,
+                    );
+                }
                 sess.mark_tool_history_consumed(
                     &turn_context,
                     client_session.effective_input().unwrap_or(&prompt.input),

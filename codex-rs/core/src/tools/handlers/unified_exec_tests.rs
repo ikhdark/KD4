@@ -425,77 +425,6 @@ async fn sandbox_denial_preserves_the_process_raw_output_artifact() {
     assert_eq!(finalized, preserved);
 }
 
-#[tokio::test]
-async fn unified_pipeline_validation_is_denied_before_process_launch() {
-    let (session, turn) = make_session_and_context().await;
-    {
-        let mut authorization = turn.validation_authorization.write().await;
-        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
-        assert!(authorization.update_from_user_input("do not run tests"));
-    }
-    let turn = Arc::new(turn);
-    let payload = ToolPayload::Function {
-        arguments: serde_json::json!({
-            "kind": "script",
-            "cmd": "cargo test | cargo --version"
-        })
-        .to_string(),
-    };
-
-    let (output, launches) =
-        crate::tools::runtimes::unified_exec::test_observation::observe(async {
-            ExecCommandHandler::default()
-                .handle(ToolInvocation {
-                    session: session.into(),
-                    step_context: StepContext::for_test(turn),
-                    cancellation_token: tokio_util::sync::CancellationToken::new(),
-                    tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                    call_id: "unified-pipeline-validation-denied".to_string(),
-                    tool_name: codex_tools::ToolName::plain("exec_command"),
-                    source: ToolCallSource::Direct,
-                    payload: payload.clone(),
-                })
-                .await
-        })
-        .await;
-    let output = output.expect("the denied pipeline should return a structured skip");
-    let structured = output
-        .post_tool_use_response("unified-pipeline-validation-denied", &payload)
-        .expect("the validation skip should retain its structured result");
-
-    assert_eq!(structured["reason"], "user_prohibited_validation");
-    assert_eq!(structured["operation"], "test");
-    assert_eq!(structured["command_was_executed"], false);
-    assert_eq!(launches.process_launches, 0);
-}
-
-#[tokio::test]
-async fn late_unified_validation_denial_records_suppressed_timing() {
-    let (_session, turn) = make_session_and_context().await;
-    let invocation = CommandInvocation::Argv {
-        program: "cargo".to_string(),
-        args: vec!["test".to_string()],
-    };
-    let skipped = {
-        let mut authorization = turn.validation_authorization.write().await;
-        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
-        assert!(authorization.update_from_user_input("do not run tests"));
-        crate::validation_admission::prohibited_skip_for(&authorization, &invocation, true)
-            .expect("test denial suppresses the validation")
-    };
-
-    super::exec_command::record_late_validation_skip(&turn, &skipped);
-
-    assert_eq!(
-        turn.turn_timing_state
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .suppressed_validation_output_count,
-        1,
-    );
-}
-
 async fn run_exec_command_for_test(
     session: &Arc<crate::session::session::Session>,
     turn: &Arc<crate::session::turn_context::TurnContext>,
@@ -892,8 +821,6 @@ async fn command_handlers_normalize_status_and_distinguish_search_misses_from_er
     for tool in ["exec_command", "shell_command"] {
         let (session, mut turn) = make_session_and_context().await;
         turn.permission_profile = PermissionProfile::Disabled;
-        *turn.validation_authorization.write().await =
-            crate::validation_admission::ValidationAuthorization::enabled();
         let session = Arc::new(session);
         let turn = Arc::new(turn);
         for (program, args, validation, expected_success, expected_output) in [
@@ -980,10 +907,6 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
     let (session, turn) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
-    {
-        let mut authorization = turn.validation_authorization.write().await;
-        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
-    }
     let validation_repository = tempfile::tempdir().expect("temporary validation repository");
     let git_init = std::process::Command::new("git")
         .args(["init", "--quiet"])
@@ -3941,4 +3864,141 @@ async fn registered_exec_declared_validation_survives_yield_and_stdin_completion
         .unified_exec_manager
         .terminate_all_processes()
         .await;
+}
+// Opt-in local measurement through the registered native tool path, without a model.
+#[rstest::rstest]
+#[case("small_output", 64, false)]
+#[case("large_output", 1_048_576, false)]
+#[case("background_completion", 1_048_576, true)]
+#[tokio::test]
+#[ignore = "opt-in direct_runtime off/on latency measurement"]
+async fn direct_runtime_native_command_benchmark(
+    #[case] case: &str,
+    #[case] bytes: usize,
+    #[case] background: bool,
+) {
+    use std::io::Write;
+    use std::time::Instant;
+
+    let python = which::which("python").expect("benchmark requires Python");
+    let output_path = std::env::var_os("DIRECT_RUNTIME_BENCH_OUTPUT")
+        .expect("DIRECT_RUNTIME_BENCH_OUTPUT must name the raw JSONL report");
+    for sample in 0..11 {
+        // Alternate pair order; the first pair warms both paths and is excluded.
+        for direct_runtime in if sample % 2 == 0 { [false, true] } else { [true, false] } {
+            let workspace = tempfile::tempdir().unwrap();
+            let release = workspace.path().join("release");
+            let release_literal = serde_json::to_string(&release.to_string_lossy()).unwrap();
+            let wait = if background {
+                format!("print('READY',flush=True); p=pathlib.Path({release_literal}); exec('while not p.exists(): time.sleep(0.001)'); ")
+            } else {
+                String::new()
+            };
+            let script = format!(
+                "import pathlib,time,sys; {wait}sys.stdout.write('X'*{bytes}+'\\nDIRECT_RUNTIME_DONE\\n'); sys.stdout.flush()"
+            );
+            let (session, mut turn, events) = make_session_and_context_with_rx().await;
+            let turn_mut = Arc::get_mut(&mut turn).unwrap();
+            turn_mut.permission_profile = PermissionProfile::Disabled;
+            let mut config = (*turn_mut.config).clone();
+            config.features.enable(codex_features::Feature::UnifiedExec).unwrap();
+            assert!(config.features.enabled(codex_features::Feature::Kd4Runtime));
+            if direct_runtime {
+                config.features.enable(codex_features::Feature::DirectRuntime).unwrap();
+            } else {
+                config.features.disable(codex_features::Feature::DirectRuntime).unwrap();
+            }
+            config.permissions.approval_policy =
+                crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+            turn_mut.approval_policy = config.permissions.approval_policy.clone();
+            turn_mut.config = Arc::new(config);
+            let step = StepContext::for_test(Arc::clone(&turn));
+            let router = Arc::new(crate::tools::router::ToolRouter::from_context(
+                step.as_ref(),
+                crate::tools::router::ToolRouterParams {
+                    tool_suggest_candidates: None,
+                    deferred_mcp_tools: None,
+                    mcp_tools: None,
+                    extension_tool_executors: Vec::new(),
+                    dynamic_tools: &[],
+                    exposure_identity: Default::default(),
+                },
+                &Default::default(),
+            ));
+            assert!(step.set_tool_router(router).is_ok());
+            let runtime = crate::tools::parallel::ToolCallRuntime::new(
+                Arc::clone(&session), step, Arc::new(Mutex::new(TurnDiffTracker::new())),
+            );
+            let terminal = tokio::spawn(async move {
+                loop {
+                    if let codex_protocol::protocol::EventMsg::ExecCommandEnd(end) =
+                        events.recv().await.unwrap().msg
+                    {
+                        if end.call_id == "direct-runtime-bench" {
+                            assert_eq!(end.exit_code, 0);
+                            assert!(end.aggregated_output.contains("DIRECT_RUNTIME_DONE"));
+                            break Instant::now();
+                        }
+                    }
+                }
+            });
+            let started = Instant::now();
+            let response = runtime.clone().handle_tool_call(
+                crate::tools::router::ToolCall {
+                    tool_name: codex_tools::ToolName::plain("exec_command"),
+                    call_id: "direct-runtime-bench".into(),
+                    payload: ToolPayload::Function { arguments: serde_json::json!({
+                        "program": python, "args": ["-c", script], "workdir": workspace.path(),
+                        "yield_time_ms": if background { 250 } else { 10_000 },
+                        "max_output_tokens": 1000
+                    }).to_string() },
+                },
+                tokio_util::sync::CancellationToken::new(),
+            ).await.unwrap();
+            let initial_return_ns = started.elapsed().as_nanos();
+            let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+            else { panic!("registered command must return function output") };
+            let mut result: serde_json::Value =
+                serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+            let released = Instant::now();
+            if background {
+                assert!(result["session_id"].is_u64(), "child must wait for release: {result}");
+                std::fs::write(&release, b"go").unwrap();
+            }
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(10), terminal)
+                .await.expect("terminal event deadline").unwrap();
+            if let Some(id) = result["session_id"].as_u64() {
+                let response = runtime.clone().handle_tool_call(
+                    crate::tools::router::ToolCall {
+                        tool_name: codex_tools::ToolName::plain("write_stdin"),
+                        call_id: "direct-runtime-bench-poll".into(),
+                        payload: ToolPayload::Function { arguments: serde_json::json!({
+                            "session_id": id, "chars": "", "yield_time_ms": 1000,
+                            "max_output_tokens": 1000
+                        }).to_string() },
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                ).await.unwrap();
+                let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+                else { panic!("registered poll must return function output") };
+                result = serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+            }
+            let settled_ns = started.elapsed().as_nanos();
+            assert_eq!(result["exit_code"], 0, "{result}");
+            assert!(result["output"].as_str().unwrap().contains("DIRECT_RUNTIME_DONE"));
+            session.services.unified_exec_manager.terminate_all_processes().await;
+            let record = serde_json::json!({
+                "case": case, "sample": sample, "warmup": sample == 0,
+                "direct_runtime": direct_runtime, "output_payload_bytes": bytes,
+                "initial_return_ns": initial_return_ns, "settled_ns": settled_ns,
+                "terminal_event_ns": ended.duration_since(started).as_nanos(),
+                "release_to_terminal_ns": background.then(|| ended.duration_since(released).as_nanos()),
+                "exit_code": 0, "final_marker_verified": true,
+                "scope": "registered native tools; no model, sandbox disabled, fixture setup excluded"
+            });
+            let mut file = std::fs::OpenOptions::new().create(true).append(true)
+                .open(&output_path).unwrap();
+            writeln!(file, "{record}").unwrap();
+        }
+    }
 }

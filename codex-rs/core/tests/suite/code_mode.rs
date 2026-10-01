@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used)]
 
+#[path = "code_mode_direct_delivery.rs"]
+mod direct_delivery;
+
 #[path = "code_mode_owned_continuation.rs"]
 mod owned_continuation;
 
@@ -1679,10 +1682,11 @@ async fn output_only_preserves_running_command_and_recovers_middle(
         "// @exec: {{\"max_output_tokens\": {budget}}}\nconst r = await tools.exec_command({{cmd: {command:?}, yield_time_ms: 1000, max_output_tokens: {budget}}}); if (r.process_exited !== false || r.execution_state !== 'running' || r.exit_code !== null || r.output_complete !== false) throw new Error('expected live command'); text(r.output);",
         budget = if zero_budget { 0 } else { 256 },
     );
-    let (test, observed) = run_code_mode_turn_with_config(
+    let (test, observed) = run_code_mode_turn_with_model_and_config(
         &server,
         "Run the command and collect all its output.",
         &code,
+        "gpt-5.5",
         |config| config.completed_tool_history_projection = true,
     )
     .await?;
@@ -1716,8 +1720,14 @@ async fn output_only_preserves_running_command_and_recovers_middle(
         ]),
     )
     .await;
-    test.submit_turn("Collect the remaining output using the returned handle.")
+    let completed = test
+        .submit_turn_and_capture_completion("Collect the remaining output using the returned handle.")
         .await?;
+    let counters = &completed.timing.as_ref().expect("turn timing").counters;
+    assert!(
+        counters.tool_output_truncation_count > counters.tool_output_projection_truncation_count,
+        "the native command reduction must be counted independently of outer projection"
+    );
     assert!(raw_custom_tool_output_text(&observed.single_request(), "call-1")
         .contains(&format!("Running command session_id: {session_id}")));
     let raw = raw_custom_tool_output_text(&observed.single_request(), "poll");

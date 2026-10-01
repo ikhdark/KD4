@@ -84,7 +84,6 @@ impl<'a> ToolEventCtx<'a> {
 
 pub(crate) enum ToolEventStage<'a> {
     Begin,
-    Skipped(String),
     Success {
         output: ExecToolCallOutput,
         applied_patch_delta: Option<&'a AppliedPatchDelta>,
@@ -439,7 +438,6 @@ impl ToolEmitter {
                 )
                 .await?;
             }
-            (Self::ApplyPatch { .. }, ToolEventStage::Skipped(_)) => {}
             (
                 Self::UnifiedExec {
                     command,
@@ -578,13 +576,6 @@ impl ToolEmitter {
                 let event = ToolEventStage::Failure(ToolEventFailure::Message(message.clone()));
                 let result = Err(FunctionCallError::RespondToModel(message));
                 (event, result)
-            }
-            Err(ToolError::ValidationSkipped(skipped)) => {
-                let content = serde_json::to_string(&skipped).unwrap_or_else(|_| {
-                    r#"{"reason":"validation_skipped","command_was_executed":false}"#.to_string()
-                });
-                tracing::info!(reason = ?skipped.reason, "validation command skipped");
-                (ToolEventStage::Skipped(content.clone()), Ok(content))
             }
             Err(ToolError::Rejected(msg)) => {
                 let bounded = self.bound_error_message(msg);
@@ -771,21 +762,6 @@ async fn emit_exec_stage(
             let exec_result = ExecCommandResult {
                 stdout: String::new(),
                 stderr: text.clone(),
-                aggregated_output: text.clone(),
-                exit_code: -1,
-                duration: Duration::ZERO,
-                formatted_output: text,
-                status: ExecCommandStatus::Declined,
-                timed_out: false,
-            };
-            emit_exec_end(ctx, exec_input, exec_result).await?;
-        }
-        ToolEventStage::Skipped(output) => {
-            tracing::info!(%output, "exec tool completed with a skipped outcome");
-            let text = output.to_string();
-            let exec_result = ExecCommandResult {
-                stdout: String::new(),
-                stderr: String::new(),
                 aggregated_output: text.clone(),
                 exit_code: -1,
                 duration: Duration::ZERO,

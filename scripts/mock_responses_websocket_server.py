@@ -3,8 +3,10 @@
 import argparse
 import asyncio
 import datetime as dt
+import hashlib
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -71,6 +73,108 @@ start codex with `codex --profile localapi_ws`
 
 class _ConnectionAbort(Exception):
     pass
+
+
+TOOL_RESULT_TYPES = frozenset((
+    "function_call_output", "custom_tool_call_output", "tool_search_output",
+))
+
+
+def load_rollout_replay(path: Path) -> list[dict[str, Any]]:
+    """Load data, never executable code. Incomplete/legacy evidence fails closed.
+
+    One completed turn per replay connection; retries without a completed
+    response cannot be reconstructed from response items and are rejected.
+    """
+    requests = []
+    pending_results = []
+    hashes = {}
+    response_ids = {}
+    turn_ids = set()
+    for line in path.read_bytes().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        payload = row["payload"]
+        if row["type"] == "sampling_boundary":
+            turn_ids.add(payload.get("turn_id"))
+            requests.append({
+                "attempt": payload["physical_attempt_id"],
+                "outputs": [],
+                "tool_results": pending_results,
+            })
+            pending_results = []
+        elif row["type"] == "response_item":
+            kind = payload.get("type")
+            if kind in TOOL_RESULT_TYPES:
+                pending_results.append(payload)
+            elif requests and (kind in ("reasoning", "function_call", "custom_tool_call",
+                                        "tool_search_call") or
+                               kind == "message" and payload.get("role") == "assistant"):
+                requests[-1]["outputs"].append(payload)
+        elif payload.get("type") == "task_complete":
+            for request in payload.get("timing", {}).get("modelRequests", []):
+                hashes.update(request.get("requestSha256ByAttempt", {}))
+                response_ids.update(request.get("responseIdByAttempt", {}))
+    if len(turn_ids) != 1 or not requests or pending_results:
+        raise ValueError("replay requires one completed turn with all tool results consumed")
+    for request in requests:
+        attempt = request["attempt"]
+        if attempt not in hashes or attempt not in response_ids or not request["outputs"]:
+            raise ValueError(f"attempt {attempt}: missing exact request hash, response ID or outputs")
+        request["request_sha256"] = hashes[attempt]
+        response_id = response_ids[attempt]
+        request["events"] = tuple(_dump_json(event) for event in (
+            _event_response_created(response_id),
+            *({"type": "response.output_item.done", "item": item}
+              for item in request["outputs"]),
+            _event_response_completed(response_id),
+        ))
+    if set(hashes) != {request["attempt"] for request in requests}:
+        raise ValueError("request hashes and sampling boundaries do not cover the same attempts")
+    return requests
+
+
+async def _handle_replay(websocket: Any, replay: list[dict[str, Any]], *,
+                         quiet: bool, log_json: str) -> bool:
+    known_results = {}
+    try:
+        for index, expected in enumerate(replay):
+            while True:
+                raw = []
+                request = await _recv_json(websocket, f"replay-{index}", quiet=quiet,
+                                           log_json=log_json, raw_messages=raw)
+                if request.get("generate") is not False:
+                    break
+                await _send_events(websocket, (
+                    _dump_json(_event_response_created("replay-warmup")),
+                    _dump_json(_event_response_completed("replay-warmup")),
+                ), quiet=quiet)
+            actual_results = {
+                (item["type"], item.get("call_id")): item for item in request.get("input", [])
+                if item.get("type") in TOOL_RESULT_TYPES
+            }
+            known_results.update({
+                (item["type"], item.get("call_id")): item for item in expected["tool_results"]
+            })
+            required = {(item["type"], item.get("call_id")) for item in expected["tool_results"]}
+            if not required.issubset(actual_results) or any(
+                known_results.get(key) != value for key, value in actual_results.items()
+            ):
+                raise ValueError(f"request {index}: tool result mismatch")
+            actual_hash = hashlib.sha256(raw[0]).hexdigest()
+            if actual_hash != expected["request_sha256"]:
+                raise ValueError(f"request {index}: exact request hash mismatch "
+                                 f"(expected {expected['request_sha256']}, got {actual_hash})")
+            await _send_events(websocket, expected["events"], quiet=quiet)
+    except _ConnectionAbort:
+        return False
+    except ValueError as error:
+        sys.stderr.write(f"[replay] {error}\n")
+        await websocket.close(code=1008, reason=str(error)[:120])
+        return False
+    await websocket.close()
+    return True
 
 
 def _utc_iso() -> str:
@@ -167,8 +271,11 @@ async def _recv_json(
     *,
     quiet: bool,
     log_json: str,
+    raw_messages: list[bytes] | None = None,
 ) -> dict[str, Any]:
     msg = await websocket.recv()
+    if raw_messages is not None:
+        raw_messages.append(msg if isinstance(msg, bytes) else msg.encode("utf-8"))
     try:
         if isinstance(msg, bytes):
             payload = json.loads(msg.decode("utf-8"))
@@ -212,6 +319,7 @@ async def _handle_connection(
     expected_path: str = PATH,
     quiet: bool = False,
     log_json: str = "pretty",
+    replay: list[dict[str, Any]] | None = None,
 ) -> bool:
     path = websocket.request.path
 
@@ -222,6 +330,9 @@ async def _handle_connection(
         _log_conn(f"rejecting unexpected path (expected {expected_path})", quiet=quiet)
         await websocket.close(code=1008, reason="unexpected websocket path")
         return False
+
+    if replay is not None:
+        return await _handle_replay(websocket, replay, quiet=quiet, log_json=log_json)
 
     # Request 1: provoke a function call (mirrors `codex-rs/core/tests/suite/agent_websocket.rs`).
     try:
@@ -294,6 +405,7 @@ async def _serve(
     log_json: str = "pretty",
     max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     max_sessions: int | None = None,
+    replay: list[dict[str, Any]] | None = None,
 ) -> int:
     if not 0 <= port <= 65535:
         raise ValueError("port must be between 0 and 65535")
@@ -302,9 +414,10 @@ async def _serve(
 
     finished = asyncio.Event()
     sessions_seen = 0
+    replay_failed = False
 
     async def handler(ws: Any) -> None:
-        nonlocal sessions_seen
+        nonlocal sessions_seen, replay_failed
         completed = False
         try:
             completed = await _handle_connection(
@@ -312,10 +425,14 @@ async def _serve(
                 expected_path=PATH,
                 quiet=quiet,
                 log_json=log_json,
+                replay=replay,
             )
         except ConnectionClosed:
             return
         finally:
+            if replay is not None and not completed:
+                replay_failed = True
+                finished.set()
             if completed and max_sessions is not None:
                 sessions_seen += 1
                 if sessions_seen >= max_sessions:
@@ -345,14 +462,14 @@ async def _serve(
         sys.stdout.write(_config_snippet(ws_uri))
         sys.stdout.flush()
     try:
-        if max_sessions is None:
+        if max_sessions is None and replay is None:
             await asyncio.Future()
         else:
             await finished.wait()
     finally:
         server.close()
         await server.wait_closed()
-    return 0
+    return 1 if replay_failed else 0
 
 
 def _positive_int(value: str) -> int:
@@ -414,6 +531,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit after one websocket session.",
     )
+    parser.add_argument("--replay-rollout", type=Path,
+                        help="Replay one completed turn from JSONL; verify exact request hashes "
+                             "and tool results. Missing provenance is an error.")
     return parser
 
 
@@ -423,6 +543,14 @@ def main() -> int:
     if args.once and args.max_sessions is not None and args.max_sessions != 1:
         parser.error("--once cannot be combined with --max-sessions other than 1")
     max_sessions = 1 if args.once else args.max_sessions
+    replay = None
+    if args.replay_rollout:
+        try:
+            replay = load_rollout_replay(args.replay_rollout)
+        except (OSError, ValueError, KeyError) as error:
+            parser.error(str(error))
+        if max_sessions is None:
+            max_sessions = 1
 
     try:
         return asyncio.run(
@@ -432,6 +560,7 @@ def main() -> int:
                 log_json=args.log_json,
                 max_message_bytes=args.max_message_bytes,
                 max_sessions=max_sessions,
+                replay=replay,
             )
         )
     except KeyboardInterrupt:

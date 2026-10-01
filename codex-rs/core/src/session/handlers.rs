@@ -229,30 +229,36 @@ pub(super) async fn user_input_or_turn_inner(
             return;
         }
     };
-    if let Err(err) = sess
+    let initial_settings_persisted = match sess
         .persist_thread_settings_snapshot_if_unmaterialized()
         .await
     {
-        let message = format!("failed to persist initial thread settings: {err}");
-        sess.send_event_raw_without_materializing_rollout(Event {
-            id: sub_id.clone(),
-            msg: EventMsg::Error(ErrorEvent {
-                message: message.clone(),
-                codex_error_info: Some(CodexErrorInfo::InternalServerError),
-            }),
-        })
-        .await;
-        if let Some((task_start_permit, admission)) = start_only_admission.take() {
-            drop(task_start_permit);
-            let _ = admission.send(Err(CodexErr::Fatal(message)));
+        Ok(persisted) => persisted,
+        Err(err) => {
+            let message = format!("failed to persist initial thread settings: {err}");
+            sess.send_event_raw_without_materializing_rollout(Event {
+                id: sub_id.clone(),
+                msg: EventMsg::Error(ErrorEvent {
+                    message: message.clone(),
+                    codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                }),
+            })
+            .await;
+            if let Some((task_start_permit, admission)) = start_only_admission.take() {
+                drop(task_start_permit);
+                let _ = admission.send(Err(CodexErr::Fatal(message)));
+            }
+            return;
         }
-        return;
-    }
+    };
     if emit_thread_settings_applied {
-        sess.send_event_raw_without_materializing_rollout(Event {
-            id: sub_id.clone(),
-            msg: sess.thread_settings_applied_event().await,
-        })
+        sess.send_event_raw_with_persistence(
+            Event {
+                id: sub_id.clone(),
+                msg: sess.thread_settings_applied_event().await,
+            },
+            !initial_settings_persisted,
+        )
         .await;
     }
     let items = if start_only_admission.is_some() {
@@ -295,9 +301,6 @@ pub(super) async fn user_input_or_turn_inner(
             .turn_metadata_state
             .set_responsesapi_client_metadata(responsesapi_client_metadata);
     }
-    current_context
-        .update_validation_authorization(&items)
-        .await;
     current_context.update_multi_agent_spawn_authorization(&items);
     current_context.session_telemetry.user_prompt(&items);
     sess.refresh_mcp_servers_if_requested(&current_context)

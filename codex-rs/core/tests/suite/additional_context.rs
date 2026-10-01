@@ -112,7 +112,7 @@ async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Re
         vec![application_context("automation_info", "run one")]
     );
     assert_eq!(
-        user_texts_without_task_model_guidance(&request),
+        request.message_input_texts("user"),
         vec![
             external_context("browser_info", "tab one"),
             "inspect the active tab".to_string(),
@@ -167,7 +167,7 @@ async fn external_context_like_user_text_remains_a_user_message_item() -> Result
 
     let request = request.single_request();
     assert_eq!(
-        user_texts_without_task_model_guidance(&request),
+        request.message_input_texts("user"),
         vec!["<external_api>"]
     );
 
@@ -232,7 +232,7 @@ async fn additional_context_trust_controls_message_role() -> Result<()> {
         vec![application_context("automation_info", "run one")]
     );
     assert_eq!(
-        user_texts_without_task_model_guidance(&request),
+        request.message_input_texts("user"),
         vec![
             external_context("browser_info", "tab one"),
             "inspect context".to_string(),
@@ -304,14 +304,14 @@ async fn additional_context_is_deduplicated_between_turns_while_retained() -> Re
     .await;
 
     assert_eq!(
-        user_texts_without_task_model_guidance(&first_request.single_request()),
+        first_request.single_request().message_input_texts("user"),
         vec![
             external_context("browser_info", "same tab"),
             "first turn".to_string(),
         ]
     );
     assert_eq!(
-        user_texts_without_task_model_guidance(&second_request.single_request()),
+        second_request.single_request().message_input_texts("user"),
         vec![
             external_context("browser_info", "same tab"),
             "first turn".to_string(),
@@ -455,7 +455,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
         "Additional context snapshot replaced. All previously supplied additional context values are obsolete (previous_value_obsolete=\"true\"). Only additional-context entries following this reset in the current update remain available. Do not infer omitted values from earlier messages.",
     );
     assert_eq!(
-        user_texts_without_task_model_guidance(&first_request.single_request()),
+        first_request.single_request().message_input_texts("user"),
         vec![
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
@@ -463,7 +463,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
         ]
     );
     assert_eq!(
-        user_texts_without_task_model_guidance(&second_request.single_request()),
+        second_request.single_request().message_input_texts("user"),
         vec![
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
@@ -475,7 +475,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
         ]
     );
     assert_eq!(
-        user_texts_without_task_model_guidance(&third_request.single_request()),
+        third_request.single_request().message_input_texts("user"),
         vec![
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
@@ -569,7 +569,7 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
         automation_text.len()
     );
 
-    let user_texts = user_texts_without_task_model_guidance(&request);
+    let user_texts = request.message_input_texts("user");
     let [external_text, user_text] = user_texts.as_slice() else {
         panic!("expected external context plus user input, got {user_texts:?}");
     };
@@ -615,22 +615,6 @@ fn application_context_prefix(source: &str) -> String {
     format!("<application_context source=\"{source}\" kind=\"application\">")
 }
 
-fn user_texts_without_task_model_guidance(request: &responses::ResponsesRequest) -> Vec<String> {
-    request
-        .message_input_texts("user")
-        .into_iter()
-        .filter(|text| !text.starts_with("<task_model_guidance>"))
-        .collect()
-}
-
-fn task_model_guidance_texts(request: &responses::ResponsesRequest) -> Vec<String> {
-    request
-        .message_input_texts("user")
-        .into_iter()
-        .filter(|text| text.starts_with("<task_model_guidance>"))
-        .collect()
-}
-
 async fn submit_plain_user_text(
     test: &core_test_support::test_codex::TestCodex,
     text: &str,
@@ -655,108 +639,16 @@ async fn submit_plain_user_text(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_model_guidance_is_injected_only_when_the_feature_is_enabled() -> Result<()> {
-    require_network!();
-
-    for (instructions, base_owns_shared_policy) in [
-        (codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim(), true),
-        ("catalog supplied instructions", false),
-    ] {
-        for enabled in [false, true] {
-            let server = start_mock_server().await;
-            let test = test_codex()
-                .with_config(move |config| {
-                    config.include_environment_context = false;
-                    config.base_instructions = Some(instructions.to_string());
-                    config
-                        .features
-                        .set_enabled(Feature::TaskModelGuidance, enabled)
-                        .expect("test config should allow feature update");
-                })
-                .build(&server)
-                .await?;
-            let mut first_guidance = None;
-            for turn in 0..2 {
-                let request = mount_sse_once(
-                    &server,
-                    sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-                )
-                .await;
-                submit_plain_user_text(&test, &format!("summarize guidance, turn {turn}")).await?;
-                let request = request.single_request();
-                assert_eq!(request.body_json()["instructions"], instructions);
-                let guidance = task_model_guidance_texts(&request);
-                assert_eq!(guidance.len(), usize::from(enabled));
-                if enabled {
-                    for required in [
-                        "direct_file_read",
-                        "Form competing hypotheses only when uncertainty between explanations affects the next action.",
-                        "Track repository ownership and runtime relationships only as needed to establish the requested behavior.",
-                        "These are internal evidence labels, not a mandatory user-facing reporting format.",
-                    ] {
-                        assert!(guidance[0].contains(required), "missing guidance: {required}");
-                    }
-                    let shared = "A no-change result is valid";
-                    assert_eq!(guidance[0].contains(shared), !base_owns_shared_policy);
-                    assert_eq!(
-                        instructions.matches(shared).count() + guidance[0].matches(shared).count(),
-                        1
-                    );
-                    assert!(!guidance[0].contains("one to three plausible hypotheses"));
-                    assert!(!guidance[0].contains("stay at module-level abstraction"));
-                    assert!(guidance[0].ends_with("</task_model_guidance>"));
-                }
-                if let Some(first_guidance) = &first_guidance {
-                    assert_eq!(
-                        &guidance, first_guidance,
-                        "second turn must not duplicate guidance"
-                    );
-                } else {
-                    first_guidance = Some(guidance);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_model_guidance_owned_by_base_instructions_is_not_duplicated() -> Result<()> {
-    require_network!();
-    let server = start_mock_server().await;
-    let request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let instructions = "<task_model_guidance_policy version=\"1\" />\nRetain exact observed paths.";
-    let test = test_codex()
-        .with_config(move |config| {
-            config.base_instructions = Some(instructions.to_string());
-            config.features.enable(Feature::TaskModelGuidance).unwrap();
-        })
-        .build(&server)
-        .await?;
-    submit_plain_user_text(&test, "summarize the guidance policy").await?;
-    let request = request.single_request();
-    assert_eq!(request.body_json()["instructions"], instructions);
-    assert!(task_model_guidance_texts(&request).is_empty());
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_model_guidance_production_capture_matches_effective_settings() -> Result<()> {
+async fn production_capture_matches_effective_settings() -> Result<()> {
     require_network!();
 
     // Isolate the opt-in trace environment from concurrently running tests.
-    const TRACE_CHILD: &str = "CODEX_GUIDANCE_CAPTURE_TEST_CHILD";
+    const TRACE_CHILD: &str = "CODEX_PRODUCTION_CAPTURE_TEST_CHILD";
     if std::env::var_os(TRACE_CHILD).is_none() {
         let trace_root = tempfile::tempdir()?;
         let output = tokio::process::Command::new(std::env::current_exe()?)
             .arg("--exact")
-            .arg("suite::additional_context::task_model_guidance_production_capture_matches_effective_settings")
+            .arg("suite::additional_context::production_capture_matches_effective_settings")
             .arg("--nocapture")
             .env(TRACE_CHILD, "1")
             .env(codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV, trace_root.path())
@@ -782,115 +674,95 @@ async fn task_model_guidance_production_capture_matches_effective_settings() -> 
     );
     let mut sampling_ids = std::collections::BTreeSet::new();
     let mut attempt_ids = std::collections::BTreeSet::new();
-    for enabled in [false, true] {
-        for owned in [false, true] {
-            let instructions = if owned {
-                "<task_model_guidance_policy version=\"1\" />\nRetain exact observed paths."
-            } else {
-                // Similar prose without the exact ownership marker must not
-                // suppress the separate fragment when the feature is enabled.
-                "Retain exact observed paths."
-            };
-            let server = start_mock_server().await;
-            let test = test_codex()
-                .with_config(move |config| {
-                    config.include_environment_context = false;
-                    config.base_instructions = Some(instructions.to_string());
-                    config
-                        .features
-                        .set_enabled(Feature::TaskModelGuidance, enabled)
-                        .unwrap();
-                })
-                .build(&server)
-                .await?;
-            let mut wire_requests = Vec::new();
-            for turn in 0..2 {
-                let request = mount_sse_once(
-                    &server,
-                    sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-                )
-                .await;
-                submit_plain_user_text(
-                    &test,
-                    &format!("capture enabled={enabled} owned={owned} turn={turn}"),
-                )
-                .await?;
-                let request = request.single_request();
-                let wire = request.body_json();
-                assert!(wire.get("_codex").is_none());
-                assert_eq!(wire["instructions"], instructions);
-                assert!(!wire["tools"].as_array().expect("tool schemas").is_empty());
-                assert_eq!(
-                    task_model_guidance_texts(&request).len(),
-                    usize::from(enabled && !owned)
-                );
-                wire_requests.push(wire);
-            }
-            // Stop trace producers before reading payload files.
-            test.codex.shutdown_and_wait().await?;
+    for (base_index, instructions) in [
+        codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim(),
+        "Catalog base instructions.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let server = start_mock_server().await;
+        let test = test_codex()
+            .with_config(move |config| {
+                config.include_environment_context = false;
+                config.base_instructions = Some(instructions.to_string());
+            })
+            .build(&server)
+            .await?;
+        let mut wire_requests = Vec::new();
+        let mut user_texts = Vec::new();
+        for turn in 0..2 {
+            let request = mount_sse_once(
+                &server,
+                sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+            )
+            .await;
+            let user_text = format!("capture base={base_index} turn={turn}");
+            submit_plain_user_text(&test, &user_text).await?;
+            user_texts.push(user_text);
+            let request = request.single_request();
+            assert_eq!(request.message_input_texts("user"), user_texts);
+            let wire = request.body_json();
+            assert!(wire.get("_codex").is_none());
+            assert_eq!(wire["instructions"], instructions);
+            assert!(!wire["tools"].as_array().expect("tool schemas").is_empty());
+            wire_requests.push(wire);
+        }
+        // Stop trace producers before reading payload files.
+        test.codex.shutdown_and_wait().await?;
 
-            for wire in wire_requests {
-                let mut captures = Vec::new();
-                for bundle in std::fs::read_dir(&trace_root)? {
-                    let payloads = bundle?.path().join("payloads");
-                    for entry in std::fs::read_dir(payloads)? {
-                        let value: serde_json::Value =
-                            serde_json::from_slice(&std::fs::read(entry?.path())?)?;
-                        if value.get("_codex").is_some() && value["input"] == wire["input"] {
-                            captures.push(value);
-                        }
+        for wire in wire_requests {
+            let mut captures = Vec::new();
+            for bundle in std::fs::read_dir(&trace_root)? {
+                let payloads = bundle?.path().join("payloads");
+                for entry in std::fs::read_dir(payloads)? {
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(entry?.path())?)?;
+                    if value.get("_codex").is_some() && value["input"] == wire["input"] {
+                        captures.push(value);
                     }
                 }
-                assert_eq!(
-                    captures.len(),
-                    1,
-                    "normal turn must save its production request"
-                );
-                let mut captured = captures.pop().unwrap();
-                let metadata = captured.as_object_mut().unwrap().remove("_codex").unwrap();
-                assert_eq!(
-                    captured, wire,
-                    "capture must preserve instructions, input, tools, and wire settings"
-                );
-                let settings = &metadata["settings"];
-                assert_eq!(settings["task_model_guidance_enabled"], enabled);
-                assert_eq!(settings["base_instructions_own_task_model_guidance"], owned);
-                assert_eq!(
-                    settings["enabled_features"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|key| key == Feature::TaskModelGuidance.key()),
-                    enabled
-                );
-                assert!(settings.get("configured_reasoning_effort").is_some());
-                assert!(settings.get("resolved_reasoning_effort").is_some());
-                assert_eq!(
-                    settings["resolved_reasoning_effort"],
-                    wire["reasoning"]["effort"]
-                );
-                assert_eq!(settings["parallel_tool_calls"], wire["parallel_tool_calls"]);
-                sampling_ids.insert(
-                    metadata["sampling_request_id"]
-                        .as_str()
-                        .expect("sampling ID")
-                        .to_string(),
-                );
-                attempt_ids.insert(
-                    metadata["physical_attempt_id"]
-                        .as_str()
-                        .expect("attempt ID")
-                        .to_string(),
-                );
             }
+            assert_eq!(
+                captures.len(),
+                1,
+                "normal turn must save its production request"
+            );
+            let mut captured = captures.pop().unwrap();
+            let metadata = captured.as_object_mut().unwrap().remove("_codex").unwrap();
+            assert_eq!(
+                captured, wire,
+                "capture must preserve instructions, input, tools, and wire settings"
+            );
+            let settings = &metadata["settings"];
+            assert!(settings["enabled_features"].is_array());
+            assert!(settings.get("configured_reasoning_effort").is_some());
+            assert!(settings.get("resolved_reasoning_effort").is_some());
+            assert_eq!(
+                settings["resolved_reasoning_effort"],
+                wire["reasoning"]["effort"]
+            );
+            assert_eq!(settings["parallel_tool_calls"], wire["parallel_tool_calls"]);
+            sampling_ids.insert(
+                metadata["sampling_request_id"]
+                    .as_str()
+                    .expect("sampling ID")
+                    .to_string(),
+            );
+            attempt_ids.insert(
+                metadata["physical_attempt_id"]
+                    .as_str()
+                    .expect("attempt ID")
+                    .to_string(),
+            );
         }
     }
     assert_eq!(
         sampling_ids.len(),
-        8,
+        4,
         "each turn has a distinct logical request"
     );
-    assert_eq!(attempt_ids.len(), 8, "each dispatch has a distinct attempt");
+    assert_eq!(attempt_ids.len(), 4, "each dispatch has a distinct attempt");
     Ok(())
 }
 

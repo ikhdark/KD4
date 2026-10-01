@@ -706,9 +706,9 @@ fn build_code_mode_executors(
             deferred_code_mode_nested_tool_specs.push(spec);
         } else {
             // Built-in direct tools have stable contracts, so ship their
-            // typed declarations with `exec`. Keep descriptions once when
-            // the same tool is also exposed directly. MCP, plugin, extension, and
-            // other dynamic-external tools remain discoverable at runtime but
+            // typed declarations with `exec`. Keep descriptions and argument
+            // schemas once when the same tool is also exposed directly. MCP,
+            // plugin, extension, and other dynamic-external tools remain discoverable at runtime but
             // keep their schemas lazy to avoid rebuilding the prompt around
             // an external inventory that can change between turns.
             if executor.authorization_class() != TypedToolClass::DynamicExternal
@@ -718,6 +718,10 @@ fn build_code_mode_executors(
                     && matches!(&spec, ToolSpec::Function(_) | ToolSpec::Freeform(_))
                 {
                     definition.description.clear();
+                    // The direct schema already describes these arguments. This
+                    // is only the eager prompt projection: registration and
+                    // resolve_tool retain the complete callable contract.
+                    definition.input_schema = None;
                 }
                 // Recovery payloads are inspected in JavaScript. Keep their full
                 // result schemas available through resolve_tool, not every prompt.

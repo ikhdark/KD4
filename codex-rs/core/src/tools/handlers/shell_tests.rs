@@ -38,7 +38,6 @@ use crate::exec_env::inject_permission_profile_env;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
-use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
@@ -48,15 +47,12 @@ use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
-use crate::tools::events::ToolEmitter;
-use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::shell::shell_command::resolve_command_shell;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
-use crate::validation_admission::prohibited_skip_for;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_shell_command::powershell::try_find_powershell_executable_blocking;
 use codex_shell_command::powershell::try_find_pwsh_executable_blocking;
@@ -70,94 +66,6 @@ use super::parse_shell_command_hook_invocation;
 use super::shell_command::effective_stall_timeout_ms;
 use super::shell_failure_sampling_signal;
 use super::shell_sampling_signal;
-
-#[tokio::test]
-async fn late_validation_denial_finishes_the_started_shell_event() {
-    let (session, turn, rx_event) = make_session_and_context_with_rx().await;
-    let invocation = CommandInvocation::Argv {
-        program: "cargo".to_string(),
-        args: vec!["test".to_string()],
-    };
-    let skipped = {
-        let mut authorization = turn.validation_authorization.write().await;
-        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
-        assert!(authorization.update_from_user_input("do not run tests"));
-        prohibited_skip_for(&authorization, &invocation, true)
-            .expect("test denial suppresses the validation")
-    };
-    let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-    let call_id = "late-validation-denial";
-    let command = vec!["cargo".to_string(), "test".to_string()];
-    let emitter = ToolEmitter::shell(
-        command,
-        turn.cwd().clone(),
-        codex_protocol::protocol::ExecCommandSource::Agent,
-        turn.environments
-            .primary()
-            .expect("primary environment")
-            .environment_id
-            .clone(),
-    );
-    emitter
-        .begin(ToolEventCtx::new(
-            session.as_ref(),
-            turn.as_ref(),
-            call_id,
-            Some(&tracker),
-        ))
-        .await
-        .expect("begin event should publish");
-
-    let result = super::finish_validation_skip_after_begin(
-        &emitter,
-        &session,
-        &turn,
-        call_id,
-        &crate::tools::context::ToolCallSource::Direct,
-        Some(&tracker),
-        skipped,
-    )
-    .await
-    .expect("denial produces a normal skipped tool result");
-    assert_eq!(
-        result.validation_execution_outcome,
-        super::ValidationExecutionOutcome::NotExecuted
-    );
-
-    let mut saw_begin = false;
-    let mut saw_end = false;
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !saw_end {
-            let event = rx_event.recv().await.expect("event channel remains open");
-            match event.msg {
-                codex_protocol::protocol::EventMsg::ExecCommandBegin(event)
-                    if event.call_id == call_id =>
-                {
-                    saw_begin = true;
-                }
-                codex_protocol::protocol::EventMsg::ExecCommandEnd(event)
-                    if event.call_id == call_id =>
-                {
-                    saw_end = true;
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("a denied validation closes its started shell event");
-    assert!(saw_begin);
-    assert!(saw_end);
-    assert_eq!(
-        turn.turn_timing_state
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .suppressed_validation_output_count,
-        1,
-        "a post-admission denial must retain suppressed-by-user timing",
-    );
-}
 
 #[test]
 fn orchestration_correctness_stall_timeout_defaults_and_overrides() {
@@ -190,47 +98,8 @@ fn workspace_operation_root_reuses_the_preclassified_inspection_result() {
     );
 }
 
-#[tokio::test]
-async fn shell_pipeline_validation_is_denied_before_execution() {
-    let (session, turn) = make_session_and_context().await;
-    {
-        let mut authorization = turn.validation_authorization.write().await;
-        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
-        assert!(authorization.update_from_user_input("do not run tests"));
-    }
-    let turn = Arc::new(turn);
-    let payload = ToolPayload::Function {
-        arguments: json!({
-            "kind": "script",
-            "command": "cargo test | cargo --version"
-        })
-        .to_string(),
-    };
-
-    let output = ShellCommandHandler::default()
-        .handle(ToolInvocation {
-            session: session.into(),
-            step_context: StepContext::for_test(turn),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-            call_id: "shell-pipeline-validation-denied".to_string(),
-            tool_name: codex_tools::ToolName::plain("shell_command"),
-            source: ToolCallSource::Direct,
-            payload: payload.clone(),
-        })
-        .await
-        .expect("the denied pipeline should return a structured skip");
-    let structured = output
-        .post_tool_use_response("shell-pipeline-validation-denied", &payload)
-        .expect("the validation skip should retain its structured result");
-
-    assert_eq!(structured["reason"], "user_prohibited_validation");
-    assert_eq!(structured["operation"], "test");
-    assert_eq!(structured["command_was_executed"], false);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inactive_validation_enforcement_preserves_shell_failure_diagnostics() {
+async fn validation_commands_preserve_shell_failure_diagnostics() {
     let python = which::which("python")
         .or_else(|_| which::which("python3"))
         .unwrap();
@@ -504,7 +373,7 @@ fn nonzero_shell_output_has_failure_outcome() {
 }
 
 #[test]
-fn retained_validation_attempt_preserves_output_and_late_skip_timing() {
+fn retained_validation_attempt_preserves_output_after_retry_refusal() {
     let retained_attempt = codex_protocol::exec_output::ExecToolCallOutput {
         exit_code: 126,
         ..Default::default()
@@ -522,32 +391,8 @@ fn retained_validation_attempt_preserves_output_and_late_skip_timing() {
         "a retry refusal must not hide the sandboxed validation attempt",
     );
 
-    let invocation = CommandInvocation::Argv {
-        program: "cargo".to_string(),
-        args: vec!["test".to_string()],
-    };
-    let mut authorization = crate::validation_admission::ValidationAuthorization::enabled();
-    assert!(authorization.update_from_user_input("do not run tests"));
-    let skipped = prohibited_skip_for(&authorization, &invocation, true)
-        .expect("test denial suppresses the validation");
-    let late_skip = Err(crate::tools::sandboxing::ToolError::ValidationSkipped(
-        skipped,
-    ));
-    let timing = crate::turn_timing::TurnTimingState::default();
-    super::record_retained_validation_skip(&timing, &late_skip, Some(&retained_attempt));
-
     assert_eq!(
-        timing
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .suppressed_validation_output_count,
-        1,
-    );
-    assert!(super::unexecuted_validation_skip(&late_skip, false).is_some());
-    assert!(super::unexecuted_validation_skip(&late_skip, true).is_none());
-    assert_eq!(
-        super::restore_retained_validation_attempt(late_skip, Some(&retained_attempt))
+        super::restore_retained_validation_attempt(user_declined, Some(&retained_attempt))
             .expect("retained attempt becomes the terminal output")
             .exit_code,
         126,

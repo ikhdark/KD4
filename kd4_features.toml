@@ -158,26 +158,6 @@ path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
 contains = "turn.config.features.enabled(Feature::DirectRuntime)"
 
 [[features]]
-id = "task-model-guidance"
-version = 1
-status = "disabled"
-capability_kind = "runtime"
-owner = "codex-rs/core"
-summary = "Optional task-model guidance injection, preserving its deliberately disabled default in the benchmark fork."
-upstream_equivalent = "none"
-config_keys = ["features.task_model_guidance"]
-runtime_feature_key = "features.task_model_guidance"
-runtime_status = "disabled"
-runtime_status_source = "codex-rs/features/src/lib.rs"
-benchmark_on = false
-benchmark_control = { kind = "runtime", reason = "Existing guidance switch stays false rather than enabling deliberately disabled prompt content." }
-
-[[features.evidence]]
-kind = "entrypoint"
-path = "codex-rs/core/src/session/turn.rs"
-contains = ".enabled(Feature::TaskModelGuidance)"
-
-[[features]]
 id = "kd4-feature-manifest"
 version = 1
 status = "enabled"
@@ -677,24 +657,3 @@ contains = "begin_exec_mutation_evidence"
 kind = "registration"
 path = "codex-rs/core/src/tools/runtimes/unified_exec.rs"
 contains = "begin_exec_mutation_evidence"
-
-[[features]]
-id = "validation-authorization"
-version = 1
-status = "disabled"
-capability_kind = "runtime"
-owner = "codex-rs/core"
-summary = "Inactive in production: turn initialization disables directive-based validation admission; test-only activation does not establish enforcement."
-upstream_equivalent = "none"
-config_keys = []
-benchmark_control = { kind = "lacking_off_state", reason = "Production validation admission remains disabled in the benchmark fork; test-only activation is not an implemented runtime control." }
-
-[[features.evidence]]
-kind = "entrypoint"
-path = "codex-rs/core/src/session/turn_context.rs"
-contains = "validation_authorization: Default::default()"
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/validation_admission.rs"
-contains = "production_turn_keeps_validation_classification_without_enforcement"

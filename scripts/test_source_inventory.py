@@ -21,6 +21,12 @@ class SourceInventoryTests(unittest.TestCase):
         self.root = Path(self.temp.name) / "repo"
         self.root.mkdir()
         self.git("init", "-q")
+        report_root = mock.patch.object(
+            inventory, "report_directory",
+            side_effect=lambda state: Path(self.temp.name) / "reports" / state["scan"]["epoch"],
+        )
+        report_root.start()
+        self.addCleanup(report_root.stop)
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.root, check=True,
@@ -86,11 +92,19 @@ class SourceInventoryTests(unittest.TestCase):
             self.assertEqual(state.name, "state.json")
             self.assertEqual(state.parent.parent, Path(self.temp.name))
             self.assertTrue(state.parent.name.startswith("source-inventory-"))
-            self.assertTrue((state.parent / "inventory.md").is_file())
+            self.assertEqual(Path(result["report"]).parent.name, result["scan_epoch"])
             for key in ("artifact", "report", "canonical_paths"):
                 self.assertTrue(Path(result[key]).is_absolute())
                 self.assertTrue(Path(result[key]).is_file())
             self.assertEqual(result["next_action"], "deliver_report")
+        self.assertEqual(results[0]["report"], results[1]["report"])
+        self.assertEqual(results[0]["scan_epoch"], results[1]["scan_epoch"])
+        self.assertNotEqual(results[0]["report"], results[2]["report"])
+        (other / "a.md").write_bytes((self.root / "a.md").read_bytes())
+        subprocess.run(["git", "-C", str(other), "add", "a.md"], check=True, capture_output=True)
+        isolated = self.scan_stdin(query, root=other)
+        self.assertEqual(isolated["report"], results[0]["report"])
+        self.assertEqual(isolated["canonical_paths"], results[0]["canonical_paths"])
 
     def test_default_state_honors_explicit_report(self):
         self.file("a.md")
@@ -114,7 +128,8 @@ class SourceInventoryTests(unittest.TestCase):
             second = self.scan_stdin(
                 query, "--state", first["artifact"], "--report", str(report), "--paths",
             )
-        self.assertEqual(second["scan_epoch"], first["scan_epoch"])
+        fresh, _ = inventory.inventory(self.root, query)
+        self.assertEqual(second["scan_epoch"], fresh["scan_epoch"])
         self.assertEqual(second["scan_pending"], 0)
         self.assertEqual(second["paths"], ["a.md", "b.md"])
         self.assertEqual(second["source_bytes_read"], 4)
@@ -125,6 +140,35 @@ class SourceInventoryTests(unittest.TestCase):
             inventory.main(["--state", second["artifact"], "--render-only", "--paths"])
         self.assertEqual(json.loads(stdout.getvalue())["paths"], second["paths"])
         self.assertEqual(Path(second["artifact"]).read_bytes(), saved)
+
+    def test_snapshot_identity_includes_negative_evidence_and_rejects_epoch_drift(self):
+        source = self.file("a.md", "prompt")
+        negative = self.file("b.md", "absent")
+        query = {"categories": [{"name": "prompts", "paths": ["*.md"],
+                                 "contains": "prompt", "verification": "path"}]}
+        first = self.scan_stdin(query)
+        second = self.scan_stdin(query)
+        self.assertEqual(first["source_snapshot_sha256"], second["source_snapshot_sha256"])
+        self.assertEqual(first["delivery_sha256"], second["delivery_sha256"])
+        negative.write_text("still absent", encoding="utf-8")
+        changed = self.scan_stdin(query)
+        self.assertEqual(first["count"], changed["count"])
+        self.assertNotEqual(first["source_snapshot_sha256"], changed["source_snapshot_sha256"])
+        document = json.loads(Path(changed["canonical_paths"]).read_text(encoding="utf-8"))
+        self.assertEqual([r["path"] for r in document["sources"]], ["a.md", "b.md"])
+
+        with mock.patch.object(inventory, "MAX_SCAN_BYTES", 6):
+            pending = self.scan_stdin(query)
+        self.assertGreater(pending["scan_pending"], 0)
+        self.assertNotIn("source_snapshot_sha256", pending)
+        saved = Path(pending["artifact"]).read_bytes()
+        source.write_text("changed prompt", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "source changed.*--refresh"):
+            self.scan_stdin(query, "--state", pending["artifact"])
+        self.assertEqual(Path(pending["artifact"]).read_bytes(), saved)
+        refreshed = self.scan_stdin(query, "--state", pending["artifact"], "--refresh")
+        self.assertEqual(refreshed["scan_pending"], 0)
+        self.assertNotEqual(refreshed["scan_epoch"], pending["scan_epoch"])
 
     def test_stdin_malformed_or_non_utf8_query_does_not_create_run(self):
         for raw in (b"", b"{", b"\xff"):
@@ -264,10 +308,12 @@ class SourceInventoryTests(unittest.TestCase):
         real_run = inventory.repository_source_records.__globals__["subprocess"].run
         with mock.patch("scripts.source_inventory.subprocess.run", wraps=real_run) as run:
             output, state = inventory.inventory(self.root, query)
-        argv = run.call_args.args[0]
-        self.assertIn("--exclude=target/", argv)
-        self.assertIn("--exclude=node_modules/", argv)
-        self.assertEqual(run.call_count, 1)
+        # Discovery and the end-of-scan source-set fence both prune before descent.
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            argv = call.args[0]
+            self.assertIn("--exclude=target/", argv)
+            self.assertIn("--exclude=node_modules/", argv)
         self.assertEqual(output["paths"], ["src/tracked.rs"])
         self.assertEqual(output["untracked_paths"], ["src/new name.rs"])
         records = {r["path"]: r for r in state["records"]}
@@ -573,8 +619,14 @@ class SourceInventoryTests(unittest.TestCase):
         self.file("src/templates/a.md")
         body = "PRIVATE PROMPT CONTENT" * 2000
         catalog = self.file("src/models.json", json.dumps({"models": [{"prompt": body}]}))
+        # File listings do not need JSON parsing. Opt in only for the catalog
+        # when this caller actually needs structural evidence.
+        definition = contract["example"]
+        for category in definition["categories"]:
+            if category["name"] == "catalog":
+                category["json_summary"] = True
         query = Path(self.temp.name) / "query.json"
-        query.write_text(json.dumps(contract["example"]), encoding="utf-8")
+        query.write_text(json.dumps(definition), encoding="utf-8")
         state = Path(self.temp.name) / "state.json"
         report = Path(self.temp.name) / "report.md"
         result = subprocess.run([sys.executable, str(Path(inventory.__file__).resolve()),
@@ -612,25 +664,50 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertIn("describe -> scan -> final", contract["workflow"]["default"])
         self.assertIn("restricted request", contract["workflow"]["scope"])
         self.assertIn("uncertainty", contract["workflow"]["inspection_exception"])
-        expected = [
-            "models.json",
-            "packages/unknown/deep/models.json",
-            "packages/unknown/deep/templates/nested/a.md",
-            "templates/a.md",
-        ]
-        for path in expected:
-            self.file(path, "{}" if path.endswith(".json") else "template")
+        assets = {
+            "AGENTS.md": "Keep changes small.",
+            "models.json": "{}",
+            "packages/unknown/deep/models.json": "{}",
+            "packages/unknown/deep/skills/demo/SKILL.md": "Use the local runner.",
+            "packages/unknown/deep/skills/demo/references/usage.md": "Run with --quiet.",
+            "packages/unknown/deep/templates/nested/a.md": "Answer briefly.",
+            "templates/a.md": "Be concise.",
+        }
+        references = {
+            "config/settings.toml": 'prompt = "example"',
+            "config/settings.yaml": "prompt: example",
+            "docs/prompts.md": "Documents a prompt consumer, not a definition.",
+            "src/consumer.rs": "load_prompt();",
+        }
+        for path, body in {**assets, **references}.items():
+            self.file(path, body)
         self.file("packages/unknown/deep/not-models.json", "{}")
-        self.file("docs/a.md")
-        result = self.scan_stdin(contract["example"])
+        self.file("docs/a.md", "Build with cargo.")
+        self.file("tui/frames/frame_01.txt", "....")
+        self.file("tests/fixtures/patch.txt", "*** Begin Patch\n*** End Patch")
+        definition = contract["example"]
+        self.assertNotIn("required_categories", definition)
+        result = self.scan_stdin(definition)
+        expected = sorted([*assets, *references])
         self.assertEqual(result["count"], len(expected))
-        self.assertEqual(result["category_counts"], {"templates": 2, "catalog": 2})
+        self.assertEqual(result["category_counts"], {
+            "templates": 2, "catalog": 2, "guidance_assets": 3,
+            "related_text_candidates": 4,
+        })
         self.assertEqual(result["scan_pending"], 0)
         self.assertEqual(result["unresolved_count"], 0)
+        self.assertEqual(result["missing_categories"], [])
+        self.assertNotIn("json_summaries", result)
         self.assertTrue(result["ready_to_render"])
         self.assertEqual(result["next_action"], "deliver_report")
         delivered = json.loads(Path(result["canonical_paths"]).read_text(encoding="utf-8"))
         self.assertEqual(delivered["paths"], expected)
+        self.assertEqual(delivered["categories"]["related_text_candidates"], sorted(references))
+        primary = {
+            path for name in ("templates", "catalog", "guidance_assets")
+            for path in delivered["categories"][name]
+        }
+        self.assertEqual(primary, set(assets))
 
     def test_successful_evidence_excludes_unresolved_and_reviewed_exclusions(self):
         self.file("include.json", '{"prompt":"included"}')

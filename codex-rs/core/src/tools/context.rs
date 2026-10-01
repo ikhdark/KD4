@@ -434,6 +434,7 @@ impl McpToolOutput {
 pub struct ToolSearchOutput {
     pub tools: Vec<JsonValue>,
     pub omitted_result_count: usize,
+    pub unactivated_matches: Vec<String>,
 }
 
 impl ToolOutput for ToolSearchOutput {
@@ -467,7 +468,12 @@ impl ToolOutput for ToolSearchOutput {
         } else {
             CodeModeToolSearchStatus::Incomplete
         };
-        code_mode_tool_search_result(status, self.tools.clone(), Some(self.omitted_result_count))
+        let mut result =
+            code_mode_tool_search_result(status, self.tools.clone(), Some(self.omitted_result_count));
+        if !self.unactivated_matches.is_empty() {
+            result["unactivated_matches"] = serde_json::json!(self.unactivated_matches);
+        }
+        result
     }
 }
 
@@ -1317,8 +1323,8 @@ pub(crate) fn successful_command_evidence(raw_output: &[u8], command: Option<&st
     // polls). Only a recognized validation producer may normalize diagnostic
     // framing on success; ordinary reads still identify the exact source bytes.
     if command.is_some_and(|command| matches!(
-        crate::validation_admission::classify_validation_script(command),
-        crate::validation_admission::ValidationClassification::Validation { .. }
+        crate::validation::classify_validation_script(command),
+        crate::validation::ValidationClassification::Validation { .. }
     )) {
         semantic_evidence_for_command_output(raw_output)
     } else {

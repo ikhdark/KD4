@@ -69,6 +69,7 @@ use codex_tools::ToolSpec;
 use codex_utils_output_truncation::OutputDiagnosticClass;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::approx_token_count;
+#[cfg(test)]
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_projected_output_limits;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
@@ -2110,19 +2111,23 @@ async fn prepare_model_projection(
             8_000
         },
     );
-    let generic_projection = formatted_truncate_text_with_output_limit(&spillable_text, limits);
+    // This pass only decides whether canonical recovery is needed. The actual
+    // projection is rendered below; constructing and discarding a truncated
+    // copy here repeats the most expensive work on oversized results.
+    let exceeds_limit =
+        codex_utils_string::approx_token_count_exceeds(&spillable_text, limits.applied_limit);
     let non_text_tokens = non_text_projection_token_cost(&preserved_content);
     // Truncation already proves the canonical text exceeds the applied budget.
     // Avoid a second full-buffer token scan on the large-output path; the
     // canonical producer remains the accounting source for the artifact.
-    let model_output_tokens = if generic_projection.was_truncated {
+    let model_output_tokens = if exceeds_limit {
         limits.applied_limit.saturating_add(1)
     } else {
         approx_token_count(&spillable_text)
     }
     .saturating_add(non_text_tokens);
     let projection_truncated =
-        generic_projection.was_truncated || model_output_tokens > limits.applied_limit;
+        exceeds_limit || model_output_tokens > limits.applied_limit;
     // Preset selectors describe how to recover omitted evidence; they do not
     // establish that anything was omitted. Projecting a fitting result solely
     // for these hints needlessly reads its artifact and, in code mode, merges
@@ -2257,7 +2262,7 @@ async fn prepare_model_projection(
     )
     .await;
     let original_output_sha256 = crate::tool_history::sha256(original_output_text.as_bytes());
-    let original_output_tokens = if generic_projection.was_truncated {
+    let original_output_tokens = if exceeds_limit {
         canonical
             .approximate_tokens
             .saturating_add(non_text_tokens as u64)

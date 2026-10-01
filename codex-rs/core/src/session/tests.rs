@@ -16701,7 +16701,6 @@ async fn steer_input_enforces_expected_turn_id() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    assert_eq!(tc.validation_authorization.read().await.revision, 0);
 }
 
 #[tokio::test]
@@ -16745,10 +16744,6 @@ async fn steer_input_rejects_non_regular_turns() {
             .expect_err("steering a non-regular turn should fail");
 
         assert_eq!(err, SteerInputError::ActiveTurnNotSteerable { turn_kind });
-        assert_eq!(
-            turn_context.validation_authorization.read().await.revision,
-            0
-        );
 
         sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
@@ -16882,8 +16877,6 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
         )
         .await
         .expect("baseline steering should be accepted");
-        // Normal turn construction leaves the optional classifier disabled.
-        assert_eq!(tc.validation_authorization.read().await.revision, 0);
         assert!(super::multi_agents::spawn_is_authorized(&tc));
         let baseline_input = sess.input_queue.get_pending_input(&sess.active_turn).await;
         assert_eq!(baseline_input.len(), 2, "baseline context and user input");
@@ -16980,7 +16973,6 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
                 }
             ));
         }
-        assert_eq!(tc.validation_authorization.read().await.revision, 0);
         assert!(super::multi_agents::spawn_is_authorized(&tc));
         assert_eq!(sess.state.lock().await.additional_context, context_before);
         assert_eq!(metadata(), baseline_metadata);
@@ -17016,7 +17008,6 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
             .await
             .expect("small steering should commit after either failed attempt");
         assert_eq!(turn_id, tc.sub_id);
-        assert_eq!(tc.validation_authorization.read().await.revision, 0);
         assert!(!super::multi_agents::spawn_is_authorized(&tc));
         assert_eq!(metadata(), candidate_metadata);
         assert!(activity.has_changed().unwrap());
@@ -17120,8 +17111,6 @@ async fn steer_input_returns_active_turn_id() {
         .expect("steering with matching expected turn id should succeed");
 
     assert_eq!(turn_id, tc.sub_id);
-    // Normal turn construction leaves the optional classifier disabled.
-    assert_eq!(tc.validation_authorization.read().await.revision, 0);
     assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
 }
 
@@ -19024,196 +19013,6 @@ fn turn_context_projection_uses_one_worker_and_preserves_gitdir_permissions() {
         );
     });
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
-}
-
-#[tokio::test]
-async fn steer_input_validation_wait_preserves_cancellation_and_task_identity() {
-    use crate::responses_metadata::CodexResponsesRequestKind;
-    use codex_protocol::protocol::AdditionalContextEntry;
-    use codex_protocol::protocol::AdditionalContextKind;
-    use indexmap::IndexMap;
-    use std::collections::HashMap;
-
-    for outcome in ["drop", "no_replacement", "new_context", "same_context"] {
-        let (sess, mut tc, rx) = make_session_and_context_with_rx().await;
-        Arc::get_mut(&mut tc)
-            .expect("unique context")
-            .multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
-        let task = NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: true,
-        };
-        sess.spawn_task(Arc::clone(&tc), Vec::new(), task).await;
-        let baseline_context = IndexMap::from([(
-            "stable-source".to_string(),
-            AdditionalContextEntry {
-                value: "original-context".to_string(),
-                kind: AdditionalContextKind::Application,
-            },
-        )]);
-        let baseline_metadata = HashMap::from([(
-            "workspace_kind".to_string(),
-            "original-workspace".to_string(),
-        )]);
-        sess.steer_input(
-            vec![UserInput::Text {
-                text: "Use subagents to inspect the user's code.".to_string(),
-                text_elements: Vec::new(),
-            }],
-            baseline_context,
-            Some(&tc.sub_id),
-            Some("baseline-client".to_string()),
-            Some(baseline_metadata.clone()),
-        )
-        .await
-        .expect("normal baseline admission");
-        assert!(super::multi_agents::spawn_is_authorized(&tc));
-        assert_eq!(
-            sess.input_queue
-                .get_pending_input(&sess.active_turn)
-                .await
-                .len(),
-            2
-        );
-        let context_before = sess.state.lock().await.additional_context.clone();
-        let metadata = |context: &TurnContext| {
-            context
-                .turn_metadata_state
-                .to_responses_metadata(
-                    "test-installation".to_string(),
-                    "test-window".to_string(),
-                    CodexResponsesRequestKind::Turn,
-                )
-                .extra
-                .into_iter()
-                .collect::<HashMap<_, _>>()
-        };
-        assert_eq!(metadata(&tc), baseline_metadata);
-        let candidate_context = IndexMap::from([(
-            "candidate-source".to_string(),
-            AdditionalContextEntry {
-                value: "candidate-context".to_string(),
-                kind: AdditionalContextKind::Application,
-            },
-        )]);
-        let candidate_metadata = HashMap::from([(
-            "workspace_kind".to_string(),
-            "candidate-workspace".to_string(),
-        )]);
-        let candidate_input = vec![UserInput::Text {
-            text: "Don't use subagents.".to_string(),
-            text_elements: Vec::new(),
-        }];
-        // This is the actual owned lock type retained by validation spawn
-        // lifecycles. It controls scheduling here, without claiming that the
-        // production-disabled optional classifier launches an external process.
-        let held_reader = Arc::clone(&tc.validation_authorization).read_owned().await;
-        let mut steering = Box::pin(sess.steer_input(
-            candidate_input.clone(),
-            candidate_context.clone(),
-            Some(&tc.sub_id),
-            Some("stale-client".to_string()),
-            Some(candidate_metadata.clone()),
-        ));
-        assert!(futures::poll!(steering.as_mut()).is_pending());
-        let mut recipient = Arc::clone(&tc);
-        if outcome == "drop" {
-            drop(steering);
-            drop(held_reader);
-        } else {
-            timeout(Duration::from_secs(2), sess.interrupt_task())
-                .await
-                .expect("interrupt must finish while the validation reader remains held");
-            let event = recv_terminal_event(&rx, TerminalEventKind::TurnAborted).await;
-            assert!(matches!(
-                event.msg,
-                EventMsg::TurnAborted(TurnAbortedEvent {
-                    reason: TurnAbortReason::Interrupted,
-                    ..
-                })
-            ));
-            assert!(sess.active_turn.lock().await.is_none());
-            if outcome == "new_context" {
-                recipient = sess.new_default_turn_with_sub_id(tc.sub_id.clone()).await;
-                Arc::get_mut(&mut recipient)
-                    .expect("unique replacement")
-                    .multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
-                assert!(!Arc::ptr_eq(&tc, &recipient));
-                assert_eq!(recipient.sub_id, tc.sub_id);
-            }
-            if outcome != "no_replacement" {
-                // Same-context replacement exercises generation identity even
-                // when both the public ID and the context Arc are reused.
-                sess.spawn_task(Arc::clone(&recipient), Vec::new(), task)
-                    .await;
-            }
-            drop(held_reader);
-            assert_eq!(
-                steering.await,
-                Err(SteerInputError::NoActiveTurn(candidate_input.clone()))
-            );
-        }
-        assert_eq!(tc.validation_authorization.read().await.revision, 0);
-        assert!(super::multi_agents::spawn_is_authorized(&tc));
-        assert_eq!(metadata(&tc), baseline_metadata);
-        assert_eq!(sess.state.lock().await.additional_context, context_before);
-        assert!(
-            sess.input_queue
-                .get_pending_input(&sess.active_turn)
-                .await
-                .is_empty()
-        );
-        if outcome == "new_context" {
-            assert!(!super::multi_agents::spawn_is_authorized(&recipient));
-            assert!(metadata(&recipient).is_empty());
-        }
-        if outcome == "no_replacement" {
-            sess.spawn_task(Arc::clone(&recipient), Vec::new(), task)
-                .await;
-        }
-        // Fresh steering still commits normally after a dropped or stale waiter.
-        assert_eq!(
-            sess.steer_input(
-                candidate_input.clone(),
-                candidate_context,
-                Some(&recipient.sub_id),
-                Some("accepted-client".to_string()),
-                Some(candidate_metadata.clone()),
-            )
-            .await
-            .expect("fresh steering should be admitted"),
-            recipient.sub_id
-        );
-        assert!(!super::multi_agents::spawn_is_authorized(&recipient));
-        assert_eq!(metadata(&recipient), candidate_metadata);
-        let pending = sess.input_queue.get_pending_input(&sess.active_turn).await;
-        let [
-            TurnInput::ResponseItem(ResponseItem::Message {
-                role: reset_role,
-                content: reset_content,
-                ..
-            }),
-            TurnInput::ResponseItem(ResponseItem::Message { role, content, .. }),
-            TurnInput::UserInput {
-                content: actual_input,
-                client_id,
-            },
-        ] = pending.as_slice()
-        else {
-            panic!("accepted context and user input must be queued exactly once: {pending:?}")
-        };
-        assert_eq!(reset_role, "developer");
-        assert!(matches!(reset_content.as_slice(), [ContentItem::InputText { text }]
-            if text.contains("__codex_additional_context_reset__")
-                && text.contains("previous_value_obsolete=\"true\"")));
-        assert_eq!(role, "developer");
-        assert_eq!(content, &vec![ContentItem::InputText {
-            text: "<application_context source=\"candidate-source\" kind=\"application\">\ncandidate-context\n</application_context>".to_string(),
-        }]);
-        assert_eq!(actual_input, &candidate_input);
-        assert_eq!(client_id.as_deref(), Some("accepted-client"));
-        sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-    }
 }
 
 fn attach_session_trace_bundle(

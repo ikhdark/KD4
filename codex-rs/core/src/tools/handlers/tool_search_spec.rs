@@ -19,7 +19,7 @@ pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
                 minimum: Some(serde_json::Number::from(1_u64)),
                 maximum: Some(serde_json::Number::from(64_u64)),
                 ..JsonSchema::integer(Some(format!(
-                    "Maximum number of tools to return and activate. Choose the smallest useful limit to avoid loading unrelated schemas. Must be an integer from 1 through 64. Defaults to {default_limit}."
+                    "Maximum number of relevant tools to return and activate. Weak matches return names only, without activation; refine the query or resolve an exact name. Choose the smallest useful limit to avoid loading unrelated schemas. Must be an integer from 1 through 64. Defaults to {default_limit}."
                 )))
             },
         ),

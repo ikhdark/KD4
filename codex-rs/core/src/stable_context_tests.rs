@@ -101,7 +101,6 @@ fn ordinary_user_envelopes_remain_dynamic_history() {
         repository("user repository collision"),
         skill("user-selected-skill collision"),
         "<environment_context>user environment collision</environment_context>".to_string(),
-        "<task_model_guidance>user guidance collision</task_model_guidance>".to_string(),
         "<recommended_plugins>user plugin collision</recommended_plugins>".to_string(),
     ];
     let mut items = vec![
@@ -138,7 +137,6 @@ fn ordinary_user_envelopes_remain_dynamic_history() {
             component.kind,
             StableContextKind::SelectedSkill
                 | StableContextKind::Environment
-                | StableContextKind::TaskModelGuidance
                 | StableContextKind::RecommendedPlugins
         )
     }));
@@ -150,7 +148,6 @@ fn malformed_ordinary_user_markers_do_not_disable_projection() {
         format!("{REPOSITORY_OPEN_TAG}\n<INSTRUCTIONS>\nuser text"),
         format!("{SKILL_OPEN_TAG}\nuser text"),
         "<environment_context>\nuser text".to_string(),
-        "<task_model_guidance>\nuser text".to_string(),
         "<recommended_plugins>\nuser text".to_string(),
         format!("{COLLABORATION_MODE_OPEN_TAG}\nuser text"),
         format!("{SKILLS_USAGE_OPEN_TAG}\nuser text"),
@@ -816,11 +813,11 @@ fn token_efficiency_places_volatile_context_after_reusable_history_prefix() {
 #[test]
 fn unchanged_runtime_context_preserves_the_previous_request_prefix() {
     let environment = "<environment_context>same environment</environment_context>";
-    let guidance = "<task_model_guidance>same guidance</task_model_guidance>";
+    let repository = repository("same instructions");
     let first = project_stable_context(
         vec![
             text_message_for_turn("user", environment, "turn-1"),
-            text_message_for_turn("user", guidance, "turn-1"),
+            text_message_for_turn("user", &repository, "turn-1"),
             text_message_for_turn("user", "first task", "turn-1"),
         ]
         .into(),
@@ -829,9 +826,9 @@ fn unchanged_runtime_context_preserves_the_previous_request_prefix() {
     let second = project_stable_context(
         vec![
             text_message_for_turn("user", environment, "turn-1"),
-            text_message_for_turn("user", guidance, "turn-1"),
+            text_message_for_turn("user", &repository, "turn-1"),
             text_message_for_turn("user", "first task", "turn-1"),
-            text_message_for_turn("user", guidance, "turn-2"),
+            text_message_for_turn("user", &repository, "turn-2"),
             text_message_for_turn("user", "second task", "turn-2"),
         ]
         .into(),
@@ -848,12 +845,12 @@ fn unchanged_runtime_context_preserves_the_previous_request_prefix() {
     assert_eq!(
         second_visible
             .iter()
-            .filter(|text| **text == guidance)
+            .filter(|text| **text == repository)
             .count(),
         1
     );
     assert!(second.manifest.components().iter().any(|component| {
-        component.kind == StableContextKind::TaskModelGuidance && component.active
+        component.kind == StableContextKind::Repository && component.active
     }));
 }
 

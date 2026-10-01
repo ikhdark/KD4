@@ -4,7 +4,9 @@ import asyncio
 import contextlib
 import io
 import json
+import hashlib
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,6 +116,46 @@ class FlushTrackingStringIO(io.StringIO):
 
 
 class MockResponsesWebSocketServerTest(unittest.TestCase):
+    def test_rollout_replay_verifies_raw_requests_and_tool_results(self) -> None:
+        rows = [
+            {"type": "sampling_boundary", "payload": {"physical_attempt_id": "a", "turn_id": "t"}},
+            {"type": "response_item", "payload": json.loads(server.REQUEST_1_EVENT_JSON[1])["item"]},
+            {"type": "response_item", "payload": json.loads(TOOL_OUTPUT_JSON)["input"][0]},
+            {"type": "sampling_boundary", "payload": {"physical_attempt_id": "b", "turn_id": "t"}},
+            {"type": "response_item", "payload": json.loads(server.REQUEST_2_EVENT_JSON[1])["item"]},
+            {"type": "event_msg", "payload": {"type": "task_complete", "timing": {
+                "modelRequests": [{
+                    "requestSha256ByAttempt": {
+                        "a": hashlib.sha256(REQUEST_JSON.encode()).hexdigest(),
+                        "b": hashlib.sha256(TOOL_OUTPUT_JSON.encode()).hexdigest(),
+                    },
+                    "responseIdByAttempt": {"a": "resp-1", "b": "resp-2"},
+                }],
+            }}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            replay = server.load_rollout_replay(path)
+            websocket = FakeWebSocket([REQUEST_JSON, TOOL_OUTPUT_JSON])
+            self.assertTrue(run_bounded(server._handle_connection(
+                websocket, quiet=True, log_json="off", replay=replay)))
+            self.assert_scripted_response_events([json.loads(event) for event in websocket.sent])
+            for requests, message in [
+                ([REQUEST_JSON + " ", TOOL_OUTPUT_JSON], "exact request hash mismatch"),
+                ([REQUEST_JSON, TOOL_OUTPUT_JSON.replace("websocket", "changed")], "tool result mismatch"),
+            ]:
+                websocket = FakeWebSocket(requests)
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    self.assertFalse(run_bounded(server._handle_connection(
+                        websocket, quiet=True, log_json="off", replay=replay)))
+                self.assertIn(message, errors.getvalue())
+                self.assertEqual(websocket.close_calls[-1][0], 1008)
+            rows[-1]["payload"]["timing"]["modelRequests"][0].pop("requestSha256ByAttempt")
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing exact request hash"):
+                server.load_rollout_replay(path)
+
     def assert_scripted_response_events(self, events: list[dict]) -> None:
         usage = {
             "input_tokens": 0,

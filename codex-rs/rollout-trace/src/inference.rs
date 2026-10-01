@@ -529,7 +529,7 @@ mod tests {
         );
 
         let context =
-            context.with_request_metadata(|| json!({"task_model_guidance_enabled": true}));
+            context.with_request_metadata(|| json!({"parallel_tool_calls": true}));
         let attempt = context.start_attempt();
         attempt.record_started_with_metadata(
             &json!({
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(captured["model"], "gpt-test");
         assert_eq!(captured["input"][0]["content"][0]["text"], "hello");
         assert_eq!(
-            captured["_codex"]["settings"]["task_model_guidance_enabled"],
+            captured["_codex"]["settings"]["parallel_tool_calls"],
             true
         );
         assert_eq!(captured["_codex"]["sampling_request_id"], "sample-1");

@@ -634,6 +634,22 @@ impl McpConnectionManager {
         manager
     }
 
+    /// Settle all configured startups before freezing a turn's catalog. Each
+    /// client owns its startup/tool-discovery deadlines and cancellation; join
+    /// them concurrently rather than imposing a readiness-dependent short poll.
+    pub async fn wait_for_startup(&self) {
+        futures::future::join_all(self.clients.iter().map(|(name, client)| {
+            let config = self.server_definitions.get(name).and_then(|server| server.configured_config());
+            let startup = config.and_then(|config| config.startup_timeout_sec)
+                .unwrap_or(crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT);
+            let discovery = config.and_then(|config| config.tool_timeout_sec)
+                .unwrap_or(crate::rmcp_client::DEFAULT_TOOL_TIMEOUT);
+            // Bound setup preceding the client's own timers too. Do not cancel
+            // shared startup: a late server can enter the next turn's snapshot.
+            tokio::time::timeout(startup.saturating_add(discovery), client.client())
+        })).await;
+    }
+
     /// Waits for every required server and reports their startup failures together.
     ///
     /// Callers must make the manager reachable to request handlers before awaiting this method,

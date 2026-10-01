@@ -3729,59 +3729,6 @@ fn checkpoint_lifecycle_reaches_next_model_request_without_reexecution() -> Resu
 }
 
 #[test]
-fn final_prompt_injects_evidence_guidance_once_for_bundled_and_catalog_bases() -> Result<()> {
-    run_turn_multi_thread_test_with_stack(
-        "final_prompt_injects_evidence_guidance_once_for_bundled_and_catalog_bases",
-        || async {
-            for base in [
-                include_str!("../../../protocol/src/prompts/base_instructions/default.md"),
-                "Catalog base instructions.",
-            ] {
-                let server = responses::start_mock_server().await;
-                let requests = responses::mount_sse_sequence(
-                    &server,
-                    vec![responses::sse(vec![
-                        responses::ev_assistant_message("answer", "done"),
-                        responses::ev_completed("done"),
-                    ])],
-                )
-                .await;
-                let test = test_codex()
-                    .with_config(move |config| {
-                        config.base_instructions = Some(base.into());
-                        config.features.enable(Feature::Kd4Runtime).unwrap();
-                        config.features.enable(Feature::TaskModelGuidance).unwrap();
-                        config.features.disable(Feature::CodeModeHost).unwrap();
-                    })
-                    .build(&server)
-                    .await?;
-                test.submit_turn("inspect guidance").await?;
-                let request = requests.single_request();
-                let prompt = format!(
-                    "{}\n{}\n{}",
-                    request.instructions_text(),
-                    request.message_input_texts("user").join("\n"),
-                    request.message_input_texts("developer").join("\n")
-                );
-                assert_eq!(
-                    prompt
-                        .matches("Storage or repetition never upgrades evidence strength.")
-                        .count(),
-                    1
-                );
-                assert_eq!(
-                    prompt
-                        .matches("A no-change result is valid")
-                        .count(),
-                    1
-                );
-            }
-            Ok(())
-        },
-    )
-}
-
-#[test]
 fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
         "ordinary_exec_validation_repair_and_inflight_source_freshness",
@@ -6541,18 +6488,21 @@ fn pending_token_estimate_excludes_stable_startup_injections_from_body_growth() 
     let empty_router = ToolRouter::from_parts(empty_registry, Vec::new());
     let baseline =
         estimate_pending_tokens(&[], &[], &[], &empty_router, /*initial_context*/ false);
-    let guidance = ContextualUserFragment::into(TaskModelGuidance::default());
-    let with_guidance = estimate_pending_tokens(
+    let instructions = ContextualUserFragment::into(crate::context::UserInstructions {
+        directory: None,
+        text: "Keep the task focused.".to_string(),
+    });
+    let with_instructions = estimate_pending_tokens(
         &[],
-        &[guidance],
+        &[instructions],
         &[],
         &empty_router,
         /*initial_context*/ false,
     );
 
-    assert!(with_guidance.total_tokens > baseline.total_tokens);
+    assert!(with_instructions.total_tokens > baseline.total_tokens);
     assert_eq!(
-        with_guidance.body_growth_tokens,
+        with_instructions.body_growth_tokens,
         baseline.body_growth_tokens
     );
 }

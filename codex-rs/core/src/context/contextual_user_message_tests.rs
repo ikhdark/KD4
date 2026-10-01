@@ -273,7 +273,6 @@ fn startup_classification_is_a_subset_of_contextual_fragments() {
         ("<environment_context>ctx</environment_context>", true),
         ("<skill>body</skill>", true),
         ("<recommended_plugins>body</recommended_plugins>", true),
-        ("<task_model_guidance>body</task_model_guidance>", true),
         ("<external_browser_info>body</external_browser_info>", false),
         ("<SUBAGENT_NOTIFICATION>{}</subagent_notification>", false),
         (

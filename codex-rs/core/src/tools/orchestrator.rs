@@ -540,7 +540,6 @@ fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str> {
         ToolError::Codex(CodexErr::Sandbox(SandboxErr::Signal(_))) => Some("signal"),
         ToolError::Denied(_)
         | ToolError::Rejected(_)
-        | ToolError::ValidationSkipped(_)
         | ToolError::Codex(_) => None,
     }
 }

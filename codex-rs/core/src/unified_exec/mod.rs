@@ -145,7 +145,7 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
-    pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
+    pub validation_launch: bool,
     pub known_delta: Option<PreparedKnownDelta>,
 }
 
@@ -155,6 +155,7 @@ pub(crate) struct ExecCommandRequest {
 pub(crate) struct PendingSpawnRegistration {
     processes: Arc<StdMutex<Vec<Arc<UnifiedExecProcess>>>>,
     termination_owner: Option<process::ProcessTerminationOwner>,
+    workspace_operation: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
 }
 
 #[cfg(test)]
@@ -173,12 +174,27 @@ impl PendingSpawnRegistration {
         Self {
             processes: Arc::default(),
             termination_owner: Some(owner),
+            workspace_operation: None,
+        }
+    }
+
+    pub(crate) fn with_workspace_operation(
+        &self,
+        permit: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Self {
+        Self {
+            processes: Arc::clone(&self.processes),
+            termination_owner: self.termination_owner.clone(),
+            workspace_operation: Some(Arc::new(permit)),
         }
     }
 
     pub(crate) fn register(&self, process: Arc<UnifiedExecProcess>) {
         if let Some(owner) = self.termination_owner.as_ref() {
             process.set_termination_owner(owner.clone());
+        }
+        if let Some(permit) = &self.workspace_operation {
+            process.hold_workspace_operation_until_exit(Arc::clone(permit));
         }
         self.processes
             .lock()

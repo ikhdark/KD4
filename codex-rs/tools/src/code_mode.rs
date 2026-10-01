@@ -17,6 +17,11 @@ pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
             },
             "execution": { "const": "client" },
             "tools": { "type": "array" },
+            "unactivated_matches": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Low-relevance names only, not activated. Refine the query or resolve an exact name."
+            },
             "omitted_result_count": {
                 "type": ["integer", "null"],
                 "minimum": 0

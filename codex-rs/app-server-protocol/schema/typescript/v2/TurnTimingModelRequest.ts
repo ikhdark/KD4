@@ -12,6 +12,21 @@ import type { TurnTimingRequestTokenCategories } from "./TurnTimingRequestTokenC
 
 export type TurnTimingModelRequest = {
 /**
+ * SHA-256 of the exact serialized transport body for each dispatched
+ * physical attempt. Includes retry bodies and websocket deltas.
+ */
+requestSha256ByAttempt?: { [key in string]?: string },
+/**
+ * Hashes of serialized top-level transport fields, captured at dispatch
+ * even when optional prompt/token diagnostics have not finished.
+ */
+requestSectionSha256ByAttempt?: { [key in string]?: { [key in string]?: string } },
+/**
+ * Provider response IDs retained so offline replay preserves websocket
+ * continuation requests rather than inventing new response identities.
+ */
+responseIdByAttempt?: { [key in string]?: string },
+/**
  * Zero-based logical generation owning this physical provider attempt.
  */
 generationIndex: number, generationReason: TurnTimingGenerationReason,
@@ -78,8 +93,8 @@ toolActiveUnionNs: bigint, outputTokens: bigint, reasoningOutputTokens: bigint,
  */
 tokenUsage?: TurnTimingProviderTokenUsage,
 /**
- * Aggregate-only full logical prompt accounting. No prompt text,
- * repository paths, tool arguments, or hashes are persisted here.
+ * Full logical prompt accounting and section hashes. No prompt text,
+ * repository paths, or tool arguments are persisted here.
  */
 requestTokenCategories: TurnTimingRequestTokenCategories | null,
 /**

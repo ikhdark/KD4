@@ -431,6 +431,9 @@ impl ModelRequestMeasurements {
                 Vec::new()
             };
         TurnTimingRequestTokenCategories {
+            prompt_section_sha256: self.prompt_context_categories.iter()
+                .map(|section| (section.category.to_string(), section.sha256.clone()))
+                .collect(),
             accounting_basis: TurnTimingTokenCategoryBasis::FullLogicalPrompt,
             base_instructions: self.tokens(PromptContextCategory::BaseSystem),
             tool_schemas: self.tokens(PromptContextCategory::ToolSchemas),
@@ -2445,8 +2448,18 @@ impl ModelClient {
         }
     }
 
-    fn prompt_cache_key(&self) -> String {
-        self.state.thread_id.to_string()
+    fn prompt_cache_key(&self, prompt: &Prompt, model: &str) -> String {
+        // Route identical stable prefixes to the same provider cache across
+        // chats. History and session IDs are deliberately not part of the key;
+        // the provider still requires an exact prefix match for cache reuse.
+        let mut hash = Sha256::new();
+        hash.update(b"codex-prompt-prefix-v1\0");
+        for part in [model.as_bytes(), prompt.base_instructions.text.as_bytes()] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part);
+        }
+        hash.update(prompt.tools.digest());
+        format!("{:x}", hash.finalize())
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -2816,7 +2829,7 @@ impl ModelClient {
         } else {
             Vec::new()
         };
-        let prompt_cache_key = Some(self.prompt_cache_key());
+        let prompt_cache_key = Some(self.prompt_cache_key(prompt, &model_info.slug));
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
@@ -3920,7 +3933,15 @@ impl ModelClientSession {
             let stream_result = client
                 .stream_request_with_dispatch_ready(&request, options, {
                     let attempt_clock = attempt_clock.clone();
+                    let dispatched_identity = attempt_identity.clone();
                     move |request_bytes| {
+                        if let Some(timing) = turn_timing.as_ref() {
+                            timing.record_model_request_payload(
+                                &dispatched_identity.sampling_request_id,
+                                &dispatched_identity.physical_attempt_id,
+                                &request_bytes,
+                            );
+                        }
                         let _ = dispatched_request_for_callback.set(request_bytes);
                         attempt_clock.mark_dispatch_ready();
                         drop(serialization_timing_guard);
@@ -4492,6 +4513,7 @@ impl ModelClientSession {
             let established_clock = attempt_clock.clone();
             let dispatched_request = Arc::new(OnceLock::new());
             let dispatched_request_for_callback = Arc::clone(&dispatched_request);
+            let dispatched_identity = attempt_identity.clone();
             let stream_result = websocket_connection
                 .stream_request_with_dispatch_ready(
                     &ws_request,
@@ -4503,6 +4525,16 @@ impl ModelClientSession {
                         }
                     },
                     move |request_bytes| {
+                        if !warmup
+                            && let Some(timing) = turn_timing.as_ref()
+                            && let Some(identity) = dispatched_identity.as_ref()
+                        {
+                            timing.record_model_request_payload(
+                                &identity.sampling_request_id,
+                                &identity.physical_attempt_id,
+                                &request_bytes,
+                            );
+                        }
                         let _ = dispatched_request_for_callback.set(request_bytes);
                         if let Some(clock) = dispatch_clock {
                             clock.mark_dispatch_ready();

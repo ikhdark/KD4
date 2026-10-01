@@ -126,7 +126,7 @@ fn passing_validation_is_compact_before_the_generic_threshold() {
         summarize_shell_output_for_model(&output, 0, false, options(Some("cat fixture.txt"), None)),
         None
     );
-    crate::validation_admission::reset_validation_classification_count();
+    crate::validation::reset_validation_classification_count();
     assert_eq!(
         summarize_shell_output_for_model(
             "test result: ok. 1 passed\n",
@@ -137,7 +137,7 @@ fn passing_validation_is_compact_before_the_generic_threshold() {
         None
     );
     assert_eq!(
-        crate::validation_admission::validation_classification_count(),
+        crate::validation::validation_classification_count(),
         0
     );
 }

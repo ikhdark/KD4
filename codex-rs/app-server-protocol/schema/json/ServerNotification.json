@@ -5186,6 +5186,13 @@
     "TurnTiming": {
       "description": "Immutable wall-clock profile captured at the core terminal boundary.\n\n`exclusive` is the canonical elapsed-time partition. Values in `unions` and `local` may overlap and must not be added to that partition.",
       "properties": {
+        "checkoutSnapshotSha256": {
+          "description": "Content identity of tracked and non-ignored untracked files captured before this turn's tools ran. Absent means capture was unavailable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "classificationComplete": {
           "type": "boolean"
         },
@@ -6698,6 +6705,23 @@
           "default": "pending",
           "description": "Optional diagnostics can finish after the turn. Late diagnostic records use sampling_request_id and physical_attempt_id to update this row."
         },
+        "requestSectionSha256ByAttempt": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "description": "Hashes of serialized top-level transport fields, captured at dispatch even when optional prompt/token diagnostics have not finished.",
+          "type": "object"
+        },
+        "requestSha256ByAttempt": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "SHA-256 of the exact serialized transport body for each dispatched physical attempt. Includes retry bodies and websocket deltas.",
+          "type": "object"
+        },
         "requestTokenCategories": {
           "anyOf": [
             {
@@ -6708,7 +6732,14 @@
             }
           ],
           "default": null,
-          "description": "Aggregate-only full logical prompt accounting. No prompt text, repository paths, tool arguments, or hashes are persisted here."
+          "description": "Full logical prompt accounting and section hashes. No prompt text, repository paths, or tool arguments are persisted here."
+        },
+        "responseIdByAttempt": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Provider response IDs retained so offline replay preserves websocket continuation requests rather than inventing new response identities.",
+          "type": "object"
         },
         "samplingRequestId": {
           "description": "Stable identity shared by every physical provider attempt for this logical request.",
@@ -6966,6 +6997,13 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "promptSectionSha256": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Exact content hashes from prompt provenance, not the state fingerprint.",
+          "type": "object"
         },
         "providerInputTokens": {
           "default": null,

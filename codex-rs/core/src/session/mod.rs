@@ -1749,18 +1749,19 @@ impl Session {
 
     pub(crate) async fn persist_thread_settings_snapshot_if_unmaterialized(
         &self,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<bool> {
         let Some(path) = self
             .current_rollout_path()
             .await
             .map_err(std::io::Error::other)?
         else {
-            return Ok(());
+            return Ok(false);
         };
         if codex_rollout::existing_rollout_path(&path).await.is_some() {
-            return Ok(());
+            return Ok(false);
         }
-        self.persist_thread_settings_snapshot().await
+        self.persist_thread_settings_snapshot().await?;
+        Ok(true)
     }
 
     pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
@@ -4281,6 +4282,10 @@ impl Session {
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
     ) -> CodexResult<Arc<StepContext>> {
+        if turn_context.environments.single_local_environment_cwd().is_some() {
+            turn_context.turn_timing_state
+                .capture_checkout_snapshot(turn_context.cwd().as_path()).await;
+        }
         let deferred_executor_enabled = turn_context
             .config
             .features
@@ -4290,9 +4295,12 @@ impl Session {
             let selected_capability_roots = self
                 .resolve_selected_capability_roots_for_step(&environments)
                 .await;
-            let mcp = self
-                .mcp_runtime_for_step(turn.as_ref(), &environments, &selected_capability_roots)
-                .await?;
+            let mcp = if let Some(mcp) = turn.mcp_runtime.get() {
+                Arc::clone(mcp)
+            } else {
+                self.mcp_runtime_for_step(turn.as_ref(), &environments, &selected_capability_roots)
+                    .await?
+            };
             Ok::<_, CodexErr>((selected_capability_roots, mcp))
         };
         // Keep the turn-frozen environment view unless deferred executors are enabled, but refresh
@@ -6291,26 +6299,6 @@ impl Session {
             return Err(SteerInputError::EmptyInput);
         }
         let input_for_telemetry = input.clone();
-        let task_identity = Arc::clone(&active_task.worker_done);
-        let turn_state_identity = Arc::clone(&active_turn.turn_state);
-        // Validation launch lifecycles retain authorization readers until spawn finishes. Do
-        // not block task interruption on active_turn while waiting for that reader.
-        drop(active);
-        let mut authorization = active_turn_context.validation_authorization.write().await;
-        let mut active = self.active_turn.lock().await;
-        let Some(active_turn) = active.as_mut() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
-        let Some(active_task) = active_turn.task.as_ref() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
-        // A replacement can reuse the textual turn ID or even its TurnContext.
-        // Retain and compare both registration and queue identities before effects.
-        if !Arc::ptr_eq(&task_identity, &active_task.worker_done)
-            || !Arc::ptr_eq(&turn_state_identity, &active_turn.turn_state)
-        {
-            return Err(SteerInputError::NoActiveTurn(input));
-        }
         // Acquire context guards without changing live state. Rejection or a
         // dropped caller while waiting for queue admission must have no effects.
         let mut state = self.state.lock().await;
@@ -6331,11 +6319,6 @@ impl Session {
                 active_turn.turn_state.as_ref(),
                 &pending_input,
                 || {
-                    for item in &input_for_telemetry {
-                        if let UserInput::Text { text, .. } = item {
-                            authorization.update_from_user_input(text);
-                        }
-                    }
                     active_turn_context
                         .update_multi_agent_spawn_authorization(&input_for_telemetry);
                     state.additional_context = staged_additional_context;
@@ -6352,7 +6335,6 @@ impl Session {
                 max_bytes: err.max_bytes,
             })?;
         drop(state);
-        drop(authorization);
         drop(active);
         active_turn_context
             .session_telemetry

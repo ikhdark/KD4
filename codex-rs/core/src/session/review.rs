@@ -108,6 +108,8 @@ pub(super) async fn spawn_review_thread(
 
     let review_turn_context = TurnContext {
         hook_context_budget: Default::default(),
+        mcp_runtime: Default::default(),
+        mcp_tool_snapshot: Default::default(),
         sub_id: review_turn_id.clone(),
         trace_id: current_span_trace_id(),
         config: per_turn_config,
@@ -144,7 +146,6 @@ pub(super) async fn spawn_review_thread(
         deferred_tool_activations: Arc::new(std::sync::RwLock::new(
             crate::session::turn_context::DeferredToolActivationState::default(),
         )),
-        validation_authorization: Arc::clone(&parent_turn_context.validation_authorization),
         turn_metadata_state,
         extension_data,
         pending_post_tool_contexts: Default::default(),

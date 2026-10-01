@@ -1944,13 +1944,19 @@ impl RolloutWriterState {
             None if get_git_repo_root(&self.cwd).is_some() => collect_git_info(&self.cwd).await,
             None => None,
         };
-        // The metadata line is assembled here, so this write is its capture.
+        // Session creation predates queued records, even when materialization
+        // and Git enrichment happen later.
+        let captured_at = OffsetDateTime::parse(
+            &session_meta.timestamp,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(IoError::other)?;
         Ok(Some(CapturedRolloutItem::new(
             RolloutItem::SessionMeta(SessionMetaLine {
                 meta: session_meta,
                 git: git_info,
             }),
-            OffsetDateTime::now_utc(),
+            captured_at,
         )))
     }
 

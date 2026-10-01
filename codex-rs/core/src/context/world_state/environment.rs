@@ -33,10 +33,13 @@ impl EnvironmentsState {
             current_date: turn_context.current_date.clone(),
             timezone: turn_context.timezone.clone(),
             network: network_from_turn_context(turn_context),
-            filesystem: Some(FileSystemContext::from_permission_profile(
-                &turn_context.permission_profile,
-                turn_context.effective_workspace_roots(),
-            )),
+            filesystem: Some(
+                FileSystemContext::from_permission_profile(
+                    &turn_context.permission_profile,
+                    turn_context.effective_workspace_roots(),
+                )
+                .without_session_visualizations(&turn_context.config.codex_home),
+            ),
             subagents: None,
         }
     }

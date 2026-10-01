@@ -147,6 +147,18 @@ fn test_model_client_with_thread_id(
 }
 
 #[tokio::test]
+async fn prompt_cache_routing_is_shared_across_threads_but_bound_to_the_stable_prefix() {
+    let first = test_model_client(SessionSource::Cli);
+    let second = test_model_client(SessionSource::Cli);
+    let mut prompt = Prompt::default();
+    let key = first.prompt_cache_key(&prompt, "model");
+    assert_eq!(key, second.prompt_cache_key(&prompt, "model"));
+    prompt.base_instructions.text.push_str("changed");
+    assert_ne!(key, first.prompt_cache_key(&prompt, "model"));
+    assert_ne!(key, first.prompt_cache_key(&Prompt::default(), "other-model"));
+}
+
+#[tokio::test]
 async fn model_http_transport_pool_reuses_client_across_api_endpoints() {
     let client = test_model_client(SessionSource::Cli);
     let setup = client
@@ -492,6 +504,10 @@ fn model_request_measurements_count_serialized_tools_independently() {
     );
     assert_ne!(measured.tool_token_count, 123_456);
     let categories = measured.request_token_categories();
+    assert_ne!(
+        categories.prompt_section_sha256["tool_schemas"],
+        baseline.request_token_categories().prompt_section_sha256["tool_schemas"],
+    );
     assert_eq!(measured.tool_schema_breakdown.len(), 1);
     assert_eq!(measured.tool_schema_breakdown[0].name, "lookup");
     assert!(measured.tool_schema_breakdown[0].serialized_bytes > 0);
@@ -1517,7 +1533,7 @@ async fn turn_timing_carries_prefix_divergence_and_selected_budget_drops() -> an
         "gpt-test".to_string(),
         "test-provider".to_string(),
     )
-    .with_request_metadata(|| json!({"task_model_guidance_enabled": false}));
+    .with_request_metadata(|| json!({"parallel_tool_calls": false}));
 
     let prompts = vec![
         prompt_for(vec![first_item.clone(), second_item.clone()]),
@@ -1588,7 +1604,7 @@ async fn turn_timing_carries_prefix_divergence_and_selected_budget_drops() -> an
                 .any(|id| capture["_codex"]["physical_attempt_id"] == *id)
         );
         assert_eq!(
-            capture["_codex"]["settings"]["task_model_guidance_enabled"],
+            capture["_codex"]["settings"]["parallel_tool_calls"],
             false
         );
         let mut provider_capture = capture.clone();

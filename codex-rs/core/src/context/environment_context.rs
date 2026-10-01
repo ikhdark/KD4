@@ -7,6 +7,7 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,41 @@ impl FileSystemContext {
             workspace_roots,
             permission_profile,
         }
+    }
+
+    /// Hide Desktop's per-session output directory in the prompt only. Runtime
+    /// permissions and the actual workspace roots remain unchanged.
+    pub(super) fn without_session_visualizations(mut self, codex_home: &Path) -> Self {
+        let base = codex_home.join("visualizations");
+        let is_session_directory = |path: &Path| {
+            let Ok(relative) = path.strip_prefix(&base) else {
+                return false;
+            };
+            let parts = relative
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>();
+            parts.len() == 4
+                && chrono::NaiveDate::parse_from_str(
+                    &format!("{}/{}/{}", parts[0], parts[1], parts[2]),
+                    "%Y/%m/%d",
+                )
+                .is_ok()
+                && uuid::Uuid::parse_str(&parts[3]).is_ok()
+        };
+        self.workspace_roots
+            .retain(|root| !is_session_directory(Path::new(root)));
+        if let FileSystemPermissionProfileContext::Managed(
+            ManagedFileSystemContext::Restricted { entries, .. },
+        ) = &mut self.permission_profile
+        {
+            entries.retain(|entry| {
+                entry.access == FileSystemAccessMode::Deny
+                    || !matches!(&entry.path, FileSystemPath::Path { path }
+                        if is_session_directory(path.as_path()))
+            });
+        }
+        self
     }
 
     pub(super) fn render(&self) -> String {

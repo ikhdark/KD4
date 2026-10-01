@@ -176,7 +176,7 @@ async fn exec_command_with_tracker(
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
-        validation_launch: None,
+        validation_launch: false,
         known_delta: None,
     };
     let mut context =

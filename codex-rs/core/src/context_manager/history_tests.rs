@@ -1345,15 +1345,15 @@ fn pending_user_boundary_estimate_excludes_current_group_reasoning() {
 
 #[test]
 fn pending_user_boundary_estimate_uses_sampling_projection() {
-    let repeated_guidance = format!(
-        "<task_model_guidance>\n{}\n</task_model_guidance>",
-        "stable guidance ".repeat(400)
+    let repeated_instructions = format!(
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+        "stable instructions ".repeat(400)
     );
-    let mut guidance = user_input_text_msg(&repeated_guidance);
-    crate::stable_context::mark_trusted_stable_context_item(&mut guidance);
+    let mut instructions = user_input_text_msg(&repeated_instructions);
+    crate::stable_context::mark_trusted_stable_context_item(&mut instructions);
     let history = create_history_with_items(vec![
-        guidance.clone(),
-        guidance,
+        instructions.clone(),
+        instructions,
         user_input_text_msg("current instruction"),
     ]);
     let base_instructions = BaseInstructions {

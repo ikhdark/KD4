@@ -29,6 +29,30 @@ pub struct CodeModeExecuteHandler {
     enabled_tools: Vec<codex_code_mode::ToolDefinition>,
 }
 
+fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usize) -> Option<String> {
+    use codex_code_mode::FunctionCallOutputContentItem;
+    let codex_code_mode::RuntimeResponse::Result {
+        content_items,
+        error_text: None,
+        output_loss: None,
+        ..
+    } = response
+    else {
+        return None;
+    };
+    let mut parts = Vec::with_capacity(content_items.len());
+    for item in content_items {
+        let FunctionCallOutputContentItem::InputText { text } = item else {
+            return None;
+        };
+        parts.push(text.as_str());
+    }
+    let message = parts.join("\n");
+    (!message.trim().is_empty()
+        && codex_utils_output_truncation::model_token_count(&message) <= limit)
+        .then_some(message)
+}
+
 /// Headroom added to the longest wait a nested tool can be asked to perform, so
 /// dispatch, hooks, transport, and lock queueing cannot turn a full-length
 /// cooperative yield into a guaranteed hard-timeout failure.
@@ -375,8 +399,36 @@ impl CodeModeExecuteHandler {
         }
         exec.session.services.elicitations.wait_until_clear().await;
         emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
-        let output = handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
+        let delivery = (args.deliver && exec.turn.final_output_json_schema.is_none())
+            .then(|| {
+                direct_delivery_text(
+                    &response,
+                    args.max_output_tokens
+                        .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+                        .min(
+                            exec.turn.config.tool_output_token_limit
+                                .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
+                        )
+                        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
+                )
+            })
+            .flatten();
+        let mut output = handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .map_err(FunctionCallError::RespondToModel)?;
+        if output.success == Some(true)
+            && !output
+                .essential_inline
+                .contains_key(super::VISIBLE_OUTPUT_TRUNCATED_KEY)
+            && let Some(message) = delivery
+            && let Some(signal) = output
+                .sampling_request_signal
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            // Private host signal, never read from child stdout or persisted as
+            // instructions. The turn owner still runs normal completion hooks.
+            signal.insert("explicit_completion_message".to_string(), message.into());
+        }
         if keep_dispatch_open {
             dispatch_lease.keep_open();
         }

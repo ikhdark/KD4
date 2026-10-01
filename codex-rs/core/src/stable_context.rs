@@ -116,7 +116,6 @@ pub(crate) enum StableContextKind {
     RootCoordinator,
     MultiAgent,
     MultiAgentUsageHint,
-    TaskModelGuidance,
     ToolSchemas,
     RequestUserInput,
     Wait,
@@ -145,7 +144,6 @@ impl StableContextKind {
             Self::RootCoordinator => "root_coordinator",
             Self::MultiAgent => "multi_agent",
             Self::MultiAgentUsageHint => "multi_agent_usage_hint",
-            Self::TaskModelGuidance => "task_model_guidance",
             Self::ToolSchemas => "tool_schemas",
             Self::RequestUserInput => "request_user_input",
             Self::Wait => "wait",
@@ -423,7 +421,6 @@ enum StableContextSlot {
     RecommendedPlugins,
     Environment,
     Subagents,
-    TaskModelGuidance,
     Permissions,
     ModelSwitch,
     Personality,
@@ -449,7 +446,6 @@ impl StableContextSlot {
             Self::Plugins => StableContextKind::Plugins,
             Self::RecommendedPlugins => StableContextKind::RecommendedPlugins,
             Self::Environment | Self::Subagents => StableContextKind::Environment,
-            Self::TaskModelGuidance => StableContextKind::TaskModelGuidance,
             Self::Permissions => StableContextKind::EnvironmentPermissions,
             Self::ModelSwitch => StableContextKind::ModelSwitch,
             Self::Personality => StableContextKind::Personality,
@@ -479,7 +475,6 @@ impl StableContextSlot {
             Self::RecommendedPlugins => "recommended_plugins",
             Self::Environment => "environment",
             Self::Subagents => "subagents",
-            Self::TaskModelGuidance => "task_model_guidance",
             Self::Permissions => "environment_permissions",
             Self::ModelSwitch => "model_switch",
             Self::Personality => "personality",
@@ -503,7 +498,6 @@ impl StableContextSlot {
             Self::RootCoordinator => 3,
             Self::MultiAgent => 4,
             Self::MultiAgentUsageHint => 5,
-            Self::TaskModelGuidance => 6,
             Self::Permissions => 8,
             Self::SkillUsage => 10,
             Self::SkillCatalog => 11,
@@ -1156,11 +1150,6 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
     if role == "user" && marked(text, "<subagents_context>", "</subagents_context>") {
         return Some(StableTextClassification::inline(StableContextSlot::Subagents));
     }
-    if role == "user" && marked(text, "<task_model_guidance>", "</task_model_guidance>") {
-        return Some(StableTextClassification::inline(
-            StableContextSlot::TaskModelGuidance,
-        ));
-    }
     if role == "user" && marked(text, "<recommended_plugins>", "</recommended_plugins>") {
         return Some(StableTextClassification::inline(
             StableContextSlot::RecommendedPlugins,
@@ -1284,7 +1273,6 @@ fn contains_known_open_marker(text: &str) -> bool {
         SKILL_OPEN_TAG,
         "<environment_context>",
         "<subagents_context>",
-        "<task_model_guidance>",
         "<recommended_plugins>",
         APPS_INSTRUCTIONS_OPEN_TAG,
         "<app-context>",
@@ -1501,14 +1489,14 @@ mod tests_optimization {
 
     #[test]
     fn unchanged_nonvolatile_injection_is_reused_without_history_growth() {
-        let guidance = text_message(
-            "user",
-            "<task_model_guidance>\nkeep the task focused\n</task_model_guidance>",
+        let collaboration = text_message(
+            "developer",
+            "<collaboration_mode>keep the task focused</collaboration_mode>",
         );
 
         let retained = filter_unchanged_stable_context_items(
-            std::slice::from_ref(&guidance),
-            vec![guidance.clone()],
+            std::slice::from_ref(&collaboration),
+            vec![collaboration.clone()],
         );
 
         assert!(retained.is_empty());
@@ -1550,19 +1538,22 @@ mod tests_optimization {
 
     #[test]
     fn changed_and_volatile_injections_remain_turn_scoped() {
-        let old_guidance = text_message(
-            "user",
-            "<task_model_guidance>\nold guidance\n</task_model_guidance>",
+        let old_collaboration = text_message(
+            "developer",
+            "<collaboration_mode>old instructions</collaboration_mode>",
         );
-        let new_guidance = text_message(
-            "user",
-            "<task_model_guidance>\nnew guidance\n</task_model_guidance>",
+        let new_collaboration = text_message(
+            "developer",
+            "<collaboration_mode>new instructions</collaboration_mode>",
         );
         let selected_skill = text_message("user", &skill("one"));
 
         assert_eq!(
-            filter_unchanged_stable_context_items(&[old_guidance], vec![new_guidance.clone()]),
-            vec![new_guidance]
+            filter_unchanged_stable_context_items(
+                &[old_collaboration],
+                vec![new_collaboration.clone()]
+            ),
+            vec![new_collaboration]
         );
         assert_eq!(
             filter_unchanged_stable_context_items(

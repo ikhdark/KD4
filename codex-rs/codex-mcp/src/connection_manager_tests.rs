@@ -2714,3 +2714,35 @@ async fn tool_snapshot_keeps_ready_servers_while_another_starts() {
     assert_eq!(ready.len(), 2);
     assert!(!Arc::ptr_eq(&initial, &ready));
 }
+
+#[tokio::test(start_paused = true)]
+async fn startup_barrier_waits_past_short_poll_and_bounds_stuck_clients() {
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager =
+        McpConnectionManager::new_uninitialized(&approval_policy, &permission_profile, true);
+    let mut delayed = create_ready_async_managed_client(vec![create_test_tool("late", "read")]).await;
+    let ready = delayed.client.clone();
+    delayed.startup_complete.store(false, Ordering::Release);
+    let complete = Arc::clone(&delayed.startup_complete);
+    delayed.client = async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        complete.store(true, Ordering::Release);
+        ready.await
+    }.boxed().shared();
+    manager.clients.insert("late".to_owned(), delayed);
+    let start = tokio::time::Instant::now();
+    manager.wait_for_startup().await;
+    assert_eq!(start.elapsed(), Duration::from_secs(3));
+    assert_eq!(manager.list_all_tools_snapshot().await.len(), 1);
+
+    let mut stuck = create_ready_async_managed_client(Vec::new()).await;
+    stuck.client = futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
+        .boxed().shared();
+    stuck.startup_complete.store(false, Ordering::Release);
+    manager.clients.insert("stuck".to_owned(), stuck);
+    let start = tokio::time::Instant::now();
+    manager.wait_for_startup().await;
+    assert_eq!(start.elapsed(), crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT + DEFAULT_TOOL_TIMEOUT);
+    assert_eq!(manager.list_all_tools_snapshot().await.len(), 1);
+}

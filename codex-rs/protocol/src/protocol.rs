@@ -4,6 +4,7 @@
 //! between user and agent.
 
 use indexmap::IndexMap;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Mul;
@@ -1745,6 +1746,11 @@ pub struct ContextCompactedEvent;
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTiming {
+    /// Content identity of tracked and non-ignored untracked files captured
+    /// before this turn's tools ran. Absent means capture was unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub checkout_snapshot_sha256: Option<String>,
     pub schema_version: u16,
     pub profile_valid: bool,
     pub classification_complete: bool,
@@ -2233,6 +2239,9 @@ pub enum TurnTimingTokenCategoryBasis {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingRequestTokenCategories {
+    /// Exact content hashes from prompt provenance, not the state fingerprint.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prompt_section_sha256: BTreeMap<String, String>,
     #[serde(default)]
     pub accounting_basis: TurnTimingTokenCategoryBasis,
     #[serde(default)]
@@ -2322,6 +2331,18 @@ pub enum TurnTimingRequestDiagnosticsStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingModelRequest {
+    /// SHA-256 of the exact serialized transport body for each dispatched
+    /// physical attempt. Includes retry bodies and websocket deltas.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_sha256_by_attempt: BTreeMap<String, String>,
+    /// Hashes of serialized top-level transport fields, captured at dispatch
+    /// even when optional prompt/token diagnostics have not finished.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_section_sha256_by_attempt: BTreeMap<String, BTreeMap<String, String>>,
+    /// Provider response IDs retained so offline replay preserves websocket
+    /// continuation requests rather than inventing new response identities.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub response_id_by_attempt: BTreeMap<String, String>,
     /// Zero-based logical generation owning this physical provider attempt.
     #[serde(default)]
     pub generation_index: u32,
@@ -2394,8 +2415,8 @@ pub struct TurnTimingModelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub token_usage: Option<TurnTimingProviderTokenUsage>,
-    /// Aggregate-only full logical prompt accounting. No prompt text,
-    /// repository paths, tool arguments, or hashes are persisted here.
+    /// Full logical prompt accounting and section hashes. No prompt text,
+    /// repository paths, or tool arguments are persisted here.
     #[serde(default)]
     pub request_token_categories: Option<TurnTimingRequestTokenCategories>,
     /// Optional diagnostics can finish after the turn. Late diagnostic records

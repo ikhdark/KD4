@@ -84,7 +84,6 @@ fn json_message_input_texts(request: &Value, role: &str) -> Vec<String> {
 fn is_injected_user_context(text: &str) -> bool {
     let text = text.trim_start();
     text.starts_with("<environment_context>")
-        || text.starts_with("<task_model_guidance>")
         || text.starts_with("<recommended_plugins>")
         || text.starts_with("# AGENTS.md instructions")
 }

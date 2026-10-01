@@ -8601,6 +8601,13 @@ class TurnTimingRequestTokenCategories(BaseModel):
         ),
     ] = 0
     other_injected_context: Annotated[int | None, Field(alias="otherInjectedContext", ge=0)] = 0
+    prompt_section_sha256: Annotated[
+        dict[str, str] | None,
+        Field(
+            alias="promptSectionSha256",
+            description="Exact content hashes from prompt provenance, not the state fingerprint.",
+        ),
+    ] = None
     provider_input_tokens: Annotated[
         int | None,
         Field(
@@ -9768,11 +9775,32 @@ class TurnTimingModelRequest(BaseModel):
             description="Optional diagnostics can finish after the turn. Late diagnostic records use sampling_request_id and physical_attempt_id to update this row.",
         ),
     ] = "pending"
+    request_section_sha256_by_attempt: Annotated[
+        dict[str, dict[str, str]] | None,
+        Field(
+            alias="requestSectionSha256ByAttempt",
+            description="Hashes of serialized top-level transport fields, captured at dispatch even when optional prompt/token diagnostics have not finished.",
+        ),
+    ] = None
+    request_sha256_by_attempt: Annotated[
+        dict[str, str] | None,
+        Field(
+            alias="requestSha256ByAttempt",
+            description="SHA-256 of the exact serialized transport body for each dispatched physical attempt. Includes retry bodies and websocket deltas.",
+        ),
+    ] = None
     request_token_categories: Annotated[
         TurnTimingRequestTokenCategories | None,
         Field(
             alias="requestTokenCategories",
-            description="Aggregate-only full logical prompt accounting. No prompt text, repository paths, tool arguments, or hashes are persisted here.",
+            description="Full logical prompt accounting and section hashes. No prompt text, repository paths, or tool arguments are persisted here.",
+        ),
+    ] = None
+    response_id_by_attempt: Annotated[
+        dict[str, str] | None,
+        Field(
+            alias="responseIdByAttempt",
+            description="Provider response IDs retained so offline replay preserves websocket continuation requests rather than inventing new response identities.",
         ),
     ] = None
     sampling_request_id: Annotated[
@@ -9966,6 +9994,13 @@ class TurnTiming(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    checkout_snapshot_sha256: Annotated[
+        str | None,
+        Field(
+            alias="checkoutSnapshotSha256",
+            description="Content identity of tracked and non-ignored untracked files captured before this turn's tools ran. Absent means capture was unavailable.",
+        ),
+    ] = None
     classification_complete: Annotated[bool, Field(alias="classificationComplete")]
     completed_at_unix_ms: Annotated[int | None, Field(alias="completedAtUnixMs")] = None
     counters: TurnTimingCounters

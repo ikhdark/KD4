@@ -701,8 +701,6 @@ fn network_approval_error_message(err: ToolError) -> String {
     match err {
         ToolError::Denied(message) | ToolError::Rejected(message) => message,
         ToolError::Codex(err) => err.to_string(),
-        ToolError::ValidationSkipped(skipped) => serde_json::to_string(&skipped)
-            .unwrap_or_else(|_| "validation command skipped".to_string()),
     }
 }
 
@@ -1255,7 +1253,7 @@ impl UnifiedExecProcessManager {
         process.set_validation(request.validation.clone());
         process.start_stall_watchdog(request.stall_timeout_ms);
         let validation_process =
-            request.validation_launch.is_some() || request.validation.is_some();
+            request.validation_launch || request.validation.is_some();
         registration.attach_process(Arc::clone(&process), deferred_network_approval.clone());
         let executor_was_ready = self.mark_executor_ready(&request.turn_environment.environment_id);
         let tool_execution_timing_guard = context.turn.turn_timing_state.begin_tool_execution();
@@ -1327,7 +1325,7 @@ impl UnifiedExecProcessManager {
                         .known_delta
                         .as_ref()
                         .map(|_| known_delta_executor_started_at),
-                    !request.tty && request.validation_launch.is_some(),
+                    !request.tty && request.validation_launch,
                     validation_process.then_some(known_delta_executor_started_at),
                 )
                 .await;
@@ -2650,7 +2648,6 @@ impl UnifiedExecProcessManager {
             additional_permissions_uri: request.additional_permissions_uri.clone(),
             justification: request.justification.clone(),
             exec_approval_requirement,
-            validation_launch: request.validation_launch.clone(),
             known_delta_hit: request
                 .known_delta
                 .as_ref()
@@ -2682,9 +2679,6 @@ impl UnifiedExecProcessManager {
                         output.aggregated_output.text.clone()
                     };
                     UnifiedExecError::sandbox_denied(message, output)
-                }
-                ToolError::ValidationSkipped(skipped) => {
-                    UnifiedExecError::ValidationSkipped(skipped)
                 }
                 other => UnifiedExecError::create_process(format!("{other:?}")),
             })
@@ -2872,8 +2866,8 @@ impl UnifiedExecProcessManager {
                     if wait_attempt > 0
                         && let Some(timing) = tool_dispatch_timing.as_ref()
                     {
+                        // Re-entering an output wait does not retry the command.
                         timing.increment_reentry_count();
-                        timing.increment_retry_count();
                     }
                     wait_attempt = wait_attempt.saturating_add(1);
                     let requested_timeout_ms =
@@ -2918,7 +2912,6 @@ impl UnifiedExecProcessManager {
                     && let Some(timing) = tool_dispatch_timing.as_ref()
                 {
                     timing.increment_reentry_count();
-                    timing.increment_retry_count();
                 }
                 wait_attempt = wait_attempt.saturating_add(1);
                 let requested_timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);

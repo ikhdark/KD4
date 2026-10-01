@@ -34,7 +34,7 @@ fn shell_request(environment_id: &str) -> ShellRequest {
             proposed_execpolicy_amendment: None,
         },
         known_delta: None,
-        validation_launch: None,
+        validation_launch: false,
         workspace_operation_root: None,
     }
 }

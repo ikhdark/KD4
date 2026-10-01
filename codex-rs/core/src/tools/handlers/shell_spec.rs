@@ -429,7 +429,7 @@ fn unified_exec_output_schema() -> Value {
             },
             "wall_time_seconds": {
                 "type": "number",
-                "description": "Elapsed wall time spent waiting for output in seconds."
+                "description": "Diagnostic elapsed time; retained in session logs and omitted from script-visible results."
             },
             "exit_code": {
                 "type": ["integer", "null"],
@@ -499,7 +499,7 @@ fn unified_exec_output_schema() -> Value {
                 "description": "Command output text, possibly truncated."
             }
         },
-        "required": ["wall_time_seconds", "output", "execution_state", "process_exited", "exit_code", "output_complete", "output_reduced", "raw_output_artifact_retention_limit_hit"],
+        "required": ["output", "execution_state", "process_exited", "exit_code", "output_complete", "output_reduced", "raw_output_artifact_retention_limit_hit"],
         "oneOf": [
             {
                 "type": "object",

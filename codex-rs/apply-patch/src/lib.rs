@@ -542,15 +542,19 @@ async fn apply_hunks_to_files(
         }
     }
 
-    // A failed write can still have modified the target before surfacing an
-    // error (for example by truncating before ENOSPC), so the accumulated
-    // delta is no longer exact when a write fails.
+    // A failed write may truncate its destination, but failures such as Windows
+    // sharing violations leave it unchanged. Reconcile the known source before
+    // discarding the exact committed prefix; never infer no mutation from the
+    // error kind alone.
     macro_rules! try_write {
-        ($result:expr) => {
+        ($result:expr, $path:expr, $before:expr) => {
             match $result {
                 Ok(value) => value,
                 Err(error) => {
-                    delta.exact = false;
+                    delta.exact &= remove_failure_was_side_effect_free(
+                        $path, $before, fs, sandbox,
+                    )
+                    .await;
                     return Err(anyhow::Error::from(error));
                 }
             }
@@ -579,7 +583,9 @@ async fn apply_hunks_to_files(
                         contents.clone().into_bytes(),
                         sandbox,
                     )
-                    .await
+                    .await,
+                    &path_uri,
+                    overwritten_content.as_deref()
                 );
                 delta.changes.push(AppliedPatchChange {
                     path: path_uri.to_path_buf(),
@@ -692,7 +698,9 @@ async fn apply_hunks_to_files(
                             new_contents.clone().into_bytes(),
                             sandbox,
                         )
-                        .await
+                        .await,
+                        &dest_uri,
+                        overwritten_move_content.as_deref()
                     );
                     let dest_write_change_index = delta.changes.len();
                     delta.changes.push(AppliedPatchChange {
@@ -754,7 +762,9 @@ async fn apply_hunks_to_files(
                             .with_context(|| format!(
                                 "Failed to write file {}",
                                 path_uri.inferred_native_path_string()
-                            ))
+                            )),
+                        &path_uri,
+                        Some(original_contents.as_str())
                     );
                     delta.changes.push(AppliedPatchChange {
                         path: path_uri.to_path_buf(),
@@ -3171,5 +3181,42 @@ g
 
             assert!(!delta.is_exact());
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_write_preserves_exact_prefix_when_destination_is_unchanged() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("locked.txt");
+        fs::write(&path, "before\n").unwrap();
+        let _reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ, deliberately disallow writes.
+            .open(&path)
+            .unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let mut stderr = Vec::new();
+        let failure = apply_patch(
+            &wrap_patch(
+                "*** Add File: prefix.txt\n+committed\n*** Update File: locked.txt\n@@\n-before\n+after\n*** Add File: suffix.txt\n+not committed",
+            ),
+            &cwd,
+            &mut Vec::new(),
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        assert_eq!(fs::read_to_string(dir.path().join("prefix.txt")).unwrap(), "committed\n");
+        assert!(!dir.path().join("suffix.txt").exists());
+        assert!(failure.delta().is_exact());
+        assert_eq!(failure.delta().changes().len(), 1);
+        let summary = String::from_utf8(stderr).unwrap();
+        assert!(summary.contains("prefix.txt"));
+        assert!(!summary.contains("Additional filesystem changes"));
     }
 }

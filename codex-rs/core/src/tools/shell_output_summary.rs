@@ -1,5 +1,5 @@
-use crate::validation_admission::ValidationClassification;
-use crate::validation_admission::classify_validation_script;
+use crate::validation::ValidationClassification;
+use crate::validation::classify_validation_script;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fmt::Write as _;

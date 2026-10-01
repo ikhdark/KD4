@@ -15,6 +15,43 @@ use pretty_assertions::assert_eq;
 use tokio::time::Duration;
 use tokio::time::Instant;
 
+#[tokio::test]
+async fn validation_workspace_lease_survives_observer_and_releases_at_process_exit() {
+    let workspace = tempfile::tempdir().unwrap();
+    let independent = tempfile::tempdir().unwrap();
+    let permit = crate::workspace_operation_gate::acquire_workspace_operation(workspace.path()).await;
+    let registration = PendingSpawnRegistration::default().with_workspace_operation(permit);
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted,
+        None,
+    )
+    .await;
+    registration.register(Arc::clone(&process));
+    drop(registration);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            crate::workspace_operation_gate::acquire_workspace_operation(workspace.path()),
+        )
+        .await
+        .is_err()
+    );
+    let _independent = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::workspace_operation_gate::acquire_workspace_operation(independent.path()),
+    )
+    .await
+    .unwrap();
+    process.signal_exit_for_test(Some(0));
+    // Retaining the process to drain its output must not retain build admission.
+    let _released = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::workspace_operation_gate::acquire_workspace_operation(workspace.path()),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn short_empty_polls_require_unreported_output() {
     use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
@@ -950,7 +987,9 @@ async fn output_wait_does_not_spin_on_resume_or_closed_pause_channel() {
 
         assert_eq!(collected.await, b"complete evidence\n", "{state}");
         assert_eq!(Instant::now() - started_at, Duration::from_millis(1_250));
-        let waits = timing.snapshot(Instant::now()).timer_waits;
+        let snapshot = timing.snapshot(Instant::now());
+        assert_eq!(snapshot.retry_count, 0, "{state}: waiting is not execution retry");
+        let waits = snapshot.timer_waits;
         assert_eq!(
             waits.len(),
             2,
@@ -1795,7 +1834,7 @@ async fn cancelled_known_delta_replay_closes_started_command_before_returning() 
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
-        validation_launch: None,
+        validation_launch: false,
         known_delta: Some(prepared),
     };
     // Completion records the command in this real tracker before publishing its event.
@@ -2037,7 +2076,7 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
-        validation_launch: None,
+        validation_launch: false,
         known_delta: None,
     };
     let cancellation = CancellationToken::new();
@@ -2374,7 +2413,7 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
-        validation_launch: None,
+        validation_launch: false,
         known_delta: None,
     };
     let result = tokio::time::timeout(
@@ -2626,7 +2665,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
-        validation_launch: None,
+        validation_launch: false,
         known_delta: None,
     };
 
@@ -2953,7 +2992,7 @@ fn check_pending_remote_exec_drop(entered_shutdown: bool) {
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None, additional_permissions_uri: None,
                 additional_permissions_preapproved: false, justification: None, prefix_rule: None,
-                validation_launch: None, known_delta: None,
+                validation_launch: false, known_delta: None,
             };
             let cancellation = CancellationToken::new();
             // Scheduling control only: the normal execution must attach the
@@ -3192,7 +3231,7 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None, additional_permissions_uri: None,
                 additional_permissions_preapproved: false, justification: None, prefix_rule: None,
-                validation_launch: None, known_delta: None,
+                validation_launch: false, known_delta: None,
             };
             let cancellation = CancellationToken::new();
             let mut pending = Box::pin(manager.exec_command(request, reservation, &context, &cancellation));
@@ -3807,7 +3846,7 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None, additional_permissions_uri: None,
                 additional_permissions_preapproved: false, justification: None, prefix_rule: None,
-                validation_launch: None, known_delta: None,
+                validation_launch: false, known_delta: None,
             };
             let cancellation = CancellationToken::new();
             // Scheduling control only: the normal execution must attach the

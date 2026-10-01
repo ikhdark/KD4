@@ -34,8 +34,6 @@ use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
 use crate::unified_exec::NoopSpawnLifecycle;
 use crate::unified_exec::PendingSpawnRegistration;
-use crate::unified_exec::SpawnLifecycle;
-use crate::unified_exec::SpawnLifecycleHandle;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
 use codex_network_proxy::ManagedNetworkSandboxContext;
@@ -51,7 +49,6 @@ use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use tokio::sync::OwnedRwLockReadGuard;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -122,7 +119,6 @@ pub struct UnifiedExecRequest {
     pub additional_permissions_uri: Option<UriAdditionalPermissionProfile>,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
-    pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
     pub(crate) known_delta_hit: Option<KnownDeltaHit>,
 }
 
@@ -130,44 +126,6 @@ pub struct UnifiedExecRequest {
 pub(crate) enum UnifiedExecLaunch {
     Process(Arc<UnifiedExecProcess>),
     KnownDelta(KnownDeltaHit),
-}
-
-#[derive(Debug)]
-struct ValidationSpawnLifecycle {
-    inner: SpawnLifecycleHandle,
-    authorization_guard:
-        Option<OwnedRwLockReadGuard<crate::validation_admission::ValidationAuthorization>>,
-}
-
-impl SpawnLifecycle for ValidationSpawnLifecycle {
-    fn inherited_fds(&self) -> Vec<i32> {
-        self.inner.inherited_fds()
-    }
-
-    fn after_spawn(&mut self) {
-        self.inner.after_spawn();
-        self.authorization_guard.take();
-    }
-}
-
-async fn validation_spawn_lifecycle(
-    req: &UnifiedExecRequest,
-    ctx: &ToolCtx,
-    inner: SpawnLifecycleHandle,
-) -> Result<SpawnLifecycleHandle, ToolError> {
-    let Some(launch) = req.validation_launch.as_ref() else {
-        return Ok(inner);
-    };
-    let guard = Arc::clone(&ctx.turn.validation_authorization)
-        .read_owned()
-        .await;
-    if let Some(skipped) = crate::validation_admission::recheck_validation_launch(&guard, launch) {
-        return Err(ToolError::ValidationSkipped(skipped));
-    }
-    Ok(Box::new(ValidationSpawnLifecycle {
-        inner,
-        authorization_guard: Some(guard),
-    }))
 }
 
 /// Cache key for approval decisions that can be reused across equivalent
@@ -377,6 +335,21 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
         if let Some(hit) = req.known_delta_hit.as_ref() {
             return Ok(UnifiedExecLaunch::KnownDelta(hit.clone()));
         }
+        // Reuse the same workspace gate as patches and legacy shell validation.
+        // This only queues known noninteractive validation, not arbitrary
+        // long-lived servers or opaque scripts. Admission precedes process
+        // creation, so a tool's own execution timeout cannot expire in Cargo's
+        // build-lock queue behind another harness validation.
+        let pending_spawns = if !req.tty && validation_workspace_required(&req.command_for_approval) {
+            let permit = crate::workspace_operation_gate::acquire_patch_operation(
+                &req.turn_environment.environment,
+                &req.cwd,
+            )
+            .await;
+            self.pending_spawns.with_workspace_operation(permit)
+        } else {
+            self.pending_spawns.clone()
+        };
         let native_cwd = req.cwd.to_abs_path().ok();
         let mutation = crate::tools::events::command_mutation_for_exec(
             &req.command_for_approval,
@@ -476,13 +449,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             ToolError::Rejected(_) => {
                 ToolError::Rejected("missing command line for PTY".to_string())
             }
-            error @ (ToolError::Denied(_)
-            | ToolError::Codex(_)
-            | ToolError::ValidationSkipped(_)) => error,
+            error @ (ToolError::Denied(_) | ToolError::Codex(_)) => error,
         })?;
         let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
-        let spawn_lifecycle =
-            validation_spawn_lifecycle(req, ctx, Box::new(NoopSpawnLifecycle)).await?;
         self.manager
             .open_session_with_exec_env(
                 req.process_id,
@@ -495,14 +464,35 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
                 req.exec_server_env_config.clone(),
                 req.tty,
-                spawn_lifecycle,
+                Box::new(NoopSpawnLifecycle),
                 Some(req.raw_output_artifact.clone()),
                 req.turn_environment.environment.as_ref(),
-                &self.pending_spawns,
+                &pending_spawns,
             )
             .await
             .map(UnifiedExecLaunch::Process)
     }
+}
+
+fn validation_workspace_required(command: &[String]) -> bool {
+    use codex_shell_command::validation::ValidationClassification;
+    use codex_shell_command::validation::ValidationOperation;
+
+    let Some((program, arguments)) = command.split_first() else {
+        return false;
+    };
+    matches!(
+        codex_shell_command::validation::classify_argv(program, arguments),
+        ValidationClassification::Validation {
+            leaves,
+            has_unclassified_targets: false,
+            ..
+        } if !leaves.is_empty()
+            && leaves.iter().all(|leaf| matches!(
+                leaf.operation,
+                ValidationOperation::Test | ValidationOperation::Check | ValidationOperation::Lint
+            ))
+    )
 }
 
 #[cfg(test)]
@@ -517,6 +507,29 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn workspace_admission_only_recognizes_bounded_validation_commands() {
+        for (command, expected) in [
+            (vec!["cargo", "test", "-p", "example"], true),
+            (vec!["cargo", "check"], true),
+            (vec!["python", "-m", "pytest", "tests"], true),
+            (vec!["cargo", "run"], false),
+            (vec!["cargo", "fuzz", "run", "target"], false),
+            (vec!["python", "server.py"], false),
+            (
+                vec!["pwsh", "-Command", "cargo test; python server.py"],
+                false,
+            ),
+        ] {
+            let command = command.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(
+                validation_workspace_required(&command),
+                expected,
+                "{command:?}"
+            );
+        }
+    }
 
     fn test_turn_environment(cwd: PathUri) -> TurnEnvironment {
         TurnEnvironment::new(
@@ -648,7 +661,6 @@ mod tests {
                 bypass_sandbox: false,
                 proposed_execpolicy_amendment: None,
             },
-            validation_launch: None,
             known_delta_hit: None,
         };
 
@@ -753,7 +765,6 @@ mod tests {
             additional_permissions_uri: None,
             justification: None,
             exec_approval_requirement,
-            validation_launch: None,
             known_delta_hit: None,
         }
     }

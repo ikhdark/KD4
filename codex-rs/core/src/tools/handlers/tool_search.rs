@@ -44,6 +44,9 @@ const MAX_TOOL_SEARCH_RESULT_BYTES: usize = 6 * 1024;
 const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
+// BM25 ranks results but has no corpus-independent absolute cutoff. Require
+// at least half of the distinct query terms before exposing a schema.
+const MIN_TOOL_ACTIVATION_RELEVANCE: f32 = 0.5;
 
 #[cfg(test)]
 static LOADABLE_TOOL_SERIALIZATION_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -115,6 +118,23 @@ impl Ord for RankedToolSearchDocument {
 }
 
 impl ToolSearchIndex {
+    fn relevance(&self, query: &str, id: ToolSearchDocumentId) -> f32 {
+        let terms = ToolSearchTokenizer.tokenize(query).into_iter().collect::<HashSet<_>>();
+        if terms.is_empty() {
+            return 0.0;
+        }
+        let matches = terms.iter().filter(|term| {
+            term.split('_').any(|part| {
+                self.postings.get(part).is_some_and(|postings| {
+                    postings.iter().any(|(candidate, _)| *candidate == id)
+                })
+            }) || self.postings.get(*term).is_some_and(|postings| {
+                postings.iter().any(|(candidate, _)| *candidate == id)
+            })
+        }).count();
+        matches as f32 / terms.len() as f32
+    }
+
     fn new(search_infos: &[ToolSearchInfo]) -> Self {
         const K1: f32 = 1.2;
         const B: f32 = 0.75;
@@ -348,6 +368,7 @@ struct ToolSearchResult {
     serialized_tools: Vec<serde_json::Value>,
     activation_tools: Vec<ToolName>,
     supplemental_tools: Vec<ToolName>,
+    unactivated_matches: Vec<String>,
     omitted_result_count: usize,
     encoded_tools_len: usize,
 }
@@ -359,6 +380,7 @@ impl Default for ToolSearchResult {
             serialized_tools: Vec::new(),
             activation_tools: Vec::new(),
             supplemental_tools: Vec::new(),
+            unactivated_matches: Vec::new(),
             omitted_result_count: 0,
             encoded_tools_len: 2,
         }
@@ -900,9 +922,30 @@ impl ToolSearchHandler {
                 .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
         }
 
+        if !result.unactivated_matches.is_empty()
+            && crate::tools::effective_tool_mode(&turn)
+                != codex_protocol::openai_models::ToolMode::CodeModeOnly
+        {
+            session.record_conversation_items(&turn, &[
+                codex_protocol::models::ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![codex_protocol::models::ContentItem::InputText {
+                        text: format!(
+                            "Low-relevance tool names only (not activated; refine the query): {}",
+                            serde_json::to_string(&result.unactivated_matches)
+                                .map_err(|error| FunctionCallError::Fatal(error.to_string()))?,
+                        ),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ]).await.map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
+        }
         Ok(boxed_tool_output(ToolSearchOutput {
             tools: result.serialized_tools.clone(),
             omitted_result_count: result.omitted_result_count,
+            unactivated_matches: result.unactivated_matches.clone(),
         }))
     }
 }
@@ -1028,10 +1071,31 @@ impl ToolSearchHandler {
         let mut retained = ToolSearchResultBuilder::new();
         let mut activation_tools = Vec::new();
         let mut supplemental_tools = Vec::new();
+        let mut unactivated_matches = Vec::new();
+        let mut unactivated_bytes = 0;
         let mut omitted_result_count = 0usize;
         let mut selected = HashSet::new();
         for result_id in results {
             let result = &result_id.info(&self.search_infos).entry;
+            let relevant = exact_query.is_none_or(|query| {
+                self.exact_name_index.get(query).is_some_and(|ids| ids.contains(&result_id))
+                    || self.search_index.relevance(query, result_id) >= MIN_TOOL_ACTIVATION_RELEVANCE
+            });
+            if !relevant {
+                for name in loadable_tool_names(result.output.as_ref()) {
+                    let name = name.to_string();
+                    let bytes = serde_json::to_vec(&name)
+                        .map_err(|error| FunctionCallError::Fatal(error.to_string()))?.len() + 1;
+                    if unactivated_matches.len() < limit
+                        && unactivated_bytes + bytes <= MAX_TOOL_SEARCH_RESULT_BYTES / 4
+                        && !unactivated_matches.contains(&name)
+                    {
+                        unactivated_bytes += bytes;
+                        unactivated_matches.push(name);
+                    }
+                }
+                continue;
+            }
             let exact_output_names = exact_query.and_then(|query| {
                 result_id
                     .name_index(&self.name_indexes)
@@ -1107,6 +1171,7 @@ impl ToolSearchHandler {
             serialized_tools,
             activation_tools,
             supplemental_tools,
+            unactivated_matches,
             omitted_result_count,
             encoded_tools_len,
         })
@@ -1332,6 +1397,7 @@ fn tool_search_cache_entry_fits_budget(
     let mut writer = ByteBudgetWriter::new(remaining);
     if serde_json::to_writer(&mut writer, &result.activation_tools).is_err()
         || serde_json::to_writer(&mut writer, &result.supplemental_tools).is_err()
+        || serde_json::to_writer(&mut writer, &result.unactivated_matches).is_err()
     {
         return false;
     }
@@ -2116,6 +2182,7 @@ mod tests {
         let output = ToolSearchOutput {
             tools: second.serialized_tools.clone(),
             omitted_result_count: 0,
+            unactivated_matches: Vec::new(),
         };
         let payload = ToolPayload::ToolSearch {
             arguments: codex_protocol::models::SearchToolCallParams {
@@ -2130,6 +2197,23 @@ mod tests {
         assert_eq!(second.serialized_tools[0]["type"], "namespace");
         assert_eq!(second.serialized_tools[0]["name"], "mcp__calendar");
         assert_eq!(LOADABLE_TOOL_SERIALIZATION_COUNT.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn weak_matches_return_names_without_activation_and_exact_names_still_activate() {
+        let handler = ToolSearchHandler::new(vec![
+            search_info("scan pet spritesheet", Some("Pets"), "pets", "_validate_pet_spritesheet"),
+            search_info("repository file inventory scan", None, "repo", "inventory"),
+        ]);
+        let result = handler.search("repository file inventory scan", 8).unwrap();
+        assert_eq!(result.activation_tools, vec![ToolName::namespaced("mcp__repo", "inventory")]);
+        assert_eq!(result.unactivated_matches, vec!["mcp__pets._validate_pet_spritesheet"]);
+        assert_eq!(result.serialized_tools.len(), 1);
+        let exact = handler.search("_validate_pet_spritesheet", 1).unwrap();
+        assert_eq!(exact.activation_tools, vec![
+            ToolName::namespaced("mcp__pets", "_validate_pet_spritesheet"),
+        ]);
+        assert!(exact.unactivated_matches.is_empty());
     }
 
     #[test]

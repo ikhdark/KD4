@@ -1239,7 +1239,10 @@ async fn records_coalesced_into_one_flush_keep_their_own_capture_times() -> std:
         .await?;
     recorder.flush().await?;
 
-    let messages = recorded_lines(&rollout_path)?
+    let lines = recorded_lines(&rollout_path)?;
+    assert!(matches!(lines[0].item, RolloutItem::SessionMeta(_)));
+    assert!(parse_record_timestamp(&lines[0].timestamp) <= parse_record_timestamp(&lines[1].timestamp));
+    let messages = lines
         .iter()
         .filter_map(|line| match &line.item {
             RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some((

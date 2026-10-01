@@ -140,7 +140,7 @@ mod tools;
 pub(crate) mod turn_diff_tracker;
 mod turn_metadata;
 mod turn_timing;
-mod validation_admission;
+mod validation;
 mod workspace_operation_gate;
 pub(crate) use codex_tools::FunctionCallError;
 

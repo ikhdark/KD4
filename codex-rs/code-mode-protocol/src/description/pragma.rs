@@ -10,6 +10,8 @@ struct CodeModeExecPragma {
     compatibility_yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
+    #[serde(default)]
+    deliver: bool,
     #[serde(flatten)]
     unknown_fields: BTreeMap<String, serde::de::IgnoredAny>,
 }
@@ -18,6 +20,7 @@ struct CodeModeExecPragma {
 pub struct ParsedExecSource<'a> {
     pub code: &'a str,
     pub max_output_tokens: Option<usize>,
+    pub deliver: bool,
 }
 
 pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
@@ -36,6 +39,7 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
         return Ok(ParsedExecSource {
             code: input,
             max_output_tokens: None,
+            deliver: false,
         });
     };
 
@@ -48,21 +52,21 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
     let directive = pragma.trim();
     if directive.is_empty() {
         return Err(
-            "exec pragma must be a JSON object with supported field `max_output_tokens`"
+            "exec pragma must be a JSON object with supported fields `max_output_tokens` and `deliver`"
                 .to_string(),
         );
     }
 
     if !directive.starts_with('{') {
         return Err(
-            "exec pragma must be a JSON object with supported field `max_output_tokens`"
+            "exec pragma must be a JSON object with supported fields `max_output_tokens` and `deliver`"
                 .to_string(),
         );
     }
     let pragma: CodeModeExecPragma = serde_json::from_str(directive).map_err(|err| {
         if err.is_syntax() || err.is_eof() {
             format!(
-                "exec pragma must be valid JSON with supported field `max_output_tokens`: {err}"
+                "exec pragma must be valid JSON with supported fields `max_output_tokens` and `deliver`: {err}"
             )
         } else {
             format!("exec pragma has an invalid field value: {err}")
@@ -70,7 +74,7 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
     })?;
     if let Some(key) = pragma.unknown_fields.keys().next() {
         return Err(format!(
-            "exec pragma only supports `max_output_tokens`; got `{key}`"
+            "exec pragma only supports `max_output_tokens` and `deliver`; got `{key}`"
         ));
     }
     if pragma
@@ -94,6 +98,7 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
     Ok(ParsedExecSource {
         code: rest,
         max_output_tokens: pragma.max_output_tokens,
+        deliver: pragma.deliver,
     })
 }
 
@@ -121,6 +126,7 @@ mod tests {
                 Ok(ParsedExecSource {
                     code: "text('first');\r\ntext('second');",
                     max_output_tokens,
+                    deliver: false,
                 }),
                 "{directive}"
             );
@@ -183,7 +189,7 @@ mod tests {
         );
         assert_eq!(
             parse_exec_source("// @exec: {\"timeout_ms\":1}\ntext('hi')").unwrap_err(),
-            "exec pragma only supports `max_output_tokens`; got `timeout_ms`"
+            "exec pragma only supports `max_output_tokens` and `deliver`; got `timeout_ms`"
         );
         assert_eq!(
             parse_exec_source("// @exec: {\"max_output_tokens\":1}\n  ").unwrap_err(),
@@ -194,8 +200,27 @@ mod tests {
             parse_exec_source(code),
             Ok(ParsedExecSource {
                 code,
-                max_output_tokens: None
+                max_output_tokens: None,
+                deliver: false,
             })
         );
+    }
+
+    #[test]
+    fn delivery_requires_an_explicit_boolean_and_preserves_the_script() {
+        for deliver in [false, true] {
+            let source = format!("// @exec: {{\"deliver\":{deliver}}}\ntext('answer');");
+            let parsed = parse_exec_source(&source).unwrap();
+            assert_eq!(parsed.deliver, deliver);
+            assert_eq!(parsed.code, "text('answer');");
+        }
+        for value in ["null", "1", "\"true\"", "[]", "{}"] {
+            assert!(parse_exec_source(&format!(
+                "// @exec: {{\"deliver\":{value}}}\ntext('must not execute');"
+            )).is_err());
+        }
+        assert!(parse_exec_source(
+            "// @exec: {\"deliver\":true,\"deliver\":true}\ntext('must not execute');"
+        ).is_err());
     }
 }
