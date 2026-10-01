@@ -8,7 +8,9 @@ pub(crate) struct TurnAborted {
 impl TurnAborted {
     pub(crate) const INTERRUPTED_GUIDANCE: &'static str = "The user interrupted the previous turn on purpose. If tools, commands, or nested code-mode work were in flight, inspect only the affected state and live sessions needed to resolve uncertain effects before relying on them or repeating an operation. Reuse unaffected evidence and continue with the user's latest direction.";
     pub(crate) const INTERRUPTED_DEVELOPER_GUIDANCE: &'static str = "The previous turn was interrupted on purpose. If tools, commands, or nested code-mode work were in flight, inspect only the affected state and live sessions needed to resolve uncertain effects before relying on them or repeating an operation. Reuse unaffected evidence and continue with the user's latest direction.";
-    pub(crate) const UNFINISHED_GUIDANCE: &'static str = "The previous turn ended before it completed: the session stopped without recording a response or completion for that request, and no tool calls or file changes from it are recorded here. Do not assume any part of that request was carried out. Inspect the workspace and live state before relying on or repeating work, then continue with the user's latest direction.";
+    pub(crate) fn unfinished_guidance(tool_calls: usize, tool_results: usize) -> String {
+        format!("Recovery detected a lost process, not a user interruption. The previous turn has no recorded completion. Its retained history contains {tool_calls} tool call(s) and {tool_results} tool result(s). Recorded results remain evidence; calls without results may have taken effect, and child commands may still be running. The exact loss time and duration are unknown; this notice records discovery on resume. Inspect only affected live sessions and workspace state before relying on uncertain effects or repeating work, then continue with the user's latest direction.")
+    }
 
     pub(crate) fn new(guidance: impl Into<String>) -> Self {
         Self {

@@ -337,26 +337,8 @@ fn preflight_invocation_with_equivalent_repair_detailed(
         return Err(issue);
     }
 
-    if let Some(CommandPreflightRetry::PowerShellScript { script_body }) = issue.retry.as_ref()
-        && issue.code == CommandPreflightIssueCode::DirectArgvPowerShellCmdlet
-    {
-        let Some(shell) = crate::shell::get_shell(ShellType::PowerShell, None) else {
-            return Err(issue);
-        };
-        let repaired = CommandInvocation::PowerShellScript(script_body.clone());
-        let repaired_command = repaired.to_safety_args(&shell, false).map_err(|_| issue.clone())?;
-        if !codex_shell_command::is_safe_command::is_known_safe_command(&repaired_command) {
-            return Err(issue);
-        }
-        let commands = preflight_command_issue(&repaired_command, Some(ShellType::PowerShell))?;
-        return Ok(CommandPreflightOutcome {
-            validation_invocations: validation_invocations(commands, &repaired),
-            repair_notice: Some(read_only_repair_notice(issue.code, invocation, &repaired)),
-            invocation: repaired,
-            advisory: None,
-        });
-    }
-
+    // Keep shell conversion as retry advice: the caller's shell, environment,
+    // and login settings are not bound by this direct-argv preflight.
     let Some(CommandPreflightRetry::Argv { program, args }) = issue.retry.as_ref() else {
         return Err(issue);
     };

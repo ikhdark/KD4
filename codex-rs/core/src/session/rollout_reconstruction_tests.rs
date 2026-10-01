@@ -579,6 +579,8 @@ async fn plan_reconstruction_preserves_rollback_for_eventless_legacy_history() {
 async fn durability_regression_resume_invalidates_unified_exec_session() {
     let (session, _turn_context) = make_session_and_context().await;
     let original_output = crate::tools::context::ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "exec-call".to_string(),
         chunk_id: "123".to_string(),

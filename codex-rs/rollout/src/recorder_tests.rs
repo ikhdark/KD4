@@ -230,6 +230,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             cwd: home.path().to_path_buf(),
             originator: "test".to_string(),
             cli_version: "test".to_string(),
+            harness_build: None,
             source: SessionSource::Cli,
             thread_source: None,
             agent_path: None,
@@ -358,6 +359,7 @@ async fn load_rollout_items_defaults_legacy_session_id() -> std::io::Result<()> 
         panic!("expected session metadata");
     };
     assert_eq!(session_meta.meta.session_id, SessionId::from(thread_id));
+    assert!(session_meta.meta.harness_build.is_none(), "legacy rollouts remain readable");
     assert!(matches!(
         items[1],
         RolloutItem::ResponseItem(ResponseItem::Message { .. })
@@ -782,6 +784,13 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
         panic!("expected session metadata in rollout");
     };
     assert_eq!(session_meta.meta.session_id, session_id);
+    let build = session_meta.meta.harness_build.as_ref().expect("harness provenance is persisted");
+    let embedded = codex_utils_build_info::BuildInfo::current();
+    assert_eq!(build.version, embedded.version);
+    assert_eq!(build.commit, embedded.commit);
+    assert_eq!(build.dirty, embedded.dirty);
+    assert_eq!(build.profile, embedded.profile);
+    assert_eq!(build.built, embedded.built);
     assert_eq!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated);
     assert_eq!(
         session_meta
@@ -1051,6 +1060,97 @@ fn writer_state_defines_manifests_once_then_references_them() {
         &state.pending_items[5].item,
         RolloutItem::EventMsg(EventMsg::TurnStarted(_))
     ));
+}
+
+#[test]
+fn identical_settings_are_omitted_but_transitions_are_preserved() {
+    let home = TempDir::new().unwrap();
+    let mut state = RolloutWriterState::new(
+        None, None, None, home.path().to_path_buf(), None,
+        home.path().join("rollout.jsonl"), ToolManifestDictionary::default(),
+    );
+    let settings = |tier: &str| {
+        RolloutItem::EventMsg(serde_json::from_value(serde_json::json!({
+            "type": "thread_settings_applied",
+            "thread_settings": {
+                "model": "test-model", "model_provider_id": "test-provider",
+                "service_tier": tier, "developer_instructions": "shared instructions",
+                "approval_policy": "never", "permission_profile": {"type": "disabled"},
+                "cwd": home.path(),
+                "collaboration_mode": {"mode": "default", "settings": {
+                    "model": "test-model", "reasoning_effort": null,
+                    "developer_instructions": null
+                }}
+            }
+        })).unwrap())
+    };
+    state.add_items(captured(vec![settings("default"), settings("default")]));
+    state.add_items(captured(vec![
+        settings("default"), settings("priority"), settings("priority"), settings("default"),
+    ]));
+    assert_eq!(state.pending_items.len(), 3);
+    let tiers: Vec<_> = state.pending_items.iter().map(|item| {
+        serde_json::to_value(&item.item).unwrap()["payload"]["thread_settings"]["service_tier"].clone()
+    }).collect();
+    assert_eq!(tiers, vec!["default", "priority", "default"]);
+    for item in &state.pending_items[1..] {
+        let value = serde_json::to_value(&item.item).unwrap();
+        assert!(value["payload"]["thread_settings"].get("developer_instructions").is_none());
+    }
+    let persisted: Vec<_> = state.pending_items.iter().map(|item| item.item.clone()).collect();
+    let restored = codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings(
+        &persisted, Default::default(),
+    );
+    assert_eq!(restored.developer_instructions, Some(Some("shared instructions".into())));
+    let mut cleared = settings("default");
+    if let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = &mut cleared {
+        event.thread_settings.developer_instructions = Some(None);
+    }
+    state.add_items(captured(vec![cleared]));
+    let persisted: Vec<_> = state.pending_items.iter().map(|item| item.item.clone()).collect();
+    let restored = codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings(
+        &persisted, Default::default(),
+    );
+    assert_eq!(restored.developer_instructions, Some(None));
+}
+
+#[test]
+fn canonical_messages_omit_only_their_immediate_legacy_mirrors() {
+    let home = TempDir::new().unwrap();
+    let mut state = RolloutWriterState::new(
+        None, None, None, home.path().to_path_buf(), None,
+        home.path().join("rollout.jsonl"), ToolManifestDictionary::default(),
+    );
+    let mirror = || RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        message: "same text".into(), phase: None,
+    }));
+    for id in ["first", "second"] {
+        state.add_items(captured(vec![RolloutItem::EventMsg(EventMsg::ItemCompleted(
+            codex_protocol::protocol::ItemCompletedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn".into(),
+                completed_at_ms: 0,
+                item: codex_protocol::items::TurnItem::AgentMessage(
+                    codex_protocol::items::AgentMessageItem {
+                        id: id.into(),
+                        content: vec![codex_protocol::items::AgentMessageContent::Text {
+                            text: "same text".into(),
+                        }],
+                        phase: None,
+                    },
+                ),
+            },
+        ))]));
+        // Core can enqueue the live legacy alias in a separate recorder call.
+        state.add_items(captured(vec![mirror()]));
+    }
+    state.add_items(captured(vec![mirror()]));
+    assert_eq!(state.pending_items.len(), 3);
+    for (item, id) in state.pending_items.iter().zip(["first", "second"]) {
+        assert!(matches!(&item.item, RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+            if event.item.id() == id));
+    }
+    assert!(matches!(&state.pending_items[2].item, RolloutItem::EventMsg(EventMsg::AgentMessage(_))));
 }
 
 #[tokio::test]

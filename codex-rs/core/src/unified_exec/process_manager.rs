@@ -895,8 +895,16 @@ impl UnifiedExecProcessManager {
         process: &Arc<UnifiedExecProcess>,
         message: String,
     ) -> UnifiedExecError {
+        let started = Instant::now();
+        let (call_id, hook_command, tty) = {
+            let store = self.process_store.lock().await;
+            store.processes.get(&process_id)
+                .filter(|entry| Arc::ptr_eq(&entry.process, process))
+                .map(|entry| (entry.call_id.clone(), Some(entry.hook_command.clone()), entry.tty))
+                .unwrap_or_default()
+        };
         let message = process.failure_message().unwrap_or(message);
-        match process.fail_and_terminate(message.clone()).await {
+        let (message, cleanup_confirmed) = match process.fail_and_terminate(message.clone()).await {
             Ok(()) => {
                 let removed = {
                     let mut store = self.process_store.lock().await;
@@ -909,7 +917,7 @@ impl UnifiedExecProcessManager {
                 if let Some(entry) = removed {
                     unregister_network_approval_for_entry(&entry).await;
                 }
-                UnifiedExecError::process_failed(message)
+                (message, true)
             }
             Err(error) => {
                 tracing::warn!(
@@ -917,11 +925,35 @@ impl UnifiedExecProcessManager {
                     %error,
                     "retaining unified exec process because termination was not confirmed"
                 );
-                UnifiedExecError::process_failed(format!(
-                    "{message}; process termination was not confirmed: {error}"
-                ))
+                (format!("{message}; process termination was not confirmed: {error}"), false)
             }
-        }
+        };
+        let snapshot = process.snapshot_tool_output(tty).await;
+        let mut raw_output = snapshot.aggregated_output.clone();
+        raw_output.extend_from_slice(format!("\n{message}").as_bytes());
+        let process_exited = process.has_exited();
+        let output = ExecCommandToolOutput {
+            process_output: Some(snapshot),
+            error: Some(message.clone()),
+            validation: process.validation(),
+            event_call_id: call_id,
+            chunk_id: generate_chunk_id(),
+            wall_time: started.elapsed(),
+            raw_output,
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(8_000),
+            max_output_tokens: None,
+            process_id: (!cleanup_confirmed).then_some(process_id),
+            session_capabilities: (!cleanup_confirmed).then(|| process.session_capabilities(tty)),
+            exit_code: process_exited.then(|| process.exit_code()).flatten(),
+            process_exited,
+            search_no_match: false,
+            original_token_count: None,
+            hook_command,
+            raw_output_artifact: process.raw_output_artifact().await,
+            repair_notice: None,
+            pending_deferred_completions: Vec::new(),
+        };
+        UnifiedExecError::ProcessFailedWithOutput { message, output: Box::new(output) }
     }
 
     pub(crate) fn effective_environment(
@@ -1230,6 +1262,8 @@ impl UnifiedExecProcessManager {
                     event_call_id: Some(context.call_id.clone()),
                 })?;
                 return Ok(ExecCommandToolOutput {
+                    process_output: None,
+                    error: None,
                     validation: request.validation.clone(),
                     event_call_id: context.call_id.clone(),
                     chunk_id: generate_chunk_id(),
@@ -1251,6 +1285,10 @@ impl UnifiedExecProcessManager {
             }
         };
         process.set_validation(request.validation.clone());
+        let mut stall_handoff = Some(Box::pin(process.interaction_requested().notified_owned()));
+        if let Some(notified) = stall_handoff.as_mut() {
+            notified.as_mut().enable();
+        }
         process.start_stall_watchdog(request.stall_timeout_ms);
         let validation_process =
             request.validation_launch || request.validation.is_some();
@@ -1370,7 +1408,7 @@ impl UnifiedExecProcessManager {
             deadline,
             poll_bound,
             quiet_period,
-            &mut None,
+            &mut stall_handoff,
         )
         .await
         .bytes;
@@ -1573,6 +1611,12 @@ impl UnifiedExecProcessManager {
 
         let original_token_count = approx_token_count(&text);
         let response = ExecCommandToolOutput {
+            process_output: if process_exited && response_process_id.is_none() {
+                Some(process.snapshot_tool_output(request.tty).await)
+            } else {
+                None
+            },
+            error: None,
             validation: process.validation(),
             event_call_id: context.call_id.clone(),
             chunk_id,
@@ -1656,6 +1700,21 @@ impl UnifiedExecProcessManager {
         &self,
         request: WriteStdinRequest<'_>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        self.write_stdin_with_observation_mode(request, false).await
+    }
+
+    pub(crate) async fn write_stdin_until_output(
+        &self,
+        request: WriteStdinRequest<'_>,
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        self.write_stdin_with_observation_mode(request, true).await
+    }
+
+    async fn write_stdin_with_observation_mode(
+        &self,
+        request: WriteStdinRequest<'_>,
+        until_output: bool,
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process = self
             .process_store
             .lock()
@@ -1668,7 +1727,7 @@ impl UnifiedExecProcessManager {
             })?;
         let started_at = Instant::now();
         let hard_deadline = nested_poll_bound(request.nested_deadline);
-        let result = self.write_stdin_inner(request, &process).await;
+        let result = self.write_stdin_inner(request, &process, until_output).await;
         finish_exited_process_result(
             Some(&process),
             result,
@@ -1682,6 +1741,7 @@ impl UnifiedExecProcessManager {
         &self,
         request: WriteStdinRequest<'_>,
         locked_process: &Arc<UnifiedExecProcess>,
+        until_output: bool,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process_id = request.process_id;
 
@@ -1860,7 +1920,7 @@ impl UnifiedExecProcessManager {
             poll_bound,
             // Polling a noninteractive command continues through progress
             // bursts until exit, handoff, or the existing bounded deadline.
-            (request.input.is_empty() && tty && !validation_launch)
+            (request.input.is_empty() && (until_output || tty && !validation_launch))
                 .then_some(INITIAL_OUTPUT_QUIET_PERIOD),
             &mut handoff,
         )
@@ -1942,6 +2002,12 @@ impl UnifiedExecProcessManager {
         let original_token_count = approx_token_count(&text);
 
         let response = ExecCommandToolOutput {
+            process_output: if process_exited && process_id.is_none() {
+                Some(process.snapshot_tool_output(tty).await)
+            } else {
+                None
+            },
+            error: None,
             validation: process.validation(),
             event_call_id,
             chunk_id,
@@ -2089,6 +2155,8 @@ impl UnifiedExecProcessManager {
                 .to_string()
         };
         Ok(ExecCommandToolOutput {
+            process_output: None,
+            error: None,
             validation: handles.process.validation(),
             event_call_id: handles.call_id,
             chunk_id: generate_chunk_id(),
@@ -2984,7 +3052,10 @@ impl UnifiedExecProcessManager {
             }
         };
 
-        let guard = output_buffer.lock().await;
+        let mut guard = output_buffer.lock().await;
+        // A handoff can win the select before the ordinary output drain. Include
+        // its diagnostic and any bytes already committed by the producer.
+        guard.collect_pending_output();
         let output = guard
             .pending_output()
             .map(|collected| {

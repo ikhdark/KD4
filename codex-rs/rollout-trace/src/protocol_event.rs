@@ -519,7 +519,7 @@ fn execution_status_for_abort_reason(reason: &TurnAbortReason) -> ExecutionStatu
         | TurnAbortReason::Replaced
         | TurnAbortReason::ReviewEnded
         | TurnAbortReason::BudgetLimited => ExecutionStatus::Cancelled,
-        TurnAbortReason::InternalError => ExecutionStatus::Failed,
+        TurnAbortReason::InternalError | TurnAbortReason::ProcessLost => ExecutionStatus::Failed,
     }
 }
 

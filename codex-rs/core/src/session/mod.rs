@@ -1433,19 +1433,44 @@ fn unfinished_turn_boundary_items(
     else {
         return Vec::new();
     };
+    let start = rollout_items.iter().rposition(|item| {
+        matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_)))
+    }).unwrap_or(0);
+    let mut calls = std::collections::HashSet::new();
+    let mut results = std::collections::HashSet::new();
+    for item in &rollout_items[start..] {
+        match item {
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall { call_id, .. }
+                | ResponseItem::CustomToolCall { call_id, .. }) => {
+                calls.insert(call_id);
+            }
+            RolloutItem::ResponseItem(ResponseItem::LocalShellCall { call_id: Some(call_id), .. }
+                | ResponseItem::ToolSearchCall { call_id: Some(call_id), .. }) => {
+                calls.insert(call_id);
+            }
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. }
+                | ResponseItem::CustomToolCallOutput { call_id, .. }
+                | ResponseItem::ToolSearchOutput { call_id: Some(call_id), .. }) => {
+                results.insert(call_id);
+            }
+            _ => {}
+        }
+    }
     let mut items = Vec::new();
     if let Some(marker) = crate::tasks::unfinished_turn_history_marker(
         crate::tasks::InterruptedTurnHistoryMarker::from_config_and_version(
             turn_context.config.as_ref(),
             turn_context.multi_agent_version,
         ),
+        calls.len(),
+        results.len(),
     ) {
         items.push(RolloutItem::ResponseItem(marker));
     }
     items.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
         TurnAbortedEvent {
             turn_id,
-            reason: TurnAbortReason::Interrupted,
+            reason: TurnAbortReason::ProcessLost,
             completed_at: None,
             duration_ms: None,
             timing: None,
@@ -4284,7 +4309,7 @@ impl Session {
     ) -> CodexResult<Arc<StepContext>> {
         if turn_context.environments.single_local_environment_cwd().is_some() {
             turn_context.turn_timing_state
-                .capture_checkout_snapshot(turn_context.cwd().as_path()).await;
+                .start_checkout_snapshot(turn_context.cwd().as_path());
         }
         let deferred_executor_enabled = turn_context
             .config

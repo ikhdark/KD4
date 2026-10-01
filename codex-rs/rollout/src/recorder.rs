@@ -832,6 +832,7 @@ impl RolloutRecorder {
                     .format(timestamp_format)
                     .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
 
+                let build = codex_utils_build_info::BuildInfo::current();
                 let session_meta = SessionMeta {
                     session_id,
                     id: thread_id,
@@ -841,6 +842,13 @@ impl RolloutRecorder {
                     cwd: config.cwd().to_path_buf(),
                     originator,
                     cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                    harness_build: Some(codex_protocol::protocol::SessionBuildInfo {
+                        version: build.version.to_string(),
+                        commit: build.commit.to_string(),
+                        dirty: build.dirty.to_string(),
+                        profile: build.profile.to_string(),
+                        built: build.built.to_string(),
+                    }),
                     agent_nickname: source.get_nickname(),
                     agent_role: source.get_agent_role(),
                     agent_path: source.get_agent_path().map(Into::into),
@@ -1723,6 +1731,8 @@ struct RolloutWriterState {
     last_logged_error: Option<String>,
     retry_blocked_error: Option<String>,
     tool_manifests: crate::ToolManifestDictionary,
+    last_settings: Option<serde_json::Value>,
+    pending_agent_message_mirrors: std::collections::VecDeque<codex_protocol::protocol::AgentMessageEvent>,
 }
 
 impl RolloutWriterState {
@@ -1746,11 +1756,21 @@ impl RolloutWriterState {
             last_logged_error: None,
             retry_blocked_error: None,
             tool_manifests,
+            last_settings: None,
+            pending_agent_message_mirrors: Default::default(),
         }
     }
 
     fn add_items(&mut self, items: Vec<CapturedRolloutItem>) {
         for captured in items {
+            if let Some(expected) = self.pending_agent_message_mirrors.pop_front() {
+                if let RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::AgentMessage(actual)) = &captured.item
+                    && expected.message == actual.message && expected.phase == actual.phase
+                {
+                    continue;
+                }
+                self.pending_agent_message_mirrors.clear();
+            }
             match &captured.item {
                 // The recorder owns the single canonical metadata slot. Inherited history must
                 // never append another session_meta record.
@@ -1758,6 +1778,41 @@ impl RolloutWriterState {
                     trace!(
                         "ignoring inherited session metadata; recorder owns the canonical record"
                     );
+                }
+                RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ThreadSettingsApplied(settings)) => {
+                    // Preserve actual transitions (including a return to an older
+                    // value), but do not re-store identical instruction payloads.
+                    let mut compact = settings.clone();
+                    match serde_json::to_value(settings) {
+                        Ok(value) => {
+                            if self.last_settings.as_ref() == Some(&value) {
+                                continue;
+                            }
+                            if self.last_settings.as_ref().is_some_and(|previous| {
+                                previous["thread_settings"].get("developer_instructions")
+                                    == value["thread_settings"].get("developer_instructions")
+                            }) {
+                                // This existing presence-aware field is already
+                                // reduced as "unchanged" by resume/fork consumers.
+                                compact.thread_settings.developer_instructions = None;
+                            }
+                            self.last_settings = Some(value);
+                        }
+                        Err(_) => self.last_settings = None,
+                    }
+                    self.pending_items.push(captured.with_item(RolloutItem::EventMsg(
+                        codex_protocol::protocol::EventMsg::ThreadSettingsApplied(compact),
+                    )));
+                }
+                RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ItemCompleted(event)) => {
+                    if let codex_protocol::items::TurnItem::AgentMessage(message) = &event.item {
+                        self.pending_agent_message_mirrors = message.as_legacy_events().into_iter()
+                            .filter_map(|event| match event {
+                                codex_protocol::protocol::EventMsg::AgentMessage(message) => Some(message),
+                                _ => None,
+                            }).collect();
+                    }
+                    self.pending_items.push(captured);
                 }
                 RolloutItem::ToolManifest(manifest) => {
                     // Encoding rewrites the payload, never when it happened.

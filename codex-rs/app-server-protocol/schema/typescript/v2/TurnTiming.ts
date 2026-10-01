@@ -45,7 +45,13 @@ modelRequests?: Array<TurnTimingModelRequest>,
  * turn start; phase durations are diagnostics and are not additive with
  * the canonical `exclusive` partition.
  */
-toolCalls?: Array<TurnTimingToolCall>, toolCallTimingOverflow: number,
+toolCalls?: Array<TurnTimingToolCall>,
+/**
+ * Optional full per-call lifecycle detail in the thread's tool-output
+ * artifact store. Subject to that store's retention policy; aggregate
+ * timings and per-call summary fields remain usable without the artifact.
+ */
+toolCallDetailsArtifactId?: string, toolCallTimingOverflow: number,
 /**
  * Exact accepted-call closure ledger. A terminal event is publishable only
  * when every accepted direct and nested execution has timing, a terminal

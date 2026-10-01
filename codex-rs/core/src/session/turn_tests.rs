@@ -1,4 +1,14 @@
 use super::*;
+
+#[test]
+fn incomplete_scope_admissions_are_flagged_without_rejecting_honest_limits() {
+    assert!(final_reports_unfinished_work(
+        "The full source-level review is **not complete**; 23,135 warnings remain unverified."
+    ));
+    assert!(final_reports_unfinished_work("The requested work is not finished because access is blocked."));
+    assert!(!final_reports_unfinished_work("The requested review is complete."));
+    assert!(!final_reports_unfinished_work("The server's response was not complete."));
+}
 use crate::session::turn_execution::AuthoritativeWaitOwnerResult;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
@@ -304,6 +314,25 @@ async fn consecutive_turn_contexts_share_the_unchanged_picker_snapshot() {
         &first_turn.available_models,
         &second_turn.available_models
     ));
+}
+
+#[tokio::test]
+async fn sampling_uses_latest_tier_instead_of_the_turn_start_snapshot() {
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    Arc::make_mut(&mut turn.config).features.enable(Feature::FastMode).unwrap();
+    turn.model_info.service_tiers = vec![codex_protocol::openai_models::ModelServiceTier {
+        id: "priority".into(), name: "Priority".into(), description: "Priority processing".into(),
+    }];
+    Arc::make_mut(&mut turn.config).service_tier = Some("default".into());
+    {
+        let mut state = session.state.lock().await;
+        for tier in ["priority", "default", "priority"] {
+            state.session_configuration.service_tier = Some(tier.into());
+        }
+    }
+    assert_eq!(service_tier_for_sampling(&session, &turn).await.as_deref(), Some("priority"));
+    session.state.lock().await.session_configuration.service_tier = None;
+    assert_eq!(service_tier_for_sampling(&session, &turn).await, None);
 }
 
 #[tokio::test]

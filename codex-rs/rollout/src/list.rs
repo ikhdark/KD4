@@ -383,7 +383,7 @@ pub async fn get_threads_in_root(
     sort_key: ThreadSortKey,
     config: ThreadListConfig<'_>,
 ) -> io::Result<ThreadsPage> {
-    if !root.exists() {
+    if !tokio::fs::try_exists(&root).await? {
         return Ok(ThreadsPage {
             items: Vec::new(),
             next_cursor: None,
@@ -452,7 +452,7 @@ async fn get_threads_in_root_by_summary(
     config: ThreadListConfig<'_>,
     ascending: bool,
 ) -> io::Result<ThreadsPage> {
-    if !root.exists() {
+    if !tokio::fs::try_exists(&root).await? {
         return Ok(ThreadsPage::default());
     }
 
@@ -1626,7 +1626,7 @@ async fn find_thread_path_by_id_str_in_subdir(
 
     let mut root = codex_home.to_path_buf();
     root.push(subdir);
-    if !root.exists() {
+    if !tokio::fs::try_exists(&root).await? {
         return Ok(unverified_db_path);
     }
     let (filename_match, filename_scan_error) = match find_rollout_path_by_id_from_filenames(
@@ -1779,6 +1779,63 @@ pub fn rollout_date_parts(file_name: &OsStr) -> Option<(String, String, String)>
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn filesystem_lookup_distinguishes_missing_roots_from_errors() -> io::Result<()> {
+        let home = tempfile::tempdir()?;
+        let id = Uuid::from_u128(0x12345678123456781234567812345678).to_string();
+        for (root, invalid) in [
+            (home.path().join("missing"), false),
+            (home.path().join("invalid\0root"), true),
+        ] {
+            for ascending in [false, true] {
+                let config = ThreadListConfig {
+                    allowed_sources: &[],
+                    model_providers: None,
+                    cwd_filters: None,
+                    default_provider: "openai",
+                    layout: ThreadListLayout::NestedByDate,
+                };
+                let result = if ascending {
+                    get_threads_in_root_ascending(
+                        root.clone(),
+                        1,
+                        None,
+                        ThreadSortKey::CreatedAt,
+                        config,
+                    )
+                    .await
+                } else {
+                    get_threads_in_root(root.clone(), 1, None, ThreadSortKey::CreatedAt, config)
+                        .await
+                };
+                if invalid {
+                    assert_eq!(
+                        result.expect_err("invalid root").kind(),
+                        io::ErrorKind::InvalidInput
+                    );
+                } else {
+                    assert_eq!(result?, ThreadsPage::default());
+                }
+            }
+            for archived in [false, true] {
+                let result = if archived {
+                    find_archived_thread_path_by_id_str(&root, &id, None).await
+                } else {
+                    find_thread_path_by_id_str(&root, &id, None).await
+                };
+                if invalid {
+                    assert_eq!(
+                        result.expect_err("invalid root").kind(),
+                        io::ErrorKind::InvalidInput
+                    );
+                } else {
+                    assert_eq!(result?, None);
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn uuid_lookup_finds_noncanonical_plain_and_compressed_rollouts() -> io::Result<()> {

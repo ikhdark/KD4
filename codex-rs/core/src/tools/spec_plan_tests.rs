@@ -1125,14 +1125,14 @@ async fn request_user_input_stays_direct_in_code_mode_only() {
 }
 
 #[tokio::test]
-async fn request_user_input_is_absent_under_never_approval() {
+async fn clarification_is_available_under_never_approval() {
     let plan = probe(|turn| {
         turn.approval_policy = codex_config::Constrained::allow_any(AskForApproval::Never);
     })
     .await;
 
-    plan.assert_visible_lacks(&["request_user_input"]);
-    plan.assert_registered_lacks(&["request_user_input"]);
+    plan.assert_visible_contains(&["request_user_input"]);
+    plan.assert_registered_contains(&["request_user_input"]);
 }
 
 #[tokio::test]

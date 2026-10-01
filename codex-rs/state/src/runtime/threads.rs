@@ -2518,6 +2518,7 @@ END
                 cwd: PathBuf::new(),
                 originator: String::new(),
                 cli_version: String::new(),
+                harness_build: None,
                 source: SessionSource::Cli,
                 thread_source: None,
                 agent_path: None,

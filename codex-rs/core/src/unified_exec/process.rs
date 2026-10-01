@@ -198,11 +198,13 @@ pub(crate) struct ProcessOutputChunk {
 }
 
 /// Process-owned terminal output, retained independently of polling and live-event delivery.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProcessOutputSnapshot {
     pub(crate) aggregated_output: Vec<u8>,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
     pub(crate) aggregated_output_is_exact: bool,
+    pub(crate) streams_are_exact: bool,
 }
 
 /// Shared output state exposed to polling and streaming consumers.
@@ -300,7 +302,6 @@ impl UnifiedExecProcess {
         let mut output = self.output_tx.subscribe();
         let cancelled = self.cancellation_token.clone();
         let process = Arc::downgrade(self);
-        let termination_owner = self.termination_owner.get().cloned();
         let watchdog = async move {
             let timeout = Duration::from_millis(stall_timeout_ms);
             let deadline = tokio::time::sleep(timeout);
@@ -328,22 +329,16 @@ impl UnifiedExecProcess {
             if process.has_exited() || process.termination_was_requested() {
                 return;
             }
+            // Silence is an observation, not a terminal failure. Keep diagnostics
+            // out of the actual stdout/stderr and retained process-output artifact.
             let message = format!(
-                "command stalled after {stall_timeout_ms} milliseconds without stdout or stderr"
+                "\n[harness: command stalled after {stall_timeout_ms} milliseconds without stdout or stderr; still running, not terminated. Resume this session; do not restart the command.]\n"
             );
-            let termination = async move {
-                if let Err(error) = process.fail_and_terminate(message).await {
-                    tracing::warn!(%error, "failed to terminate stalled unified-exec process");
-                }
-            };
-            if let Some(owner) = termination_owner {
-                owner.tasks.spawn_on(termination, &owner.runtime);
-            } else {
-                termination.await;
-            }
+            process.output_buffer.lock().await.push_chunk(message.as_bytes());
+            process.output_notify.notify_waiters();
+            process.interaction_requested.notify_waiters();
         };
-        // An idle observer owns no shutdown-barrier slot. Only accepted
-        // termination must be retained until process cleanup completes.
+        // An idle observer owns no shutdown-barrier slot.
         if let Some(owner) = self.termination_owner.get() {
             owner.runtime.spawn(watchdog);
         } else {
@@ -589,14 +584,24 @@ impl UnifiedExecProcess {
     pub(super) async fn snapshot_completion_output(&self) -> ProcessOutputSnapshot {
         let (aggregated_output, aggregated_output_is_exact) =
             snapshot_retained_output(&self.completion_output_buffer).await;
-        let (stdout, _) = snapshot_retained_output(&self.stdout_buffer).await;
-        let (stderr, _) = snapshot_retained_output(&self.stderr_buffer).await;
+        let (stdout, stdout_exact) = snapshot_retained_output(&self.stdout_buffer).await;
+        let (stderr, stderr_exact) = snapshot_retained_output(&self.stderr_buffer).await;
         ProcessOutputSnapshot {
             aggregated_output,
             stdout,
             stderr,
             aggregated_output_is_exact,
+            streams_are_exact: stdout_exact && stderr_exact,
         }
+    }
+
+    pub(super) async fn snapshot_tool_output(&self, tty: bool) -> Arc<ProcessOutputSnapshot> {
+        let mut snapshot = self.snapshot_completion_output().await;
+        // PTYs and the exec-server transport merge streams. Their retained bytes
+        // are still useful display output, but are not exact stdout and stderr.
+        snapshot.streams_are_exact &=
+            !tty && matches!(&self.process_handle, ProcessHandle::Local(_));
+        Arc::new(snapshot)
     }
 
     pub(super) fn has_exited(&self) -> bool {

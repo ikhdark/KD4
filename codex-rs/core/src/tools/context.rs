@@ -962,6 +962,9 @@ pub struct ExecSessionCapabilities {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecCommandToolOutput {
+    /// Bounded process-owned streams, separate from the display projection.
+    pub(crate) process_output: Option<Arc<crate::unified_exec::ProcessOutputSnapshot>>,
+    pub(crate) error: Option<String>,
     /// Model-declared attribution only; it does not establish successful coverage.
     pub validation: Option<codex_protocol::validation::ValidationCommandContext>,
     pub event_call_id: String,
@@ -1005,7 +1008,9 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
-        if self.process_exited && self.exit_code != Some(0) && !self.search_no_match {
+        if self.error.is_some()
+            || (self.process_exited && self.exit_code != Some(0) && !self.search_no_match)
+        {
             ToolOutputOutcome::Failure
         } else if self.process_id.is_some() {
             ToolOutputOutcome::Yielded
@@ -1115,6 +1120,14 @@ impl ToolOutput for ExecCommandToolOutput {
         #[derive(Serialize)]
         struct UnifiedExecCodeModeResult {
             #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stdout: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stderr: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            streams_complete: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             chunk_id: Option<String>,
             wall_time_seconds: f64,
             exit_code: Option<i32>,
@@ -1176,7 +1189,31 @@ impl ToolOutput for ExecCommandToolOutput {
             .flatten()
             .map(|(start, end)| serde_json::json!({"kind": "lines", "start": start, "end": end}));
 
+        // Exact programmatic access does not inherit the display-token budget.
+        // Never offer a truncated or lossy string as JSON. Larger/binary streams
+        // remain unavailable here; the combined output artifact is still retained.
+        let streams = self.process_output.as_ref().and_then(|snapshot| {
+            (self.process_exited
+                && self.process_id.is_none()
+                && snapshot.streams_are_exact
+                && snapshot.stdout.len().saturating_add(snapshot.stderr.len()) <= 64 * 1024)
+                .then(|| {
+                    Some((
+                        String::from_utf8(snapshot.stdout.clone()).ok()?,
+                        String::from_utf8(snapshot.stderr.clone()).ok()?,
+                    ))
+                })
+                .flatten()
+        });
+        let streams_complete = self.process_output.as_ref().map(|_| streams.is_some());
+        let (stdout, stderr) = streams
+            .map(|(stdout, stderr)| (Some(stdout), Some(stderr)))
+            .unwrap_or_default();
         let result = UnifiedExecCodeModeResult {
+            error: self.error.clone(),
+            stdout,
+            stderr,
+            streams_complete,
             recovery_selector,
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
             wall_time_seconds: self.wall_time.as_secs_f64(),
@@ -1675,6 +1712,9 @@ impl ExecCommandToolOutput {
                 });
                 if let Some(validation) = self.declared_validation_metadata() {
                     metadata["validation"] = validation;
+                }
+                if let Some(error) = &self.error {
+                    metadata["error"] = JsonValue::String(error.clone());
                 }
                 if self.original_token_count.is_some() {
                     metadata["original_token_count_is_approximate"] = JsonValue::Bool(true);

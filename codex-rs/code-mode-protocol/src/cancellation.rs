@@ -55,6 +55,7 @@ fn turn_abort_reason_label(reason: &TurnAbortReason) -> &'static str {
         TurnAbortReason::ReviewEnded => "review ended",
         TurnAbortReason::BudgetLimited => "budget limited",
         TurnAbortReason::InternalError => "internal error",
+        TurnAbortReason::ProcessLost => "process lost",
     }
 }
 

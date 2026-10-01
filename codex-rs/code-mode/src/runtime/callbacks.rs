@@ -45,7 +45,7 @@ pub(super) fn tool_callback(
             return;
         }
     };
-    let timeout_ms = match tool_timeout_ms(scope, args, tool_index) {
+    let timeout_ms = match tool_timeout_ms(scope, args, tool_index, input.as_ref()) {
         Ok(timeout_ms) => timeout_ms,
         Err(error_text) => {
             throw_type_error(scope, &error_text);
@@ -466,10 +466,16 @@ fn tool_timeout_ms(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
     tool_index: usize,
+    input: Option<&serde_json::Value>,
 ) -> Result<u64, String> {
     let default_timeout_ms = scope
         .get_slot::<RuntimeState>()
         .map(|state| {
+            if state.enabled_tools.get(tool_index).is_some_and(|tool| {
+                tool.tool_name.namespace.is_none() && tool.tool_name.name == "write_stdin"
+            }) && input.is_some_and(|input| input["wait_for_output"] == true) {
+                return 0;
+            }
             state
                 .enabled_tools
                 .get(tool_index)

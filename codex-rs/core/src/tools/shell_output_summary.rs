@@ -119,6 +119,9 @@ pub(crate) fn summarize_shell_output_for_model(
         builder.push_line("- timed_out: true");
     }
     builder.push_line(format!("- selection_policy: {selection_policy}"));
+    if selection.collapsed_progress_lines > 0 {
+        builder.push_line(format!("- collapsed_progress_lines: {} (latest sample retained; raw output unchanged)", selection.collapsed_progress_lines));
+    }
     if selection.omitted_groups > 0 {
         let qualifier = if selection.groups_overflowed {
             "at least "
@@ -709,9 +712,48 @@ struct LineSelection {
     indexes: BTreeSet<usize>,
     omitted_groups: usize,
     groups_overflowed: bool,
+    collapsed_progress_lines: usize,
+}
+
+fn progress_line_key(line: &str) -> Option<String> {
+    let kind = classify_line(line);
+    // Never normalize diagnostic identities, file inventories, or JSON records.
+    if kind.critical || kind.advisory || kind.status
+        || (line.trim_start().starts_with(['{', '['])
+            && serde_json::from_str::<serde_json::Value>(line).is_ok())
+        || !(contains_word_ascii_case(line, "elapsed")
+            || contains_word_ascii_case(line, "progress"))
+        || !line.bytes().any(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut key = String::new();
+    let mut number = false;
+    for character in line.chars() {
+        if character.is_ascii_digit() {
+            if !number { key.push('#'); }
+            number = true;
+        } else {
+            number = false;
+            key.push(character);
+        }
+    }
+    Some(key)
 }
 
 fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool) -> LineSelection {
+    let mut progress = std::collections::BTreeMap::new();
+    let mut collapsed_progress_lines = 0;
+    for (index, line) in output.lines().enumerate() {
+        if let Some(key) = progress_line_key(line) {
+            // Bound metadata even for a pathological stream of distinct progress.
+            if (progress.len() < MAX_DIAGNOSTIC_GROUPS || progress.contains_key(&key))
+                && progress.insert(key, index).is_some()
+            {
+                collapsed_progress_lines += 1;
+            }
+        }
+    }
     let mut groups: Vec<((&str, Option<&str>), usize)> = Vec::new();
     let mut groups_overflowed = false;
     let mut lines = output.lines().enumerate().peekable();
@@ -777,6 +819,14 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
         SUCCESS_TAIL_LINES
     };
     indexes.extend(line_count.saturating_sub(tail)..line_count);
+    indexes.extend(progress.values().copied());
+    for (index, line) in output.lines().enumerate() {
+        if let Some(key) = progress_line_key(line)
+            && progress.get(&key).is_some_and(|latest| *latest != index)
+        {
+            indexes.remove(&index);
+        }
+    }
     // Count groups whose representative is absent, including context/tail
     // coverage. After overflow this is a lower bound, never a claim of completeness.
     let omitted_groups = groups
@@ -788,6 +838,7 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
         indexes,
         omitted_groups,
         groups_overflowed,
+        collapsed_progress_lines,
     }
 }
 

@@ -1020,7 +1020,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     if turn_context.config.experimental_request_user_input_enabled
         && context.exposure_identity.request_user_input_eligible
-        && !matches!(turn_context.approval_policy.value(), AskForApproval::Never)
     {
         planned_tools.add_with_exposure_and_authorization_class(
             RequestUserInputHandler {

@@ -239,7 +239,8 @@ impl ThreadWatchManager {
     }
 
     pub(crate) async fn note_turn_aborted(&self, thread_id: &str, reason: &TurnAbortReason) {
-        let failed = (reason == &TurnAbortReason::InternalError).then_some(true);
+        let failed = matches!(reason, TurnAbortReason::InternalError | TurnAbortReason::ProcessLost)
+            .then_some(true);
         self.clear_active_state(thread_id, failed).await;
     }
 

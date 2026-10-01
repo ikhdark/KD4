@@ -2965,7 +2965,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
 
 #[tokio::test]
 async fn resumed_history_marks_a_turn_that_never_completed() {
-    let (session, _turn_context) = make_session_and_context().await;
+    let (session, turn_context) = make_session_and_context().await;
     let completed_turn = vec![
         RolloutItem::ResponseItem(user_message("read fully")),
         RolloutItem::ResponseItem(assistant_message("Read it.")),
@@ -3003,6 +3003,16 @@ async fn resumed_history_marks_a_turn_that_never_completed() {
             ..Default::default()
         },
     )));
+    for item in [
+        serde_json::json!({"type":"function_call","call_id":"read","name":"read_file","arguments":"{}"}),
+        serde_json::json!({"type":"function_call_output","call_id":"read","output":"recorded evidence"}),
+        serde_json::json!({"type":"function_call","call_id":"build","name":"exec_command","arguments":"{}"}),
+    ] {
+        cut_short.push(RolloutItem::ResponseItem(serde_json::from_value(item).unwrap()));
+    }
+    let boundary = super::unfinished_turn_boundary_items(&cut_short, &turn_context);
+    assert!(matches!(boundary.last(), Some(RolloutItem::EventMsg(EventMsg::TurnAborted(event)))
+        if event.reason == TurnAbortReason::ProcessLost && event.duration_ms.is_none()));
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
@@ -3023,18 +3033,19 @@ async fn resumed_history_marks_a_turn_that_never_completed() {
         matches!(
             content.as_slice(),
             [ContentItem::InputText { text }]
-                if text.contains("ended before it completed")
-                    && text.contains("Do not assume any part of that request was carried out")
+                if text.contains("lost process, not a user interruption")
+                    && text.contains("2 tool call(s) and 1 tool result(s)")
+                    && text.contains("child commands may still be running")
         ),
-        "unfinished-turn marker must tell the model the request was not worked on: {content:?}"
+        "recovery must preserve recorded work without inventing completion: {content:?}"
     );
     assert!(
-        matches!(
-            &items[items.len() - 2],
+        items[..items.len() - 1].iter().any(|item| matches!(
+            item,
             ResponseItem::Message { role, content, .. }
                 if role == "user"
                     && matches!(content.as_slice(), [ContentItem::InputText { text }] if text == "now do it.")
-        ),
+        )),
         "the unfinished request itself is retained ahead of the marker"
     );
 

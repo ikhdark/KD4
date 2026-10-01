@@ -3,6 +3,23 @@ use codex_utils_string::approx_token_count;
 use std::time::Duration;
 
 #[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn raw_command_json_supports_pointer_recovery_without_rewriting_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let body = format!(" {{ \"z\": \"{}\", \"a/b\": [{{\"~key\": \"λ evidence\"}}] }}\n", "padding".repeat(3200));
+    let artifact = create_raw_output_artifact(temp.path(), "thread", body.as_bytes()).await;
+    let id = artifact.artifact_id().unwrap().to_string();
+    let result = read_tool_output_selectors(temp.path(), "thread", &id, vec![
+        ToolOutputSelector::JsonPointer { pointer: "/a~1b/0/~0key".into() },
+    ]).await.unwrap();
+    assert_eq!(result.results[0].value, Some(serde_json::json!("λ evidence")));
+    let range = result.results[0].canonical_range.unwrap();
+    assert_eq!(&body[range.start as usize..range.end as usize], "\"λ evidence\"");
+    assert_eq!(result.canonical_bytes, body.len() as u64);
+    assert_eq!(result.canonical_sha256, format!("{:x}", Sha256::digest(body.as_bytes())));
+}
+
+#[tokio::test]
 async fn recovery_searches_share_remaining_capacity_and_keep_exact_evidence() {
     let text = (0..180).map(|i| format!("{} row {i}: {}\n",
         ["ALPHA", "BETA", "GAMMA"][i / 60], "exact evidence ".repeat(12))).collect::<String>();

@@ -37,6 +37,39 @@ fn local_policy_models_use_one_canonical_prompt() {
 }
 
 #[test]
+fn evidence_guidance_reaches_local_policy_and_fallback_models() {
+    let mut response = crate::bundled_models_response().expect("bundled models.json should parse");
+    response
+        .models
+        .retain(|model| BUNDLED_LOCAL_POLICY_SLUGS.contains(&model.slug.as_str()));
+    response
+        .models
+        .push(crate::model_info::model_info_from_slug("unknown-model"));
+
+    for model in response.models {
+        let instructions = model.get_model_instructions(None);
+        for required in [
+            "Direct file reads establish exact content at that time; discovery-only search hits identify candidates.",
+            "Complete search results establish exact matching facts within their recorded scope and snapshot, not omitted context or broader behavior.",
+            "Preserve source and freshness through summaries and durable state.",
+            "Storage or repetition never upgrades evidence strength.",
+            "Treat generated summaries as derived and potentially lossy, cached observations as potentially stale, and inferred relationships as hypotheses.",
+            "Use provenance labels such as `direct_file_read`, `search_hit`, `generated_summary`, `cached_observation`, `inferred_relationship`, and `test_result` only when they preserve a material distinction.",
+            "These labels are optional internal aids, not a required user-facing reporting format.",
+            "Before citing exact values (versions, names, counts, paths, subcommands), check retained evidence; if unavailable or stale, refresh it or mark the value unknown.",
+            "Never substitute a remembered value while citing an earlier read.",
+            "Resolve contradictions using runtime reachability, ownership, freshness, and generated-source contracts; revise conclusions when evidence disagrees and never fill an unknown with an unstated assumption.",
+        ] {
+            assert!(
+                instructions.contains(required),
+                "{} is missing evidence guidance: {required}",
+                model.slug
+            );
+        }
+    }
+}
+
+#[test]
 fn bundled_local_policy_catalog_defers_prompt_to_local_policy() {
     let catalog: serde_json::Value = serde_json::from_str(include_str!("../models.json"))
         .expect("bundled models.json should parse");

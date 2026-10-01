@@ -970,6 +970,7 @@ mod tests {
                         cwd: self.codex_home.path().to_path_buf(),
                         originator: "test".to_string(),
                         cli_version: "test".to_string(),
+                        harness_build: None,
                         source: SessionSource::Cli,
                         model_provider: Some("test-provider".to_string()),
                         ..Default::default()

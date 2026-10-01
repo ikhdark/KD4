@@ -744,6 +744,8 @@ impl ExecCommandHandler {
                 }
                 return Ok(boxed_tool_output(
                     ExecCommandToolOutput {
+                        process_output: None,
+                        error: None,
                         validation: args.validation.clone(),
                         event_call_id: String::new(),
                         chunk_id: String::new(),
@@ -838,6 +840,14 @@ impl ExecCommandHandler {
             .process_execution_identity(process_id)
             .await;
         let mut background_process_expected = false;
+        let exec_result = match exec_result {
+            Err(UnifiedExecError::ProcessFailedWithOutput { mut output, .. }) => {
+                output.max_output_tokens = max_output_tokens;
+                output.truncation_policy = turn.model_info.truncation_policy.into();
+                Ok(*output)
+            }
+            other => other,
+        };
         let result = match exec_result {
             Ok(mut response) => {
                 background_process_expected = response.process_id.is_some();
@@ -934,6 +944,8 @@ impl ExecCommandHandler {
                 }
                 let original_token_count = approx_token_count(&output_text);
                 let mut response = ExecCommandToolOutput {
+                    process_output: None,
+                    error: None,
                     validation: args.validation.clone(),
                     event_call_id: context.call_id.clone(),
                     chunk_id: generate_chunk_id(),

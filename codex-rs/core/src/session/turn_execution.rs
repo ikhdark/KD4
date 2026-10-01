@@ -43,7 +43,7 @@ use crate::validation::classify_validation;
 const TURN_EFFICIENCY_TOOL_CALL_THRESHOLD: usize = 8;
 const TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL: u64 = 500;
 const LIGHTWEIGHT_HANDOFF_ADVISORY_GENERATIONS: u32 = 3;
-const LIGHTWEIGHT_HANDOFF_ADVISORY: &str = "Execution-efficiency advisory: several consecutive model handoffs each ran only one or two short tools. This is orchestration overhead, not evidence of a loop or task completion. For the next necessary work, batch already-known independent calls and keep deterministic dependent steps in the same exec after checking prerequisites. Reuse delivered contracts and evidence instead of exploring their implementation without a concrete correctness gap. If the requested result is already supported, deliver it rather than adding optional verification. Do not skip required reading, implementation, or validation; do not combine conflicting mutations or cancel progressing work. Keep tools available and preserve the user's scope.";
+const LIGHTWEIGHT_HANDOFF_ADVISORY: &str = "Execution-efficiency advisory: several consecutive model handoffs each ran only one or two short tools. This is orchestration overhead, not evidence of a loop or task completion. For the next necessary work, batch already-known independent calls and keep deterministic dependent steps in the same exec after checking prerequisites. Reuse delivered contracts and evidence instead of exploring their implementation without a concrete correctness gap. Do not skip required reading, implementation, or validation; do not combine conflicting mutations or cancel progressing work. Keep tools available and preserve the user's scope.";
 const DISTINCT_FAILURE_RECOVERY_ADVISORY_THRESHOLD: u32 = 2;
 const SUCCESSFUL_REPLAY_GATE_LIMIT: usize = 32;
 const RECENT_CYCLE_LIMIT: usize = 32;
@@ -2594,6 +2594,8 @@ impl TurnExecutionControl {
 
     pub(crate) fn batching_advisory(&self, is_continuation: bool) -> Option<String> {
         (is_continuation
+            // An informational/question-only turn has no execution plan.
+            && self.plan.is_some()
             && self.lightweight_handoffs >= LIGHTWEIGHT_HANDOFF_ADVISORY_GENERATIONS
             && !self.issued_directives.contains(LIGHTWEIGHT_HANDOFF_ADVISORY))
         .then(|| LIGHTWEIGHT_HANDOFF_ADVISORY.to_string())
@@ -3551,6 +3553,7 @@ mod tests {
     #[test]
     fn lightweight_handoff_advisory_preserves_novel_progress_and_tool_access() {
         let mut control = TurnExecutionControl::new();
+        settle_plan(&mut control, plan(&[StepStatus::InProgress]));
         let (baselines, settled) = unchanged_state(&control);
         for generation in 1..=3 {
             let collector = lightweight_handoff_collector(
@@ -3590,6 +3593,7 @@ mod tests {
             (1, Some(100), 1),
         ] {
             let mut control = TurnExecutionControl::new();
+            settle_plan(&mut control, plan(&[StepStatus::InProgress]));
             let baselines = control.baselines(0);
             for generation in 0..2 {
                 let collector = lightweight_handoff_collector(

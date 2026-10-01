@@ -29,6 +29,21 @@ fn removed_memory_features_are_not_registered() {
 }
 
 #[test]
+fn unknown_feature_settings_emit_a_visible_warning_for_booleans_and_tables() {
+    let table: Table = toml::from_str(
+        "unified_exec = true\ntask_completion_reviewer = true\n[future_feature]\nenabled = true",
+    ).unwrap();
+    let event = crate::unknown_features_warning_event(Some(&table), "config.toml").unwrap();
+    let EventMsg::Warning(warning) = event.msg else {
+        panic!("unknown settings must be visible warnings");
+    };
+    assert!(warning.message.contains("future_feature, task_completion_reviewer"));
+    assert!(!warning.message.contains("unified_exec"));
+    assert!(warning.message.contains("no effect"));
+    assert!(crate::unknown_features_warning_event(None, "config.toml").is_none());
+}
+
+#[test]
 fn feature_membership_is_independent_and_enumeration_preserves_enum_order() {
     let mut features = Features::default();
     let mut expected = std::collections::BTreeSet::new();

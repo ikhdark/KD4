@@ -19,7 +19,6 @@ use super::is_exec_tool_name;
 use super::wait_handler::OwnerHeldCodeModeExit;
 use super::wait_handler::attach_drained_wait_evidence;
 use super::wait_handler::hold_until_state_change;
-use super::wait_handler::idle_timeout_response;
 use super::wait_handler::input_activity_response;
 use super::wait_handler::record_internally_drained_waits;
 use super::wait_handler::terminate_interrupted_cell;
@@ -362,9 +361,6 @@ impl CodeModeExecuteHandler {
                     true,
                     drained_observations,
                 ),
-                OwnerHeldCodeModeExit::IdleTimeout => {
-                    (idle_timeout_response(&cell_id), true, drained_observations)
-                }
             }
         } else {
             (initial_response, true, 0)

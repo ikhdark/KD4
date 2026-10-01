@@ -1,15 +1,43 @@
 use codex_protocol::ToolName;
 use serde_json::Value;
 
-/// Lossless envelope compaction for presentation, never for execution or storage.
+/// Display-only envelope projection, never for execution or storage.
 /// Only known tool envelopes qualify; arbitrary user JSON must not be rewritten.
 pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
-    if tool.namespace.is_none() && tool.name != "read_file" && !tool.name.starts_with("mcp__") {
+    if tool.namespace.is_none()
+        && !matches!(tool.name.as_str(), "read_file" | "exec_command" | "write_stdin")
+        && !tool.name.starts_with("mcp__")
+    {
         return None;
     }
     let object = raw.as_object()?;
     let mut projected = object.clone();
-    if tool.namespace.is_none() && tool.name == "read_file" {
+    if tool.namespace.is_none() && matches!(tool.name.as_str(), "exec_command" | "write_stdin") {
+        // Chunk IDs identify transport frames, not resumable commands or artifacts.
+        projected.remove("chunk_id");
+        for key in [
+            "raw_output_artifact_error",
+            "raw_output_artifact_retention_limit_reason",
+            "output_decoding_notice",
+        ] {
+            if projected.get(key) == Some(&Value::Null) {
+                projected.remove(key);
+            }
+        }
+        if projected.get("raw_output_artifact_retention_limit_hit") == Some(&Value::Bool(false)) {
+            projected.remove("raw_output_artifact_retention_limit_hit");
+        }
+        // These are exact script inputs, not a second copy to spend the cell's
+        // display budget on. Scripts can explicitly emit selected stream data.
+        if object.get("streams_complete") == Some(&Value::Bool(true))
+            && object.get("stdout").is_some_and(Value::is_string)
+            && object.get("stderr").is_some_and(Value::is_string)
+        {
+            projected.remove("stdout");
+            projected.remove("stderr");
+            projected.remove("streams_complete");
+        }
+    } else if tool.namespace.is_none() && tool.name == "read_file" {
         if object.get("source_sha256").is_some_and(Value::is_string)
             && object.get("canonical_sha256") == object.get("source_sha256")
         {
@@ -50,6 +78,22 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn command_projection_keeps_lifecycle_and_recovery_not_transport_defaults() {
+        let raw = json!({"chunk_id":"transport", "output":"progress",
+            "session_id":7, "execution_state":"running", "exit_code":null,
+            "raw_output_artifact_id":"retained", "output_complete":false,
+            "raw_output_artifact_retention_limit_hit":false,
+            "raw_output_artifact_error":null,
+            "stdout":"progress", "stderr":"", "streams_complete":true});
+        let compact = model_visible_tool_result(&ToolName::plain("exec_command"), &raw).unwrap();
+        assert_eq!(compact, json!({"output":"progress", "session_id":7,
+            "execution_state":"running", "exit_code":null,
+            "raw_output_artifact_id":"retained", "output_complete":false}));
+        // Execution values, including the separate streams, remain untouched.
+        assert_eq!(raw["stdout"], "progress");
+    }
 
     #[test]
     fn read_file_preserves_distinctions_and_recovery() {

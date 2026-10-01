@@ -44,7 +44,7 @@ fn command_parameters_schema(
 fn stall_timeout_schema() -> JsonSchema {
     bounded_integer(
         format!(
-            "Maximum time without stdout or stderr before cancellation, including between polls. Defaults to {} ms; exec_command disables this default for recognized long-running validation, build, install, and discovery commands. Set zero to disable or increase for intentionally quiet or interactive commands. This is not a total runtime limit.",
+            "Maximum time without stdout or stderr before reporting the command as stalled and yielding its live session, including between polls. Silence never terminates the command. Defaults to {} ms; exec_command disables this default for recognized long-running validation, build, install, and discovery commands. Set zero to disable this observation. This is not a total runtime limit.",
             crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS,
         ),
         0,
@@ -224,6 +224,10 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
     let default_timeout_ms =
         crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS.min(max_timeout_ms);
     let properties = BTreeMap::from([
+        (
+            "wait_for_output".to_string(),
+            JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
+        ),
         (
             "session_id".to_string(),
             bounded_integer(
@@ -412,6 +416,22 @@ fn unified_exec_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "error": {
+                "type": "string",
+                "description": "Command failure, including watchdog or cleanup failure. Inspect execution_state and session_id; do not replay uncertain effects."
+            },
+            "stdout": {
+                "type": "string",
+                "description": "Exact whole-command UTF-8 stdout, available to scripts only when streams_complete is true. Independent of the display token budget; stdout and stderr together are limited to 64 KiB."
+            },
+            "stderr": {
+                "type": "string",
+                "description": "Exact whole-command UTF-8 stderr when streams_complete is true."
+            },
+            "streams_complete": {
+                "type": "boolean",
+                "description": "True only when both entire streams are available separately without loss. False means merged (PTY or exec-server), partial, oversized, or non-UTF-8 streams; never parse output as a substitute for exact stdout."
+            },
             "session_capabilities": {
                 "type": "object",
                 "properties": {

@@ -1204,6 +1204,29 @@ define_features! {
     },
 }
 
+pub fn unknown_features_warning_event(
+    effective_features: Option<&Table>,
+    config_path: &str,
+) -> Option<Event> {
+    let unknown = effective_features?
+        .keys()
+        .filter(|key| canonical_feature_for_key(key).is_none())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if unknown.is_empty() {
+        return None;
+    }
+    Some(Event {
+        id: String::new(),
+        msg: EventMsg::Warning(WarningEvent {
+            message: format!(
+                "Unknown feature keys in {config_path}: {}. These settings have no effect in this build.",
+                unknown.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        }),
+    })
+}
+
 pub fn unstable_features_warning_event(
     effective_features: Option<&Table>,
     suppress_unstable_features_warning: bool,

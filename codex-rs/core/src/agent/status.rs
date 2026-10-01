@@ -35,6 +35,9 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
             codex_protocol::protocol::TurnAbortReason::InternalError => Some(AgentStatus::Errored(
                 "The turn was aborted because of an internal error.".to_string(),
             )),
+            codex_protocol::protocol::TurnAbortReason::ProcessLost => Some(AgentStatus::Errored(
+                "The process was lost before the turn completed.".to_string(),
+            )),
         },
         EventMsg::Error(ev) if ev.affects_turn_status() => {
             Some(AgentStatus::Errored(ev.message.clone()))

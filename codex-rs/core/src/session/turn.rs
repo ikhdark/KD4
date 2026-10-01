@@ -422,11 +422,11 @@ pub(crate) async fn run_turn(
         let prepared_context_update =
             take_stabilized_context_update(&mut pending_turn_plan.prepared_context_update)?;
         let (world_state, display_roots) = tokio::join!(
-            sess.compare_and_record_context_updates(
+            time_planning_step("context_commit", sess.compare_and_record_context_updates(
                 prepared_context_update,
                 pending_turn_plan.planning_generation,
-            ),
-            turn_diff_display_roots(sess.as_ref(), turn_context.as_ref()),
+            )),
+            time_planning_step("diff_roots", turn_diff_display_roots(sess.as_ref(), turn_context.as_ref())),
         );
         let world_state = match world_state {
             Ok(world_state) => world_state,
@@ -1689,12 +1689,28 @@ struct CompletionStopHookReport {
     stop_reason: Option<String>,
 }
 
+fn final_reports_unfinished_work(message: &str) -> bool {
+    message.to_ascii_lowercase().lines().any(|line| {
+        ["work", "task", "review", "requested", "implementation"]
+            .iter().any(|subject| line.contains(subject))
+            && ["not complete", "not finished", "still incomplete", "remains unfinished", "remain unverified"]
+                .iter().any(|admission| line.contains(admission))
+    })
+}
+
 async fn run_completion_stop_hook(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     stop_hook_active: bool,
     last_agent_message: Option<String>,
 ) -> CompletionStopHookReport {
+    if last_agent_message.as_deref().is_some_and(final_reports_unfinished_work) {
+        // A truthful limitation is allowed, but must not silently look like
+        // verified task completion. Do not auto-loop on a genuine blocker.
+        sess.send_event(turn_context, EventMsg::Warning(WarningEvent {
+            message: "The assistant's final response reports unfinished requested work. This turn is not a verified completion of that scope.".to_string(),
+        })).await;
+    }
     let observed =
         run_turn_stop_hooks(sess, turn_context, stop_hook_active, last_agent_message).await;
     let stop = observed.stop;
@@ -2006,6 +2022,24 @@ async fn build_recommended_plugin_items(
 }
 
 #[instrument(level = "trace", skip_all)]
+async fn time_planning_step<T>(step: &'static str, work: impl Future<Output = T>) -> T {
+    struct Timer {
+        step: &'static str,
+        started: std::time::Instant,
+    }
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            tracing::info!(
+                planning_step = self.step,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                "turn planning step finished"
+            );
+        }
+    }
+    let _timer = Timer { step, started: std::time::Instant::now() };
+    work.await
+}
+
 async fn build_pure_pending_turn_plan(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
@@ -2036,15 +2070,15 @@ async fn build_pure_pending_turn_plan(
     // concurrently internally and collect by registration index.
     let plugins_config_input = turn_context.config.plugins_config_input();
     let (loaded_plugins, extension_injection_items) = tokio::join!(
-        sess.services
+        time_planning_step("plugins", sess.services
             .plugins_manager
-            .plugins_for_config(&plugins_config_input),
-        build_extension_turn_input_items(
+            .plugins_for_config(&plugins_config_input)),
+        time_planning_step("extension_input", build_extension_turn_input_items(
             sess,
             step_context.as_ref(),
             &user_input,
             cancellation_token
-        )
+        ))
     );
     let extension_injection_items = extension_injection_items?;
     // DAG edge P -> plugin mentions. Connector inventory C waits for P because
@@ -2060,20 +2094,20 @@ async fn build_pure_pending_turn_plan(
         .collect::<Vec<_>>();
     let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
     let (recommended_plugin_items, mcp_tools) = join_recommendations_and_mcp(
-        build_recommended_plugin_items(
+        time_planning_step("recommendations", build_recommended_plugin_items(
             sess,
             turn_context,
             &plugins_config_input,
             &loaded_plugins,
             &recommended_plugin_input,
-        ),
-        async {
+        )),
+        time_planning_step("mcp_catalog", async {
             if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
                 step_context.mcp_tools().or_cancel(cancellation_token).await
             } else {
                 Ok(&[][..])
             }
-        },
+        }),
     )
     .await;
     let mcp_tools = mcp_tools?;
@@ -2104,8 +2138,8 @@ async fn build_pure_pending_turn_plan(
     // Once SK is resolved, inventory-effect planning and pure skill materialization
     // are independent and remain side-effect free.
     let (planned_mcp, skill_plan) = tokio::join!(
-        plan_mcp_dependencies(sess, turn_context, &mentioned_skills),
-        plan_skill_injections(&mentioned_skills, Some(skills_outcome))
+        time_planning_step("mcp_dependencies", plan_mcp_dependencies(sess, turn_context, &mentioned_skills)),
+        time_planning_step("skill_injections", plan_skill_injections(&mentioned_skills, Some(skills_outcome)))
     );
     let skill_connector_items = skill_plan
         .injections
@@ -2171,14 +2205,14 @@ async fn build_pure_pending_turn_plan(
     // Final DAG leaves build the router and immutable context candidate concurrently,
     // then validate the generation before accepting either.
     let (first_router, prepared_context_update) = tokio::join!(
-        built_tools_for_pending_turn(
+        time_planning_step("tool_router", built_tools_for_pending_turn(
             sess.as_ref(),
             &step_context,
             &skill_plan.invocations,
             planning_generation,
             cancellation_token,
-        ),
-        sess.prepare_context_update(step_context.as_ref()),
+        )),
+        time_planning_step("context_update", sess.prepare_context_update(step_context.as_ref())),
     );
     let first_router = first_router?;
     if sess.services.planning_generation() != planning_generation {
@@ -2196,7 +2230,7 @@ async fn build_pure_pending_turn_plan(
         initial_context,
     );
     let projected_prompt_pressure =
-        projected_prompt_pressure(sess, turn_context, pending_token_estimate).await;
+        time_planning_step("prompt_pressure", projected_prompt_pressure(sess, turn_context, pending_token_estimate)).await;
     Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
         planning_generation,
         step_context,
@@ -2240,13 +2274,13 @@ async fn stabilize_pending_turn_plan(
         let compaction_timing_guard = turn_context
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::Compaction);
-        let history_compaction = run_history_pre_sampling_compact(
+        let history_compaction = time_planning_step("history_compaction", run_history_pre_sampling_compact(
             sess,
             turn_context,
             client_session,
             check_previous_model_compaction,
             cancellation_token,
-        )
+        ))
         .await?;
         drop(compaction_timing_guard);
         check_previous_model_compaction = false;
@@ -2276,7 +2310,7 @@ async fn stabilize_pending_turn_plan(
         }
         // Capturing a step can publish an MCP manager. Let that resource-owning
         // operation finish; the pure build below checks cancellation again.
-        let step_context = sess.capture_step_context(Arc::clone(turn_context)).await?;
+        let step_context = time_planning_step("step_context", sess.capture_step_context(Arc::clone(turn_context))).await?;
         let plan_build = build_pure_pending_turn_plan(
             sess,
             step_context,
@@ -2303,7 +2337,7 @@ async fn stabilize_pending_turn_plan(
         let compaction_timing_guard = turn_context
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::Compaction);
-        let compaction_reason = run_pending_input_pre_sampling_compact(
+        let compaction_reason = time_planning_step("pending_input_compaction", run_pending_input_pre_sampling_compact(
             sess,
             turn_context,
             client_session,
@@ -2311,7 +2345,7 @@ async fn stabilize_pending_turn_plan(
             plan.projected_prompt_pressure,
             !incoming_precompaction_completed,
             cancellation_token,
-        )
+        ))
         .await?;
         drop(compaction_timing_guard);
         if compaction_reason.is_some() {
@@ -2328,7 +2362,7 @@ async fn stabilize_pending_turn_plan(
             && !mcp_dependency_effect_is_completed(completed_mcp_effect.as_ref(), &effect.id)
         {
             let outcome =
-                apply_mcp_dependency_effect(sess, turn_context, cancellation_token, effect)
+                time_planning_step("mcp_effect", apply_mcp_dependency_effect(sess, turn_context, cancellation_token, effect))
                     .await
                     .map_err(|err| {
                         if cancellation_token.is_cancelled() {
@@ -5378,6 +5412,18 @@ fn assign_missing_streamed_response_item_id(
     Session::assign_missing_response_item_id(item);
 }
 
+async fn service_tier_for_sampling(sess: &Session, turn: &TurnContext) -> Option<String> {
+    // Settings bursts may settle while planning or tools are running. Collapse
+    // them at the request boundary instead of pinning every request to the
+    // transient value captured when the turn was constructed.
+    let configured = sess.state.lock().await.session_configuration.service_tier.clone();
+    super::get_service_tier(
+        configured,
+        turn.config.features.enabled(Feature::FastMode),
+        &turn.model_info,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -5467,6 +5513,7 @@ async fn try_run_sampling_request(
         &turn_context.model_info,
         turn_context.configured_reasoning_effort.clone(),
     );
+    let service_tier = service_tier_for_sampling(&sess, &turn_context).await;
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
@@ -5484,7 +5531,7 @@ async fn try_run_sampling_request(
         "configured_reasoning_effort": turn_context.configured_reasoning_effort,
         "resolved_reasoning_effort": request_effort,
         "reasoning_summary": turn_context.reasoning_summary,
-        "service_tier": turn_context.config.service_tier,
+        "service_tier": service_tier,
         "collaboration_mode": turn_context.collaboration_mode,
         "parallel_tool_calls": prompt.parallel_tool_calls,
     }));
@@ -5521,7 +5568,7 @@ async fn try_run_sampling_request(
                         &turn_context.model_info,
                         request_effort.clone(),
                         turn_context.reasoning_summary,
-                        turn_context.config.service_tier.clone(),
+                        service_tier.clone(),
                         responses_metadata,
                     )
                     .await?;
@@ -5665,7 +5712,7 @@ async fn try_run_sampling_request(
             &turn_context.session_telemetry,
             request_effort.clone(),
             turn_context.reasoning_summary,
-            turn_context.config.service_tier.clone(),
+            service_tier,
             responses_metadata,
             &inference_trace,
             Some(attempt_prepared),

@@ -1545,6 +1545,16 @@ impl Session {
                 });
             }
             let config_path = config.codex_home.join(CONFIG_TOML_FILE);
+            if let Some(event) = codex_features::unknown_features_warning_event(
+                config
+                    .config_layer_stack
+                    .effective_config()
+                    .get("features")
+                    .and_then(TomlValue::as_table),
+                &config_path.display().to_string(),
+            ) {
+                post_session_configured_events.push(event);
+            }
             if let Some(event) = unstable_features_warning_event(
                 config
                     .config_layer_stack

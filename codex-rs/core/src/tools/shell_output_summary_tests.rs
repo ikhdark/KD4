@@ -12,6 +12,21 @@ fn options(
 }
 
 #[test]
+fn counter_only_progress_does_not_displace_failure_diagnostics() {
+    let mut lines = (0..700).map(|i| format!("KDA elapsed {i}s; progress {i}/900")).collect::<Vec<_>>();
+    lines[350] = "error: validation gate rejected warning ABC123".to_string();
+    lines[351] = "expected zero warnings; got 23333".to_string();
+    let summary = summarize_shell_output_for_model(
+        &lines.join("\n"), 1, false, options(Some("python validate.py"), Some(1200)),
+    ).unwrap();
+    assert!(summary.contains("validation gate rejected warning ABC123"), "{summary}");
+    assert!(summary.contains("expected zero warnings; got 23333"), "{summary}");
+    assert_eq!(summary.matches("KDA elapsed").count(), 1);
+    assert!(summary.contains("elapsed 699s"));
+    assert!(summary.contains("collapsed_progress_lines: 697"));
+}
+
+#[test]
 fn go_and_pytest_failures_survive_passing_output_afterward() {
     for (command, failure) in [
         ("go test ./...", "--- FAIL: TestExpectedResult (0.00s)"),

@@ -1235,7 +1235,8 @@ impl ThreadHistoryBuilder {
 
     fn handle_turn_aborted(&mut self, payload: &TurnAbortedEvent) {
         let abort_status =
-            if payload.reason == codex_protocol::protocol::TurnAbortReason::InternalError {
+            if matches!(payload.reason, codex_protocol::protocol::TurnAbortReason::InternalError
+                | codex_protocol::protocol::TurnAbortReason::ProcessLost) {
                 TurnStatus::Failed
             } else {
                 TurnStatus::Interrupted

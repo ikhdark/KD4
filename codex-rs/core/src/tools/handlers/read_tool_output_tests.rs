@@ -213,6 +213,31 @@ use super::*;
 use crate::tools::command_output_artifact::ByteSubdivisionPlan;
 
 #[tokio::test]
+async fn byte_budget_delivers_an_exact_prefix_and_resumable_remainder() {
+    let temp = tempfile::tempdir().unwrap();
+    let text = "λ source evidence\n".repeat(2000);
+    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        temp.path(), "thread", &CanonicalToolResult::text(text.clone()),
+    ).await;
+    let snapshot = load_tool_output_snapshot(temp.path(), "thread", &artifact.artifact_id().unwrap().to_string())
+        .await.unwrap();
+    let result = drain_recovery_snapshot_with_byte_limit(
+        &snapshot,
+        vec![ToolOutputSelector::Bytes { start: 0, end: text.len() as u64 }],
+        RECOVERY_AGGREGATE_TOKEN_CEILING, 4096, &CancellationToken::new(),
+    ).await.unwrap();
+    let delivered: u64 = result.output.delivered_ranges().iter().map(|(start, end)| end - start).sum();
+    assert!(delivered > 0 && delivered <= 4096, "{delivered}");
+    assert!(!result.output.complete);
+    assert!(result.continuation_stop.as_ref().is_some_and(|stop| stop.resumable));
+    for page in &result.output.results {
+        if let (Some(range), Some(value)) = (page.canonical_range, page.text.as_ref()) {
+            assert_eq!(value, &text[range.start as usize..range.end as usize]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn recovery_uses_actual_cell_budget_with_a_minimum_page() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let session = std::sync::Arc::new(session);

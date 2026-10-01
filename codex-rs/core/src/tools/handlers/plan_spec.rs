@@ -54,11 +54,11 @@ pub fn create_update_plan_tool() -> ToolSpec {
             BTreeMap::from([
                 (
                     "explanation".to_string(),
-                    JsonSchema::string(Some("Optional explanation for this update, including blockers or cancelled work. Do not mark unfinished work completed.".to_string())),
+                    JsonSchema::string(Some("Explanation for this update, including blockers or cancelled work. Required when revising or removing unfinished steps; account for their remaining obligations and any user-authorized scope change. Do not mark unfinished work completed.".to_string())),
                 ),
                 (
                     "plan".to_string(),
-                    JsonSchema::array(plan_item.clone(), Some("Complete task checklist, replacing the previous plan. Omitted steps are removed; include every step you want to retain.".to_string())),
+                    JsonSchema::array(plan_item.clone(), Some("Complete task checklist, replacing the previous plan. Preserve the user's acceptance criteria; rewriting a step does not complete its old obligations. A completed checklist is not proof that the request is satisfied.".to_string())),
                 ),
                 ("set".to_string(), status_updates),
             ]),

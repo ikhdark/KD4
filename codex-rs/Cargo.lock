@@ -3646,6 +3646,7 @@ dependencies = [
  "codex-protocol",
  "codex-state",
  "codex-utils-absolute-path",
+ "codex-utils-build-info",
  "futures",
  "pretty_assertions",
  "regex",

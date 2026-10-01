@@ -30,6 +30,35 @@ use crate::RolloutRecorderParams;
 use crate::append_rollout_item_to_path;
 use crate::search_rollout_matches;
 
+#[cfg(windows)]
+#[tokio::test]
+async fn orphan_lock_cleanup_never_unlinks_an_open_lock() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let directory = home.path().join(crate::SESSIONS_SUBDIR);
+    fs::create_dir_all(&directory)?;
+    let missing = directory.join("rollout-missing.jsonl");
+    let orphan = rollout_lock_path(&missing);
+    let orphan_write = rollout_write_lock_path(&missing);
+    fs::write(&orphan, [])?;
+    fs::write(&orphan_write, [])?;
+    let held_path = rollout_lock_path(&directory.join("rollout-held.jsonl"));
+    let held = open_lock_file(&held_path)?;
+    // An unlocked open handle is sufficient protection, including OS-lock waiters.
+    let compressed = directory.join("rollout-compressed.jsonl");
+    let compressed_lock = rollout_lock_path(&compressed);
+    fs::write(path::compressed_rollout_path(&compressed), [])?;
+    fs::write(&compressed_lock, [])?;
+    worker::run(home.path().to_path_buf()).await?;
+    assert!(!orphan.exists());
+    assert!(!orphan_write.exists());
+    assert!(held_path.exists());
+    assert!(compressed_lock.exists());
+    drop(held);
+    assert!(cleanup_orphan_rollout_lock(&held_path)?);
+    assert!(!held_path.exists());
+    Ok(())
+}
+
 #[tokio::test]
 async fn archive_waits_for_compression_and_moves_its_final_representation() -> anyhow::Result<()> {
     let home = TempDir::new()?;
@@ -882,6 +911,7 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
             cwd: parent.to_path_buf(),
             originator: "test".to_string(),
             cli_version: "test".to_string(),
+            harness_build: None,
             source: SessionSource::Cli,
             thread_source: None,
             agent_path: None,

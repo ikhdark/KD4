@@ -128,8 +128,10 @@ impl StepContext {
     pub(crate) async fn mcp_tool_snapshot(&self) -> &McpToolSnapshot {
         self.mcp_tool_snapshot
             .get_or_init(|| async {
-                self.mcp.manager().wait_for_startup().await;
                 bounded_mcp_snapshot(async {
+                    // Startup is part of capture's budget too. A slow optional
+                    // server must not hold the turn behind its network timeout.
+                    self.mcp.manager().wait_for_startup().await;
                     loop {
                         let revision = self.mcp.manager().tool_catalog_revision();
                         let (tools, resources_available) = tokio::join!(

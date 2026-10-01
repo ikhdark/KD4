@@ -12,7 +12,6 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::protocol::AskForApproval;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_tools::JsonToolOutput;
 use codex_tools::ToolName;
@@ -59,13 +58,6 @@ impl RequestUserInputHandler {
                 )));
             }
         };
-
-        if matches!(turn.approval_policy.value(), AskForApproval::Never) {
-            return Err(FunctionCallError::RespondToModel(
-                "request_user_input is unavailable when approval policy is `never`; continue without interactive input or return a final response explaining the missing information"
-                    .to_string(),
-            ));
-        }
 
         if turn.session_source.is_non_root_agent() {
             return Err(FunctionCallError::RespondToModel(

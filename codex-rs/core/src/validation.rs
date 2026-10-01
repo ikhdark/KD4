@@ -38,7 +38,7 @@ pub(crate) fn prefers_long_observation_wait(invocation: &CommandInvocation) -> b
             codex_shell_command::validation::is_build_or_discovery(program, args)
         }
         CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => {
-            codex_shell_command::validation::script_has_build_or_discovery(script)
+            codex_shell_command::validation::script_prefers_long_observation_wait(script)
         }
     }
 }

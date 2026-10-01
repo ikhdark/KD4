@@ -3974,6 +3974,49 @@ fn load_logical_metadata(
     load_logical_metadata_with_snapshot(path, id).map(|(metadata, _)| metadata)
 }
 
+/// Index borrowed lexical values, retaining the producer's whitespace, key
+/// order, and byte offsets rather than reserializing its JSON.
+fn raw_json_pointer_index(contents: &[u8]) -> Option<BTreeMap<String, CanonicalJsonPointer>> {
+    fn visit<'a>(
+        raw: &'a serde_json::value::RawValue,
+        base: usize,
+        pointer: String,
+        depth: usize,
+        index: &mut BTreeMap<String, CanonicalJsonPointer>,
+    ) -> Option<()> {
+        if depth > 128 { return None; }
+        let text = raw.get();
+        let start = text.as_ptr() as usize - base;
+        let mut children = Vec::new();
+        if text.starts_with('{') {
+            let values: BTreeMap<String, &'a serde_json::value::RawValue> = serde_json::from_str(text).ok()?;
+            for (key, value) in values {
+                let child = format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1"));
+                visit(value, base, child.clone(), depth + 1, index)?;
+                children.push(child);
+            }
+        } else if text.starts_with('[') {
+            let values: Vec<&'a serde_json::value::RawValue> = serde_json::from_str(text).ok()?;
+            for (position, value) in values.into_iter().enumerate() {
+                let child = format!("{pointer}/{position}");
+                visit(value, base, child.clone(), depth + 1, index)?;
+                children.push(child);
+            }
+        }
+        index.insert(pointer, CanonicalJsonPointer {
+            range: CanonicalByteRange::new(start as u64, (start + text.len()) as u64),
+            exact_bytes: text.len() as u64,
+            direct_children: children,
+            recovery_chunk_bytes: None,
+        });
+        Some(())
+    }
+    let raw: &serde_json::value::RawValue = serde_json::from_slice(contents).ok()?;
+    let mut index = BTreeMap::new();
+    visit(raw, contents.as_ptr() as usize, String::new(), 0, &mut index)?;
+    Some(index)
+}
+
 fn load_logical_metadata_with_snapshot(
     path: &Path,
     id: ToolOutputArtifactId,
@@ -4015,17 +4058,22 @@ fn load_logical_metadata_with_snapshot(
             })?;
             let bytes = contents.len() as u64;
             let sha256 = format!("{:x}", Sha256::digest(&contents));
+            let json_pointers = raw_json_pointer_index(&contents).unwrap_or_default();
             let metadata = LogicalArtifactMetadata {
                 version: LOGICAL_ARTIFACT_METADATA_VERSION,
                 artifact_id: id.to_string(),
-                canonical_kind: CanonicalToolResultKind::Bytes,
+                canonical_kind: if json_pointers.is_empty() {
+                    CanonicalToolResultKind::Bytes
+                } else {
+                    CanonicalToolResultKind::Json
+                },
                 canonical_sha256: sha256.clone(),
                 retained_sha256: Some(sha256),
                 canonical_bytes: bytes,
                 retained_bytes: bytes,
                 complete: true,
                 unavailable_ranges: Vec::new(),
-                json_pointers: BTreeMap::new(),
+                json_pointers,
                 sections: Vec::new(),
                 line_starts: canonical_line_starts(&contents),
                 segments: vec![LogicalArtifactSegment {

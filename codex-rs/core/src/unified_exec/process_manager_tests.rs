@@ -86,6 +86,49 @@ async fn short_empty_polls_require_unreported_output() {
     process.terminate_confirmed().await.unwrap();
 }
 
+#[tokio::test]
+async fn failed_process_receipt_preserves_output_and_uncertain_cleanup() {
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
+
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    for cleanup_error in [None, Some("cleanup refused".to_string())] {
+        let cleanup_failed = cleanup_error.is_some();
+        let process = crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            cleanup_error,
+        ).await;
+        crate::unified_exec::process_tests::store_process_for_test(
+            manager, &session, &turn, 1000, Arc::clone(&process),
+        ).await;
+        process.output_handles().completion_output_buffer.lock().await
+            .push_chunk(b"retained evidence");
+        let error = manager.fail_process_with_message(
+            1000, &process, "command failed".to_string(),
+        ).await;
+        let UnifiedExecError::ProcessFailedWithOutput { output, .. } = error else {
+            panic!("failure must retain a structured receipt");
+        };
+        assert!(!output.success_for_logging());
+        let result = output.code_mode_result(&ToolPayload::Function { arguments: "{}".to_string() });
+        assert!(result["error"].as_str().unwrap().contains("command failed"));
+        assert!(result["output"].as_str().unwrap().contains("retained evidence"));
+        assert_eq!(result["process_exited"], !cleanup_failed);
+        assert_eq!(result["streams_complete"], false, "remote streams are merged");
+        if cleanup_failed {
+            assert_eq!(result["session_id"], 1000);
+            assert!(result["error"].as_str().unwrap().contains("cleanup refused"));
+            assert!(manager.process_store.lock().await.processes.contains_key(&1000));
+            manager.process_store.lock().await.remove(1000);
+            process.signal_exit_for_test(Some(1));
+        } else {
+            assert!(result.get("session_id").is_none());
+            assert!(!manager.process_store.lock().await.processes.contains_key(&1000));
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn poll_advertises_noninteractive_session_capabilities() {
     use codex_tools::ToolOutput;
@@ -1874,7 +1917,7 @@ async fn cancelled_known_delta_replay_closes_started_command_before_returning() 
             assert_eq!(output.exit_code, Some(0));
             assert!(output.process_exited);
         }
-        Err(UnifiedExecError::ProcessFailed { message }) => {
+        Err(UnifiedExecError::ProcessFailed { message } | UnifiedExecError::ProcessFailedWithOutput { message, .. }) => {
             assert_eq!(message, "unified exec cancelled");
         }
         Err(error) => panic!("unexpected replay failure: {error:?}"),
@@ -2111,7 +2154,7 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
     let result = tokio::time::timeout(Duration::from_secs(10), &mut execution)
         .await
         .expect("normal manager failure settles");
-    let Err(UnifiedExecError::ProcessFailed { message }) = result else {
+    let Err(UnifiedExecError::ProcessFailed { message } | UnifiedExecError::ProcessFailedWithOutput { message, .. }) = result else {
         panic!("expected registration failure: {result:?}");
     };
     if cancel_during_registration {
@@ -2422,7 +2465,7 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
     )
     .await
     .expect("normal manager failure settles");
-    let Err(UnifiedExecError::ProcessFailed { message }) = result else {
+    let Err(UnifiedExecError::ProcessFailed { message } | UnifiedExecError::ProcessFailedWithOutput { message, .. }) = result else {
         panic!("expected registration failure: {result:?}");
     };
     assert!(
@@ -2804,6 +2847,8 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
     .expect("actual process exits");
     let receipt = process.register_terminal_completion();
     let response = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "completed-without-watcher".to_string(),
         chunk_id: "chunk".to_string(),
@@ -3271,7 +3316,7 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
                     tokio::time::timeout(Duration::from_secs(5), &mut pending).await
                         .expect("normal cancellation returns while start response remains withheld")
                 });
-                assert!(matches!(result, Err(UnifiedExecError::ProcessFailed { message }) if message == "unified exec cancelled"));
+                assert!(matches!(result, Err(UnifiedExecError::ProcessFailed { message } | UnifiedExecError::ProcessFailedWithOutput { message, .. }) if message == "unified exec cancelled"));
                 drop(pending);
             } else {
                 assert!(tokio::runtime::Handle::try_current().is_err());
@@ -3915,7 +3960,7 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
                     cancellation.cancel();
                     let result = tokio::time::timeout(Duration::from_secs(5), &mut pending).await
                         .expect("normal cancellation settles independently of held retirement");
-                    assert!(matches!(result, Err(UnifiedExecError::ProcessFailed { message }) if message == "unified exec cancelled"));
+                    assert!(matches!(result, Err(UnifiedExecError::ProcessFailed { message } | UnifiedExecError::ProcessFailedWithOutput { message, .. }) if message == "unified exec cancelled"));
                     drop(pending);
                 } else {
                     drop(pending);

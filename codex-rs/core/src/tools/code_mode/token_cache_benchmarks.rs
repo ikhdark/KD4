@@ -118,6 +118,8 @@ async fn nested_budget() {
         .collect::<String>();
     let artifact = create_raw_output_artifact(home.path(), "nested", source.as_bytes()).await;
     let base = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "command".into(),
         chunk_id: "chunk".into(),

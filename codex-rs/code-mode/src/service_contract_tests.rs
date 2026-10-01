@@ -355,6 +355,29 @@ async fn yields_again_after_the_previous_yield_was_observed() {
 }
 
 #[tokio::test]
+async fn passive_command_wait_has_no_default_nested_deadline() {
+    let (delegate, mut events_rx) = BlockingDelegate::new();
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let mut tool = blocking_tool();
+    tool.name = "write_stdin".into();
+    tool.tool_name = ToolName::plain("write_stdin");
+    tool.default_timeout_ms = Some(10);
+    let cell = service.execute(ExecuteRequest {
+        enabled_tools: vec![tool],
+        source: "await tools.write_stdin({session_id:7, wait_for_output:true}); text('completed');".into(),
+        yield_time_ms: Some(60_000),
+        ..execute_request("")
+    }).await.unwrap();
+    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(events_rx.try_recv().is_err(), "passive wait must not time out");
+    delegate.tool_release.notify_one();
+    let response = cell.initial_response().await.unwrap();
+    assert!(matches!(response, RuntimeResponse::Result { error_text: None, .. }));
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn bounded_parallel_nested_tool_timeout_rejects_only_the_expired_call() {
     let (delegate, mut events_rx) = BlockingDelegate::new();
     let service = InProcessCodeModeSession::with_delegate(delegate);

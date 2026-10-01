@@ -2138,6 +2138,7 @@ mod tests {
             cwd: cwd.to_path_buf(),
             originator: "codex".to_string(),
             cli_version: "0.0.0".to_string(),
+            harness_build: None,
             source: codex_protocol::protocol::SessionSource::Cli,
             model_provider: Some(model_provider.to_string()),
             ..Default::default()

@@ -150,12 +150,16 @@ impl LocalSecretsBackend {
 
     fn load_file(&self) -> Result<SecretsFile> {
         let path = self.secrets_path();
-        if !path.exists() {
-            return Ok(SecretsFile::new_empty());
-        }
-
-        let ciphertext = fs::read(&path)
-            .with_context(|| format!("failed to read secrets file at {}", path.display()))?;
+        let ciphertext = match fs::read(&path) {
+            Ok(ciphertext) => ciphertext,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SecretsFile::new_empty());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read secrets file at {}", path.display()));
+            }
+        };
         let passphrase = self.load_or_create_passphrase()?;
         let plaintext = decrypt_with_passphrase(&ciphertext, &passphrase)?;
         let mut parsed: SecretsFile = serde_json::from_slice(&plaintext).with_context(|| {
@@ -357,6 +361,27 @@ mod tests {
     use codex_keyring_store::tests::MockKeyringStore;
     use keyring::Error as KeyringError;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn list_distinguishes_missing_store_from_read_errors() -> Result<()> {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let keyring = Arc::new(MockKeyringStore::default());
+        let missing = LocalSecretsBackend::new(codex_home.path().join("missing"), keyring.clone());
+        assert!(missing.list(None)?.is_empty());
+
+        let invalid = LocalSecretsBackend::new(codex_home.path().join("invalid\0home"), keyring);
+        let error = invalid
+            .list(None)
+            .expect_err("an unreadable store must not be reported as empty");
+        assert!(error.to_string().contains("failed to read secrets file at"));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidInput)
+        );
+        Ok(())
+    }
 
     #[test]
     fn load_file_rejects_newer_schema_versions() -> Result<()> {

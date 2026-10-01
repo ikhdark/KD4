@@ -24,6 +24,68 @@ def publish_source_text() -> str:
 
 
 class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
+    def test_activation_guard_checks_other_chats_and_requires_force(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            sessions = home / "sessions" / "2026" / "10" / "01"
+            sessions.mkdir(parents=True)
+            completed = sessions / "rollout-completed.jsonl"
+            running = sessions / "rollout-other-chat.jsonl"
+            invalid = sessions / "rollout-invalid.jsonl"
+            # Analysis exports can resemble events but are not session rollouts.
+            (sessions / "condensed.jsonl").write_text(
+                '{"type":"event_msg","ptype":"task_started"}\n'
+            )
+            def event(kind: str, turn: str) -> str:
+                return json.dumps({"type": "event_msg", "payload": {
+                    "type": kind, "turn_id": turn,
+                }}) + "\n"
+            completed.write_text(event("task_started", "done") + event("task_complete", "done"))
+            running.write_text(event("task_started", "still-running"))
+            command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+$homePath = {ps_single_quote(home)}
+try {{
+    Assert-NoCodexRunningTurns -LocalCodexHome $homePath
+    throw 'guard did not block'
+}}
+catch {{
+    if ($_.Exception.Message -notlike '*Activation deferred*other-chat*still-running*') {{ throw }}
+}}
+Assert-NoCodexRunningTurns -LocalCodexHome $homePath -Force
+Add-Content -LiteralPath {ps_single_quote(running)} -Value '{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"still-running"}}}}'
+Assert-NoCodexRunningTurns -LocalCodexHome $homePath
+foreach ($invalidRecord in @(
+    '{{partial',
+    '{{"type":"event_msg"}}',
+    '{{"type":"event_msg","payload":null}}',
+    '{{"type":"event_msg","payload":{{}}}}',
+    '{{}}',
+    'null'
+)) {{
+    Set-Content -LiteralPath {ps_single_quote(invalid)} -Value $invalidRecord
+    try {{
+        Assert-NoCodexRunningTurns -LocalCodexHome $homePath
+        throw 'invalid state did not block'
+    }}
+    catch {{
+        if ($_.Exception.Message -notlike '*Cannot verify chat state*') {{ throw }}
+    }}
+    Assert-NoCodexRunningTurns -LocalCodexHome $homePath -Force
+}}
+# PowerShell -Command otherwise preserves the caught error's failing status.
+Write-Output 'guard checks passed'
+"""
+            result = subprocess.run(
+                [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                env=clean_env(), text=True, capture_output=True, check=False,
+                timeout=RUN_TIMEOUT_SECONDS, creationflags=CREATE_NO_WINDOW,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_desktop_executable_comes_from_package_manifest(self) -> None:
         shell = powershell()
         if shell is None:

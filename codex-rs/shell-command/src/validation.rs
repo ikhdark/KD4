@@ -169,6 +169,10 @@ fn classify_simple_script(script: &str, depth: usize) -> ValidationClassificatio
 }
 
 fn split_deterministic_script(script: &str) -> Option<(Vec<&str>, bool)> {
+    split_script(script, false)
+}
+
+fn split_script(script: &str, allow_pipelines: bool) -> Option<(Vec<&str>, bool)> {
     if script.contains("$(") || script.contains("${") || script.contains('`') {
         return None;
     }
@@ -203,6 +207,7 @@ fn split_deterministic_script(script: &str) -> Option<(Vec<&str>, bool)> {
             b';' | b'\r' | b'\n' => 1,
             b'&' if bytes.get(index + 1) == Some(&b'&') => 2,
             b'|' if bytes.get(index + 1) == Some(&b'|') => 2,
+            b'|' if allow_pipelines => 1,
             b'&' | b'|' => return None,
             _ => 0,
         };
@@ -1022,8 +1027,10 @@ pub fn is_build_or_discovery(program: &str, args: &[String]) -> bool {
 
 /// Reuse the shell classifier's quote-aware command splitting for observation
 /// policy. This does not authorize execution or establish validation coverage.
-pub fn script_has_build_or_discovery(script: &str) -> bool {
-    let Some((commands, _)) = split_deterministic_script(script) else {
+pub fn script_prefers_long_observation_wait(script: &str) -> bool {
+    // Pipelines can hide a native command's exit status, but not its need for
+    // a long observation window. Keep this separate from evidence classification.
+    let Some((commands, _)) = split_script(script, true) else {
         return false;
     };
     commands.into_iter().any(|command| {
@@ -1034,6 +1041,10 @@ pub fn script_has_build_or_discovery(script: &str) -> bool {
             return false;
         };
         is_build_or_discovery(&words[index], &words[index + 1..])
+            || matches!(
+                classify_argv(&words[index], &words[index + 1..]),
+                ValidationClassification::Validation { .. }
+            )
     })
 }
 
@@ -1087,10 +1098,10 @@ mod tests {
             let strings = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
             assert!(!is_build_or_discovery("just", &strings));
         }
-        assert!(script_has_build_or_discovery(
+        assert!(script_prefers_long_observation_wait(
             "cd repo; just --justfile justfile publish-local-codex-final -Verbose"
         ));
-        assert!(!script_has_build_or_discovery(
+        assert!(!script_prefers_long_observation_wait(
             "echo 'just publish-local-codex-final'"
         ));
     }
@@ -1106,10 +1117,10 @@ mod tests {
             "pnpm run build",
             "cargo +stable --locked nextest list",
         ] {
-            assert!(script_has_build_or_discovery(script), "{script}");
+            assert!(script_prefers_long_observation_wait(script), "{script}");
         }
         for script in ["echo 'cargo build'", "cat build.rs", "git status", "echo 'x && npm install'"] {
-            assert!(!script_has_build_or_discovery(script), "{script}");
+            assert!(!script_prefers_long_observation_wait(script), "{script}");
         }
     }
 

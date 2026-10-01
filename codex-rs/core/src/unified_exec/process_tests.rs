@@ -973,8 +973,11 @@ async fn fail_and_terminate_preserves_failure_message() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn stall_timeout_resets_on_stdout_and_stderr_then_terminates() {
+async fn stall_timeout_resets_on_stdout_and_stderr_then_yields_without_terminating() {
     let process = remote_process(WriteStatus::Accepted, None).await;
+    let notified = process.interaction_requested().notified_owned();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
     process.start_stall_watchdog(Some(100));
     tokio::task::yield_now().await;
     for stream in [ExecOutputStream::Stdout, ExecOutputStream::Stderr, ExecOutputStream::Stdout] {
@@ -985,11 +988,15 @@ async fn stall_timeout_resets_on_stdout_and_stderr_then_terminates() {
         assert_eq!(process.failure_message(), None);
     }
     tokio::time::advance(Duration::from_millis(101)).await;
-    tokio::time::timeout(Duration::from_secs(1), process.cancellation_token().cancelled()).await.unwrap();
-    assert!(process.has_exited());
-    assert!(process.termination_was_requested());
-    assert_eq!(process.failure_message().as_deref(), Some("command stalled after 100 milliseconds without stdout or stderr"));
-    assert_eq!(process.snapshot_output().await, b"progressprogressprogress");
+    tokio::time::timeout(Duration::from_secs(1), notified).await.unwrap();
+    assert!(!process.has_exited());
+    assert!(!process.termination_was_requested());
+    assert_eq!(process.failure_message(), None);
+    let output = String::from_utf8(process.snapshot_output().await).unwrap();
+    assert!(output.starts_with("progressprogressprogress"));
+    assert!(output.contains("stalled after 100 milliseconds"));
+    assert!(output.contains("still running, not terminated"));
+    process.terminate_confirmed().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

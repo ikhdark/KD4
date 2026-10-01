@@ -69,6 +69,8 @@ fn command_timing_normalization_preserves_substantive_data_and_failure_status() 
 #[test]
 fn exec_validation_timing_is_stable_without_normalizing_source_reads() {
     let output = |command: &str, seconds: &str, exit_code: i32| ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "timing".into(),
         chunk_id: "chunk".into(),
@@ -805,6 +807,7 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
             }
         })],
         omitted_result_count: 0,
+        unactivated_matches: Vec::new(),
     };
     assert_eq!(
         output.code_mode_result(&payload),
@@ -869,6 +872,7 @@ fn partial_tool_search_outputs_are_model_visible_as_incomplete() {
     let output = ToolSearchOutput {
         tools: Vec::new(),
         omitted_result_count: 1,
+        unactivated_matches: Vec::new(),
     };
     assert_eq!(
         output.code_mode_result(&payload),
@@ -1130,6 +1134,8 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         arguments: "{}".to_string(),
     };
     let response = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-42".to_string(),
         chunk_id: "abc123".to_string(),
@@ -1181,6 +1187,8 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
 #[test]
 fn retained_exec_command_process_is_yielded_not_timed_out() {
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "retained-call".to_string(),
         chunk_id: "retained-chunk".to_string(),
@@ -1229,6 +1237,8 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
 #[test]
 fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "missing-exit-call".to_string(),
         chunk_id: "missing-exit-chunk".to_string(),
@@ -1268,6 +1278,8 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
         arguments: "{}".to_string(),
     };
     let mut output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "decoding-call".to_string(),
         chunk_id: "decoding-chunk".to_string(),
@@ -1351,6 +1363,8 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
 #[test]
 fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "pending-output-call".to_string(),
         chunk_id: "pending-output-chunk".to_string(),
@@ -1389,6 +1403,8 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
 fn exec_command_projection_metadata_preserves_authoritative_first_output() {
     let raw_output = "first output line\n".repeat(100);
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-first-output".to_string(),
         chunk_id: "chunk-first-output".to_string(),
@@ -1437,6 +1453,8 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
 #[test]
 fn token_efficiency_exec_projection_reports_truncation_once() {
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-hard-limit".to_string(),
         chunk_id: "chunk-hard-limit".to_string(),
@@ -1472,6 +1490,8 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
 #[test]
 fn exec_command_projection_reports_reduction_from_per_call_limit() {
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-per-call-limit".to_string(),
         chunk_id: "chunk-per-call-limit".to_string(),
@@ -1505,6 +1525,8 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         .collect::<Vec<_>>()
         .join("\n");
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-complete-output".to_string(),
         chunk_id: "chunk-complete-output".to_string(),
@@ -1583,6 +1605,8 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         .collect::<Vec<_>>()
         .join("\n");
     let response = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-live".to_string(),
         chunk_id: "chunk-live".to_string(),
@@ -1627,6 +1651,8 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     let artifact_path =
         std::path::PathBuf::from(format!(r"C:\codex\tool-output\{artifact_id}.log"));
     let mut output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-summary".to_string(),
         chunk_id: "chunk-summary".to_string(),
@@ -1730,6 +1756,8 @@ async fn artifact_backed_exec_output(
         .join("tool-output/thread")
         .join(format!("{artifact_id}.log"));
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-artifact".to_string(),
         chunk_id: "chunk-artifact".to_string(),

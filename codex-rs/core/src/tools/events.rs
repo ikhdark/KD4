@@ -1155,25 +1155,8 @@ async fn emit_exec_end(
         None => None,
     };
     if let Some(message) = invalidation_warning {
-        // A UI warning alone cannot constrain the model's clean-workspace claim.
-        let warning_persistence = ctx
-            .session
-            .record_conversation_items(
-                ctx.turn,
-                &[codex_protocol::models::ResponseItem::Message {
-                    id: None,
-                    role: "developer".to_string(),
-                    content: vec![codex_protocol::models::ContentItem::InputText {
-                        text: message.to_string(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                }],
-            )
-            .await;
-        if persistence_result.is_ok() {
-            persistence_result = warning_persistence.map_err(Into::into);
-        }
+        // Diff-display uncertainty belongs in the UI, not in model history.
+        // Source-evidence invalidation above remains authoritative and separate.
         ctx.session
             .send_event(
                 ctx.turn,
@@ -2682,12 +2665,6 @@ mod tests {
                 if unified_diff.contains("changed.txt") && unified_diff.contains("+after"))
             );
         } else {
-            let recorded = events.next().expect("model-visible uncertainty warning");
-            assert!(matches!(recorded.msg, EventMsg::RawResponseItem(event)
-                if matches!(&event.item, codex_protocol::models::ResponseItem::Message { role, content, .. }
-                    if role == "developer" && content.iter().any(|part| matches!(part,
-                        codex_protocol::models::ContentItem::InputText { text }
-                            if text.contains("without fresh workspace verification"))))));
             let warning = events.next().expect("unknown command diff warning");
             assert!(matches!(warning.msg, EventMsg::Warning(event)
                 if event.message.contains("The turn diff is unavailable")
@@ -2701,7 +2678,7 @@ mod tests {
         );
         let history = session.clone_history().await;
         if !apply_patch {
-            assert!(history.raw_items().iter().any(|item| matches!(item,
+            assert!(!history.raw_items().iter().any(|item| matches!(item,
                 codex_protocol::models::ResponseItem::Message { role, content, .. }
                     if role == "developer" && content.iter().any(|part| matches!(part,
                         codex_protocol::models::ContentItem::InputText { text }

@@ -34,18 +34,9 @@ use super::handle_runtime_response;
 use super::wait_spec::create_wait_tool;
 
 const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(2);
-// A held wait that sees no explicit yield or completion for this long returns
-// control to the model as a live-cell yield instead of blocking silently. The
-// cell keeps running; nothing is terminated. A one-hour bound left a recorded
-// full-suite run invisible for ten minutes until the user aborted it.
-const OWNER_HELD_WAIT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// Default for a nested terminal poll whose caller omitted its deadline. It
-/// must end inside the held wait above: an equal default always loses that
-/// race, so the cell yields first and the model spends a `wait` call to collect
-/// a result that was milliseconds away. The headroom covers dispatch and the
-/// short setup a cell typically runs before it starts polling.
-pub(crate) const NESTED_DEFAULT_POLL: Duration =
-    OWNER_HELD_WAIT_TIMEOUT.saturating_sub(Duration::from_secs(15));
+/// Compatibility default for bounded polls. Passive wait_for_output owns
+/// continuation internally; cell waits wake on decisions or input, not silence.
+pub(crate) const NESTED_DEFAULT_POLL: Duration = Duration::from_secs(285);
 
 pub struct CodeModeWaitHandler;
 
@@ -64,9 +55,6 @@ struct ExecWaitArgs {
 pub(super) enum OwnerHeldCodeModeExit {
     Runtime(codex_code_mode::WaitOutcome),
     InputActivity(InputQueueActivity),
-    /// The cell produced no state change within `OWNER_HELD_WAIT_TIMEOUT`.
-    /// It is still running; the model gets a yield so it can report or check.
-    IdleTimeout,
 }
 
 #[derive(Debug)]
@@ -194,9 +182,6 @@ impl CodeModeWaitHandler {
                             codex_code_mode::WaitOutcome::LiveCell(input_activity_response(
                                 &cell_id, activity,
                             ))
-                        }
-                        OwnerHeldCodeModeExit::IdleTimeout => {
-                            codex_code_mode::WaitOutcome::LiveCell(idle_timeout_response(&cell_id))
                         }
                     };
                     Ok((response, held.drained_observations))
@@ -425,31 +410,6 @@ where
         activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
             Ok(steered(activity))
         }
-        _ = tokio::time::sleep(OWNER_HELD_WAIT_TIMEOUT) => {
-            // Silence is not failure: the runtime has not reported completion,
-            // so the cell is still live. Hand control back as a yield rather
-            // than terminating work the model may need to keep waiting on.
-            Ok(OwnerHeldCodeModeWait {
-                exit: OwnerHeldCodeModeExit::IdleTimeout,
-                drained_observations: 0,
-            })
-        }
-    }
-}
-
-pub(super) fn idle_timeout_response(
-    cell_id: &codex_code_mode::CellId,
-) -> codex_code_mode::RuntimeResponse {
-    codex_code_mode::RuntimeResponse::Yielded {
-        cell_id: cell_id.clone(),
-        content_items: vec![codex_code_mode::FunctionCallOutputContentItem::InputText {
-            text: format!(
-                "No explicit yield or completion from this cell for {}s. Output remains buffered. The cell and any command \
-                 sessions it started are still running; nothing was terminated. Call wait again \
-                 to keep waiting, or inspect its logs or processes first. Do not restart the work.",
-                OWNER_HELD_WAIT_TIMEOUT.as_secs()
-            ),
-        }],
     }
 }
 
@@ -1089,9 +1049,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn held_wait_yields_at_the_idle_bound_without_failing() {
+    async fn held_wait_ignores_silence_but_wakes_for_input() {
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
+        let (activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
         let held = tokio::spawn(async move {
             hold_until_state_change(
                 std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
@@ -1108,32 +1068,20 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!held.is_finished());
 
-        tokio::time::advance(OWNER_HELD_WAIT_TIMEOUT - Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::task::yield_now().await;
+        assert!(!held.is_finished());
+        activity_tx.send(InputQueueActivity::Steer).unwrap();
         let held = held
             .await
             .expect("held wait task")
-            .expect("the idle bound yields to the model instead of failing the wait");
-        assert!(matches!(held.exit, OwnerHeldCodeModeExit::IdleTimeout));
+            .expect("input wakes the held wait");
+        assert!(matches!(held.exit, OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer)));
         assert_eq!(held.drained_observations, 0);
-
-        let cell_id = codex_code_mode::CellId::new("cell-a".to_string());
-        let codex_code_mode::RuntimeResponse::Yielded {
-            cell_id: yielded_cell_id,
-            content_items,
-        } = idle_timeout_response(&cell_id)
-        else {
-            panic!("idle timeout must present as a live-cell yield");
-        };
-        assert_eq!(yielded_cell_id, cell_id);
-        assert!(matches!(
-            content_items.as_slice(),
-            [codex_code_mode::FunctionCallOutputContentItem::InputText { text }]
-                if text.contains("300s") && text.contains("still running")
-        ));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn owner_timeout_reaches_the_real_code_mode_state_change_path() {
+    async fn real_code_mode_wait_survives_silence_until_steered() {
         // Runtime initialization runs on a native thread, outside Tokio's paused clock.
         tokio::time::resume();
         let service = Arc::new(crate::tools::code_mode::CodeModeService::new(Arc::new(
@@ -1165,7 +1113,7 @@ mod tests {
         tokio::time::pause();
         let wait_service = Arc::clone(&service);
         let wait_cell_id = cell_id.clone();
-        let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
+        let (activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
         let held = tokio::spawn(async move {
             let cancellation = tokio_util::sync::CancellationToken::new();
             hold_until_state_change(
@@ -1182,14 +1130,17 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        tokio::time::advance(OWNER_HELD_WAIT_TIMEOUT).await;
+        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::task::yield_now().await;
+        assert!(!held.is_finished());
+        activity_tx.send(InputQueueActivity::Steer).unwrap();
         let held = held
             .await
             .expect("real state-change wait task")
-            .expect("real state-change wait should yield at the owner bound");
-        assert!(matches!(held.exit, OwnerHeldCodeModeExit::IdleTimeout));
+            .expect("real state-change wait should wake on steering");
+        assert!(matches!(held.exit, OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer)));
 
-        // The bound released the wait without touching the cell: it is still
+        // Steering released the wait without touching the cell: it is still
         // live, so explicit termination is what ends it.
         assert!(matches!(
             service

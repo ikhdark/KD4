@@ -30,6 +30,8 @@ param(
     [switch]$ConfigureDesktopLocalCli,
     [switch]$RestartDesktop,
     [switch]$RestartDesktopIfNeeded,
+    # Explicitly permit interruption of other chats during activation.
+    [switch]$Force,
     [ValidateSet("User", "Process")]
     [string]$DesktopCliEnvironmentTarget = "User",
     [string]$LocalCodexHome = $env:CODEX_LOCAL_CODEX_HOME,
@@ -2289,9 +2291,70 @@ function Test-DesktopRuntimeProof {
     }
 }
 
+function Assert-NoCodexRunningTurns {
+    param([string]$LocalCodexHome, [switch]$Force)
+
+    if ($Force) { return }
+    if ([string]::IsNullOrWhiteSpace($LocalCodexHome)) {
+        throw "Cannot verify running chats without LocalCodexHome. Refusing activation; use -Force to override."
+    }
+    $sessions = Join-Path $LocalCodexHome "sessions"
+    if (-not (Test-Path -LiteralPath $sessions)) { return }
+    $unfinished = [System.Collections.Generic.List[string]]::new()
+    # Active rollouts are materialized as JSONL. Completed compressed rollouts
+    # cannot contain a live writer. Read every chat, not just the caller's host.
+    foreach ($file in Get-ChildItem -LiteralPath $sessions -Recurse -File -Filter "rollout-*.jsonl") {
+        $active = @{}
+        $reader = [IO.File]::OpenText($file.FullName)
+        try {
+            while ($null -ne ($line = $reader.ReadLine())) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                try {
+                    $record = ConvertFrom-Json -InputObject $line -ErrorAction Stop
+                    if ($record -isnot [pscustomobject] -or
+                        $null -eq $record.PSObject.Properties["type"] -or
+                        $record.type -isnot [string]) {
+                        throw "Invalid rollout record type."
+                    }
+                    if ($record.type -ne "event_msg") { continue }
+                    $payloadProperty = $record.PSObject.Properties["payload"]
+                    if ($null -eq $payloadProperty -or $payloadProperty.Value -isnot [pscustomobject]) {
+                        throw "Invalid rollout event payload."
+                    }
+                    $payload = $payloadProperty.Value
+                    if ($null -eq $payload.PSObject.Properties["type"] -or $payload.type -isnot [string]) {
+                        throw "Invalid rollout event type."
+                    }
+                }
+                catch {
+                    throw "Cannot verify chat state in $($file.FullName); refusing activation. Retry after writes settle or use -Force."
+                }
+                if ($payload.type -notin @("task_started", "turn_started", "task_complete", "turn_complete", "turn_aborted")) {
+                    continue
+                }
+                $id = if ($payload.PSObject.Properties["turn_id"]) { [string]$payload.turn_id } else { "<unknown>" }
+                if ($payload.type -in @("task_started", "turn_started")) {
+                    $active[$id] = $true
+                }
+                else {
+                    $active.Remove($id)
+                }
+            }
+        }
+        finally {
+            $reader.Dispose()
+        }
+        foreach ($id in $active.Keys) { $unfinished.Add("$($file.Name):$id") }
+    }
+    if ($unfinished.Count -gt 0) {
+        throw "Activation deferred: $($unfinished.Count) chat turn(s) have no recorded completion. Wait for them to finish, or use -Force to explicitly allow interruption. $($unfinished -join ', ')"
+    }
+}
+
 function Restart-CodexDesktop {
     param(
         [switch]$DryRun,
+        [switch]$Force,
         [string]$LocalCliPath,
         [string]$LocalCodexHome,
         [string]$LocalCodexSqliteHome,
@@ -2319,6 +2382,8 @@ function Restart-CodexDesktop {
     if ([string]::IsNullOrWhiteSpace($LocalCodexHome)) {
         throw "LocalCodexHome is required to prove the restarted Desktop fork runtime."
     }
+
+    Assert-NoCodexRunningTurns -LocalCodexHome $LocalCodexHome -Force:$Force
 
     # Match on the resolved desktop executable path so codex CLI sessions
     # (same process name, different binary) are never killed.
@@ -4057,6 +4122,11 @@ if ($null -ne $turnHostProcess) {
     }
 }
 
+if (-not $DryRun -and ($binaryChanged -or $RestartDesktop -or $RestartDesktopIfNeeded)) {
+    # Run before closing target processes, replacing binaries, or changing routing.
+    Assert-NoCodexRunningTurns -LocalCodexHome $LocalCodexHome -Force:$Force
+}
+
 $desktopRoutingResult = [pscustomobject]@{
     Changed = $false
     RestartRequired = $false
@@ -4122,10 +4192,10 @@ if ($DryRun) {
     }
     if ($RestartDesktop) {
         if ($ConfigureDesktopLocalCli) {
-            Restart-CodexDesktop -DryRun -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+            Restart-CodexDesktop -DryRun -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
         }
         else {
-            Restart-CodexDesktop -DryRun -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+            Restart-CodexDesktop -DryRun -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
         }
     }
     if (-not [string]::IsNullOrWhiteSpace($staleSourceBuildFailureMessage)) {
@@ -4198,10 +4268,10 @@ if (-not $binaryChanged) {
     if ($RestartDesktop) {
         try {
             if ($ConfigureDesktopLocalCli) {
-                Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+                Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
             }
             else {
-                Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+                Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
             }
             Write-ProofLine "restartFailed" "false"
         }
@@ -4371,10 +4441,10 @@ Write-ProofLine "publishCommitted" "true"
 if ($RestartDesktop) {
     try {
         if ($ConfigureDesktopLocalCli) {
-            Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+            Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
         }
         else {
-            Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
+            Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
         }
         Write-ProofLine "restartFailed" "false"
     }

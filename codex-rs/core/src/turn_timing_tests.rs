@@ -51,6 +51,41 @@ use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NS_PER_MS: u128 = 1_000_000;
 
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn timing_details_are_recoverable_without_repeating_them_in_the_rollout() {
+    use crate::tools::command_output_artifact::ToolOutputSelector;
+    use crate::tools::command_output_artifact::read_tool_output_selectors;
+    let home = tempfile::tempdir().unwrap();
+    let call = codex_protocol::protocol::TurnTimingToolCall {
+        call_id: "call-1".into(),
+        lifecycle_events: vec![TurnTimingToolLifecycleEvent {
+            boundary: ToolLifecycleBoundary::ProcessExit,
+            at_ms: 123,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let timing = TurnTiming {
+        inclusive_duration_ms: 456,
+        tool_calls: vec![call.clone()],
+        ..Default::default()
+    };
+    let compact = super::retain_turn_timing_details(timing.clone(), home.path(), "thread").await;
+    assert_eq!(compact.inclusive_duration_ms, 456);
+    assert_eq!(compact.tool_calls[0].call_id, call.call_id);
+    assert!(compact.tool_calls[0].lifecycle_events.is_empty());
+    let artifact = read_tool_output_selectors(
+        home.path(), "thread", compact.tool_call_details_artifact_id.as_ref().unwrap(),
+        vec![ToolOutputSelector::JsonPointer { pointer: "/0/lifecycleEvents".into() }],
+    ).await.unwrap();
+    assert_eq!(artifact.results[0].value, Some(serde_json::to_value(&call.lifecycle_events).unwrap()));
+    let not_a_directory = home.path().join("file");
+    std::fs::write(&not_a_directory, "occupied").unwrap();
+    let fallback = super::retain_turn_timing_details(timing.clone(), &not_a_directory, "thread").await;
+    assert_eq!(fallback, timing);
+}
+
 #[derive(Debug)]
 struct FakeClock {
     sample: Mutex<TimeSample>,
@@ -169,6 +204,76 @@ fn timing() -> (Arc<FakeClock>, Arc<TurnTimingState>) {
     let clock = Arc::new(FakeClock::new(0, 0));
     let state = Arc::new(TurnTimingState::with_clock(clock.clone()));
     (clock, state)
+}
+
+#[tokio::test]
+async fn checkout_snapshot_retains_only_pre_dispatch_results() {
+    for result in [Some("checkout-hash".to_string()), None] {
+        let (_clock, state) = timing();
+        state.mark_turn_started();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let captured = result.clone();
+        let task = tokio::spawn(async move {
+            ready_tx.send(()).unwrap();
+            captured
+        });
+        *state.checkout_snapshot.lock().unwrap() =
+            super::CheckoutSnapshotCapture::Pending(tokio_util::task::AbortOnDropHandle::new(task));
+        ready_rx.await.unwrap();
+
+        state.record_model_request_payload("request", "attempt", b"{}");
+        // Later sampling steps and retries must not capture a post-tool checkout.
+        state.start_checkout_snapshot(std::path::Path::new("must-not-be-read"));
+        state.record_model_request_payload("request", "retry", b"{}");
+        assert!(matches!(
+            *state.checkout_snapshot.lock().unwrap(),
+            super::CheckoutSnapshotCapture::Closed
+        ));
+        let timing = state.complete_snapshot().protocol_timing();
+        assert_eq!(timing.checkout_snapshot_sha256, result);
+        let serialized = serde_json::to_value(timing).unwrap();
+        assert_eq!(
+            serialized.get("checkoutSnapshotSha256").is_some(),
+            result.is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn checkout_snapshot_cancels_pending_work_without_waiting() {
+    for boundary in ["dispatch", "completion", "drop"] {
+        let (_clock, state) = timing();
+        state.mark_turn_started();
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let guard = cancelled.clone().drop_guard();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<Option<String>>().await
+        });
+        *state.checkout_snapshot.lock().unwrap() =
+            super::CheckoutSnapshotCapture::Pending(tokio_util::task::AbortOnDropHandle::new(task));
+        // Starting another sampling step must not replace the in-flight capture.
+        state.start_checkout_snapshot(std::path::Path::new("must-not-be-read"));
+        match boundary {
+            "dispatch" => {
+                state.record_model_request_payload("request", "attempt", b"{}");
+                state.start_checkout_snapshot(std::path::Path::new("must-not-be-read"));
+                assert!(matches!(
+                    *state.checkout_snapshot.lock().unwrap(),
+                    super::CheckoutSnapshotCapture::Closed
+                ));
+                assert!(state.complete_snapshot().checkout_snapshot_sha256.is_none());
+            }
+            "completion" => {
+                assert!(state.complete_snapshot().checkout_snapshot_sha256.is_none());
+            }
+            "drop" => drop(state),
+            _ => unreachable!(),
+        }
+        tokio::time::timeout(Duration::from_secs(1), cancelled.cancelled())
+            .await
+            .expect("pending checkout capture must be cancelled");
+    }
 }
 
 #[test]

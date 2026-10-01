@@ -9,7 +9,9 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use futures::FutureExt;
 use tokio::sync::Notify;
+use tokio_util::task::AbortOnDropHandle;
 
 use codex_analytics::TurnProfile;
 use codex_otel::TURN_TTFM_DURATION_METRIC;
@@ -189,8 +191,16 @@ impl TurnClock for SystemTurnClock {
     }
 }
 
+#[derive(Default)]
+enum CheckoutSnapshotCapture {
+    #[default]
+    NotStarted,
+    Pending(AbortOnDropHandle<Option<String>>),
+    Closed,
+}
+
 pub(crate) struct TurnTimingState {
-    checkout_snapshot: tokio::sync::OnceCell<Option<String>>,
+    checkout_snapshot: StdMutex<CheckoutSnapshotCapture>,
     clock: Arc<dyn TurnClock>,
     state: StdMutex<TurnTimingStateInner>,
     relay_queue_depth: AtomicU32,
@@ -682,6 +692,7 @@ impl TurnTimingSnapshot {
             terminalization: profile.terminalization.clone(),
             model_requests,
             tool_calls: profile.tool_calls.clone(),
+            tool_call_details_artifact_id: None,
             tool_call_timing_overflow: profile.tool_call_timing_overflow,
             tool_closure: profile.tool_closure.clone(),
             observational_nonprogress_tokens,
@@ -694,6 +705,36 @@ impl TurnTimingSnapshot {
             pre_first_model_output,
         }
     }
+}
+
+/// Reuse the authenticated, bounded artifact store instead of inventing a
+/// second side-file lifecycle. Keep inline evidence if durable retention fails.
+pub(crate) async fn retain_turn_timing_details(
+    mut timing: TurnTiming,
+    codex_home: &std::path::Path,
+    thread_id: &str,
+) -> TurnTiming {
+    if timing.tool_calls.iter().all(|call| {
+        call.lifecycle_events.is_empty() && call.timer_waits.is_empty()
+    }) {
+        return timing;
+    }
+    let Ok(bytes) = serde_json::to_vec(&timing.tool_calls) else {
+        return timing;
+    };
+    let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+        codex_home, thread_id, &bytes,
+    ).await;
+    if let crate::tools::command_output_artifact::RawOutputArtifact::Stored {
+        id, truncated: false, ..
+    } = artifact {
+        timing.tool_call_details_artifact_id = Some(id.to_string());
+        for call in &mut timing.tool_calls {
+            call.lifecycle_events.clear();
+            call.timer_waits.clear();
+        }
+    }
+    timing
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1520,12 +1561,37 @@ impl TurnTimingState {
         state.start(sample)
     }
 
-    pub(crate) async fn capture_checkout_snapshot(&self, cwd: &std::path::Path) {
-        self.checkout_snapshot.get_or_init(|| async {
-            let hash = crate::git_workspace::capture_checkout_snapshot(cwd).await;
-            self.state().checkout_snapshot_sha256 = hash.clone();
-            hash
-        }).await;
+    pub(crate) fn start_checkout_snapshot(&self, cwd: &std::path::Path) {
+        let mut capture = self
+            .checkout_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*capture, CheckoutSnapshotCapture::NotStarted) {
+            let cwd = cwd.to_path_buf();
+            *capture = CheckoutSnapshotCapture::Pending(AbortOnDropHandle::new(tokio::spawn(
+                async move { crate::git_workspace::capture_checkout_snapshot(&cwd).await },
+            )));
+        }
+    }
+
+    /// Provenance is optional: never delay dispatch or let a capture include later tool edits.
+    /// Poll once, retaining only an already completed hash and aborting unfinished work on drop.
+    fn finish_checkout_snapshot(&self) {
+        let capture = {
+            let mut capture = self
+                .checkout_snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *capture, CheckoutSnapshotCapture::Closed)
+        };
+        if let CheckoutSnapshotCapture::Pending(task) = capture
+            && let Some(Ok(Some(hash))) = task.now_or_never()
+        {
+            let mut state = self.state();
+            if state.completed_snapshot.is_none() {
+                state.checkout_snapshot_sha256 = Some(hash);
+            }
+        }
     }
 
     /// Capture the dispatched bytes independently of optional post-dispatch
@@ -1536,6 +1602,7 @@ impl TurnTimingState {
         physical_attempt_id: &str,
         bytes: &[u8],
     ) {
+        self.finish_checkout_snapshot();
         let hash = format!("{:x}", Sha256::digest(bytes));
         let sections = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(bytes)
             .ok()
@@ -1570,6 +1637,7 @@ impl TurnTimingState {
     }
 
     pub(crate) fn complete_snapshot(&self) -> TurnTimingSnapshot {
+        self.finish_checkout_snapshot();
         let mut state = self.state();
         let sample = self.clock.sample();
         state.complete(sample)

@@ -128,6 +128,15 @@ impl PlanStore {
     ) -> Result<PlanStoreUpdate, String> {
         let mut current = self.current.lock().await;
         let next = if let Some(plan) = plan {
+            if let Some(previous) = current.as_ref()
+                && previous.plan.iter().any(|item| {
+                    item.status != StepStatus::Completed
+                        && !plan.iter().any(|next| next.step == item.step)
+                })
+                && explanation.as_deref().is_none_or(|text| text.trim().is_empty())
+            {
+                return Err("Revising or removing unfinished steps requires an explanation that accounts for their remaining obligations. A plan revision does not authorize narrowing the user's request.".to_string());
+            }
             UpdatePlanArgs {
                 explanation,
                 plan,
@@ -231,6 +240,24 @@ mod tests {
                 status,
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn unfinished_scope_cannot_disappear_without_an_accounted_revision() {
+        let store = PlanStore::default();
+        let original = plan("Review every warning against source", StepStatus::InProgress);
+        store.update(original.clone()).await;
+        let narrower = plan("Inventory warnings", StepStatus::Completed);
+        for explanation in [None, Some("  ".to_string())] {
+            assert!(store.update_tool(Some(narrower.plan.clone()), None, explanation).await.is_err());
+            assert_eq!(store.snapshot().await, Some(original.clone()));
+        }
+        let revised = store.update_tool(
+            Some(narrower.plan),
+            None,
+            Some("The user cancelled source review and requested only an inventory.".to_string()),
+        ).await.expect("explicitly accounted scope revision");
+        assert_eq!(revised.effect, PlanUpdateEffect::StructuralRevision);
     }
 
     #[tokio::test]

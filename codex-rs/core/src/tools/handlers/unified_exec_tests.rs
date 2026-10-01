@@ -136,12 +136,24 @@ fn stall_timeout_exec_command_defaults_and_overrides() {
     assert!(validate_exec_command_arguments(
         &serde_json::json!({"cmd": "must-not-run", "stall_timeout_ms": -1}).to_string()
     ).is_err());
-    for command in ["cd x && cargo build", "npm install", "go build ./...", "dotnet build", "git clone repo"] {
+    for command in [
+        "cd x && cargo build",
+        "npm install",
+        "go build ./...",
+        "dotnet build",
+        "git clone repo",
+        "python scripts/validate.py run library | ForEach-Object { $_ | ConvertFrom-Json }; exit $LASTEXITCODE",
+        "cargo test -p codex-core | ForEach-Object { $_ }",
+    ] {
         let decoded: ExecCommandArgs = parse_arguments(&serde_json::json!({"cmd": command}).to_string()).unwrap();
-        assert_eq!(decoded.stall_timeout_ms, None);
+        assert_eq!(decoded.stall_timeout_ms, None, "{command}");
         let decoded: ExecCommandArgs = parse_arguments(&serde_json::json!({"cmd": command, "stall_timeout_ms": 123}).to_string()).unwrap();
         assert_eq!(decoded.stall_timeout_ms, Some(123));
     }
+    let decoded: ExecCommandArgs = parse_arguments(
+        &serde_json::json!({"cmd": "Write-Output 'cargo test' | ForEach-Object { $_ }"}).to_string(),
+    ).unwrap();
+    assert_eq!(decoded.stall_timeout_ms, Some(60_000));
 }
 
 #[test]
@@ -166,11 +178,11 @@ fn publishing_exec_command_preserves_explicit_observation_and_stall_overrides() 
 }
 
 #[tokio::test]
-async fn stall_timeout_exec_command_terminates_between_polls() {
+async fn stall_timeout_exec_command_preserves_session_between_polls() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
             "program": "python",
-            "args": ["-c", "import time; print('ready', flush=True); time.sleep(30)"],
+            "args": ["-c", "import time; print('ready', flush=True); time.sleep(8)"],
             "stall_timeout_ms": 3500,
             "yield_time_ms": 250,
         }).to_string(),
@@ -188,9 +200,9 @@ async fn stall_timeout_exec_command_terminates_between_polls() {
     // No polling or input keeps the watchdog alive: the process owns it.
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     let poll = ToolInvocation {
-        session,
-        step_context,
-        tracker,
+        session: Arc::clone(&session),
+        step_context: Arc::clone(&step_context),
+        tracker: Arc::clone(&tracker),
         call_id: "stall-timeout-poll".to_string(),
         tool_name: codex_tools::ToolName::plain("write_stdin"),
         source: ToolCallSource::Direct,
@@ -199,12 +211,31 @@ async fn stall_timeout_exec_command_terminates_between_polls() {
         },
         cancellation_token: tokio_util::sync::CancellationToken::new(),
     };
-    let error = WriteStdinHandler::default()
+    let output = WriteStdinHandler::default()
         .handle(poll)
         .await
-        .err()
-        .expect("stalled command must fail");
-    assert!(error.to_string().contains("command stalled after 3500 milliseconds"), "{error}");
+        .expect("stalled command returns its live session");
+    assert!(output.success_for_logging());
+    let result = output.code_mode_result(&payload);
+    assert!(result["output"].as_str().unwrap().contains("command stalled after 3500 milliseconds"));
+    assert_eq!(result["execution_state"], "running");
+    assert_eq!(result["process_exited"], false);
+    assert_eq!(result["session_id"], process_id);
+    assert!(result["output"].as_str().unwrap().contains("ready"));
+    let wait_payload = ToolPayload::Function {
+        arguments: serde_json::json!({"session_id":process_id, "wait_for_output":true}).to_string(),
+    };
+    let completed = WriteStdinHandler::default().handle(ToolInvocation {
+        session, step_context, tracker,
+        call_id: "stall-timeout-completion".into(),
+        tool_name: codex_tools::ToolName::plain("write_stdin"),
+        source: ToolCallSource::Direct,
+        payload: wait_payload.clone(),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+    }).await.unwrap().code_mode_result(&wait_payload);
+    assert_eq!(completed["exit_code"], 0);
+    assert_eq!(completed["execution_state"], "exited");
+    assert_eq!(completed["stdout"].as_str().unwrap().trim(), "ready");
 }
 
 #[test]
@@ -238,6 +269,53 @@ fn exec_command_boundary_reports_branch_field_and_bound_errors() {
     .unwrap();
     assert_eq!(adjusted.yield_time_ms, 250);
     assert!(adjusted.argument_notices.iter().any(|notice| notice.contains("250")));
+}
+
+#[tokio::test]
+async fn exec_command_keeps_exact_json_stdout_separate_from_display_and_stderr() {
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": "python",
+            "args": ["-c", "import json,sys; print('progress', file=sys.stderr); print(json.dumps({'value':'x'*12000}))"],
+            "max_output_tokens": 64,
+            "yield_time_ms": 30000,
+        }).to_string(),
+    };
+    let invocation = invocation_for_payload_without_sandbox(
+        "exec_command", "exact-json-streams", payload.clone(),
+    ).await;
+    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+    let result = output.code_mode_result(&payload);
+    assert_eq!(result["process_exited"], true);
+    assert_eq!(result["streams_complete"], true);
+    assert_eq!(result["output_reduced"], true);
+    let parsed: serde_json::Value = serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed["value"].as_str().unwrap().len(), 12000);
+    assert_eq!(result["stderr"].as_str().unwrap().trim(), "progress");
+    let visible = codex_code_mode::model_visible_tool_result(
+        &codex_tools::ToolName::plain("exec_command"), &result,
+    ).unwrap();
+    assert!(visible.get("stdout").is_none());
+    assert!(visible.get("stderr").is_none());
+    assert_eq!(visible["output"], result["output"]);
+    let tty_payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": "python",
+            "args": ["-c", "import sys; print('out'); print('err', file=sys.stderr)"],
+            "tty": true,
+            "yield_time_ms": 30000,
+        }).to_string(),
+    };
+    let invocation = invocation_for_payload_without_sandbox(
+        "exec_command", "merged-terminal-streams", tty_payload.clone(),
+    ).await;
+    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+    let result = output.code_mode_result(&tty_payload);
+    assert_eq!(result["process_exited"], true);
+    assert_eq!(result["streams_complete"], false);
+    assert!(result.get("stdout").is_none());
+    assert!(result.get("stderr").is_none());
+    assert!(result["output"].as_str().unwrap().contains("err"));
 }
 
 #[test]
@@ -484,6 +562,8 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
     let raw_output = b"ParserError: Unexpected token 'foo'".to_vec();
     let existing_repair_notice = "Preflight repaired the command.";
     let mut output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-parser-failure".to_string(),
         chunk_id: "chunk-parser-failure".to_string(),
@@ -569,6 +649,8 @@ fn terminal_powershell_nonterminating_error_exposes_recovery_hint_after_success(
     assert!(String::from_utf8_lossy(&result.stderr).contains("PositionalParameterNotFound"));
     let raw_output = [result.stdout, result.stderr].concat();
     let mut output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-nonterminating-error".to_string(),
         chunk_id: "chunk-nonterminating-error".to_string(),
@@ -2614,6 +2696,8 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         arguments: serde_json::json!({ "cmd": "echo three", "tty": false }).to_string(),
     };
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-43".to_string(),
         chunk_id: "chunk-1".to_string(),
@@ -2651,6 +2735,8 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         arguments: serde_json::json!({ "cmd": "echo three", "tty": true }).to_string(),
     };
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "call-44".to_string(),
         chunk_id: "chunk-1".to_string(),
@@ -2689,6 +2775,8 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         arguments: serde_json::json!({ "cmd": "echo three", "tty": false }).to_string(),
     };
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "event-45".to_string(),
         chunk_id: "chunk-1".to_string(),
@@ -2722,6 +2810,8 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         .to_string(),
     };
     let output = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "exec-call-45".to_string(),
         chunk_id: "chunk-2".to_string(),
@@ -2790,6 +2880,8 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         arguments: serde_json::json!({ "session_id": 45, "chars": "" }).to_string(),
     };
     let output_a = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "exec-call-a".to_string(),
         chunk_id: "chunk-a".to_string(),
@@ -2809,6 +2901,8 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         pending_deferred_completions: Vec::new(),
     };
     let output_b = ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "exec-call-b".to_string(),
         chunk_id: "chunk-b".to_string(),
@@ -3866,16 +3960,15 @@ async fn registered_exec_declared_validation_survives_yield_and_stdin_completion
         .await;
 }
 // Opt-in local measurement through the registered native tool path, without a model.
-#[rstest::rstest]
-#[case("small_output", 64, false)]
-#[case("large_output", 1_048_576, false)]
-#[case("background_completion", 1_048_576, true)]
+#[test_case::test_case("small_output", 64, false; "small_output")]
+#[test_case::test_case("large_output", 1_048_576, false; "large_output")]
+#[test_case::test_case("background_completion", 1_048_576, true; "background_completion")]
 #[tokio::test]
 #[ignore = "opt-in direct_runtime off/on latency measurement"]
 async fn direct_runtime_native_command_benchmark(
-    #[case] case: &str,
-    #[case] bytes: usize,
-    #[case] background: bool,
+    case: &str,
+    bytes: usize,
+    background: bool,
 ) {
     use std::io::Write;
     use std::time::Instant;
@@ -3897,7 +3990,17 @@ async fn direct_runtime_native_command_benchmark(
             let script = format!(
                 "import pathlib,time,sys; {wait}sys.stdout.write('X'*{bytes}+'\\nDIRECT_RUNTIME_DONE\\n'); sys.stdout.flush()"
             );
-            let (session, mut turn, events) = make_session_and_context_with_rx().await;
+            // Large output needs a durable home throughout artifact finalization.
+            // The convenience fixture drops its temporary home before returning.
+            let codex_home = tempfile::tempdir().unwrap();
+            let (session, mut turn, events) =
+                crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                    codex_login::CodexAuth::from_api_key("Test API Key"),
+                    Vec::new(),
+                    codex_home.path(),
+                    |_| {},
+                )
+                .await;
             let turn_mut = Arc::get_mut(&mut turn).unwrap();
             turn_mut.permission_profile = PermissionProfile::Disabled;
             let mut config = (*turn_mut.config).clone();
@@ -3929,6 +4032,15 @@ async fn direct_runtime_native_command_benchmark(
             let runtime = crate::tools::parallel::ToolCallRuntime::new(
                 Arc::clone(&session), step, Arc::new(Mutex::new(TurnDiffTracker::new())),
             );
+            // Match the nested native-tool entrypoint used by code mode. Its
+            // structured result is distinct from the model-facing text projection.
+            let source = || ToolCallSource::CodeMode {
+                cell_id: "direct-runtime-bench".into(),
+                parent_call_id: None,
+                runtime_tool_call_id: "native-command".into(),
+                nested_deadline: None,
+                cancellation_cause: None,
+            };
             let terminal = tokio::spawn(async move {
                 loop {
                     if let codex_protocol::protocol::EventMsg::ExecCommandEnd(end) =
@@ -3943,7 +4055,7 @@ async fn direct_runtime_native_command_benchmark(
                 }
             });
             let started = Instant::now();
-            let response = runtime.clone().handle_tool_call(
+            let response = runtime.clone().handle_tool_call_with_source(
                 crate::tools::router::ToolCall {
                     tool_name: codex_tools::ToolName::plain("exec_command"),
                     call_id: "direct-runtime-bench".into(),
@@ -3953,13 +4065,11 @@ async fn direct_runtime_native_command_benchmark(
                         "max_output_tokens": 1000
                     }).to_string() },
                 },
+                source(),
                 tokio_util::sync::CancellationToken::new(),
             ).await.unwrap();
             let initial_return_ns = started.elapsed().as_nanos();
-            let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
-            else { panic!("registered command must return function output") };
-            let mut result: serde_json::Value =
-                serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+            let mut result = response.code_mode_result();
             let released = Instant::now();
             if background {
                 assert!(result["session_id"].is_u64(), "child must wait for release: {result}");
@@ -3968,7 +4078,7 @@ async fn direct_runtime_native_command_benchmark(
             let ended = tokio::time::timeout(std::time::Duration::from_secs(10), terminal)
                 .await.expect("terminal event deadline").unwrap();
             if let Some(id) = result["session_id"].as_u64() {
-                let response = runtime.clone().handle_tool_call(
+                let response = runtime.clone().handle_tool_call_with_source(
                     crate::tools::router::ToolCall {
                         tool_name: codex_tools::ToolName::plain("write_stdin"),
                         call_id: "direct-runtime-bench-poll".into(),
@@ -3977,15 +4087,19 @@ async fn direct_runtime_native_command_benchmark(
                             "max_output_tokens": 1000
                         }).to_string() },
                     },
+                    source(),
                     tokio_util::sync::CancellationToken::new(),
                 ).await.unwrap();
-                let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
-                else { panic!("registered poll must return function output") };
-                result = serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+                result = response.code_mode_result();
             }
             let settled_ns = started.elapsed().as_nanos();
             assert_eq!(result["exit_code"], 0, "{result}");
             assert!(result["output"].as_str().unwrap().contains("DIRECT_RUNTIME_DONE"));
+            if bytes > 64 {
+                assert!(result["raw_output_artifact_bytes"].as_u64().unwrap() >= bytes as u64);
+            } else {
+                assert!(result["output"].as_str().unwrap().contains(&"X".repeat(bytes)));
+            }
             session.services.unified_exec_manager.terminate_all_processes().await;
             let record = serde_json::json!({
                 "case": case, "sample": sample, "warmup": sample == 0,
@@ -3994,7 +4108,7 @@ async fn direct_runtime_native_command_benchmark(
                 "terminal_event_ns": ended.duration_since(started).as_nanos(),
                 "release_to_terminal_ns": background.then(|| ended.duration_since(released).as_nanos()),
                 "exit_code": 0, "final_marker_verified": true,
-                "scope": "registered native tools; no model, sandbox disabled, fixture setup excluded"
+                "scope": "registered code-mode native dispatch; no JS host or model, sandbox disabled, fixture setup excluded"
             });
             let mut file = std::fs::OpenOptions::new().create(true).append(true)
                 .open(&output_path).unwrap();

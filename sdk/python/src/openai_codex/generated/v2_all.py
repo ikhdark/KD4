@@ -10095,6 +10095,13 @@ class TurnTiming(BaseModel):
         "validationLaunchCount": 0,
         "validationProcessNs": 0,
     }
+    tool_call_details_artifact_id: Annotated[
+        str | None,
+        Field(
+            alias="toolCallDetailsArtifactId",
+            description="Optional full per-call lifecycle detail in the thread's tool-output artifact store. Subject to that store's retention policy; aggregate timings and per-call summary fields remain usable without the artifact.",
+        ),
+    ] = None
     tool_call_timing_overflow: Annotated[
         int | None, Field(alias="toolCallTimingOverflow", ge=0)
     ] = 0

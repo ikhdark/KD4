@@ -16,6 +16,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use codex_async_utils::OrCancelExt;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -32,6 +33,8 @@ struct WriteStdinArgs {
     yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
+    #[serde(default)]
+    wait_for_output: bool,
 }
 
 pub struct WriteStdinHandler {
@@ -78,6 +81,7 @@ impl WriteStdinHandler {
             step_context,
             payload,
             source,
+            cancellation_token,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -92,6 +96,11 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        if args.wait_for_output && !args.chars.is_empty() {
+            return Err(FunctionCallError::RespondToModel(
+                "wait_for_output requires empty chars; send input separately".to_string(),
+            ));
+        }
         validate_independent_review_stdin(&turn.session_source, &args.chars)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         let yield_time_ms = owner_wait_yield_time_ms(
@@ -99,10 +108,8 @@ impl WriteStdinHandler {
             args.yield_time_ms,
             matches!(source, ToolCallSource::CodeMode { .. }),
         );
-        let response = session
-            .services
-            .unified_exec_manager
-            .write_stdin(WriteStdinRequest {
+        let response = loop {
+            let request = WriteStdinRequest {
                 process_id: args.session_id,
                 input: &args.chars,
                 yield_time_ms,
@@ -111,8 +118,23 @@ impl WriteStdinHandler {
                 // A nested poll must finish inside the runtime's wrapper
                 // deadline; the wrapper cancels rather than waits.
                 nested_deadline: source.nested_deadline(),
-            })
-            .await;
+            };
+            let manager = &session.services.unified_exec_manager;
+            let response = if args.wait_for_output {
+                manager.write_stdin_until_output(request)
+                    .or_cancel(&cancellation_token).await
+                    .map_err(|_| FunctionCallError::RespondToModel("command wait cancelled; process state remains inspectable".to_string()))?
+            } else {
+                manager.write_stdin(request).await
+            };
+            if !args.wait_for_output || response.as_ref().map_or(true, |output| {
+                output.process_exited || !output.raw_output.is_empty()
+                    || !output.pending_deferred_completions.is_empty()
+                    || source.nested_deadline().is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            }) {
+                break response;
+            }
+        };
         if let Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence {
             event_call_id: Some(call_id),
             ..
@@ -130,6 +152,14 @@ impl WriteStdinHandler {
                 )
                 .await;
         }
+        let response = match response {
+            Err(crate::unified_exec::UnifiedExecError::ProcessFailedWithOutput { mut output, .. }) => {
+                output.max_output_tokens = args.max_output_tokens;
+                output.truncation_policy = turn.model_info.truncation_policy.into();
+                Ok(*output)
+            }
+            other => other,
+        };
         let mut response = response.map_err(|err| match err {
             crate::unified_exec::UnifiedExecError::ToolHistoryPersistence { message, .. } => {
                 FunctionCallError::Fatal(message)

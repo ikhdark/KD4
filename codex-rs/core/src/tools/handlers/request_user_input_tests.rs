@@ -40,6 +40,10 @@ fn request_invocation(
                         {
                             "label": "B",
                             "description": "B"
+                        },
+                        {
+                            "label": "C",
+                            "description": "C"
                         }
                     ]
                 }]
@@ -74,30 +78,6 @@ async fn multi_agent_v2_request_user_input_rejects_subagent_threads() {
         err,
         FunctionCallError::RespondToModel(
             "request_user_input can only be used by the root thread".to_string(),
-        )
-    );
-}
-
-#[tokio::test]
-async fn never_approval_request_user_input_returns_recoverable_error() {
-    let (session, mut turn) = make_session_and_context().await;
-    turn.approval_policy = codex_config::Constrained::allow_any(AskForApproval::Never);
-    let turn = Arc::new(turn);
-
-    let result = RequestUserInputHandler {
-        available_modes: Vec::new(),
-    }
-    .handle(request_invocation(Arc::new(session), turn))
-    .await;
-
-    let Err(err) = result else {
-        panic!("never-approval request_user_input should fail recoverably");
-    };
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel(
-            "request_user_input is unavailable when approval policy is `never`; continue without interactive input or return a final response explaining the missing information"
-                .to_string(),
         )
     );
 }
@@ -251,8 +231,10 @@ async fn registered_user_input_output_schema_covers_answers_empty_and_interrupte
         json!({"answers":{},"interrupted":false}),
         json!({"answers":{},"interrupted":true}),
     ] {
-        let (session, turn, events) =
+        let (session, mut turn, events) =
             crate::session::tests::make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut turn).unwrap().approval_policy =
+            codex_config::Constrained::allow_any(AskForApproval::Never);
         *session.active_turn.lock().await = Some(ActiveTurn {
             terminal: Some(TurnTerminalCoordinator::new(turn.sub_id.clone())),
             ..Default::default()
@@ -269,6 +251,7 @@ async fn registered_user_input_output_schema_covers_answers_empty_and_interrupte
                     event = events.recv() => {
                         if let EventMsg::RequestUserInput(event) = event.unwrap().msg {
                             assert_eq!(event.call_id, "input-schema");
+                            assert_eq!(event.questions[0].options.as_ref().unwrap().len(), 3);
                             break;
                         }
                     }

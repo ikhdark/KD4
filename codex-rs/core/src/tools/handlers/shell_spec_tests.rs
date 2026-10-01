@@ -798,6 +798,14 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
         (None, None, false, "unknown"),
     ] {
         let output = ExecCommandToolOutput {
+            process_output: Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+                aggregated_output: b"evidence".to_vec(),
+                stdout: b"{}".to_vec(),
+                stderr: b"progress".to_vec(),
+                aggregated_output_is_exact: true,
+                streams_are_exact: true,
+            })),
+            error: None,
             validation: None,
             event_call_id: "lifecycle".into(),
             chunk_id: "chunk".into(),
@@ -822,6 +830,13 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
         assert_eq!(result["execution_state"], expected);
         assert_eq!(result["exit_code"], json!(exit_code));
         assert!(validator.is_valid(&result), "{result}");
+        assert_eq!(result["streams_complete"], process_exited && process_id.is_none());
+        if result["streams_complete"] == true {
+            assert_eq!(result["stdout"], "{}");
+            assert_eq!(result["stderr"], "progress");
+        } else {
+            assert!(result.get("stdout").is_none());
+        }
         assert_eq!(
             output.projection_metadata().unwrap().essential_inline["execution_state"],
             expected

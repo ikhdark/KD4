@@ -180,6 +180,8 @@ fn evidence_reuse_live_stdout_resets_soft_pressure_without_source_credit() {
     let baseline = control.baselines(0);
     for text in ["", "working\n", "", "working\n"] {
         let output = ExecCommandToolOutput {
+            process_output: None,
+            error: None,
             validation: None, event_call_id: "poll".into(), chunk_id: "chunk".into(),
             wall_time: std::time::Duration::ZERO, raw_output: text.as_bytes().to_vec(),
             truncation_policy: TruncationPolicy::Tokens(100), max_output_tokens: Some(100),
@@ -399,6 +401,8 @@ async fn command_result(
         call_id: "command".into(),
         payload,
         result: Box::new(ExecCommandToolOutput {
+            process_output: None,
+            error: None,
             validation: None,
             event_call_id: "command".into(),
             chunk_id: "chunk".into(),

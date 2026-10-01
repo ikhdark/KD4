@@ -107,6 +107,8 @@ fn command(
     limit: Option<usize>,
 ) -> ExecCommandToolOutput {
     ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: "bench-command".into(),
         chunk_id: "bench-chunk".into(),

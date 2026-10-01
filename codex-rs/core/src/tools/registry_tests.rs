@@ -189,6 +189,8 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         ToolName::plain("shell"),
     );
     let output = crate::tools::context::ExecCommandToolOutput {
+        process_output: None,
+        error: None,
         validation: None,
         event_call_id: call_id.to_string(),
         chunk_id: "chunk-materialization".to_string(),
@@ -316,6 +318,8 @@ async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
             .map(|line| format!("error: exact evidence {line:03}\n"))
             .collect::<String>();
         let output = crate::tools::context::ExecCommandToolOutput {
+            process_output: None,
+            error: None,
             validation: None,
             event_call_id: invocation.call_id.clone(),
             chunk_id: "fitting-preset-chunk".to_string(),

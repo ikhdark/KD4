@@ -79,6 +79,7 @@ coverage/
 
 # benchmarks
 /docs/benchmarks/repo-benchmark/accepted/
+/audits_benchmarks
 
 # personal files
 /current-diff.txt

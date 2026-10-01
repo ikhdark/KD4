@@ -1782,6 +1782,12 @@ pub struct TurnTiming {
     /// the canonical `exclusive` partition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<TurnTimingToolCall>,
+    /// Optional full per-call lifecycle detail in the thread's tool-output
+    /// artifact store. Subject to that store's retention policy; aggregate
+    /// timings and per-call summary fields remain usable without the artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tool_call_details_artifact_id: Option<String>,
     #[serde(default)]
     pub tool_call_timing_overflow: u32,
     /// Exact accepted-call closure ledger. A terminal event is publishable only
@@ -4322,6 +4328,16 @@ impl SessionContextWindow {
     }
 }
 
+/// Identity of the harness binary, independent of the repository it is editing.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SessionBuildInfo {
+    pub version: String,
+    pub commit: String,
+    pub dirty: String,
+    pub profile: String,
+    pub built: String,
+}
+
 /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
 ///
 /// NOTE: There used to be an `instructions` field here, which stored user_instructions, but we
@@ -4339,6 +4355,8 @@ pub struct SessionMeta {
     pub cwd: PathBuf,
     pub originator: String,
     pub cli_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_build: Option<SessionBuildInfo>,
     #[serde(default)]
     pub source: SessionSource,
     /// Optional analytics source classification for this thread.
@@ -4388,6 +4406,7 @@ impl Default for SessionMeta {
             cwd: PathBuf::new(),
             originator: String::new(),
             cli_version: String::new(),
+            harness_build: None,
             source: SessionSource::default(),
             thread_source: None,
             agent_nickname: None,
@@ -5682,6 +5701,8 @@ pub enum TurnAbortReason {
     ReviewEnded,
     BudgetLimited,
     InternalError,
+    /// Recovery found an open turn after its owning process disappeared.
+    ProcessLost,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

@@ -1015,9 +1015,7 @@ async fn handle_read_tool_output(
         ));
     };
     let args = parse_read_tool_output_args(arguments)?;
-    // Keep validating the legacy knob for compatibility, but never use it to
-    // clip a selected value. The selector engine owns its exact response fit.
-    let _legacy_max_bytes = resolved_max_bytes(args.max_bytes)?;
+    let max_bytes = resolved_max_bytes(args.max_bytes)?;
     let selectors = resolved_selectors(&args)?;
     let code_mode_recovery = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
     let mut action_bounds_digest = Sha256::new();
@@ -1030,34 +1028,25 @@ async fn handle_read_tool_output(
             .session.services.code_mode_service.output_budget(cell_id),
         _ => None,
     };
-    let transaction = if let Some(budget) = outer_budget {
+    let token_ceiling = if let Some(budget) = outer_budget {
         // A small wait projection must not disable recovery inside the live cell.
         let budget = budget.max(896);
         #[cfg(feature = "bench-generation-opportunities")]
         crate::generation_live_bench::record(5, "outer_budget_negotiated");
-        let snapshot = load_tool_output_snapshot(
-            invocation.step_context.turn.config.codex_home.as_path(),
-            &invocation.session.thread_id.to_string(),
-            &args.artifact_id,
-        )
-        .await
-        .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
-        drain_recovery_snapshot(
-            &snapshot,
-            selectors,
-            CODE_MODE_RECOVERY_TOKEN_CEILING.min(budget.saturating_sub(384)),
-            &invocation.cancellation_token,
-        ).await
+        CODE_MODE_RECOVERY_TOKEN_CEILING.min(budget.saturating_sub(384))
+    } else if code_mode_recovery {
+        CODE_MODE_RECOVERY_TOKEN_CEILING
     } else {
-        execute_recovery_transaction_with_continuations(
-            invocation.step_context.turn.config.codex_home.as_path(),
-            &invocation.session.thread_id.to_string(),
-            &args.artifact_id,
-            selectors,
-            code_mode_recovery,
-            &invocation.cancellation_token,
-        ).await
-    }
+        RECOVERY_AGGREGATE_TOKEN_CEILING
+    };
+    let snapshot = load_tool_output_snapshot(
+        invocation.step_context.turn.config.codex_home.as_path(),
+        &invocation.session.thread_id.to_string(),
+        &args.artifact_id,
+    ).await.map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
+    let transaction = drain_recovery_snapshot_with_byte_limit(
+        &snapshot, selectors, token_ceiling, max_bytes, &invocation.cancellation_token,
+    ).await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
     let DrainedRecoveryTransaction {
         output,
@@ -1180,6 +1169,35 @@ pub(crate) async fn execute_recovery_transaction_with_continuations(
     };
     let snapshot = load_tool_output_snapshot(codex_home, thread_id, artifact_id).await?;
     drain_recovery_snapshot(&snapshot, selectors, token_ceiling, cancellation_token).await
+}
+
+async fn drain_recovery_snapshot_with_byte_limit(
+    snapshot: &std::sync::Arc<ToolOutputSnapshot>,
+    selectors: Vec<ToolOutputSelector>,
+    mut token_ceiling: usize,
+    max_bytes: usize,
+    cancellation_token: &CancellationToken,
+) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
+    loop {
+        let result = drain_recovery_snapshot(
+            snapshot, selectors.clone(), token_ceiling, cancellation_token,
+        ).await?;
+        let delivered_bytes: u64 = result.output.delivered_ranges().iter()
+            .map(|(start, end)| end - start).sum();
+        if delivered_bytes <= max_bytes as u64 || cancellation_token.is_cancelled() {
+            return Ok(result);
+        }
+        // Refit against the same authenticated snapshot, never rerun or reread
+        // the producer. Preserve the selector engine's exact ranges/continuation.
+        let smaller = token_ceiling.saturating_mul(max_bytes)
+            / usize::try_from(delivered_bytes).unwrap_or(usize::MAX);
+        if smaller >= token_ceiling || smaller < 256 {
+            return Err(ReadToolOutputError::InvalidRange(
+                "max_bytes is too small for an exact recovery page; increase it or request a smaller selector".to_string(),
+            ));
+        }
+        token_ceiling = smaller;
+    }
 }
 
 async fn drain_recovery_snapshot(

@@ -389,6 +389,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                 cwd: codex_home.to_path_buf(),
                 originator: "test".to_string(),
                 cli_version: "test".to_string(),
+                harness_build: None,
                 source: SessionSource::default(),
                 thread_source: None,
                 agent_path: None,

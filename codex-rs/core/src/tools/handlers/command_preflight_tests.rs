@@ -1351,24 +1351,6 @@ fn accepts_rg_literal_glob_path_in_posix_script() {
 }
 
 #[test]
-fn rejects_powershell_cmdlets_for_direct_argv() {
-    let issue = preflight_command_issue(
-        &strings(&["get-content", "-LiteralPath", r"C:\repo\file.txt"]),
-        /*shell_type*/ None,
-    )
-    .expect_err("PowerShell cmdlets are not direct executables");
-
-    assert_eq!(
-        issue.code,
-        CommandPreflightIssueCode::DirectArgvPowerShellCmdlet
-    );
-    let rendered = issue.render_for_model();
-    assert!(rendered.contains("not a standalone executable"));
-    assert!(rendered.contains("kind: \"powershell_script\""));
-    assert!(rendered.contains("\"kind\":\"direct_argv_powershell_cmdlet\""));
-}
-
-#[test]
 fn powershell_cmdlet_retry_uses_powershell_literal_quoting() {
     let issue = preflight_command_issue(
         &strings(&[
@@ -1542,25 +1524,28 @@ fn preflight_preserves_each_plain_pipeline_stage_for_validation() {
 
 #[cfg(windows)]
 #[test]
-fn preflight_repairs_read_only_cmdlets_but_rejects_invalid_source() {
-    let invocation = CommandInvocation::Argv {
-        program: "Get-Content".into(), args: vec!["a file.txt".into()],
-    };
-    let outcome = preflight_invocation_with_equivalent_repair(
-        &invocation, &strings(&["Get-Content", "a file.txt"]), None,
-    ).unwrap();
-    assert!(outcome.repaired());
-    assert!(outcome.invocation.is_powershell_script());
+fn preflight_requires_explicit_powershell_for_cmdlets_and_rejects_invalid_source() {
+    for command in [
+        strings(&["get-content", "-LiteralPath", r"C:\repo\file.txt"]),
+        strings(&["Get-Content", "a file.txt"]),
+        strings(&["Remove-Item", "file"]),
+    ] {
+        let invocation = CommandInvocation::Argv {
+            program: command[0].clone(),
+            args: command[1..].to_vec(),
+        };
+        let error = preflight_invocation_with_equivalent_repair(&invocation, &command, None)
+            .expect_err("automatic repair must not introduce a shell or its profile");
+        assert!(error.contains("not a standalone executable"));
+        assert!(error.contains("kind: \"powershell_script\""));
+        assert!(error.contains("\"kind\":\"direct_argv_powershell_cmdlet\""));
+    }
     let error = preflight_invocation_with_equivalent_repair(
         &CommandInvocation::PowerShellScript("Get-Content '".into()),
         &strings(&["pwsh", "-NoProfile", "-Command", "Get-Content '"]),
         Some(ShellType::PowerShell),
     ).unwrap_err();
     assert!(error.contains("invalid script syntax"));
-    assert!(preflight_invocation_with_equivalent_repair(
-        &CommandInvocation::Argv { program: "Remove-Item".into(), args: vec!["file".into()] },
-        &strings(&["Remove-Item", "file"]), None,
-    ).is_err());
 }
 
 #[tokio::test(flavor = "current_thread")]

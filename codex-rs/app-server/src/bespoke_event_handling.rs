@@ -1307,8 +1307,9 @@ async fn handle_turn_interrupted(
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
     let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
-    let internal_error =
-        turn_aborted_event.reason == codex_protocol::protocol::TurnAbortReason::InternalError;
+    let internal_error = matches!(turn_aborted_event.reason,
+        codex_protocol::protocol::TurnAbortReason::InternalError
+        | codex_protocol::protocol::TurnAbortReason::ProcessLost);
     let status = if internal_error {
         TurnStatus::Failed
     } else {

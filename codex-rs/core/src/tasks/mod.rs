@@ -121,15 +121,18 @@ pub(crate) fn interrupted_turn_history_marker(
 }
 
 /// Marker for a resumed rollout whose last turn recorded neither a completion
-/// nor an interruption: the process stopped mid-turn, so nothing establishes
-/// that the request was worked on.
+/// nor an interruption. Preserve the recorded evidence without inventing a
+/// user interruption or claiming that no work occurred.
 pub(crate) fn unfinished_turn_history_marker(
     marker: InterruptedTurnHistoryMarker,
+    tool_calls: usize,
+    tool_results: usize,
 ) -> Option<ResponseItem> {
+    let guidance = crate::context::TurnAborted::unfinished_guidance(tool_calls, tool_results);
     turn_boundary_history_marker(
         marker,
-        crate::context::TurnAborted::UNFINISHED_GUIDANCE,
-        crate::context::TurnAborted::UNFINISHED_GUIDANCE,
+        &guidance,
+        &guidance,
     )
 }
 
@@ -1239,7 +1242,11 @@ impl Session {
                 .session_telemetry
                 .record_duration(TURN_E2E_DURATION_METRIC, duration, &[]);
         }
-        let timing = timing_snapshot.protocol_timing();
+        let timing = crate::turn_timing::retain_turn_timing_details(
+            timing_snapshot.protocol_timing(),
+            &turn_context.config.codex_home,
+            &self.thread_id.to_string(),
+        ).await;
         if finalization
             .permit
             .as_ref()
@@ -1389,7 +1396,11 @@ impl Session {
         }
         turn_context.turn_timing_state.begin_finalization();
         let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
-        let timing = timing_snapshot.protocol_timing();
+        let timing = crate::turn_timing::retain_turn_timing_details(
+            timing_snapshot.protocol_timing(),
+            &turn_context.config.codex_home,
+            &self.thread_id.to_string(),
+        ).await;
         let event = if let Some(reason) = finalization.outcome.abort_reason() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),

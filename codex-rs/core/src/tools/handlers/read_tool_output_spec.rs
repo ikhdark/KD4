@@ -149,7 +149,9 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Selected values are returned intact; oversized selections return smaller child_selectors or a continuation selector to retry. complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.".to_string(),
+        description: format!("Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Returns as much exact content as fits plus continuation metadata; structured selections use JSON pointers. Recovery also has a {} token envelope ceiling ({} in code mode, further reduced by the cell budget), independent of max_bytes. complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.",
+            crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING,
+            codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS.saturating_sub(1_000)),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
@@ -157,7 +159,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                 ("artifact_id".to_string(), artifact_id),
                 ("selectors".to_string(), selectors),
                 ("max_bytes".to_string(), bounded_integer(1, u64::MAX,
-                    format!("Compatibility byte budget, capped at {READ_TOOL_OUTPUT_MAX_BYTES}."))),
+                    format!("Maximum delivered source bytes, default and cap {READ_TOOL_OUTPUT_MAX_BYTES}; response metadata is additional. The advertised token ceiling can produce a smaller page with continuation."))),
             ]),
             Some(vec!["artifact_id".to_string(), "selectors".to_string()]),
             Some(false.into()),

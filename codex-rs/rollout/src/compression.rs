@@ -170,7 +170,57 @@ fn open_lock_file(lock_path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true);
 
+    #[cfg(windows)]
+    for _ in 0..3 {
+        match options.open(lock_path) {
+            // An orphan-lock cleanup briefly holds a no-sharing delete handle.
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 303)) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
     options.open(lock_path)
+}
+
+#[cfg(windows)]
+fn cleanup_orphan_rollout_lock(lock_path: &Path) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(name) = lock_path.file_name().and_then(OsStr::to_str) else {
+        return Ok(false);
+    };
+    let Some(plain_name) = name.strip_prefix('.').and_then(|name| {
+        name.strip_suffix(".write.lock").or_else(|| name.strip_suffix(".lock"))
+    }).filter(|name| name.starts_with("rollout-") && name.ends_with(".jsonl")) else {
+        return Ok(false);
+    };
+    let plain_path = lock_path.with_file_name(plain_name);
+    if plain_path.exists() || path::compressed_rollout_path(&plain_path).exists() {
+        return Ok(false);
+    }
+    let metadata = std::fs::symlink_metadata(lock_path)?;
+    if !metadata.is_file() || metadata.len() != 0 {
+        return Ok(false);
+    }
+    // Windows denies this open while *any* read/write handle exists, even
+    // one waiting for an OS lock. Delete-on-close excludes new opens until the
+    // name is removed. Never unlink POSIX lock inodes: waiters may still own them.
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    match std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(lock_path)
+    {
+        Ok(file) => {
+            drop(file);
+            Ok(true)
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(2 | 5 | 32 | 303)) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn rollout_lock_path(path: &Path) -> PathBuf {
@@ -613,6 +663,14 @@ mod worker {
                     continue;
                 }
                 cleanup_stale_temp(&entry).await;
+                #[cfg(windows)]
+                if path.extension().is_some_and(|extension| extension == "lock") {
+                    let lock_path = path.clone();
+                    match tokio::task::spawn_blocking(move || super::cleanup_orphan_rollout_lock(&lock_path)).await {
+                        Ok(Ok(_)) => {}
+                        result => debug!(?result, "orphan rollout lock cleanup skipped"),
+                    }
+                }
                 let Some(rollout_file) = RolloutFile::from_path(path) else {
                     continue;
                 };

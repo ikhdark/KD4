@@ -9,6 +9,11 @@ pub(crate) enum UnifiedExecError {
     CreateProcess { message: String },
     #[error("Unified exec process failed: {message}")]
     ProcessFailed { message: String },
+    #[error("Unified exec process failed: {message}")]
+    ProcessFailedWithOutput {
+        message: String,
+        output: Box<crate::tools::context::ExecCommandToolOutput>,
+    },
     #[error(
         "command completed with exit code {exit_code}; tool-history persistence failed: {message}. Do not repeat completed effects"
     )]

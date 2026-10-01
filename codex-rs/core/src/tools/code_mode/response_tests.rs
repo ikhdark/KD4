@@ -48,6 +48,8 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
             if process_exit_code.is_some() || process_running {
                 return Ok(crate::tools::context::boxed_tool_output(
                     crate::tools::context::ExecCommandToolOutput {
+                        process_output: None,
+                        error: None,
                         validation: None,
                         event_call_id: invocation.call_id,
                         chunk_id: "failed-process".into(),

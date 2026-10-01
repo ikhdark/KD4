@@ -18560,6 +18560,13 @@
           },
           "description": "Additive terminalization phase timings captured as part of the terminal timing profile."
         },
+        "toolCallDetailsArtifactId": {
+          "description": "Optional full per-call lifecycle detail in the thread's tool-output artifact store. Subject to that store's retention policy; aggregate timings and per-call summary fields remain usable without the artifact.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "toolCallTimingOverflow": {
           "default": 0,
           "format": "uint32",

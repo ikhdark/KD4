@@ -46,6 +46,7 @@ fn resume_history(
                 cwd: config.cwd.to_path_buf(),
                 originator: "resume_warning_test".to_string(),
                 cli_version: "test_version".to_string(),
+                harness_build: None,
                 model_provider: Some(config.model_provider_id.clone()),
                 ..Default::default()
             },
