@@ -12,8 +12,9 @@ async fn code_mode_runs_with_jit_disabled() {
     let service = InProcessCodeModeSession::new();
     let started = service
         .execute(ExecuteRequest {
+            state_path: None,
             tool_call_id: "call_1".to_string(),
-            enabled_tools: Vec::new(),
+            enabled_tools: Vec::new().into(),
             source: "21 * 2;".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,

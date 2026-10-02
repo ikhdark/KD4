@@ -67,6 +67,20 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 5] = [
 
 pub const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
+/// Opt-in reasoning defaults by generation purpose. Explicit turn effort wins,
+/// unsupported efforts are ignored, and this policy never switches models.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PurposeReasoningEffort {
+    pub initial: Option<ReasoningEffort>,
+    pub implementation: Option<ReasoningEffort>,
+    pub failure_diagnosis: Option<ReasoningEffort>,
+    pub repair: Option<ReasoningEffort>,
+    pub validation_interpretation: Option<ReasoningEffort>,
+    pub tool_result_interpretation: Option<ReasoningEffort>,
+    pub agent_coordination: Option<ReasoningEffort>,
+}
+
 /// Converts a configured ChatGPT URL into the one internal backend base URL
 /// used by all runtime consumers.
 pub fn canonicalize_chatgpt_base_url(value: &str) -> String {
@@ -241,6 +255,13 @@ pub struct ConfigToml {
     /// only to tokens after the carried prefix in the current compaction window.
     pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
 
+    /// Wall-clock seconds after which a turn stops starting new work and asks the model for a
+    /// final summary of completed and remaining work. Unset means no limit.
+    pub turn_wall_time_limit_secs: Option<u64>,
+    /// Observed credit consumption after which a turn requests its final summary.
+    /// Unset means no credit ceiling. Requires finite provider balance reports.
+    pub turn_credit_limit: Option<f64>,
+
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
 
@@ -407,6 +428,10 @@ pub struct ConfigToml {
     pub show_raw_agent_reasoning: Option<bool>,
 
     pub model_reasoning_effort: Option<ReasoningEffort>,
+    /// Reasoning effort for local history compaction; unset inherits the turn effort.
+    pub compaction_reasoning_effort: Option<ReasoningEffort>,
+    /// Opt-in defaults for sampling purposes; never overrides explicit turn effort.
+    pub purpose_reasoning_effort: Option<PurposeReasoningEffort>,
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).

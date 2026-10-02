@@ -164,11 +164,18 @@ impl Connection {
         let mut reader = FramedReader::new(stdout);
         let mut writer = FramedWriter::new(stdin);
         let handshake = async {
+            let catalog_capability = codex_code_mode_protocol::host::Capability::new(
+                codex_code_mode_protocol::host::TOOL_CATALOG_CAPABILITY,
+            ).map_err(|error| error.to_string())?;
+            let state_capability = codex_code_mode_protocol::host::Capability::new(
+                codex_code_mode_protocol::host::NAMED_STATE_CAPABILITY,
+            ).map_err(|error| error.to_string())?;
             let hello = ClientHello::new(
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
                     .map_err(|err| err.to_string())?,
                 CapabilitySet::empty(),
-                CapabilitySet::empty(),
+                CapabilitySet::try_new([catalog_capability.clone(), state_capability.clone()])
+                    .map_err(|error| error.to_string())?,
             )
             .map_err(|err| err.to_string())?;
             writer
@@ -183,7 +190,10 @@ impl Connection {
                 Some(HostToClient::HostHello(hello))
                     if hello.selected_version() == ProtocolVersion::V1 =>
                 {
-                    Ok(())
+                    Ok((
+                        hello.capabilities().contains(&catalog_capability),
+                        hello.capabilities().contains(&state_capability),
+                    ))
                 }
                 Some(HostToClient::HandshakeRejected { reason }) => {
                     Err(format!("code-mode host rejected the handshake: {reason:?}"))
@@ -201,10 +211,13 @@ impl Connection {
                 return Err("timed out negotiating with the code-mode host".to_string());
             }
         };
-        if let Err(err) = handshake_result {
-            kill_and_reap(&mut child, &managed).await;
-            return Err(err);
-        }
+        let (tool_catalog_references, named_state_snapshots) = match handshake_result {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                kill_and_reap(&mut child, &managed).await;
+                return Err(err);
+            }
+        };
 
         let (command_tx, command_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
@@ -237,7 +250,7 @@ impl Connection {
                 async move { drive_reader(reader, reader_events, reader_cancellation).await },
             );
 
-        let (driver, execute_claim_tx) = ConnectionDriver::new(
+        let (mut driver, execute_claim_tx) = ConnectionDriver::new(
             command_rx,
             event_rx,
             event_tx.clone(),
@@ -248,6 +261,8 @@ impl Connection {
                 cancellation: cancellation.clone(),
             },
         );
+        driver.tool_catalog_references = tool_catalog_references;
+        driver.named_state_snapshots = named_state_snapshots;
         let driver_task = tokio::spawn(driver.run());
         tokio::spawn(
             ConnectionSupervisor {

@@ -73,6 +73,22 @@ pub(crate) fn preview(
     .collect()
 }
 
+/// Whether any configured handler selects this tool. Per-turn run gates are
+/// ignored, so this may over-report but never misses a handler `run` executes.
+pub(crate) fn has_matching_handler(
+    handlers: &[ConfiguredHandler],
+    tool_name: &str,
+    matcher_aliases: &[String],
+) -> bool {
+    let matcher_inputs = common::matcher_inputs(tool_name, matcher_aliases);
+    !dispatcher::select_handlers_for_matcher_inputs(
+        handlers,
+        HookEventName::PreToolUse,
+        &matcher_inputs,
+    )
+    .is_empty()
+}
+
 pub(crate) async fn run(
     handlers: &[ConfiguredHandler],
     shell: &CommandShell,
@@ -763,6 +779,18 @@ mod tests {
         let completed = common::hook_completed_for_tool_use(parsed.completed, &request.tool_use_id);
 
         assert_eq!(completed.run.id, runs[0].id);
+    }
+
+    #[test]
+    fn matching_handler_check_respects_matchers_and_aliases() {
+        let handlers = [handler()];
+        assert!(super::has_matching_handler(&handlers, "Bash", &[]));
+        assert!(super::has_matching_handler(&handlers, "Write", &["Bash".to_string()]));
+        assert!(!super::has_matching_handler(
+            &handlers,
+            "apply_patch",
+            &["Write".to_string(), "Edit".to_string()],
+        ));
     }
 
     #[test]

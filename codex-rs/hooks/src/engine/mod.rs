@@ -262,6 +262,18 @@ impl ClaudeHooksEngine {
             .any(|handler| handler.event_name == event_name)
     }
 
+    pub(crate) fn has_pre_tool_use_handler_for(
+        &self,
+        tool_name: &str,
+        matcher_aliases: &[String],
+    ) -> bool {
+        crate::events::pre_tool_use::has_matching_handler(
+            &self.handlers,
+            tool_name,
+            matcher_aliases,
+        )
+    }
+
     pub(crate) fn preview_session_start(
         &self,
         request: &SessionStartRequest,

@@ -618,7 +618,7 @@ async fn persisted_missing_output_repairs_tool_timing_and_publishes_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_terminal_rollout_flush_releases_fence_without_persistence_attestation() {
-    let (mut session, turn_context, _events) = make_session_and_context_with_rx().await;
+    let (mut session, turn_context, events) = make_session_and_context_with_rx().await;
     attach_thread_persistence(
         Arc::get_mut(&mut session).expect("test session should be uniquely owned"),
     )
@@ -676,6 +676,27 @@ async fn failed_terminal_rollout_flush_releases_fence_without_persistence_attest
     assert!(session.active_turn.lock().await.is_none());
     assert!(!session.terminal_interaction_pending.load(Ordering::Acquire));
     assert!(coordinator.interaction_released());
+
+    // The turn completed but its record did not: the client must learn that
+    // before the terminal event instead of assuming crash-safe resumption.
+    let mut unsaved_warnings = 0;
+    let mut terminal_seen = false;
+    while let Ok(event) = events.try_recv() {
+        match event.msg {
+            EventMsg::Warning(warning) if warning.message.contains("not durably saved") => {
+                assert!(!terminal_seen, "unsaved-record warning must precede the terminal event");
+                assert!(warning.message.contains("conversation history"), "{}", warning.message);
+                unsaved_warnings += 1;
+            }
+            EventMsg::TurnComplete(completed) if completed.turn_id == turn_context.sub_id => {
+                assert!(completed.error.is_none(), "execution itself succeeded");
+                terminal_seen = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(terminal_seen);
+    assert_eq!(unsaved_warnings, 1, "one unsaved record is reported once");
 }
 
 #[tokio::test]

@@ -143,8 +143,6 @@ pub enum Feature {
     StandaloneWebSearch,
     /// Experimental shell snapshotting.
     ShellSnapshot,
-    /// Collect and, after shadow validation, reuse immutable tool output evidence.
-    KnownDeltaStore,
     /// Allow turns to start while selected executors are still starting.
     DeferredExecutor,
     /// Enable runtime metrics snapshots via a manual reader.
@@ -886,12 +884,6 @@ define_features! {
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::KnownDeltaStore,
-        key: "known_delta_store",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::DeferredExecutor,
         key: "deferred_executor",
         stage: Stage::Stable,
@@ -1216,12 +1208,26 @@ pub fn unknown_features_warning_event(
     if unknown.is_empty() {
         return None;
     }
+    // Classify only migrations established by this registry. Never guess a
+    // replacement from spelling similarity or silently change user settings.
+    let compatibility = unknown.iter().map(|key| {
+        let removed = matches!(key.as_str(), "memories" | "memory_tool" | "auto_review"
+            | "guardian_approval" | "artifact" | "enable_mcp_apps" | "realtime_conversation");
+        serde_json::json!({
+            "key": key,
+            "classification": if removed { "removed" } else { "unknown" },
+            "suggested_action": if removed { "review removal of this inactive setting" }
+                else { "check the configuration owner and spelling; no automatic migration is known" },
+            "applied": false,
+        })
+    }).collect::<Vec<_>>();
     Some(Event {
         id: String::new(),
         msg: EventMsg::Warning(WarningEvent {
             message: format!(
-                "Unknown feature keys in {config_path}: {}. These settings have no effect in this build.",
-                unknown.into_iter().collect::<Vec<_>>().join(", ")
+                "Unknown feature keys in {config_path}: {}. These settings have no effect in this build. Compatibility preview (no settings changed): {}",
+                unknown.into_iter().collect::<Vec<_>>().join(", "),
+                serde_json::Value::Array(compatibility),
             ),
         }),
     })

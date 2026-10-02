@@ -584,6 +584,10 @@ pub(super) fn resolve_command_shell(
 }
 
 impl CoreToolRuntime for ShellCommandHandler {
+    fn command_argument_format(&self) -> Option<crate::tools::registry::CommandArgumentFormat> {
+        Some(crate::tools::registry::CommandArgumentFormat::Shell)
+    }
+
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::NestedRuntime
     }
@@ -596,14 +600,23 @@ impl CoreToolRuntime for ShellCommandHandler {
         true
     }
 
+    fn pre_tool_use_hook_name(
+        &self,
+        _tool_name: &codex_tools::ToolName,
+        payload: &ToolPayload,
+    ) -> Option<HookToolName> {
+        matches!(payload, ToolPayload::Function { .. }).then(HookToolName::shell_command)
+    }
+
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
         let ToolPayload::Function { arguments } = &invocation.payload else {
             return None;
         };
+        let tool_name = self.pre_tool_use_hook_name(&invocation.tool_name, &invocation.payload)?;
         parse_shell_command_hook_invocation(arguments)
             .ok()
             .map(|command| PreToolUsePayload {
-                tool_name: HookToolName::shell_command(),
+                tool_name,
                 tool_input: command.hook_input(),
             })
     }
@@ -667,7 +680,7 @@ mod tests {
     use super::ShellCommandHandler;
 
     #[tokio::test]
-    async fn foreign_shell_command_dispatches_to_executor_and_rejects_deadlines_before_launch() {
+    async fn foreign_shell_command_dispatches_to_executor_and_reports_ignored_deadlines() {
         use crate::session::step_context::StepContext;
         use crate::session::turn_context::TurnEnvironment;
         use crate::tools::context::ToolCallSource;
@@ -805,21 +818,12 @@ mod tests {
             },
             cancellation_token: tokio_util::sync::CancellationToken::new(),
         };
-        for deadline in ["timeout_ms"] {
-            let mut args = json!({"kind": "argv", "program": "printf", "args": ["remote ok\\n"]});
-            args[deadline] = json!(60_000);
-            let error = handler
-                .handle_call(invocation(args))
-                .await
-                .err()
-                .expect("unsupported deadline rejected");
-            assert!(error.to_string().contains(deadline));
-            assert!(launches.lock().unwrap().is_empty());
-        }
         let output = tokio::time::timeout(Duration::from_secs(5), handler.handle_call(invocation(
-            json!({"kind": "argv", "program": "printf", "args": ["remote ok\\n"], "yield_time_ms": 1000})
+            json!({"kind": "argv", "program": "printf", "args": ["remote ok\\n"], "yield_time_ms": 1000, "timeout_ms": 60_000})
         ))).await.unwrap().unwrap();
         assert_eq!(output.log_preview(), "remote ok\n");
+        let result = output.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
+        assert!(result["repair"].as_str().unwrap().contains("Ignored `timeout_ms`"));
         assert_eq!(
             output.outcome_for_logging(),
             codex_tools::ToolOutputOutcome::Success
@@ -833,17 +837,17 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_timeout_is_rejected_by_unified_exec() {
+    fn forwarded_timeout_preserves_the_legacy_field_for_unified_exec_normalization() {
         let forwarded = ShellCommandHandler::forward_arguments_to_unified_exec(
             &json!({"command": "long-running", "timeout_ms": 60_000}).to_string(),
             "remote",
             true,
         )
         .expect("forward shell_command arguments");
-        let error =
-            crate::tools::handlers::unified_exec::validate_exec_command_arguments(&forwarded)
-                .expect_err("forwarding must not silently discard a requested deadline");
-        assert!(error.contains("does not support `timeout_ms`"), "{error}");
-        assert!(error.contains("no command was started"), "{error}");
+        let arguments: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
+        assert_eq!(arguments["timeout_ms"], 60_000);
+        assert_eq!(arguments["cmd"], "long-running");
+        crate::tools::handlers::unified_exec::validate_exec_command_arguments(&forwarded)
+            .expect("legacy timeout is accepted with an explicit normalization notice");
     }
 }

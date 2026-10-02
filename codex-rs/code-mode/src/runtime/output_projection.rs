@@ -30,6 +30,36 @@ const PROJECTOR: &str = r#"(() => {
     }
     return true;
   }
+  const escapes = (text) => stringify(text).length !== text.length + 2;
+  const lineCount = (text) => text.split('\n').length;
+  // A whole command or file-read result prints its text raw after a one-line
+  // envelope that counts the lines following it; JSON escaping would otherwise
+  // turn every newline and quote of source text into an escape sequence.
+  function rawText(projected) {
+    if (projected === null || typeof projected !== 'object' || Array.isArray(projected)) {
+      return undefined;
+    }
+    if (typeof projected.output === 'string' && !('results' in projected)) {
+      const {output, ...envelope} = projected;
+      if (!escapes(output)) return undefined;
+      envelope.output_lines = lineCount(output);
+      return stringify(envelope) + '\n' + output;
+    }
+    if (Array.isArray(projected.results) && !('output' in projected)) {
+      const texts = [];
+      const results = projected.results.map((result) => {
+        if (result === null || typeof result !== 'object' || typeof result.text !== 'string') {
+          return result;
+        }
+        const {text, ...rest} = result;
+        texts.push(text);
+        return {...rest, text_lines: lineCount(text)};
+      });
+      if (!texts.some(escapes)) return undefined;
+      return stringify({...projected, results}) + '\n' + texts.join('\n');
+    }
+    return undefined;
+  }
   return function(value, original, projected) {
     if (arguments.length === 3) {
       set(value, {original, projected});
@@ -37,6 +67,11 @@ const PROJECTOR: &str = r#"(() => {
       return;
     }
     if (!active) return stringify(value);
+    const whole = value !== null && typeof value === 'object' ? get(value) : undefined;
+    if (whole && same(value, whole.original)) {
+      const raw = rawText(whole.projected);
+      if (raw !== undefined) return raw;
+    }
     return stringify(value, (_key, item) => {
       const entry = item !== null && typeof item === 'object' ? get(item) : undefined;
       return entry && same(item, entry.original) ? entry.projected : item;
@@ -127,16 +162,17 @@ mod tests {
                     .unwrap();
             let (event_tx, mut rx) = mpsc::unbounded_channel();
             let request = ExecuteRequest {
+                state_path: None,
                 tool_call_id: "projection".into(),
                 enabled_tools: vec![ToolDefinition {
                     name: name.into(),
                     tool_name: ToolName::plain(name),
                     kind: CodeModeToolKind::Function,
-                    description: String::new(),
+                    description: "".into(),
                     input_schema: None,
                     output_schema: None,
                     default_timeout_ms: None,
-                }],
+                }].into(),
                 source: format!(
                     r#"
                     const r = await tools.{name}({{}});
@@ -224,5 +260,81 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn whole_command_result_prints_text_raw_after_counted_envelope() {
+        let raw = json!({"chunk_id":"transport", "output":"line \"one\"\nline two",
+            "exit_code":0, "execution_state":"exited", "process_exited":true,
+            "output_complete":true});
+        let mut envelope = codex_code_mode_protocol::model_visible_tool_result(
+            &ToolName::plain("exec_command"),
+            &raw,
+        )
+        .unwrap();
+        envelope.as_object_mut().unwrap().remove("output");
+        envelope["output_lines"] = json!(2);
+        let (event_tx, mut rx) = mpsc::unbounded_channel();
+        let request = ExecuteRequest {
+            state_path: None,
+            tool_call_id: "raw-projection".into(),
+            enabled_tools: vec![ToolDefinition {
+                name: "exec_command".into(),
+                tool_name: ToolName::plain("exec_command"),
+                kind: CodeModeToolKind::Function,
+                description: "".into(),
+                input_schema: None,
+                output_schema: None,
+                default_timeout_ms: None,
+            }].into(),
+            source: "const r = await tools.exec_command({}); text(r); r.extra = 1; text(r);"
+                .to_string(),
+            yield_time_ms: None,
+            max_output_tokens: None,
+            default_tool_timeout_ms: None,
+        };
+        let (tx, _termination) = spawn_runtime(
+            HashMap::new(),
+            request,
+            60_000,
+            event_tx,
+            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut printed = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                RuntimeEvent::Started => {}
+                RuntimeEvent::ToolCall { id, .. } => tx
+                    .send(RuntimeCommand::ToolResponse {
+                        id,
+                        result: raw.clone(),
+                    })
+                    .unwrap(),
+                RuntimeEvent::ContentItem {
+                    item: FunctionCallOutputContentItem::InputText { text },
+                    ..
+                } => printed.push(text),
+                RuntimeEvent::Result { error_text, .. } => {
+                    assert_eq!(error_text, None);
+                    break;
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(printed.len(), 2);
+        let (header, body) = printed[0].split_once('\n').unwrap();
+        assert_eq!(serde_json::from_str::<Value>(header).unwrap(), envelope);
+        assert_eq!(body, "line \"one\"\nline two");
+        // A modified result is no longer the tool's own value: print it as JSON.
+        let mut changed = raw;
+        changed["extra"] = json!(1);
+        assert_eq!(serde_json::from_str::<Value>(&printed[1]).unwrap(), changed);
     }
 }

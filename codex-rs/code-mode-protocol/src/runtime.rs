@@ -36,8 +36,11 @@ pub const MAX_TOOL_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ExecuteRequest {
+    /// Host-selected, thread-scoped named-value snapshot. Never a script-selected path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_path: Option<std::path::PathBuf>,
     pub tool_call_id: String,
-    pub enabled_tools: Vec<ToolDefinition>,
+    pub enabled_tools: std::sync::Arc<[ToolDefinition]>,
     pub source: String,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
@@ -144,8 +147,9 @@ mod tests {
 
     fn execute_request() -> ExecuteRequest {
         ExecuteRequest {
+            state_path: None,
             tool_call_id: "call-1".to_string(),
-            enabled_tools: Vec::new(),
+            enabled_tools: Vec::new().into(),
             source: "text('ok');".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,

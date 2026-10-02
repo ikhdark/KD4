@@ -820,6 +820,33 @@ pub struct ValidationCall {
     pub recorded_at: DateTime<Utc>,
 }
 
+impl ValidationCall {
+    /// Producer-verified evidence kind, never inferred from a criterion's claim.
+    pub fn verified_evidence_kind(&self) -> Option<CriterionEvidenceKind> {
+        crate::local::verified_evidence_kind(self)
+    }
+}
+
+/// Host-only preparation for a complete local source read. It is not proof
+/// until the producer finishes and the store confirms an unchanged epoch.
+pub struct SourceInspectionStart {
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) path: String,
+    pub(crate) workspace_id: String,
+    pub(crate) epoch: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceInspectionResult {
+    pub version: u8,
+    pub kind: String,
+    pub call_id: String,
+    pub path: String,
+    pub source_sha256: String,
+    pub bytes: u64,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationEvidence {
@@ -886,6 +913,9 @@ pub struct CriterionResult {
 pub enum CriterionEvidenceKind {
     /// A successful recorded execution; does not imply a test or runtime boundary passed.
     ValidationExecution,
+    /// The native file reader delivered a complete, hash-bound source snapshot
+    /// at an unchanged repository epoch. Does not establish semantic correctness.
+    SourceInspection,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1251,6 +1281,7 @@ impl AgentTask {
                             && call.status == ValidationCallStatus::Succeeded
                             && call.evidence.start_epoch == reference.evidence_epoch
                             && call.evidence.end_epoch == Some(reference.evidence_epoch)
+                            && call.verified_evidence_kind() == Some(reference.kind)
                     })
             });
             let status = match (result.status, evidence) {
@@ -1259,7 +1290,12 @@ impl AgentTask {
                 (CriterionStatus::Passed, Some(reference))
                     if reference.evidence_epoch == self.workspace_status.epoch =>
                 {
-                    "supported by a successful validation execution (test coverage not established)"
+                    match reference.kind {
+                        CriterionEvidenceKind::ValidationExecution =>
+                            "supported by a successful validation execution (test coverage not established)",
+                        CriterionEvidenceKind::SourceInspection =>
+                            "supported by a complete source inspection (semantic correctness not established)",
+                    }
                 }
                 (CriterionStatus::Passed, Some(_)) => {
                     "prior validation recorded; freshness unverified"

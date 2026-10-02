@@ -82,6 +82,23 @@ fn ultimate_fallback_shell() -> Shell {
 }
 
 pub fn get_shell_by_model_provided_path(shell_path: &PathBuf) -> anyhow::Result<Shell> {
+    // An explicit local path is not permission to silently choose another
+    // shell. Remote overrides are consumed by the environment owner before
+    // this local resolver is called.
+    if shell_path.is_absolute() || shell_path.components().count() > 1 {
+        let metadata = std::fs::metadata(shell_path).map_err(|error| {
+            anyhow::anyhow!(
+                "process not started: stage=shell_metadata shell={}: {error}",
+                shell_path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "process not started: stage=shell_metadata shell={} is not a file",
+                shell_path.display()
+            );
+        }
+    }
     codex_shell_command::shell_detect::get_shell_by_model_provided_path(shell_path)
         .map(Into::into)
         .ok_or_else(|| anyhow::anyhow!("unsupported Windows shell `{}`", shell_path.display()))

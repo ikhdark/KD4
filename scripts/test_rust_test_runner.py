@@ -1198,6 +1198,72 @@ class NamedSelectionTest(RunnerTestCase):
         )
 
 
+class GatesForTest(RunnerTestCase):
+    def test_gates_follow_module_ownership_and_path_declarations(self) -> None:
+        crate = self.temp_dir / "core"
+        files = {
+            "src/lib.rs": "pub mod session;\n",
+            "src/session/mod.rs": "mod turn;\nmod turn_execution;\n",
+            "src/session/turn.rs": "",
+            "src/session/turn_execution.rs": (
+                '#[cfg(test)]\n#[path = "turn_execution_evidence_tests.rs"]\n'
+                "mod evidence_tests;\n"
+            ),
+            "src/session/turn_execution_evidence_tests.rs": "",
+            "tests/all.rs": "mod suite;\n",
+            "tests/suite/exec.rs": "",
+        }
+        for relative, text in files.items():
+            (crate / relative).parent.mkdir(parents=True, exist_ok=True)
+            (crate / relative).write_text(text, encoding="utf-8")
+        manifest = self.manifest(
+            gates={
+                "evidence": {
+                    "steps": [
+                        {
+                            "target": "core_lib",
+                            "tests": ["session::turn_execution::evidence_tests::reuse"],
+                        }
+                    ]
+                },
+                "suite": {"steps": [{"target": "core_all", "tests": ["suite::exec::beta"]}]},
+                "broad": {"steps": [{"target": "core_lib", "filter": "test(alpha)"}]},
+            }
+        )
+        runner, executor = self.runner(manifest=manifest)
+        core = runner.metadata.packages["codex-core"]
+        core["manifest_path"] = str(crate / "Cargo.toml")
+        for target in core["targets"]:
+            target["src_path"] = str(
+                crate / ("src/lib.rs" if "lib" in target["kind"] else f"tests/{target['name']}.rs")
+            )
+
+        result = runner.gates_for(
+            [
+                "core/src/session/turn_execution_evidence_tests.rs",
+                "core/src/session/turn.rs",
+                "core/tests/suite/exec.rs",
+                "core/src/lib.rs",
+                "core/README.md",
+            ],
+            cwd=self.temp_dir,
+        )
+
+        self.assertEqual(
+            result["paths"],
+            {
+                "core/src/session/turn_execution_evidence_tests.rs": ["evidence"],
+                "core/src/session/turn.rs": [],
+                "core/tests/suite/exec.rs": ["suite"],
+                "core/src/lib.rs": ["evidence"],
+            },
+        )
+        self.assertEqual(result["gates"], ["evidence", "suite"])
+        self.assertEqual(result["unmapped"], ["core/README.md"])
+        self.assertEqual(result["filter_only_gates_not_evaluated"], ["broad"])
+        self.assertEqual(executor.calls, [])
+
+
 class FilteringArgumentPolicyTest(unittest.TestCase):
     def test_package_and_target_overrides_are_rejected(self) -> None:
         for argv in (
@@ -1797,6 +1863,7 @@ class RunTargetTest(RunnerTestCase):
                 mock.patch.object(rust_test_runner, "load_metadata"),
                 mock.patch.object(rust_test_runner, "RustTestRunner") as runner,
             ):
+                runner.return_value.run_target.return_value = {"codex-core": ["tests::alpha"]}
                 self.assertEqual(
                     rust_test_runner.main(["run-target", "core_lib", *arguments]), 0
                 )
@@ -2266,6 +2333,50 @@ class RunGateTest(RunnerTestCase):
                 self.assertEqual(rust_test_runner.main(args), 2)
                 metadata.assert_not_called()
 
+    def test_forwarded_target_profile_reaches_every_cargo_command(self):
+        for profile in (["--profile", "fast"], ["--profile=fast"]):
+            executor = self.gate_executor(self.matching_listings())
+
+            def construct(manifest, metadata, executor=executor, **kw):
+                return RustTestRunner(manifest, metadata, executor=executor, **kw)
+
+            with (
+                self.subTest(profile=profile),
+                mock.patch.object(Manifest, "load", return_value=self.manifest()),
+                mock.patch.object(
+                    rust_test_runner, "load_metadata", return_value=self.metadata()
+                ),
+                mock.patch.object(
+                    rust_test_runner, "RustTestRunner", side_effect=construct
+                ),
+            ):
+                self.assertEqual(
+                    rust_test_runner.main(
+                        ["run-target", "core_all", *profile, "-E", "test(beta)"]
+                    ),
+                    0,
+                )
+            self.assertTrue(executor.commands(["cargo", "nextest", "run"]))
+            for call in executor.calls:
+                self.assertEqual(call["env"]["NEXTEST_PROFILE"], "fast")
+                self.assertFalse(
+                    any(arg.startswith("--profile") for arg in call["args"])
+                )
+
+    def test_invalid_forwarded_profile_does_not_start_metadata(self):
+        for args in (
+            ["run-target", "--profile", "ci", "core_all", "--profile", "fast"],
+            ["run-target", "core_all", "--profile"],
+            ["run-target", "core_all", "--profile", "-E", "test(beta)"],
+        ):
+            with (
+                self.subTest(args=args),
+                mock.patch.object(rust_test_runner, "load_metadata") as metadata,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(rust_test_runner.main(args), 2)
+                metadata.assert_not_called()
+
     def test_cli_deadline_covers_metadata_and_gate_commands(self) -> None:
         executor = self.gate_executor(self.matching_listings())
         runners = []
@@ -2347,7 +2458,6 @@ class RunGateTest(RunnerTestCase):
         cases = {
             "windows-sandbox-core-exec": [],
             "core-stdio-helper-regressions": ["test_stdio_server"],
-            "capability-known-delta-store": [],
             "capability-command-output-artifacts": [],
         }
         for gate_name, expected_helpers in cases.items():

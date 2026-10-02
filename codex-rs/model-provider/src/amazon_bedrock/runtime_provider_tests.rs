@@ -58,9 +58,11 @@ async fn runtime_registration_resolves_endpoint_auth_and_catalog() {
     assert_eq!(presets.len(), 12);
     assert_eq!(
         presets.iter().find(|model| model.is_default).unwrap().model,
-        "global.openai.gpt-6-sol"
+        "global.openai.gpt-6-astra"
     );
     for slug in [
+        "global.openai.gpt-6-astra",
+        "us.openai.gpt-6-astra",
         "global.openai.gpt-6-sol",
         "us.openai.gpt-6-sol",
         "global.openai.gpt-6-luna",

@@ -12,6 +12,8 @@ struct CodeModeExecPragma {
     max_output_tokens: Option<usize>,
     #[serde(default)]
     deliver: bool,
+    #[serde(default)]
+    persist: bool,
     #[serde(flatten)]
     unknown_fields: BTreeMap<String, serde::de::IgnoredAny>,
 }
@@ -21,6 +23,7 @@ pub struct ParsedExecSource<'a> {
     pub code: &'a str,
     pub max_output_tokens: Option<usize>,
     pub deliver: bool,
+    pub persist: bool,
 }
 
 pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
@@ -40,6 +43,7 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
             code: input,
             max_output_tokens: None,
             deliver: false,
+            persist: false,
         });
     };
 
@@ -52,21 +56,21 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
     let directive = pragma.trim();
     if directive.is_empty() {
         return Err(
-            "exec pragma must be a JSON object with supported fields `max_output_tokens` and `deliver`"
+            "exec pragma must be a JSON object with supported fields `max_output_tokens`, `deliver`, and `persist`"
                 .to_string(),
         );
     }
 
     if !directive.starts_with('{') {
         return Err(
-            "exec pragma must be a JSON object with supported fields `max_output_tokens` and `deliver`"
+            "exec pragma must be a JSON object with supported fields `max_output_tokens`, `deliver`, and `persist`"
                 .to_string(),
         );
     }
     let pragma: CodeModeExecPragma = serde_json::from_str(directive).map_err(|err| {
         if err.is_syntax() || err.is_eof() {
             format!(
-                "exec pragma must be valid JSON with supported fields `max_output_tokens` and `deliver`: {err}"
+                "exec pragma must be valid JSON with supported fields `max_output_tokens`, `deliver`, and `persist`: {err}"
             )
         } else {
             format!("exec pragma has an invalid field value: {err}")
@@ -74,7 +78,7 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
     })?;
     if let Some(key) = pragma.unknown_fields.keys().next() {
         return Err(format!(
-            "exec pragma only supports `max_output_tokens` and `deliver`; got `{key}`"
+            "exec pragma only supports `max_output_tokens`, `deliver`, and `persist`; got `{key}`"
         ));
     }
     if pragma
@@ -99,6 +103,7 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
         code: rest,
         max_output_tokens: pragma.max_output_tokens,
         deliver: pragma.deliver,
+        persist: pragma.persist,
     })
 }
 
@@ -127,6 +132,7 @@ mod tests {
                     code: "text('first');\r\ntext('second');",
                     max_output_tokens,
                     deliver: false,
+                    persist: false,
                 }),
                 "{directive}"
             );
@@ -189,7 +195,7 @@ mod tests {
         );
         assert_eq!(
             parse_exec_source("// @exec: {\"timeout_ms\":1}\ntext('hi')").unwrap_err(),
-            "exec pragma only supports `max_output_tokens` and `deliver`; got `timeout_ms`"
+            "exec pragma only supports `max_output_tokens`, `deliver`, and `persist`; got `timeout_ms`"
         );
         assert_eq!(
             parse_exec_source("// @exec: {\"max_output_tokens\":1}\n  ").unwrap_err(),
@@ -202,6 +208,7 @@ mod tests {
                 code,
                 max_output_tokens: None,
                 deliver: false,
+                persist: false,
             })
         );
     }

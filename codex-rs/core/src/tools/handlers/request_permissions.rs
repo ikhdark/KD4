@@ -391,6 +391,9 @@ mod tests {
         assert_eq!(output.success, None);
         let aborted_text = output.body.to_text().expect("runtime cancellation text");
         let elapsed = aborted_text
+            .lines()
+            .next()
+            .expect("runtime cancellation summary")
             .strip_prefix("aborted by user after ")
             .and_then(|text| text.strip_suffix('s'))
             .expect("normal runtime returns its explicit aborted response")

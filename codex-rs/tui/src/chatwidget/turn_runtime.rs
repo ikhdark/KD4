@@ -269,6 +269,7 @@ impl ChatWidget {
             .show_selection_view(plan_implementation::selection_view_params(
                 default_mask,
                 self.transcript.latest_proposed_plan_markdown.as_deref(),
+                &self.transcript.user_turn_message_texts(),
                 context_usage_label.as_deref(),
             ));
         self.notify(Notification::PlanModePrompt {

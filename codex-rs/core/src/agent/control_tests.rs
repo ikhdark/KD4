@@ -2243,6 +2243,9 @@ fn registered_cancelled_spawn_retains_usage_until_child_termination() {
                 panic!("model-visible cancellation text expected");
             };
             let elapsed = message
+                .lines()
+                .next()
+                .expect("canonical cancellation summary")
                 .strip_prefix("aborted by user after ")
                 .and_then(|duration| duration.strip_suffix('s'))
                 .expect("canonical user cancellation message")

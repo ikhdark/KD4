@@ -588,6 +588,34 @@ pub(crate) fn active_tool_dispatch_timing() -> Option<Arc<ToolDispatchTiming>> {
     ACTIVE_TOOL_DISPATCH_TIMING.try_with(Arc::clone).ok()
 }
 
+/// Separates startup stages in structured logs without changing the rollout wire
+/// schema. RAII includes failed and cancelled attempts, not just successful spawns.
+pub(crate) struct ToolPhaseGuard {
+    phase: &'static str,
+    started_at: Instant,
+    timing: Option<Arc<ToolDispatchTiming>>,
+}
+
+pub(crate) fn begin_tool_phase(phase: &'static str) -> ToolPhaseGuard {
+    ToolPhaseGuard {
+        phase,
+        started_at: Instant::now(),
+        timing: active_tool_dispatch_timing(),
+    }
+}
+
+impl Drop for ToolPhaseGuard {
+    fn drop(&mut self) {
+        tracing::info!(
+            target: "codex_core::tools::execution_phase",
+            phase = self.phase,
+            elapsed_ms = self.started_at.elapsed().as_secs_f64() * 1_000.0,
+            execution_id = self.timing.as_ref().map(|timing| timing.execution_id().0.as_str()),
+            "tool execution phase completed"
+        );
+    }
+}
+
 macro_rules! record_phase {
     ($name:ident, $method:ident) => {
         pub(crate) fn $name(duration: Duration) {

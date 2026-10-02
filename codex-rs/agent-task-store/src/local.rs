@@ -1664,10 +1664,10 @@ LIMIT 1
                 invalid_statuses.push(call_id.clone());
             }
             if completion_proof {
-                validation_summaries.insert(call.command_summary);
+                validation_summaries.insert(call.command_summary.clone());
                 if let Some(end_epoch) = call.evidence.end_epoch {
                     successful_call_epochs.push((call_id.clone(), end_epoch));
-                    successful_calls.insert(call_id.as_str(), end_epoch);
+                    successful_calls.insert(call_id.as_str(), (end_epoch, call.verified_evidence_kind()));
                 }
             }
         }
@@ -1686,7 +1686,7 @@ LIMIT 1
                 && (result.status != crate::CriterionStatus::Passed
                     || reference.workspace_id != assignment.workspace_id
                     || successful_calls.get(reference.call_id.as_str())
-                        != Some(&reference.evidence_epoch))
+                        != Some(&(reference.evidence_epoch, Some(reference.kind))))
             {
                 return Err(StoreError::CriterionResultsInvalid(format!(
                     "criterion {} must reference its workspace and an owned successful validation in this receipt at the recorded epoch",
@@ -3859,6 +3859,95 @@ impl LocalAgentTaskStore {
         })
     }
 
+    /// Only immutable assignment requirements in the explicit `inspect:path`
+    /// form opt into source evidence. Ordinary reads create no proof records.
+    pub fn prepare_source_inspection(
+        &self,
+        attempt_id: AttemptId,
+        absolute_path: String,
+    ) -> TaskStoreFuture<'_, Option<crate::SourceInspectionStart>> {
+        Box::pin(async move {
+            let context = validation_context(&self.pool, attempt_id).await?;
+            if !matches!(context.assignment.role, AgentRole::Worker | AgentRole::Verifier | AgentRole::Integrator) {
+                return Ok(None);
+            }
+            if !context.assignment.required_evidence.iter().any(|item| item.starts_with("inspect:")) {
+                return Ok(None);
+            }
+            let Ok(absolute_path) = tokio::fs::canonicalize(&absolute_path).await else {
+                return Ok(None);
+            };
+            let Ok(relative_path) = absolute_path.strip_prefix(&context.repo_root) else {
+                return Ok(None);
+            };
+            let Ok(path) = crate::scope::normalize_repo_path_async(
+                &context.repo_root, &relative_path.to_string_lossy(),
+            ).await else {
+                return Ok(None);
+            };
+            if !context.assignment.required_evidence.contains(&format!("inspect:{path}")) {
+                return Ok(None);
+            }
+            let mut transaction = self.pool.begin().await?;
+            let revision = capture_complete_repository_revision_tx(
+                &mut transaction, context.assignment.assignment_id,
+            ).await?;
+            transaction.commit().await?;
+            Ok(Some(crate::SourceInspectionStart {
+                attempt_id, path, workspace_id: context.assignment.workspace_id,
+                epoch: revision.epoch,
+            }))
+        })
+    }
+
+    pub fn record_source_inspection(
+        &self,
+        start: crate::SourceInspectionStart,
+        call_id: String,
+        source_sha256: String,
+        bytes: u64,
+    ) -> TaskStoreFuture<'_, crate::CriterionEvidenceRef> {
+        Box::pin(async move {
+            let result = crate::SourceInspectionResult {
+                version: 1, kind: "source_inspection".into(), call_id: call_id.clone(),
+                path: start.path.clone(), source_sha256, bytes,
+            };
+            let mut call = ValidationCall {
+                call_id: call_id.clone(), attempt_id: start.attempt_id,
+                command_summary: format!("inspect:{}", start.path),
+                evidence: crate::ValidationEvidence {
+                    validation_result: Some(serde_json::to_value(result)
+                        .map_err(|error| StoreError::CorruptData(error.to_string()))?),
+                    ..Default::default()
+                },
+                status: ValidationCallStatus::Running,
+                recorded_at: Utc::now(),
+            };
+            self.record_validation_call(call.clone()).await?;
+            let recorded = self.get_validation_call(call_id.clone()).await?
+                .ok_or_else(|| StoreError::CorruptData("inspection call disappeared".into()))?;
+            call.status = if recorded.evidence.start_epoch == start.epoch {
+                ValidationCallStatus::Succeeded
+            } else {
+                ValidationCallStatus::NotExecuted
+            };
+            call.recorded_at = Utc::now();
+            self.record_validation_call(call).await?;
+            let recorded = self.get_validation_call(call_id.clone()).await?
+                .ok_or_else(|| StoreError::CorruptData("inspection call disappeared".into()))?;
+            if recorded.evidence.start_epoch != start.epoch
+                || recorded.evidence.end_epoch != Some(start.epoch)
+                || recorded.verified_evidence_kind() != Some(crate::CriterionEvidenceKind::SourceInspection)
+            {
+                return Err(StoreError::EvidenceSuperseded { call_ids: vec![call_id] });
+            }
+            Ok(crate::CriterionEvidenceRef {
+                call_id, workspace_id: start.workspace_id, evidence_epoch: start.epoch,
+                kind: crate::CriterionEvidenceKind::SourceInspection,
+            })
+        })
+    }
+
     pub fn get_validation_call(
         &self,
         call_id: String,
@@ -4656,21 +4745,44 @@ enum StoredValidationTerminalStatus {
 }
 
 fn validation_call_has_successful_result(call: &ValidationCall) -> bool {
+    verified_evidence_kind(call).is_some()
+}
+
+pub(crate) fn verified_evidence_kind(call: &ValidationCall) -> Option<crate::CriterionEvidenceKind> {
+    if call.status != ValidationCallStatus::Succeeded
+        || call.evidence.end_epoch != Some(call.evidence.start_epoch)
+    {
+        return None;
+    }
+    if let Some(inspection) = call.evidence.validation_result.as_ref()
+        .and_then(|value| serde_json::from_value::<crate::SourceInspectionResult>(value.clone()).ok())
+    {
+        return (inspection.version == 1
+            && inspection.kind == "source_inspection"
+            && inspection.call_id == call.call_id
+            && is_normalized_repository_relative_scope(&inspection.path)
+            && inspection.path != "."
+            && call.command_summary == format!("inspect:{}", inspection.path)
+            && inspection.source_sha256.len() == 64
+            && inspection.source_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then_some(crate::CriterionEvidenceKind::SourceInspection);
+    }
     let Some(result) =
         call.evidence.validation_result.as_ref().and_then(|result| {
             serde_json::from_value::<StoredValidationResult>(result.clone()).ok()
         })
     else {
-        return false;
+        return None;
     };
-    call.status == ValidationCallStatus::Succeeded
+    (call.status == ValidationCallStatus::Succeeded
         && call.evidence.end_epoch == Some(call.evidence.start_epoch)
         && result.call_id == call.call_id
         && result.status == StoredValidationTerminalStatus::Succeeded
         && !result.argv.is_empty()
         && result.argv.iter().all(|value| !value.trim().is_empty())
         && !result.covered_paths.is_empty()
-        && stored_covered_paths_are_normalized(&result.covered_paths)
+        && stored_covered_paths_are_normalized(&result.covered_paths))
+        .then_some(crate::CriterionEvidenceKind::ValidationExecution)
 }
 
 fn stored_covered_paths_are_normalized(covered_paths: &[String]) -> bool {

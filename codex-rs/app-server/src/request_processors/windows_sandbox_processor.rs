@@ -293,7 +293,7 @@ mod tests {
         std::fs::write(
             home.path().join("config.toml"),
             r#"[windows]
-sandbox = "unelevated"
+sandbox = "elevated"
 "#,
         )
         .expect("config");
@@ -303,7 +303,7 @@ sandbox = "unelevated"
                 .await
                 .expect("readiness")
                 .status,
-            WindowsSandboxReadiness::Ready
+            WindowsSandboxReadiness::UpdateRequired
         );
         std::fs::write(home.path().join("config.toml"), "").expect("clear config");
         processor.config_manager.invalidate_load_cache();

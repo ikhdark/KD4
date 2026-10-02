@@ -1420,8 +1420,10 @@ async fn direct_runtime_does_not_gate_execution_on_preflight_heuristics() {
     let script = "Write-Output 'unterminated";
     let invocation = CommandInvocation::PowerShellScript(script.to_string());
     let command = strings(&["pwsh", "-NoProfile", "-Command", script]);
-    preflight_invocation_with_equivalent_repair(&invocation, &command, Some(ShellType::PowerShell))
-        .expect("shell syntax is checked by the shell");
+    let error =
+        preflight_invocation_with_equivalent_repair(&invocation, &command, Some(ShellType::PowerShell))
+            .expect_err("non-direct preflight rejects invalid PowerShell syntax");
+    assert!(error.contains("powershell_syntax"), "{error}");
 
     let outcome = preflight_invocation_for_runtime(
         /*direct_runtime*/ true,

@@ -123,8 +123,9 @@ impl DriverHarness {
             .send(DriverCommand::Execute {
                 session,
                 request: ExecuteRequest {
+                    state_path: None,
                     tool_call_id: format!("call-{request_id}"),
-                    enabled_tools: Vec::new(),
+                    enabled_tools: Vec::new().into(),
                     source: "await new Promise(() => {})".to_string(),
                     yield_time_ms: Some(1),
                     max_output_tokens: None,
@@ -387,8 +388,9 @@ async fn dropped_open_waiter_shuts_down_committed_session() {
         .send(DriverCommand::Execute {
             session: session.clone(),
             request: ExecuteRequest {
+                state_path: None,
                 tool_call_id: "call-1".to_string(),
-                enabled_tools: Vec::new(),
+                enabled_tools: Vec::new().into(),
                 source: "text('ok')".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,
@@ -1135,8 +1137,9 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
         .send(DriverCommand::Execute {
             session: session.clone(),
             request: ExecuteRequest {
+                state_path: None,
                 tool_call_id: "call-1".to_string(),
-                enabled_tools: Vec::new(),
+                enabled_tools: Vec::new().into(),
                 source: "await new Promise(() => {})".to_string(),
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
@@ -1231,8 +1234,9 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
         .send(DriverCommand::Execute {
             session: session.clone(),
             request: ExecuteRequest {
+                state_path: None,
                 tool_call_id: "call-1".to_string(),
-                enabled_tools: Vec::new(),
+                enabled_tools: Vec::new().into(),
                 source: "await new Promise(() => {})".to_string(),
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
@@ -1386,8 +1390,9 @@ async fn connection_failure_closes_every_live_cell_once() {
         .send(DriverCommand::Execute {
             session,
             request: ExecuteRequest {
+                state_path: None,
                 tool_call_id: "call-1".to_string(),
-                enabled_tools: Vec::new(),
+                enabled_tools: Vec::new().into(),
                 source: "await new Promise(() => {})".to_string(),
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
@@ -1555,8 +1560,9 @@ async fn dropped_shutdown_waiter_does_not_abort_remote_cleanup() {
         .send(DriverCommand::Execute {
             session,
             request: ExecuteRequest {
+                state_path: None,
                 tool_call_id: "call-2".to_string(),
-                enabled_tools: Vec::new(),
+                enabled_tools: Vec::new().into(),
                 source: "text('unreachable')".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,

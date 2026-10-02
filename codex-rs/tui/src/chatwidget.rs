@@ -1267,6 +1267,7 @@ impl ChatWidget {
             || !display.remote_image_urls.is_empty()
         {
             self.record_visible_user_turn_for_copy();
+            self.transcript.record_user_turn_message(&display.message);
             self.add_to_history(history_cell::new_user_prompt(
                 display.message,
                 display.text_elements,

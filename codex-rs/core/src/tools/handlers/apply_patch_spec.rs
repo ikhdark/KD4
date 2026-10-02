@@ -21,6 +21,7 @@ pub fn create_apply_patch_freeform_tool(include_environment_id: bool) -> ToolSpe
     description.push_str("\n\n");
     description.push_str("A current read_file source hash supports exact range replacement: use @@ codex-range START:END sha256:HASH followed by +replacement lines, without regenerating unchanged context. Lines are inclusive and refer to the hashed complete file. Multiple ranges must be ordered and nonoverlapping. A stale hash rejects the edit. All update conflicts are preflighted before any file write.\n\n");
     description.push_str(codex_prompts::APPLY_PATCH_TOOL_INSTRUCTIONS);
+    description.push_str("\nUpdates to previously valid strict JSON are rejected during preflight if the complete candidate is invalid; no files are written. Existing JSONC or malformed documents remain editable.");
     description.push_str("\n\nIn code mode the result is an object with success, text, changes (committed paths with kind and optional move_path), changes_exact, and environment_id. Check success before continuing; if changes_exact is false, inspect the filesystem before retrying. Large results use the standard recoverable tool-output projection.");
     ToolSpec::Freeform(FreeformTool {
         name: "apply_patch".to_string(),

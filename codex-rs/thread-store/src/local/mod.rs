@@ -285,6 +285,21 @@ impl LocalThreadStore {
         )
         .await
     }
+
+    async fn flush_thread_with_durability(
+        &self,
+        thread_id: ThreadId,
+        durable: bool,
+    ) -> ThreadStoreResult<()> {
+        if let Some(projection) = projection::existing_entry(self, thread_id).await {
+            let _operation = projection.acquire_operation().await?;
+            live_writer::flush_thread(self, thread_id, durable).await?;
+            projection.commit_pending().await?;
+        } else {
+            live_writer::flush_thread(self, thread_id, durable).await?;
+        }
+        Ok(())
+    }
 }
 
 impl ThreadStore for LocalThreadStore {
@@ -407,16 +422,11 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move {
-            if let Some(projection) = projection::existing_entry(self, thread_id).await {
-                let _operation = projection.acquire_operation().await?;
-                live_writer::flush_thread(self, thread_id).await?;
-                projection.commit_pending().await?;
-            } else {
-                live_writer::flush_thread(self, thread_id).await?;
-            }
-            Ok(())
-        })
+        Box::pin(self.flush_thread_with_durability(thread_id, /*durable*/ false))
+    }
+
+    fn flush_thread_durable(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(self.flush_thread_with_durability(thread_id, /*durable*/ true))
     }
 
     fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {

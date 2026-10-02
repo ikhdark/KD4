@@ -94,6 +94,7 @@ pub(crate) fn override_model_visible_tool_result_token_budget_for_test(
 
 const COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET: usize = 2_000;
 const COMPACTION_ARTIFACT_PIN_MAX_ITEMS: usize = 32;
+const UNREAD_OVERFLOW_MANIFEST_MAX_ITEMS: usize = 16;
 const MINIMUM_RAW_TOKENS: u64 = 256;
 const MINIMUM_SAVED_TOKENS: u64 = 64;
 const MINIMUM_RELATIVE_SAVINGS_PERCENT: u64 = 25;
@@ -598,6 +599,10 @@ pub(crate) struct ToolHistoryState {
     /// without artifacts keep unread priority and evict newer source evidence.
     #[serde(default)]
     untracked_consumption: BTreeMap<String, ModelGenerationId>,
+    /// First observed consumption order, replayed by the existing consumption
+    /// journal. Turn IDs themselves are opaque and must not be sorted as time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    consumption_turns: Vec<String>,
     /// The most complete representation of each output a sent request has
     /// exposed to the model. Entries only move toward a more complete form.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -893,6 +898,10 @@ impl ToolHistoryMutation {
 }
 
 pub(crate) fn phase_checkpoint_ids(item: &ResponseItem) -> Option<Vec<String>> {
+    Some(phase_checkpoint_payload(item)?["receipts"].as_object()?.keys().cloned().collect())
+}
+
+fn phase_checkpoint_payload(item: &ResponseItem) -> Option<serde_json::Value> {
     let ResponseItem::Message { role, content, .. } = item else {
         return None;
     };
@@ -906,12 +915,42 @@ pub(crate) fn phase_checkpoint_ids(item: &ResponseItem) -> Option<Vec<String>> {
         let body = text
             .strip_prefix("<completed_phase_checkpoint>\n")?
             .strip_suffix("\n</completed_phase_checkpoint>")?;
-        let value: serde_json::Value = serde_json::from_str(body).ok()?;
-        Some(value["receipts"].as_object()?.keys().cloned().collect())
+        serde_json::from_str(body).ok()
     })
 }
 
 impl ToolHistoryState {
+    /// Recover only the provenance of an exact successful source response.
+    /// This is a candidate, not freshness or authorization: dispatch must prove
+    /// those again. Receipts, reminted outputs and legacy unscoped records miss.
+    pub(crate) fn read_replay_provenance(
+        &self,
+        item: &ResponseItem,
+    ) -> Option<(Option<WorkspaceEvidenceIdentity>, Vec<SourcePathChangeObservation>, String)> {
+        let (call_id, output) = canonical_textual_output_identity(item)?;
+        let candidate = self.candidates.get(call_id)?;
+        let authorization = candidate.supersession_identity.as_deref()?
+            .strip_prefix("authorized-v1:")?.rsplit(':').nth(1)?;
+        if authorization.len() != 64
+            || !authorization.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || candidate.original_output_sha256 != sha256(output.as_bytes())
+        {
+            return None;
+        }
+        let observation = self.workspace_evidence.get(call_id)?;
+        if !observation.successful
+            || !observation.source_dependencies_current
+            || observation.output_sha256 != sha256(output.as_bytes())
+            || observation.source_path_observations.is_empty()
+            || observation.source_path_observations.iter()
+                .map(SourcePathChangeObservation::source_dependency)
+                .collect::<BTreeSet<_>>() != observation.source_dependencies
+        {
+            return None;
+        }
+        Some((observation.revision.clone(), observation.source_path_observations.clone(), authorization.to_string()))
+    }
+
     pub(crate) fn retained_checkpoint_reference(
         &self,
         reference: &str,
@@ -969,19 +1008,67 @@ impl ToolHistoryState {
             .sum()
     }
 
+    /// A later, consumed success for exactly the same invocation resolves a
+    /// failed observation. Never infer resolution from similar output or a
+    /// checklist status, and revoke it when the replacement evidence is stale.
+    fn failure_resolution(&self, candidate: &ToolHistoryCandidate) -> Option<&ToolHistoryCandidate> {
+        let identity = candidate.supersession_identity.as_deref()?;
+        if candidate.successful || !action_bound_supersession_identity(identity) {
+            return None;
+        }
+        let action = identity.rsplit_once(':')?.0;
+        let consumed = candidate.consumed_by_generation.as_ref()?;
+        self.candidates.values().find(|replacement| {
+            replacement.successful && replacement.complete && replacement.projection_eligible
+                && replacement.source_dependencies_current
+                && replacement.tool_identity == candidate.tool_identity
+                && replacement.consumed_by_generation.as_ref().is_some_and(|later| {
+                    if later.turn_id == consumed.turn_id {
+                        later.ordinal > consumed.ordinal
+                    } else if identity.starts_with("authorized-v1:") {
+                        self.consumption_turns.iter().position(|id| id == &consumed.turn_id)
+                            .zip(self.consumption_turns.iter().position(|id| id == &later.turn_id))
+                            .is_some_and(|(before, after)| before < after)
+                    } else {
+                        // Legacy invocation hashes do not bind authorization.
+                        false
+                    }
+                })
+                && replacement.supersession_identity.as_deref().is_some_and(|identity| {
+                    action_bound_supersession_identity(identity)
+                        && identity.rsplit_once(':').is_some_and(|(prefix, _)| prefix == action)
+                })
+        })
+    }
+
     pub(crate) fn phase_checkpoint_receipts(
         &self,
         call_ids: &[String],
     ) -> Result<serde_json::Value, String> {
+        let unknown = call_ids.iter().filter(|id| !self.candidates.contains_key(*id)).collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            let eligible = self.candidates.values().filter(|candidate| {
+                candidate.successful && candidate.consumed_by_generation.is_some()
+                    && candidate.checkpoint_pin().is_some()
+            }).map(|candidate| candidate.call_id.clone()).collect::<BTreeSet<_>>();
+            return Err(serde_json::json!({
+                "error": "unknown checkpoint tool results; no evidence was changed",
+                "unknown_call_ids": unknown,
+                "eligible_call_ids": eligible.iter().take(16).collect::<Vec<_>>(),
+                "eligible_count": eligible.len(),
+                "eligible_list_complete": eligible.len() <= 16,
+            }).to_string());
+        }
         let mut receipts = BTreeMap::new();
         for id in call_ids {
             let candidate = self
                 .candidates
                 .get(id)
                 .ok_or_else(|| format!("unknown tool result {id}"))?;
-            if !candidate.successful || candidate.consumed_by_generation.is_none() {
+            let resolution = self.failure_resolution(candidate);
+            if (!candidate.successful && resolution.is_none()) || candidate.consumed_by_generation.is_none() {
                 return Err(format!(
-                    "{id} is unsuccessful or has not yet been consumed; retain it until resolved"
+                    "{id} is unresolved or has not yet been consumed; retain it until resolved"
                 ));
             }
             let mut receipt = candidate
@@ -989,6 +1076,12 @@ impl ToolHistoryState {
                 .ok_or_else(|| format!("{id} has no complete recovery artifact"))?;
             if let Some(fields) = receipt.as_object_mut() {
                 fields.remove("digest");
+                if let Some(resolution) = resolution {
+                    fields.insert("resolved_by".into(), serde_json::json!({
+                        "call_id": resolution.call_id,
+                        "evidence": resolution.artifact_pin_value(),
+                    }));
+                }
             }
             if candidate.checkpoint_pin().is_none() {
                 continue;
@@ -1167,6 +1260,51 @@ impl ToolHistoryState {
         self.model_visible_tool_result_token_budget
     }
 
+    pub(crate) fn task_sensitive_tool_result_budget(
+        &self,
+        window: i64,
+        prompt_tokens: usize,
+        generation_room: usize,
+        active_requirements: usize,
+    ) -> usize {
+        let baseline = model_visible_tool_result_token_budget_for_context_window(Some(window));
+        let Ok(window) = usize::try_from(window) else { return baseline };
+        if window == 0 {
+            return baseline;
+        }
+        let retained_tokens = self.candidates.values().map(|candidate| {
+            usize::try_from(candidate.derived.bounded_model_output_tokens).unwrap_or(usize::MAX)
+        }).fold(0usize, usize::saturating_add);
+        // The last realized prompt includes instructions and other non-tool
+        // context. Reserve that space, observed generation demand, and room to
+        // reason about outstanding obligations before allocating evidence.
+        let non_tool_tokens = prompt_tokens.saturating_sub(retained_tokens);
+        let reserve = non_tool_tokens
+            .saturating_add(generation_room.min(window / 4))
+            .saturating_add(active_requirements.saturating_mul(128).min(window / 8))
+            .max(window / 4);
+        let ceiling = window.saturating_sub(reserve).min(model_visible_tool_result_token_budget());
+        let active_evidence = self.candidates.values().filter(|candidate| {
+            candidate.consumed_by_generation.is_none()
+                || (!candidate.successful && self.failure_resolution(candidate).is_none())
+                || (active_requirements > 0 && candidate.source_dependencies_current
+                    && self.recovered_call_ids.contains(&candidate.call_id))
+        }).map(|candidate| {
+            let tokens = usize::try_from(candidate.derived.bounded_model_output_tokens)
+                .unwrap_or(usize::MAX);
+            // Frequently recovered, expensive evidence deserves more working
+            // room than a cheap consumed success. This is budgeting, not proof.
+            if self.recovered_call_ids.contains(&candidate.call_id) {
+                tokens.saturating_add(
+                    usize::try_from(candidate.original_tokens).unwrap_or(usize::MAX).min(tokens),
+                )
+            } else {
+                tokens
+            }
+        }).fold(0usize, usize::saturating_add);
+        baseline.max(active_evidence).min(ceiling)
+    }
+
     pub(crate) fn set_model_visible_tool_result_token_budget(&mut self, budget: Option<usize>) {
         self.model_visible_tool_result_token_budget = budget;
     }
@@ -1258,6 +1396,9 @@ impl ToolHistoryState {
         input: &[ResponseItem],
         generation: ModelGenerationId,
     ) -> BTreeSet<String> {
+        if !self.consumption_turns.contains(&generation.turn_id) {
+            self.consumption_turns.push(generation.turn_id.clone());
+        }
         struct ExposedOutputIdentity<'a> {
             text: Cow<'a, str>,
             output_sha256: String,
@@ -1314,6 +1455,9 @@ impl ToolHistoryState {
         call_ids: &BTreeSet<String>,
         generation: &ModelGenerationId,
     ) -> bool {
+        if !self.consumption_turns.contains(&generation.turn_id) {
+            self.consumption_turns.push(generation.turn_id.clone());
+        }
         let mut changed = false;
         for call_id in call_ids {
             if let Some(candidate) = self.candidates.get_mut(call_id) {
@@ -1412,7 +1556,7 @@ impl ToolHistoryState {
             let Some(candidate) = self.candidates.get(call_id) else {
                 continue;
             };
-            if !candidate.successful
+            if (!candidate.successful && self.failure_resolution(candidate).is_none())
                 || candidate.consumed_by_generation.is_none()
                 || sha256(output.as_bytes()) != candidate.derived.bounded_model_output_sha256
             {
@@ -1465,7 +1609,23 @@ impl ToolHistoryState {
             Some(git_workspace),
         );
         let checked = checked.into_shared();
-        if Arc::ptr_eq(canonical, &checked) {
+        let workspace_unchanged = Arc::ptr_eq(canonical, &checked);
+        let linked_checkpoints = canonical
+            .iter()
+            .filter_map(phase_checkpoint_payload)
+            .filter(|checkpoint| {
+                checkpoint["answered_questions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|answer| {
+                        answer["evidence_refs"]
+                            .as_array()
+                            .is_some_and(|refs| !refs.is_empty())
+                    })
+            })
+            .collect::<Vec<_>>();
+        if workspace_unchanged && linked_checkpoints.is_empty() {
             return base;
         }
         let mut result = ProjectedResponseItems::Shared(base);
@@ -1496,7 +1656,7 @@ impl ToolHistoryState {
             .collect::<Vec<_>>();
         let mut notices = Vec::new();
         for (original, checked) in canonical.iter().zip(checked.iter()) {
-            if original == checked {
+            if workspace_unchanged || original == checked {
                 continue;
             }
             let Some((_, text)) = canonical_textual_output_identity(checked) else {
@@ -1534,6 +1694,35 @@ impl ToolHistoryState {
             }
             if !previous_notices.contains(&notice) && !notices.contains(&notice) {
                 notices.push(notice);
+            }
+        }
+        // Keep checkpoint prose immutable for prefix caching, but downgrade its
+        // conclusions explicitly when linked evidence is stale or unavailable.
+        for checkpoint in &linked_checkpoints {
+            for answer in checkpoint["answered_questions"].as_array().into_iter().flatten() {
+                let invalid_refs = answer["evidence_refs"].as_array().into_iter().flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|reference| {
+                        self.checkpoint_evidence(reference).map_or(true, |candidate| {
+                            !candidate.source_dependencies_current
+                                || previous_notices.iter().chain(&notices).any(|notice| {
+                                    notice["call_id"].as_str() == Some(candidate.call_id.as_str())
+                                })
+                        })
+                    }).collect::<Vec<_>>();
+                if invalid_refs.is_empty() {
+                    continue;
+                }
+                let notice = serde_json::json!({
+                    "kind": "checkpoint_answer_evidence",
+                    "answer_sha256": sha256(answer.to_string().as_bytes()),
+                    "evidence_refs": invalid_refs,
+                    "status": "unverified",
+                    "reason": "Linked evidence is stale or unavailable; the assistant-authored answer is not a current verified fact.",
+                });
+                if !previous_notices.contains(&notice) && !notices.contains(&notice) {
+                    notices.push(notice);
+                }
             }
         }
         if !notices.is_empty() {
@@ -2012,7 +2201,7 @@ impl ToolHistoryState {
             // when its encoded size alone exceeds the shared history budget.
             let preserve_newest_non_text = Some(item_index) == newest_unconsumed_non_text_item;
             let mut decision = if retired.contains(&call_id)
-                && candidate.successful
+                && (candidate.successful || self.failure_resolution(candidate).is_some())
                 && candidate.consumed_by_generation.is_some()
                 && let Some((text, tokens)) = artifact_pin
                 && *tokens <= remaining_tokens
@@ -2253,9 +2442,10 @@ impl ToolHistoryState {
                 .collect::<BTreeSet<_>>();
             let unread_drops = unread_outputs
                 .iter()
-                .filter(|id| !retained.contains(id.as_str()))
-                .count();
-            Self::append_unread_overflow_notice(items, unread_drops);
+                .map(String::as_str)
+                .filter(|id| !retained.contains(id))
+                .collect::<Vec<_>>();
+            self.append_unread_overflow_notice(items, &unread_drops);
         }
         let items_budget_drops = self.enforce_tool_result_budget(&mut projected);
         let unreplaced_items_budget_drops =
@@ -2284,13 +2474,46 @@ impl ToolHistoryState {
         }
     }
 
-    fn append_unread_overflow_notice(items: &mut ProjectedResponseItems, unread_drops: usize) {
-        if unread_drops > 0 {
+    /// Omitted pairs are removed whole, so name them; a count alone leaves
+    /// recovery guessing which outcomes are missing.
+    fn append_unread_overflow_notice(
+        &self,
+        items: &mut ProjectedResponseItems,
+        unread_drops: &[&str],
+    ) {
+        if unread_drops.is_empty() {
+            return;
+        }
+        // Each notice is bounded, but never silently discard the identities
+        // after the first page. These are lifecycle/recovery controls rather
+        // than spillable tool prose and are excluded from the prose budget.
+        for (page, unread_page) in unread_drops
+            .chunks(UNREAD_OVERFLOW_MANIFEST_MAX_ITEMS)
+            .enumerate()
+        {
+            let omitted = unread_page
+                .iter()
+                .map(|call_id| {
+                    let mut entry = serde_json::json!({ "call_id": call_id });
+                    if let Some(candidate) = self.candidates.get(*call_id)
+                        && candidate.complete
+                        && candidate.projection_eligible
+                    {
+                        entry["artifact_id"] = candidate.artifact_id.clone().into();
+                    }
+                    entry
+                })
+                .collect::<Vec<_>>();
+            let count = unread_drops.len();
+            let offset = page * UNREAD_OVERFLOW_MANIFEST_MAX_ITEMS;
+            let page = page + 1;
+            let pages = count.div_ceil(UNREAD_OVERFLOW_MANIFEST_MAX_ITEMS);
+            let omitted = serde_json::Value::from(omitted);
             items.make_owned().push(ResponseItem::Message {
                 id: None,
                 role: "developer".to_string(),
                 content: vec![codex_protocol::models::ContentItem::InputText { text: format!(
-                    "Tool result budget overflow: {unread_drops} unread outcomes could not fit even as compact receipts. Those outcomes are unresolved. Do not infer success or repeat state-changing operations because their results are absent. Recover retained evidence before claiming completion."
+                    "Tool result budget overflow: {count} unread outcomes are unresolved. Manifest page {page}/{pages}, offset {offset}: {omitted}. Recover each artifact_id with read_tool_output; an entry without artifact_id has no complete retained artifact. Do not infer success or repeat state-changing operations because their results are absent."
                 ) }],
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
@@ -2427,9 +2650,10 @@ impl ToolHistoryState {
         items.retain(|item| item_call_id(item).is_none_or(|id| !dropped.contains(id)));
         let unread_drops = dropped
             .iter()
+            .map(String::as_str)
             .filter(|id| !self.output_was_consumed(id))
-            .count();
-        Self::append_unread_overflow_notice(items, unread_drops);
+            .collect::<Vec<_>>();
+        self.append_unread_overflow_notice(items, &unread_drops);
         ToolOutputBudgetDrops {
             count: u32::try_from(dropped.len()).unwrap_or(u32::MAX),
             tokens: dropped_tokens,
@@ -3157,6 +3381,12 @@ enum ToolHistoryJournalLoadError {
 pub(crate) enum ToolHistoryLoadOutcome {
     Missing,
     Loaded(ToolHistoryState),
+    /// The checkpoint plus every journal record before the first invalid one.
+    RecoveredJournalPrefix {
+        state: ToolHistoryState,
+        path: std::path::PathBuf,
+        error: String,
+    },
     Corrupt {
         path: std::path::PathBuf,
         error: String,
@@ -3177,6 +3407,13 @@ impl ToolHistoryLoadOutcome {
         match self {
             Self::Missing => (ToolHistoryState::default(), None),
             Self::Loaded(state) => (state, None),
+            Self::RecoveredJournalPrefix { state, path, error } => (
+                state,
+                Some(format!(
+                    "Recovered completed-tool history up to the first corrupt record of journal {}: {error}",
+                    path.display()
+                )),
+            ),
             Self::Corrupt { path, error } => (
                 ToolHistoryState::default(),
                 Some(format!(
@@ -3214,6 +3451,26 @@ pub(crate) async fn load_tool_history_state(
         ToolHistoryLoadOutcome::Loaded(state) => ToolHistoryLoadOutcome::Loaded(
             reconcile_tool_history_state(codex_home, thread_id, state).await,
         ),
+        ToolHistoryLoadOutcome::RecoveredJournalPrefix { state, path, error } => {
+            // The checkpoint supersedes the recovered records at the next
+            // persist; moving the journal keeps it from re-validating the tail.
+            let quarantine_path = corrupt_ledger_quarantine_path(&path);
+            let error = match tokio::fs::rename(&path, &quarantine_path).await {
+                Ok(()) => format!(
+                    "{error}; quarantined from {} to {}",
+                    path.display(),
+                    quarantine_path.display()
+                ),
+                Err(rename_error) => {
+                    format!("{error}; failed to quarantine journal: {rename_error}")
+                }
+            };
+            ToolHistoryLoadOutcome::RecoveredJournalPrefix {
+                state: reconcile_tool_history_state(codex_home, thread_id, state).await,
+                path,
+                error,
+            }
+        }
         ToolHistoryLoadOutcome::Corrupt { path, error } => {
             let quarantine_path = corrupt_ledger_quarantine_path(&path);
             match tokio::fs::rename(&path, &quarantine_path).await {
@@ -3289,7 +3546,11 @@ pub(crate) async fn load_tool_history_state_for_fork(
         {
             Ok(exists) => exists,
             Err(ToolHistoryJournalLoadError::Corrupt(error)) => {
-                return ToolHistoryLoadOutcome::Corrupt {
+                // Replay applied each checksummed record before the invalid
+                // one, a state that was durably reached, as with a torn tail.
+                state.refresh_derived_and_indexes();
+                return ToolHistoryLoadOutcome::RecoveredJournalPrefix {
+                    state,
                     path: journal_path,
                     error,
                 };
@@ -3528,6 +3789,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
     let mut reminted_state = ToolHistoryState {
         candidates: reminted_candidates,
         untracked_consumption: state.untracked_consumption,
+        consumption_turns: state.consumption_turns,
         exposed_representations: state.exposed_representations,
         recovered_call_ids: state.recovered_call_ids,
         recovered_ranges: state.recovered_ranges,

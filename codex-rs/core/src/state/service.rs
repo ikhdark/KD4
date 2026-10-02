@@ -65,6 +65,8 @@ pub(crate) struct SessionServices {
     pub(crate) command_execution: CommandExecutionLedger,
     pub(crate) retained_patches:
         std::sync::Mutex<crate::tools::handlers::apply_patch_retries::RetainedPatches>,
+    /// Path-scoped successful reads reusable by later turns once re-proven fresh.
+    pub(crate) path_replays: Arc<crate::session::turn_execution::SessionPathReplays>,
     pub(crate) plan_store: PlanStore,
     pub(crate) elicitations: ElicitationService,
     pub(crate) analytics_events_client: AnalyticsEventsClient,

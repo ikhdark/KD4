@@ -108,7 +108,7 @@ impl From<WireToolKind> for CodeModeToolKind {
 pub struct WireToolDefinition {
     pub name: String,
     pub tool_name: WireToolName,
-    pub description: String,
+    pub description: std::sync::Arc<str>,
     pub kind: WireToolKind,
     pub input_schema: Option<JsonValue>,
     pub output_schema: Option<JsonValue>,
@@ -148,7 +148,20 @@ impl From<WireToolDefinition> for ToolDefinition {
 /// The complete execute request shape supported by protocol V1.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct WireToolCatalog {
+    pub revision: u64,
+    /// Registration carries the complete catalog, including an empty catalog.
+    /// Otherwise enabled_tools must be empty and the revision must already exist.
+    pub register: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireExecuteRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<WireToolCatalog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_path: Option<std::path::PathBuf>,
     pub tool_call_id: String,
     pub enabled_tools: Vec<WireToolDefinition>,
     pub source: String,
@@ -166,8 +179,10 @@ impl TryFrom<ExecuteRequest> for WireExecuteRequest {
     fn try_from(value: ExecuteRequest) -> Result<Self, Self::Error> {
         let max_output_tokens = value.max_output_tokens.map(i32::try_from).transpose()?;
         Ok(Self {
+            catalog: None,
+            state_path: value.state_path,
             tool_call_id: value.tool_call_id,
-            enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
+            enabled_tools: value.enabled_tools.iter().cloned().map(Into::into).collect(),
             source: value.source,
             yield_time_ms: value.yield_time_ms,
             max_output_tokens,
@@ -182,6 +197,7 @@ impl TryFrom<WireExecuteRequest> for ExecuteRequest {
     fn try_from(value: WireExecuteRequest) -> Result<Self, Self::Error> {
         let max_output_tokens = value.max_output_tokens.map(usize::try_from).transpose()?;
         Ok(Self {
+            state_path: value.state_path,
             tool_call_id: value.tool_call_id,
             enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
             source: value.source,

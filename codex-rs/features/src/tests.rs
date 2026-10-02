@@ -31,13 +31,17 @@ fn removed_memory_features_are_not_registered() {
 #[test]
 fn unknown_feature_settings_emit_a_visible_warning_for_booleans_and_tables() {
     let table: Table = toml::from_str(
-        "unified_exec = true\ntask_completion_reviewer = true\n[future_feature]\nenabled = true",
+        "unified_exec = true\ntask_completion_reviewer = true\nmemory_tool = true\n[future_feature]\nenabled = true",
     ).unwrap();
     let event = crate::unknown_features_warning_event(Some(&table), "config.toml").unwrap();
     let EventMsg::Warning(warning) = event.msg else {
         panic!("unknown settings must be visible warnings");
     };
-    assert!(warning.message.contains("future_feature, task_completion_reviewer"));
+    assert!(warning.message.contains("future_feature, memory_tool, task_completion_reviewer"));
+    let preview: serde_json::Value = serde_json::from_str(warning.message.split_once("Compatibility preview (no settings changed): ").unwrap().1).unwrap();
+    assert_eq!(preview[0]["classification"], "unknown");
+    assert_eq!(preview[1]["classification"], "removed");
+    assert_eq!(preview[1]["applied"], false);
     assert!(!warning.message.contains("unified_exec"));
     assert!(warning.message.contains("no effect"));
     assert!(crate::unknown_features_warning_event(None, "config.toml").is_none());
@@ -380,7 +384,6 @@ fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
         (Feature::ToolSuggest, "tool_suggest"),
         (Feature::SecretAuthStorage, "secret_auth_storage"),
         (Feature::UnifiedExec, "unified_exec"),
-        (Feature::KnownDeltaStore, "known_delta_store"),
         (Feature::DeferredExecutor, "deferred_executor"),
         (Feature::CodeMode, "code_mode"),
         (

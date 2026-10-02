@@ -149,6 +149,8 @@ static LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION: FragmentRegistrationProxy<
 > = FragmentRegistrationProxy::new();
 static TASK_CAPSULE_REGISTRATION: FragmentRegistrationProxy<TaskCapsuleFragment> =
     FragmentRegistrationProxy::new();
+static TASK_STATE_REGISTRATION: FragmentRegistrationProxy<super::world_state::TaskState> =
+    FragmentRegistrationProxy::new();
 
 static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &USER_INSTRUCTIONS_REGISTRATION,
@@ -165,6 +167,7 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &LEGACY_APPLY_PATCH_EXEC_COMMAND_WARNING_REGISTRATION,
     &LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION,
     &TASK_CAPSULE_REGISTRATION,
+    &TASK_STATE_REGISTRATION,
 ];
 
 static STARTUP_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[

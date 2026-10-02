@@ -61,7 +61,7 @@ fn exec_command_definition() -> ToolDefinition {
     ToolDefinition {
         name: "exec_command".to_string(),
         tool_name: ToolName::plain("exec_command"),
-        description: "run a command".to_string(),
+        description: "run a command".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
         default_timeout_ms: None,
@@ -90,8 +90,9 @@ fn result_text(response: &RuntimeResponse) -> String {
 
 fn execute_request(source: &str) -> ExecuteRequest {
     ExecuteRequest {
+        state_path: None,
         tool_call_id: "call_1".to_string(),
-        enabled_tools: Vec::new(),
+        enabled_tools: Vec::new().into(),
         source: source.to_string(),
         yield_time_ms: Some(1),
         max_output_tokens: None,
@@ -360,12 +361,12 @@ async fn compact_tool_discovery_resolves_one_exact_description() {
             enabled_tools: vec![ToolDefinition {
                 name: "sample-tool".to_string(),
                 tool_name: ToolName::plain("sample-tool"),
-                description: "exact schema description".to_string(),
+                description: "exact schema description".into(),
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
                 default_timeout_ms: None,
                 output_schema: None,
-            }],
+            }].into(),
             source: r#"
 const all = ALL_TOOLS;
 if (all !== ALL_TOOLS) throw new Error("discovery array must be memoized");
@@ -401,9 +402,9 @@ async fn discovered_tools_are_callable_and_namespace_aliases_keep_exact_dispatch
             enabled_tools: vec![ToolDefinition {
                 name: "web__run".to_string(),
                 tool_name: ToolName::plain("web__run"),
-                description: "web schema".to_string(),
+                description: "web schema".into(),
                 ..exec_command_definition()
-            }],
+            }].into(),
             source: r#"
 const web = await resolve_tool("web__run");
 text({name: web.name, description: web.description, metadata: JSON.parse(JSON.stringify(web))});
@@ -485,7 +486,7 @@ async fn resolve_tool_accepts_the_namespace_identity_reported_by_tool_search() {
     let namespaced = |name: &str, namespace: &str, member: &str| ToolDefinition {
         name: name.to_string(),
         tool_name: ToolName::namespaced(namespace, member),
-        description: format!("{member} schema"),
+        description: format!("{member} schema").into(),
         ..exec_command_definition()
     };
     let response = execute(
@@ -497,7 +498,7 @@ async fn resolve_tool_accepts_the_namespace_identity_reported_by_tool_search() {
                 // One identity registered twice must not dispatch arbitrarily.
                 namespaced("mcp__dup__first", "mcp__dup", "run"),
                 namespaced("mcp__dup__second", "mcp__dup", "run"),
-            ],
+            ].into(),
             source: r#"
 const fetch = resolve_tool("mcp__github._fetch");
 text({name: fetch.name, description: fetch.description});
@@ -767,7 +768,7 @@ async fn bare_exec_aliases_forward_to_the_exec_command_tool() {
     let response = execute(
         &service,
         ExecuteRequest {
-            enabled_tools: vec![exec_command_definition()],
+            enabled_tools: vec![exec_command_definition()].into(),
             source: r#"const viaExec = await exec({ cmd: "echo hi" });
 const viaBare = await exec_command("echo again");
 const viaShell = await shell({ cmd: "pwd" });

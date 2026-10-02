@@ -31,6 +31,7 @@ use tracing::instrument;
 #[derive(Clone, Debug)]
 pub(crate) struct TurnSkillsContext {
     pub(crate) snapshot: HostSkillsSnapshot,
+    pub(crate) catalog_task: Arc<Mutex<String>>,
     pub(crate) implicit_invocation_seen_skills: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -38,8 +39,18 @@ impl TurnSkillsContext {
     pub(crate) fn new(snapshot: HostSkillsSnapshot) -> Self {
         Self {
             snapshot,
+            catalog_task: Arc::new(Mutex::new(String::new())),
             implicit_invocation_seen_skills: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    pub(crate) async fn update_catalog_task<'a>(&self, input: impl IntoIterator<Item = &'a UserInput>) {
+        let task = input.into_iter().filter_map(|item| match item {
+            UserInput::Text { text, .. } => Some(text.as_str()),
+            UserInput::Skill { name, .. } | UserInput::Mention { name, .. } => Some(name.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>().join("\n");
+        *self.catalog_task.lock().await = task;
     }
 }
 
@@ -473,6 +484,33 @@ impl TurnContext {
             .unwrap_or_else(|| "default".to_string())
     }
 
+    pub(crate) fn request_reasoning_effort(
+        &self,
+        purpose: Option<codex_protocol::protocol::TurnTimingGenerationPurpose>,
+    ) -> Option<ReasoningEffortConfig> {
+        use codex_protocol::protocol::TurnTimingGenerationPurpose;
+        let policy_effort = self.config.purpose_reasoning_effort.as_ref().and_then(|policy| {
+            match purpose? {
+                TurnTimingGenerationPurpose::InitialReasoning => policy.initial.clone(),
+                TurnTimingGenerationPurpose::ImplementationDecision => policy.implementation.clone(),
+                TurnTimingGenerationPurpose::FailureDiagnosis => policy.failure_diagnosis.clone(),
+                TurnTimingGenerationPurpose::Repair => policy.repair.clone(),
+                TurnTimingGenerationPurpose::ValidationInterpretation => policy.validation_interpretation.clone(),
+                TurnTimingGenerationPurpose::ArtifactContinuation => policy.tool_result_interpretation.clone(),
+                TurnTimingGenerationPurpose::Coordination => policy.agent_coordination.clone(),
+                _ => None,
+            }
+        }).filter(|effort| {
+            self.model_info.supports_reasoning_summaries
+                && self.model_info.supported_reasoning_levels.iter()
+                    .any(|supported| supported.effort == *effort)
+        });
+        crate::client::request_effort_for_model(
+            &self.model_info,
+            self.configured_reasoning_effort.clone().or(policy_effort),
+        )
+    }
+
     pub(crate) fn model_context_window(&self) -> Option<i64> {
         let effective_context_window_percent = self.model_info.effective_context_window_percent;
         self.model_info
@@ -670,6 +708,46 @@ impl TurnContext {
         tokio::task::spawn_blocking(move || turn.to_turn_context_item())
             .await
             .expect("turn context projection worker panicked")
+    }
+
+    /// Identity only: never persist config bodies, which can contain secrets.
+    /// Work runs off the async executor and once per logical request, not once
+    /// per physical transport retry. Existing manifests identify tool schemas.
+    pub(crate) async fn runtime_identity(
+        self: &Arc<Self>,
+    ) -> (BTreeMap<String, String>, Option<codex_protocol::protocol::SessionBuildInfo>) {
+        let turn = Arc::clone(self);
+        let result = tokio::task::spawn_blocking(move || -> Result<_, serde_json::Error> {
+            let mut settings = turn.to_turn_context_item();
+            settings.turn_id = None;
+            settings.current_date = None;
+            let parts = [
+                ("config_layers_v1", serde_json::to_value(turn.config.config_layer_stack.effective_config())?),
+                ("turn_settings_v1", serde_json::to_value((
+                    settings,
+                    &turn.reasoning_summary,
+                    &turn.config.service_tier,
+                    turn.config.web_search_mode.value(),
+                    &turn.config.purpose_reasoning_effort,
+                ))?),
+                ("selected_model_v1", serde_json::to_value(&turn.model_info)?),
+            ];
+            let mut identity = BTreeMap::new();
+            for (name, value) in parts {
+                let mut writer = super::Sha256Writer(Sha256::new());
+                Digest::update(&mut writer.0, name.as_bytes());
+                serde_json::to_writer(&mut writer, &value)?;
+                identity.insert(name.to_string(), format!("{:x}", writer.0.finalize()));
+            }
+            Ok((identity, Some(codex_rollout::current_harness_build_info())))
+        }).await;
+        match result {
+            Ok(Ok(identity)) => identity,
+            _ => {
+                warn!("runtime input identity capture unavailable");
+                (BTreeMap::new(), None)
+            }
+        }
     }
 
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {

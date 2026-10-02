@@ -2,7 +2,6 @@ use super::append_output_loss_markers;
 use super::lagged_output_marker;
 use super::observe_process_exit;
 use super::omitted_output_marker;
-use super::record_known_delta_from_process_output;
 use super::resolve_aggregated_output;
 use super::split_valid_utf8_prefix_with_max;
 use super::wait_for_process_output_drain;
@@ -22,9 +21,6 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_execution::CommandExecutionLedger;
 use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::RawOutputArtifact;
-use crate::tools::known_delta_store;
-use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
-use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_protocol::protocol::ToolExecutionId;
 
@@ -150,81 +146,6 @@ async fn direct_runtime_terminal_event_does_not_wait_for_raw_output_finalization
         !output_closed.load(Ordering::Acquire),
         "the terminal-event wait may finish while artifact finalization is still pending"
     );
-}
-
-fn run_git(cwd: &std::path::Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_AUTHOR_NAME", "KD4 Test")
-        .env("GIT_AUTHOR_EMAIL", "kd4@example.invalid")
-        .env("GIT_COMMITTER_NAME", "KD4 Test")
-        .env("GIT_COMMITTER_EMAIL", "kd4@example.invalid")
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("git output is UTF-8")
-        .trim()
-        .to_string()
-}
-
-async fn published_candidate(
-    root: &std::path::Path,
-    name: &str,
-    force_fresh: bool,
-    output: &str,
-) -> (
-    std::path::PathBuf,
-    std::path::PathBuf,
-    String,
-    PreparedKnownDelta,
-) {
-    let repo = root.join(format!("repo-{name}"));
-    let home = root.join(format!("home-{name}"));
-    std::fs::create_dir_all(&repo).expect("create git repo");
-    run_git(&repo, &["init"]);
-    std::fs::write(repo.join("read.txt"), output).expect("write immutable fixture");
-    run_git(&repo, &["add", "read.txt"]);
-    run_git(&repo, &["commit", "-m", "initial"]);
-    let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
-    let args = ["show".to_string(), blob.clone()];
-    let first = known_delta_store::prepare_immutable_git_show(
-        &home,
-        "test-thread",
-        &repo,
-        "git",
-        &args,
-        known_delta_store::ProjectNamespaceHint::Discover,
-        false,
-    )
-    .await
-    .expect("immutable git show is eligible");
-    known_delta_store::record_execution(
-        &home,
-        &first,
-        KnownDeltaExecutionObservation::CompleteSuccess {
-            output: output.as_bytes(),
-            executor_cost: Duration::from_secs(1),
-        },
-    )
-    .await;
-    let prepared = known_delta_store::prepare_immutable_git_show(
-        &home,
-        "test-thread",
-        &repo,
-        "git",
-        &args,
-        known_delta_store::ProjectNamespaceHint::Discover,
-        force_fresh,
-    )
-    .await
-    .expect("published immutable git show remains eligible");
-    (repo, home, blob, prepared)
 }
 
 #[test]
@@ -398,178 +319,6 @@ async fn final_capacity_marker_separates_nonadjacent_head_and_tail() {
 }
 
 #[tokio::test]
-async fn known_delta_background_completion_promotes_exact_process_output() {
-    known_delta_store::test_observation::with_profitability_costs(
-        async {
-            let root = tempfile::tempdir().expect("test root");
-            let (repo, home, blob, prepared) =
-                published_candidate(root.path(), "exact", false, "immutable\n").await;
-            assert!(prepared.has_candidate());
-            assert!(!prepared.is_hit());
-            let process = crate::unified_exec::process_tests::remote_process(
-                codex_exec_server::WriteStatus::Accepted,
-                None,
-            )
-            .await;
-            process
-                .publish_output_for_test(b"immutable\n".to_vec())
-                .await;
-            let transcript = process.snapshot_completion_output().await;
-
-            record_known_delta_from_process_output(
-                &home,
-                &prepared,
-                &transcript,
-                true,
-                Duration::from_secs(1),
-            )
-            .await;
-
-            let promoted = known_delta_store::prepare_immutable_git_show(
-                &home,
-                "next-thread",
-                &repo,
-                "git",
-                &["show".to_string(), blob],
-                known_delta_store::ProjectNamespaceHint::Discover,
-                false,
-            )
-            .await
-            .expect("exact background evidence remains eligible");
-            assert!(promoted.is_hit());
-        },
-        Duration::from_micros(1),
-        Duration::from_micros(1),
-        Duration::from_secs(1),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn known_delta_background_completion_skips_lossy_output_and_quarantines_fresh_failure() {
-    known_delta_store::test_observation::with_profitability_costs(
-        async {
-            let root = tempfile::tempdir().expect("test root");
-
-            let (omitted_repo, omitted_home, omitted_blob, omitted_prepared) =
-                published_candidate(root.path(), "omitted", false, "immutable\n").await;
-            let process = crate::unified_exec::process_tests::remote_process(
-                codex_exec_server::WriteStatus::Accepted,
-                None,
-            )
-            .await;
-            process
-                .publish_output_for_test(vec![
-                    b'x';
-                    crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES + 1
-                ])
-                .await;
-            let omitted = process.snapshot_completion_output().await;
-            assert!(!omitted.aggregated_output_is_exact);
-            record_known_delta_from_process_output(
-                &omitted_home,
-                &omitted_prepared,
-                &omitted,
-                true,
-                Duration::from_secs(1),
-            )
-            .await;
-            let after_omission = known_delta_store::prepare_immutable_git_show(
-                &omitted_home,
-                "next-thread",
-                &omitted_repo,
-                "git",
-                &["show".to_string(), omitted_blob],
-                known_delta_store::ProjectNamespaceHint::Discover,
-                false,
-            )
-            .await
-            .expect("omitted evidence remains eligible as a miss");
-            assert!(after_omission.has_candidate());
-            assert!(!after_omission.is_hit());
-
-            let (lagged_repo, lagged_home, lagged_blob, lagged_prepared) =
-                published_candidate(root.path(), "lagged", false, &"immutable\n".repeat(128)).await;
-            let process = crate::unified_exec::process_tests::remote_process(
-                codex_exec_server::WriteStatus::Accepted,
-                None,
-            )
-            .await;
-            let mut receiver = process.take_output_receiver().expect("live receiver");
-            for _ in 0..128 {
-                process
-                    .publish_output_for_test(b"immutable\n".to_vec())
-                    .await;
-            }
-            assert!(matches!(
-                receiver.try_recv(),
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
-            ));
-            let lagged = process.snapshot_completion_output().await;
-            assert!(lagged.aggregated_output_is_exact);
-            record_known_delta_from_process_output(
-                &lagged_home,
-                &lagged_prepared,
-                &lagged,
-                true,
-                Duration::from_secs(1),
-            )
-            .await;
-            let after_lag = known_delta_store::prepare_immutable_git_show(
-                &lagged_home,
-                "next-thread",
-                &lagged_repo,
-                "git",
-                &["show".to_string(), lagged_blob],
-                known_delta_store::ProjectNamespaceHint::Discover,
-                false,
-            )
-            .await
-            .expect("live-event loss preserves exact process-owned evidence");
-            assert!(after_lag.is_hit());
-
-            let (fresh_repo, fresh_home, fresh_blob, fresh_prepared) =
-                published_candidate(root.path(), "force-fresh", true, "immutable\n").await;
-            assert!(fresh_prepared.has_candidate());
-            let process = crate::unified_exec::process_tests::remote_process(
-                codex_exec_server::WriteStatus::Accepted,
-                None,
-            )
-            .await;
-            process
-                .publish_output_for_test(b"fatal: object unavailable\n".to_vec())
-                .await;
-            let exact_failure = process.snapshot_completion_output().await;
-            record_known_delta_from_process_output(
-                &fresh_home,
-                &fresh_prepared,
-                &exact_failure,
-                false,
-                Duration::from_secs(1),
-            )
-            .await;
-            let quarantined = known_delta_store::prepare_immutable_git_show(
-                &fresh_home,
-                "next-thread",
-                &fresh_repo,
-                "git",
-                &["show".to_string(), fresh_blob],
-                known_delta_store::ProjectNamespaceHint::Discover,
-                false,
-            )
-            .await
-            .expect("quarantined identity remains structurally eligible");
-            assert!(!quarantined.has_candidate());
-            assert!(!quarantined.is_hit());
-        },
-        Duration::from_micros(1),
-        Duration::from_micros(1),
-        Duration::from_secs(1),
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn capped_live_output_preserves_transcript_without_growing_pending_buffers() {
     use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
     use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
@@ -659,18 +408,14 @@ async fn capped_live_output_preserves_transcript_without_growing_pending_buffers
 }
 
 #[tokio::test]
-async fn exit_watcher_applies_late_network_denial_before_terminal_event_and_cache_promotion()
--> anyhow::Result<()> {
+async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> anyhow::Result<()> {
     use crate::tools::network_approval::NetworkApprovalMode;
     use crate::tools::network_approval::NetworkApprovalSpec;
     use crate::tools::network_approval::begin_network_approval;
     use codex_protocol::protocol::EventMsg;
     for denied in [false, true] {
         let root = tempfile::tempdir()?;
-        let (repo, home, blob, prepared) =
-            published_candidate(root.path(), "late-denial", false, "immutable\n").await;
-        assert!(prepared.has_candidate());
-        assert!(!prepared.is_hit());
+        let home = root.path().to_path_buf();
         let (session, mut turn, events) =
             crate::session::tests::make_session_and_context_with_rx().await;
         Arc::make_mut(&mut Arc::get_mut(&mut turn).expect("unique fixture turn").config)
@@ -697,7 +442,7 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event_and_cach
                 codex_network_proxy::NetworkProxyAuditMetadata::default(),
             )
             .await?;
-        let command = vec!["git".to_string(), "show".to_string(), blob.clone()];
+        let command = vec!["fixture-command".to_string()];
         let deferred = begin_network_approval(
             &session,
             true,
@@ -753,8 +498,6 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event_and_cach
             started,
             crate::tools::context::ToolCallSource::Direct,
             None,
-            Some(prepared),
-            Some(started),
             None,
             Some(deferred.clone()),
             None,
@@ -823,22 +566,6 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event_and_cach
             assert_eq!(terminal_events[0].aggregated_output, "immutable\n");
             assert_eq!(process.failure_message(), None);
         }
-        let next = known_delta_store::prepare_immutable_git_show(
-            &home,
-            "next-thread",
-            &repo,
-            "git",
-            &["show".to_string(), blob],
-            known_delta_store::ProjectNamespaceHint::Discover,
-            false,
-        )
-        .await
-        .expect("eligible command");
-        assert_eq!(
-            next.is_hit(),
-            !denied,
-            "only successful approved execution may promote the candidate"
-        );
         assert!(ledger.running_process(73).await.is_none());
     }
     Ok(())

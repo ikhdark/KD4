@@ -29,35 +29,6 @@ path = "codex-rs/core/src/session/turn.rs"
 contains = "let kd4_runtime = turn_context.config.features.enabled(Feature::Kd4Runtime);"
 
 [[features]]
-id = "known-delta-store"
-version = 1
-status = "enabled"
-capability_kind = "runtime"
-owner = "codex-rs/core"
-summary = "Reuse validated exact command results while preserving force-fresh execution and background result evidence."
-upstream_equivalent = "none"
-config_keys = ["features.known_delta_store"]
-runtime_feature_key = "features.known_delta_store"
-runtime_status = "enabled"
-runtime_status_source = "codex-rs/features/src/lib.rs"
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs", symbol = "known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-known-delta-store", "--profile", "fast"] }
-
-[[features.evidence]]
-kind = "entrypoint"
-path = "codex-rs/core/src/tools/known_delta_store.rs"
-contains = "pub(crate) struct KnownDeltaHit"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
-contains = "session.features().enabled(Feature::KnownDeltaStore)"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/tools/handlers/shell.rs"
-contains = "turn.config.features.enabled(Feature::KnownDeltaStore)"
-
-[[features]]
 id = "deferred-executor"
 version = 1
 status = "enabled"
@@ -584,7 +555,7 @@ version = 2
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/agent-task-store"
-summary = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
+summary = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, lifecycle quiescence, and versioned isolated-worktree handoffs."
 upstream_equivalent = "none"
 config_keys = []
 runtime_verification = { kind = "contract_test", path = "codex-rs/agent-task-store/src/tests.rs", symbol = "completed_receipt_rejects_workspace_change_after_validation", command = ["python", "scripts/rust_test_runner.py", "run-gate", "capability-shared-worktree-reliability", "--profile", "fast"] }

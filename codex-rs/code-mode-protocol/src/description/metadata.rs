@@ -20,7 +20,8 @@ pub enum CodeModeToolKind {
 pub struct ToolDefinition {
     pub name: String,
     pub tool_name: ToolName,
-    pub description: String,
+    /// Immutable rendered contract, shared by per-cell timeout overlays.
+    pub description: std::sync::Arc<str>,
     pub kind: CodeModeToolKind,
     pub input_schema: Option<JsonValue>,
     pub output_schema: Option<JsonValue>,
@@ -59,7 +60,7 @@ pub fn normalize_code_mode_identifier(tool_key: &str) -> String {
 
 pub fn augment_tool_definition(mut definition: ToolDefinition) -> ToolDefinition {
     if is_code_mode_nested_tool(&definition.name) {
-        definition.description = render_code_mode_sample_for_definition(&definition);
+        definition.description = render_code_mode_sample_for_definition(&definition).into();
     }
     definition
 }
@@ -80,7 +81,7 @@ pub struct EnabledToolMetadata {
     pub global_name: String,
     #[serde(skip)]
     pub default_timeout_ms: Option<u64>,
-    pub description: String,
+    pub description: std::sync::Arc<str>,
     pub kind: CodeModeToolKind,
 }
 
@@ -303,7 +304,7 @@ mod tests {
         let definitions = (0..12).map(|index| ToolDefinition {
             name: format!("sample_{index}"),
             tool_name: ToolName::plain(format!("sample_{index}")),
-            description: String::new(),
+            description: "".into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(json!({
                 "type": "object",
@@ -347,7 +348,7 @@ mod tests {
         ToolDefinition {
             name: name.to_string(),
             tool_name: ToolName::plain(name),
-            description: format!("Call {name}."),
+            description: format!("Call {name}.").into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(schema.clone()),
             output_schema: Some(schema),
@@ -456,7 +457,7 @@ mod tests {
             let definition = ToolDefinition {
                 name: "answer".to_string(),
                 tool_name: ToolName::plain("answer"),
-                description: "Answer.".to_string(),
+                description: "Answer.".into(),
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
                 output_schema: Some(schema.clone()),
@@ -477,7 +478,7 @@ mod tests {
                     description: format!(
                         "Answer.\n\nexec tool declaration:\n```ts\n{envelope}declare const tools: {{ answer(args: unknown, options?: {{ timeout_ms?: number }}): Promise<{expected_output}>; }};\n```",
                         envelope = if marker { MCP_RESULT_ENVELOPE } else { "" },
-                    ),
+                    ).into(),
                 }
             );
         }

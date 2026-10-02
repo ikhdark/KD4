@@ -16,6 +16,12 @@ const SUCCESS_HEAD_LINES: usize = 24;
 const SUCCESS_TAIL_LINES: usize = 64;
 const VALIDATION_SUCCESS_TAIL_LINES: usize = 16;
 const FAILURE_TAIL_LINES: usize = 140;
+/// A successful output this short exceeds its budget through long lines, not
+/// many lines: keep every line and abbreviate the long ones instead of ranking
+/// an excerpt that sends the model back to re-read the omitted lines.
+const COMPLETE_SUCCESS_MAX_LINES: usize = 160;
+/// Narrowest per-line excerpt used before whole lines are omitted.
+const MIN_COMPLETE_LINE_BYTES: usize = 240;
 pub(crate) const FOCUS_CONTEXT_LINES: usize = 3;
 // Keep the selected ranges below the summary line ceiling even when every
 // match is disjoint and receives the full context window. This leaves room for
@@ -189,6 +195,31 @@ pub(crate) fn summarize_shell_output_for_model(
     if let Some(limit) = options.applied_token_limit
         && codex_utils_string::approx_token_count_exceeds(&summary, limit)
     {
+        if !(failed || validation) && line_count <= COMPLETE_SUCCESS_MAX_LINES {
+            // Every line is selected; abbreviate the long ones further before
+            // omitting any whole line.
+            let fits = |budget| {
+                render_selected_lines(builder.clone(), &selected, budget, line_count).filter(
+                    |rendered| !codex_utils_string::approx_token_count_exceeds(rendered, limit),
+                )
+            };
+            if let Some(minimum) = fits(MIN_COMPLETE_LINE_BYTES.min(line_budget)) {
+                let mut low = MIN_COMPLETE_LINE_BYTES.min(line_budget);
+                let mut high = line_budget;
+                summary = minimum;
+                while low < high {
+                    let mid = low + (high - low).div_ceil(2);
+                    match fits(mid) {
+                        Some(rendered) => {
+                            low = mid;
+                            summary = rendered;
+                        }
+                        None => high = mid - 1,
+                    }
+                }
+                return (summary.len() < output.len()).then_some(summary);
+            }
+        }
         // The byte ceiling does not honor a caller's smaller token budget (or
         // punctuation-dense diagnostics). Fit the entire selected summary so
         // downstream truncation cannot discard a middle diagnostic region.
@@ -863,6 +894,9 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
         SUCCESS_TAIL_LINES
     };
     indexes.extend(line_count.saturating_sub(tail)..line_count);
+    if !(failed || validation) && line_count <= COMPLETE_SUCCESS_MAX_LINES {
+        indexes.extend(0..line_count);
+    }
     indexes.extend(progress.values().copied());
     for (index, line) in output.lines().enumerate() {
         if let Some(key) = progress_line_key(line)

@@ -9,6 +9,8 @@ import hashlib
 import tempfile
 import json
 import os
+import re
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +23,86 @@ except ImportError:
 
 
 _READ_CHUNK_BYTES = 1024 * 1024
+_MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
+_PAYLOAD_KIND = "rollout_payload_artifact"
+
+
+def rollout_payload_root(path: Path) -> Path:
+    for ancestor in path.parents:
+        if ancestor.name in {"sessions", "archived_sessions"}:
+            return ancestor.parent / "rollout-payloads"
+    return path.parent / "rollout-payloads"
+
+
+def load_rollout_payload(path: Path, sha256: str, expected_bytes: int | None = None) -> bytes:
+    """Load immutable undo/timing data, rejecting missing or substituted blobs."""
+    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise ValueError("invalid rollout payload hash")
+    artifact = rollout_payload_root(path) / f"{sha256}.json"
+    metadata = artifact.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_PAYLOAD_BYTES:
+        raise ValueError(f"invalid rollout payload file: {artifact}")
+    if expected_bytes is not None and metadata.st_size != expected_bytes:
+        raise ValueError(f"rollout payload size mismatch: {artifact}")
+    with artifact.open("rb") as handle:
+        data = handle.read(_MAX_PAYLOAD_BYTES + 1)
+    if len(data) != metadata.st_size or hashlib.sha256(data).hexdigest() != sha256:
+        raise ValueError(f"rollout payload checksum mismatch: {artifact}")
+    return data
+
+
+def hydrate_rollout_record(record: Any, path: Path) -> Any:
+    """Keep the public record shape identical for inline and external payloads."""
+    if not isinstance(record, dict) or record.get("type") != _PAYLOAD_KIND:
+        return record
+    reference = record.get("payload")
+    if not isinstance(reference, dict) or type(reference.get("bytes")) is not int:
+        raise ValueError("invalid rollout payload reference")
+    item = json.loads(load_rollout_payload(path, reference.get("sha256"), reference["bytes"]))
+    if (not isinstance(item, dict) or item.get("type") == _PAYLOAD_KIND
+            or item.get("type") != reference.get("item_type")):
+        raise ValueError("rollout payload type mismatch")
+    item["timestamp"] = record.get("timestamp")
+    item["format_version"] = record.get("format_version")
+    return item
+
+
+def copy_rollout_payloads(snapshot: RolloutSnapshot, output: Path) -> None:
+    """Copy dependencies before publishing a byte-identical portable snapshot."""
+    if rollout_payload_root(snapshot.path) == rollout_payload_root(output):
+        return
+    seen = set()
+    with snapshot.open_lines() as lines:
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue  # Preserve raw snapshots, including an incomplete tail.
+            if not isinstance(record, dict) or record.get("type") != _PAYLOAD_KIND:
+                continue
+            hydrate_rollout_record(record, snapshot.path)
+            reference = record["payload"]
+            digest = reference["sha256"]
+            if digest in seen:
+                continue
+            seen.add(digest)
+            data = load_rollout_payload(snapshot.path, digest, reference["bytes"])
+            directory = rollout_payload_root(output)
+            directory.mkdir(parents=True, exist_ok=True)
+            destination = directory / f"{digest}.json"
+            # Publish atomically without replacing any existing immutable blob.
+            with tempfile.NamedTemporaryFile(dir=directory, delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(data)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            try:
+                try:
+                    os.link(temporary_path, destination)
+                except FileExistsError:
+                    load_rollout_payload(output, digest, reference["bytes"])
+            finally:
+                temporary_path.unlink()
 
 
 @dataclass(frozen=True)
@@ -208,7 +290,7 @@ def read_rollout_records(path: Path) -> list[tuple[dict[str, Any], int]]:
                 raise ValueError(
                     f"rollout record {snapshot.path}:{number} is not an object"
                 )
-            records.append((record, len(line)))
+            records.append((hydrate_rollout_record(record, snapshot.path), len(line)))
     return records
 
 
@@ -246,6 +328,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "snapshot output suffix must match the captured rollout format "
                     "(.jsonl.zst for compressed bytes)"
                 )
+            copy_rollout_payloads(snapshot, output)
             snapshot.stream.seek(0)
             write_stream_atomic(output, snapshot.stream)
             metadata["output"] = str(output)

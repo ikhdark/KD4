@@ -1873,6 +1873,7 @@ impl Session {
                 unified_exec_manager,
                 command_execution,
                 retained_patches: Default::default(),
+                path_replays: Default::default(),
                 plan_store: crate::plan_store::PlanStore::default(),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 analytics_events_client,

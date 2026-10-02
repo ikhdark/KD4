@@ -374,6 +374,7 @@ impl RolloutFile {
 /// Line-oriented rollout reader returned by [`open_rollout_line_reader`].
 pub struct RolloutLineReader {
     inner: RolloutLineReaderInner,
+    path: PathBuf,
 }
 
 enum RolloutLineReaderInner {
@@ -389,7 +390,7 @@ struct BlockingRolloutLineReader {
 impl RolloutLineReader {
     /// Reads the next JSONL record from the rollout.
     pub async fn next_line(&mut self) -> io::Result<Option<String>> {
-        match &mut self.inner {
+        let line = match &mut self.inner {
             RolloutLineReaderInner::Plain(reader) => {
                 let mut line = Vec::new();
                 if reader.read_until(b'\n', &mut line).await? == 0 {
@@ -406,7 +407,12 @@ impl RolloutLineReader {
                     Ok(None)
                 }
             },
-        }
+        }?;
+        let Some(line) = line else { return Ok(None); };
+        if !line.contains("rollout_payload_artifact") { return Ok(Some(line)); }
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || crate::payload_artifact::hydrate_line(&path, line))
+            .await.map_err(io::Error::other)?.map(Some)
     }
 }
 
@@ -1200,6 +1206,7 @@ mod reader {
         let path = path::existing_rollout_path(path)
             .await
             .unwrap_or_else(|| path.to_path_buf());
+        let source_path = path.clone();
         if path::is_compressed_rollout_path(path.as_path()) {
             let mut reader = tokio::task::spawn_blocking(move || {
                 let input = File::open(path.as_path())?;
@@ -1227,6 +1234,7 @@ mod reader {
                 Ok(())
             });
             return Ok(RolloutLineReader {
+                path: source_path,
                 inner: RolloutLineReaderInner::Blocking(BlockingRolloutLineReader {
                     receiver,
                     task: Some(task),
@@ -1235,6 +1243,7 @@ mod reader {
         }
         let file = tokio::fs::File::open(path).await?;
         Ok(RolloutLineReader {
+            path: source_path,
             inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file)),
         })
     }

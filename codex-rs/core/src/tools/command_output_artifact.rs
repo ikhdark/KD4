@@ -45,7 +45,7 @@ use tokio::sync::Mutex;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 
-const ARTIFACT_EXPIRED_MESSAGE: &str = "artifact expired or does not belong to this thread; rerun the command if the output is still needed";
+const ARTIFACT_EXPIRED_MESSAGE: &str = "artifact expired or does not belong to this thread. The producing operation already ran; a missing artifact does not mean it failed or had no effects. Use output already in context or inspect the state it changed; rerun it only if it is read-only or safely repeatable.";
 const ARTIFACT_WRITING_MESSAGE: &str =
     "artifact is still being written; retry after the command yields or exits";
 const ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION: &str = "active-tool-history";
@@ -431,6 +431,7 @@ struct RetentionIndex {
     logical_mutations_since_reconciliation: u64,
     near_limit_reconciled: bool,
     near_limit_pending: bool,
+    background_reconciliation_pending: bool,
 }
 
 impl RetentionIndex {
@@ -3458,11 +3459,29 @@ pub(crate) async fn protect_active_tool_history_artifact(
     expected_bytes: u64,
     expected_sha256: &str,
 ) -> Result<(), String> {
-    let id = artifact_id
-        .parse::<ToolOutputArtifactId>()
-        .map_err(|_| "invalid tool-output artifact id".to_string())?;
-    if id.to_string() != artifact_id {
-        return Err("non-canonical tool-output artifact id".to_string());
+    protect_active_tool_history_artifacts(
+        codex_home, thread_id,
+        BTreeMap::from([(artifact_id.to_string(), (expected_bytes, expected_sha256.to_string()))]),
+    ).await
+}
+
+/// Protect a checkpoint's references under one admission/retention lock. Validate
+/// the complete set before publishing markers; interrupted publication is safe
+/// to reconcile from the durable history using the existing pruning owner.
+pub(crate) async fn protect_active_tool_history_artifacts(
+    codex_home: &Path,
+    thread_id: &str,
+    references: BTreeMap<String, (u64, String)>,
+) -> Result<(), String> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    for artifact_id in references.keys() {
+        let id = artifact_id.parse::<ToolOutputArtifactId>()
+            .map_err(|_| "invalid tool-output artifact id".to_string())?;
+        if id.to_string() != *artifact_id {
+            return Err("non-canonical tool-output artifact id".to_string());
+        }
     }
     let directory = codex_home.join("tool-output").join(thread_id);
     let (root, semaphore) = retention_sweep_admission_for_directory(&directory)
@@ -3472,54 +3491,58 @@ pub(crate) async fn protect_active_tool_history_artifact(
         .acquire_owned()
         .await
         .map_err(|error| format!("failed to acquire artifact retention admission: {error}"))?;
-    let expected_sha256 = expected_sha256.to_string();
     // One worker owns every filesystem operation and both retention locks through
     // publication. It never waits for another worker in the same blocking pool.
     tokio::task::spawn_blocking(move || {
-        let token = capture_retention_token(&directory);
         let _permit = retention_sweep_permit_blocking(&root, process_permit).map_err(|error| {
             record_retention_sweep_permit_failure(&root, &error);
             format!("failed to acquire artifact retention lock: {error}")
         })?;
-        let path = directory.join(format!("{id}.log"));
-        let marker = active_tool_history_protection_path(&path);
-        let result = (|| {
-            verify_tool_history_artifact_blocking(&path, expected_bytes, &expected_sha256)?;
-            match std::fs::symlink_metadata(&marker) {
-                Ok(_) => {
-                    if !protection_marker_status(
-                        &marker,
-                        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
-                    )
-                    .unwrap_or(false)
-                    {
-                        return Err("active tool-history protection marker is invalid".to_string());
+        for (id, (bytes, sha256)) in &references {
+            verify_tool_history_artifact_blocking(&directory.join(format!("{id}.log")), *bytes, sha256)?;
+        }
+        for (id, _) in references {
+            let token = capture_retention_token(&directory);
+            let path = directory.join(format!("{id}.log"));
+            let marker = active_tool_history_protection_path(&path);
+            let result = (|| {
+                match std::fs::symlink_metadata(&marker) {
+                    Ok(_) => {
+                        if !protection_marker_status(
+                            &marker,
+                            ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+                        )
+                        .unwrap_or(false)
+                        {
+                            return Err("active tool-history protection marker is invalid".to_string());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        create_new_protection_marker(
+                            &marker,
+                            ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+                        )
+                        .map_err(|error| format!("failed to protect artifact: {error}"))?;
+                    }
+                    Err(error) => {
+                        return Err(format!("failed to inspect artifact protection: {error}"));
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    create_new_protection_marker(
-                        &marker,
-                        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
-                    )
-                    .map_err(|error| format!("failed to protect artifact: {error}"))?;
-                }
-                Err(error) => {
-                    return Err(format!("failed to inspect artifact protection: {error}"));
-                }
+                sync_parent_directory(&marker).map_err(|error| {
+                    format!("failed to sync active tool-history protection: {error}")
+                })?;
+                let record = artifact_retention_record_blocking(&path)
+                    .map_err(|error| format!("failed to index protected artifact: {error}"))?
+                    .ok_or_else(|| "artifact disappeared before protection was indexed".to_string())?;
+                publish_known_record(&token, record, LogicalRetentionMutation::Protection);
+                Ok(())
+            })();
+            if result.is_err() {
+                reject_stale_delta(&token);
             }
-            sync_parent_directory(&marker).map_err(|error| {
-                format!("failed to sync active tool-history protection: {error}")
-            })?;
-            let record = artifact_retention_record_blocking(&path)
-                .map_err(|error| format!("failed to index protected artifact: {error}"))?
-                .ok_or_else(|| "artifact disappeared before protection was indexed".to_string())?;
-            publish_known_record(&token, record, LogicalRetentionMutation::Protection);
-            Ok(())
-        })();
-        if result.is_err() {
-            reject_stale_delta(&token);
+            result?;
         }
-        result
+        Ok(())
     })
     .await
     .map_err(|error| format!("artifact protection worker failed: {error}"))?
@@ -4759,6 +4782,8 @@ fn search_logical_artifact(
     };
 
     let fits = |candidate: &ToolOutputSelectorResult| {
+        let mut results = previous_results.to_vec();
+        results.push(candidate.clone());
         let response = ReadToolOutputResult {
             artifact_id: metadata.artifact_id.clone(),
             canonical_sha256: metadata.canonical_sha256.clone(),
@@ -4766,7 +4791,7 @@ fn search_logical_artifact(
             retained_bytes: metadata.retained_bytes,
             complete: metadata.complete,
             unavailable_ranges: metadata.unavailable_ranges.clone(),
-            results: vec![candidate.clone()],
+            results,
         };
         response_fits_recovery_token_ceiling(&response, token_ceiling)
     };
@@ -5390,6 +5415,75 @@ pub(crate) fn select_file_snapshot(
         selectors,
         RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000),
     )
+}
+
+/// Script consumers get exact data independently of the cell's display budget.
+/// Bound the serialized payload, including escaping, rather than its token estimate.
+pub(crate) fn select_file_snapshot_for_script(
+    canonical: &CanonicalToolResult,
+    selectors: Option<Vec<ToolOutputSelector>>,
+) -> Result<(ReadToolOutputResult, Option<ToolOutputSelector>), ReadToolOutputError> {
+    const MAX_SCRIPT_BYTES: usize = 1024 * 1024;
+    let metadata = producer_snapshot_metadata(canonical, uuid::Uuid::nil().to_string());
+    let default_read = selectors.is_none();
+    let selectors = selectors.unwrap_or_else(|| vec![ToolOutputSelector::Bytes {
+        start: 0,
+        end: canonical.exact_bytes.min(MAX_SCRIPT_BYTES as u64),
+    }]);
+    let mut response = ReadToolOutputResult {
+        artifact_id: metadata.artifact_id.clone(),
+        canonical_sha256: canonical.sha256.clone(),
+        canonical_bytes: canonical.exact_bytes,
+        retained_bytes: canonical.exact_bytes,
+        complete: true,
+        unavailable_ranges: canonical.unavailable_ranges.clone(),
+        results: Vec::new(),
+    };
+    let mut continuation = None;
+    for selector in selectors {
+        let mut selected = select_logical_artifact(
+            &metadata, &canonical.bytes, selector.clone(), usize::MAX, usize::MAX,
+            &response.results,
+        );
+        loop {
+            response.results.push(selected.clone());
+            // Reserve enough room for all remaining selectors' overflow metadata.
+            let fits = serde_json::to_vec(&response)
+                .is_ok_and(|bytes| bytes.len() <= MAX_SCRIPT_BYTES - 128 * 1024);
+            if fits {
+                break;
+            }
+            response.results.pop();
+            if default_read && let Some(range) = selected.canonical_range && range.end > 1 {
+                let mut end = range.end as usize / 2;
+                while end > 0 && std::str::from_utf8(&canonical.bytes[..end]).is_err() {
+                    end -= 1;
+                }
+                selected = successful_byte_selector_result(
+                    CanonicalByteRange::new(0, end as u64), &canonical.bytes[..end],
+                );
+                continue;
+            }
+            let mut omitted = ToolOutputSelectorResult::state(
+                selector.clone(), ToolOutputSelectorStatus::AggregateOmitted,
+            );
+            omitted.exact_bytes = selected.exact_bytes;
+            omitted.canonical_range = selected.canonical_range;
+            omitted.continuation = Some(selector.clone());
+            omitted.message = Some("Selection exceeds the 1 MiB script payload cap; request smaller ranges.".into());
+            response.results.push(omitted);
+            break;
+        }
+    }
+    response.complete = response.results.iter().all(|result|
+        result.status == ToolOutputSelectorStatus::Ok && result.complete);
+    if default_read && let Some(end) = response.results.first()
+        .and_then(|result| result.canonical_range.map(|range| range.end))
+        && end < canonical.exact_bytes
+    {
+        continuation = Some(ToolOutputSelector::Bytes { start: end, end: canonical.exact_bytes });
+    }
+    Ok((response, continuation))
 }
 
 pub(crate) fn select_file_snapshot_with_ceiling(
@@ -6230,14 +6324,18 @@ fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> R
         if let Some(state) = registry.roots.get_mut(&root) {
             match &mut state.mode {
                 RetentionRootMode::Indexed(index) => {
-                    if force_reconciliation
-                        || index.logical_mutations_since_reconciliation
-                            >= RETENTION_RECONCILIATION_INTERVAL
-                        || index.near_limit_pending
-                    {
+                    if force_reconciliation || index.near_limit_pending {
                         RetentionModeKind::Dirty
-                    } else {
+                    } else if index.logical_mutations_since_reconciliation
+                        < RETENTION_RECONCILIATION_INTERVAL
+                        || index.background_reconciliation_pending
+                    {
                         RetentionModeKind::Indexed
+                    } else if schedule_background_retention_reconciliation(&root) {
+                        index.background_reconciliation_pending = true;
+                        RetentionModeKind::Indexed
+                    } else {
+                        RetentionModeKind::Dirty
                     }
                 }
                 RetentionRootMode::Dirty | RetentionRootMode::Reconciling { .. } => {
@@ -6281,6 +6379,37 @@ fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> R
         return reconciled;
     }
     RetentionModeKind::Indexed
+}
+
+/// Periodic reconciliation only corrects drift in an index that deltas keep
+/// current, so the triggering commit keeps that index and the full-root scan
+/// runs afterwards under its own permit. Returns false without a runtime.
+fn schedule_background_retention_reconciliation(root: &Path) -> bool {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    let root = root.to_path_buf();
+    runtime.spawn(async move {
+        let permit = retention_sweep_permit(&root).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            // A reconciliation that replaced the index since scheduling also cleared this.
+            let due = {
+                let mut registry = lock_retention_registry();
+                match registry.roots.get_mut(&root).map(|state| &mut state.mode) {
+                    Some(RetentionRootMode::Indexed(index)) => {
+                        std::mem::take(&mut index.background_reconciliation_pending)
+                    }
+                    _ => false,
+                }
+            };
+            if due && permit.is_some() {
+                reconcile_retention_root_blocking(&root);
+            }
+            drop(permit);
+        })
+        .await;
+    });
+    true
 }
 
 fn invalidate_root_after_ambiguous_failure(root: &Path) {
@@ -6640,7 +6769,7 @@ fn idle_thread_artifact_directories(
         let Ok(thread_id) = entry.file_name().into_string() else {
             continue;
         };
-        // Shared stores under the root, such as known-delta blobs, are not thread-owned.
+        // Directories without valid thread IDs are not thread-owned.
         if thread_id == active_thread_id
             || codex_protocol::ThreadId::from_string(&thread_id).is_err()
         {

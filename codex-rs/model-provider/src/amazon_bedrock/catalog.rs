@@ -1,4 +1,3 @@
-use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_5_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID;
@@ -14,7 +13,6 @@ use codex_protocol::openai_models::ReasoningEffort;
 
 const GPT_5_BEDROCK_CONTEXT_WINDOW: i64 = 272_000;
 const GPT_5_5_OPENAI_MODEL_ID: &str = "gpt-5.5";
-const GPT_5_4_OPENAI_MODEL_ID: &str = "gpt-5.4";
 
 #[expect(
     clippy::expect_used,
@@ -25,15 +23,15 @@ pub(crate) fn static_model_catalog() -> ModelsResponse {
     with_default_only_service_tier(ModelsResponse {
         models: vec![
             bedrock_model(
-                bundled_openai_model(&bundled, "gpt-6-sol"),
-                AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID,
-                "GPT-6 Sol",
-                /*priority*/ 0,
-            ),
-            bedrock_model(
                 bundled_openai_model(&bundled, "gpt-6-astra"),
                 AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID,
                 "GPT-6-Astra",
+                /*priority*/ 0,
+            ),
+            bedrock_model(
+                bundled_openai_model(&bundled, "gpt-6-sol"),
+                AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID,
+                "GPT-6 Sol",
                 /*priority*/ 1,
             ),
             bedrock_model(
@@ -65,12 +63,6 @@ pub(crate) fn static_model_catalog() -> ModelsResponse {
                 AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
                 "GPT-5.5",
                 /*priority*/ 6,
-            ),
-            gpt_5_bedrock_model(
-                bundled_openai_model(&bundled, GPT_5_4_OPENAI_MODEL_ID),
-                AMAZON_BEDROCK_GPT_5_4_MODEL_ID,
-                "GPT-5.4",
-                /*priority*/ 7,
             ),
         ],
     })
@@ -235,14 +227,13 @@ mod tests {
                 .map(|model| model.slug.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID,
                 AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID,
+                AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID,
                 AMAZON_BEDROCK_GPT_6_LUNA_MODEL_ID,
                 AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID,
                 AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID,
                 AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID,
                 AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
-                AMAZON_BEDROCK_GPT_5_4_MODEL_ID,
             ]
         );
     }
@@ -253,13 +244,10 @@ mod tests {
 
         for model in catalog.models {
             let expected = match model.slug.as_str() {
-                AMAZON_BEDROCK_GPT_5_5_MODEL_ID | AMAZON_BEDROCK_GPT_5_4_MODEL_ID => (
+                AMAZON_BEDROCK_GPT_5_5_MODEL_ID => (
                     Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
                     Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
                 ),
-                AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID
-                | AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID
-                | AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID => (Some(372_000), Some(372_000)),
                 _ => (Some(272_000), Some(872_000)),
             };
             assert_eq!(
@@ -286,8 +274,8 @@ mod tests {
         let bundled = bundled_models_response().unwrap();
 
         for (slug, display_name, priority) in [
-            (AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID, "GPT-6 Sol", 0),
-            (AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID, "GPT-6-Astra", 1),
+            (AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID, "GPT-6-Astra", 0),
+            (AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID, "GPT-6 Sol", 1),
             (AMAZON_BEDROCK_GPT_6_LUNA_MODEL_ID, "GPT-6 Luna", 2),
             (AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID, "GPT-5.6 Sol", 3),
             (AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID, "GPT-5.6 Terra", 4),

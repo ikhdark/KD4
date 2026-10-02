@@ -73,6 +73,8 @@ async fn decode_frame(frame: EncodedFrame) -> HostToClient {
 
 fn execute_request(source: &str) -> WireExecuteRequest {
     WireExecuteRequest {
+        catalog: None,
+        state_path: None,
         tool_call_id: "call-1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
@@ -80,6 +82,24 @@ fn execute_request(source: &str) -> WireExecuteRequest {
         max_output_tokens: Some(1_000),
         default_tool_timeout_ms: None,
     }
+}
+
+fn session_capacity_error() -> String {
+    serde_json::json!({
+        "kind": "code_mode_admission_failure",
+        "version": 1,
+        "reason": "active_cell_limit",
+        "message": "code mode has reached its active cell limit; wait for a known dependency or explicitly terminate an unwanted cell before starting another exec",
+        "started": false,
+        "active_cells": (1..=8).map(|id| serde_json::json!({
+            "cell_id": id.to_string(),
+            "state": "registered",
+            "readiness": "unknown",
+            "permitted_actions": ["wait", "terminate"],
+        })).collect::<Vec<_>>(),
+        "preparing_cells_may_be_unlisted": true,
+        "retry_after": "a cell releases its permit",
+    }).to_string()
 }
 
 #[tokio::test]
@@ -413,7 +433,7 @@ async fn saturated_execute_is_rejected_without_side_effects_and_host_shuts_down(
             Some(HostToClient::Response {
                 id: request_id(10),
                 result: WireResult::Err {
-                    message: "code mode has reached its active cell limit; wait for an existing cell to finish or terminate one before starting another exec".to_string(),
+                    message: session_capacity_error(),
                 },
             })
         );
@@ -515,7 +535,7 @@ async fn admitted_delegate_burst_survives_a_stalled_client_reader() {
                 name: "echo".to_string(),
                 namespace: None,
             },
-            description: String::new(),
+            description: "".into(),
             kind: WireToolKind::Function,
             input_schema: None,
             output_schema: None,
@@ -730,6 +750,7 @@ async fn request_task_panic_disconnects_host() {
     let (outgoing_tx, _outgoing_rx) = mpsc::channel(/*max_capacity*/ 1);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
     let state = HostState {
+        catalogs: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
         seen_session_ids: Mutex::new(SeenSessionIds::default()),
         requests: Mutex::new(RequestRegistry::default()),
@@ -760,6 +781,7 @@ async fn execute_request_id_remains_active_until_initial_response() {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(/*max_capacity*/ 4);
         let peer = Arc::new(HostPeer::new(outgoing_tx));
         let state = Arc::new(HostState {
+            catalogs: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             seen_session_ids: Mutex::new(SeenSessionIds::default()),
             requests: Mutex::new(RequestRegistry::default()),
@@ -852,6 +874,7 @@ async fn saturated_session_admission_releases_host_permit() {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
         let peer = Arc::new(HostPeer::new(outgoing_tx));
         let state = HostState {
+            catalogs: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             seen_session_ids: Mutex::new(SeenSessionIds::default()),
             requests: Mutex::new(RequestRegistry::default()),
@@ -887,7 +910,7 @@ async fn saturated_session_admission_releases_host_permit() {
             HostToClient::Response {
                 id: request_id(1),
                 result: WireResult::Err {
-                    message: "code mode has reached its active cell limit; wait for an existing cell to finish or terminate one before starting another exec".to_string()
+                    message: session_capacity_error()
                 },
             }
         );
@@ -913,6 +936,7 @@ async fn open_session_limit_rejects_without_consuming_id_and_recovers_after_shut
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1);
         let peer = Arc::new(HostPeer::new(outgoing_tx));
         let state = HostState {
+            catalogs: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             seen_session_ids: Mutex::new(SeenSessionIds::default()),
             requests: Mutex::new(RequestRegistry::default()),
@@ -1019,6 +1043,7 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel(/*max_capacity*/ 1);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
     let state = HostState {
+        catalogs: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
         seen_session_ids: Mutex::new(SeenSessionIds::default()),
         requests: Mutex::new(RequestRegistry::default()),

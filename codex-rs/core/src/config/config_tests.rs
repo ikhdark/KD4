@@ -2716,6 +2716,50 @@ async fn empty_config_defaults_to_builtin_profile_for_untrusted_project() -> std
 }
 
 #[tokio::test]
+async fn unusable_legacy_windows_sandbox_is_reported_at_startup() -> std::io::Result<()> {
+    let unusable =
+        cfg!(windows) && !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child();
+    for (sandbox_mode, expect_error) in [
+        (SandboxMode::ReadOnly, unusable),
+        (SandboxMode::DangerFullAccess, false),
+    ] {
+        let codex_home = TempDir::new()?;
+        let cwd = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                sandbox_mode: Some(sandbox_mode),
+                windows: Some(WindowsToml {
+                    sandbox: Some(WindowsSandboxModeToml::Unelevated),
+                    sandbox_private_desktop: None,
+                }),
+                ..Default::default()
+            },
+            ConfigOverrides {
+                cwd: Some(cwd.path().to_path_buf()),
+                ..Default::default()
+            },
+            codex_home.abs(),
+        )
+        .await;
+        if expect_error {
+            let error = config.expect_err("an unusable sandbox must fail closed at startup");
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(
+                error.to_string().contains(
+                    codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
+                ),
+                "{error}"
+            );
+        } else {
+            assert!(config?.startup_warnings.iter().all(|warning| {
+                !warning.contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR)
+            }));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn implicit_builtin_workspace_profile_preserves_sandbox_workspace_write_settings()
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;

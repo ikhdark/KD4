@@ -775,7 +775,7 @@ async fn emit_exec_stage(
     Ok(())
 }
 
-/// Records the workspace identity an uncertain command's end is compared with.
+/// Records the workspace identity a potentially mutating command is compared with.
 /// The snapshot must precede the process: a write that lands while it is being
 /// captured becomes part of the baseline and the command reads as unchanged.
 /// Launchers that publish Begin after spawning call this before the spawn, and
@@ -786,10 +786,7 @@ pub(crate) async fn begin_uncertain_command_baseline(
     environment_id: &str,
     mutation: &crate::turn_diff_tracker::CommandMutation,
 ) {
-    if !matches!(
-        mutation,
-        crate::turn_diff_tracker::CommandMutation::Uncertain
-    ) || ctx
+    if !mutation.may_have_mutated() || ctx
         .session
         .services
         .command_execution
@@ -961,10 +958,8 @@ async fn emit_exec_end(
     };
     let mut observed_workspace_identity = None;
     let mut captured_workspace_identity = false;
-    if matches!(
-        mutation,
-        crate::turn_diff_tracker::CommandMutation::Uncertain
-    ) {
+    let mut workspace_unchanged = false;
+    if mutation.may_have_mutated() {
         let baseline = ctx
             .session
             .services
@@ -983,8 +978,13 @@ async fn emit_exec_end(
             captured_workspace_identity = true;
             let workspace_changed =
                 observed_workspace_identity_changed(baseline.as_ref(), current.as_ref());
+            workspace_unchanged = workspace_changed == Some(false);
             observed_workspace_identity = current;
-            crate::turn_diff_tracker::resolve_uncertain_command_observation(workspace_changed)
+            if matches!(mutation, crate::turn_diff_tracker::CommandMutation::Uncertain) {
+                crate::turn_diff_tracker::resolve_uncertain_command_observation(workspace_changed)
+            } else {
+                mutation
+            }
         };
     }
     finish_exec_mutation_evidence(ctx).await;
@@ -1065,7 +1065,11 @@ async fn emit_exec_end(
             exec_result.timed_out,
             exec_input.environment_id,
             native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-            mutation.clone(),
+            if workspace_unchanged && captured_workspace_identity {
+                crate::turn_diff_tracker::CommandMutation::ReadOnly
+            } else {
+                mutation.clone()
+            },
         );
         Some(tracker.current_mutation_revision())
     } else {

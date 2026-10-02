@@ -505,6 +505,7 @@ async fn run_cell<H: CellHost>(
     )
     .await;
     host.closed(cell_state.terminal_event()).await;
+    cell_state.mark_closed();
 }
 
 fn send_observer_event(observer: Option<Observer>, event: CellEvent) -> Result<(), CellEvent> {

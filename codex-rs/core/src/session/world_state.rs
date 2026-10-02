@@ -51,6 +51,14 @@ impl Session {
 
         let previous_world_state = self.state.lock().await.history.world_state_baseline();
         let mut world_state = WorldState::default();
+        let effect_recovery = if turn_context.config.ephemeral {
+            None
+        } else {
+            self.services.command_execution.effect_recovery().await
+        };
+        world_state.add_section(crate::context::world_state::TaskState::new(
+            self.services.plan_store.snapshot_with_lineage().await,
+        ).with_effect_recovery(effect_recovery));
         if turn_context.config.features.enabled(codex_features::Feature::TokenBudget) {
             let ids = self.state.lock().await.auto_compact_window_ids();
             world_state.add_section(crate::context::TokenBudgetContext::new(
@@ -60,6 +68,7 @@ impl Session {
                 ids.window_id,
                 turn_context.config.token_budget.as_ref()
                     .and_then(|config| config.guidance_message.as_deref())
+                    .filter(|_| self.token_budget_recovery_available())
                     .map(|guidance| crate::context::ContextualUserFragment::render(
                         &crate::context::ContextWindowGuidance::new(guidance))),
             ));

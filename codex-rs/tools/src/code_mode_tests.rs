@@ -115,7 +115,7 @@ exec tool declaration:
 ```ts
 declare const tools: { apply_patch(input: string, options?: { timeout_ms?: number }): Promise<unknown>; };
 ```"#
-                .to_string(),
+                .into(),
             kind: codex_code_mode::CodeModeToolKind::Freeform,
             input_schema: None,
             default_timeout_ms: None,

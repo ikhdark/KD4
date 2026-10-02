@@ -300,6 +300,20 @@ class WarmLaneReservationTest(unittest.TestCase):
             context,
             rust_build_status.cargo_build_context(self.repo, args + ["--release"], {}),
         )
+        # Nextest's --profile picks test policy; --cargo-profile picks artifacts.
+        for profile in (["--profile", "local"], ["--profile=fast"], ["-P", "ci"]):
+            self.assertEqual(
+                context,
+                rust_build_status.cargo_build_context(self.repo, args + profile, {}),
+            )
+        built = rust_build_status.cargo_build_context(
+            self.repo, ["cargo", "build", "-p", "example", "--profile", "dev-small"], {}
+        )
+        for profile in (["--cargo-profile", "dev-small"], ["--cargo-profile=dev-small"]):
+            self.assertEqual(
+                built,
+                rust_build_status.cargo_build_context(self.repo, args + profile, {}),
+            )
         # Named core targets and gates share one lane by design; which one ran
         # last is not a build setting and must not rank that lane as changed.
         named = [
@@ -1263,6 +1277,7 @@ class BuildToolingStorageTest(unittest.TestCase):
         )
 
     def test_run_lane_rejects_all_generic_core_selections_before_launch(self):
+        commands = []
         for recipe, prefix in (
             ("_test-lane-fast-reserved", []),
             ("_test-lane-local-reserved", []),
@@ -1280,27 +1295,84 @@ class BuildToolingStorageTest(unittest.TestCase):
             ):
                 if prefix and not selection:
                     continue
-                command = ["just", recipe, *prefix, *selection]
+                commands.append(["just", recipe, *prefix, *selection])
+        # Raw test runs would skip the named targets' helper builds and fail on
+        # a stale codex-code-mode-host only after compiling.
+        commands += [
+            ["cargo", "nextest", "run", "--profile", "local", "-p", "codex-core"],
+            ["cargo", "nextest", "-P", "local", "r", "--package=codex-core"],
+            ["cargo", "+stable", "test", "-pcodex-core", "--test", "all"],
+            ["cargo", "t", "--workspace"],
+        ]
+        for command in commands:
+            with (
+                self.subTest(command=command),
+                mock.patch.object(
+                    rust_build_status,
+                    "reserve_cargo_lane",
+                    return_value=contextlib.nullcontext(
+                        ("unit", Path("C:/target/lane"))
+                    ),
+                ),
+                mock.patch.object(rust_build_status, "run_owned") as run,
+                mock.patch.object(
+                    rust_build_status, "request_cargo_lane_maintenance"
+                ) as maintain,
+                self.assertRaises(ValueError),
+            ):
+                rust_build_status.run_in_cargo_lane(
+                    repo_root=Path.cwd(), requested_lane="unit", command=command
+                )
+            run.assert_not_called()
+            maintain.assert_not_called()
+
+    def test_raw_lane_tests_without_package_follow_cargo_directory_selection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "Cargo.toml").write_text('[workspace]\nmembers = ["core", "tui"]\n')
+            for directory, name in (("core", "codex-core"), ("tui", "codex-tui")):
+                (root / directory / "src").mkdir(parents=True)
+                (root / directory / "Cargo.toml").write_text(
+                    f'[package]\nname = "{name}"\n'
+                )
+            (root / "lane").mkdir()
+            for cwd, command, launches in (
+                (root / "tui" / "src", ["cargo", "test"], True),
+                (
+                    root,
+                    ["cargo", "nextest", "run", "--manifest-path", "tui/Cargo.toml"],
+                    True,
+                ),
+                (root / "core", ["cargo", "nextest", "run"], False),
+                (root, ["cargo", "test"], False),
+            ):
                 with (
-                    self.subTest(command=command),
+                    self.subTest(cwd=cwd, command=command),
+                    contextlib.chdir(cwd),
                     mock.patch.object(
                         rust_build_status,
                         "reserve_cargo_lane",
-                        return_value=contextlib.nullcontext(
-                            ("unit", Path("C:/target/lane"))
-                        ),
+                        return_value=contextlib.nullcontext(("unit", root / "lane")),
                     ),
-                    mock.patch.object(rust_build_status, "run_owned") as run,
                     mock.patch.object(
                         rust_build_status, "request_cargo_lane_maintenance"
-                    ) as maintain,
-                    self.assertRaises(ValueError),
+                    ),
+                    mock.patch.object(
+                        rust_build_status.shutil, "which", return_value=None
+                    ),
+                    mock.patch.object(rust_build_status, "run_owned") as run,
                 ):
-                    rust_build_status.run_in_cargo_lane(
-                        repo_root=Path.cwd(), requested_lane="unit", command=command
-                    )
-                run.assert_not_called()
-                maintain.assert_not_called()
+                    run.return_value.returncode = 0
+                    if launches:
+                        rust_build_status.run_in_cargo_lane(
+                            repo_root=root, requested_lane="unit", command=command
+                        )
+                    else:
+                        with self.assertRaises(ValueError):
+                            rust_build_status.run_in_cargo_lane(
+                                repo_root=root, requested_lane="unit", command=command
+                            )
+                self.assertEqual(run.called, launches)
 
     def test_direct_reserved_lane_commands_cover_fast_and_package_recipes(
         self,

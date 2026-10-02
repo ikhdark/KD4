@@ -954,7 +954,7 @@ fn typed_assignment_schema() -> JsonSchema {
             ),
             (
                 "required_evidence".to_string(),
-                string_array("Validation evidence required in a completed receipt."),
+                string_array("Producer-verified evidence required in a completed receipt. Use inspect:<normalized repository-relative file> to require a complete native read_file source_inspection receipt at an unchanged repository epoch; this proves inspection, not tests or semantic correctness."),
             ),
             (
                 "prohibited_changes".to_string(),

@@ -78,7 +78,7 @@ async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Res
                 tool_suggest_candidates: None,
                 deferred_mcp_tools: None,
                 mcp_tools: None,
-                extension_tool_executors: Vec::new(),
+                extension_tool_executors: crate::session::tests::token_budget_recovery_tool_stubs(),
                 dynamic_tools: &[],
                 exposure_identity: Default::default(),
             },
@@ -1464,7 +1464,7 @@ async fn router_apply_patch_cancellation_settles_committed_write_and_skips_tail(
         })?.expect("normal custom apply_patch call");
         let initial_gate =
             crate::workspace_operation_gate::acquire_workspace_operation(&repo).await;
-        let gate = Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&initial_gate));
+        let gate = initial_gate.gate();
         drop(initial_gate);
         let cancellation = CancellationToken::new();
         let mut response = Box::pin(runtime.handle_tool_call(call, cancellation.clone()));
@@ -2072,7 +2072,7 @@ async fn router_apply_patch_cancel_during_approval_has_no_mutation() -> anyhow::
         internal_chat_message_metadata_passthrough: None,
     })?.expect("normal custom apply_patch call");
     let initial_gate = crate::workspace_operation_gate::acquire_workspace_operation(&repo).await;
-    let gate = Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&initial_gate));
+    let gate = initial_gate.gate();
     drop(initial_gate);
     let paused = session.services.elicitations.subscribe();
     let cancellation = CancellationToken::new();

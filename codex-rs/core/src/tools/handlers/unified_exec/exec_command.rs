@@ -32,7 +32,6 @@ use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_search_repository_root;
 use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
-use crate::tools::known_delta_store;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
@@ -504,7 +503,11 @@ impl ExecCommandHandler {
             ..
         } = args;
 
-        let max_output_tokens = max_output_tokens.or_else(|| {
+        let learned_output_budget = session
+            .learned_command_output_budget(&context.call_id, &hook_command).await;
+        // Caller-specified caps remain authoritative. Only later default-budget
+        // commands of a recovered class get the larger session-local allowance.
+        let max_output_tokens = max_output_tokens.or(learned_output_budget).or_else(|| {
             crate::tools::shell_output_summary::source_read_output_budget(&hook_command)
         });
 
@@ -630,64 +633,10 @@ impl ExecCommandHandler {
                 .await
                 .map_err(FunctionCallError::RespondToModel)?;
         }
-        let mut known_delta = if session.features().enabled(Feature::KnownDeltaStore)
-            && !environment_is_remote
-            && !tty
-            && !validation_launch
-            && let Some(native_cwd) = native_cwd.as_ref()
-            && let CommandInvocation::Argv { program, args } = &command_invocation
-            && known_delta_store::is_immutable_git_show_candidate(program, args)
-            && let Some(authorization_scope) = known_delta_store::authorization_scope_fingerprint(
-                &turn.file_system_sandbox_context(normalized_additional_permissions.clone(), &cwd),
-                effective_additional_permissions.sandbox_permissions,
-            ) {
-            let metadata_source = turn
-                .turn_metadata_state
-                .git_metadata_source()
-                .filter(|source| native_cwd.starts_with(source.repo_root().as_path()));
-            let project_namespace = match &metadata_source {
-                Some(source) => source.project_namespace().await,
-                None => None,
-            };
-            let project_namespace_hint = metadata_source
-                .map_or(known_delta_store::ProjectNamespaceHint::Discover, |_| {
-                    known_delta_store::ProjectNamespaceHint::Resolved(project_namespace.as_deref())
-                });
-            known_delta_store::prepare_immutable_git_show_with_authorization_scope(
-                turn.config.codex_home.as_path(),
-                &session.thread_id.to_string(),
-                native_cwd,
-                program,
-                args,
-                project_namespace_hint,
-                &authorization_scope,
-                force_fresh,
-            )
-            .await
-        } else {
-            None
-        };
-        if let Some(prepared) = known_delta.as_mut() {
-            let policy: codex_utils_output_truncation::TruncationPolicy =
-                turn.model_info.truncation_policy.into();
-            prepared
-                .prepare_output_budget(
-                    codex_utils_output_truncation::TruncationPolicy::Tokens(
-                        policy.token_budget().min(10_000),
-                    ),
-                    max_output_tokens,
-                    &hook_command,
-                )
-                .await;
-        }
-        let known_delta_hit = known_delta
-            .as_ref()
-            .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
         let validation_attempt = validation_launch;
         // Validation shares ordinary attempt accounting. Only input-state
         // determined failures are replayed; a failing test remains rerunnable.
-        if !known_delta_hit
-            && let Err(blocked) = session
+        if let Err(blocked) = session
                 .services
                 .command_execution
                 .begin_attempt_with_freshness(&attempt_key, repaired, force_fresh)
@@ -735,13 +684,11 @@ impl ExecCommandHandler {
                     &raw_output,
                 )
                 .await) } else { None };
-                if !known_delta_hit {
-                    session
-                        .services
-                        .command_execution
-                        .record_exit(&attempt_key, 0)
-                        .await;
-                }
+                session
+                    .services
+                    .command_execution
+                    .record_exit(&attempt_key, 0)
+                    .await;
                 return Ok(boxed_tool_output(
                     ExecCommandToolOutput {
                         process_output: None,
@@ -768,10 +715,8 @@ impl ExecCommandHandler {
             }
             Ok(None) => {}
             Err(err) => {
-                if !known_delta_hit {
-                    err.record_attempt_failure(&session.services.command_execution, &attempt_key)
-                        .await;
-                }
+                err.record_attempt_failure(&session.services.command_execution, &attempt_key)
+                    .await;
                 return Err(err.into_error());
             }
         }
@@ -821,7 +766,6 @@ impl ExecCommandHandler {
                     justification,
                     prefix_rule,
                     validation_launch,
-                    known_delta,
                 },
                 process_id_reservation,
                 &context,
@@ -861,40 +805,38 @@ impl ExecCommandHandler {
                         None => notice,
                     });
                 }
-                if !known_delta_hit {
-                    if let Some(process_id) = response.process_id {
+                if let Some(process_id) = response.process_id {
+                    session
+                        .services
+                        .command_execution
+                        .update_running_artifact(process_id, finalized_artifact)
+                        .await;
+                } else if let Some(exit_code) = response.exit_code {
+                    let tracked = if let Some((execution_id, parent_tool_execution_id)) =
+                        tracked_execution.as_ref()
+                    {
                         session
                             .services
                             .command_execution
-                            .update_running_artifact(process_id, finalized_artifact)
+                            .finish_running_process_with_execution_id(
+                                process_id,
+                                *execution_id,
+                                parent_tool_execution_id,
+                                Some(exit_code),
+                            )
+                            .await
+                    } else {
+                        CompletionApplyResult::Missing
+                    };
+                    if !matches!(
+                        tracked,
+                        CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
+                    ) {
+                        session
+                            .services
+                            .command_execution
+                            .record_exit(&attempt_key, exit_code)
                             .await;
-                    } else if let Some(exit_code) = response.exit_code {
-                        let tracked = if let Some((execution_id, parent_tool_execution_id)) =
-                            tracked_execution.as_ref()
-                        {
-                            session
-                                .services
-                                .command_execution
-                                .finish_running_process_with_execution_id(
-                                    process_id,
-                                    *execution_id,
-                                    parent_tool_execution_id,
-                                    Some(exit_code),
-                                )
-                                .await
-                        } else {
-                            CompletionApplyResult::Missing
-                        };
-                        if !matches!(
-                            tracked,
-                            CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
-                        ) {
-                            session
-                                .services
-                                .command_execution
-                                .record_exit(&attempt_key, exit_code)
-                                .await;
-                        }
                     }
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
@@ -914,33 +856,31 @@ impl ExecCommandHandler {
                     output_text.as_bytes(),
                 )
                 .await;
-                if !known_delta_hit {
-                    let tracked = if let Some((execution_id, parent_tool_execution_id)) =
-                        tracked_execution.as_ref()
-                    {
-                        session
-                            .services
-                            .command_execution
-                            .finish_running_process_with_execution_id(
-                                process_id,
-                                *execution_id,
-                                parent_tool_execution_id,
-                                Some(output.exit_code),
-                            )
-                            .await
-                    } else {
-                        CompletionApplyResult::Missing
-                    };
-                    if !matches!(
-                        tracked,
-                        CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
-                    ) {
-                        session
-                            .services
-                            .command_execution
-                            .record_exit(&attempt_key, output.exit_code)
-                            .await;
-                    }
+                let tracked = if let Some((execution_id, parent_tool_execution_id)) =
+                    tracked_execution.as_ref()
+                {
+                    session
+                        .services
+                        .command_execution
+                        .finish_running_process_with_execution_id(
+                            process_id,
+                            *execution_id,
+                            parent_tool_execution_id,
+                            Some(output.exit_code),
+                        )
+                        .await
+                } else {
+                    CompletionApplyResult::Missing
+                };
+                if !matches!(
+                    tracked,
+                    CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
+                ) {
+                    session
+                        .services
+                        .command_execution
+                        .record_exit(&attempt_key, output.exit_code)
+                        .await;
                 }
                 let original_token_count = approx_token_count(&output_text);
                 let mut response = ExecCommandToolOutput {
@@ -976,33 +916,31 @@ impl ExecCommandHandler {
             }) => {
                 // The process completed; retain its actual outcome in command
                 // accounting while ending this model turn on failed durability.
-                if !known_delta_hit {
-                    let tracked = if let Some((execution_id, parent_tool_execution_id)) =
-                        tracked_execution.as_ref()
-                    {
-                        session
-                            .services
-                            .command_execution
-                            .finish_running_process_with_execution_id(
-                                process_id,
-                                *execution_id,
-                                parent_tool_execution_id,
-                                Some(exit_code),
-                            )
-                            .await
-                    } else {
-                        CompletionApplyResult::Missing
-                    };
-                    if !matches!(
-                        tracked,
-                        CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
-                    ) {
-                        session
-                            .services
-                            .command_execution
-                            .record_exit(&attempt_key, exit_code)
-                            .await;
-                    }
+                let tracked = if let Some((execution_id, parent_tool_execution_id)) =
+                    tracked_execution.as_ref()
+                {
+                    session
+                        .services
+                        .command_execution
+                        .finish_running_process_with_execution_id(
+                            process_id,
+                            *execution_id,
+                            parent_tool_execution_id,
+                            Some(exit_code),
+                        )
+                        .await
+                } else {
+                    CompletionApplyResult::Missing
+                };
+                if !matches!(
+                    tracked,
+                    CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
+                ) {
+                    session
+                        .services
+                        .command_execution
+                        .record_exit(&attempt_key, exit_code)
+                        .await;
                 }
                 Err(FunctionCallError::Fatal(message))
             }
@@ -1011,7 +949,7 @@ impl ExecCommandHandler {
                     &err,
                     UnifiedExecError::CreateProcess { .. } | UnifiedExecError::ProcessFailed { .. }
                 );
-                if retry_failure && !known_delta_hit {
+                if retry_failure {
                     let finalized_running_process =
                         if matches!(&err, UnifiedExecError::ProcessFailed { .. }) {
                             if let Some((execution_id, parent_tool_execution_id)) =
@@ -1065,6 +1003,10 @@ impl ExecCommandHandler {
 }
 
 impl CoreToolRuntime for ExecCommandHandler {
+    fn command_argument_format(&self) -> Option<crate::tools::registry::CommandArgumentFormat> {
+        Some(crate::tools::registry::CommandArgumentFormat::Exec)
+    }
+
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::NestedRuntime
     }
@@ -1081,13 +1023,22 @@ impl CoreToolRuntime for ExecCommandHandler {
         true
     }
 
+    fn pre_tool_use_hook_name(
+        &self,
+        _tool_name: &codex_tools::ToolName,
+        payload: &ToolPayload,
+    ) -> Option<HookToolName> {
+        matches!(payload, ToolPayload::Function { .. }).then(HookToolName::exec_command)
+    }
+
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
         let ToolPayload::Function { arguments } = &invocation.payload else {
             return None;
         };
+        let tool_name = self.pre_tool_use_hook_name(&invocation.tool_name, &invocation.payload)?;
 
         exec_command_hook_input(arguments).map(|tool_input| PreToolUsePayload {
-            tool_name: HookToolName::exec_command(),
+            tool_name,
             tool_input,
         })
     }

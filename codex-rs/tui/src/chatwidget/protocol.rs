@@ -272,6 +272,22 @@ impl ChatWidget {
         notification: ItemStartedNotification,
         from_replay: bool,
     ) {
+        // Once tool work starts, its effects may land before the turn ends, so
+        // the turn can no longer be re-run on a faster model without repeating them.
+        if !from_replay
+            && matches!(
+                notification.item,
+                ThreadItem::CommandExecution { .. }
+                    | ThreadItem::FileChange { .. }
+                    | ThreadItem::McpToolCall { .. }
+                    | ThreadItem::DynamicToolCall { .. }
+                    | ThreadItem::CollabAgentToolCall { .. }
+                    | ThreadItem::SubAgentActivity { .. }
+                    | ThreadItem::ImageGeneration(_)
+            )
+        {
+            self.mark_safety_buffering_tool_activity_started();
+        }
         match notification.item {
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_started(item),
             ThreadItem::FileChange { id, changes, .. } => {

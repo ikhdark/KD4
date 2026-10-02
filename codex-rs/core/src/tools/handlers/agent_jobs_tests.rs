@@ -260,6 +260,7 @@ async fn report_rejects_schema_invalid_result_without_completing_then_accepts_co
         "job_id": job.id.as_str(),
         "item_id": "item-0",
         "result": {"score": "high"},
+        "deliver": true,
     })
     .to_string();
     let Err(invalid_report_error) =
@@ -282,17 +283,20 @@ async fn report_rejects_schema_invalid_result_without_completing_then_accepts_co
     assert_eq!(item.status, codex_state::AgentJobItemStatus::Running);
     assert_eq!(item.result_json, None);
 
-    report_agent_job_result::handle(
+    let delivered = report_agent_job_result::handle(
         session,
         json!({
             "job_id": job.id.as_str(),
             "item_id": "item-0",
             "result": {"score": 5},
+            "deliver": true,
         })
         .to_string(),
     )
     .await
     .expect("schema-conforming correction should be accepted");
+    assert_eq!(delivered.sampling_request_signal.as_ref().unwrap()
+        ["authoritative_wait_owner_v1"]["surfaceable_message"], r#"{"score":5}"#);
     let item = db
         .get_agent_job_item(job.id.as_str(), "item-0")
         .await
@@ -669,11 +673,13 @@ async fn worker_stop_cancels_job_settles_other_worker_and_requests_shutdown() {
             "job_id": job.id.as_str(),
             "item_id": "item-1",
             "result": {"late": true},
+            "deliver": true,
         })
         .to_string(),
     )
     .await
     .expect("late report should return an explicit rejection");
+    assert!(late_output.sampling_request_signal.is_none());
     assert_eq!(late_output.into_text(), r#"{"accepted":false}"#);
 
     let options = JobRunnerOptions {

@@ -69,6 +69,12 @@ pub fn create_spawn_agents_on_csv_tool() -> ToolSpec {
             )),
         ),
         ("output_schema".to_string(), output_schema),
+        (
+            "deliver".to_string(),
+            JsonSchema::boolean(Some(
+                "Opt in only when this top-level call completes the entire request. Deliver the final successful export receipt directly; pending input, sibling failures, schema mismatch, or incomplete work prevent delivery.".to_string(),
+            )),
+        ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
@@ -103,6 +109,12 @@ pub fn create_report_agent_job_result_tool() -> ToolSpec {
             JsonSchema::string(Some("Identifier of the job item.".to_string())),
         ),
         ("result".to_string(), result_schema),
+        (
+            "deliver".to_string(),
+            JsonSchema::boolean(Some(
+                "Opt in only when this top-level report completes the worker's entire assignment. Deliver the accepted result directly; rejected reports, pending input, sibling failures, or final-schema mismatch prevent delivery.".to_string(),
+            )),
+        ),
         (
             "stop".to_string(),
             JsonSchema::boolean(Some(

@@ -1,5 +1,23 @@
 use super::*;
 
+#[test]
+fn evidence_budget_reserves_generation_and_obligation_room() {
+    let mut state = ToolHistoryState::default();
+    let mut reusable = candidate("reusable", "retained source\n".repeat(100));
+    reusable.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "previous".into(), ordinal: 1,
+    });
+    state.register(reusable);
+    let baseline = state.task_sensitive_tool_result_budget(100_000, 0, 4096, 0);
+    let pressured = state.task_sensitive_tool_result_budget(100_000, 90_000, 8192, 20);
+    assert!(pressured < baseline, "evidence must leave room for generation and active obligations");
+    assert!(pressured <= 100_000 - 8192 - 20 * 128);
+    state.recovered_call_ids.insert("reusable".into());
+    let reusable_budget = state.task_sensitive_tool_result_budget(100_000, 0, 4096, 1);
+    assert!(reusable_budget >= baseline);
+    assert!(reusable_budget <= model_visible_tool_result_token_budget());
+}
+
 #[tokio::test]
 async fn journal_writer_reuses_handles_and_replays_after_another_writer() {
     let temp = tempfile::tempdir().unwrap();
@@ -209,6 +227,23 @@ async fn long_session_prompt_pressure_comparison() {
 }
 
 #[test]
+fn task_sensitive_budget_reserves_unread_evidence_and_releases_it_after_consumption() {
+    let mut state = ToolHistoryState::default();
+    let evidence = candidate("active-budget", bounded_output().repeat(2));
+    state.register(evidence.clone());
+    let mut history = crate::context_manager::ContextManager::new();
+    history.update_token_info(&codex_protocol::protocol::TokenUsage::default(), Some(40_000));
+    history.set_tool_history_state(state);
+    let budget = history.tool_history_state().configured_model_visible_tool_result_token_budget().unwrap();
+    assert!(budget > 20_000 && budget <= 30_000, "{budget}");
+    history.mark_tool_history_consumed_with_delta(
+        &[text_output("active-budget", evidence.bounded_model_output)],
+        ModelGenerationId { turn_id: "task".into(), ordinal: 0 },
+    );
+    assert_eq!(history.tool_history_state().configured_model_visible_tool_result_token_budget(), Some(20_000));
+}
+
+#[test]
 fn phase_checkpoint_leaves_tiny_results_inline() {
     let mut state = ToolHistoryState::default();
     for text in ["ok".to_string(), "x".repeat(900), " ".repeat(2_000)] {
@@ -367,7 +402,14 @@ async fn checkpoint_handler_boundaries_and_retained_artifacts() {
         ),
     ] {
         let before = session.clone_history().await.raw_items().len();
-        let payload = ToolPayload::Function { arguments:json!({"completed_call_ids":completed,"retained_evidence":retained,"summary":summary,"active_work":""}).to_string() };
+        let mut arguments = json!({"completed_call_ids":completed,"retained_evidence":retained,"summary":summary,"active_work":""});
+        if name == "valid" {
+            arguments["answered_questions"] = json!([{
+                "question": "Which evidence completed?", "answer": "The done call.",
+                "evidence_refs": ["done"],
+            }]);
+        }
+        let payload = ToolPayload::Function { arguments: arguments.to_string() };
         let result = ContextCheckpointHandler
             .handle(ToolInvocation {
                 session: Arc::clone(&session),
@@ -408,6 +450,10 @@ async fn checkpoint_handler_boundaries_and_retained_artifacts() {
         .filter(|item| phase_checkpoint_ids(item).is_some())
         .cloned()
         .collect::<Vec<_>>();
+    let checkpoint = phase_checkpoint_payload(&checkpoints[0]).unwrap();
+    assert_eq!(checkpoint["answer_evidence"]["done"]["status"], "evidence_linked_not_claim_verified");
+    assert_eq!(checkpoint["answer_evidence"]["done"]["original_output_sha256"],
+        state.checkpoint_evidence("done").unwrap().original_output_sha256);
     state.retain_for_history(&checkpoints);
     assert!(
         state.checkpoint_evidence(&active_artifact).is_ok(),
@@ -442,11 +488,11 @@ fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
     state.register_non_workspace_code_mode_call("done".into());
     state.register_non_workspace_code_mode_call("active".into());
     assert!(state.phase_checkpoint_receipts(&["active".into()]).is_err());
-    assert!(
-        state
-            .phase_checkpoint_receipts(&["missing".into()])
-            .is_err()
-    );
+    let diagnostic: serde_json::Value = serde_json::from_str(
+        &state.phase_checkpoint_receipts(&["missing".into(), "also-missing".into()]).unwrap_err(),
+    ).unwrap();
+    assert_eq!(diagnostic["unknown_call_ids"], serde_json::json!(["missing", "also-missing"]));
+    assert_eq!(diagnostic["eligible_call_ids"], serde_json::json!(["done"]));
     let receipts = state.phase_checkpoint_receipts(&["done".into()]).unwrap();
     assert!(receipts["done"].get("digest").is_none());
     let checkpoint = ResponseItem::Message {
@@ -509,6 +555,80 @@ fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
     );
     assert!(projection.items.contains(&checkpoint));
     assert!(items.contains(&text_output("done", source)));
+}
+
+#[test]
+fn phase_checkpoint_resolves_only_later_current_success_for_the_same_action() {
+    let mut state = ToolHistoryState::default();
+    let source = bounded_output();
+    let action = sha256(b"test exact target");
+    let mut failure = candidate("failed", source.clone());
+    failure.successful = false;
+    failure.supersession_identity = Some(format!("functions.exec:{action}:{}", sha256(b"failed")));
+    failure.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 0 });
+    state.register(failure);
+    assert!(state.phase_checkpoint_receipts(&["failed".into()]).is_err());
+    let mut success = candidate("repaired", source.clone());
+    success.supersession_identity = Some(format!("functions.exec:{action}:{}", sha256(b"passed")));
+    success.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 1 });
+    state.register(success.clone());
+    let receipts = state.phase_checkpoint_receipts(&["failed".into()]).unwrap();
+    assert_eq!(receipts["failed"]["resolved_by"]["call_id"], "repaired");
+    let checkpoint = ResponseItem::Message {
+        id: None, role: "developer".into(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                serde_json::json!({"receipts": receipts})),
+        }],
+        phase: None, internal_chat_message_metadata_passthrough: None,
+    };
+    let items: Arc<[ResponseItem]> = Arc::from([
+        function_call("failed"), text_output("failed", source.clone()), checkpoint,
+    ]);
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let projected = state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache);
+    assert!(!projected.items.contains(&text_output("failed", source.clone())));
+    success.source_dependencies_current = false;
+    state.register(success.clone());
+    assert!(state.phase_checkpoint_receipts(&["failed".into()]).is_err());
+    let projected = state.project_sampling_with_workspace_cache(items, None, &cache);
+    assert!(projected.items.contains(&text_output("failed", source)));
+    success.source_dependencies_current = true;
+    success.supersession_identity = Some(format!("functions.exec:{}:{}", sha256(b"other target"), sha256(b"passed")));
+    state.register(success);
+    assert!(state.phase_checkpoint_receipts(&["failed".into()]).is_err());
+}
+
+#[test]
+fn checkpoint_answer_lineage_downgrades_without_rewriting_or_repeating_notes() {
+    let mut state = ToolHistoryState::default();
+    let mut evidence = candidate("source", bounded_output());
+    state.register(evidence.clone());
+    let checkpoint = ResponseItem::Message {
+        id: None, role: "developer".into(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                serde_json::json!({"receipts": {}, "answered_questions": [{
+                    "question": "What is the source?", "answer": "A prior observation.",
+                    "evidence_refs": ["source"],
+                }]})),
+        }],
+        phase: None, internal_chat_message_metadata_passthrough: None,
+    };
+    let items: Arc<[ResponseItem]> = Arc::from([checkpoint.clone()]);
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let current = state.project_sampling_with_workspace_cache(Arc::clone(&items), None, &cache);
+    assert_eq!(current.items.as_ref(), items.as_ref());
+    evidence.source_dependencies_current = false;
+    state.register(evidence);
+    let stale = state.project_sampling_with_workspace_cache(items, None, &cache);
+    assert_eq!(stale.items.len(), 2);
+    assert_eq!(stale.items[0], checkpoint);
+    let notice = serde_json::to_value(&stale.items[1]).unwrap().to_string();
+    assert!(notice.contains("checkpoint_answer_evidence"));
+    assert!(notice.contains("unverified"));
+    let repeated = state.project_sampling_with_workspace_cache(Arc::clone(&stale.items), None, &cache);
+    assert_eq!(repeated.items, stale.items);
 }
 
 #[test]
@@ -1454,7 +1574,7 @@ fn investigation_evidence_stays_raw_across_consumed_generations() {
     // result. Merely seeing them once must not replace them with recovery receipts.
     for index in 0..14 {
         let call_id = format!("evidence-{index}");
-        let output = format!("source-{index}\n{}", "detail ".repeat(2_400));
+        let output = format!("source-{index}\n{}", "detail ".repeat(2_600));
         let mut record = candidate(&call_id, output.clone());
         record.artifact_id = format!("00000000-0000-7000-8000-{index:012}");
         record.consumed_by_generation = Some(ModelGenerationId {
@@ -2735,8 +2855,15 @@ fn tool_history_receipt_does_not_replace_output_when_only_an_empty_digest_fits()
     let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     // This call ID leaves exactly enough envelope space for an empty digest.
     // Such a receipt would fail the consumer's nonempty-digest validation.
-    let call_id = "c".repeat(576);
     let bounded = bounded_output();
+    let sample = candidate("", bounded.clone());
+    let mut empty: ToolHistoryReceiptV2 =
+        serde_json::from_str(sample.admission_receipt().unwrap().1).unwrap();
+    empty.digest.clear();
+    let envelope_bytes = serde_json::to_vec(&empty).unwrap().len();
+    let call_id = "c".repeat(
+        codex_utils_string::approx_bytes_for_tokens(RECEIPT_MAX_TOKENS) - envelope_bytes,
+    );
     let canonical: Arc<[ResponseItem]> = Arc::from([text_output(&call_id, bounded.clone())]);
     let tracked = candidate(&call_id, bounded);
     assert!(tracked.admission_receipt().is_none());
@@ -3294,7 +3421,7 @@ async fn remote_compaction_bounds_recovery_metadata_and_keeps_newest_exact_handl
 #[test]
 fn tool_history_admission_reserves_competing_results_before_spending_the_shared_budget() {
     let older = "older ".repeat(1_000);
-    let newest = "x ".repeat(model_visible_tool_result_token_budget());
+    let newest = "abc ".repeat(model_visible_tool_result_token_budget());
     assert_eq!(
         approx_token_count(&newest),
         model_visible_tool_result_token_budget()
@@ -3482,11 +3609,22 @@ fn tool_history_admission_keeps_small_consumed_raw_output_when_receipt_costs_mor
 
 #[test]
 fn tool_history_admission_keeps_in_budget_consumed_output_below_savings_thresholds() {
-    let call_id = "threshold-call";
-    let output = "x ".repeat(MINIMUM_RAW_TOKENS as usize);
+    let output = "abc ".repeat(MINIMUM_RAW_TOKENS as usize);
     let raw_tokens = approx_token_count(&output);
     assert_eq!(raw_tokens, MINIMUM_RAW_TOKENS as usize);
     assert!(raw_tokens <= model_visible_tool_result_token_budget());
+    let call_id = (1..64)
+        .map(|length| "threshold-call".repeat(length))
+        .find(|call_id| {
+            candidate(call_id, output.clone())
+                .admission_receipt()
+                .is_some_and(|(_, _, tokens)| {
+                    tokens <= raw_tokens as u64
+                        && (raw_tokens as u64 - tokens) < MINIMUM_SAVED_TOKENS
+                })
+        })
+        .expect("fixture leaves less than the minimum savings");
+    let call_id = call_id.as_str();
 
     let canonical: Arc<[ResponseItem]> =
         Arc::from([function_call(call_id), text_output(call_id, output.clone())]);
@@ -3673,9 +3811,11 @@ fn tool_search_receipt_caps_all_argument_fields_and_binds_semantics() {
         );
     }
 
-    // Forty semantic receipts fit the global budget if envelope overhead is ignored.
+    // Size the fixture from the actual envelope so it exceeds the global budget.
     // The normal admission path must instead charge the complete model-visible outputs.
-    let pressure_items = (0..40)
+    let pressure_count =
+        model_visible_tool_result_token_budget() / approx_token_count(&rendered_item) + 1;
+    let pressure_items = (0..pressure_count)
         .flat_map(|index| {
             let mut pair = tool_search_pair(&format!("search-{index}"), 48_000);
             let ResponseItem::ToolSearchCall { arguments, .. } = &mut pair[0] else {
@@ -3692,7 +3832,7 @@ fn tool_search_receipt_caps_all_argument_fields_and_binds_semantics() {
         .filter(|item| matches!(item, ResponseItem::ToolSearchOutput { .. }))
         .collect::<Vec<_>>();
     assert!(!receipts.is_empty());
-    assert!(receipts.len() < 40);
+    assert!(receipts.len() < pressure_count);
     let total_output_tokens = receipts
         .into_iter()
         .map(|item| {
@@ -4066,6 +4206,7 @@ fn structural_receipt_validation_rejects_receipt_like_text_and_tampering() {
 fn legacy_tool_history_ledger_keys_remain_compatible() {
     let bounded = bounded_output();
     let state = ToolHistoryState {
+        consumption_turns: Vec::new(),
         candidates: BTreeMap::from([("call-1".to_string(), candidate("call-1", bounded))]),
         untracked_consumption: BTreeMap::new(),
         exposed_representations: BTreeMap::new(),
@@ -4545,6 +4686,54 @@ async fn mutation_journal_repairs_an_incomplete_tail_before_appending() {
         };
         assert_eq!(restored.non_workspace_code_mode_calls, expected);
     }
+}
+
+#[tokio::test]
+async fn corrupt_journal_record_keeps_checkpoint_and_valid_prefix() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let thread_id = "corrupt-journal-thread";
+    let mut checkpoint = ToolHistoryState::default();
+    checkpoint.register_non_workspace_code_mode_call("checkpoint-call".to_string());
+    persist_tool_history_state(temp.path(), thread_id, &checkpoint)
+        .await
+        .expect("persist checkpoint");
+    let register = |call_id: &str| ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+        call_id: call_id.to_string(),
+    };
+    persist_tool_history_mutations(
+        temp.path(),
+        thread_id,
+        "writer",
+        &[(1, register("prefix-call")), (2, register("after-corruption"))],
+    )
+    .await
+    .expect("persist journal");
+    let path = journal_path(temp.path(), thread_id);
+    let journal = std::fs::read(&path).expect("read journal");
+    let first_end = journal.iter().position(|byte| *byte == b'\n').expect("first record") + 1;
+    let mut corrupted = journal[..first_end].to_vec();
+    corrupted.extend_from_slice(b"{\"version\":1,\"not\":\"a record\"}\n");
+    corrupted.extend_from_slice(&journal[first_end..]);
+    std::fs::write(&path, corrupted).expect("corrupt a complete middle record");
+
+    let outcome = load_tool_history_state(temp.path(), thread_id).await;
+    let ToolHistoryLoadOutcome::RecoveredJournalPrefix { state, path: _, error } = outcome else {
+        panic!("expected a recovered journal prefix, got {outcome:?}");
+    };
+    assert_eq!(
+        state.non_workspace_code_mode_calls,
+        BTreeSet::from(["checkpoint-call".to_string(), "prefix-call".to_string()])
+    );
+    assert!(error.contains("quarantined"), "{error}");
+    assert!(!path.exists(), "the invalid journal is moved aside");
+    persist_tool_history_state(temp.path(), thread_id, &state)
+        .await
+        .expect("the recovered state persists without the invalid journal");
+    assert_eq!(
+        expect_loaded_tool_history(load_tool_history_state(temp.path(), thread_id).await)
+            .non_workspace_code_mode_calls,
+        state.non_workspace_code_mode_calls
+    );
 }
 
 #[tokio::test]
@@ -5692,20 +5881,36 @@ fn observed_failure_detail_does_not_evict_an_unread_live_handle() {
 #[test]
 fn impossible_unread_receipt_budget_reports_unresolved_overflow() {
     let _budget = override_model_visible_tool_result_token_budget_for_test(1);
-    let state = ToolHistoryState::default();
+    let mut state = ToolHistoryState::default();
+    state.register(candidate("tracked", "tracked output".into()));
     let mut items = ProjectedResponseItems::Owned(vec![
+        function_call("tracked"),
+        text_output("tracked", "tracked output".into()),
         function_call("unread"),
         text_output("unread", "operation failed".into()),
     ]);
     let dropped = state.enforce_tool_result_budget(&mut items);
-    assert_eq!(dropped.count, 1);
-    assert!(
-        items
-            .iter()
-            .all(|item| item_call_id(item) != Some("unread"))
-    );
-    assert!(
-        matches!(&items[0], ResponseItem::Message { content, .. } if format!("{content:?}").contains("1 unread outcomes"))
+    assert_eq!(dropped.count, 2);
+    assert!(items.iter().all(|item| item_call_id(item).is_none()));
+    let ResponseItem::Message { content, .. } = &items[0] else {
+        panic!("expected overflow notice");
+    };
+    let [codex_protocol::models::ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("expected one text notice");
+    };
+    assert!(text.contains("2 unread outcomes"));
+    // Pairs are removed whole, so recovery depends on the notice naming them.
+    let manifest = text
+        .split_once("Manifest page 1/1, offset 0: ")
+        .and_then(|(_, rest)| rest.split_once(". Recover each"))
+        .map(|(manifest, _)| manifest)
+        .expect("overflow manifest");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(manifest).unwrap(),
+        serde_json::json!([
+            {"call_id": "tracked", "artifact_id": "artifact-1"},
+            {"call_id": "unread"},
+        ])
     );
 }
 
@@ -5844,7 +6049,7 @@ fn recovery_priority_and_exact_selectors_survive_compaction_metadata() {
     assert!(mutation.apply(&mut state));
     assert!(!mutation.apply(&mut state));
     let mut restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
-    restored.rebuild_artifact_index();
+    restored.refresh_derived_and_indexes();
     assert!(restored.reuse_priority("recovery", 2) < restored.reuse_priority("cold", 2));
     let output = text_output("recovery", serde_json::json!({
         "artifact_id": artifact_id,

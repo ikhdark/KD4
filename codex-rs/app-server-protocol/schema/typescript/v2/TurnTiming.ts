@@ -23,6 +23,11 @@ import type { TurnTimingUnions } from "./TurnTimingUnions";
  */
 export type TurnTiming = {
 /**
+ * Observed starting minus ending account credit balance, not an isolated
+ * invoice: concurrent turns, replenishments, or delayed reports may affect it.
+ */
+creditDelta?: string,
+/**
  * Content identity of tracked and non-ignored untracked files captured
  * before this turn's tools ran. Absent means capture was unavailable.
  */

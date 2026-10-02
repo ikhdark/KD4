@@ -1344,13 +1344,15 @@ async fn shell_command_output_budget_case(policy_bytes: i64, budget: Option<usiz
             );
         }
     }
-    assert!(
-        rendered.contains(
-            "command output reduced; read a bounded selection from the retained output with read_tool_output"
-        ),
-        "{rendered}"
-    );
-    assert!(rendered.contains("do not rerun the producer"));
+    if budget != Some(0) {
+        assert!(
+            rendered.contains(
+                "command output reduced; recover the first omitted lines with read_tool_output"
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("do not rerun the producer"));
+    }
     if budget.is_none() {
         assert!(
             !rendered.contains("notice-proof-0128"),

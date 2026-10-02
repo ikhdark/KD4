@@ -22,7 +22,7 @@ const SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS: usize = 100;
 pub const SKILL_DESCRIPTION_TRUNCATED_WARNING: &str = "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.";
 pub const SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX: &str =
     "Exceeded skills context budget. All skill descriptions were removed and";
-pub const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "Each entry gives a skill name, concise trigger or purpose, and an opaque locator for loading its full instructions after selection.";
+pub const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "Entries prioritize the current task and may shorten other descriptions. Load full instructions through the skill locator. For complete enabled names, descriptions, and locators, read_file(path=\"skill:catalog\", force_fresh=true); search selectors can find newly relevant skills when the task changes.";
 const SKILLS_INTRO_WITH_ALIASES: &str = "Catalog entries give a skill name, concise purpose, and deterministic `SKILL.md` locator. Expand `rN/...` locators through the roots below.";
 pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by the user or clearly matched by the task. Announce each skill on first use in the conversation, state ordering when needed, and reassess relevance on later turns without repeating the announcement.
 - Before task actions, the main agent must read each selected `SKILL.md` completely. Do not delegate that reading or interpretation.
@@ -131,6 +131,18 @@ pub fn build_available_skills(
     budget: SkillMetadataBudget,
     side_effects: SkillRenderSideEffects<'_>,
 ) -> Option<AvailableSkills> {
+    build_available_skills_for_task(outcome, budget, side_effects, "")
+}
+
+/// Ranking changes descriptions and order, never skill permissions. Explicit
+/// invocation still uses the unfiltered snapshot, and skill:catalog exposes all
+/// enabled skills even when the prompt budget cannot hold their minimum lines.
+pub fn build_available_skills_for_task(
+    outcome: &SkillLoadOutcome,
+    budget: SkillMetadataBudget,
+    side_effects: SkillRenderSideEffects<'_>,
+    task: &str,
+) -> Option<AvailableSkills> {
     let skills = outcome.allowed_skills_for_implicit_invocation();
     if skills.is_empty() {
         record_skill_render_side_effects(
@@ -143,11 +155,36 @@ pub fn build_available_skills(
         return None;
     }
 
-    let skill_lines = ordered_catalog_skill_lines(&skills);
+    let mut skill_lines = ordered_catalog_skill_lines(&skills);
+    if !task.trim().is_empty() {
+        let words = catalog_words(task);
+        let score = |line: &SkillLine<'_>| {
+            let name_words = catalog_words(line.name);
+            let named = !name_words.is_empty() && name_words.iter().all(|word| words.contains(word));
+            let description = catalog_words(line.description.as_ref());
+            (named, description.intersection(&words).count())
+        };
+        // Stable sort preserves scope/name order for equal relevance.
+        skill_lines.sort_by_cached_key(|line| std::cmp::Reverse(score(line)));
+        for line in &mut skill_lines {
+            if score(line) == (false, 0) {
+                // Keep a trigger, not just a name: lexical relevance is only a
+                // hint and cannot prove that a skill is inapplicable.
+                line.description = Cow::Owned(line.description.chars().take(64).collect());
+            }
+        }
+    }
     let selected = build_available_skills_from_lines(skill_lines, skills.len(), budget)?;
 
     record_available_skills_side_effects(&selected, budget, side_effects);
     Some(selected)
+}
+
+fn catalog_words(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| word.chars().count() > 2)
+        .map(str::to_lowercase)
+        .collect()
 }
 
 fn build_available_skills_from_lines(
@@ -759,6 +796,25 @@ mod tests {
     }
 
     #[test]
+    fn task_catalog_prioritizes_newly_relevant_skills_without_losing_discovery() {
+        let outcome = SkillLoadOutcome {
+            skills: vec![
+                make_skill_with_description("alpha", SkillScope::Repo, &"database migrations ".repeat(20)),
+                make_skill_with_description("beta", SkillScope::Repo, &"image generation ".repeat(20)),
+            ],
+            ..Default::default()
+        };
+        let budget = SkillMetadataBudget::Characters(500);
+        for (task, first) in [("database migrations", "alpha"), ("image generation", "beta")] {
+            let result = build_available_skills_for_task(
+                &outcome, budget, SkillRenderSideEffects::None, task,
+            ).unwrap();
+            assert!(result.skill_lines[0].starts_with(&format!("- {first} —")));
+            assert_eq!(result.report.omitted_count, 0);
+        }
+    }
+
+    #[test]
     fn implicit_catalog_uses_opaque_ids_without_host_paths_or_roots() {
         let root = test_path_buf("/Users/private/.codex/skills").abs();
         let skills = vec![
@@ -1006,9 +1062,8 @@ mod tests {
         let long_description = "!".repeat(1000);
         let long_skill =
             make_skill_with_description("long-skill", SkillScope::Repo, &long_description);
-        // The minimum catalog entry has 15 lexical tokens: three punctuation
-        // tokens, four name tokens, two for "skill", and six for the 24 hex ID
-        // characters. The extra separator and two exclamation marks add three.
+        // Leave room for a shortened description without depending on the
+        // tokenizer's treatment of repeated punctuation or the skill locator.
         let budget = SkillMetadataBudget::Tokens(18);
 
         let rendered =
@@ -1018,11 +1073,10 @@ mod tests {
         assert_eq!(rendered.report.total_count, 1);
         assert_eq!(rendered.report.included_count, 1);
         assert_eq!(rendered.report.omitted_count, 0);
-        assert_eq!(rendered.report.truncated_description_chars, 238);
-        assert_eq!(
-            rendered.skill_lines,
-            vec![expected_skill_line(&long_skill, "!!")]
-        );
+        assert!(rendered.report.truncated_description_chars > 0);
+        assert_eq!(rendered.skill_lines.len(), 1);
+        assert!(rendered.skill_lines[0].starts_with("- long-skill — !"));
+        assert!(budget.cost(&format!("{}\n", rendered.skill_lines[0])) <= budget.limit());
         assert_eq!(
             rendered.warning_message,
             Some(SKILL_DESCRIPTION_TRUNCATED_WARNING.to_string())

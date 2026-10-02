@@ -44,6 +44,16 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "Whether compaction counts the full context or only the body after the carried prefix.",
     ),
     doc(
+        "turn_credit_limit",
+        "Reasoning and output",
+        "Observed credit consumption ceiling before a final summary; unavailable balances cannot enforce it.",
+    ),
+    doc(
+        "turn_wall_time_limit_secs",
+        "Reasoning and output",
+        "Seconds after which a turn stops starting new work and reports completed and remaining work.",
+    ),
+    doc(
         "model_providers",
         "Model and provider",
         "Custom provider entries; built-in provider IDs are reserved.",
@@ -79,9 +89,19 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "Reasoning effort for normal model calls.",
     ),
     doc(
+        "compaction_reasoning_effort",
+        "Reasoning and output",
+        "Reasoning effort for local compaction; unset inherits the current turn's effort.",
+    ),
+    doc(
         "plan_mode_reasoning_effort",
         "Reasoning and output",
         "Reasoning effort to use while in plan mode.",
+    ),
+    doc(
+        "purpose_reasoning_effort",
+        "Reasoning and output",
+        "Opt-in reasoning defaults by sampling purpose; explicit turn effort takes precedence.",
     ),
     doc(
         "model_reasoning_summary",

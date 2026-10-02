@@ -19,9 +19,11 @@ from pathlib import Path
 if __package__:
     from . import source_inventory as inventory
     from .atomic_json import write_json_atomic
+    from .rollout_snapshot import read_rollout_records
 else:
     import source_inventory as inventory
     from atomic_json import write_json_atomic
+    from rollout_snapshot import read_rollout_records
 
 
 def sha256(path):
@@ -31,7 +33,7 @@ def sha256(path):
 
 def logged_query(path):
     """Decode data literals only; never execute code or instructions from logs."""
-    rows = [json.loads(line) for line in path.read_bytes().splitlines() if line.strip()]
+    rows = [record for record, _ in read_rollout_records(path)]
     queries = []
     timing = None
     for row in rows:

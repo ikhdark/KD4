@@ -81,6 +81,11 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "exit", exit.into())?;
     install_tool_aliases(scope, global, &enabled_tools)?;
     install_console_shim(scope, global)?;
+    let graph_source = v8::String::new(scope, include_str!("dependency_graph.js"))
+        .ok_or_else(|| "failed to allocate dependency graph helper".to_string())?;
+    v8::Script::compile(scope, graph_source, None)
+        .and_then(|script| script.run(scope))
+        .ok_or_else(|| "failed to install dependency graph helper".to_string())?;
     Ok(())
 }
 

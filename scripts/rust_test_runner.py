@@ -7,6 +7,7 @@ import argparse
 import codecs
 import filecmp
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -430,6 +431,78 @@ class MetadataIndex:
             isinstance(target.get("kind"), list) and kind in target["kind"]
             for target in cls._targets(package)
         )
+
+
+_PATH_MODULE = re.compile(
+    r'#\[path\s*=\s*"([^"]+)"\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;'
+)
+_LIB_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+
+
+def _rust_module_owners(
+    metadata: MetadataIndex, raw: str, cwd: Path
+) -> tuple[str, list[tuple[str, str | None, str]]] | None:
+    """The package and (selector kind, selector value, module) owning a Rust file."""
+    if not raw.endswith(".rs"):
+        return None
+    candidates = [Path(raw)] if Path(raw).is_absolute() else [cwd / raw, REPO_ROOT / raw]
+    for path in (candidate.resolve() for candidate in candidates):
+        owner = None
+        for name, package in metadata.packages.items():
+            manifest_path = package.get("manifest_path")
+            if not isinstance(manifest_path, str):
+                continue
+            root = Path(manifest_path).resolve().parent
+            if path.is_relative_to(root) and (
+                owner is None or len(root.parts) > len(owner[1].parts)
+            ):
+                owner = (name, root, package)
+        if owner is None:
+            continue
+        targets = []
+        for target in MetadataIndex._targets(owner[2]):
+            kinds = target.get("kind")
+            src_path = target.get("src_path")
+            if not isinstance(kinds, list) or not isinstance(src_path, str):
+                continue
+            if "test" in kinds or "bin" in kinds:
+                selector = ("test" if "test" in kinds else "bin", target.get("name"))
+            elif _LIB_KINDS.intersection(kinds):
+                selector = ("lib", None)
+            else:
+                continue
+            targets.append((selector, Path(src_path).resolve()))
+        # A file that is a target root belongs only to that target.
+        roots = [(selector, src) for selector, src in targets if src == path]
+        modules = [
+            (kind, value, _rust_module(src, path))
+            for (kind, value), src in roots
+            or [(selector, src) for selector, src in targets if path.is_relative_to(src.parent)]
+        ]
+        return (owner[0], modules) if modules else None
+    return None
+
+
+def _rust_module(crate_root: Path, path: Path, depth: int = 0) -> str:
+    """Module path of `path` below `crate_root`, honoring sibling `#[path]`."""
+    if path == crate_root:
+        return ""
+    if depth < 8:
+        for sibling in sorted(path.parent.glob("*.rs")):
+            if sibling == path:
+                continue
+            try:
+                text = sibling.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for declared, module in _PATH_MODULE.findall(text):
+                if declared == path.name:
+                    parent = _rust_module(crate_root, sibling.resolve(), depth + 1)
+                    return f"{parent}::{module}" if parent else module
+    parts = list(path.relative_to(crate_root.parent).with_suffix("").parts)
+    if parts[-1:] == ["mod"]:
+        parts.pop()
+    return "::".join(parts)
 
 
 Executor = Callable[..., subprocess.CompletedProcess[str]]
@@ -892,6 +965,52 @@ class RustTestRunner:
                 "steps": steps,
             }
         raise RunnerError(f"unknown named Rust test target or gate {name!r}")
+
+    def gates_for(self, paths: Sequence[str], *, cwd: Path | None = None) -> dict[str, Any]:
+        """Gates whose declared test IDs live in the module owning each file.
+
+        Ownership comes from Cargo target roots, module file layout, and sibling
+        `#[path]` declarations. A gate that reaches a changed module only through
+        a caller elsewhere is not selected, and filter-only steps are reported
+        rather than listed with nextest.
+        """
+        selected: dict[str, list[str]] = {}
+        unmapped: list[str] = []
+        not_evaluated: set[str] = set()
+        for raw in dict.fromkeys(paths):
+            owners = _rust_module_owners(self.metadata, raw, cwd or Path.cwd())
+            if not owners:
+                unmapped.append(raw)
+                continue
+            package, modules = owners
+            gates = []
+            for gate in self.manifest.gates.values():
+                for step in gate.steps:
+                    target = self.manifest.targets[step.target]
+                    if target.package != package:
+                        continue
+                    for kind, value, module in modules:
+                        if (target.selector_kind, target.selector_value) != (kind, value):
+                            continue
+                        if not step.tests:
+                            not_evaluated.add(gate.name)
+                        elif any(
+                            not module or test == module or test.startswith(f"{module}::")
+                            for test in step.tests
+                        ):
+                            gates.append(gate.name)
+            selected[raw] = list(dict.fromkeys(gates))
+        return {
+            "gates": sorted({gate for gates in selected.values() for gate in gates}),
+            "paths": selected,
+            **({"unmapped": unmapped} if unmapped else {}),
+            **(
+                {"filter_only_gates_not_evaluated": sorted(not_evaluated)}
+                if not_evaluated
+                else {}
+            ),
+            "scope": "direct module ownership; callers in other modules are not selected",
+        }
 
     def run_target(
         self,
@@ -2117,6 +2236,11 @@ def build_parser() -> argparse.ArgumentParser:
     check_gates.add_argument("names", nargs="+")
     plan = subparsers.add_parser("plan")
     plan.add_argument("name")
+    gates_for = subparsers.add_parser(
+        "gates-for",
+        help="List gates whose declared tests live in the modules owning these Rust files.",
+    )
+    gates_for.add_argument("paths", nargs="+")
     run_target = subparsers.add_parser("run-target", parents=[run_options])
     run_target.add_argument(
         "--all",
@@ -2141,15 +2265,17 @@ _RUNNER_OWNED_RUN_OPTIONS = {"--no-fail-fast", "--all"}
 
 def _split_runner_owned_options(
     filter_args: Sequence[str],
-) -> tuple[list[str], set[str], float | None]:
+) -> tuple[list[str], set[str], float | None, str | None]:
     """Separates runner-owned execution flags from caller filtering args.
 
-    Recipes forward execution flags and the per-command deadline after the
-    target name. Leave libtest arguments and filtering-option values intact.
+    Recipes forward execution flags, the nextest profile, and the per-command
+    deadline after the target name. Leave libtest arguments and
+    filtering-option values intact.
     """
     remaining: list[str] = []
     owned: set[str] = set()
     timeout = None
+    profile = None
     after_separator = False
     tokens = iter(filter_args)
     for token in tokens:
@@ -2172,12 +2298,24 @@ def _split_runner_owned_options(
                     "command timeout must be a finite positive number of seconds"
                 ) from exc
             continue
+        if not after_separator and (
+            token == "--profile" or token.startswith("--profile=")
+        ):
+            value = token.split("=", 1)[1] if "=" in token else next(tokens, "")
+            if not value or value.startswith("-"):
+                raise RunnerError("--profile requires a nextest profile name")
+            if profile not in (None, value):
+                raise RunnerError(
+                    f"conflicting --profile values {profile!r} and {value!r}"
+                )
+            profile = value
+            continue
         remaining.append(token)
         if not after_separator and token in {"-E", "--filterset", "--run-ignored"}:
             value = next(tokens, None)
             if value is not None:
                 remaining.append(value)
-    return remaining, owned, timeout
+    return remaining, owned, timeout, profile
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2199,14 +2337,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             filter_args = list(args.filter_args)
             if filter_args[:1] == ["--"]:
                 filter_args = filter_args[1:]
-            filter_args, owned, timeout = _split_runner_owned_options(filter_args)
+            filter_args, owned, timeout, profile = _split_runner_owned_options(
+                filter_args
+            )
             if timeout is not None:
                 args.command_timeout_seconds = timeout
+            if profile is not None:
+                if args.profile not in (None, profile):
+                    raise RunnerError(
+                        f"conflicting --profile values {args.profile!r} and {profile!r}"
+                    )
+                args.profile = profile
             no_fail_fast = no_fail_fast or "--no-fail-fast" in owned
             allow_all = allow_all or "--all" in owned
             validate_filtering_args(filter_args)
 
         manifest = Manifest.load(args.manifest)
+        execution_fingerprint = None
+        if args.command in {"run-target", "run-gate"}:
+            inputs = Path(__file__).read_bytes() + Path(args.manifest).read_bytes()
+            execution_fingerprint = hashlib.sha256(inputs).hexdigest()
         if args.command == "run-target":
             require_core_lib_filter(
                 manifest.targets.get(args.name), filter_args, allow_all=allow_all
@@ -2232,6 +2382,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             no_fail_fast=no_fail_fast,
             command_timeout_seconds=getattr(args, "command_timeout_seconds", None),
         )
+        dependencies = (
+            execution_dependency_manifest(metadata, Path(args.manifest))
+            if args.command in {"run-target", "run-gate"}
+            else None
+        )
         if args.command == "check-manifest":
             metadata.validate_manifest(manifest)
             print(
@@ -2241,16 +2396,121 @@ def main(argv: Sequence[str] | None = None) -> int:
             runner.check_gates(args.names)
         elif args.command == "plan":
             print(json.dumps(runner.plan(args.name), indent=2))
+        elif args.command == "gates-for":
+            print(json.dumps(runner.gates_for(args.paths), indent=2))
         elif args.command == "run-target":
-            runner.run_target(args.name, filter_args, allow_all=allow_all)
+            receipts = runner.run_target(args.name, filter_args, allow_all=allow_all)
+            emit_execution_receipt(
+                execution_fingerprint, receipts, [args.name], skipped=None,
+                dependency_manifest=dependencies,
+            )
         elif args.command == "run-gate":
-            runner.run_gates(args.names)
+            receipts = runner.run_gates(args.names)
+            emit_execution_receipt(
+                execution_fingerprint, receipts, args.names, skipped=0,
+                dependency_manifest=dependencies,
+            )
         else:  # pragma: no cover - argparse enforces the command set.
             raise RunnerError(f"unsupported command {args.command!r}")
     except RunnerError as exc:
         print(f"rust_test_runner: {exc}", file=sys.stderr)
         return 2
     return 0
+
+
+def execution_dependency_manifest(
+    metadata: MetadataIndex, manifest: Path,
+) -> dict[str, Any]:
+    """Record known inputs without claiming arbitrary test effects are hermetic.
+
+    Cargo metadata uses --no-deps; package roots are observations, not a
+    transitive dependency proof. Never enable replay from this manifest alone.
+    Environment values are hashed as a whole and are never emitted.
+    """
+    roots = {str(REPO_ROOT.resolve())}
+    inputs = {
+        Path(__file__).resolve(), manifest.resolve(),
+        Path(__file__).with_name("process_owner.py").resolve(),
+        Path(__file__).with_name("rust_tool_env.py").resolve(),
+        CODEX_RS_ROOT / "Cargo.toml", CODEX_RS_ROOT / "Cargo.lock",
+    }
+    for package in metadata.packages.values():
+        path = package.get("manifest_path")
+        if isinstance(path, str):
+            path = Path(path).resolve()
+            inputs.add(path)
+            roots.add(str(path.parent))
+    for directory in (CODEX_RS_ROOT, *CODEX_RS_ROOT.parents):
+        inputs.update(directory / name for name in (
+            ".cargo/config", ".cargo/config.toml",
+            "rust-toolchain", "rust-toolchain.toml",
+        ))
+    records = []
+    for path in sorted(inputs, key=str)[:256]:
+        record: dict[str, Any] = {"path": str(path)}
+        try:
+            # Do not let a malformed config turn provenance capture into an
+            # unbounded read or discard an otherwise usable execution receipt.
+            with path.open("rb") as source:
+                content = source.read(1024 * 1024 + 1)
+            if len(content) <= 1024 * 1024:
+                record["sha256"] = hashlib.sha256(content).hexdigest()
+            else:
+                record["state"] = "oversized"
+        except FileNotFoundError:
+            record["state"] = "absent"
+        except OSError:
+            record["state"] = "unavailable"
+        records.append(record)
+    context = json.dumps({
+        "environment": dict(os.environ),
+        "python": str(Path(sys.executable).resolve()),
+        "platform": sys.platform,
+    }, sort_keys=True, ensure_ascii=True).encode()
+    return {
+        "version": 1,
+        "producer": "rust_test_runner",
+        "captured": "before_execution",
+        "file_inputs": records,
+        "source_roots": sorted(roots)[:256],
+        "omitted_file_inputs": max(0, len(inputs) - 256),
+        "omitted_source_roots": max(0, len(roots) - 256),
+        "execution_context_sha256": hashlib.sha256(context).hexdigest(),
+        "coverage": "declared_not_exhaustive",
+        "unresolved_dependencies": [
+            "transitive_and_generated_inputs", "resolved_toolchain",
+            "test_owned_services_network_and_time",
+        ],
+        "automatic_replay_allowed": False,
+    }
+
+
+def emit_execution_receipt(
+    fingerprint: str | None,
+    receipts: dict[str, list[str]],
+    selected_targets: Sequence[str],
+    *,
+    skipped: int | None,
+    dependency_manifest: dict[str, Any] | None = None,
+) -> None:
+    """Publish the runner's completed-test ledger, not a parsed success slogan.
+
+    Source dependency freshness remains the invoking harness's obligation.
+    A target run does not count ignored tests; report that count as unknown.
+    """
+    receipt = {
+        "kind": "codex_test_execution_v1",
+        "runner": "rust_test_runner",
+        "runner_input_fingerprint": fingerprint,
+        "selected_targets": list(selected_targets),
+        "completed_tests": receipts,
+        "executed_tests": sum(len(set(tests)) for tests in receipts.values()),
+        "skipped_tests": skipped,
+        "exit_code": 0,
+    }
+    if dependency_manifest is not None:
+        receipt["dependency_manifest"] = dependency_manifest
+    print(json.dumps(receipt, sort_keys=True))
 
 
 if __name__ == "__main__":

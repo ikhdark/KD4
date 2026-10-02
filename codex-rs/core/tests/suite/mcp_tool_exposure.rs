@@ -97,7 +97,7 @@ async fn code_mode_only_exposes_direct_model_only_mcp_namespaces() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apps_guidance_appears_after_background_recovery_within_a_turn() -> Result<()> {
+async fn apps_guidance_stays_frozen_after_background_recovery_within_a_turn() -> Result<()> {
     require_network!();
 
     let server = responses::start_mock_server().await;
@@ -226,16 +226,14 @@ async fn apps_guidance_appears_after_background_recovery_within_a_turn() -> Resu
         .filter(|text| text.starts_with("<tool_search_sources>"))
         .collect::<Vec<_>>();
     assert_eq!(initial_sources.len(), 1);
-    assert_eq!(final_sources.len(), 2);
-    assert_eq!(final_sources[0], initial_sources[0]);
-    assert_ne!(final_sources[0], final_sources[1]);
+    assert_eq!(final_sources, initial_sources);
     assert_eq!(
         requests[1]
             .message_input_texts("developer")
             .iter()
             .filter(|text| text.contains("<apps_instructions>"))
             .count(),
-        1
+        0
     );
 
     Ok(())

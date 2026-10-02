@@ -5,6 +5,23 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
+fn windows_crash_exit_codes_are_named_and_ordinary_codes_are_not() {
+    let notice = windows_abnormal_exit_notice(-1_073_741_819).expect("access violation");
+    assert!(
+        notice.contains("0xC0000005 STATUS_ACCESS_VIOLATION"),
+        "{notice}"
+    );
+    assert!(notice.contains("crashed"), "{notice}");
+    assert!(
+        windows_abnormal_exit_notice(-1_073_740_791)
+            .is_some_and(|notice| notice.contains("STATUS_STACK_BUFFER_OVERRUN"))
+    );
+    for ordinary in [0, 1, 2, 101, 127, -1] {
+        assert_eq!(windows_abnormal_exit_notice(ordinary), None);
+    }
+}
+
+#[test]
 fn command_evidence_ignores_durations_and_timestamps() {
     for (first, second) in [
         ("Finished test in 2.31s", "Finished test in 9.84s"),

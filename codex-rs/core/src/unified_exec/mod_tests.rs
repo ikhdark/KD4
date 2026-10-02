@@ -177,7 +177,6 @@ async fn exec_command_with_tracker(
         justification: None,
         prefix_rule: None,
         validation_launch: false,
-        known_delta: None,
     };
     let mut context =
         UnifiedExecContext::new(Arc::clone(session), Arc::clone(turn), "call".to_string());
@@ -776,9 +775,9 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
     let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 0).await?;
     assert_eq!(
         Instant::now().saturating_duration_since(started_at),
-        Duration::from_millis(MIN_YIELD_TIME_MS)
+        Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS)
     );
-    assert_eq!(output.wall_time, Duration::from_millis(MIN_YIELD_TIME_MS));
+    assert_eq!(output.wall_time, Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS));
     assert!(output.raw_output.is_empty());
     assert_eq!(output.process_id, Some(process_id));
     assert_eq!(output.exit_code, None);

@@ -33,6 +33,7 @@ use super::new_attempt_id;
 use super::new_attempt_identity;
 use super::new_sampling_request_id;
 use super::selected_tool_schema_breakdown;
+use super::websocket_connection_expiring;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -119,6 +120,25 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+#[test]
+fn websocket_rotates_before_the_server_connection_age_limit() {
+    let connected_at = std::time::Instant::now();
+    let minutes = |count: u64| connected_at + Duration::from_secs(count * 60);
+    assert!(!websocket_connection_expiring(None, minutes(120)));
+    assert!(!websocket_connection_expiring(
+        Some(connected_at),
+        minutes(54)
+    ));
+    assert!(websocket_connection_expiring(
+        Some(connected_at),
+        minutes(55)
+    ));
+    assert!(websocket_connection_expiring(
+        Some(connected_at),
+        minutes(61)
+    ));
+}
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_thread_id(ThreadId::new(), session_source)
@@ -1204,6 +1224,8 @@ fn history_growth_alone_keeps_fixed_prefix_reuse_eligible() {
 #[tokio::test]
 async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_key()
 -> anyhow::Result<()> {
+    use sha2::Digest;
+
     let server = MockServer::start().await;
     let sse_body = concat!(
         "event: response.created\n",
@@ -1303,13 +1325,18 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
             .collect::<Vec<_>>(),
         vec![Some(false), Some(true)],
     );
+    let wire_requests = server.received_requests().await.expect("captured requests");
+    let wire_body: serde_json::Value = serde_json::from_slice(&wire_requests[0].body)?;
+    let cache_key = wire_body["prompt_cache_key"].as_str().expect("wire cache key");
+    let fingerprint = format!("{:x}", sha2::Sha256::digest(cache_key.as_bytes()));
     for request in &protocol.model_requests {
         assert_eq!(
             request.prompt_cache_key_fingerprint.as_deref(),
-            Some("10110fe0b9b7ef55cf1ce055b9ed7af83cf1369c41937b4146c1e059d71f2152"),
+            Some(fingerprint.as_str()),
         );
     }
     let serialized = serde_json::to_string(&protocol)?;
+    assert!(!serialized.contains(cache_key));
     assert!(!serialized.contains("018f31aa-1111-7111-8111-111111111111"));
 
     Ok(())

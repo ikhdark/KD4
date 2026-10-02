@@ -451,6 +451,10 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
         create_apply_patch_freeform_tool(self.multi_environment)
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async move {
             let cancellation = invocation.cancellation_token.clone();
@@ -577,7 +581,9 @@ impl ApplyPatchHandler {
             let workspace_operation_permit = acquire_patch_workspace(
                 turn_environment,
                 turn_environment.cwd(),
+                native_addition_paths(&args.hunks).as_deref(),
                 &cancellation_token,
+                &turn.turn_timing_state,
             )
             .await?;
             if let Some(id) = &retry_id {
@@ -717,6 +723,30 @@ impl ApplyPatchHandler {
 }
 
 impl CoreToolRuntime for ApplyPatchHandler {
+    fn cancellation_recovery(
+        &self,
+        result: Option<&serde_json::Value>,
+        error: Option<&str>,
+    ) -> crate::tools::context::ToolEffectRecovery {
+        match result.filter(|value| value["changes_exact"] == true && value["changes"].is_array()) {
+            Some(result) => crate::tools::context::ToolEffectRecovery::committed(result.clone()),
+            None => crate::tools::context::ToolEffectRecovery::unknown(result, error),
+        }
+    }
+
+    fn native_addition_paths(&self, payload: &ToolPayload) -> Option<Vec<PathBuf>> {
+        // Some(empty) identifies a mutator with no safe narrow footprint;
+        // it must not be mistaken for a non-workspace parallel tool.
+        Some((|| {
+            let ToolPayload::Custom { input } = payload else { return None; };
+            let args = codex_apply_patch::parse_patch(input).ok()?;
+            if args.environment_id.is_some() {
+                return None;
+            }
+            native_addition_paths(&args.hunks)
+        })().unwrap_or_default())
+    }
+
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
     }
@@ -737,7 +767,16 @@ impl CoreToolRuntime for ApplyPatchHandler {
         Some(Box::<ApplyPatchArgumentDiffConsumer>::default())
     }
 
+    fn pre_tool_use_hook_name(
+        &self,
+        _tool_name: &codex_tools::ToolName,
+        payload: &ToolPayload,
+    ) -> Option<HookToolName> {
+        matches!(payload, ToolPayload::Custom { .. }).then(HookToolName::apply_patch)
+    }
+
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+        let tool_name = self.pre_tool_use_hook_name(&invocation.tool_name, &invocation.payload)?;
         let mut command = apply_patch_payload_command(&invocation.payload)?;
         if apply_patch_retries::is_retry(&command) {
             if let Ok(retry) = invocation
@@ -752,7 +791,7 @@ impl CoreToolRuntime for ApplyPatchHandler {
             }
         }
         Some(PreToolUsePayload {
-            tool_name: HookToolName::apply_patch(),
+            tool_name,
             tool_input: serde_json::json!({ "command": command }),
         })
     }
@@ -827,17 +866,33 @@ impl CoreToolRuntime for ApplyPatchHandler {
 async fn acquire_patch_workspace(
     environment: &TurnEnvironment,
     cwd: &PathUri,
+    additions: Option<&[PathBuf]>,
     cancellation_token: &tokio_util::sync::CancellationToken,
-) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, FunctionCallError> {
+    turn_timing_state: &Arc<crate::turn_timing::TurnTimingState>,
+) -> Result<Option<crate::scoped_workspace_gate::WorkspaceLease>, FunctionCallError> {
+    // Waiting for another patch is tool activity, not model orchestration or
+    // executor setup. Validation has a separate gate.
+    let _tool_wait = turn_timing_state.begin_tool_execution();
+    let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("patch_gate_wait");
     tokio::select! {
         biased;
         _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel(
             "apply_patch cancelled while waiting for the workspace".to_string(),
         )),
-        permit = crate::workspace_operation_gate::acquire_patch_operation(&environment.environment, cwd) => {
-            Ok(Some(permit))
+        permit = crate::workspace_operation_gate::acquire_patch_additions_with_timeout(&environment.environment, cwd, additions) => {
+            permit.map(Some).map_err(|error| FunctionCallError::RespondToModel(error.to_string()))
         }
     }
+}
+
+fn native_addition_paths(hunks: &[Hunk]) -> Option<Vec<PathBuf>> {
+    if hunks.is_empty() || hunks.len() > 64 {
+        return None;
+    }
+    hunks.iter().map(|hunk| match hunk {
+        Hunk::AddFile { path, .. } => Some(path.clone()),
+        _ => None,
+    }).collect()
 }
 
 // An admitted patch owns its filesystem operations, mutation evidence and diff
@@ -847,7 +902,7 @@ async fn run_owned_patch(
     tool_ctx: ToolCtx,
     tracker: Option<SharedTurnDiffTracker>,
     emitter: ToolEmitter,
-    workspace_operation_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
+    workspace_operation_permit: Option<crate::scoped_workspace_gate::WorkspaceLease>,
 ) -> Result<ApplyPatchToolOutput, FunctionCallError> {
     let terminal_tasks = tool_ctx.session.terminal_tasks.clone();
     let timing = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing();
@@ -1033,7 +1088,14 @@ pub(crate) async fn intercept_apply_patch(
     // wait for the patch gate. Verification below must run while holding the permit.
     let workspace_operation_permit =
         if let Some(patch_cwd) = codex_apply_patch::apply_patch_command_cwd(command, cwd) {
-            acquire_patch_workspace(&turn_environment, &patch_cwd, &cancellation_token).await?
+            acquire_patch_workspace(
+                &turn_environment,
+                &patch_cwd,
+                None,
+                &cancellation_token,
+                &turn.turn_timing_state,
+            )
+            .await?
         } else {
             None
         };

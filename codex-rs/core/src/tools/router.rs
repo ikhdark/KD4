@@ -505,6 +505,15 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
+    pub(crate) fn pre_tool_use_hook_may_run(
+        &self,
+        hooks: &codex_hooks::Hooks,
+        call: &ToolCall,
+    ) -> bool {
+        self.registry
+            .pre_tool_use_hook_may_run(hooks, &call.tool_name, &call.payload)
+    }
+
     pub fn tool_waits_for_runtime_cancellation(&self, call: &ToolCall) -> bool {
         self.registry
             .waits_for_runtime_cancellation(&call.tool_name)
@@ -521,6 +530,50 @@ impl ToolRouter {
         self.registry
             .cancellation_requires_commit_barrier(&call.tool_name)
             .unwrap_or(false)
+    }
+
+    pub(crate) fn tool_cancellation_cleanup_deadline(&self, call: &ToolCall) -> std::time::Duration {
+        self.registry.cancellation_cleanup_deadline(&call.tool_name)
+    }
+
+    pub(crate) fn cancellation_recovery(
+        &self,
+        name: &ToolName,
+        result: Option<&serde_json::Value>,
+        error: Option<&str>,
+    ) -> crate::tools::context::ToolEffectRecovery {
+        self.registry.cancellation_recovery(name, result, error)
+    }
+
+    pub(crate) fn semantic_tool_name(&self, name: &ToolName) -> ToolName {
+        self.registry.semantic_tool_name(name)
+    }
+
+    pub(crate) fn semantic_capabilities(
+        &self, name: &ToolName,
+    ) -> crate::tools::registry::ToolSemanticCapabilities {
+        self.registry.semantic_capabilities(name)
+    }
+
+    pub(crate) fn terminal_failure_reuse(&self, name: &ToolName) -> crate::tools::registry::TerminalFailureReuse {
+        self.registry.terminal_failure_reuse(name)
+    }
+
+    pub(crate) fn terminal_result_adapter(&self, name: &ToolName) -> Option<&'static str> {
+        self.registry.terminal_result_adapter(name)
+    }
+
+    pub(crate) fn permits_shared_workspace_observation(&self, call: &ToolCall) -> bool {
+        self.registry
+            .permits_shared_workspace_observation(&call.tool_name, &call.payload)
+    }
+
+    pub(crate) fn delegates_workspace_admission(&self, call: &ToolCall) -> bool {
+        self.registry.delegates_workspace_admission(&call.tool_name)
+    }
+
+    pub(crate) fn native_addition_paths(&self, call: &ToolCall) -> Option<Vec<std::path::PathBuf>> {
+        self.registry.native_addition_paths(&call.tool_name, &call.payload)
     }
 
     #[instrument(level = "trace", skip_all, err)]

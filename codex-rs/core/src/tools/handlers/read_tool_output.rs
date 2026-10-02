@@ -987,7 +987,15 @@ impl ToolExecutor<ToolInvocation> for ReadToolOutputHandler {
     }
 }
 
-impl CoreToolRuntime for ReadToolOutputHandler {}
+impl CoreToolRuntime for ReadToolOutputHandler {
+    fn cancellation_cleanup_policy(&self) -> crate::tools::registry::ToolCleanupPolicy {
+        crate::tools::registry::ToolCleanupPolicy::InterruptibleRead
+    }
+
+    fn terminal_failure_reuse(&self) -> crate::tools::registry::TerminalFailureReuse {
+        crate::tools::registry::TerminalFailureReuse::RequestRevisionAndJsonSyntax
+    }
+}
 
 async fn handle_read_tool_output(
     invocation: ToolInvocation,
@@ -1190,6 +1198,12 @@ async fn drain_recovery_snapshot(
     let token_ceiling = token_ceiling.saturating_add(
         crate::tools::command_output_artifact::RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN,
     );
+    let complete_output = snapshot.select(selectors.clone(), token_ceiling).await?;
+    if complete_output.complete
+        && recovery_envelope_fits(&complete_output, None, token_ceiling)
+    {
+        return Ok(RecoveryContinuationState::new(complete_output, token_ceiling).finish());
+    }
     // Reserve stop metadata, including caller-supplied selectors. Byte continuations
     // fit within the fixed allowance; arbitrary error text is checked at finalization.
     let reserve = selectors

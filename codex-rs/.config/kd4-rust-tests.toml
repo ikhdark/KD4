@@ -722,15 +722,6 @@ tests = [
   "suite::client::initial_turn_uses_model_default_reasoning_effort",
 ]
 
-[gates.capability-known-delta-store]
-description = "Known delta reuse preserves force-fresh command execution."
-
-[[gates.capability-known-delta-store.steps]]
-target = "core_lib"
-# The fixture runs git directly and uses in-process code mode.
-helpers = []
-tests = ["tools::handlers::unified_exec::tests::known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches"]
-
 [gates.capability-deferred-executor]
 description = "Deferred executor readiness updates live context and tools."
 
@@ -748,9 +739,42 @@ description = "Code mode executes a native command and delivers its output."
 
 [[gates.capability-code-mode-runtime.steps]]
 target = "core_code_mode_mcp"
-# This turn configures no MCP server.
+# The recovery fixture uses an in-process mock MCP server.
 helpers = ["codex-code-mode-host"]
-tests = ["suite::code_mode::code_mode_can_return_exec_command_output"]
+tests = [
+  "suite::code_mode::code_mode_can_return_exec_command_output",
+  "suite::code_mode::token_cache_e2e::production_compact_outputs_complete_turn_non_regression",
+]
+
+[gates.harness-efficiency-safety]
+description = "Replayable advisory-policy comparison and evidence budgets paired with fixed recovery, cancellation, completion, and disjoint-admission invariants; no wall-clock tuning or model routing."
+
+[[gates.harness-efficiency-safety.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "tool_history::tests::task_sensitive_budget_reserves_unread_evidence_and_releases_it_after_consumption",
+  "tool_history::tests::phase_checkpoint_resolves_only_later_current_success_for_the_same_action",
+  "tool_history::tests::checkpoint_answer_lineage_downgrades_without_rewriting_or_repeating_notes",
+  "session::turn_execution::tests::executed_validation_summary_requires_a_completed_non_skipped_result",
+  "session::turn_execution::tests::lightweight_handoff_advisory_preserves_novel_progress_and_tool_access",
+  "session::turn_execution::tests::lightweight_handoff_window_resets_for_unmeasured_slow_batched_or_mutating_work",
+  "session::turn_execution::tests::distinct_failure_strategies_allow_narrow_successful_recovery",
+  "session::turn_execution::tests::native_receipt_requires_settled_success_and_no_unfinished_plan",
+  "session::turn::tests::terminal_surface_preserves_owner_canonical_message_exactly",
+  "scoped_workspace_gate::tests::native_addition_claims_exclude_overlaps_and_release_cancelled_waiters",
+  "tools::parallel::tests::nested_cancellation_owns_terminal_before_runtime_cleanup",
+  "tools::handlers::agent_jobs::tests::report_rejects_schema_invalid_result_without_completing_then_accepts_correction",
+]
+
+[[gates.harness-efficiency-safety.steps]]
+target = "core_code_mode_mcp"
+helpers = ["codex-code-mode-host"]
+tests = [
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request",
+  "suite::code_mode::direct_delivery::explicit_delivery_accepts_schema_valid_json_and_supported_media",
+  "suite::code_mode::direct_delivery::delivery_cannot_hide_failure_yield_overflow_or_sibling_work",
+]
 
 [gates.capability-shell-output-summary]
 description = "Bounded failure-focused output on classic and unified execution paths."

@@ -11,7 +11,7 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - For command output, prefer `text(result.output)` and inspect `result.exit_code` and `result.error`; live-session and recovery controls are preserved by the host. For machine-readable commands, parse `result.stdout` only when `streams_complete` is true; `output` is a display projection and may combine diagnostics or omit bytes. Exact stdout/stderr are available to scripts but omitted when printing an unchanged whole result; explicitly emit only the stream data needed. Use `text(result)` only when the complete object is needed.
 - Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. Resume only an actually returned live session/cell ID; otherwise check the outcome before retrying uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
 - `text(...)` buffers output while awaited work continues in the same awaited evaluation; `yield_control()` is only for a new model decision. Input and host deadlines can yield.
-- When a script can compute the complete final answer from its tool results, use first-line `// @exec: {"deliver": true}` and emit only the final answer with `text(...)`. Await and check all work first. A successful, complete, text-only cell can finish the turn with that exact text, without another model call. Do not use this for intermediate evidence or unfinished work. Errors, incomplete work, output loss/overflow, explicit yields, other simultaneous top-level calls, new input, or a required output schema fall back to ordinary model continuation; delivery is never inferred from tool output. Delivery applies only to this exec call, not a later wait.
+- When a script can compute the complete final answer from its tool results, use first-line `// @exec: {"deliver": true}` and emit only the final answer with `text(...)`. Await and check all work first. A successful, complete cell can finish the turn with that exact text and supported images, without another model call. When a final JSON schema is required, emit valid JSON matching that schema; the host validates it before delivery. Do not use this for intermediate evidence or unfinished work. Errors, incomplete work, invalid final JSON, unsafe media URLs, output loss/overflow, unsettled or failed sibling calls, conflicting delivery intents, or new input fall back to ordinary model continuation; delivery is never inferred from tool output. Delivery intent survives empty yields and can finish through a later wait in the same turn. Visible partial output, intervening input, failures, or a changed final schema invalidate that intent.
 - An exec cell and a command process have separate lifecycles. A resolved `exec_command` call may still return a running command session. Resume a running cell with `wait(cell_id)`; resume a returned command session with `write_stdin(session_id)`. When no new model decision is needed, continue that session within the current evaluation. Completion of the cell does not establish completion of every process it started. Command lifecycle and recovery metadata survive text-only output and zero-token text budgets.
 - For a quiet running command, use `write_stdin({session_id, wait_for_output:true})` to await output or exit without periodic model handoffs. If it yields only routine progress, await the next observation in this same cell. Stop for terminal state, pending_deferred_completions, new input, cancellation, no progress requiring diagnosis, or a genuine decision. Never restart the producer.
 - Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
@@ -19,9 +19,10 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - Output defaults to 10000 tokens, with a 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin display results carry at most 8000 output tokens, bounded by the cell hard cap. Budget the combined emitted output, not each nested call independently; reserve space for JSON escaping and lifecycle metadata rather than summing per-call maxima up to the cell limit. Use `store` to retain results and emit only the evidence needed for the next decision. Read whole useful regions; after truncation, select only missing evidence from the retained artifact. If recovery stops at its budget, follow its unconsumed selector rather than repeating the original range; preserve completion and continuation metadata when filtering recovered output.
 
 Helpers:
+- `await run_graph([{id, deps?: string[], step_id?: string, requires?: string[], run: async (dependencies) => value, accept: async (value) => boolean}], {concurrency?: number})` executes a cell-local DAG (1–256 nodes, concurrency 1–16, default 4). Link nodes to existing update_plan step IDs with step_id; graph execution never changes checklist status or proves the whole task complete. requires lists exact ALL_TOOL_NAMES capabilities; missing capabilities, unknown dependencies, and cycles fail before any node runs. Every node requires an explicit success predicate; check tool status/exit codes there. Failed dependencies skip their descendants; independent nodes finish, then failure throws with `.results` containing every fulfilled/rejected/skipped node. Successful results are keyed by node ID with `{status:"fulfilled", value}` and the supplied step_id. No automatic retries, effect rollback, live-cell resume after a crash, or authorization to spawn agents. Use existing task-coordination tools inside nodes for authorized agent assignments, not a separate task ledger. All nested calls keep normal admission and cancellation. Prefer ordinary awaits for simple chains.
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
 - `notify(value): Promise<void>` queues a model-visible message without yielding.
-- JS bindings reset per exec; `store(key, value)`/`load(key)` keep JSON values for later cells.
+- JS bindings reset per exec; `store(key, value)`/`load(key)` keep JSON values for later cells. Opt in before storing values with first-line `// @exec: {"persist":true}` to restore and persist bounded completed named values and terminal-cell results (including artifact references) for this chat. Use that opt-in again after restarting the host; retained completed cell IDs can then be observed without reexecution. This does not resume live JavaScript or rerun tools; interrupted external effects remain unknown. Snapshots protect against process crashes, not all power-loss scenarios.
 - `setTimeout(callback: () => void, delayMs?: number)` returns an ID; `clearTimeout(timeoutId?: number)` cancels it. Await a promise resolved by the callback to wait."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` buffers output while its awaited continuation runs. Use `wait` only after `exec` returns a genuinely live `Script running with cell ID ...` result, such as an explicit `yield_control()` or input interruption; a completed cell never needs `wait`.
 - `cell_id` identifies the running `exec` cell to resume.
@@ -29,7 +30,7 @@ const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` buffers output while its awa
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` buffers output until an explicit yield, input activity, or final completion or termination. Silence alone does not cause a model handoff.
 - New user steering or mailbox input interrupts a held wait without terminating a still-valid cell.
-- If the cell has already finished, `wait` returns the completed result and closes the cell."#;
+- If the cell has already finished, `wait` returns the completed result and closes the cell. A retained explicit delivery intent can finish the turn only if the cell yielded no partial output and input and schema remain unchanged."#;
 
 pub fn build_exec_tool_description(
     code_mode_only: bool,
@@ -93,11 +94,14 @@ mod tests {
                         .split('`')
                         .filter(|part| part.starts_with("// @exec:"))
                         .collect::<Vec<_>>();
-                    assert_eq!(directives.len(), 1);
-                    let source = format!("{}\ntext('budget applied');", directives[0]);
-                    let parsed = parse_exec_source(&source).unwrap();
-                    assert_eq!(parsed.max_output_tokens, Some(10000));
-                    assert_eq!(parsed.code, "text('budget applied');");
+                    let mut options = Vec::new();
+                    for directive in directives {
+                        let source = format!("{directive}\ntext('budget applied');");
+                        let parsed = parse_exec_source(&source).unwrap();
+                        assert_eq!(parsed.code, "text('budget applied');");
+                        options.push((parsed.max_output_tokens, parsed.deliver, parsed.persist));
+                    }
+                    assert_eq!(options, vec![(None, true, false), (Some(10000), false, false), (None, false, true)]);
                     assert!(description.contains(
                         "override it with the documented `{ timeout_ms }` option when needed."
                     ));

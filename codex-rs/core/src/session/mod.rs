@@ -20,6 +20,7 @@ use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
+#[cfg(test)]
 use crate::build_available_skills;
 use crate::compact;
 use crate::config::ManagedFeatures;
@@ -1456,8 +1457,10 @@ fn unfinished_turn_boundary_items(
             _ => {}
         }
     }
+    let (recovery, mut timing) = crate::context::lost_turn_recovery(rollout_items);
+    timing.counters.tool_call_count = calls.len() as u32;
     let mut items = Vec::new();
-    if let Some(marker) = crate::tasks::unfinished_turn_history_marker(
+    if let Some(mut marker) = crate::tasks::unfinished_turn_history_marker(
         crate::tasks::InterruptedTurnHistoryMarker::from_config_and_version(
             turn_context.config.as_ref(),
             turn_context.multi_agent_version,
@@ -1465,6 +1468,9 @@ fn unfinished_turn_boundary_items(
         calls.len(),
         results.len(),
     ) {
+        if let ResponseItem::Message { content, .. } = &mut marker {
+            content.push(codex_protocol::models::ContentItem::InputText { text: recovery });
+        }
         items.push(RolloutItem::ResponseItem(marker));
     }
     items.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
@@ -1473,7 +1479,7 @@ fn unfinished_turn_boundary_items(
             reason: TurnAbortReason::ProcessLost,
             completed_at: None,
             duration_ms: None,
-            timing: None,
+            timing: Some(timing),
         },
     )));
     items
@@ -1652,14 +1658,29 @@ impl Session {
     /// Flush rollout writes and return the final durability-barrier result.
     #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
+        self.flush_rollout_with_durability(/*durable*/ false).await
+    }
+
+    /// [`Self::flush_rollout`] plus a stable-storage barrier for the rollout itself, so a
+    /// terminal turn record survives an operating-system crash. Used once per turn.
+    #[instrument(name = "session.flush_rollout_durable", level = "trace", skip_all)]
+    pub(crate) async fn flush_rollout_durable(&self) -> std::io::Result<()> {
+        self.flush_rollout_with_durability(/*durable*/ true).await
+    }
+
+    async fn flush_rollout_with_durability(&self, durable: bool) -> std::io::Result<()> {
         crate::tools::command_output_artifact::sync_tool_output_artifacts(
             self.codex_home().await.as_path(), &self.thread_id.to_string(),
         ).await?;
-        if let Some(live_thread) = self.live_thread() {
-            live_thread.flush().await.map_err(std::io::Error::other)
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(());
+        };
+        if durable {
+            live_thread.flush_durable().await
         } else {
-            Ok(())
+            live_thread.flush().await
         }
+        .map_err(std::io::Error::other)
     }
 
     #[cfg(test)]
@@ -2092,6 +2113,7 @@ impl Session {
         let rollout_reconstruction::RolloutReconstruction {
             mut history,
             plan,
+            plan_lineage,
             mut previous_turn_settings,
             reference_context_item,
             world_state_baseline,
@@ -2120,7 +2142,7 @@ impl Session {
         // This meets image resizing requirements without modifying persisted rollouts.
         prepare_response_items(&mut history);
         if let Some(plan) = plan {
-            self.services.plan_store.restore(Some(plan)).await;
+            self.services.plan_store.restore_with_lineage(Some(plan), plan_lineage).await;
         } else {
             // Older rollouts only carried checklist state in direct tool output.
             self.services
@@ -4520,7 +4542,12 @@ impl Session {
             if turn_context.config.features.enabled(Feature::TokenBudget) {
                 // Render reserved IDs into the same durable replacement that publishes them.
                 // Never advance live window state before the ordered append succeeds.
-                token_budget::update_window_metadata(&mut items, &turn_context, window_ids);
+                token_budget::update_window_metadata(
+                    &mut items,
+                    &turn_context,
+                    window_ids,
+                    session.token_budget_recovery_available(),
+                );
             }
             let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
             let compacted_item = CompactedItem {
@@ -4956,7 +4983,8 @@ impl Session {
             developer_sections.push(PersonalitySpecInstructions::new(personality_message).render());
         }
         if turn_context.config.include_skill_instructions {
-            let available_skills = build_available_skills(
+            let catalog_task = turn_context.turn_skills.catalog_task.lock().await.clone();
+            let available_skills = codex_core_skills::render::build_available_skills_for_task(
                 turn_context.turn_skills.snapshot.outcome(),
                 default_skill_metadata_budget(turn_context.model_info.context_window),
                 if estimate {
@@ -4966,6 +4994,7 @@ impl Session {
                         session_telemetry: &self.services.session_telemetry,
                     }
                 },
+                &catalog_task,
             );
             if let Some(available_skills) = available_skills {
                 if turn_context.model_info.include_skills_usage_instructions {
@@ -5328,8 +5357,11 @@ impl Session {
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
-        let state = self.state.lock().await;
-        state.clone_history()
+        // Never hold the history lock while acquiring the plan lock.
+        let active_requirements = self.services.plan_store.active_requirement_count().await;
+        let mut history = self.state.lock().await.clone_history();
+        history.set_active_requirement_count(active_requirements);
+        history
     }
 
     pub(crate) async fn dedupe_existing_developer_contexts(
@@ -5504,13 +5536,26 @@ impl Session {
         }
     }
 
+    pub(crate) async fn learned_command_output_budget(&self, call_id: &str, command: &str) -> Option<usize> {
+        let class = command.split_whitespace().next().unwrap_or("shell")
+            .trim_matches(['\'', '"']).to_ascii_lowercase();
+        let mut state = self.state.lock().await;
+        state.command_output_classes.insert(call_id.to_string(), class.clone());
+        state.recovered_output_classes.contains(&class).then_some(10_000)
+    }
+
     pub(crate) async fn record_tool_history_recovery(&self, artifact_id: String, recovery_call_id: String, selectors: Vec<serde_json::Value>) {
         let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
-        let mutation = crate::tool_history::ToolHistoryMutation::RecordArtifactRecovery { artifact_id, recovery_call_id, selectors };
+        let mutation = crate::tool_history::ToolHistoryMutation::RecordArtifactRecovery { artifact_id: artifact_id.clone(), recovery_call_id, selectors };
         let mut writer = self.tool_history_persistence.writer().await;
         let mut state = self.state.lock().await;
+        if let Some(class) = state.history.artifact_origin_call_id(&artifact_id)
+            .and_then(|call_id| state.command_output_classes.get(&call_id).cloned())
+        {
+            state.recovered_output_classes.insert(class);
+        }
         if !state.apply_tool_history_mutation(&mutation) {
             return;
         }
@@ -6163,6 +6208,7 @@ impl Session {
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
     ) {
+        turn_context.turn_timing_state.observe_credits(new_rate_limits.credits.as_ref());
         self.record_rate_limits_info(new_rate_limits).await;
         self.send_token_count_event(turn_context).await;
     }
@@ -6244,6 +6290,9 @@ impl Session {
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         self.record_conversation_items_ordered(turn_context, std::slice::from_ref(&response_item))
             .await?;
+        // Use only accepted user input, not tool output or injected instructions.
+        // Explicit skill injection retains its independent authorization path.
+        turn_context.turn_skills.update_catalog_task(input).await;
         let turn_item = TurnItem::UserMessage(user_message_item);
         self.emit_turn_item_started(turn_context, &turn_item).await;
         self.emit_turn_item_completed(turn_context, turn_item).await;

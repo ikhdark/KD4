@@ -595,6 +595,7 @@ struct PendingDynamicToolCall {
     server: MockServer,
     request_id: RequestId,
     params: DynamicToolCallParams,
+    _codex_home: TempDir,
 }
 
 async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynamicToolCall> {
@@ -697,6 +698,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
         server,
         request_id,
         params,
+        _codex_home: codex_home,
     })
 }
 
@@ -709,6 +711,7 @@ async fn dynamic_tool_call_round_trip_sends_content_items_to_model() -> Result<(
         server,
         request_id,
         params,
+        _codex_home,
     } = start_function_dynamic_tool_call(call_id).await?;
 
     let response_content_items = vec![
@@ -818,6 +821,7 @@ async fn dynamic_tool_remote_image_preserves_text_and_marks_partial_output() -> 
         server,
         request_id,
         params,
+        _codex_home,
     } = start_function_dynamic_tool_call(call_id).await?;
 
     let response = DynamicToolCallResponse {

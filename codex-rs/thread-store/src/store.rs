@@ -121,6 +121,13 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Flushes all queued items and returns once they are durable/readable.
     fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
 
+    /// Like [`Self::flush_thread`], and also waits for a stable-storage barrier so the items
+    /// survive an operating-system crash. Callers use it at terminal checkpoints only. Stores
+    /// without a separate barrier fall back to `flush_thread`.
+    fn flush_thread_durable(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+        self.flush_thread(thread_id)
+    }
+
     /// Flushes pending items and closes the live thread writer.
     fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
 

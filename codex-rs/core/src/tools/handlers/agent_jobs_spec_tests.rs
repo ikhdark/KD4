@@ -79,6 +79,12 @@ fn spawn_agents_on_csv_tool_requires_csv_and_instruction() {
                             "JSON Schema enforced for each worker result. Its root type must allow an object. Omit to accept any result object.",
                         ),
                     ),
+                    (
+                        "deliver".to_string(),
+                        JsonSchema::boolean(Some(
+                            "Opt in only when this top-level call completes the entire request. Deliver the final successful export receipt directly; pending input, sibling failures, schema mismatch, or incomplete work prevent delivery.".to_string(),
+                        )),
+                    ),
                 ]), Some(vec!["csv_path".to_string(), "instruction".to_string()]), Some(false.into())),
             output_schema: None,
         })
@@ -108,6 +114,12 @@ fn report_agent_job_result_tool_requires_result_payload() {
                     (
                         "result".to_string(),
                         described_object("Result object for this job item."),
+                    ),
+                    (
+                        "deliver".to_string(),
+                        JsonSchema::boolean(Some(
+                            "Opt in only when this top-level report completes the worker's entire assignment. Deliver the accepted result directly; rejected reports, pending input, sibling failures, or final-schema mismatch prevent delivery.".to_string(),
+                        )),
                     ),
                     (
                         "stop".to_string(),

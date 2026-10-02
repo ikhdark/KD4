@@ -7,7 +7,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use core_test_support::TempDirExt;
 use core_test_support::require_network;
@@ -28,12 +27,12 @@ fn collab_mode_with_instructions(instructions: Option<&str>) -> CollaborationMod
     }
 }
 
-fn persisted_thread_settings(path: &std::path::Path) -> Result<Vec<ThreadSettingsSnapshot>> {
-    let rollout = std::fs::read_to_string(path)?;
+async fn persisted_thread_settings(path: &std::path::Path) -> Result<Vec<ThreadSettingsSnapshot>> {
+    let (items, _, parse_errors) = codex_rollout::RolloutRecorder::load_rollout_items(path).await?;
+    anyhow::ensure!(parse_errors == 0, "invalid rollout records");
     let mut settings = Vec::new();
-    for line in rollout.lines().filter(|line| !line.trim().is_empty()) {
-        let rollout_line: RolloutLine = serde_json::from_str(line)?;
-        if let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = rollout_line.item {
+    for item in items {
+        if let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = item {
             settings.push(event.thread_settings);
         }
     }
@@ -63,7 +62,7 @@ async fn thread_settings_update_without_user_turn_records_permissions_update() -
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 
     let rollout_path = test.codex.rollout_path().expect("rollout path");
-    let settings = persisted_thread_settings(&rollout_path)?;
+    let settings = persisted_thread_settings(&rollout_path).await?;
     assert_eq!(settings.len(), 1);
     assert_eq!(settings[0].approval_policy, AskForApproval::Never);
 
@@ -92,7 +91,7 @@ async fn thread_settings_update_without_user_turn_records_environment_update() -
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 
     let rollout_path = test.codex.rollout_path().expect("rollout path");
-    let settings = persisted_thread_settings(&rollout_path)?;
+    let settings = persisted_thread_settings(&rollout_path).await?;
     assert_eq!(settings.len(), 1);
     assert_eq!(settings[0].environments.as_ref(), Some(&environments));
     assert_eq!(settings[0].cwd, new_cwd.abs());
@@ -122,7 +121,7 @@ async fn thread_settings_update_without_user_turn_records_collaboration_update()
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 
     let rollout_path = test.codex.rollout_path().expect("rollout path");
-    let settings = persisted_thread_settings(&rollout_path)?;
+    let settings = persisted_thread_settings(&rollout_path).await?;
     assert_eq!(settings.len(), 1);
     assert_eq!(settings[0].collaboration_mode, collaboration_mode);
 

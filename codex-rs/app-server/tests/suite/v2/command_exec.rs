@@ -328,6 +328,19 @@ async fn command_exec_permission_profile_starts_selected_network_proxy() -> Resu
         })
         .await?;
 
+    #[cfg(windows)]
+    if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
+        let error = mcp
+            .read_stream_until_error_message(RequestId::Integer(command_request_id))
+            .await?;
+        assert!(
+            error.error.message.contains(
+                codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
+            ),
+            "{error:?}"
+        );
+        return Ok(());
+    }
     let response = mcp
         .read_stream_until_response_message(RequestId::Integer(command_request_id))
         .await?;
@@ -475,7 +488,10 @@ async fn command_exec_legacy_policy_workspace_write_uses_request_cwd() -> Result
             error
                 .error
                 .message
-                .contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR),
+                .contains(codex_windows_sandbox::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR)
+                || error.error.message.contains(
+                    "requested restrictions require a sandbox, but no sandbox backend is available"
+                ),
             "{error:?}"
         );
         assert!(!request_cwd.join("request-cwd-write.txt").exists());

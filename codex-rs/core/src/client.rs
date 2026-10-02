@@ -2164,9 +2164,21 @@ struct WebsocketHistoryBaseline {
     normalization_policy_version: u16,
 }
 
+/// The Responses websocket ends every connection after 60 minutes and fails any
+/// response still streaming on it. Rotate at a request boundary before then.
+const WEBSOCKET_ROTATION_AGE: Duration = Duration::from_secs(55 * 60);
+
+fn websocket_connection_expiring(connected_at: Option<Instant>, now: Instant) -> bool {
+    connected_at.is_some_and(|connected_at| {
+        now.saturating_duration_since(connected_at) >= WEBSOCKET_ROTATION_AGE
+    })
+}
+
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    /// When `connection` was established; drives rotation before the server's age limit.
+    connected_at: Option<Instant>,
     setup_fingerprint: Option<WebsocketSetupFingerprint>,
     last_request: Option<ResponsesApiRequest>,
     last_request_history: Option<WebsocketHistoryBaseline>,
@@ -3172,6 +3184,7 @@ impl ModelClientSession {
 
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
+        self.websocket_session.connected_at = None;
         self.websocket_session.setup_fingerprint = None;
         self.invalidate_incremental_history("websocket reset");
         self.websocket_session
@@ -3748,6 +3761,10 @@ impl ModelClientSession {
             Some(conn) => {
                 setup_fingerprint.is_none()
                     || self.websocket_session.setup_fingerprint != setup_fingerprint
+                    || websocket_connection_expiring(
+                        self.websocket_session.connected_at,
+                        Instant::now(),
+                    )
                     || conn.is_closed().await
             }
             None => true,
@@ -3777,6 +3794,7 @@ impl ModelClientSession {
                 }
             };
             self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.connected_at = Some(Instant::now());
             self.websocket_session.setup_fingerprint = setup_fingerprint;
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);

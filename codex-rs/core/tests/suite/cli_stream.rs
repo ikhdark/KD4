@@ -592,13 +592,14 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     }
 
     let content = std::fs::read_to_string(&path).expect("failed to read session file");
-    let mut lines = content.lines();
-    let meta_line = lines
-        .next()
-        .ok_or("missing session meta line")
+    let lines = content.lines().skip(1);
+    let mut reader = codex_rollout::open_rollout_line_reader(&path).await?;
+    let meta_line = reader
+        .next_line()
+        .await?
         .expect("missing session meta line");
     let meta: serde_json::Value =
-        serde_json::from_str(meta_line).expect("failed to parse session meta line as JSON");
+        serde_json::from_str(&meta_line).expect("failed to parse session meta line as JSON");
     assert_eq!(
         meta.get("type").and_then(|v| v.as_str()),
         Some("session_meta")

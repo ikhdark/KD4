@@ -1163,15 +1163,18 @@ impl ReceiptEvidenceRefArgs {
                     self.call_id
                 )))?,
         };
+        let kind = self.kind
+            .or_else(|| task.validation_calls.iter()
+                .find(|call| call.call_id == self.call_id)
+                .and_then(ValidationCall::verified_evidence_kind))
+            .unwrap_or(codex_agent_task_store::CriterionEvidenceKind::ValidationExecution);
         Ok(codex_agent_task_store::CriterionEvidenceRef {
             call_id: self.call_id,
             workspace_id: self
                 .workspace_id
                 .unwrap_or_else(|| task.assignment.workspace_id.clone()),
             evidence_epoch,
-            kind: self
-                .kind
-                .unwrap_or(codex_agent_task_store::CriterionEvidenceKind::ValidationExecution),
+            kind,
         })
     }
 }
@@ -1431,7 +1434,7 @@ fn required_evidence_is_satisfied(task: &AgentTask, requirement: &str) -> bool {
             .as_ref()
             .is_some_and(|receipt| receipt.validation_call_ids.contains(&call.call_id))
             && call.command_summary == requirement
-            && is_successful_focused_validation(call)
+            && call.verified_evidence_kind().is_some()
     })
 }
 
@@ -2147,7 +2150,7 @@ fn submit_agent_receipt_spec() -> ToolSpec {
             ),
             (
                 "required_evidence",
-                string_array_schema("Canonical worker evidence requirements."),
+                string_array_schema("Canonical worker evidence requirements. inspect:<normalized repository-relative file> requests a complete native read_file source_inspection receipt, not a test or semantic correctness claim."),
             ),
             (
                 "prohibited_changes",
@@ -2198,7 +2201,7 @@ fn submit_agent_receipt_spec() -> ToolSpec {
                     ("call_id", JsonSchema::string(Some("Successful owned validation ID; included automatically when validation_call_ids is omitted.".to_string()))),
                     ("workspace_id", JsonSchema::string(Some("Omit to use the bound assignment's workspace.".to_string()))),
                     ("evidence_epoch", JsonSchema::integer(Some("Omit to use the validation call's recorded end_epoch.".to_string()))),
-                    ("kind", enum_schema(["validation_execution"], "Omit for validation_execution. Execution alone does not establish test coverage or deployment.")),
+                    ("kind", enum_schema(["validation_execution", "source_inspection"], "Omit to use the recorded producer kind. Source inspection proves a complete hash-bound read, not semantic correctness; execution alone does not establish test coverage or deployment.")),
                 ], &["call_id"]),
             ),
         ],
@@ -2761,6 +2764,7 @@ mod projection_tests {
                     attempt_id,
                     command_summary: "focused validation one".to_string(),
                     evidence: ValidationEvidence {
+                        start_epoch: 13,
                         end_epoch: Some(13),
                         validation_result: Some(json!({
                             "argv": ["cargo", "test", "focused-proof"],

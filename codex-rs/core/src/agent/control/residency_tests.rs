@@ -15,7 +15,6 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
@@ -228,12 +227,15 @@ async fn residency_materialization_failure_preserves_running_agent_and_buffered_
         Ok(_) => panic!("successfully persisted resident must be evicted"),
     }
     assert!(!first.thread.is_running());
-    let history = std::fs::read_to_string(&rollout_path).expect("read persisted history");
+    let (history, _, parse_errors) =
+        codex_rollout::RolloutRecorder::load_rollout_items(&rollout_path)
+            .await
+            .expect("read persisted history");
+    assert_eq!(parse_errors, 0, "invalid rollout records");
     let buffered_messages = history
-        .lines()
-        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("valid rollout line"))
-        .filter(|line| {
-            matches!(&line.item, RolloutItem::EventMsg(EventMsg::AgentMessage(message))
+        .iter()
+        .filter(|item| {
+            matches!(item, RolloutItem::EventMsg(EventMsg::AgentMessage(message))
                 if message.message == "history-before-failed-eviction")
         })
         .count();

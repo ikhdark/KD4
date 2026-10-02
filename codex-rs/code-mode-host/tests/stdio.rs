@@ -283,8 +283,9 @@ fn cell_id(value: &str) -> CellId {
 
 fn execute_request(source: &str) -> ExecuteRequest {
     ExecuteRequest {
+        state_path: None,
         tool_call_id: "call-1".to_string(),
-        enabled_tools: Vec::new(),
+        enabled_tools: Vec::new().into(),
         source: source.to_string(),
         yield_time_ms: None,
         max_output_tokens: None,
@@ -360,12 +361,12 @@ async fn nested_tool_input_presence_reaches_local_and_remote_delegates() {
                 enabled_tools: vec![ToolDefinition {
                     name: "echo".to_string(),
                     tool_name: ToolName::plain("echo"),
-                    description: String::new(),
+                    description: "".into(),
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
                     default_timeout_ms: None,
                     output_schema: None,
-                }],
+                }].into(),
                 ..execute_request(
                     r#"
 const absent = await tools.echo();
@@ -481,12 +482,12 @@ async fn remote_dropped_initial_response_keeps_the_cell_available_for_terminatio
             enabled_tools: vec![ToolDefinition {
                 name: "tool_call_slow".to_string(),
                 tool_name: ToolName::plain("tool_call_slow"),
-                description: String::new(),
+                description: "".into(),
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
                 default_timeout_ms: None,
                 output_schema: None,
-            }],
+            }].into(),
             yield_time_ms: Some(60_000),
             ..execute_request("await tools.tool_call_slow({});")
         })
@@ -555,12 +556,12 @@ text(result.value);
     callback_request.enabled_tools = vec![ToolDefinition {
         name: "echo".to_string(),
         tool_name: ToolName::plain("echo"),
-        description: String::new(),
+        description: "".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
         default_timeout_ms: None,
         output_schema: None,
-    }];
+    }].into();
     assert_eq!(
         execute(&session, callback_request).await,
         RuntimeResponse::Result {
@@ -807,7 +808,7 @@ return;
     .map(|name| ToolDefinition {
         name: name.to_string(),
         tool_name: ToolName::plain(name),
-        description: String::new(),
+        description: "".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
         default_timeout_ms: None,
@@ -933,7 +934,7 @@ async fn oversized_delegate_payloads_fail_only_the_tool_call() {
     let tool = |name: &str| ToolDefinition {
         name: name.to_string(),
         tool_name: ToolName::plain(name),
-        description: String::new(),
+        description: "".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
         default_timeout_ms: None,
@@ -949,7 +950,7 @@ try {{
 }}
 "#
     ));
-    oversized_argument.enabled_tools = vec![tool("big_argument")];
+    oversized_argument.enabled_tools = vec![tool("big_argument")].into();
     oversized_argument.yield_time_ms = Some(60_000);
     assert_eq!(
         execute_to_terminal(&session, oversized_argument).await,
@@ -972,7 +973,7 @@ try {
 }
 "#,
     );
-    oversized_result.enabled_tools = vec![tool("big_result")];
+    oversized_result.enabled_tools = vec![tool("big_result")].into();
     oversized_result.yield_time_ms = Some(60_000);
     assert_eq!(
         execute_to_terminal(&session, oversized_result).await,

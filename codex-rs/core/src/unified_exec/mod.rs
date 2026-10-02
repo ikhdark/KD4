@@ -49,7 +49,6 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
-use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::network_approval::DeferredNetworkApproval;
 
 mod async_watcher;
@@ -147,7 +146,6 @@ pub(crate) struct ExecCommandRequest {
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
     pub validation_launch: bool,
-    pub known_delta: Option<PreparedKnownDelta>,
 }
 
 /// Retains every process created by sandbox retries until startup is either
@@ -156,7 +154,7 @@ pub(crate) struct ExecCommandRequest {
 pub(crate) struct PendingSpawnRegistration {
     processes: Arc<StdMutex<Vec<Arc<UnifiedExecProcess>>>>,
     termination_owner: Option<process::ProcessTerminationOwner>,
-    workspace_operation: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    workspace_operation: Option<Arc<dyn Send + Sync>>,
 }
 
 #[cfg(test)]
@@ -179,9 +177,9 @@ impl PendingSpawnRegistration {
         }
     }
 
-    pub(crate) fn with_workspace_operation(
+    pub(crate) fn with_workspace_operation<T: Send + Sync + 'static>(
         &self,
-        permit: tokio::sync::OwnedMutexGuard<()>,
+        permit: T,
     ) -> Self {
         Self {
             processes: Arc::clone(&self.processes),

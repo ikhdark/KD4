@@ -17,7 +17,7 @@ use codex_login::default_client::originator;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::built_in_model_providers;
-use codex_models_manager::bundled_models_response;
+use codex_models_manager::test_support::test_models_response as bundled_models_response;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ResponseItemId;
@@ -1226,10 +1226,10 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
     assert_eq!(request_thread_id, thread_id_string.as_str());
     assert_eq!(request_originator, originator().value);
     assert_eq!(request_authorization, "Bearer Test API Key");
-    assert_eq!(
-        request_body["prompt_cache_key"].as_str(),
-        Some(thread_id_string.as_str())
-    );
+    let cache_key = request_body["prompt_cache_key"].as_str().expect("prefix cache key");
+    assert_ne!(cache_key, thread_id_string);
+    assert_eq!(cache_key.len(), 64);
+    assert!(cache_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_codex_client_metadata(
         &request_body,
         installation_id.as_str(),
@@ -1885,11 +1885,11 @@ async fn omits_apps_guidance_when_orchestrator_mcp_is_disabled() {
             config.chatgpt_base_url = apps_base_url;
             config.orchestrator_mcp_enabled = false;
         });
-    let codex = builder
+    let test = builder
         .build(&server)
         .await
-        .expect("create new conversation")
-        .codex;
+        .expect("create new conversation");
+    let codex = &test.codex;
 
     codex
         .submit(Op::UserInput {

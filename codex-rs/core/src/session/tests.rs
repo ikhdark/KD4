@@ -38,7 +38,7 @@ use codex_http_client::OutboundProxyPolicy;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_models_manager::bundled_models_response;
+use codex_models_manager::test_support::test_models_response as bundled_models_response;
 use codex_models_manager::model_info;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
@@ -3032,10 +3032,11 @@ async fn resumed_history_marks_a_turn_that_never_completed() {
     assert!(
         matches!(
             content.as_slice(),
-            [ContentItem::InputText { text }]
+            [ContentItem::InputText { text }, ContentItem::InputText { text: timing }]
                 if text.contains("lost process, not a user interruption")
                     && text.contains("2 tool call(s) and 1 tool result(s)")
                     && text.contains("child commands may still be running")
+                    && timing.contains("not a valid complete timing profile")
         ),
         "recovery must preserve recorded work without inventing completion: {content:?}"
     );
@@ -5661,19 +5662,47 @@ async fn includes_timed_out_message() {
 }
 
 #[tokio::test]
+async fn purpose_effort_is_opt_in_capability_checked_and_preserves_explicit_choice() {
+    use codex_protocol::protocol::TurnTimingGenerationPurpose;
+    let (_, mut turn) = make_session_and_context().await;
+    let supported = turn.model_info.supported_reasoning_levels.first()
+        .expect("fixture advertises reasoning efforts").effort.clone();
+    let original_model = turn.model_info.slug.clone();
+    turn.configured_reasoning_effort = None;
+    turn.model_info.supports_reasoning_summaries = true;
+    turn.model_info.default_reasoning_level = None;
+    let purpose = Some(TurnTimingGenerationPurpose::FailureDiagnosis);
+    assert_eq!(turn.request_reasoning_effort(purpose), None);
+    Arc::make_mut(&mut turn.config).purpose_reasoning_effort =
+        Some(codex_config::config_toml::PurposeReasoningEffort {
+            failure_diagnosis: Some(supported.clone()), ..Default::default()
+        });
+    assert_eq!(turn.request_reasoning_effort(purpose), Some(supported));
+    assert_eq!(turn.request_reasoning_effort(None), None);
+    turn.model_info.supported_reasoning_levels.clear();
+    assert_eq!(turn.request_reasoning_effort(purpose), None);
+    turn.configured_reasoning_effort = Some(ReasoningEffortConfig::Minimal);
+    assert_eq!(turn.request_reasoning_effort(purpose), Some(ReasoningEffortConfig::Minimal));
+    assert_eq!(turn.model_info.slug, original_model);
+}
+
+#[tokio::test]
 async fn turn_context_with_model_updates_model_fields() {
-    let (session, mut turn_context) = make_session_and_context().await;
+    let (_session, mut turn_context) = make_session_and_context().await;
+    let models_manager: codex_models_manager::manager::SharedModelsManager =
+        Arc::new(codex_models_manager::manager::StaticModelsManager::new(
+            None,
+            bundled_models_response().expect("model-switch fixture catalog"),
+        ));
     let session_base_instructions = Arc::clone(&turn_context.base_instructions);
     turn_context.configured_reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     turn_context.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     let durable_history_completed_commits =
         Arc::clone(&turn_context.durable_history_completed_commits);
     let updated = turn_context
-        .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+        .with_model("gpt-5.4".to_string(), &models_manager)
         .await;
-    let expected_model_info = session
-        .services
-        .models_manager
+    let expected_model_info = models_manager
         .get_model_info(
             "gpt-5.4",
             &updated.config.as_ref().to_models_manager_config(),
@@ -5707,6 +5736,14 @@ async fn turn_context_with_model_updates_model_fields() {
         updated.config.model_reasoning_effort,
         Some(ReasoningEffortConfig::Medium)
     );
+    let (original_identity, original_build) = Arc::new(turn_context).runtime_identity().await;
+    let updated = Arc::new(updated);
+    let (updated_identity, updated_build) = updated.runtime_identity().await;
+    assert_eq!(updated_identity, updated.runtime_identity().await.0);
+    assert_eq!(original_build, updated_build);
+    assert!(updated_build.is_some(), "current process identity is independent of session creation metadata");
+    assert_eq!(original_identity["config_layers_v1"], updated_identity["config_layers_v1"]);
+    assert_ne!(original_identity["turn_settings_v1"], updated_identity["turn_settings_v1"]);
 }
 
 #[test]
@@ -9420,6 +9457,65 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     )
 }
 
+/// Stand-ins for the history-notes tools that make a token-budget fresh window recoverable.
+pub(crate) struct TokenBudgetRecoveryTools;
+
+impl codex_extension_api::ToolContributor for TokenBudgetRecoveryTools {
+    fn tools(
+        &self,
+        _session_store: &codex_extension_api::ExtensionData,
+        _thread_store: &codex_extension_api::ExtensionData,
+    ) -> Vec<Arc<dyn codex_tools::ToolExecutor<codex_tools::ToolCall>>> {
+        token_budget_recovery_tool_stubs()
+    }
+}
+
+pub(crate) fn token_budget_recovery_tool_stubs()
+-> Vec<Arc<dyn codex_tools::ToolExecutor<codex_tools::ToolCall>>> {
+    [("notes", "write_file"), ("history", "read_item")]
+        .into_iter()
+        .map(|(namespace, name)| {
+            Arc::new(RecoveryToolStub { namespace, name })
+                as Arc<dyn codex_tools::ToolExecutor<codex_tools::ToolCall>>
+        })
+        .collect()
+}
+
+struct RecoveryToolStub {
+    namespace: &'static str,
+    name: &'static str,
+}
+
+impl codex_tools::ToolExecutor<codex_tools::ToolCall> for RecoveryToolStub {
+    fn tool_name(&self) -> codex_tools::ToolName {
+        codex_tools::ToolName::namespaced(self.namespace, self.name)
+    }
+
+    fn spec(&self) -> codex_tools::ToolSpec {
+        codex_tools::ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: self.namespace.to_string(),
+            description: "Test namespace.".to_string(),
+            tools: vec![codex_tools::ResponsesApiNamespaceTool::Function(
+                codex_tools::ResponsesApiTool {
+                    name: self.name.to_string(),
+                    description: "Test recovery tool.".to_string(),
+                    strict: false,
+                    defer_loading: None,
+                    parameters: codex_tools::JsonSchema::default(),
+                    output_schema: None,
+                },
+            )],
+        })
+    }
+
+    fn handle(&self, _call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async {
+            Ok(Box::new(codex_tools::JsonToolOutput::new(serde_json::json!({})))
+                as Box<dyn codex_tools::ToolOutput>)
+        })
+    }
+}
+
 async fn make_session_with_config(
     mutator: impl FnOnce(&mut Config),
 ) -> anyhow::Result<Arc<Session>> {
@@ -9726,6 +9822,7 @@ where
         ),
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
         retained_patches: Default::default(),
+        path_replays: Default::default(),
         plan_store: crate::plan_store::PlanStore::default(),
         elicitations: crate::elicitation::ElicitationService::new(),
         analytics_events_client: AnalyticsEventsClient::new(
@@ -15272,6 +15369,7 @@ async fn initial_input_and_sampling_boundary_share_the_terminal_durability_barri
             physical_attempt_id: "attempt-1".to_string(),
             turn_id: Some(tc.sub_id.clone()),
             unresolved_context: true,
+            timing_checkpoint: None,
         },
     )])
     .await
@@ -15338,6 +15436,7 @@ async fn tool_manifest_persistence_failure_stops_ordered_request_prefix() {
                 physical_attempt_id: "attempt-after-failed-manifest".to_string(),
                 turn_id: Some(tc.sub_id.clone()),
                 unresolved_context: true,
+                timing_checkpoint: None,
             },
         )
         .await?;
@@ -15391,6 +15490,7 @@ async fn tool_manifest_and_first_sampling_boundary_share_one_ordered_append() {
             physical_attempt_id: "attempt-1".to_string(),
             turn_id: Some(tc.sub_id.clone()),
             unresolved_context: true,
+            timing_checkpoint: None,
         },
     )
     .await

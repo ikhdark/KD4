@@ -9,6 +9,15 @@ pub(super) struct AgentTurnMarkdown {
     pub(super) markdown: String,
 }
 
+/// Bounds the user messages carried into a fresh-context plan handoff.
+const MAX_HANDOFF_USER_MESSAGES: usize = 8;
+
+#[derive(Debug)]
+pub(super) struct UserTurnMessage {
+    pub(super) user_turn_count: usize,
+    pub(super) text: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ActiveStreamTailSyncKey {
     Agent {
@@ -43,6 +52,9 @@ pub(super) struct TranscriptState {
     pub(super) copy_history_evicted_by_rollback: bool,
     /// Raw markdown of the most recently completed proposed plan.
     pub(super) latest_proposed_plan_markdown: Option<String>,
+    /// Text of recent visible user turns, keyed like the copy history, so a
+    /// fresh-context plan handoff can carry the user's own constraints.
+    pub(super) user_turn_messages: Vec<UserTurnMessage>,
     /// Whether this turn already produced a copyable response.
     pub(super) saw_copy_source_this_turn: bool,
     /// Whether the next streamed assistant content should be preceded by a final message separator.
@@ -100,9 +112,31 @@ impl TranscriptState {
         self.visible_user_turn_count = self.visible_user_turn_count.saturating_add(1);
     }
 
+    pub(super) fn record_user_turn_message(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.user_turn_messages.push(UserTurnMessage {
+            user_turn_count: self.visible_user_turn_count,
+            text: text.to_string(),
+        });
+        if self.user_turn_messages.len() > MAX_HANDOFF_USER_MESSAGES {
+            self.user_turn_messages.remove(0);
+        }
+    }
+
+    pub(super) fn user_turn_message_texts(&self) -> Vec<&str> {
+        self.user_turn_messages
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect()
+    }
+
     pub(super) fn reset_copy_history(&mut self) {
         self.last_agent_markdown = None;
         self.agent_turn_markdowns.clear();
+        self.user_turn_messages.clear();
         self.visible_user_turn_count = 0;
         self.copy_history_evicted_by_rollback = false;
         self.saw_copy_source_this_turn = false;
@@ -112,6 +146,8 @@ impl TranscriptState {
         self.visible_user_turn_count = user_turn_count;
         let had_copy_history = !self.agent_turn_markdowns.is_empty();
         self.agent_turn_markdowns
+            .retain(|entry| entry.user_turn_count <= user_turn_count);
+        self.user_turn_messages
             .retain(|entry| entry.user_turn_count <= user_turn_count);
         self.last_agent_markdown = self
             .agent_turn_markdowns

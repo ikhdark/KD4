@@ -705,19 +705,24 @@ fn build_code_mode_executors(
             }
             deferred_code_mode_nested_tool_specs.push(spec);
         } else {
-            // Built-in direct tools have stable contracts, so ship their
-            // typed declarations with `exec`. Keep descriptions and argument
+            // Keep only execution, editing, and recovery contracts eager.
+            // Planning and directory discovery remain callable through
+            // resolve_tool without charging every generation for their schemas.
+            // Keep descriptions and argument
             // schemas once when the same tool is also exposed directly. MCP,
             // plugin, extension, and other dynamic-external tools remain discoverable at runtime but
             // keep their schemas lazy to avoid rebuilding the prompt around
             // an external inventory that can change between turns.
             if executor.authorization_class() != TypedToolClass::DynamicExternal
+                && matches!(executor.tool_name().name.as_str(),
+                    "exec_command" | "shell_command" | "write_stdin" | "apply_patch"
+                    | "read_file" | "read_tool_output" | "tool_search")
                 && let Some(mut definition) = codex_tools::code_mode_tool_definition_for_spec(&spec)
             {
                 if !is_hidden_by_code_mode_only(turn_context, executor.tool_name(), exposure)
                     && matches!(&spec, ToolSpec::Function(_) | ToolSpec::Freeform(_))
                 {
-                    definition.description.clear();
+                    definition.description = "".into();
                     // The direct schema already describes these arguments. This
                     // is only the eager prompt projection: registration and
                     // resolve_tool retain the complete callable contract.
@@ -1048,10 +1053,14 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
             crate::tools::handlers::GetContextRemainingHandler,
             TypedToolClass::ReadSearch,
         );
-        planned_tools.add_with_authorization_class(
-            crate::tools::handlers::NewContextWindowHandler,
-            TypedToolClass::OwnTask,
-        );
+        // A fresh window discards history; offer it only with the recovery tools.
+        if crate::session::token_budget::recovery_tools_registered(context.extension_tool_executors)
+        {
+            planned_tools.add_with_authorization_class(
+                crate::tools::handlers::NewContextWindowHandler,
+                TypedToolClass::OwnTask,
+            );
+        }
     }
 
     if features.enabled(Feature::CurrentTimeReminder) {
@@ -1067,30 +1076,39 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         }
     }
 
+    let plugin_install_exposure = if search_tool_enabled(turn_context) {
+        ToolExposure::Deferred
+    } else {
+        ToolExposure::Direct
+    };
     if tool_suggest_enabled(turn_context)
         && let Some(candidates) = context
             .tool_suggest_candidates
             .filter(|candidates| !candidates.tools.is_empty())
     {
         if candidates.presentation == crate::tools::router::ToolSuggestPresentation::ListTool {
-            planned_tools.add_with_authorization_class(
+            planned_tools.add_with_exposure_and_authorization_class(
                 ListAvailablePluginsToInstallHandler::new(collect_request_plugin_install_entries(
                     &candidates.tools,
                 )),
+                plugin_install_exposure,
                 TypedToolClass::ReadSearch,
             );
         }
-        planned_tools.add_with_authorization_class(
+        planned_tools.add_with_exposure_and_authorization_class(
             RequestPluginInstallHandler::new(candidates.tools.clone(), candidates.presentation),
+            plugin_install_exposure,
             TypedToolClass::DynamicExternal,
         );
     } else if tool_suggest_enabled(turn_context) && context.tool_suggest_candidates.is_none() {
-        planned_tools.add_with_authorization_class(
+        planned_tools.add_with_exposure_and_authorization_class(
             ListAvailablePluginsToInstallHandler::on_demand(),
+            plugin_install_exposure,
             TypedToolClass::ReadSearch,
         );
-        planned_tools.add_with_authorization_class(
+        planned_tools.add_with_exposure_and_authorization_class(
             RequestPluginInstallHandler::on_demand(),
+            plugin_install_exposure,
             TypedToolClass::DynamicExternal,
         );
     }
@@ -1536,6 +1554,35 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
 }
 
 impl CoreToolRuntime for MultiAgentV2NamespaceOverride {
+    fn terminal_failure_reuse(&self) -> crate::tools::registry::TerminalFailureReuse {
+        self.handler.terminal_failure_reuse()
+    }
+
+    // The namespace changes only the model-facing name. Classification and
+    // hook matching keep the wrapped handler's identity.
+    fn semantic_tool_name(&self) -> ToolName {
+        self.handler.semantic_tool_name()
+    }
+
+    fn pre_tool_use_hook_name(
+        &self,
+        _tool_name: &ToolName,
+        payload: &crate::tools::context::ToolPayload,
+    ) -> Option<crate::tools::hook_names::HookToolName> {
+        self.handler
+            .pre_tool_use_hook_name(&self.handler.tool_name(), payload)
+    }
+
+    fn post_tool_use_hook_name(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Option<crate::tools::hook_names::HookToolName> {
+        self.handler.post_tool_use_hook_name(&ToolInvocation {
+            tool_name: self.handler.tool_name(),
+            ..invocation.clone()
+        })
+    }
+
     fn waits_for_runtime_cancellation(&self) -> bool {
         self.handler.waits_for_runtime_cancellation()
     }

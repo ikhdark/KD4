@@ -398,6 +398,41 @@ fn summary_does_not_end_with_a_gap_when_the_following_line_cannot_fit() {
 }
 
 #[test]
+fn short_success_output_keeps_every_line_and_abbreviates_long_ones() {
+    // A mixed listing whose budget is consumed by a few very long lines: the
+    // short lines are the evidence, so none of them may be omitted.
+    // The warning gives a successful run something to rank.
+    let mut lines = vec!["warning: in the working copy of 'models.json', CRLF will be replaced by LF".to_string()];
+    lines.extend(
+        (0..64).map(|index| format!("codex-rs/models-manager/src/file_{index}.rs:12: short hit")),
+    );
+    for index in 0..28 {
+        lines.push(format!(
+            "group {index}: {} {}",
+            "prompt body ".repeat(1_200),
+            "x".repeat(1_000)
+        ));
+    }
+    let output = lines.join("\n");
+    let limit = 8_000;
+    assert!(codex_utils_string::approx_token_count_exceeds(&output, limit));
+
+    let summary = summarize_shell_output_for_model(&output, 0, false, options(None, Some(limit)))
+        .expect("over-budget output is summarized");
+
+    assert!(!codex_utils_string::approx_token_count_exceeds(&summary, limit));
+    assert!(!summary.contains("lines omitted"), "{summary}");
+    for index in 0..64 {
+        assert!(
+            summary.contains(&format!("file_{index}.rs:12: short hit")),
+            "{summary}"
+        );
+    }
+    assert!(summary.contains("   93: group 27:"), "{summary}");
+    assert!(summary.contains("[line truncated]"), "{summary}");
+}
+
+#[test]
 fn source_prose_about_passed_does_not_displace_test_status() {
     let mut lines = vec!["ordinary output".to_string(); 700];
     lines[200] = "test result: ok. 3 passed; 0 failed".to_string();
@@ -836,12 +871,12 @@ fn powershell_read_pipelines_use_ordered_truncation() {
 
 #[test]
 fn dense_output_over_token_budget_keeps_middle_diagnostics() {
-    let mut lines = vec!["{}[]():,;".repeat(3); 500];
+    let mut lines = vec!["{}[]():,;".repeat(5); 500];
     lines[250] = "error: unique middle diagnostic".to_string();
     lines[499] = "test result: FAILED".to_string();
     let output = lines.join("\n");
     let limit = 4000;
-    assert!(output.len() < codex_utils_string::approx_bytes_for_tokens(limit));
+    assert!(output.len() > codex_utils_string::approx_bytes_for_tokens(limit));
     assert!(codex_utils_string::approx_token_count(&output) > limit);
     let exec_output = codex_protocol::exec_output::ExecToolCallOutput {
         exit_code: 1,

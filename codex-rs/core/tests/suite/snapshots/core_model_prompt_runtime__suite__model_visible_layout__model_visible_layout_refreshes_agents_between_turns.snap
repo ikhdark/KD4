@@ -16,7 +16,8 @@ Scenario: Normal turns refresh AGENTS.md after a cwd change and after a same-cwd
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
 04:message/user:first turn in agents_one
-05:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
+05:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+06:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
 
 ## Second Request (agents_two cwd)
 00:message/developer[4]:
@@ -30,12 +31,13 @@ Scenario: Normal turns refresh AGENTS.md after a cwd change and after a same-cwd
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
 04:message/user:first turn in agents_one
-05:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
-06:message/assistant:turn one complete
-07:message/user[2]:
+05:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+06:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
+07:message/assistant:turn one complete
+08:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-08:message/user:second turn in agents_two
+09:message/user:second turn in agents_two
 
 ## Third Request (agents_two edited)
 00:message/developer[4]:
@@ -49,12 +51,13 @@ Scenario: Normal turns refresh AGENTS.md after a cwd change and after a same-cwd
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
 04:message/user:first turn in agents_one
-05:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
-06:message/assistant:turn one complete
-07:message/user[2]:
+05:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+06:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
+07:message/assistant:turn one complete
+08:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-08:message/user:second turn in agents_two
-09:message/assistant:turn two complete
-10:message/user:<AGENTS_MD>
-11:message/user:third turn after same-cwd AGENTS edit
+09:message/user:second turn in agents_two
+10:message/assistant:turn two complete
+11:message/user:<AGENTS_MD>
+12:message/user:third turn after same-cwd AGENTS edit

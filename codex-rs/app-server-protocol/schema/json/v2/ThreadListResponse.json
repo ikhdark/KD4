@@ -2185,6 +2185,13 @@
         "counters": {
           "$ref": "#/definitions/TurnTimingCounters"
         },
+        "creditDelta": {
+          "description": "Observed starting minus ending account credit balance, not an isolated invoice: concurrent turns, replenishments, or delayed reports may affect it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "deterministicContinuationReceiptOverflow": {
           "default": 0,
           "format": "uint32",

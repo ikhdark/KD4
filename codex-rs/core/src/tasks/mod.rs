@@ -55,6 +55,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::WarningEvent;
 
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -159,6 +160,15 @@ fn turn_boundary_history_marker(
             })
         }
     }
+}
+
+/// A turn whose record could not be saved still happened; only crash-safe
+/// resumption of its final state is in doubt. The turn is named because the
+/// post-terminal flush can fail after the next turn has already started.
+fn unsaved_turn_record_warning(turn_id: &str, unsaved: &str) -> String {
+    format!(
+        "Turn {turn_id} ended, but its record was not durably saved: {unsaved}. Its effects stand; resuming this thread after a crash or restart may not show that turn's final state."
+    )
 }
 
 fn emit_turn_network_proxy_metric(
@@ -1146,6 +1156,9 @@ impl Session {
         // Accepted tool completions can still own context extraction and identity
         // preparation after the sampling worker stops. Let their ordered commits
         // finish before synthesizing outputs for calls that truly have none.
+        // Execution and its durable record are separate outcomes, so a record
+        // that could not be saved is reported to the client, not only logged.
+        let mut unsaved_records = Vec::new();
         if let Err(err) = self
             .flush_rollout_after_ordered_commits(&turn_context)
             .await
@@ -1154,6 +1167,7 @@ impl Session {
                 turn_id = %turn_context.sub_id,
                 "failed to flush rollout before terminal event: {err}"
             );
+            unsaved_records.push(format!("conversation history ({err})"));
         }
         if let Err(err) = self
             .persist_missing_call_outputs_durable(&turn_context)
@@ -1163,9 +1177,11 @@ impl Session {
                 turn_id = %turn_context.sub_id,
                 "failed to persist missing tool outputs before terminal event: {err}"
             );
+            unsaved_records.push(format!("synthesized tool outputs ({err})"));
         }
         if let Err(err) = self.flush_tool_history_persistence().await {
             warn!(turn_id = %turn_context.sub_id, "failed to checkpoint tool history before terminal event: {err}");
+            unsaved_records.push(format!("tool history ({err})"));
         }
         turn_context.turn_timing_state.begin_finalization();
 
@@ -1188,6 +1204,19 @@ impl Session {
                 turn_id = %turn_context.sub_id,
                 "failed to persist interrupted-turn marker before terminal event: {err}"
             );
+            unsaved_records.push(format!("interrupted-turn marker ({err})"));
+        }
+        if !unsaved_records.is_empty() {
+            self.send_event(
+                turn_context.as_ref(),
+                EventMsg::Warning(WarningEvent {
+                    message: unsaved_turn_record_warning(
+                        &turn_context.sub_id,
+                        &unsaved_records.join("; "),
+                    ),
+                }),
+            )
+            .await;
         }
 
         finalization.restart_for_pending_input = if requires_abort_cleanup {
@@ -1355,8 +1384,21 @@ impl Session {
         self.emit_post_terminal_metrics(turn_tool_calls, &turn_token_usage)
             .await;
 
-        if let Err(err) = self.flush_rollout().await {
+        if let Err(err) = self.flush_rollout_durable().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
+            // An earlier warning already told the client this turn's record is unsaved.
+            if unsaved_records.is_empty() {
+                self.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Warning(WarningEvent {
+                        message: unsaved_turn_record_warning(
+                            &turn_context.sub_id,
+                            &format!("terminal record ({err})"),
+                        ),
+                    }),
+                )
+                .await;
+            }
         }
 
         if cleared_active_turn {

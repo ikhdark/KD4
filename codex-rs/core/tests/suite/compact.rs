@@ -8,7 +8,7 @@ use codex_core::config::Config;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
-use codex_models_manager::bundled_models_response;
+use codex_models_manager::test_support::test_models_response as bundled_models_response;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
@@ -319,19 +319,16 @@ fn expected_instruction_fragment(contents: &str) -> String {
     )
 }
 
+#[track_caller]
 fn assert_single_instruction_fragment(request: &responses::ResponsesRequest, expected: &str) {
     assert_eq!(instruction_fragments(request), vec![expected.to_string()]);
 }
 
-fn replacement_history_from_rollout(path: &Path) -> Result<Vec<Value>> {
-    let rollout_text = fs::read_to_string(path)?;
+async fn replacement_history_from_rollout(path: &Path) -> Result<Vec<Value>> {
+    let mut reader = codex_rollout::open_rollout_line_reader(path).await?;
     let mut replacement_history = None;
-    for line in rollout_text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let entry: RolloutLine = serde_json::from_str(line)?;
+    while let Some(line) = reader.next_line().await? {
+        let entry: RolloutLine = serde_json::from_str(&line)?;
         if let RolloutItem::Compacted(compacted) = entry.item
             && let Some(items) = compacted.replacement_history
         {
@@ -2018,8 +2015,8 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     require_network!();
 
     let server = MockServer::start().await;
-    let previous_model = "gpt-5.4";
-    let next_model = "gpt-5.2";
+    let previous_model = "gpt-5.5";
+    let next_model = "gpt-5.4";
 
     let models_mock = mount_models_once(
         &server,
@@ -4018,7 +4015,9 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 
     let context_window = 100_000;
     let limit = context_window * 90 / 100;
-    let over_limit_tokens = context_window * 95 / 100 + 1;
+    // Cross the compaction threshold without exhausting the separate evidence
+    // budget that must still carry the completed tool result into this request.
+    let over_limit_tokens = limit + 1;
 
     let first_turn = sse(vec![
         ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
@@ -4047,7 +4046,8 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         config.model_context_window = Some(context_window);
         config.model_auto_compact_token_limit = Some(limit);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let codex = &test.codex;
 
     codex
         .submit(Op::UserInput {
@@ -4096,7 +4096,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     let auto_compact_body = auto_compact_mock.single_request().body_json().to_string();
     assert!(
         body_contains_text(&auto_compact_body, SUMMARIZATION_PROMPT),
-        "mid-turn auto compact request should include the summarization prompt after exceeding 95% (limit {limit})"
+        "mid-turn auto compact request should include the summarization prompt after exceeding limit {limit}"
     );
 
     insta::assert_snapshot!(
@@ -4185,11 +4185,11 @@ async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_usage("r1", /*input_tokens*/ 600, /*output_tokens*/ 50),
+        ev_completed_with_usage("r1", /*input_tokens*/ 60_000, /*output_tokens*/ 50),
     ]);
     let second_turn = sse(vec![
         ev_assistant_message("m2", SECOND_LARGE_REPLY),
-        ev_completed_with_usage("r2", /*input_tokens*/ 700, /*output_tokens*/ 50),
+        ev_completed_with_usage("r2", /*input_tokens*/ 70_000, /*output_tokens*/ 50),
     ]);
     let auto_compact_turn = sse(vec![
         ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
@@ -4197,7 +4197,7 @@ async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
     ]);
     let post_compact_turn = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_usage("r4", /*input_tokens*/ 750, /*output_tokens*/ 20),
+        ev_completed_with_usage("r4", /*input_tokens*/ 75_000, /*output_tokens*/ 20),
     ]);
     let request_log = mount_sse_sequence(
         &server,
@@ -4216,7 +4216,7 @@ async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             config.model_context_window = Some(200_000);
-            config.model_auto_compact_token_limit = Some(100);
+            config.model_auto_compact_token_limit = Some(10_000);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
         })
@@ -4229,7 +4229,7 @@ async fn auto_compact_body_after_prefix_ignores_prefix_until_body_hits_limit() {
     }
 
     // A completed response needs no further sampling. Compact at the next
-    // request boundary after the second response raises body usage above 100.
+    // request boundary after the second response raises body usage above 10,000.
     assert_eq!(request_log.requests().len(), 2);
     test.submit_turn("PREFIX_FREE_THREE")
         .await
@@ -4874,7 +4874,11 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
     let expected_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &expected_fragment);
     assert!(instruction_fragments(&requests[1]).is_empty());
-    assert_single_instruction_fragment(&requests[2], &expected_fragment);
+    assert_eq!(
+        instruction_fragments(&requests[2]),
+        vec![expected_fragment.clone(), expected_fragment],
+        "context reinjection must also use the creation-time instructions"
+    );
     assert_eq!(
         test.codex.instruction_sources().await,
         vec![PathUri::from_abs_path(&source)],
@@ -5078,14 +5082,18 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &old_fragment);
     assert_single_instruction_fragment(&requests[1], &old_fragment);
-    assert_single_instruction_fragment(&requests[2], &old_fragment);
+    assert_eq!(
+        instruction_fragments(&requests[2]),
+        vec![old_fragment.clone(), old_fragment.clone()],
+        "context reinjection must also use the creation-time instructions"
+    );
     assert_eq!(
         requests[1].input().last(),
         Some(&json!({"type": "compaction_trigger"})),
         "remote-v2 compact request should append exactly one compaction trigger"
     );
     let rollout_path = test.codex.rollout_path().expect("rollout path");
-    let replacement_history = replacement_history_from_rollout(&rollout_path)?;
+    let replacement_history = replacement_history_from_rollout(&rollout_path).await?;
     assert_eq!(
         instruction_fragments_in_items(&replacement_history),
         vec![old_fragment.clone()],
@@ -5130,7 +5138,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     );
     assert_eq!(
         instruction_fragments(&requests[3]),
-        vec![old_fragment, replacement_fragment]
+        vec![old_fragment.clone(), old_fragment, replacement_fragment]
     );
     assert_eq!(
         resumed.codex.instruction_sources().await,

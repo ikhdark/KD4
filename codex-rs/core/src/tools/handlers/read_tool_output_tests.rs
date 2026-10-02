@@ -630,7 +630,7 @@ fn many_page_incremental_recovery_matches_reconstruction_and_budget_rollback() {
                 );
             }
             // Replay the old final-envelope rollback independently of the cache.
-            let expected = loop {
+            let mut expected = loop {
                 let reconstructed = reference.reconstructed_output();
                 if recovery_envelope_fits(
                     &reconstructed,
@@ -645,6 +645,7 @@ fn many_page_incremental_recovery_matches_reconstruction_and_budget_rollback() {
                 reference.output = previous;
                 reference.record_stop(ContinuationStopReason::Budget, Some(selector));
             };
+            merge_adjacent_recovery_pages(&mut expected.results);
             let actual = state.finish();
             assert_eq!(
                 actual.drained_continuation_pages as usize,
@@ -1642,24 +1643,24 @@ fn read_tool_output_schema_matches_runtime_bounds() {
         );
     }
 
-    // Old callers may still supply max_bytes, but new calls must use the
-    // selector bounds advertised by the schema instead of a clipping knob.
+    // max_bytes is advertised and positive values above the cap are clamped.
     for (max_bytes, runtime_expected) in [
         (0, false),
         (1, true),
         (READ_TOOL_OUTPUT_MAX_BYTES, true),
-        (READ_TOOL_OUTPUT_MAX_BYTES + 1, false),
+        (READ_TOOL_OUTPUT_MAX_BYTES + 1, true),
     ] {
         let mut arguments = selector_args(1);
         arguments["max_bytes"] = serde_json::json!(max_bytes);
-        assert!(
-            !validator.is_valid(&arguments),
-            "legacy field is not advertised"
+        assert_eq!(
+            validator.is_valid(&arguments),
+            runtime_expected,
+            "schema verdict for {arguments}"
         );
         assert_eq!(
             runtime_accepts(&arguments),
             runtime_expected,
-            "legacy runtime verdict for {arguments}"
+            "runtime verdict for {arguments}"
         );
     }
 }

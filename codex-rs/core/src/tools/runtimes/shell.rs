@@ -12,8 +12,6 @@ use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_exec_request_with_after_spawn;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
-use crate::tools::known_delta_store::KnownDeltaHit;
-use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::ShellCommandPreparation;
@@ -71,7 +69,6 @@ pub struct ShellRequest {
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
-    pub(crate) known_delta: Option<PreparedKnownDelta>,
     pub(crate) validation_launch: bool,
     pub(crate) workspace_operation_root: Option<PathBuf>,
 }
@@ -289,23 +286,11 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
-        if let Some(hit_output) = req
-            .known_delta
-            .as_ref()
-            .and_then(PreparedKnownDelta::hit)
-            .map(KnownDeltaHit::rendered_output)
-        {
-            return Ok(ExecToolCallOutput {
-                stdout: codex_protocol::exec_output::StreamOutput::new(hit_output.to_string()),
-                aggregated_output: codex_protocol::exec_output::StreamOutput::new(
-                    hit_output.to_string(),
-                ),
-                ..Default::default()
-            });
-        }
         let _workspace_operation_permit = match req.workspace_operation_root.as_deref() {
             Some(root) => {
-                Some(crate::workspace_operation_gate::acquire_workspace_operation(root).await)
+                let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
+                let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
+                Some(crate::workspace_operation_gate::acquire_workspace_validation(root).await)
             }
             None => None,
         };

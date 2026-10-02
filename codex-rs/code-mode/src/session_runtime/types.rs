@@ -39,7 +39,7 @@ pub(crate) enum ObserveMode {
 }
 
 /// An observable cell lifecycle event.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) enum CellEvent {
     Yielded {
         content_items: Vec<OutputItem>,
@@ -61,7 +61,7 @@ pub(crate) enum CellEvent {
 }
 
 /// Output emitted by a cell since its preceding observation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) enum OutputItem {
     Text {
         text: String,
@@ -73,7 +73,7 @@ pub(crate) enum OutputItem {
 }
 
 /// Requested image fidelity for an output image.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) enum ImageDetail {
     Auto,
     Low,
@@ -85,6 +85,7 @@ pub(crate) enum ImageDetail {
 ///
 /// The owning session assigns the cell ID when it admits the request.
 pub(crate) struct CreateCellRequest {
+    pub(crate) state_path: Option<std::path::PathBuf>,
     pub(crate) tool_call_id: String,
     pub(crate) enabled_tools: Vec<ToolDefinition>,
     pub(crate) source: String,
@@ -95,7 +96,7 @@ pub(crate) struct CreateCellRequest {
 pub(crate) struct ToolDefinition {
     pub(crate) name: String,
     pub(crate) tool_name: ToolName,
-    pub(crate) description: String,
+    pub(crate) description: std::sync::Arc<str>,
     pub(crate) kind: ToolKind,
     pub(crate) default_timeout_ms: Option<u64>,
 }
@@ -152,7 +153,8 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
     ShuttingDown,
-    ActiveCellLimit,
+    /// Carries the registered cells that hold permits, so callers can wait on one.
+    ActiveCellLimit(Vec<CellId>),
     CellIdSpaceExhausted,
     DuplicateCell(CellId),
     MissingCell(CellId),
@@ -166,9 +168,24 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ShuttingDown => formatter.write_str("code mode session is shutting down"),
-            Self::ActiveCellLimit => formatter.write_str(
-                "code mode has reached its active cell limit; wait for an existing cell to finish or terminate one before starting another exec",
-            ),
+            Self::ActiveCellLimit(active) => {
+                let active = active.iter().map(|cell_id| serde_json::json!({
+                    "cell_id": cell_id.as_str(),
+                    "state": "registered",
+                    "readiness": "unknown",
+                    "permitted_actions": ["wait", "terminate"],
+                })).collect::<Vec<_>>();
+                write!(formatter, "{}", serde_json::json!({
+                    "kind": "code_mode_admission_failure",
+                    "version": 1,
+                    "reason": "active_cell_limit",
+                    "message": "code mode has reached its active cell limit; wait for a known dependency or explicitly terminate an unwanted cell before starting another exec",
+                    "started": false,
+                    "active_cells": active,
+                    "preparing_cells_may_be_unlisted": true,
+                    "retry_after": "a cell releases its permit",
+                }))
+            }
             Self::CellIdSpaceExhausted => {
                 formatter.write_str("code mode session exhausted its cell ID space")
             }

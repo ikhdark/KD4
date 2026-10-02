@@ -104,6 +104,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
     let host = RuntimeCellHost {
         cell_id: CellId::new("terminating-writer"),
         parent_tool_call_id: "parent-call".to_string(),
+        snapshot: HashMap::new(),
         inner: Arc::clone(&runtime.inner),
         cell_permit: Mutex::new(None),
     };
@@ -153,6 +154,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
     let reader = runtime
         .execute(
             CreateCellRequest {
+                state_path: None,
                 tool_call_id: "reader".to_string(),
                 enabled_tools: Vec::new(),
                 source: r#"text(String(load("candidate")));"#.to_string(),
@@ -193,6 +195,7 @@ async fn storage_limit_rejects_the_complete_cell_write_set() {
     let host = RuntimeCellHost {
         cell_id: CellId::new("oversized-writer"),
         parent_tool_call_id: "parent-call".to_string(),
+        snapshot: runtime.inner.stored_values.lock().await.clone(),
         inner: Arc::clone(&runtime.inner),
         cell_permit: Mutex::new(None),
     };
@@ -224,10 +227,77 @@ async fn storage_limit_rejects_the_complete_cell_write_set() {
 
 fn execute_request(source: &str) -> CreateCellRequest {
     CreateCellRequest {
+        state_path: None,
         tool_call_id: "call-1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
         default_tool_timeout_ms: 60_000,
+    }
+}
+
+#[tokio::test]
+async fn concurrent_store_conflict_preserves_winner_and_rejects_entire_write_set() {
+    // A new key, identical concurrent increments, and ABA writes must all
+    // reject the stale transaction, including its otherwise disjoint writes.
+    for (snapshot, winner, proposed) in [(None, 1, 2), (Some(0), 1, 1), (Some(0), 0, 2)] {
+        let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+        let host = RuntimeCellHost {
+            cell_id: CellId::new("stale-writer"),
+            parent_tool_call_id: "parent-call".into(),
+            snapshot: snapshot.into_iter().map(|value| {
+                ("key".into(), StoredValue::new("key", JsonValue::from(value)))
+            }).collect(),
+            inner: Arc::clone(&runtime.inner),
+            cell_permit: Mutex::new(None),
+        };
+        runtime.inner.stored_values.lock().await.insert(
+            "key".into(), StoredValue::new("key", JsonValue::from(winner)),
+        );
+        let state = Arc::new(CellState::new(CancellationToken::new()));
+        host.commit_completion(
+            HashMap::from([
+                ("key".into(), StoredValue::new("key", JsonValue::from(proposed))),
+                ("other".into(), StoredValue::new("other", JsonValue::from(true))),
+            ]),
+            CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None },
+            None,
+            state,
+        ).await;
+        let values = runtime.inner.stored_values.lock().await;
+        assert_eq!(values["key"].value.as_ref(), &JsonValue::from(winner));
+        assert!(!values.contains_key("other"));
+        drop(values);
+        runtime.shutdown().await.unwrap();
+    }
+    // A cell can write a disjoint key while depending on a stale read, including
+    // a previously absent key. Write/write conflict checks alone miss this.
+    for snapshot in [None, Some(0)] {
+        let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+        let host = RuntimeCellHost {
+            cell_id: CellId::new("stale-reader"),
+            parent_tool_call_id: "parent-call".into(),
+            snapshot: snapshot.into_iter().map(|value| {
+                ("input".into(), StoredValue::new("input", JsonValue::from(value)))
+            }).collect(),
+            inner: Arc::clone(&runtime.inner),
+            cell_permit: Mutex::new(None),
+        };
+        runtime.inner.stored_values.lock().await.insert(
+            "input".into(), StoredValue::new("input", JsonValue::from(1)),
+        );
+        let mut output = StoredValue::new("derived", JsonValue::from(0));
+        output.read_dependencies = Some(Arc::new(std::collections::HashSet::from(["input".into()])));
+        host.commit_completion(
+            HashMap::from([("derived".into(), output)]),
+            CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None },
+            None,
+            Arc::new(CellState::new(CancellationToken::new())),
+        ).await;
+        let values = runtime.inner.stored_values.lock().await;
+        assert_eq!(values["input"].value.as_ref(), &JsonValue::from(1));
+        assert!(!values.contains_key("derived"), "stale reads cannot authorize derived writes");
+        drop(values);
+        runtime.shutdown().await.unwrap();
     }
 }
 
@@ -266,6 +336,39 @@ async fn terminal_result_remains_observable_after_active_cell_removal() {
     assert_eq!(runtime.terminate(&cell_id).await, Ok(completed));
 }
 
+#[tokio::test]
+async fn durable_cells_restore_values_and_terminal_receipts_without_reexecution() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let mut request = execute_request(
+        r#"store("artifact", {artifact_id: "retained-evidence"}); text("completed once");"#,
+    );
+    request.state_path = Some(path.clone());
+    let started = runtime.execute(request, ObserveMode::Decision).await.unwrap();
+    let old_id = started.cell_id.clone();
+    let original = started.initial_event().await.unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let restored = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let mut request = execute_request(r#"text(load("artifact").artifact_id);"#);
+    request.state_path = Some(path);
+    let started = restored.execute(request, ObserveMode::Decision).await.unwrap();
+    assert_ne!(started.cell_id, old_id, "restored IDs must never be reused");
+    assert_eq!(started.initial_event().await.unwrap(), CellEvent::Completed {
+        content_items: vec![OutputItem::Text { text: "retained-evidence".into() }],
+        error_text: None,
+        output_loss: None,
+    });
+    assert_eq!(
+        restored.begin_observe(&old_id, ObserveMode::Decision).await.unwrap().event().await.unwrap(),
+        original,
+        "observing a recovered terminal cell must return its original receipt, not run it",
+    );
+    restored.shutdown().await.unwrap();
+}
+
 #[test]
 fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
     let completed = |bytes: usize| CellEvent::Completed {
@@ -294,8 +397,9 @@ fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
     let oversized = completed(TERMINAL_CELL_CACHE_MAX_BYTES + 1);
     cache.insert(CellId::new("4"), oversized.clone());
     assert_eq!(cache.get(&CellId::new("4")), Some(oversized));
-    assert_eq!(cache.order.len(), 1);
-    assert_eq!(cache.retained_bytes, TERMINAL_CELL_CACHE_MAX_BYTES + 1);
+    assert_eq!(cache.order.len(), 3);
+    assert_eq!(cache.retained_bytes, half + 1);
+    assert!(matches!(cache.entry(&CellId::new("4")).as_deref(), Some(CachedCellEvent::Spilled(_))));
 
     for index in 0..TERMINAL_CELL_CACHE_CAPACITY + 10 {
         cache.insert(CellId::new(format!("small-{index}")), completed(0));
@@ -306,11 +410,35 @@ fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
     assert_eq!(cache.retained_bytes, 0);
 }
 
+#[test]
+fn durable_restart_never_reuses_uncompleted_cell_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let (first, _) = snapshot::DurableState::open(path.clone()).unwrap();
+    let interrupted_id = first.first_cell_id;
+    let reserved_limit = first.cell_id_limit;
+    drop(first);
+    let (restarted, values) = snapshot::DurableState::open(path).unwrap();
+    assert!(values.is_empty());
+    assert!(restarted.completed_cells().is_empty());
+    assert!(restarted.first_cell_id >= reserved_limit);
+    assert!(restarted.first_cell_id > interrupted_id);
+}
+
 #[tokio::test]
-async fn ninth_cell_is_rejected_until_a_terminal_cell_releases_its_permit() {
+async fn capacity_rejects_until_a_terminal_cell_releases_its_permit() {
     let runtime = Arc::new(SessionRuntime::new(Arc::new(RecordingDelegate)));
     let mut active_cell_ids = Vec::new();
-    for _ in 0..MAX_ACTIVE_CELLS {
+    for slot in 0..runtime.inner.active_cell_capacity {
+        if slot + 1 == runtime.inner.active_cell_capacity {
+            let mut heavy = execute_request("store('rejected', true);");
+            heavy.source.push_str(&" ".repeat(CELL_INPUT_BYTES_PER_SLOT));
+            assert!(matches!(
+                runtime.execute(heavy, ObserveMode::YieldAfter(Duration::from_millis(1))).await,
+                Err(Error::ActiveCellLimit(_))
+            ));
+            assert_eq!(runtime.inner.active_cell_permits.available_permits(), 1);
+        }
         let started = runtime
             .execute(
                 execute_request("await new Promise(() => {});"),
@@ -321,7 +449,7 @@ async fn ninth_cell_is_rejected_until_a_terminal_cell_releases_its_permit() {
         active_cell_ids.push(started.cell_id);
     }
 
-    let ninth = tokio::time::timeout(
+    let excess = tokio::time::timeout(
         Duration::from_secs(1),
         runtime.execute(
             execute_request("store('rejected', true);"),
@@ -330,8 +458,11 @@ async fn ninth_cell_is_rejected_until_a_terminal_cell_releases_its_permit() {
     )
     .await
     .expect("full capacity must return control to the caller");
-    assert!(matches!(ninth, Err(Error::ActiveCellLimit)));
-    assert_eq!(runtime.inner.cells.lock().await.len(), MAX_ACTIVE_CELLS);
+    let Err(Error::ActiveCellLimit(reported)) = excess else {
+        panic!("excess cell must be rejected at the active cell limit");
+    };
+    assert_eq!(reported, active_cell_ids);
+    assert_eq!(runtime.inner.cells.lock().await.len(), runtime.inner.active_cell_capacity);
 
     runtime
         .terminate(&active_cell_ids[0])
@@ -472,7 +603,7 @@ async fn shutdown_cancels_native_runtime_startup_without_registering_or_running_
     assert!(runtime.inner.cells.lock().await.is_empty());
     assert_eq!(
         runtime.inner.active_cell_permits.available_permits(),
-        MAX_ACTIVE_CELLS
+        runtime.inner.active_cell_capacity
     );
     assert!(runtime.inner.cell_tasks.is_empty());
     release.send(()).unwrap();
@@ -480,6 +611,70 @@ async fn shutdown_cancels_native_runtime_startup_without_registering_or_running_
         .await
         .unwrap();
     assert!(runtime.inner.stored_values.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn native_startup_does_not_block_control_of_a_running_cell() {
+    use crate::runtime::STARTUP_TEST_GATE;
+    use crate::runtime::StartupTestGate;
+
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let running = runtime
+        .execute(
+            execute_request("while (true) {}"),
+            ObserveMode::YieldAfter(Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+    let running_id = running.cell_id.clone();
+    assert_eq!(
+        running.initial_event().await,
+        Ok(CellEvent::Yielded {
+            content_items: Vec::new(),
+        })
+    );
+
+    let (release, receiver) = std::sync::mpsc::channel();
+    let gate = Arc::new(StartupTestGate {
+        entered: tokio::sync::Notify::new(),
+        release: std::sync::Mutex::new(receiver),
+        exited: tokio::sync::Notify::new(),
+    });
+    let starting = STARTUP_TEST_GATE.scope(
+        Arc::clone(&gate),
+        runtime.execute(
+            execute_request(r#"text("started");"#),
+            ObserveMode::YieldAfter(Duration::from_secs(1)),
+        ),
+    );
+    tokio::pin!(starting);
+    std::future::poll_fn(|cx| {
+        assert!(starting.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .unwrap();
+
+    let terminated = tokio::time::timeout(Duration::from_secs(1), runtime.terminate(&running_id))
+        .await
+        .expect("terminating a running cell must not wait for another cell's startup");
+    assert!(matches!(terminated, Ok(CellEvent::Terminated { .. })));
+
+    release.send(()).unwrap();
+    let started = starting.await.unwrap();
+    assert_eq!(
+        started.initial_event().await,
+        Ok(CellEvent::Completed {
+            output_loss: None,
+            content_items: vec![OutputItem::Text {
+                text: "started".to_string(),
+            }],
+            error_text: None,
+        })
+    );
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]

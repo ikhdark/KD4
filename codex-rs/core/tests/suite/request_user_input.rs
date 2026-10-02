@@ -468,12 +468,13 @@ where
                 .expect("test config should allow feature update");
         });
     }
+    let test = builder.build(&server).await?;
     let TestCodex {
         codex,
         cwd,
         session_configured,
         ..
-    } = builder.build(&server).await?;
+    } = &test;
 
     let mode_slug = mode_name.to_lowercase().replace(' ', "-");
     let call_id = format!("user-input-{mode_slug}-call");

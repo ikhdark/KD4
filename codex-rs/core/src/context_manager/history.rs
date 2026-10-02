@@ -434,6 +434,7 @@ pub(crate) struct ContextManager {
     item_token_estimates:
         Arc<StdMutex<HashMap<ItemTokenEstimateCacheNamespace, HashMap<usize, i64>>>>,
     token_info: Option<TokenUsageInfo>,
+    active_requirement_count: usize,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
     ///
@@ -468,6 +469,7 @@ impl ContextManager {
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
+            active_requirement_count: 0,
             realized_context_baseline: RealizedContextBaseline::Unknown,
             world_state_baseline: None,
         }
@@ -482,16 +484,31 @@ impl ContextManager {
         self.sync_tool_result_token_budget();
     }
 
+    pub(crate) fn set_active_requirement_count(&mut self, count: usize) {
+        self.active_requirement_count = count;
+        self.sync_tool_result_token_budget();
+    }
+
     /// The raw tool-result working set scales with the active model context
-    /// window, which is only known from recorded usage or a resumed rollout.
+    /// window and the task's unread/unresolved evidence, within a hard ceiling.
     fn sync_tool_result_token_budget(&mut self) {
         let budget = self
             .token_info
             .as_ref()
             .and_then(|info| info.model_context_window)
             .map(|window| {
-                crate::tool_history::model_visible_tool_result_token_budget_for_context_window(
-                    Some(window),
+                let usage = self.token_info.as_ref().map(|info| &info.last_token_usage);
+                // Observed output demand is an estimate, not a configured
+                // output limit. Retain a floor for the next synthesis.
+                let generation_room = usage.map_or(4096, |usage| {
+                    usize::try_from(usage.output_tokens).unwrap_or(0)
+                        .saturating_mul(2).max(4096)
+                });
+                self.tool_history.task_sensitive_tool_result_budget(
+                    window,
+                    usage.map_or(0, |usage| usize::try_from(usage.input_tokens).unwrap_or(0)),
+                    generation_room,
+                    self.active_requirement_count,
                 )
             });
         if self
@@ -862,6 +879,11 @@ impl ContextManager {
                     git_workspace,
                 )
             }) {
+                tracing::debug!(
+                    tool_history_projection_policy = "stable_sampling_continuation",
+                    aggregate_tool_result_budget_applied = false,
+                    "selected provider-bound tool history projection"
+                );
                 *anchor_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -876,19 +898,41 @@ impl ContextManager {
             Some(cache)
                 if completed_tool_projection || ToolHistoryState::has_phase_checkpoint(&items) =>
             {
+                tracing::debug!(
+                    tool_history_projection_policy = "sampling_checkpoints_and_freshness",
+                    aggregate_tool_result_budget_applied = false,
+                    "selected provider-bound tool history projection"
+                );
                 tool_history.project_sampling_with_workspace_cache(items, workspace_identity, cache)
             }
-            Some(cache) => tool_history.project_workspace_freshness_with_cache(
-                items,
-                workspace_identity,
-                cache,
-            ),
-            None if target == StableContextTarget::Sampling => ToolHistoryProjection {
-                items: Arc::clone(&items),
-                unreplaced_items: items,
-                ..Default::default()
+            Some(cache) => {
+                tracing::debug!(
+                    tool_history_projection_policy = "workspace_freshness_only",
+                    aggregate_tool_result_budget_applied = false,
+                    "selected provider-bound tool history projection"
+                );
+                tool_history.project_workspace_freshness_with_cache(items, workspace_identity, cache)
+            }
+            None if target == StableContextTarget::Sampling => {
+                tracing::debug!(
+                    tool_history_projection_policy = "raw_sampling",
+                    aggregate_tool_result_budget_applied = false,
+                    "selected provider-bound tool history projection"
+                );
+                ToolHistoryProjection {
+                    items: Arc::clone(&items),
+                    unreplaced_items: items,
+                    ..Default::default()
+                }
+            }
+            None => {
+                tracing::debug!(
+                    tool_history_projection_policy = "aggregate_budget",
+                    aggregate_tool_result_budget_applied = true,
+                    "selected provider-bound tool history projection"
+                );
+                tool_history.project_with_workspace_identity(items, workspace_identity)
             },
-            None => tool_history.project_with_workspace_identity(items, workspace_identity),
         };
         let projection = project(Arc::clone(&items));
         // Most prompts have identical sampling and fallback input. Reuse this
@@ -939,6 +983,18 @@ impl ContextManager {
         (*self.tool_history).clone()
     }
 
+    pub(crate) fn rehydrate_read_replays(
+        &self,
+        replays: &crate::session::turn_execution::SessionPathReplays,
+    ) {
+        replays.rehydrate(self.raw_items(), &self.tool_history);
+    }
+
+    pub(crate) fn artifact_origin_call_id(&self, artifact_id: &str) -> Option<String> {
+        self.tool_history.checkpoint_evidence(artifact_id).ok()
+            .map(|candidate| candidate.call_id.clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
         Arc::make_mut(&mut self.tool_history).register_non_workspace_code_mode_call(call_id);
@@ -951,7 +1007,11 @@ impl ContextManager {
         // Every tool-history mutation affects the projection applied after
         // canonical preparation. Re-run that projection against current state
         // while preserving the normalized history and its token estimates.
-        mutation.apply(Arc::make_mut(&mut self.tool_history))
+        let changed = mutation.apply(Arc::make_mut(&mut self.tool_history));
+        if changed {
+            self.sync_tool_result_token_budget();
+        }
+        changed
     }
 
     pub(crate) fn mark_tool_history_consumed_with_delta(
@@ -960,7 +1020,11 @@ impl ContextManager {
         generation: ModelGenerationId,
     ) -> std::collections::BTreeSet<String> {
         // Keep the same post-cache projection boundary while returning the changed call IDs.
-        Arc::make_mut(&mut self.tool_history).mark_consumed_with_delta(input, generation)
+        let changed = Arc::make_mut(&mut self.tool_history).mark_consumed_with_delta(input, generation);
+        if !changed.is_empty() {
+            self.sync_tool_result_token_budget();
+        }
+        changed
     }
 
     /// Returns raw items in the history.

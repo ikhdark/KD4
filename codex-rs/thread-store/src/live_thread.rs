@@ -371,6 +371,21 @@ impl LiveThread {
             .await
     }
 
+    /// [`Self::flush`] with the store's stable-storage barrier, for terminal checkpoints.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
+    )]
+    pub async fn flush_durable(&self) -> ThreadStoreResult<()> {
+        let mut metadata_sync = self.metadata_sync.lock().await;
+        self.thread_store
+            .flush_thread_durable(self.thread_id)
+            .await?;
+        let update = metadata_sync.take_pending_update_for_existing_history();
+        self.apply_pending_metadata_update(&mut metadata_sync, update)
+            .await
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"

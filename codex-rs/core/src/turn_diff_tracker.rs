@@ -125,6 +125,7 @@ pub struct TurnDiffTracker {
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
     mutation_revision: u64,
     rendered_diffs: BTreeMap<(String, TrackedPath), String>,
+    unavailable_paths: BTreeSet<TrackedPath>,
     display_keys: HashMap<TrackedPath, String>,
     destination_by_origin: HashMap<TrackedPath, TrackedPath>,
     aggregate_dirty: bool,
@@ -148,6 +149,7 @@ impl Default for TurnDiffTracker {
             origin_by_current_path: HashMap::new(),
             mutation_revision: 0,
             rendered_diffs: BTreeMap::new(),
+            unavailable_paths: BTreeSet::new(),
             display_keys: HashMap::new(),
             destination_by_origin: HashMap::new(),
             aggregate_dirty: false,
@@ -241,6 +243,9 @@ impl TurnDiffTracker {
             }
             for path in &paths {
                 self.collect_diff_partners(path, &mut changed);
+            }
+            if paths.iter().any(|path| self.unavailable_paths.contains(path)) {
+                self.unavailable_paths.extend(paths.iter().cloned());
             }
             self.apply_change(environment_id, change);
             for path in &paths {
@@ -339,17 +344,37 @@ impl TurnDiffTracker {
         _command: &[String],
         _exit_code: i32,
         _timed_out: bool,
-        _environment_id: &str,
-        _cwd: Option<&Path>,
+        environment_id: &str,
+        cwd: Option<&Path>,
         mutation: CommandMutation,
     ) {
         // A command can write before failing or timing out, so every observed
-        // mutation advances the generic turn revision and invalidates exact
-        // diff state.
+        // mutation advances the generic turn revision. Known touched paths
+        // lose exactness without discarding unrelated apply_patch diffs.
         match mutation {
-            CommandMutation::KnownMutation { paths: Some(_) } => {
+            CommandMutation::KnownMutation { paths: Some(paths) } => {
                 self.record_mutation();
-                self.invalidate();
+                if !self.valid {
+                    return;
+                }
+                let mut affected = HashSet::new();
+                for path in paths {
+                    let absolute = if path.is_absolute() { path } else {
+                        cwd.map_or_else(|| path.clone(), |cwd| cwd.join(&path))
+                    };
+                    let path = TrackedPath::new(environment_id, &absolute);
+                    self.collect_diff_partners(&path, &mut affected);
+                    for tracked in self.baseline_by_path.keys().chain(self.current_by_path.keys()) {
+                        if tracked.environment_id == path.environment_id
+                            && tracked.comparison_key.starts_with(&path.comparison_key)
+                        {
+                            self.collect_diff_partners(tracked, &mut affected);
+                        }
+                    }
+                }
+                self.rendered_diffs.retain(|(_, path), _| !affected.contains(path));
+                self.unavailable_paths.extend(affected);
+                self.aggregate_dirty = true;
             }
             CommandMutation::KnownMutation { paths: None } => {
                 self.record_unknown_mutation();
@@ -366,6 +391,25 @@ impl TurnDiffTracker {
 
     pub(crate) fn current_mutation_revision(&self) -> u64 {
         self.mutation_revision
+    }
+
+    /// Net changed paths, including both sides of renames. Never infer an empty
+    /// change set from an invalidated diff.
+    pub(crate) fn exact_changed_paths(&self) -> Option<Vec<(String, PathBuf)>> {
+        if !self.valid || !self.unavailable_paths.is_empty() {
+            return None;
+        }
+        Some(self.baseline_by_path.keys().chain(self.current_by_path.keys())
+            .filter(|path| {
+                match (self.baseline_by_path.get(*path), self.current_by_path.get(*path)) {
+                    (Some(before), Some(after)) =>
+                        before.content != after.content || before.mode != after.mode,
+                    (None, None) => false,
+                    _ => true,
+                }
+            })
+            .map(|path| (path.environment_id.clone(), path.path.clone()))
+            .collect::<BTreeSet<_>>().into_iter().collect())
     }
 
     #[cfg(test)]
@@ -395,7 +439,7 @@ impl TurnDiffTracker {
     }
 
     pub(crate) fn take_invalidation_warning(&mut self) -> Option<&'static str> {
-        if self.valid || self.invalidation_reported {
+        if (self.valid && self.unavailable_paths.is_empty()) || self.invalidation_reported {
             return None;
         }
         self.invalidation_reported = true;
@@ -419,13 +463,16 @@ impl TurnDiffTracker {
     }
 
     fn flatten_diff(&self) -> Option<String> {
-        if self.rendered_diffs.is_empty() {
+        if self.rendered_diffs.is_empty() && self.unavailable_paths.is_empty() {
             return None;
         }
         let mut aggregate =
             String::with_capacity(self.rendered_diffs.values().map(String::len).sum());
         for fragment in self.rendered_diffs.values() {
             aggregate.push_str(fragment);
+        }
+        for path in &self.unavailable_paths {
+            let _ = writeln!(aggregate, "# {}: changed, diff unavailable (command effects)", self.display_path(path));
         }
         Some(aggregate)
     }
@@ -435,6 +482,10 @@ impl TurnDiffTracker {
             return;
         }
         for path in changed {
+            if self.unavailable_paths.contains(&path) {
+                self.rendered_diffs.retain(|(_, rendered_path), _| rendered_path != &path);
+                continue;
+            }
             let display = match self.display_keys.get(&path) {
                 Some(display) => display.clone(),
                 None => {

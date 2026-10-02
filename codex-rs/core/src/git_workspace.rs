@@ -1112,15 +1112,6 @@ impl GitWorkspaceMetadataSource {
             has_changes,
         }
     }
-
-    /// Return the repository's root-history namespace using the same bounded
-    /// watcher-backed cache as the rest of the stable workspace metadata.
-    ///
-    /// This deliberately excludes worktree and index observations. When the
-    /// watcher cannot prove freshness, the cache fails open and recomputes.
-    pub(crate) async fn project_namespace(&self) -> Option<String> {
-        self.cache.project_namespace(self).await
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1399,18 +1390,10 @@ struct MetadataCacheEntry {
     _registration: GitWatchLease,
 }
 
-struct ProjectNamespaceCacheEntry {
-    dependencies: StableMetadataDependencies,
-    watcher_generation: u64,
-    namespace: Option<String>,
-    _registration: GitWatchLease,
-}
-
 #[derive(Default)]
 struct GitWorkspaceCacheState {
     root: Option<RootCacheEntry>,
     metadata: HashMap<PathBuf, MetadataCacheEntry>,
-    project_namespaces: HashMap<PathBuf, ProjectNamespaceCacheEntry>,
 }
 
 #[derive(Clone)]
@@ -1919,7 +1902,6 @@ impl GitWorkspaceCache {
         let mut state = self.state.lock().await;
         state.root = None;
         state.metadata.clear();
-        state.project_namespaces.clear();
     }
 
     fn invalidate_source_watcher(&self) {
@@ -2366,46 +2348,6 @@ impl GitWorkspaceCache {
             }
         }
         metadata
-    }
-
-    async fn project_namespace(&self, source: &GitWorkspaceMetadataSource) -> Option<String> {
-        let watcher_generation = self.watcher_generation.load(Ordering::Acquire);
-        let dependencies = StableMetadataDependencies::capture_project_namespace(source).await;
-        if self.watcher_reliable.load(Ordering::Acquire)
-            && let Some(dependencies) = dependencies.as_ref()
-        {
-            let state = self.state.lock().await;
-            if let Some(entry) = state.project_namespaces.get(source.repo_root.as_path())
-                && entry.watcher_generation == watcher_generation
-                && entry.dependencies == *dependencies
-                && self.watcher_reliable.load(Ordering::Acquire)
-                && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
-            {
-                return entry.namespace.clone();
-            }
-        }
-
-        let namespace = collect_project_namespace(source.cwd.as_path()).await;
-        if let Some(before_dependencies) = dependencies {
-            let after_dependencies =
-                StableMetadataDependencies::capture_project_namespace(source).await;
-            if after_dependencies.as_ref() == Some(&before_dependencies)
-                && self.watcher_reliable.load(Ordering::Acquire)
-                && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
-            {
-                let registration = self.register_dependencies(&before_dependencies.files).await;
-                self.state.lock().await.project_namespaces.insert(
-                    source.repo_root.to_path_buf(),
-                    ProjectNamespaceCacheEntry {
-                        dependencies: before_dependencies,
-                        watcher_generation,
-                        namespace: namespace.clone(),
-                        _registration: registration,
-                    },
-                );
-            }
-        }
-        namespace
     }
 
     async fn register_dependencies(&self, dependencies: &[DependencyFingerprint]) -> GitWatchLease {
@@ -2909,47 +2851,6 @@ impl StableMetadataDependencies {
             config_signature,
         })
     }
-
-    async fn capture_project_namespace(source: &GitWorkspaceMetadataSource) -> Option<Self> {
-        let repo_root = source.repo_root.clone();
-        run_blocking_git_metadata(move || {
-            let executable = which::which("git").ok()?;
-            let executable = executable.canonicalize().unwrap_or(executable);
-            let git_marker = repo_root.join(".git").into_path_buf();
-            let (git_dir, common_dir, head_ref) = resolve_git_dirs(&repo_root)?;
-            let mut paths = vec![
-                (executable, false),
-                (git_dir.join("HEAD"), true),
-                (git_dir.join("commondir"), true),
-                (git_dir.join("config.worktree"), true),
-                (common_dir.join("config"), true),
-                (common_dir.join("packed-refs"), true),
-                (common_dir.join("reftable").join("tables.list"), true),
-                (common_dir.join("shallow"), true),
-                (common_dir.join("info").join("grafts"), true),
-                (common_dir.join("refs").join("replace"), false),
-            ];
-            if git_marker.is_file() {
-                paths.push((git_marker, true));
-            }
-            if let Some(head_ref) = head_ref {
-                paths.push((common_dir.join(head_ref), true));
-            }
-            paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-            paths.dedup_by(|left, right| left.0 == right.0);
-            let files = paths
-                .into_iter()
-                .map(|(path, hash_contents)| dependency_fingerprint(path, hash_contents))
-                .collect::<Option<Vec<_>>>()?;
-            Some(Self {
-                files,
-                // Namespace dependencies are represented by the repository files above. Avoid a
-                // separate `git config --list` process on every cache lookup.
-                config_signature: [0; 32],
-            })
-        })
-        .await
-    }
 }
 
 async fn run_blocking_git_metadata<T, F>(capture: F) -> Option<T>
@@ -2958,14 +2859,6 @@ where
     F: FnOnce() -> Option<T> + Send + 'static,
 {
     tokio::task::spawn_blocking(capture).await.ok().flatten()
-}
-
-async fn collect_project_namespace(cwd: &Path) -> Option<String> {
-    let roots = codex_git_utils::get_root_commit_hashes(cwd).await?;
-    Some(format!(
-        "{:x}",
-        Sha256::digest(format!("git-project-roots-v1\0{}", roots.join("\0")).as_bytes())
-    ))
 }
 
 fn resolve_git_dirs(repo_root: &AbsolutePathBuf) -> Option<(PathBuf, PathBuf, Option<PathBuf>)> {

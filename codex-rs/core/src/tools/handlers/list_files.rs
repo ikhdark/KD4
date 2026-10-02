@@ -126,7 +126,15 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
     }
 }
 
-impl CoreToolRuntime for ListFilesHandler {}
+impl CoreToolRuntime for ListFilesHandler {
+    fn cancellation_cleanup_policy(&self) -> crate::tools::registry::ToolCleanupPolicy {
+        crate::tools::registry::ToolCleanupPolicy::InterruptibleRead
+    }
+
+    fn permits_shared_workspace_observation(&self, _payload: &ToolPayload) -> bool {
+        true
+    }
+}
 
 #[cfg(test)]
 #[path = "list_files_tests.rs"]

@@ -25,7 +25,13 @@ use super::wait_handler::terminate_interrupted_cell;
 
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
-    enabled_tools: Vec<codex_code_mode::ToolDefinition>,
+    enabled_tools: Arc<[codex_code_mode::ToolDefinition]>,
+    timeout_catalog: std::sync::Mutex<Option<TimeoutCatalog>>,
+}
+
+struct TimeoutCatalog {
+    overrides: Vec<Option<u64>>,
+    tools: Arc<[codex_code_mode::ToolDefinition]>,
 }
 
 fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usize) -> Option<String> {
@@ -41,15 +47,47 @@ fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usiz
     };
     let mut parts = Vec::with_capacity(content_items.len());
     for item in content_items {
-        let FunctionCallOutputContentItem::InputText { text } = item else {
-            return None;
-        };
-        parts.push(text.as_str());
+        match item {
+            FunctionCallOutputContentItem::InputText { text } => parts.push(text.clone()),
+            FunctionCallOutputContentItem::InputImage { image_url, .. } => {
+                // Use the already-produced media; never fetch or re-encode it.
+                // Reject Markdown delimiters/control characters rather than
+                // allowing a media URL to introduce additional response text.
+                let supported = image_url.split_once(':').is_some_and(|(scheme, rest)| {
+                    ((scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+                        && rest.starts_with("//"))
+                        || (scheme.eq_ignore_ascii_case("data")
+                            && rest.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/")))
+                }) || std::path::Path::new(image_url).is_absolute();
+                if image_url.chars().any(|ch| ch.is_control() || matches!(ch, '<' | '>'))
+                    || !supported
+                {
+                    return None;
+                }
+                parts.push(format!("![image](<{image_url}>)"));
+            }
+        }
     }
     let message = parts.join("\n");
     (!message.trim().is_empty()
         && codex_utils_output_truncation::model_token_count(&message) <= limit)
         .then_some(message)
+}
+
+pub(super) fn schema_validated_delivery(
+    response: &codex_code_mode::RuntimeResponse,
+    limit: usize,
+    schema: Option<&serde_json::Value>,
+) -> Option<String> {
+    let text = direct_delivery_text(response, limit)?;
+    if let Some(schema) = schema {
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let validator = jsonschema::validator_for(schema).ok()?;
+        if !validator.is_valid(&value) {
+            return None;
+        }
+    }
+    Some(text)
 }
 
 /// Headroom added to the longest wait a nested tool can be asked to perform, so
@@ -188,8 +226,35 @@ impl CodeModeExecuteHandler {
         }
         Ok(Self {
             spec,
-            enabled_tools,
+            enabled_tools: enabled_tools.into(),
+            timeout_catalog: std::sync::Mutex::new(None),
         })
+    }
+
+    fn catalog_with_timeouts(
+        &self,
+        mcp_timeouts: &HashMap<ToolName, u64>,
+        terminal_poll_ms: u64,
+    ) -> Arc<[codex_code_mode::ToolDefinition]> {
+        let overrides = self.enabled_tools.iter().map(|tool| {
+            nested_tool_timeout_override(&tool.tool_name, mcp_timeouts, terminal_poll_ms)
+        }).collect::<Vec<_>>();
+        let mut cached = self.timeout_catalog.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(catalog) = cached.as_ref()
+            && catalog.overrides == overrides
+        {
+            return Arc::clone(&catalog.tools);
+        }
+        // Publish one immutable catalog per effective timeout overlay. Active
+        // cells retain their old snapshot; a changed timeout cannot mutate it.
+        let tools = self.enabled_tools.iter().zip(&overrides).map(|(tool, timeout)| {
+            let mut tool = tool.clone();
+            tool.default_timeout_ms = *timeout;
+            tool
+        }).collect::<Arc<[_]>>();
+        *cached = Some(TimeoutCatalog { overrides, tools: Arc::clone(&tools) });
+        tools
     }
 
     async fn execute(
@@ -223,19 +288,10 @@ impl CodeModeExecuteHandler {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let mut enabled_tools = self.enabled_tools.clone();
-        for tool in &mut enabled_tools {
-            // MCP owns its transport timeout. Give that call headroom without
-            // lengthening ordinary tools or overriding explicit per-call limits.
-            tool.default_timeout_ms = nested_tool_timeout_override(
-                &tool.tool_name,
-                &mcp_timeouts,
-                session
-                    .services
-                    .unified_exec_manager
-                    .max_write_stdin_yield_time_ms(),
-            );
-        }
+        let enabled_tools = self.catalog_with_timeouts(
+            &mcp_timeouts,
+            session.services.unified_exec_manager.max_write_stdin_yield_time_ms(),
+        );
         let exec = ExecContext { session, turn };
         let started_at = std::time::Instant::now();
         let started_cell = exec
@@ -243,6 +299,10 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .execute(codex_code_mode::ExecuteRequest {
+                state_path: args.persist.then(|| {
+                    exec.turn.config.codex_home.join("code-mode-state")
+                        .join(format!("{}.json", exec.session.thread_id)).to_path_buf()
+                }),
                 tool_call_id: call_id.clone(),
                 enabled_tools,
                 source: args.code.to_owned(),
@@ -300,6 +360,11 @@ impl CodeModeExecuteHandler {
             .input_queue
             .subscribe_activity(turn_state.as_deref(), false)
             .await;
+        if args.deliver && pending_activity.is_none() {
+            exec.session.services.code_mode_service.record_delivery_intent(
+                &cell_id, &exec.turn, activity_rx.clone(),
+            );
+        }
         // Consume the immediate initial observation before making the held
         // wait steerable. This clears the runtime's initial observer, so
         // steering cannot leave a stale observer that rejects a later wait.
@@ -395,20 +460,9 @@ impl CodeModeExecuteHandler {
         }
         exec.session.services.elicitations.wait_until_clear().await;
         emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
-        let delivery = (args.deliver && exec.turn.final_output_json_schema.is_none())
-            .then(|| {
-                direct_delivery_text(
-                    &response,
-                    args.max_output_tokens
-                        .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
-                        .min(
-                            exec.turn.config.tool_output_token_limit
-                                .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
-                        )
-                        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
-                )
-            })
-            .flatten();
+        let delivery = exec.session.services.code_mode_service.delivery_for_response(
+            &cell_id, &exec.turn, &response,
+        );
         let mut output = handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .map_err(FunctionCallError::RespondToModel)?;
         if output.success == Some(true)
@@ -478,6 +532,10 @@ impl CodeModeExecuteHandler {
 }
 
 impl CoreToolRuntime for CodeModeExecuteHandler {
+    fn delegates_workspace_admission(&self) -> bool {
+        true
+    }
+
     fn waits_for_runtime_cancellation(&self) -> bool {
         // Cancellation must keep polling the handler through bounded cell
         // termination so the V8/runtime owner cannot be orphaned.
@@ -501,6 +559,26 @@ mod tests {
     use codex_code_mode::CellId;
 
     use super::*;
+
+    #[test]
+    fn direct_delivery_validates_final_schema_and_preserves_media() {
+        use codex_code_mode::FunctionCallOutputContentItem;
+        let response = |items| codex_code_mode::RuntimeResponse::Result {
+            cell_id: CellId::new("delivery".into()),
+            content_items: items,
+            error_text: None,
+            output_loss: None,
+        };
+        let schema = serde_json::json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false});
+        let json = response(vec![FunctionCallOutputContentItem::InputText { text: r#"{"count":2}"#.into() }]);
+        assert_eq!(schema_validated_delivery(&json, 100, Some(&schema)).as_deref(), Some(r#"{"count":2}"#));
+        assert!(schema_validated_delivery(&json, 100, Some(&serde_json::json!({"type":"array"}))).is_none());
+        let image = response(vec![FunctionCallOutputContentItem::InputImage {
+            image_url: "https://example.com/result.png".into(), detail: None,
+        }]);
+        assert_eq!(schema_validated_delivery(&image, 100, None).as_deref(), Some("![image](<https://example.com/result.png>)"));
+        assert!(schema_validated_delivery(&image, 100, Some(&schema)).is_none());
+    }
 
     #[test]
     fn long_poll_timeout_does_not_extend_ordinary_nested_tools() {
@@ -539,6 +617,13 @@ mod tests {
         assert!(definition.input_schema.is_none());
         assert!(definition.output_schema.is_none());
         assert!(definition.description.contains("exec tool declaration:"));
+        let first = handler.catalog_with_timeouts(&HashMap::new(), 60_000);
+        let same = handler.catalog_with_timeouts(&HashMap::new(), 60_000);
+        assert!(Arc::ptr_eq(&first, &same));
+        let changed = handler.catalog_with_timeouts(&HashMap::new(), 300_000);
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(first[0].default_timeout_ms, Some(75_000));
+        assert_eq!(changed[0].default_timeout_ms, Some(315_000));
     }
 
     #[tokio::test]

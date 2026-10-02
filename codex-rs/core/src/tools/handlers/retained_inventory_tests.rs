@@ -608,7 +608,7 @@ async fn dispatch_through_registry(
                 step_context: Arc::clone(&context.step_context),
                 cancellation_token: context.cancellation_token.clone(),
                 tracker: Arc::clone(&context.tracker),
-                call_id: "render-through-registry".to_string(),
+                call_id: format!("render-through-registry-{}", uuid::Uuid::new_v4()),
                 tool_name: ToolName::plain("inventory"),
                 source: ToolCallSource::Direct,
                 payload: ToolPayload::Function {

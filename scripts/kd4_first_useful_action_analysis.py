@@ -11,8 +11,10 @@ from typing import Any, Iterable, Sequence
 
 try:
     from scripts.rollout_snapshot import RolloutSnapshot
+    from scripts.rollout_snapshot import hydrate_rollout_record
 except ImportError:
     from rollout_snapshot import RolloutSnapshot
+    from rollout_snapshot import hydrate_rollout_record
 
 
 CANONICAL_TIMING_SCHEMA_VERSION = 25
@@ -162,9 +164,11 @@ def decoded_records(snapshot: RolloutSnapshot) -> Iterable[Any]:
     with snapshot.open_lines() as handle:
         for line in handle:
             try:
-                yield json.loads(line)
+                record = json.loads(line)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 yield None
+                continue
+            yield hydrate_rollout_record(record, snapshot.path)
 
 
 def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:

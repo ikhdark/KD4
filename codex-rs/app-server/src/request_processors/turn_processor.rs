@@ -1369,7 +1369,14 @@ impl TurnRequestProcessor {
         if !is_startup_interrupt {
             // Core checks identity while claiming terminal ownership. A completed
             // target must never turn this request into an interrupt of its successor.
-            thread.interrupt_turn_if_active(&turn_id).await;
+            if thread.interrupt_turn_if_active(&turn_id).await {
+                // Let the listener acknowledge after terminal side effects (including
+                // pausing queued prompts) have been persisted.
+                if let Some(reservation) = interrupt_reservation {
+                    reservation.disarm();
+                }
+                return Ok(None);
+            }
             let state = self.thread_state_manager.thread_state(thread_uuid).await;
             let needs_response = state.lock().await.finish_interrupt(request_id);
             drop(interrupt_reservation);

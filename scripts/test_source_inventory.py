@@ -27,6 +27,12 @@ class SourceInventoryTests(unittest.TestCase):
         )
         report_root.start()
         self.addCleanup(report_root.stop)
+        recent_index = mock.patch.object(
+            inventory, "recent_index_path",
+            return_value=Path(self.temp.name) / "reports" / "recent.jsonl",
+        )
+        recent_index.start()
+        self.addCleanup(recent_index.stop)
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.root, check=True,
@@ -75,6 +81,70 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual(stdin_result["category_counts"], {"日本語": 1})
         self.assertNotIn("report", stdin_result)
         self.assertNotIn("report", file_result)
+
+    def test_large_path_query_batches_without_losing_deleted_or_untracked_sources(self):
+        paths = tuple(f"dir {i}/café-😀.md" for i in range(8))
+        for i, path in enumerate(paths):
+            self.file(path, tracked=i != 7)
+        (self.root / paths[0]).unlink()
+        expected = inventory.repository_source_records(self.root, paths=paths)
+        real_run = subprocess.run
+        with (
+            mock.patch.object(inventory, "GIT_COMMAND_UNITS", 180),
+            mock.patch.object(inventory.subprocess, "run", wraps=real_run) as run,
+        ):
+            actual = inventory.repository_source_records(self.root, paths=paths)
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual[paths[0]], "deleted")
+        self.assertEqual(actual[paths[-1]], "untracked")
+        self.assertGreater(run.call_count, 1)
+        for call in run.call_args_list:
+            units = len(subprocess.list2cmdline(call.args[0]).encode("utf-16-le")) // 2
+            self.assertLessEqual(units, 180)
+
+    def test_review_resumes_idempotently_and_rejects_premature_completion(self):
+        self.file("a.md", "abcd")
+        result = self.scan_stdin({"categories": [{"name": "source", "paths": ["*.md"], "verification": "path"}]})
+        state_path = Path(result["artifact"])
+        initial = json.loads(state_path.read_text(encoding="utf-8"))
+        update_path = Path(self.temp.name) / "review.json"
+        record = {"path": "a.md", "sha256": initial["files"]["a.md"]["sha256"], "ranges": [[0, 2]]}
+
+        def publish(record, observation=None):
+            update = {"scan_epoch": result["scan_epoch"], "records": [record]}
+            if observation is not None:
+                update["observation"] = observation
+            update_path.write_text(json.dumps(update), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                inventory.main(["--state", str(state_path), "--review", str(update_path)])
+            return json.loads(stdout.getvalue())["review_progress"]
+
+        observation = {"id": "batch-1", "elapsed_ms": 100, "model_input_tokens": 200}
+        progress = publish(record, observation)
+        self.assertEqual(progress["remaining_bytes"], 2)
+        self.assertEqual(progress["reviewed_files"], 0)
+        self.assertEqual(progress["forecast"]["estimated_remaining_read_ms"], 100)
+        self.assertEqual(publish(record, observation), progress)
+        with self.assertRaisesRegex(ValueError, "different contents"):
+            publish(record, {**observation, "elapsed_ms": 200})
+        before = state_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "complete read coverage"):
+            publish({**record, "disposition": "reviewed", "reason": "no issue"})
+        self.assertEqual(state_path.read_bytes(), before)
+        progress = publish({**record, "ranges": [[2, 4]], "disposition": "reviewed", "reason": "complete source review", "findings": ["F1"]},
+                           {"id": "batch-2", "elapsed_ms": 300})
+        self.assertTrue(progress["complete"])
+        self.assertEqual(progress["next_batch"], [])
+        self.assertEqual(progress["forecast"]["observed_elapsed_ms"], 400)
+        self.assertTrue(progress["forecast"]["read_throughput_declining"])
+        self.assertTrue(publish(record, observation)["complete"])
+        restored = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(restored["review"]["a.md"]["findings"], ["F1"])
+        self.file("a.md", "changed")
+        _, refreshed = inventory.inventory(self.root, initial["query"], restored, refresh=True)
+        self.assertEqual(refreshed["review"], {})
+        self.assertEqual(len(refreshed["stale_review"]), 1)
+        self.assertFalse(refreshed["output"]["review_progress"]["complete"])
 
     def test_default_runs_are_unique_across_queries_and_repositories(self):
         self.file("a.md")
@@ -321,6 +391,63 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertFalse(records["src/gone.rs"]["exists"])
         self.assertIsNone(records["nested/target/deep/build.rs"]["exists"])
         self.assertNotIn("nested/target/deep/build.rs", state["files"])
+
+    def test_worktree_deletion_is_reported_without_blocking_delivery(self):
+        self.file("src/kept.rs")
+        self.file("src/gone.rs").unlink()
+        query = {"categories": [{"name": "sources", "paths": ["src/*.rs"],
+                                 "verification": "path"}]}
+        summary = self.scan_stdin(query)
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["unresolved_count"], 0)
+        self.assertEqual(summary["deleted_count"], 1)
+        self.assertTrue(summary["ready_to_render"])
+        self.assertEqual(summary["next_action"], "deliver_report")
+        delivered = json.loads(Path(summary["canonical_paths"]).read_text(encoding="utf-8"))
+        self.assertEqual(delivered["deleted"], ["src/gone.rs"])
+        self.assertNotIn("src/gone.rs", delivered["paths"])
+        report = Path(summary["report"]).read_text(encoding="utf-8")
+        self.assertIn("Deleted in the working tree", report)
+        self.assertIn("src/gone.rs", report)
+        # The deletion is part of the snapshot identity: restoring it changes it.
+        self.git("checkout", "--", "src/gone.rs")
+        restored = self.scan_stdin(query)
+        self.assertNotIn("deleted_count", restored)
+        self.assertNotEqual(restored["source_snapshot_sha256"], summary["source_snapshot_sha256"])
+
+    def test_short_remainder_is_returned_without_another_call(self):
+        self.file("src/a.rs")
+        summary = self.scan_stdin(
+            {"categories": [{"name": "runtime", "paths": ["src/*.rs"]}]})
+        self.assertEqual(summary["unresolved_count"], 1)
+        self.assertEqual(
+            [(r["path"], r["unresolved"]) for r in summary["remaining"]],
+            [("src/a.rs", "runtime consumer requires inspection")],
+        )
+        self.assertIsNone(summary["next_offset"])
+
+    def test_delivered_scope_is_listed_and_reproducible(self):
+        self.file("src/a.rs")
+        self.file("docs/b.md")
+        first = self.scan_stdin(
+            {"categories": [{"name": "rust", "paths": ["*.rs"], "verification": "path"}]})
+        second = self.scan_stdin(
+            {"categories": [{"name": "docs", "paths": ["*.md"], "verification": "path"}]})
+        self.assertNotIn("prior_queries", first)
+        self.assertEqual(
+            [(p["query_id"], p["categories"], p["canonical_paths"])
+             for p in second["prior_queries"]],
+            [(first["query_id"], ["rust"], first["canonical_paths"])],
+        )
+        with (mock.patch.object(tempfile, "tempdir", self.temp.name),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            self.assertEqual(inventory.main([
+                "--root", str(self.root), "--query", first["canonical_paths"],
+            ]), 0)
+        reproduced = json.loads(stdout.getvalue())
+        self.assertEqual(reproduced["query_id"], first["query_id"])
+        self.assertEqual(reproduced["count"], first["count"])
+        self.assertEqual(reproduced["prior_queries"][0]["query_id"], second["query_id"])
 
     def test_reuses_coverage_and_invalidates_only_changed_inputs(self):
         first = self.file("src/a.rs", "first prompt")
@@ -591,7 +718,7 @@ class SourceInventoryTests(unittest.TestCase):
         output, state = inventory.inventory(self.root, query)
         evidence = output["unresolved"][0]["evidence"]["structure"]
         fields = evidence["fields"]["models"]["items"]["0"]["fields"]
-        self.assertEqual(fields["base_instructions"], {"type": "string", "length": len(body)})
+        self.assertEqual(fields["base_instructions"], {"type": "string", "length": len(body), "sha256": inventory.digest(body.encode())})
         self.assertNotIn("SECRET", json.dumps(state))
         state_path = Path(self.temp.name) / "state.json"
         state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -645,7 +772,7 @@ class SourceInventoryTests(unittest.TestCase):
                          ("src/models.json", "catalog", "matched"))
         self.assertEqual(evidence["sha256"], inventory.digest(catalog.read_bytes()))
         self.assertEqual(evidence["structure"]["fields"]["models"]["items"]["0"]["fields"]["prompt"],
-                         {"type": "string", "length": len(body)})
+                         {"type": "string", "length": len(body), "sha256": inventory.digest(body.encode())})
         delivered = json.loads(Path(summary["canonical_paths"]).read_text(encoding="utf-8"))
         self.assertEqual(delivered["json_summaries"], summary["json_summaries"])
         self.assertEqual(delivered["paths"], summary["paths"])
@@ -784,7 +911,7 @@ class SourceInventoryTests(unittest.TestCase):
             inventory.main(["--state", str(state_path), "--render-only", "--report", str(report)])
         delivery = json.loads(Path(json.loads(stdout.getvalue())["canonical_paths"]).read_text(encoding="utf-8"))
         self.assertEqual(delivery["json_summaries"][0]["structure"]["fields"]["prompt"],
-                         {"type": "string", "length": len("private body")})
+                         {"type": "string", "length": len("private body"), "sha256": inventory.digest(b"private body")})
 
     def test_path_pages_keep_counts_readiness_and_report_links(self):
         for index in range(52):

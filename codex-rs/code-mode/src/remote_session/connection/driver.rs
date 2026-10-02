@@ -34,6 +34,12 @@ pub(super) struct DriverLifecycle {
 }
 
 pub(super) struct ConnectionDriver {
+    pub(super) tool_catalog_references: bool,
+    pub(super) named_state_snapshots: bool,
+    catalogs: std::collections::HashMap<
+        codex_code_mode_protocol::host::SessionId,
+        (u64, Arc<[codex_code_mode_protocol::ToolDefinition]>),
+    >,
     command_rx: mpsc::Receiver<DriverCommand>,
     event_rx: mpsc::Receiver<DriverEvent>,
     event_tx: mpsc::Sender<DriverEvent>,
@@ -59,6 +65,9 @@ impl ConnectionDriver {
         let (execute_claim_tx, execute_claim_rx) = mpsc::unbounded_channel();
         (
             Self {
+                tool_catalog_references: false,
+                named_state_snapshots: false,
+                catalogs: std::collections::HashMap::new(),
                 command_rx,
                 event_rx,
                 event_tx: event_tx.clone(),

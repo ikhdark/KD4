@@ -324,6 +324,11 @@ core-test-list:
 core-test-plan name:
     @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" plan "{{ name }}"
 
+# List the gates whose declared tests live in the modules owning changed Rust files.
+[no-cd]
+core-test-gates-for +paths:
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" gates-for {{ paths }}
+
 # Validate the manifest against `cargo metadata --no-deps` without building tests.
 [no-cd]
 core-test-manifest-check:

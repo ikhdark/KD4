@@ -71,7 +71,7 @@ pub struct ApplyPatchRuntime {
     mutation_finalization_attempted: bool,
     mutation_repo_root: Option<PathBuf>,
     mutation_repo_paths: Vec<String>,
-    workspace_operation_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
+    workspace_operation_permit: Option<crate::scoped_workspace_gate::WorkspaceLease>,
     mutation_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mutation_evidence_failures: usize,
 }
@@ -88,7 +88,7 @@ impl ApplyPatchRuntime {
     }
 
     pub(crate) fn with_workspace_operation_permit(
-        workspace_operation_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
+        workspace_operation_permit: Option<crate::scoped_workspace_gate::WorkspaceLease>,
     ) -> Self {
         Self {
             workspace_operation_permit,
@@ -484,16 +484,18 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             .store(true, std::sync::atomic::Ordering::Release);
         let result = async {
             if self.workspace_operation_permit.is_none() {
+                let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
+                let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("patch_gate_wait");
                 self.workspace_operation_permit = Some(tokio::select! {
                     biased;
                     _ = req.cancellation_token.cancelled() => {
                         self.finish_mutation_evidence(ctx, true).await;
                         return Err(ToolError::Codex(CodexErr::TurnAborted));
                     }
-                    permit = crate::workspace_operation_gate::acquire_patch_operation(
+                    permit = crate::workspace_operation_gate::acquire_patch_operation_with_timeout(
                         &req.turn_environment.environment,
                         &req.action.cwd,
-                    ) => permit,
+                    ) => permit.map_err(|error| ToolError::Denied(error.to_string()))?,
                 });
             }
             if let Err(error) = self.begin_mutation_evidence(req, ctx).await {

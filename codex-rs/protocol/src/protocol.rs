@@ -1746,6 +1746,11 @@ pub struct ContextCompactedEvent;
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTiming {
+    /// Observed starting minus ending account credit balance, not an isolated
+    /// invoice: concurrent turns, replenishments, or delayed reports may affect it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub credit_delta: Option<String>,
     /// Content identity of tracked and non-ignored untracked files captured
     /// before this turn's tools ran. Absent means capture was unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4343,6 +4348,18 @@ pub struct SessionBuildInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub executable_sha256: Option<String>,
+    /// Measurement names bind estimator and representation scope. Missing in
+    /// older rollouts means unknown, not compatible with the current estimator.
+    /// Compare ratios only within matching estimator AND scope; provider usage
+    /// is not a local token estimate.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub token_accounting: BTreeMap<String, SessionTokenMeasurement>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SessionTokenMeasurement {
+    pub estimator: String,
+    pub scope: String,
 }
 
 /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
@@ -4474,6 +4491,27 @@ pub struct SamplingBoundaryItem {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub unresolved_context: bool,
+    /// Model-invisible observation before dispatch, never a terminal result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing_checkpoint: Option<SamplingTimingCheckpoint>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SamplingTimingCheckpoint {
+    pub observed_at_unix_ms: i64,
+    /// All time and effects after this observation are unknown after process loss.
+    pub tail_unknown: bool,
+    pub timing: TurnTiming,
+    /// Versioned SHA-256 identities of captured config layers, effective turn
+    /// settings, selected model metadata, and the dispatched tool manifest.
+    /// These describe runtime inputs, not the repository being edited. Missing
+    /// entries are unavailable observations, never evidence of equality.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runtime_identity: BTreeMap<String, String>,
+    /// Captured from this process even when SessionMeta belongs to an older
+    /// process that created the rollout before resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_build: Option<SessionBuildInfo>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]

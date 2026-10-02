@@ -495,8 +495,8 @@ async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
     assert_eq!(consumed_exposure.items, canonical);
 
     let fresh_call_id = "fresh-code-mode-output";
-    let fresh_input = "text('x '.repeat(6000));";
-    let fresh_output = "x ".repeat(6_000);
+    let fresh_input = "text('abc '.repeat(6000));";
+    let fresh_output = "abc ".repeat(6_000);
     let raw_tokens = approx_token_count(&raw_registry_output);
     let fresh_tokens = approx_token_count(&fresh_output);
     assert_eq!(fresh_tokens, 6_000);
@@ -2773,7 +2773,7 @@ async fn incompatible_tool_payload_is_recoverable_without_execution() {
             definition: "start: /.+/".to_string(),
         },
     });
-    for (spec, wrong, correct, expected) in [
+    for (index, (spec, wrong, correct, expected)) in [
         (
             test_spec(&name),
             custom_payload.clone(),
@@ -2786,7 +2786,7 @@ async fn incompatible_tool_payload_is_recoverable_without_execution() {
             custom_payload,
             "expected raw text",
         ),
-    ] {
+    ].into_iter().enumerate() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let registry = ToolRegistry::from_tools([Arc::new(RecoveryFormatHandler {
             spec,
@@ -2795,7 +2795,7 @@ async fn incompatible_tool_payload_is_recoverable_without_execution() {
         let mut invocation = test_invocation(
             Arc::clone(&session),
             Arc::clone(&turn),
-            "wrong-format",
+            &format!("wrong-format-{index}"),
             name.clone(),
         );
         invocation.payload = wrong;
@@ -2812,7 +2812,7 @@ async fn incompatible_tool_payload_is_recoverable_without_execution() {
         let mut invocation = test_invocation(
             Arc::clone(&session),
             Arc::clone(&turn),
-            "correct-format",
+            &format!("correct-format-{index}"),
             name.clone(),
         );
         invocation.payload = correct;
@@ -3826,7 +3826,11 @@ async fn cancellation_during_projection_does_not_publish_completed_lifecycle() -
         simulated_abort_claimed,
         "unfinished projection remains cancellable"
     );
-    assert_eq!(err.to_string(), "tool cancelled after runtime cleanup");
+    let recovery: serde_json::Value = serde_json::from_str(&err.to_string())?;
+    assert_eq!(recovery["kind"], "handler_result");
+    assert_eq!(recovery["call_id"], "projection-call");
+    assert_eq!(recovery["result"], "ordinary result");
+    assert!(recovery["message"].as_str().unwrap().contains("tool cancelled after runtime cleanup"));
     assert_eq!(
         projection_calls.load(std::sync::atomic::Ordering::Acquire),
         1,
@@ -3851,10 +3855,10 @@ async fn projection_failure_preserves_completed_lifecycle_and_returns_bounded_no
 -> anyhow::Result<()> {
     let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
     let temp = tempfile::tempdir()?;
-    let blocked_home = temp.path().join("not-a-directory");
-    tokio::fs::write(&blocked_home, b"blocked").await?;
+    // Leave the effect journal writable; fail only result artifact persistence.
+    tokio::fs::write(temp.path().join("tool-output"), b"blocked").await?;
     let mut config = (*turn.config).clone();
-    config.codex_home = codex_utils_absolute_path::AbsolutePathBuf::try_from(blocked_home)?;
+    config.codex_home = codex_utils_absolute_path::AbsolutePathBuf::try_from(temp.path())?;
     turn.config = Arc::new(config);
 
     let records = Arc::new(std::sync::Mutex::new(Vec::new()));

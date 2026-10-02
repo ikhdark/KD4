@@ -1880,11 +1880,21 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
         .iter()
         .map(|handshake| handshake.header(USER_AGENT_HEADER))
         .collect();
+    let version = env!("CARGO_PKG_VERSION");
+    let expected_user_agent = codex_login::default_client::get_codex_user_agent();
+    let expected_user_agent = match codex_models_manager::source_build_client_version(version) {
+        Some(baseline) => expected_user_agent.replacen(
+            &format!("/{version} "),
+            &format!("/{baseline} "),
+            1,
+        ),
+        None => expected_user_agent,
+    };
     assert_eq!(
         handshake_user_agents,
         vec![
-            Some(codex_login::default_client::get_codex_user_agent()),
-            Some(codex_login::default_client::get_codex_user_agent()),
+            Some(expected_user_agent.clone()),
+            Some(expected_user_agent),
         ]
     );
 

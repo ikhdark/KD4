@@ -13,12 +13,31 @@ const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
 pub(super) const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
 pub(super) const PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX: &str = concat!(
     "A previous agent produced the plan below to accomplish the user's task. ",
-    "Implement the plan in a fresh context. Treat the plan as the source of ",
-    "user intent, re-read files as needed, and carry the work through ",
+    "Implement the plan in a fresh context. Preserve the user's original intent ",
+    "and constraints, re-read files as needed, and carry the work through ",
     "implementation and verification."
+);
+pub(super) const PLAN_IMPLEMENTATION_USER_MESSAGES_HEADER: &str = concat!(
+    "The plan summarizes the user's intent. The user's own messages from the planning ",
+    "conversation follow; they take precedence where the plan omits or contradicts them."
 );
 pub(super) const PLAN_IMPLEMENTATION_DEFAULT_UNAVAILABLE: &str = "Default mode unavailable";
 pub(super) const PLAN_IMPLEMENTATION_NO_APPROVED_PLAN: &str = "No approved plan available";
+
+/// A fresh context keeps only what this message carries, so the user's stated
+/// constraints travel with the model-authored plan instead of being replaced by it.
+fn clear_context_handoff_text(plan_markdown: &str, user_messages: &[&str]) -> String {
+    let mut text = format!("{PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX}\n\n{plan_markdown}");
+    if user_messages.is_empty() {
+        return text;
+    }
+    text.push_str("\n\n");
+    text.push_str(PLAN_IMPLEMENTATION_USER_MESSAGES_HEADER);
+    for (index, message) in user_messages.iter().enumerate() {
+        text.push_str(&format!("\n\n{}. {message}", index + 1));
+    }
+    text
+}
 
 /// Builds the confirmation prompt shown after a plan is approved in Plan mode.
 ///
@@ -28,6 +47,7 @@ pub(super) const PLAN_IMPLEMENTATION_NO_APPROVED_PLAN: &str = "No approved plan 
 pub(super) fn selection_view_params(
     default_mask: Option<CollaborationModeMask>,
     plan_markdown: Option<&str>,
+    user_messages: &[&str],
     clear_context_usage_label: Option<&str>,
 ) -> SelectionViewParams {
     let (implement_actions, implement_disabled_reason) = match default_mask.clone() {
@@ -54,8 +74,7 @@ pub(super) fn selection_view_params(
             Some(PLAN_IMPLEMENTATION_DEFAULT_UNAVAILABLE.to_string()),
         ),
         (Some(_), Some(plan_markdown)) if !plan_markdown.trim().is_empty() => {
-            let user_text =
-                format!("{PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX}\n\n{plan_markdown}");
+            let user_text = clear_context_handoff_text(plan_markdown, user_messages);
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                 tx.send(AppEvent::ClearUiAndSubmitUserMessage {
                     text: user_text.clone(),

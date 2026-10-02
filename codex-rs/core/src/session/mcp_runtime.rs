@@ -336,6 +336,9 @@ mod tests {
         assert!(!Arc::ptr_eq(&old_runtime, &replacement));
         assert!(replacement.manager().list_all_tools().await.is_empty());
         assert!(resources.server_cache_key("lifecycle").is_none());
+        // A turn now freezes its runtime too. Leave the step as the only owner
+        // of that turn lease before testing the final snapshot release.
+        drop(turn_context);
         let mut old_runtime = Some(old_runtime);
         for message in [
             "snapshot and step retain the connection",

@@ -19,7 +19,6 @@ use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use core_test_support::TempDirExt;
 use core_test_support::require_network;
@@ -72,14 +71,15 @@ fn assert_eq_without_metadata(left: serde_json::Value, right: serde_json::Value)
     );
 }
 
-fn persisted_reasoning_items(path: &Path) -> Vec<ResponseItem> {
-    fs::read_to_string(path)
-        .expect("read rollout")
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            let rollout_line: RolloutLine = serde_json::from_str(line).expect("parse rollout line");
-            match rollout_line.item {
+async fn persisted_reasoning_items(path: &Path) -> Vec<ResponseItem> {
+    let (items, _, parse_errors) = codex_rollout::RolloutRecorder::load_rollout_items(path)
+        .await
+        .expect("read rollout");
+    assert_eq!(parse_errors, 0, "invalid rollout records");
+    items
+        .into_iter()
+        .filter_map(|item| {
+            match item {
                 RolloutItem::ResponseItem(item @ ResponseItem::Reasoning { .. }) => Some(item),
                 _ => None,
             }
@@ -454,7 +454,7 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> anyhow::Result<()> {
+async fn overrides_turn_context_preserve_history_and_update_cache_routing() -> anyhow::Result<()> {
     require_network!();
     use pretty_assertions::assert_eq;
 
@@ -532,10 +532,11 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
     let request2 = req2.single_request();
     let body1 = request1.body_json();
     let body2 = request2.body_json();
-    // prompt_cache_key should remain constant across overrides
-    assert_eq!(
+    // Permission changes alter the exposed tool schemas and their cache identity.
+    assert_ne!(body1["tools"], body2["tools"]);
+    assert_ne!(
         body1["prompt_cache_key"], body2["prompt_cache_key"],
-        "prompt_cache_key should not change across overrides"
+        "different tool prefixes must use different cache routing keys"
     );
 
     let first_permissions = message_texts(&body1, "developer")
@@ -587,7 +588,15 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex().build(&server).await?;
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(|config| {
+            config.model_catalog = Some(
+                codex_models_manager::test_support::test_models_response()
+                    .expect("model-switch fixture catalog"),
+            );
+        })
+        .build(&server)
+        .await?;
 
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
@@ -736,7 +745,7 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Result<()> {
+async fn per_turn_overrides_preserve_history_and_update_cache_routing() -> anyhow::Result<()> {
     require_network!();
     use pretty_assertions::assert_eq;
 
@@ -811,10 +820,11 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
     let body1 = request1.body_json();
     let body2 = request2.body_json();
 
-    // prompt_cache_key should remain constant across per-turn overrides
-    assert_eq!(
+    // The model is part of the stable-prefix cache identity.
+    assert_ne!(body1["model"], body2["model"]);
+    assert_ne!(
         body1["prompt_cache_key"], body2["prompt_cache_key"],
-        "prompt_cache_key should not change across per-turn overrides"
+        "different models must use different cache routing keys"
     );
 
     let first_permissions = message_texts(&body1, "developer")
@@ -1170,7 +1180,7 @@ async fn resolved_reasoning_is_evicted_after_next_instruction_but_persisted_in_r
     assert!(request_3_reasoning[1]["encrypted_content"].is_string());
 
     test.codex.flush_rollout().await?;
-    let persisted_reasoning = persisted_reasoning_items(&rollout_path);
+    let persisted_reasoning = persisted_reasoning_items(&rollout_path).await;
     assert_eq!(persisted_reasoning.len(), 2);
     for (item, expected_summary, expected_plaintext) in [
         (&persisted_reasoning[0], "summary one", "plaintext one"),

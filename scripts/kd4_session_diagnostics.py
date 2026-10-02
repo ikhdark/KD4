@@ -138,6 +138,12 @@ def tool_observation(name: str, arguments: str, output: str) -> dict[str, Any]:
         )
         exit_code = int(match[1]) if match else None
     command = tool in ("exec_command", "shell_command", "shell", "write_stdin")
+    environment_crash = (
+        command and type(exit_code) is int and (exit_code & 0xFFFFFFFF) in {
+            0xC0000005, 0xC000001D, 0xC0000094, 0xC00000FD,
+            0xC0000135, 0xC0000142, 0xC0000374, 0xC0000409, 0x80000003,
+        }
+    )
     checkpoint_useful = None
     if result.get("changed") is False:
         checkpoint_useful = False
@@ -151,6 +157,7 @@ def tool_observation(name: str, arguments: str, output: str) -> dict[str, Any]:
         "signature": hashlib.sha256((name + "\0" + arguments).encode()).hexdigest(),
         "command": command,
         "commandFailed": exit_code != 0 if command and type(exit_code) is int else None,
+        "environmentCrash": environment_crash if command and type(exit_code) is int else None,
         "mayHideCommands": tool in ("exec", "wait"),
         "checkpoint": tool == "context_checkpoint",
         "checkpointUseful": checkpoint_useful,
@@ -290,8 +297,9 @@ def _turn_metrics(record: dict, turn: dict, coverage: dict, annotation: dict) ->
         for name, rows, key in (
             ("usefulCheckpoints", checkpoints, "checkpointUseful"),
             ("failedCommands", commands, "commandFailed"),
+            ("environmentCrashes", commands, "environmentCrash"),
         ):
-            if all(type(row[key]) is bool for row in rows):
+            if all(type(row.get(key)) is bool for row in rows):
                 metrics[name] = sum(row[key] for row in rows)
         if any(row.get("mayHideCommands") for row in observations):
             # A successful JS wrapper is not evidence of successful children.
@@ -570,6 +578,69 @@ def compare_diagnostics(
     }
 
 
+def gate_metric_names() -> frozenset[str]:
+    return frozenset(_METRICS) | frozenset(_DERIVED_UNITS)
+
+
+def regression_gate(comparison: dict[str, Any], metrics: list[str]) -> dict[str, Any]:
+    """Gate a baseline comparison on explicitly selected metrics.
+
+    Ratios measure answer and evidence quality, so a drop regresses; every other
+    unit is a cost, so a rise regresses. A selected metric that is unavailable in
+    any cohort, or never compared, is insufficient evidence, never a pass.
+    """
+    selected = sorted(set(metrics))
+    unknown = [name for name in selected if name not in gate_metric_names()]
+    if not selected or unknown:
+        raise ValueError(
+            f"unknown gate metrics {unknown}; choose from {sorted(gate_metric_names())}"
+            if unknown
+            else "a regression gate needs at least one metric"
+        )
+    units = {name: spec[0] for name, spec in _METRICS.items()} | _DERIVED_UNITS
+    rows = [row for row in comparison["metrics"] if row["metric"] in selected]
+    regressions = [
+        row
+        for row in rows
+        if row["status"]
+        == ("decreased" if units[row["metric"]] == "ratio" else "increased")
+    ]
+    unavailable = [row for row in rows if row["status"] == "unavailable"]
+    compared = {row["metric"] for row in rows if row["status"] != "unavailable"}
+    unmeasured = [name for name in selected if name not in compared]
+    if regressions:
+        status = "regression"
+    elif unavailable or unmeasured or comparison["unmatchedBaselineCohorts"]:
+        status = "insufficient_evidence"
+    else:
+        status = "passed"
+    policy = {
+        "schemaVersion": 1,
+        "metrics": selected,
+        "directions": {
+            name: "higher_is_better" if units[name] == "ratio" else "lower_is_better"
+            for name in selected
+        },
+        "minSamples": comparison["minSamples"],
+        "relativeThreshold": comparison["relativeThreshold"],
+        "absoluteThresholds": comparison["absoluteThresholds"],
+    }
+    return {
+        "status": status,
+        "metrics": selected,
+        "policy": policy,
+        "policySha256": hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "unmatchedBaselineCohorts": comparison["unmatchedBaselineCohorts"],
+        "regressionCount": len(regressions),
+        "unavailableCount": len(unavailable),
+        "unmeasuredMetrics": unmeasured,
+        "regressions": regressions,
+        "unavailable": unavailable,
+    }
+
+
 def render_diagnostics(report: dict[str, Any]) -> list[str]:
     diagnostics = report.get("sessionDiagnostics")
     if diagnostics is None:
@@ -624,5 +695,13 @@ def render_diagnostics(report: dict[str, Any]) -> list[str]:
         if len(changes) > 12:
             lines.append(
                 f"  {len(changes) - 12} additional comparison rows in JSON output"
+            )
+        gate = comparison.get("gate")
+        if gate is not None:
+            lines.append(
+                f"regression gate: {gate['status']} for {', '.join(gate['metrics'])}; "
+                f"regressions={gate['regressionCount']} "
+                f"unavailable={gate['unavailableCount']} "
+                f"unmeasured={gate['unmeasuredMetrics']}"
             )
     return lines

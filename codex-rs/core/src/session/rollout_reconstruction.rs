@@ -23,6 +23,7 @@ pub(crate) fn is_unified_exec_resume_invalidation(item: &ResponseItem) -> bool {
 pub(super) struct RolloutReconstruction {
     pub(super) history: Vec<ResponseItem>,
     pub(super) plan: Option<UpdatePlanArgs>,
+    pub(super) plan_lineage: Option<crate::plan_store::PlanLineage>,
     pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
@@ -185,6 +186,7 @@ enum TurnReferenceContextItem {
 struct ActiveReplaySegment<'a> {
     turn_id: Option<String>,
     plan: Option<UpdatePlanArgs>,
+    plan_lineage: Option<crate::plan_store::PlanLineage>,
     counts_as_user_turn: bool,
     previous_turn_settings: Option<PreviousTurnSettings>,
     reference_context_item: TurnReferenceContextItem,
@@ -204,6 +206,7 @@ struct ReplacementCheckpoint<'a> {
 
 struct FinalizedReplayState<'items, 'state> {
     plan: &'state mut Option<UpdatePlanArgs>,
+    plan_lineage: &'state mut Option<crate::plan_store::PlanLineage>,
     base_replacement_history: &'state mut Option<&'items [ResponseItem]>,
     rollout_suffix: &'state mut &'items [RolloutItem],
     discarded_history_effect_indexes: &'state mut HashSet<usize>,
@@ -227,6 +230,7 @@ fn finalize_active_segment<'a>(
 ) {
     let FinalizedReplayState {
         plan,
+        plan_lineage,
         base_replacement_history,
         rollout_suffix,
         discarded_history_effect_indexes,
@@ -252,6 +256,7 @@ fn finalize_active_segment<'a>(
     world_state_replay.extend(active_segment.world_state_replay);
     if plan.is_none() {
         *plan = active_segment.plan;
+        *plan_lineage = active_segment.plan_lineage;
     }
     *surviving_compaction_count =
         (*surviving_compaction_count).saturating_add(active_segment.compaction_count);
@@ -331,6 +336,7 @@ impl Session {
         });
         let mut base_replacement_history: Option<&[ResponseItem]> = None;
         let mut plan = None;
+        let mut plan_lineage = None;
         let update_plan_call_ids =
             rollout_items
                 .iter()
@@ -343,7 +349,9 @@ impl Session {
                 .collect::<HashSet<_>>();
         let has_plan_updates = rollout_items
             .iter()
-            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::PlanUpdate(_))))
+            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::PlanUpdate(_)))
+                || matches!(item, RolloutItem::ResponseItem(response)
+                    if crate::plan_store::plan_snapshot_from_item(response).is_some()))
             || !update_plan_call_ids.is_empty();
         let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
@@ -524,6 +532,7 @@ impl Session {
                             active_segment,
                             FinalizedReplayState {
                                 plan: &mut plan,
+                                plan_lineage: &mut plan_lineage,
                                 base_replacement_history: &mut base_replacement_history,
                                 rollout_suffix: &mut rollout_suffix,
                                 discarded_history_effect_indexes:
@@ -545,6 +554,13 @@ impl Session {
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.history_effect_indexes.push(index);
                     active_segment.counts_as_user_turn |= is_user_turn_boundary(response_item);
+                    if active_segment.plan_lineage.is_none()
+                        && let Some(snapshot) = crate::plan_store::plan_snapshot_from_item(response_item)
+                        && active_segment.plan.as_ref().is_none_or(|plan| plan == &snapshot.current_plan)
+                    {
+                        active_segment.plan = Some(snapshot.current_plan);
+                        active_segment.plan_lineage = Some(snapshot.lineage);
+                    }
                     // Events and legacy direct outputs share chronological and
                     // rollback ordering; neither representation is always newer.
                     // Eventless histories apply rollback during forward history
@@ -556,7 +572,10 @@ impl Session {
                         } = response_item
                         && update_plan_call_ids.contains(call_id.as_str())
                     {
-                        active_segment.plan = crate::plan_store::plan_from_tool_output(output);
+                        if let Some(response) = crate::plan_store::plan_response_from_tool_output(output) {
+                            active_segment.plan = Some(response.current_plan);
+                            active_segment.plan_lineage = Some(response.lineage);
+                        }
                     }
                 }
                 RolloutItem::InterAgentCommunication(_) => {
@@ -581,6 +600,7 @@ impl Session {
                     active_segment,
                     FinalizedReplayState {
                         plan: &mut plan,
+                        plan_lineage: &mut plan_lineage,
                         base_replacement_history: &mut base_replacement_history,
                         rollout_suffix: &mut rollout_suffix,
                         discarded_history_effect_indexes: &mut discarded_history_effect_indexes,
@@ -614,6 +634,7 @@ impl Session {
                 active_segment,
                 FinalizedReplayState {
                     plan: &mut plan,
+                    plan_lineage: &mut plan_lineage,
                     base_replacement_history: &mut base_replacement_history,
                     rollout_suffix: &mut rollout_suffix,
                     discarded_history_effect_indexes: &mut discarded_history_effect_indexes,
@@ -651,7 +672,11 @@ impl Session {
             }
             match item {
                 RolloutItem::ResponseItem(response_item) => {
-                    history.record_items(std::iter::once(response_item), truncation_policy);
+                    // Durable plan state is replay metadata, not another model
+                    // message or a second tool result.
+                    if crate::plan_store::plan_snapshot_from_item(response_item).is_none() {
+                        history.record_items(std::iter::once(response_item), truncation_policy);
+                    }
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
                     let response_item = communication.to_model_input_item();
@@ -754,6 +779,7 @@ impl Session {
         RolloutReconstruction {
             history: history.into_raw_items(),
             plan,
+            plan_lineage,
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,

@@ -22,7 +22,7 @@ use crate::tools::handlers::command_search::RgSearchBreadth;
 use crate::tools::handlers::command_search::RgSearchNarrowing;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
-const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 3;
+const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 4;
 const COMMAND_FINGERPRINT_VERSION: &str = "v2";
 static NEXT_COMMAND_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -286,6 +286,7 @@ pub(crate) struct CommandAttemptBlocked {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CommandAttemptBlockedReason {
     DeterministicFailure(DeterministicFailureRecord),
+    PersistedInputFailure(PersistedInputFailure),
     SearchMiss,
 }
 
@@ -309,6 +310,10 @@ impl CommandAttemptBlocked {
                     prior_failure.exit_code,
                 )
             }
+            CommandAttemptBlockedReason::PersistedInputFailure(failure) => format!(
+                "Command suppressed: this exact input and execution context previously produced an input-determined `{}` rejection (fingerprint `{}`, exit code {}). This is a persisted failure receipt, not a fresh execution or filesystem observation. Correct the invocation before retrying.",
+                failure.proof.outcome_class(), self.fingerprint, failure.exit_code,
+            ),
             CommandAttemptBlockedReason::SearchMiss => format!(
                 "Search returned no matches: an equivalent search already produced a negative result under the unchanged repository and execution context (fingerprint `{}`); execution was suppressed. Change the query or scope, or use read_file or list_files when available to revalidate current filesystem evidence when external state changed.",
                 self.fingerprint,
@@ -321,7 +326,7 @@ impl CommandAttemptBlocked {
 /// mutable filesystem state is inspected. Keep this enum closed: ordinary
 /// command failures and filesystem-dependent patch verification must remain
 /// retryable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum InputStateDetermined {
     ApplyPatchImplicitInvocation,
     ApplyPatchEnvironmentIdMismatch,
@@ -368,6 +373,14 @@ impl DeterministicFailureRecord {
     }
 }
 
+/// Only closed, input-determined rejection classes survive restart. Arbitrary
+/// command failures and their possibly expired artifact handles never do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedInputFailure {
+    proof: InputStateDetermined,
+    exit_code: i32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AttemptEntry {
     attempts: u32,
@@ -401,6 +414,7 @@ struct CommandCompletionReceipt {
 struct CommandExecutionPersistence {
     cache_path: PathBuf,
     cwd: PathBuf,
+    effect_journal_directory: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +422,8 @@ struct CommandExecutionCacheDocument {
     schema_version: u32,
     workspace_identity: crate::git_workspace::WorkspaceEvidenceIdentity,
     search_misses: Vec<SearchMissCacheKey>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    input_failures: BTreeMap<String, PersistedInputFailure>,
 }
 
 #[derive(Default)]
@@ -450,6 +466,8 @@ struct PendingTypedMutationBaseline {
 struct CommandRetryState {
     attempts: HashMap<CommandAttemptKey, AttemptEntry>,
     insertion_order: VecDeque<CommandAttemptKey>,
+    input_failures: BTreeMap<String, PersistedInputFailure>,
+    revision: u64,
 }
 
 #[derive(Default)]
@@ -463,7 +481,7 @@ struct CommandSearchState {
 
 #[derive(Default)]
 struct CommandExecutionState {
-    persisted_revision: Option<(crate::git_workspace::WorkspaceEvidenceIdentity, u64)>,
+    persisted_revision: Option<(crate::git_workspace::WorkspaceEvidenceIdentity, u64, u64)>,
     retry: CommandRetryState,
     process: CommandProcessState,
     repository: CommandRepositoryState,
@@ -475,6 +493,7 @@ pub(crate) struct CommandExecutionLedger {
     workspace_identity_refresh: tokio::sync::Semaphore,
     persistence: Option<CommandExecutionPersistence>,
     cache_persist: Arc<Mutex<()>>,
+    effect_recovery: tokio::sync::OnceCell<Option<serde_json::Value>>,
     #[cfg(test)]
     cache_commit_count: AtomicU64,
     #[cfg(test)]
@@ -496,6 +515,7 @@ impl Default for CommandExecutionLedger {
             workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
             persistence: None,
             cache_persist: Arc::new(Mutex::new(())),
+            effect_recovery: tokio::sync::OnceCell::new(),
             #[cfg(test)]
             cache_commit_count: AtomicU64::new(0),
             #[cfg(test)]
@@ -517,12 +537,14 @@ impl CommandExecutionLedger {
                 .join("command-execution-cache")
                 .join(format!("{thread_id}.json")),
             cwd: cwd.to_path_buf(),
+            effect_journal_directory: codex_home.join("effect-journal").join(&thread_id),
         };
         Self {
             state: Mutex::new(CommandExecutionState::default()),
             workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
             persistence: Some(persistence),
             cache_persist: Arc::new(Mutex::new(())),
+            effect_recovery: tokio::sync::OnceCell::new(),
             #[cfg(test)]
             cache_commit_count: AtomicU64::new(0),
             #[cfg(test)]
@@ -530,6 +552,13 @@ impl CommandExecutionLedger {
             #[cfg(test)]
             cache_persist_test_gate: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) async fn effect_recovery(&self) -> Option<serde_json::Value> {
+        let persistence = self.persistence.as_ref()?;
+        self.effect_recovery.get_or_init(|| {
+            crate::tools::effect_journal::recover(persistence.effect_journal_directory.clone())
+        }).await.clone()
     }
 
     pub(crate) async fn admit_search_narrowing(
@@ -771,7 +800,7 @@ impl CommandExecutionLedger {
                         serde_json::from_slice::<CommandExecutionCacheDocument>(&bytes).ok()
                     })
                     .filter(|document| {
-                        document.schema_version == COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
+                        matches!(document.schema_version, 3 | COMMAND_EXECUTION_CACHE_SCHEMA_VERSION)
                     }),
                 None => None,
             }
@@ -812,7 +841,9 @@ impl CommandExecutionLedger {
                     .as_ref()
                     .is_some_and(|(_, identity)| identity == &document.workspace_identity)
                     && state.search.miss_order.is_empty()
-                    && document.search_misses.len() <= MAX_TRACKED_COMMANDS;
+                    && document.search_misses.len() <= MAX_TRACKED_COMMANDS
+                    && state.retry.input_failures.is_empty()
+                    && document.input_failures.len() <= MAX_TRACKED_COMMANDS;
                 for search_miss in document
                     .search_misses
                     .into_iter()
@@ -823,9 +854,18 @@ impl CommandExecutionLedger {
                         state.search.revision = state.search.revision.wrapping_add(1);
                     }
                 }
+                for (fingerprint, failure) in document.input_failures.into_iter().take(MAX_TRACKED_COMMANDS) {
+                    if let std::collections::btree_map::Entry::Vacant(entry) = state.retry.input_failures.entry(fingerprint) {
+                        entry.insert(failure);
+                        state.retry.revision = state.retry.revision.wrapping_add(1);
+                    }
+                }
+                while state.retry.input_failures.len() > MAX_TRACKED_COMMANDS {
+                    state.retry.input_failures.pop_first();
+                }
                 if complete_document {
                     state.persisted_revision =
-                        Some((document.workspace_identity, state.search.revision));
+                        Some((document.workspace_identity, state.search.revision, state.retry.revision));
                 }
             }
         }
@@ -897,6 +937,13 @@ impl CommandExecutionLedger {
                     reason: CommandAttemptBlockedReason::DeterministicFailure(prior_failure),
                 });
             }
+            let fingerprint = key.fingerprint();
+            if let Some(failure) = state.retry.input_failures.get(&fingerprint) {
+                return Err(CommandAttemptBlocked {
+                    fingerprint,
+                    reason: CommandAttemptBlockedReason::PersistedInputFailure(failure.clone()),
+                });
+            }
             if let Some(search_miss_key) = key.search_miss_cache_key()
                 && state.search.misses.contains(&search_miss_key)
             {
@@ -935,6 +982,13 @@ impl CommandExecutionLedger {
         entry.deterministic_failure = Some(
             DeterministicFailureRecord::from_input_state_determined(proof, evidence, exit_code),
         );
+        state.retry.input_failures.insert(key.fingerprint(), PersistedInputFailure { proof, exit_code });
+        while state.retry.input_failures.len() > MAX_TRACKED_COMMANDS {
+            state.retry.input_failures.pop_first();
+        }
+        state.retry.revision = state.retry.revision.wrapping_add(1);
+        drop(state);
+        self.persist_cache().await;
     }
 
     #[cfg(test)]
@@ -1085,7 +1139,7 @@ impl CommandExecutionLedger {
             return;
         };
         let commit_guard = Arc::clone(&self.cache_persist).lock_owned().await;
-        let Some((workspace_identity, search_revision, search_misses)) = ({
+        let Some((workspace_identity, search_revision, retry_revision, search_misses, input_failures)) = ({
             let state = self.state.lock().await;
             state
                 .repository
@@ -1096,15 +1150,18 @@ impl CommandExecutionLedger {
                     state
                         .persisted_revision
                         .as_ref()
-                        .is_none_or(|(persisted, revision)| {
+                        .is_none_or(|(persisted, revision, retry_revision)| {
                             persisted != identity || *revision != state.search.revision
+                                || *retry_revision != state.retry.revision
                         })
                 })
                 .map(|(_, workspace_identity)| {
                     (
                         workspace_identity.clone(),
                         state.search.revision,
+                        state.retry.revision,
                         state.search.miss_order.iter().cloned().collect::<Vec<_>>(),
+                        state.retry.input_failures.clone(),
                     )
                 })
         }) else {
@@ -1114,6 +1171,7 @@ impl CommandExecutionLedger {
             schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
             workspace_identity: workspace_identity.clone(),
             search_misses,
+            input_failures,
         };
         let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
             return;
@@ -1123,7 +1181,7 @@ impl CommandExecutionLedger {
                 #[cfg(test)]
                 self.cache_commit_count.fetch_add(1, Ordering::Relaxed);
                 self.state.lock().await.persisted_revision =
-                    Some((workspace_identity, search_revision));
+                    Some((workspace_identity, search_revision, retry_revision));
             }
             Err(error) => tracing::warn!(%error, "failed to persist command execution cache"),
         }
@@ -1581,6 +1639,11 @@ fn record_search_result_locked(
 }
 
 fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey, exit_code: i32) {
+    // A fresh execution supersedes a cached diagnosis, even if it failed for a
+    // different reason. Never promote an ordinary failure into semantic memory.
+    if state.retry.input_failures.remove(&key.fingerprint()).is_some() {
+        state.retry.revision = state.retry.revision.wrapping_add(1);
+    }
     let entry = attempt_entry_locked(state, key);
     entry.last_exit_code = Some(exit_code);
     if exit_code == 0 {
@@ -2231,7 +2294,12 @@ mod tests {
 
     #[tokio::test]
     async fn input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses() {
-        let ledger = CommandExecutionLedger::default();
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        let home = temp.path().join("home");
+        initialize_git_repository(&repository);
+        let ledger = CommandExecutionLedger::load_or_new(home.clone(), "thread".into(), &repository).await;
+        ledger.observe_repository_revision("turn-a", 0).await;
         let attempt_key = key("fails.exe").with_repository_epoch(1);
 
         ledger
@@ -2275,6 +2343,22 @@ mod tests {
             .begin_attempt(&key("fails.exe").with_repository_epoch(2), false)
             .await
             .expect("repository revision change executes");
+
+        let resumed = CommandExecutionLedger::load_or_new(home.clone(), "thread".into(), &repository).await;
+        resumed.observe_repository_revision("turn-b", 0).await;
+        let blocked = resumed.begin_attempt(&attempt_key, false).await
+            .expect_err("input-determined failure survives restart");
+        assert!(blocked.render_for_model().contains("persisted failure receipt"));
+        resumed.begin_attempt(
+            &attempt_key.clone().with_environment_fingerprint("changed-environment"), false,
+        ).await.expect("a different execution environment is not suppressed");
+        resumed.begin_attempt_with_freshness(&attempt_key, false, true).await.unwrap();
+        resumed.record_exit(&attempt_key, 0).await;
+        resumed.persist_cache_after_terminal().await;
+        let after_success = CommandExecutionLedger::load_or_new(home, "thread".into(), &repository).await;
+        after_success.observe_repository_revision("turn-c", 0).await;
+        after_success.begin_attempt(&attempt_key, false).await
+            .expect("fresh execution supersedes the persisted diagnosis");
     }
 
     #[tokio::test]

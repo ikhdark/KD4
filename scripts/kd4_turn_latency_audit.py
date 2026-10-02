@@ -40,6 +40,7 @@ try:
         _token_report as _token_report,
     )
     from scripts.rollout_snapshot import read_rollout_snapshot
+    from scripts.rollout_snapshot import hydrate_rollout_record
     from scripts.rollout_snapshot import discover_rollouts, existing_rollout_path
 except ImportError:
     import kd4_first_useful_action_analysis
@@ -65,6 +66,7 @@ except ImportError:
         _token_report as _token_report,
     )
     from rollout_snapshot import read_rollout_snapshot
+    from rollout_snapshot import hydrate_rollout_record
     from rollout_snapshot import discover_rollouts, existing_rollout_path
 
 
@@ -76,6 +78,8 @@ _MAX_RENDERED_TURNS = 10
 _MAX_SUMMARY_TURNS = 20
 _MAX_SUMMARY_TOKEN_INTERVALS = 16
 _MAX_SUMMARY_BYTES = 32 * 1024
+# argparse owns exit status 2, so insufficient evidence cannot share it.
+_GATE_EXIT_CODES = {"passed": 0, "regression": 1, "insufficient_evidence": 3}
 _SAMPLING_PASS_TARGET_PER_COMPLETED_TURN = 8
 _MAX_OPEN_TURN_DETAILS = 100
 _MAX_SOURCE_DISCOVERY_EVENTS = 64
@@ -1719,6 +1723,7 @@ def analyze_session_path(
                             }
                         )
                     continue
+                item = hydrate_rollout_record(item, snapshot.path)
                 if runner_evidence is None:
                     native_events.append(
                         {
@@ -3086,6 +3091,11 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         trim_rows(result["startupTiming"], "records", "omittedRecords")
     if "baselineComparison" in result:
         trim_rows(result["baselineComparison"], "metrics", "omittedMetrics")
+        # The gate's status and counts stay; only its supporting rows shrink.
+        if "gate" in result["baselineComparison"]:
+            gate = result["baselineComparison"]["gate"]
+            trim_rows(gate, "unavailable", "omittedUnavailable")
+            trim_rows(gate, "regressions", "omittedRegressions")
     # Do not silently discard essential totals/coverage to satisfy a byte
     # target when those alone exceed it (for example, many distinct categories).
     result["summaryBudget"]["limitExceeded"] = budget_exceeded
@@ -3177,6 +3187,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Relative change review threshold (default: 0.20); also requires 50ms or 1 count",
     )
     parser.add_argument(
+        "--gate-metric",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help=(
+            "Gate the --baseline comparison on this metric (repeatable). Ratio metrics "
+            "regress when they drop, all others when they rise. Exit status: 0 passed, "
+            f"1 regression, {_GATE_EXIT_CODES['insufficient_evidence']} insufficient "
+            "evidence (a selected metric was unavailable or never compared)"
+        ),
+    )
+    parser.add_argument(
         "--runner-evidence",
         type=Path,
         help="Version 1 native runner evidence JSON for one attempt",
@@ -3207,6 +3229,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         and args.startup_log is None
     ):
         parser.error("a source, --runner-evidence, or --startup-log is required")
+    if args.gate_metric and args.baseline is None:
+        parser.error("--gate-metric requires --baseline")
+    unknown_gate_metrics = sorted(
+        set(args.gate_metric) - kd4_session_diagnostics.gate_metric_names()
+    )
+    if unknown_gate_metrics:
+        parser.error(
+            f"unknown --gate-metric {unknown_gate_metrics}; choose from "
+            f"{sorted(kd4_session_diagnostics.gate_metric_names())}"
+        )
     try:
         source = (
             resolve_rollout_source(args.source, args.sessions_root)
@@ -3237,6 +3269,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 min_samples=args.comparison_min_samples,
                 relative_threshold=args.comparison_threshold,
             )
+            if args.gate_metric:
+                report["baselineComparison"]["gate"] = (
+                    kd4_session_diagnostics.regression_gate(
+                        report["baselineComparison"], args.gate_metric
+                    )
+                )
     except (FileNotFoundError, OSError, ValueError, TypeError) as error:
         parser.error(str(error))
     if args.json:
@@ -3251,7 +3289,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         print(render_report(report))
-    return 0
+    gate = report.get("baselineComparison", {}).get("gate")
+    return _GATE_EXIT_CODES[gate["status"]] if gate else 0
 
 
 if __name__ == "__main__":

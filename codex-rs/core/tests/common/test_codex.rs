@@ -32,7 +32,7 @@ use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
-use codex_models_manager::bundled_models_response;
+use codex_models_manager::test_support::test_models_response as bundled_models_response;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
@@ -591,13 +591,23 @@ impl TestCodexBuilder {
 }
 
 fn ensure_test_model_catalog(config: &mut Config) -> Result<()> {
-    if config.model.as_deref() != Some(TEST_MODEL_WITH_EXPERIMENTAL_TOOLS)
-        || config.model_catalog.is_some()
-    {
+    if config.model_catalog.is_some() {
         return Ok(());
     }
 
     let bundled_models = bundled_models_response().expect("bundled models.json should parse");
+    if config.model.as_deref() != Some(TEST_MODEL_WITH_EXPERIMENTAL_TOOLS) {
+        let production = codex_models_manager::bundled_models_response()?;
+        if let Some(slug) = config.model.as_deref()
+            && !production.models.iter().any(|model| model.slug == slug)
+            && bundled_models.models.iter().any(|model| model.slug == slug)
+        {
+            // Retired regression fixtures must reach the real runtime manager,
+            // not just the offline metadata helper. Unknown models still fall back.
+            config.model_catalog = Some(bundled_models);
+        }
+        return Ok(());
+    }
     let mut model = bundled_models
         .models
         .iter()

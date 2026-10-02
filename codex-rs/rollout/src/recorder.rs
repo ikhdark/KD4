@@ -148,9 +148,11 @@ enum RolloutCmd {
     Persist {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
-    /// Ensure all prior writes are processed; respond when flushed.
+    /// Ensure all prior writes are processed; respond when flushed. A durable
+    /// flush also waits for the written bytes to reach stable storage.
     Flush {
         ack: oneshot::Sender<std::io::Result<()>>,
+        durable: bool,
     },
     Shutdown {
         ack: oneshot::Sender<std::io::Result<()>>,
@@ -385,6 +387,44 @@ fn warn_thread_list_db_fallback() {
         reason = "db_error",
         "state DB listing failed; using filesystem rollout scan"
     );
+}
+
+fn initial_harness_build_info() -> codex_protocol::protocol::SessionBuildInfo {
+    let build = codex_utils_build_info::BuildInfo::current();
+    codex_protocol::protocol::SessionBuildInfo {
+        version: build.version.to_string(),
+        commit: build.commit.to_string(),
+        dirty: build.dirty.to_string(),
+        profile: build.profile.to_string(),
+        built: build.built.to_string(),
+        executable_sha256: None,
+        token_accounting: [
+            ("local_input_estimate", "utf8_bytes_div4_ceil_v1", "complete_serialized_logical_prompt"),
+            ("logical_category_tokens", "utf8_bytes_div4_ceil_v1", "sum_of_independently_rounded_category_fragments"),
+            ("canonical_tool_tokens", "utf8_bytes_div4_ceil_v1", "canonical_tool_text_plus_nontext_estimates"),
+            ("model_facing_tool_tokens", "utf8_bytes_div4_ceil_v1", "rendered_model_packet_plus_nontext_estimates"),
+            ("projection_text_budget", "o200k_base_count_ordinary_v1", "rendered_text"),
+            ("provider_input_tokens", "provider_reported_tokenizer_unknown", "provider_request_input"),
+        ].into_iter().map(|(name, estimator, scope)| (
+            name.to_string(),
+            codex_protocol::protocol::SessionTokenMeasurement {
+                estimator: estimator.to_string(),
+                scope: scope.to_string(),
+            },
+        )).collect(),
+    }
+}
+
+/// Current process identity, not the process that originally created a resumed
+/// rollout. First use can hash the executable; call from a blocking worker.
+pub fn current_harness_build_info() -> codex_protocol::protocol::SessionBuildInfo {
+    static CURRENT: std::sync::LazyLock<codex_protocol::protocol::SessionBuildInfo> =
+        std::sync::LazyLock::new(|| {
+            let mut build = initial_harness_build_info();
+            build.executable_sha256 = codex_utils_build_info::executable_sha256().map(str::to_owned);
+            build
+        });
+    CURRENT.clone()
 }
 
 impl RolloutRecorder {
@@ -832,7 +872,6 @@ impl RolloutRecorder {
                     .format(timestamp_format)
                     .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
 
-                let build = codex_utils_build_info::BuildInfo::current();
                 let session_meta = SessionMeta {
                     session_id,
                     id: thread_id,
@@ -842,16 +881,8 @@ impl RolloutRecorder {
                     cwd: config.cwd().to_path_buf(),
                     originator,
                     cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                    harness_build: Some(codex_protocol::protocol::SessionBuildInfo {
-                        version: build.version.to_string(),
-                        commit: build.commit.to_string(),
-                        dirty: build.dirty.to_string(),
-                        profile: build.profile.to_string(),
-                        built: build.built.to_string(),
-                        // Hashed when the metadata is first written, off the
-                        // session-creation path.
-                        executable_sha256: None,
-                    }),
+                    // Hash lazily when metadata is first written.
+                    harness_build: Some(initial_harness_build_info()),
                     agent_nickname: source.get_nickname(),
                     agent_role: source.get_agent_role(),
                     agent_path: source.get_agent_path().map(Into::into),
@@ -1043,6 +1074,17 @@ impl RolloutRecorder {
     /// If the first writer attempt fails, the writer drops and reopens the file handle before
     /// retrying. This returns an error only when that retry also fails or the writer task is gone.
     pub async fn flush(&self) -> std::io::Result<()> {
+        self.flush_with_durability(/*durable*/ false).await
+    }
+
+    /// Like [`Self::flush`], then waits for the rollout bytes to reach stable storage so
+    /// they survive an operating-system crash, not only a process crash. Use it at terminal
+    /// checkpoints; ordinary flushes stay cheap.
+    pub async fn flush_durable(&self) -> std::io::Result<()> {
+        self.flush_with_durability(/*durable*/ true).await
+    }
+
+    async fn flush_with_durability(&self, durable: bool) -> std::io::Result<()> {
         let enqueue_guard = self
             .writer_task
             .enqueue_gate
@@ -1052,7 +1094,7 @@ impl RolloutRecorder {
         self.writer_task.ensure_active("flush the rollout")?;
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(RolloutCmd::Flush { ack: tx })
+            .send(RolloutCmd::Flush { ack: tx, durable })
             .await
             .map_err(|e| {
                 self.writer_task.terminal_failure().unwrap_or_else(|| {
@@ -1859,6 +1901,14 @@ impl RolloutWriterState {
         self.write_pending_with_recovery("flush").await
     }
 
+    async fn flush_durable(&mut self) -> std::io::Result<()> {
+        self.flush().await?;
+        if let Some(writer) = self.writer.as_ref() {
+            writer.file.sync_data().await?;
+        }
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> std::io::Result<()> {
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
@@ -2101,8 +2151,13 @@ async fn rollout_writer(
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);
             }
-            RolloutCmd::Flush { ack } => {
-                let _ = ack.send(state.flush().await);
+            RolloutCmd::Flush { ack, durable } => {
+                let result = if durable {
+                    state.flush_durable().await
+                } else {
+                    state.flush().await
+                };
+                let _ = ack.send(result);
             }
             RolloutCmd::Shutdown { ack } => match state.shutdown().await {
                 Ok(()) => {
@@ -2239,7 +2294,20 @@ impl JsonlWriter {
         }
         let mut bytes = Vec::new();
         for captured in rollout_items {
-            Self::serialize_rollout_item(&mut bytes, &captured.item, captured.captured_at)?;
+            let mut line = Vec::new();
+            Self::serialize_rollout_item(&mut line, &captured.item, captured.captured_at)?;
+            if line.len() < crate::payload_artifact::INLINE_BYTES {
+                bytes.extend_from_slice(&line);
+                continue;
+            }
+            let path = self.path.clone();
+            let stored = tokio::task::spawn_blocking(move || {
+                crate::payload_artifact::store_line(&path, &line).unwrap_or_else(|error| {
+                    tracing::warn!(%error, "retaining rollout payload inline because artifact storage failed");
+                    line
+                })
+            }).await.map_err(IoError::other)?;
+            bytes.extend_from_slice(&stored);
         }
         self.write_transaction(&bytes).await
     }

@@ -2413,3 +2413,46 @@ fn create_skill(codex_home: PathBuf, name: &str, description: &str) {
     let content = format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body\n");
     fs::write(skill_dir.join("SKILL.md"), content).unwrap();
 }
+
+#[test]
+fn nested_instruction_notice_lists_existing_files_below_cwd() {
+    let repo = tempfile::tempdir().expect("temp repo");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.path().join("AGENTS.md"), "root").expect("root instructions");
+    git(&["add", "AGENTS.md"]);
+    let none = nested_instruction_notice(repo.path()).expect("git checkout");
+    assert!(
+        none.starts_with("No non-ignored AGENTS.md or AGENTS.override.md files exist below"),
+        "{none}"
+    );
+
+    std::fs::create_dir_all(repo.path().join("sub").join("deeper")).expect("nested dir");
+    std::fs::write(
+        repo.path()
+            .join("sub")
+            .join("deeper")
+            .join("AGENTS.override.md"),
+        "nested",
+    )
+    .expect("nested instructions");
+    let listed = nested_instruction_notice(repo.path()).expect("git checkout");
+    assert!(listed.contains("sub/deeper/AGENTS.override.md"), "{listed}");
+    assert!(!listed.contains(": AGENTS.md"), "{listed}");
+    git(&["add", "sub/deeper/AGENTS.override.md"]);
+    std::fs::remove_file(repo.path().join("sub/deeper/AGENTS.override.md")).unwrap();
+    let deleted = nested_instruction_notice(repo.path()).unwrap();
+    assert!(!deleted.contains("sub/deeper/AGENTS.override.md"), "{deleted}");
+
+    let plain = tempfile::tempdir().expect("plain dir");
+    assert_eq!(nested_instruction_notice(plain.path()), None);
+}

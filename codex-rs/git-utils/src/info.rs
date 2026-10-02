@@ -438,28 +438,6 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
     })
 }
 
-/// Return the sorted root commits used to identify a project's history.
-pub async fn get_root_commit_hashes(cwd: &Path) -> Option<Vec<String>> {
-    // Even this metadata query can fetch missing objects in a partial clone.
-    // Use the contained runner so cancellation also stops remote helpers.
-    let output =
-        run_git_command_with_timeout(&["rev-list", "--max-parents=0", "HEAD"], cwd).await?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let mut roots = stdout.lines().map(str::to_owned).collect::<Vec<_>>();
-    if roots.is_empty()
-        || roots.iter().any(|root| {
-            root.len() < 40 || root.len() > 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-    {
-        return None;
-    }
-    roots.sort_unstable();
-    Some(roots)
-}
-
 /// Read staged index entries for literal paths using the bounded Git runner.
 /// A timeout or failed query leaves callers free to use their fallback modes.
 pub async fn git_index_entries(cwd: &Path, paths: &[PathBuf]) -> Option<Vec<u8>> {
@@ -668,9 +646,21 @@ async fn run_git_child(
     // Git can launch clean/process filters even when hooks, external diffs,
     // and text conversion are disabled. Attach the root before it can run,
     // and retain ownership across both output collection and cancellation.
-    let mut child = tokio::task::spawn_blocking(move || command.spawn())
-        .await
-        .map_err(std::io::Error::other)??;
+    let (managed, mut child, mut stdout, mut stderr) = tokio::task::spawn_blocking(move || {
+        // Windows child-pipe reads use Tokio's non-cancellable blocking pool.
+        // A cancelled metadata probe can otherwise leave those reads waiting
+        // through runtime shutdown. Anonymous temporary files have no pipe
+        // writers to await, and are discarded with this operation.
+        let stdout = tempfile::tempfile()?;
+        let stderr = tempfile::tempfile()?;
+        command
+            .stdout(stdout.try_clone()?)
+            .stderr(stderr.try_clone()?);
+        let child = command.spawn()?;
+        Ok::<_, std::io::Error>((managed, child, stdout, stderr))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
     let pid = child
         .id()
         .ok_or_else(|| std::io::Error::other("missing Git process id"))?;
@@ -679,7 +669,24 @@ async fn run_git_child(
         let _ = child.wait().await;
         return Err(error);
     }
-    let output = child.wait_with_output().await?;
+    let status = child.wait().await?;
+    let output = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        use std::io::Seek;
+        stdout.rewind()?;
+        stderr.rewind()?;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        stdout.read_to_end(&mut stdout_bytes)?;
+        stderr.read_to_end(&mut stderr_bytes)?;
+        Ok::<_, std::io::Error>(std::process::Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        })
+    })
+    .await
+    .map_err(std::io::Error::other)??;
     if fsmonitor == crate::FsmonitorOverride::BuiltIn
         && output
             .status
@@ -1312,18 +1319,18 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn root_commits_timeout_terminates_lazy_fetch_and_descendant() {
-        assert_root_commits_cleans_lazy_fetch_tree(false).await;
+    async fn metadata_query_timeout_terminates_lazy_fetch_and_descendant() {
+        assert_metadata_query_cleans_lazy_fetch_tree(false).await;
     }
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn root_commits_cancellation_terminates_lazy_fetch_and_descendant() {
-        assert_root_commits_cleans_lazy_fetch_tree(true).await;
+    async fn metadata_query_cancellation_terminates_lazy_fetch_and_descendant() {
+        assert_metadata_query_cleans_lazy_fetch_tree(true).await;
     }
 
     #[cfg(windows)]
-    async fn assert_root_commits_cleans_lazy_fetch_tree(cancel_after_spawn: bool) {
+    async fn assert_metadata_query_cleans_lazy_fetch_tree(cancel_after_spawn: bool) {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         run_git(repo, &["init", "-q"]);
@@ -1331,7 +1338,12 @@ mod tests {
         run_git(repo, &["config", "user.email", "tests@example.com"]);
         run_git(repo, &["commit", "--allow-empty", "-qm", "root"]);
         let root = run_git(repo, &["rev-parse", "HEAD"]);
-        assert_eq!(get_root_commit_hashes(repo).await, Some(vec![root.clone()]));
+        let args = ["rev-list", "--max-parents=0", "HEAD"];
+        let output = run_git_command_with_timeout(&args, repo)
+            .await
+            .expect("metadata query");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), root);
 
         let helper = repo.join("remote.ps1");
         let pids = repo.join("remote-pids.txt");
@@ -1369,10 +1381,10 @@ mod tests {
         .expect("remove promised HEAD from object database");
 
         let result = if cancel_after_spawn {
-            let operation = get_root_commit_hashes(repo);
+            let operation = run_git_command_with_timeout(&args, repo);
             tokio::pin!(operation);
             tokio::select! {
-                result = &mut operation => panic!("root query completed before cancellation: {result:?}"),
+                result = &mut operation => panic!("metadata query completed before cancellation: {result:?}"),
                 _ = async {
                     while !std::fs::read_to_string(&pids).is_ok_and(|contents| {
                         contents.split_whitespace().filter_map(|pid| pid.parse::<u32>().ok()).count() == 2
@@ -1383,7 +1395,7 @@ mod tests {
             }
             None
         } else {
-            get_root_commit_hashes(repo).await
+            run_git_command_with_timeout(&args, repo).await
         };
         let ids = std::fs::read_to_string(&pids)
             .expect("Git must launch the lazy-fetch helper")
@@ -1402,12 +1414,12 @@ mod tests {
             .expect("observe and clean up lazy-fetch processes");
         assert!(
             result.is_none(),
-            "incomplete history must not produce root commits"
+            "incomplete metadata query must not produce output"
         );
         assert!(observed.status.success());
         assert!(
             observed.stdout.is_empty(),
-            "root query left lazy-fetch processes alive: {}",
+            "metadata query left lazy-fetch processes alive: {}",
             String::from_utf8_lossy(&observed.stdout)
         );
     }

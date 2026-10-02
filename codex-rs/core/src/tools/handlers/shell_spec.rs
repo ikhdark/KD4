@@ -225,6 +225,10 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
         crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS.min(max_timeout_ms);
     let properties = BTreeMap::from([
         (
+            "terminate".to_string(),
+            JsonSchema::boolean(Some("True confirms process termination before collecting final output. Requires empty chars. Use only with session_capabilities.cancellation=true.".to_string())),
+        ),
+        (
             "wait_for_output".to_string(),
             JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
         ),
@@ -269,7 +273,7 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
     ToolSpec::Function(ResponsesApiTool {
         name: "write_stdin".to_string(),
         description:
-            "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Inspect session_capabilities first: send characters only with stdin=true, Ctrl-C by sending `chars: \"\\u0003\"` only when session_capabilities.interrupt=true, and empty input to poll with polling=true. `interrupt` is a returned capability, not an input parameter. cancellation describes explicit process cancellation through this tool; false means no such operation is exposed. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
+            "Writes characters to an existing unified exec session and returns recent output. Use only a session_id returned by exec_command or its shell_command compatibility route. Inspect session_capabilities first: send characters only with stdin=true, Ctrl-C by sending `chars: \"\\u0003\"` only when session_capabilities.interrupt=true, and empty input to poll with polling=true. `interrupt` is a returned capability, not an input parameter. Use terminate=true with empty chars to stop a process when session_capabilities.cancellation=true, including non-PTY Windows sessions. Stop when no session_id is returned. Poll again only for an identified pending transition; do not restart the command while it is live or its effects are uncertain."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -422,7 +426,7 @@ fn unified_exec_output_schema() -> Value {
             },
             "stdout": {
                 "type": "string",
-                "description": "Exact whole-command UTF-8 stdout, available to scripts only when streams_complete is true. Independent of the display token budget; stdout and stderr together are limited to 64 KiB."
+                "description": "Exact whole-command UTF-8 stdout, available to scripts only when streams_complete is true. Independent of the display token budget; stdout and stderr together are limited to 1 MiB."
             },
             "stderr": {
                 "type": "string",

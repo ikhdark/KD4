@@ -6,6 +6,7 @@ mod timers;
 mod value;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
@@ -105,6 +106,9 @@ pub(crate) struct StoredValue {
     pub(crate) value: Arc<JsonValue>,
     /// Serialized bytes of the key and value, charged to the session limit.
     pub(crate) bytes: usize,
+    /// Keys read by the producing cell. None means the bounded read set
+    /// overflowed and the owner must compare the complete snapshot.
+    pub(crate) read_dependencies: Option<Arc<HashSet<String>>>,
 }
 
 impl StoredValue {
@@ -112,6 +116,7 @@ impl StoredValue {
         Self {
             bytes: stored_value_entry_bytes(key, &value),
             value: Arc::new(value),
+            read_dependencies: Some(Arc::new(HashSet::new())),
         }
     }
 }
@@ -342,11 +347,11 @@ pub(crate) async fn spawn_runtime(
     } = request;
     let enabled_tools = Arc::new(EnabledToolCatalog::new(
         enabled_tools
-            .into_iter()
+            .iter()
             .map(|definition| EnabledToolMetadata {
                 global_name: normalize_code_mode_identifier(&definition.name),
-                tool_name: definition.tool_name,
-                description: definition.description,
+                tool_name: definition.tool_name.clone(),
+                description: definition.description.clone(),
                 kind: definition.kind,
                 default_timeout_ms: definition.default_timeout_ms,
             })
@@ -528,6 +533,7 @@ pub(super) struct RuntimeState {
     total_stored_value_bytes: usize,
     stored_value_writes: HashMap<String, StoredValue>,
     stored_value_limit_error: Option<String>,
+    stored_value_reads: Option<HashSet<String>>,
     #[cfg(test)]
     completion_collections: usize,
     #[cfg(test)]
@@ -671,6 +677,7 @@ fn run_runtime(
         total_stored_value_bytes,
         stored_value_writes: HashMap::new(),
         stored_value_limit_error: None,
+        stored_value_reads: Some(HashSet::new()),
         #[cfg(test)]
         completion_collections: 0,
         #[cfg(test)]
@@ -830,9 +837,15 @@ fn capture_scope_send_error(
 fn send_result(
     scope: &v8::PinScope<'_, '_>,
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    stored_value_writes: HashMap<String, StoredValue>,
+    mut stored_value_writes: HashMap<String, StoredValue>,
     error_text: Option<String>,
 ) {
+    let reads = scope.get_slot::<RuntimeState>()
+        .and_then(|state| state.stored_value_reads.clone())
+        .map(Arc::new);
+    for stored in stored_value_writes.values_mut() {
+        stored.read_dependencies = reads.clone();
+    }
     let _ = event_tx.send(RuntimeEvent::Result {
         stored_value_writes,
         output_loss: scope.get_slot::<RuntimeState>().and_then(|state| state.output_admission.output_loss()),
@@ -872,8 +885,9 @@ mod tests {
 
     fn execute_request(source: &str) -> ExecuteRequest {
         ExecuteRequest {
+            state_path: None,
             tool_call_id: "call_1".to_string(),
-            enabled_tools: Vec::new(),
+            enabled_tools: Vec::new().into(),
             source: source.to_string(),
             yield_time_ms: Some(1),
             max_output_tokens: None,
@@ -887,7 +901,7 @@ mod tests {
             tool_name: ToolName::plain(global_name),
             global_name: global_name.to_string(),
             default_timeout_ms: None,
-            description: description.to_string(),
+            description: description.into(),
             kind: CodeModeToolKind::Function,
         };
         let catalog = EnabledToolCatalog::new(vec![
@@ -900,14 +914,14 @@ mod tests {
             catalog
                 .index_of("sample_tool")
                 .and_then(|index| catalog.get(index))
-                .map(|tool| tool.description.as_str()),
+                .map(|tool| tool.description.as_ref()),
             Some("first")
         );
         assert_eq!(
             catalog
                 .index_of("sample_tool_extra")
                 .and_then(|index| catalog.get(index))
-                .map(|tool| tool.description.as_str()),
+                .map(|tool| tool.description.as_ref()),
             Some("other")
         );
         assert!(catalog.index_of("sample").is_none());
@@ -936,6 +950,65 @@ mod tests {
             }).await.unwrap();
             assert!(completed);
         }
+    }
+
+    #[tokio::test]
+    async fn dependency_graph_preflights_and_settles_without_running_failed_dependents() {
+        let source = r#"
+let calls = 0;
+const node = (id, deps) => ({id, deps, run: () => ++calls, accept: () => true});
+try {
+  await run_graph([node("independent", []), node("a", ["b"]), node("b", ["a"])]);
+  throw Error("cycle accepted");
+} catch (error) {
+  if (!(error instanceof TypeError) || calls !== 0) throw error;
+}
+try {
+  await run_graph([{...node("unavailable", []), requires: ["missing_capability"]}]);
+  throw Error("missing capability accepted");
+} catch (error) {
+  if (!(error instanceof TypeError) || calls !== 0) throw error;
+}
+let active = 0, peak = 0, finished = 0;
+const work = id => ({id, run: async () => {
+  peak = Math.max(peak, ++active);
+  await new Promise(resolve => setTimeout(resolve, 1));
+  --active; ++finished;
+  return id;
+}, accept: () => true});
+try {
+  await run_graph([
+    {id: "bad", run: () => ({exit_code: 1}), accept: r => r.exit_code === 0},
+    {id: "blocked", deps: ["bad"], run: () => { throw Error("must not run"); }, accept: () => true},
+    work("x"), work("y"), work("z"),
+  ], {concurrency: 2});
+  throw Error("failed postcondition accepted");
+} catch (error) {
+  if (error.results?.bad.status !== "rejected" ||
+      error.results?.blocked.status !== "skipped" ||
+      error.results?.z.status !== "fulfilled" ||
+      finished !== 3 || active !== 0 || peak !== 2) throw error;
+}
+const results = await run_graph([
+  {id: "__proto__", run: () => 7, accept: n => n === 7},
+  {id: "next", deps: ["__proto__"], step_id: "plan-step", run: d => d.__proto__ + 1, accept: n => n === 8},
+]);
+if (results.next.value !== 8 || results.next.step_id !== "plan-step") throw Error("dependency linkage lost");
+"#;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_commands, _termination) = spawn_runtime(
+            HashMap::new(), execute_request(source), 60_000, event_tx,
+            std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)), None,
+        ).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = event_rx.recv().await {
+                if let RuntimeEvent::Result { error_text, .. } = event {
+                    assert_eq!(error_text, None);
+                    return;
+                }
+            }
+            panic!("runtime closed without completing the graph");
+        }).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

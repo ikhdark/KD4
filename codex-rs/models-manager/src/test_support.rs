@@ -7,6 +7,21 @@ use crate::bundled_models_response;
 use crate::manager::construct_model_info_from_candidates;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelsResponse;
+
+/// Bundled models plus frozen metadata for retired models used by regression tests.
+/// Keep fixture identities independent of changes to the production picker catalog.
+pub fn test_models_response() -> Result<ModelsResponse, serde_json::Error> {
+    let mut response = bundled_models_response()?;
+    let mut retired: ModelsResponse = serde_json::from_str(include_str!("test_models.json"))?;
+    crate::prompt_resolver::apply_prompt_policy(&mut retired.models);
+    for model in retired.models {
+        if !response.models.iter().any(|current| current.slug == model.slug) {
+            response.models.push(model);
+        }
+    }
+    Ok(response)
+}
 
 /// Get model identifier without consulting remote state or cache.
 #[expect(
@@ -37,12 +52,12 @@ pub fn construct_model_info_offline_for_tests(
     model: &str,
     config: &ModelsManagerConfig,
 ) -> ModelInfo {
+    let fixture;
     let candidates: &[ModelInfo] = if let Some(model_catalog) = config.model_catalog.as_ref() {
         &model_catalog.models
     } else {
-        &crate::bundled_models()
-            .expect("bundled test model catalog must load")
-            .models
+        fixture = test_models_response().expect("test model catalog must load");
+        &fixture.models
     };
     construct_model_info_from_candidates(model, candidates, config)
 }

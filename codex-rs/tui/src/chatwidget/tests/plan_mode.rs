@@ -197,10 +197,47 @@ async fn plan_implementation_popup_clear_context_emits_clear_submit_event() {
     assert_eq!(
         text,
         "A previous agent produced the plan below to accomplish the user's task. \
-        Implement the plan in a fresh context. Treat the plan as the source of \
-        user intent, re-read files as needed, and carry the work through \
+        Implement the plan in a fresh context. Preserve the user's original intent \
+        and constraints, re-read files as needed, and carry the work through \
         implementation and verification.\n\n- Step 1\n- Step 2\n"
     );
+}
+
+#[tokio::test]
+async fn plan_implementation_clear_context_carries_the_users_own_messages() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    let long_message = format!("{}Do not change persisted formats.", "背景 ".repeat(1_000));
+    for message in [
+        "Keep the public API unchanged.",
+        "Do not add dependencies.",
+        &long_message,
+    ] {
+        chat.on_user_message_display(UserMessageDisplay {
+            message: message.to_string(),
+            remote_image_urls: Vec::new(),
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+        });
+    }
+    chat.on_plan_item_completed("- Step 1\n".to_string());
+    let _ = drain_insert_history(&mut rx);
+    chat.open_plan_implementation_prompt();
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let text = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::ClearUiAndSubmitUserMessage { text } => Some(text),
+            _ => None,
+        })
+        .expect("expected ClearUiAndSubmitUserMessage");
+    assert!(text.starts_with(plan_implementation::PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX));
+    assert!(text.contains("- Step 1\n"));
+    assert!(text.contains(plan_implementation::PLAN_IMPLEMENTATION_USER_MESSAGES_HEADER));
+    assert!(text.contains("\n\n1. Keep the public API unchanged."), "{text}");
+    assert!(text.contains("\n\n2. Do not add dependencies."), "{text}");
+    assert!(text.contains(&format!("\n\n3. {long_message}")), "{text}");
 }
 
 #[tokio::test]
@@ -212,6 +249,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
     let params = plan_implementation::selection_view_params(
         /*default_mask*/ None,
         Some("- Step\n"),
+        /*user_messages*/ &[],
         /*clear_context_usage_label*/ None,
     );
     assert_eq!(
@@ -222,6 +260,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
     let params = plan_implementation::selection_view_params(
         Some(default_mask.clone()),
         /*plan_markdown*/ None,
+        /*user_messages*/ &[],
         /*clear_context_usage_label*/ None,
     );
     assert_eq!(
@@ -232,6 +271,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
     let params = plan_implementation::selection_view_params(
         Some(default_mask.clone()),
         Some("  \n"),
+        /*user_messages*/ &[],
         /*clear_context_usage_label*/ None,
     );
     assert_eq!(
@@ -242,6 +282,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
     let params = plan_implementation::selection_view_params(
         Some(default_mask.clone()),
         Some("- Step\n"),
+        /*user_messages*/ &[],
         /*clear_context_usage_label*/ None,
     );
     assert_eq!(params.items[1].disabled_reason, None);
@@ -255,6 +296,7 @@ async fn plan_implementation_clear_context_requires_default_mode_and_plan() {
     let params = plan_implementation::selection_view_params(
         Some(default_mask),
         Some("- Step\n"),
+        /*user_messages*/ &[],
         Some("89% used"),
     );
     assert_eq!(

@@ -13,7 +13,6 @@ use crate::sandboxing::SandboxPermissions;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_output_artifact::RawOutputArtifact;
-use crate::tools::known_delta_store::KnownDeltaHit;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::ShellCommandPreparation;
@@ -119,13 +118,6 @@ pub struct UnifiedExecRequest {
     pub additional_permissions_uri: Option<UriAdditionalPermissionProfile>,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
-    pub(crate) known_delta_hit: Option<KnownDeltaHit>,
-}
-
-#[derive(Debug)]
-pub(crate) enum UnifiedExecLaunch {
-    Process(Arc<UnifiedExecProcess>),
-    KnownDelta(KnownDeltaHit),
 }
 
 /// Cache key for approval decisions that can be reused across equivalent
@@ -292,7 +284,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
 
 impl UnifiedExecRuntime<'_> {}
 
-impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRuntime<'a> {
+impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExecRuntime<'a> {
     fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
         Some(&req.sandbox_cwd)
     }
@@ -302,9 +294,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
         req: &UnifiedExecRequest,
         ctx: &ToolCtx,
     ) -> Option<NetworkApprovalSpec> {
-        if req.known_delta_hit.is_some() {
-            return None;
-        }
         let file_system_sandbox_policy = ctx.turn.file_system_sandbox_policy();
         let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,
@@ -331,17 +320,16 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
         req: &UnifiedExecRequest,
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
-    ) -> Result<UnifiedExecLaunch, ToolError> {
-        if let Some(hit) = req.known_delta_hit.as_ref() {
-            return Ok(UnifiedExecLaunch::KnownDelta(hit.clone()));
-        }
-        // Reuse the same workspace gate as patches and legacy shell validation.
+    ) -> Result<Arc<UnifiedExecProcess>, ToolError> {
+        // Serialize validations with legacy shell validation, never with patches.
         // This only queues known noninteractive validation, not arbitrary
         // long-lived servers or opaque scripts. Admission precedes process
         // creation, so a tool's own execution timeout cannot expire in Cargo's
         // build-lock queue behind another harness validation.
         let pending_spawns = if !req.tty && validation_workspace_required(&req.command_for_approval) {
-            let permit = crate::workspace_operation_gate::acquire_patch_operation(
+            let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
+            let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
+            let permit = crate::workspace_operation_gate::acquire_validation_operation(
                 &req.turn_environment.environment,
                 &req.cwd,
             )
@@ -350,6 +338,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
         } else {
             self.pending_spawns.clone()
         };
+        let setup_timing = ctx.turn.turn_timing_state
+            .begin_local_phase(crate::turn_timing::TurnLocalPhase::ExecutorReadinessWait);
+        let setup_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("command_setup");
         let native_cwd = req.cwd.to_abs_path().ok();
         let mutation = crate::tools::events::command_mutation_for_exec(
             &req.command_for_approval,
@@ -452,6 +443,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             error @ (ToolError::Denied(_) | ToolError::Codex(_)) => error,
         })?;
         let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
+        drop(setup_phase);
+        drop(setup_timing);
         self.manager
             .open_session_with_exec_env(
                 req.process_id,
@@ -470,7 +463,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
                 &pending_spawns,
             )
             .await
-            .map(UnifiedExecLaunch::Process)
     }
 }
 
@@ -486,7 +478,7 @@ fn validation_workspace_required(command: &[String]) -> bool {
         ValidationClassification::Validation {
             leaves,
             has_unclassified_targets: false,
-            ..
+            exit_code_is_authoritative: true,
         } if !leaves.is_empty()
             && leaves.iter().all(|leaf| matches!(
                 leaf.operation,
@@ -661,7 +653,6 @@ mod tests {
                 bypass_sandbox: false,
                 proposed_execpolicy_amendment: None,
             },
-            known_delta_hit: None,
         };
 
         assert_eq!(
@@ -765,7 +756,6 @@ mod tests {
             additional_permissions_uri: None,
             justification: None,
             exec_approval_requirement,
-            known_delta_hit: None,
         }
     }
 }

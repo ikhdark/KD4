@@ -61,14 +61,14 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                         let definition = CodeModeToolDefinition {
                             name: code_mode_name_for_tool_name(&tool_name),
                             tool_name,
-                            description: tool.description.clone(),
+                            description: tool.description.clone().into(),
                             kind: CodeModeToolKind::Function,
                             input_schema: serde_json::to_value(&tool.parameters).ok(),
                             default_timeout_ms: None,
                             output_schema: tool.output_schema.as_ref().map(crate::ToolOutputSchema::to_value),
                         };
                         tool.description =
-                            codex_code_mode::augment_tool_definition(definition).description;
+                            codex_code_mode::augment_tool_definition(definition).description.to_string();
                     }
                 }
             }
@@ -99,7 +99,7 @@ pub fn collect_code_mode_tool_definitions<'a>(
                 if !namespace_description.is_empty() {
                     for definition in &mut definitions {
                         definition.description =
-                            format!("{namespace_description}\n\n{}", definition.description);
+                            format!("{namespace_description}\n\n{}", definition.description).into();
                     }
                 }
             }
@@ -147,7 +147,7 @@ pub fn collect_code_mode_tool_definitions<'a>(
 fn augmented_description_for_spec(spec: &ToolSpec) -> Option<String> {
     code_mode_tool_definition_for_spec(spec)
         .map(codex_code_mode::augment_tool_definition)
-        .map(|definition| definition.description)
+        .map(|definition| definition.description.to_string())
 }
 
 pub fn code_mode_tool_definition_for_spec(spec: &ToolSpec) -> Option<CodeModeToolDefinition> {
@@ -165,7 +165,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
             vec![CodeModeToolDefinition {
                 tool_name,
                 name,
-                description: tool.description.clone(),
+                description: tool.description.clone().into(),
                 kind: CodeModeToolKind::Function,
                 input_schema: serde_json::to_value(&tool.parameters).ok(),
                 default_timeout_ms: None,
@@ -178,7 +178,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
             vec![CodeModeToolDefinition {
                 tool_name,
                 name,
-                description: tool.description.clone(),
+                description: tool.description.clone().into(),
                 kind: CodeModeToolKind::Freeform,
                 input_schema: None,
                 default_timeout_ms: None,
@@ -193,7 +193,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 ResponsesApiNamespaceTool::Function(tool) => CodeModeToolDefinition {
                     name: code_mode_name_for_tool_name(&tool_name),
                     tool_name,
-                    description: tool.description.clone(),
+                    description: tool.description.clone().into(),
                     kind: CodeModeToolKind::Function,
                     input_schema: serde_json::to_value(&tool.parameters).ok(),
                     default_timeout_ms: None,
@@ -211,7 +211,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
             description: format!(
                 "{}\n\n{CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE}",
                 description.trim()
-            ),
+            ).into(),
             kind: CodeModeToolKind::Function,
             input_schema: serde_json::to_value(parameters).ok(),
             default_timeout_ms: None,

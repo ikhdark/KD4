@@ -652,6 +652,8 @@ async fn command_failure_remains_inspectable_without_another_cell() {
             "the next tool must execute in the same cell: {visible}"
         );
         assert!(visible.contains("COMPILER_DIAGNOSTIC"), "{visible}");
+        assert!(visible.contains("nested_command_failure"), "{visible}");
+        assert!(visible.contains("\"exit_code\":101"), "{visible}");
         assert!(
             !visible.contains("Script error:"),
             "a nonzero exit is not a JS exception: {visible}"
@@ -668,13 +670,19 @@ async fn command_failure_remains_inspectable_without_another_cell() {
         );
         assert_eq!(
             request.purpose,
-            Some(codex_protocol::protocol::TurnTimingGenerationPurpose::FailureDiagnosis),
-            "process failure must still reach the continuation consumer"
+            Some(codex_protocol::protocol::TurnTimingGenerationPurpose::Repair),
+            "failure of a potentially mutating command must reach the repair consumer"
         );
         assert!(
-            request.failure_fingerprint.is_none(),
-            "a command failure must not imply that retries are forbidden"
+            request.failure_fingerprint.is_some(),
+            "command failure evidence must retain its diagnostic identity"
         );
+        assert_eq!(
+            request.sampling,
+            crate::session::turn_execution::SamplingGenerationDisposition::DecisionBearing,
+            "a command failure must still permit the next repair decision"
+        );
+        assert!(!request.terminal_completion_only);
         runtime.finish().await;
     }
 }

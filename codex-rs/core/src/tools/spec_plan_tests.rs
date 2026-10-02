@@ -344,15 +344,44 @@ async fn removed_workspace_workers_are_not_exposed_or_registered() {
 
 #[tokio::test]
 async fn token_budget_tools_require_feature_activation() {
-    for enabled in [false, true] {
-        let plan = probe(|turn| set_feature(turn, Feature::TokenBudget, enabled)).await;
-        let names = &["new_context", "get_context_remaining"];
+    for (enabled, notes, history) in [
+        (false, true, true),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+        (true, true, true),
+    ] {
+        let extension_tool_executors = crate::session::tests::token_budget_recovery_tool_stubs()
+            .into_iter()
+            .filter(|executor| {
+                let name = executor.tool_name();
+                (notes && name == ToolName::namespaced("notes", "write_file"))
+                    || (history && name == ToolName::namespaced("history", "read_item"))
+            })
+            .collect();
+        let plan = probe_with(
+            |turn| set_feature(turn, Feature::TokenBudget, enabled),
+            ToolPlanInputs {
+                extension_tool_executors,
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+        let names = &["get_context_remaining"];
         if enabled {
             plan.assert_visible_contains(names);
             plan.assert_registered_contains(names);
         } else {
             plan.assert_visible_lacks(names);
             plan.assert_registered_lacks(names);
+        }
+        // A fresh window discards history, so it needs the notes/history recovery tools.
+        if enabled && notes && history {
+            plan.assert_visible_contains(&["new_context"]);
+            plan.assert_registered_contains(&["new_context"]);
+        } else {
+            plan.assert_visible_lacks(&["new_context"]);
+            plan.assert_registered_lacks(&["new_context"]);
         }
     }
 }
@@ -906,7 +935,7 @@ async fn wait_is_always_registered_when_code_mode_is_enabled() {
 }
 
 #[tokio::test]
-async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
+async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvable() {
     let configure = |turn: &mut TurnContext, code_mode_only| {
         set_features(
             turn,
@@ -983,16 +1012,19 @@ async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
                 "missing {contract_field}"
             );
         }
-        assert!(exec.description.contains("curr_time(args:"));
-        assert!(exec.description.contains("Return the current time in UTC."));
+        assert!(!exec.description.contains("curr_time(args:"));
+        assert!(!exec.description.contains("Return the current time in UTC."));
     }
     assert!(mixed_exec.description.len() < nested_exec.description.len());
+    let clock = ToolName::namespaced("clock", "curr_time").to_string();
+    mixed.assert_registered_contains(&[&clock]);
+    nested_only.assert_registered_contains(&[&clock]);
     // Compare the same command/source/artifact contracts, not task-specific
     // prompts. The old mixed-mode projection retained these argument schemas.
     for name in ["exec_command", "read_file", "read_tool_output"] {
         let spec = mixed.visible_spec(name);
         let mut before = codex_tools::code_mode_tool_definition_for_spec(spec).unwrap();
-        before.description.clear();
+        before.description = "".into();
         if matches!(name, "read_file" | "read_tool_output") {
             before.output_schema = None;
         }
@@ -2228,6 +2260,35 @@ async fn request_plugin_install_stays_visible_without_tool_search() {
 }
 
 #[tokio::test]
+async fn plugin_install_tools_are_searchable_but_not_eager_with_tool_search() {
+    for candidates in [
+        None,
+        Some(plugin_candidates(ToolSuggestPresentation::ListTool)),
+        Some(plugin_candidates(ToolSuggestPresentation::RecommendationContext)),
+    ] {
+        let has_list = candidates.as_ref().is_none_or(|candidates|
+            candidates.presentation == ToolSuggestPresentation::ListTool);
+        let plan = probe_with(
+            |turn| {
+                turn.model_info.supports_search_tool = true;
+                set_features(turn, &[Feature::ToolSuggest, Feature::Apps, Feature::Plugins]);
+            },
+            ToolPlanInputs { tool_suggest_candidates: candidates, ..Default::default() },
+        ).await;
+        plan.assert_visible_contains(&["tool_search"]);
+        for name in ["request_plugin_install", "list_available_plugins_to_install"] {
+            if name == "list_available_plugins_to_install" && !has_list {
+                continue;
+            }
+            plan.assert_visible_lacks(&[name]);
+            plan.assert_registered_contains(&[name]);
+            assert_eq!(plan.exposure(name), ToolExposure::Deferred);
+            assert!(plan.tool_search_texts.iter().any(|text| text.contains(name)));
+        }
+    }
+}
+
+#[tokio::test]
 async fn request_plugin_install_description_requires_exhausting_tool_search() {
     let plan = probe_with(
         |turn| {
@@ -2652,6 +2713,38 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "spawn_agent").to_string()),
         ToolExposure::DirectModelOnly
     );
+}
+
+#[test]
+fn namespaced_multi_agent_v2_tools_keep_their_handler_identity() {
+    use crate::tools::context::ToolPayload;
+    use crate::tools::hook_names::HookToolName;
+    use crate::tools::registry::CoreToolRuntime;
+
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let spawn = super::multi_agent_v2_handler(
+        crate::tools::handlers::multi_agents_v2::SpawnAgentHandler::new(Default::default()),
+        Some(MULTI_AGENT_V2_NAMESPACE),
+    );
+    let list = super::multi_agent_v2_handler(
+        crate::tools::handlers::multi_agents_v2::ListAgentsHandler,
+        Some(MULTI_AGENT_V2_NAMESPACE),
+    );
+    // The default `agents` namespace changes only the model-facing name.
+    for (runtime, name, hook) in [
+        (&spawn, "spawn_agent", HookToolName::spawn_agent()),
+        (&list, "list_agents", HookToolName::new("list_agents")),
+    ] {
+        let registered = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, name);
+        assert_eq!(runtime.tool_name(), registered);
+        assert_eq!(runtime.semantic_tool_name(), ToolName::plain(name));
+        assert_eq!(
+            runtime.pre_tool_use_hook_name(&registered, &payload),
+            Some(hook)
+        );
+    }
 }
 
 #[tokio::test]

@@ -21,6 +21,9 @@ pub(super) struct SafetyBufferingState {
     submitted_turn: Option<(String, AppCommand)>,
     active: Option<ActiveSafetyBuffering>,
     agent_message_started: bool,
+    /// Tool work started in this turn, so its effects may already have landed and
+    /// re-running the whole turn on another model could repeat them.
+    tool_activity_started: bool,
 }
 
 impl ChatWidget {
@@ -33,6 +36,7 @@ impl ChatWidget {
             .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
         self.safety_buffering.active = None;
         self.safety_buffering.agent_message_started = false;
+        self.safety_buffering.tool_activity_started = false;
     }
 
     pub(crate) fn clear_safety_buffering(&mut self) {
@@ -45,6 +49,10 @@ impl ChatWidget {
         self.safety_buffering.agent_message_started = true;
     }
 
+    pub(super) fn mark_safety_buffering_tool_activity_started(&mut self) {
+        self.safety_buffering.tool_activity_started = true;
+    }
+
     pub(super) fn safety_buffering_is_waiting(&self) -> bool {
         self.safety_buffering.active.is_some() && !self.safety_buffering.agent_message_started
     }
@@ -52,6 +60,7 @@ impl ChatWidget {
     pub(crate) fn can_retry_safety_buffered_turn(&self, turn_id: &str) -> bool {
         self.turn_lifecycle.agent_turn_running
             && !self.safety_buffering.agent_message_started
+            && !self.safety_buffering.tool_activity_started
             && self
                 .safety_buffering
                 .active
@@ -113,13 +122,10 @@ impl ChatWidget {
             return;
         }
 
-        let has_retry_turn =
-            self.safety_buffering
-                .submitted_turn
-                .as_ref()
-                .is_some_and(|(submitted_turn_id, _)| {
-                    replay_kind.is_none() && submitted_turn_id == &turn_id
-                });
+        let has_retry_turn = !self.safety_buffering.tool_activity_started
+            && self.safety_buffering.submitted_turn.as_ref().is_some_and(
+                |(submitted_turn_id, _)| replay_kind.is_none() && submitted_turn_id == &turn_id,
+            );
         let thread_id = self.thread_id;
         let retry_model = faster_model.filter(|_| has_retry_turn && thread_id.is_some());
         let can_offer_retry = retry_model.is_some();

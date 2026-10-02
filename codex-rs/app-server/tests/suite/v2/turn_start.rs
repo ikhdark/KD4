@@ -790,7 +790,7 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
             thread_id: thread.id.clone(),
             client_user_message_id: None,
             input: vec![V2UserInput::Text {
-                text: "Hello".to_string(),
+                text: "Use the long skill descriptions".to_string(),
                 text_elements: Vec::new(),
             }],
             ..Default::default()
@@ -3284,7 +3284,7 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     const CHILD_PROMPT: &str = "child: do work";
     const PARENT_PROMPT: &str = "spawn a child and continue";
     const SPAWN_CALL_ID: &str = "spawn-call-1";
-    const REQUESTED_MODEL: &str = "gpt-5.2";
+    const REQUESTED_MODEL: &str = "gpt-5.5";
     const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
     let server = responses::start_mock_server().await;

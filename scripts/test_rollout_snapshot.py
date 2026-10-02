@@ -18,9 +18,43 @@ except ImportError:
 from scripts import kd4_first_useful_action_analysis
 from scripts import kd4_turn_latency_audit
 from scripts import rollout_snapshot
+from scripts import restore_rollout_artifact
 
 
 class RolloutSnapshotTest(unittest.TestCase):
+    def test_artifact_export_restores_deleted_unicode_without_overwriting_work(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "sessions" / "rollout.jsonl"
+            source.parent.mkdir()
+            content = "preserved Unicode: 背景\r\n" * 1000
+            item = {"type": "event_msg", "payload": {"type": "patch_apply_end",
+                    "call_id": "delete-1", "changes": {"original.txt": {
+                        "type": "delete", "content": content}}}}
+            data = json.dumps(item, ensure_ascii=False).encode("utf-8")
+            digest = hashlib.sha256(data).hexdigest()
+            directory = rollout_snapshot.rollout_payload_root(source)
+            directory.mkdir()
+            (directory / f"{digest}.json").write_bytes(data)
+            reference = {"timestamp": "2026-10-02T00:00:00Z", "format_version": 1,
+                         "type": "rollout_payload_artifact", "payload": {
+                             "sha256": digest, "bytes": len(data), "item_type": "event_msg"}}
+            source.write_text(json.dumps(reference) + "\n", encoding="utf-8")
+            output = Path(temp) / "export" / "snapshot.jsonl"
+            restored = Path(temp) / "restored.txt"
+            args = ["--rollout", str(output), "--call-id", "delete-1",
+                    "--deleted-file", "original.txt", "--output", str(restored)]
+            with contextlib.redirect_stdout(io.StringIO()):
+                rollout_snapshot.main([str(source), "--output", str(output)])
+                restore_rollout_artifact.main(args)
+            self.assertEqual(output.read_bytes(), source.read_bytes())
+            self.assertEqual(restored.read_bytes(), content.encode("utf-8"))
+            with self.assertRaises(FileExistsError):
+                restore_rollout_artifact.main(args)
+            artifact = rollout_snapshot.rollout_payload_root(output) / f"{digest}.json"
+            artifact.write_bytes(b"corrupt")
+            with self.assertRaisesRegex(ValueError, "size mismatch"):
+                rollout_snapshot.read_rollout_records(output)
+
     def test_compression_handoff_recovers_at_resolution_and_open_boundaries(self):
         data = b'{"type":"session_meta","payload":{}}\n'
         compressed = zstd.compress(data)

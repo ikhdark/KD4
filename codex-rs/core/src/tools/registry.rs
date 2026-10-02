@@ -125,11 +125,88 @@ pub(crate) enum ToolExecutionTiming {
 pub use codex_tools::ToolExecutor;
 pub use codex_tools::ToolExposure;
 
-/// Typed runtime contract for locally executed tools.
-///
-/// Implementers provide the shared `ToolExecutor` behavior plus optional
-/// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ToolCleanupPolicy {
+    InterruptibleRead,
+    ProcessTermination,
+    ExternalOperation,
+    CommitBarrier,
+}
+
+impl ToolCleanupPolicy {
+    fn deadline(self) -> Duration {
+        Duration::from_secs(match self {
+            Self::InterruptibleRead => 2,
+            Self::ProcessTermination => 60,
+            Self::ExternalOperation => 30,
+            Self::CommitBarrier => 120,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TerminalFailureReuse {
+    #[default]
+    Never,
+    /// Only explicitly terminal, fingerprinted failures, with identical
+    /// arguments and the same turn-local mutation/plan/input/tool-exposure
+    /// revision. Producers with external or time-dependent invalidators must
+    /// not opt in. Authorization and hooks must remain unchanged.
+    RequestRevision,
+    /// Also permits reuse of a previously rejected malformed JSON payload.
+    /// The runtime must parse JSON before any effects. Syntax is rechecked by
+    /// the current parser; schema errors and transient failures do not qualify.
+    RequestRevisionAndJsonSyntax,
+}
+
+/// Native argument contracts supported by command evidence classification.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CommandArgumentFormat {
+    Exec,
+    Shell,
+}
+
+impl CommandArgumentFormat {
+    pub(crate) fn canonical_name(self) -> ToolName {
+        ToolName::plain(match self {
+            Self::Exec => "exec_command",
+            Self::Shell => "shell_command",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ToolSemanticCapabilities {
+    pub(crate) mutation: bool,
+    pub(crate) coordination: bool,
+    pub(crate) command: Option<CommandArgumentFormat>,
+}
+
+/// Typed runtime contract for locally executed tools, including scheduling,
+/// evidence, cancellation and host-owned delivery capabilities.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    /// Trusted opt-in publication receipt; success alone is not completion.
+    fn terminal_result_adapter(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// A producer-owned wire contract, not inferred from an alias's name.
+    fn command_argument_format(&self) -> Option<CommandArgumentFormat> {
+        None
+    }
+
+    fn cancellation_recovery(
+        &self,
+        result: Option<&Value>,
+        error: Option<&str>,
+    ) -> crate::tools::context::ToolEffectRecovery {
+        crate::tools::context::ToolEffectRecovery::unknown(result, error)
+    }
+
+    fn terminal_failure_reuse(&self) -> TerminalFailureReuse {
+        TerminalFailureReuse::Never
+    }
+
     /// Resolve a structured request to its executable operation before hooks
     /// and command authorization inspect it. The target must be registered.
     fn prepare_invocation<'a>(
@@ -165,6 +242,54 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
     /// registrations on the same cancellation path as the canonical name.
     fn owns_unified_exec_processes(&self) -> bool {
         false
+    }
+
+    /// Opts this runtime into shared repository admission only for payloads
+    /// it guarantees are observational. Workspace evidence classification is
+    /// not proof of read-only execution: an opaque shell may both read and write.
+    /// Unknown runtimes remain exclusive; aliases inherit their runtime.
+    fn permits_shared_workspace_observation(&self, _payload: &ToolPayload) -> bool {
+        false
+    }
+
+    /// Orchestrators acquire workspace leases through each nested dispatch.
+    /// Holding an outer lease while waiting on them would deadlock. This is
+    /// runtime-owned, never inferred from a tool's public name.
+    fn delegates_workspace_admission(&self) -> bool {
+        false
+    }
+
+    /// Native add-only operations whose exact destinations the runtime
+    /// enforces. Admission still proves locality, absence and directory identity.
+    /// This is never inferred from a public tool name or opaque shell text.
+    /// Some(empty) requires global mutation exclusion; None is not an opt-in.
+    fn native_addition_paths(&self, _payload: &ToolPayload) -> Option<Vec<std::path::PathBuf>> {
+        None
+    }
+
+    /// Identity used to classify this tool's calls for scheduling and evidence.
+    /// A wrapper that registers a handler under another name or namespace
+    /// returns the handler's identity, so the alias is classified the same way.
+    fn semantic_tool_name(&self) -> ToolName {
+        self.tool_name()
+    }
+
+    /// Bounded teardown allowance, distinct from the operation's execution timeout.
+    /// Unknown runtimes keep the conservative shared deadline: aborting cleanup
+    /// early turns their effects into uncertain ones. A runtime may override
+    /// this when its teardown is known to be shorter or longer.
+    fn cancellation_cleanup_deadline(&self) -> std::time::Duration {
+        self.cancellation_cleanup_policy().deadline()
+    }
+
+    fn cancellation_cleanup_policy(&self) -> ToolCleanupPolicy {
+        if self.cancellation_requires_commit_barrier() {
+            ToolCleanupPolicy::CommitBarrier
+        } else if self.owns_unified_exec_processes() {
+            ToolCleanupPolicy::ProcessTermination
+        } else {
+            ToolCleanupPolicy::ExternalOperation
+        }
     }
 
     fn telemetry_tags<'a>(
@@ -213,13 +338,25 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         })
     }
 
+    /// Hook identity that `pre_tool_use_payload` uses for this call, without
+    /// parsing hook input. `None` means PreToolUse never runs for the call.
+    /// Overrides must return `Some` whenever `pre_tool_use_payload` does.
+    fn pre_tool_use_hook_name(
+        &self,
+        tool_name: &ToolName,
+        payload: &ToolPayload,
+    ) -> Option<HookToolName> {
+        matches!(payload, ToolPayload::Function { .. })
+            .then(|| function_hook_tool_name_for(tool_name))
+    }
+
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
         let ToolPayload::Function { arguments } = &invocation.payload else {
             return None;
         };
 
         Some(PreToolUsePayload {
-            tool_name: function_hook_tool_name(invocation),
+            tool_name: self.pre_tool_use_hook_name(&invocation.tool_name, &invocation.payload)?,
             tool_input: function_hook_tool_input(arguments),
         })
     }
@@ -792,8 +929,11 @@ fn apply_post_tool_use_outcome(
         return Vec::new();
     }
     if let Some(feedback_message) = outcome.feedback_message {
-        let model_visible = FunctionToolOutput::from_text(feedback_message, /*success*/ None);
-        result.code_mode_feedback = model_visible.body.clone();
+        let mut model_visible = FunctionToolOutput::from_text(feedback_message, /*success*/ None);
+        result.code_mode_feedback.extend(model_visible.body.clone());
+        // Preserve earlier runtime warnings for direct callers as well as
+        // code mode; a later hook must not hide a failed durable effect commit.
+        model_visible.body = result.code_mode_feedback.clone();
         result.result = Box::new(PostToolUseFeedbackOutput {
             original: std::mem::replace(
                 &mut result.result,
@@ -1179,6 +1319,26 @@ impl ToolRegistry {
         self.tool(name)?.create_diff_consumer()
     }
 
+    /// Whether a configured PreToolUse handler can select this call. Matcher
+    /// aware, so a hook scoped to one tool leaves every other tool's dispatch
+    /// shortcuts enabled. Unregistered tools never reach PreToolUse.
+    pub(crate) fn pre_tool_use_hook_may_run(
+        &self,
+        hooks: &codex_hooks::Hooks,
+        name: &ToolName,
+        payload: &ToolPayload,
+    ) -> bool {
+        if !hooks.has_handler_for(HookEventName::PreToolUse) {
+            return false;
+        }
+        self.tools
+            .get(name)
+            .and_then(|tool| tool.runtime().pre_tool_use_hook_name(name, payload))
+            .is_some_and(|hook_name| {
+                hooks.has_pre_tool_use_handler_for(hook_name.name(), hook_name.matcher_aliases())
+            })
+    }
+
     pub(crate) fn supports_parallel_tool_calls(&self, name: &ToolName) -> Option<bool> {
         let tool = self.tools.get(name)?;
         Some(
@@ -1194,6 +1354,76 @@ impl ToolRegistry {
 
     pub(crate) fn cancellation_requires_commit_barrier(&self, name: &ToolName) -> Option<bool> {
         Some(self.tool(name)?.cancellation_requires_commit_barrier())
+    }
+
+    /// The registered runtime's classification identity; unregistered names
+    /// classify as themselves.
+    pub(crate) fn semantic_tool_name(&self, name: &ToolName) -> ToolName {
+        self.tools
+            .get(name)
+            .map_or_else(|| name.clone(), |tool| tool.runtime().semantic_tool_name())
+    }
+
+    pub(crate) fn semantic_capabilities(&self, name: &ToolName) -> ToolSemanticCapabilities {
+        let Some(tool) = self.tools.get(name) else {
+            return ToolSemanticCapabilities { mutation: true, ..Default::default() };
+        };
+        ToolSemanticCapabilities {
+            mutation: tool.authorization_class() == TypedToolClass::StructuredEdit
+                || (tool.authorization_class() == TypedToolClass::DynamicExternal
+                    && tool.external_mutation_intent()
+                        == crate::agent::task_capabilities::ExternalMutationIntent::MayMutate),
+            coordination: matches!(tool.authorization_class(),
+                TypedToolClass::AgentCommunication | TypedToolClass::RootTaskControl),
+            command: tool.runtime().command_argument_format(),
+        }
+    }
+
+    pub(crate) fn terminal_failure_reuse(&self, name: &ToolName) -> TerminalFailureReuse {
+        self.tools.get(name)
+            .map_or(TerminalFailureReuse::Never, |tool| tool.runtime().terminal_failure_reuse())
+    }
+
+    pub(crate) fn terminal_result_adapter(&self, name: &ToolName) -> Option<&'static str> {
+        self.tool(name)?.terminal_result_adapter()
+    }
+
+    pub(crate) fn permits_shared_workspace_observation(
+        &self,
+        name: &ToolName,
+        payload: &ToolPayload,
+    ) -> bool {
+        self.tool(name)
+            .is_some_and(|tool| tool.permits_shared_workspace_observation(payload))
+    }
+
+    pub(crate) fn delegates_workspace_admission(&self, name: &ToolName) -> bool {
+        self.tool(name)
+            .is_some_and(|tool| tool.delegates_workspace_admission())
+    }
+
+    pub(crate) fn native_addition_paths(
+        &self, name: &ToolName, payload: &ToolPayload,
+    ) -> Option<Vec<std::path::PathBuf>> {
+        self.tool(name)?.native_addition_paths(payload)
+    }
+
+    pub(crate) fn cancellation_cleanup_deadline(&self, name: &ToolName) -> std::time::Duration {
+        self.tool(name).map(|tool| tool.cancellation_cleanup_deadline())
+            .unwrap_or(crate::tools::parallel::TOOL_RUNTIME_CLEANUP_DEADLINE)
+            .clamp(std::time::Duration::from_secs(1), std::time::Duration::from_secs(120))
+    }
+
+    pub(crate) fn cancellation_recovery(
+        &self,
+        name: &ToolName,
+        result: Option<&Value>,
+        error: Option<&str>,
+    ) -> crate::tools::context::ToolEffectRecovery {
+        self.tool(name).map_or_else(
+            || crate::tools::context::ToolEffectRecovery::unknown(result, error),
+            |runtime| runtime.cancellation_recovery(result, error),
+        )
     }
 
     pub(crate) fn owns_unified_exec_processes(&self, name: &ToolName) -> Option<bool> {
@@ -1232,11 +1462,11 @@ impl ToolRegistry {
                 invocation.tool_name
             )
         });
-        if !invocation
-            .session
-            .hooks()
-            .has_handler_for(HookEventName::PreToolUse)
-        {
+        if !self.pre_tool_use_hook_may_run(
+            &invocation.session.hooks(),
+            &invocation.tool_name,
+            &invocation.payload,
+        ) {
             return Ok((invocation, expansion_notice));
         }
         let Some(registered) = self.tools.get(&invocation.tool_name) else {
@@ -1659,15 +1889,10 @@ impl ToolRegistry {
         // already claimed the terminal outcome. Do not continue into
         // projection, persistence, or finish notification for that result.
         if dispatch_state.is_aborted() {
-            if invocation.tool_name.name == "apply_patch"
-                && let Err(error) = result
-            {
-                dispatch_trace.record_failed(&error).await;
-                return Err(error);
-            }
-            let err = FunctionCallError::RespondToModel(
-                "tool cancelled after runtime cleanup".to_string(),
-            );
+            let err = match result {
+                Err(error) => error,
+                Ok(result) => cancelled_tool_result_recovery(&result),
+            };
             dispatch_trace.record_failed(&err).await;
             return Err(err);
         }
@@ -1779,9 +2004,7 @@ impl ToolRegistry {
                 // Cancellation may win while projection or its bookkeeping is
                 // pending. Its owner publishes the aborted terminal outcome.
                 if dispatch_state.is_aborted() {
-                    let err = FunctionCallError::RespondToModel(
-                        "tool cancelled after runtime cleanup".to_string(),
-                    );
+                    let err = cancelled_tool_result_recovery(&result);
                     dispatch_trace.record_failed(&err).await;
                     return Err(err);
                 }
@@ -1801,9 +2024,7 @@ impl ToolRegistry {
                     record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                     Ok(result)
                 } else {
-                    Err(FunctionCallError::RespondToModel(
-                        "tool cancelled after runtime cleanup".to_string(),
-                    ))
+                    Err(cancelled_tool_result_recovery(&result))
                 }
             }
             Err(err) => {
@@ -1813,9 +2034,9 @@ impl ToolRegistry {
                     notify_tool_finish(&invocation, lifecycle_outcome).await;
                     record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                     Err(err)
-                } else if dispatch_state.is_aborted() && invocation.tool_name.name == "apply_patch"
+                } else if dispatch_state.is_aborted()
                 {
-                    // The cancellation owner retains committed patch recovery information
+                    // The cancellation owner retains every handler's recovery information
                     // and owns the single aborted lifecycle notification.
                     Err(err)
                 } else {
@@ -1826,6 +2047,15 @@ impl ToolRegistry {
             }
         }
     }
+}
+
+fn cancelled_tool_result_recovery(result: &AnyToolResult) -> FunctionCallError {
+    FunctionCallError::RespondToModel(serde_json::json!({
+        "kind": "handler_result",
+        "message": "tool cancelled after runtime cleanup; retain this result for effect reconciliation",
+        "call_id": result.call_id,
+        "result": result.result.code_mode_result(&result.payload),
+    }).to_string())
 }
 
 fn projection_is_provider_visible(source: &ToolCallSource) -> bool {
@@ -1863,6 +2093,23 @@ async fn handle_any_tool(
     tool: &dyn CoreToolRuntime,
     invocation: ToolInvocation,
 ) -> Result<AnyToolResult, FunctionCallError> {
+    let class = invocation.step_context.tool_router()
+        .map(|router| router.classify_tool_name(&invocation.step_context.turn, &invocation.tool_name))
+        .unwrap_or(TypedToolClass::Unknown);
+    let effect_receipt = if !invocation.step_context.turn.config.ephemeral
+        && !matches!(class, TypedToolClass::ReadSearch | TypedToolClass::CodeModeControl)
+        && !tool.permits_shared_workspace_observation(&invocation.payload)
+    {
+        Some(crate::tools::effect_journal::EffectReceipt::reserve(
+            invocation.step_context.turn.config.codex_home.join("effect-journal")
+                .join(invocation.session.thread_id.to_string()).to_path_buf(),
+            invocation.step_context.turn.sub_id.clone(),
+            invocation.call_id.clone(),
+            invocation.tool_name.to_string(),
+        ).await.map_err(FunctionCallError::RespondToModel)?)
+    } else {
+        None
+    };
     let _tool_execution_timing_guard =
         matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler).then(|| {
             invocation
@@ -1879,15 +2126,63 @@ async fn handle_any_tool(
     mark_tool_handler_entry();
     let output = tool.handle(invocation.clone()).await;
     mark_tool_handler_exit();
-    let output = output?;
-    Ok(AnyToolResult {
+    let mut persistence_warning = None;
+    if let Some(receipt) = effect_receipt {
+        let outcome = match &output {
+            Ok(output) => match output.outcome_for_logging() {
+                ToolOutputOutcome::Success => "success",
+                ToolOutputOutcome::Yielded => "yielded",
+                _ => "unsuccessful",
+            },
+            Err(_) => "handler_error",
+        };
+        if let Err(error) = receipt.returned(outcome).await {
+            persistence_warning = Some(format!(
+                "The handler returned, but its effect receipt could not be committed: {error}. Effects may already have occurred; do not replay this dispatch. Inspect the affected state."
+            ));
+        }
+    }
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(match persistence_warning {
+                Some(warning) => match error {
+                    FunctionCallError::RespondToModel(message) =>
+                        FunctionCallError::RespondToModel(format!("{message}\n{warning}")),
+                    FunctionCallError::DeniedToModel(message) =>
+                        FunctionCallError::DeniedToModel(format!("{message}\n{warning}")),
+                    FunctionCallError::RequiredOperationBlocked(message) =>
+                        FunctionCallError::RequiredOperationBlocked(format!("{message}\n{warning}")),
+                    FunctionCallError::Fatal(message) =>
+                        FunctionCallError::Fatal(format!("{message}\n{warning}")),
+                },
+                None => error,
+            });
+        }
+    };
+    let mut result = AnyToolResult {
         call_id: invocation.call_id,
         payload: invocation.payload,
         result: output,
         model_projection: None,
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
-    })
+    };
+    if let Some(warning) = persistence_warning {
+        // Keep the original result, including live process handles, available
+        // to code mode. The persistence failure must not turn a completed
+        // mutation into an apparently unexecuted, retryable dispatch.
+        let model_visible = FunctionToolOutput::from_text(
+            format!("{}\n{warning}", result.result.code_mode_result(&result.payload)),
+            None,
+        );
+        result.code_mode_feedback.extend(model_visible.body.clone());
+        result.result = Box::new(PostToolUseFeedbackOutput {
+            original: result.result,
+            model_visible,
+        });
+    }
+    Ok(result)
 }
 
 struct ModelProjectionInput {
@@ -2269,8 +2564,9 @@ async fn prepare_model_projection(
     } else {
         model_output_tokens as u64
     };
-    let invocation_sha256 =
-        canonical_tool_invocation_sha256(&invocation.payload, parsed_function_arguments);
+    let invocation_sha256 = authorized_tool_invocation_sha256(
+        &invocation.step_context.turn, &invocation.payload, parsed_function_arguments,
+    );
     Some(ModelProjectionInput {
         fragments: metadata.fragments,
         spillable_text,
@@ -2406,6 +2702,17 @@ fn consolidated_history_output_text(response: &ResponseInputItem) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
     }
+}
+
+pub(crate) fn authorized_tool_invocation_sha256(
+    turn: &TurnContext,
+    payload: &ToolPayload,
+    parsed_function_arguments: Option<&ParsedFunctionArguments>,
+) -> Option<String> {
+    let invocation_hash = canonical_tool_invocation_sha256(payload, parsed_function_arguments)?;
+    serde_json::to_vec(&(
+        invocation_hash, turn.cwd(), turn.permission_profile(), turn.approval_policy.get(),
+    )).ok().map(|bytes| crate::tool_history::sha256(&bytes))
 }
 
 fn canonical_tool_invocation_sha256(
@@ -2983,7 +3290,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             .then(admission_only_fallback);
     };
     let supersession_identity = invocation_sha256
-        .map(|invocation_sha256| format!("{tool_name}:{invocation_sha256}:{}", canonical.sha256));
+        .map(|invocation_sha256| format!("authorized-v1:{tool_name}:{invocation_sha256}:{}", canonical.sha256));
     if materialization == ProjectionMaterialization::AdmissionOnly {
         // Code mode bounds its own packet before admission. When that packet
         // dropped output, name the durable canonical artifact so the omitted
@@ -3868,16 +4175,20 @@ fn non_text_projection_byte_cost(content: &[Value]) -> usize {
 }
 
 fn function_hook_tool_name(invocation: &ToolInvocation) -> HookToolName {
-    if invocation.tool_name.name == "spawn_agent"
+    function_hook_tool_name_for(&invocation.tool_name)
+}
+
+fn function_hook_tool_name_for(tool_name: &ToolName) -> HookToolName {
+    if tool_name.name == "spawn_agent"
         && matches!(
-            invocation.tool_name.namespace.as_deref(),
+            tool_name.namespace.as_deref(),
             None | Some(MULTI_AGENT_V1_NAMESPACE)
         )
     {
         return HookToolName::spawn_agent();
     }
 
-    HookToolName::new(flat_tool_name(&invocation.tool_name).into_owned())
+    HookToolName::new(flat_tool_name(tool_name).into_owned())
 }
 
 fn compile_code_mode_argument_validator(

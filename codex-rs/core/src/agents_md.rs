@@ -148,6 +148,63 @@ struct EnvironmentProjectInstructionsDiscovery {
     cwd: PathUri,
     filesystem: Arc<dyn ExecutorFileSystem>,
     result: io::Result<Vec<ProjectDocCandidate>>,
+    /// Existing, non-ignored instruction files below a local cwd.
+    nested_notice: Option<String>,
+}
+
+/// Most nested instruction paths named individually before summarizing the rest.
+const MAX_NESTED_INSTRUCTION_PATHS: usize = 20;
+
+/// Includes untracked additions and excludes deleted index entries. Do not cache
+/// by index mtime: neither an untracked addition nor a deletion must update it.
+/// Git also handles linked worktrees, where `.git` is a file.
+fn nested_instruction_notice(cwd: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ":(glob)**/AGENTS.md",
+            ":(glob)**/AGENTS.override.md",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let nested = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        // Files directly in the cwd are already loaded above.
+        .filter(|path| path.contains('/'))
+        .filter(|path| cwd.join(path).is_file())
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    let cwd_display = cwd.display();
+    let notice = if nested.is_empty() {
+        format!("No non-ignored AGENTS.md or AGENTS.override.md files exist below {cwd_display}.")
+    } else {
+        let mut listed = nested
+            .iter()
+            .take(MAX_NESTED_INSTRUCTION_PATHS)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if nested.len() > MAX_NESTED_INSTRUCTION_PATHS {
+            listed.push_str(&format!(
+                ", and {} more",
+                nested.len() - MAX_NESTED_INSTRUCTION_PATHS
+            ));
+        }
+        format!(
+            "Instruction files below {cwd_display} (tracked and non-ignored untracked); read those on paths you will touch: {listed}."
+        )
+    };
+    Some(notice)
 }
 
 impl ProjectInstructionsDiscovery {
@@ -238,11 +295,23 @@ pub(crate) async fn discover_project_instructions_with_markers(
                         project_root_markers.as_ref(),
                     )
                     .await;
+                    let nested_notice = match cwd.to_abs_path() {
+                        Ok(local_cwd) if !environment.is_remote() => {
+                            tokio::task::spawn_blocking(move || {
+                                nested_instruction_notice(local_cwd.as_path())
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }
+                        _ => None,
+                    };
                     EnvironmentProjectInstructionsDiscovery {
                         environment_id,
                         cwd,
                         filesystem,
                         result,
+                        nested_notice,
                     }
                 }
             },
@@ -289,6 +358,7 @@ pub(crate) async fn load_project_instructions_from_discovery(
         cwd,
         filesystem,
         result,
+        nested_notice,
     } in discovery.environments
     {
         match result {
@@ -365,6 +435,17 @@ pub(crate) async fn load_project_instructions_from_discovery(
                     "error trying to find AGENTS.md docs: {err:#}"
                 );
             }
+        }
+        // A repo can contain only nested instructions and no root document.
+        // The manifest still belongs in the context in that case.
+        if let Some(notice) = nested_notice
+            && notice.len().saturating_add(2) <= remaining_rendered_bytes
+        {
+            remaining_rendered_bytes -= notice.len() + 2;
+            loaded.entries.push(InstructionEntry {
+                contents: notice,
+                provenance: InstructionProvenance::Internal,
+            });
         }
     }
 

@@ -35,8 +35,6 @@ use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::resolve_repository_root;
-use crate::tools::known_delta_store;
-use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::prove_noprofile_powershell_direct_argv_async;
 use crate::tools::runtimes::shell::ShellRequest;
@@ -566,59 +564,6 @@ async fn run_exec_like_with_exit_code_inner(
     let attempt_key =
         attempt_key.map(|key| key.with_permission_context(&effective_permission_context));
 
-    let mut known_delta = if turn.config.features.enabled(Feature::KnownDeltaStore)
-        && !is_validation
-        && !exec_params.command.is_empty()
-        && known_delta_store::is_immutable_git_show_candidate(
-            &exec_params.command[0],
-            &exec_params.command[1..],
-        )
-        && let Some(authorization_scope) = known_delta_store::authorization_scope_fingerprint(
-            &turn.file_system_sandbox_context(
-                normalized_additional_permissions.clone(),
-                &PathUri::from_abs_path(&exec_params.cwd),
-            ),
-            effective_additional_permissions.sandbox_permissions,
-        ) {
-        let metadata_source = turn
-            .turn_metadata_state
-            .git_metadata_source()
-            .filter(|source| exec_params.cwd.starts_with(source.repo_root().as_path()));
-        let project_namespace = match &metadata_source {
-            Some(source) => source.project_namespace().await,
-            None => None,
-        };
-        let project_namespace_hint = metadata_source
-            .map_or(known_delta_store::ProjectNamespaceHint::Discover, |_| {
-                known_delta_store::ProjectNamespaceHint::Resolved(project_namespace.as_deref())
-            });
-        known_delta_store::prepare_immutable_git_show_with_authorization_scope(
-            turn.config.codex_home.as_path(),
-            &session.thread_id.to_string(),
-            &exec_params.cwd,
-            &exec_params.command[0],
-            &exec_params.command[1..],
-            project_namespace_hint,
-            &authorization_scope,
-            force_fresh,
-        )
-        .await
-    } else {
-        None
-    };
-    if let Some(prepared) = known_delta.as_mut() {
-        prepared
-            .prepare_output_budget(
-                turn.model_info.truncation_policy.into(),
-                max_output_tokens,
-                &hook_command,
-            )
-            .await;
-    }
-    let known_delta_hit = known_delta
-        .as_ref()
-        .is_some_and(known_delta_store::PreparedKnownDelta::is_hit);
-
     // Fresh inline overrides require a policy that allows sandbox approval.
     // Sticky turn permissions have already been approved, so they should
     // continue through the normal exec approval flow for the command.
@@ -634,8 +579,7 @@ async fn run_exec_like_with_exit_code_inner(
         )));
     }
 
-    if !known_delta_hit
-        && let Some(attempt_key) = attempt_key.as_ref()
+    if let Some(attempt_key) = attempt_key.as_ref()
         && let Err(blocked) = session
             .services
             .command_execution
@@ -680,7 +624,7 @@ async fn run_exec_like_with_exit_code_inner(
     let intercepted = match intercepted {
         Ok(intercepted) => intercepted,
         Err(err) => {
-            if !known_delta_hit && let Some(attempt_key) = attempt_key.as_ref() {
+            if let Some(attempt_key) = attempt_key.as_ref() {
                 err.record_attempt_failure(&session.services.command_execution, attempt_key)
                     .await;
             }
@@ -821,7 +765,6 @@ async fn run_exec_like_with_exit_code_inner(
         additional_permissions: normalized_additional_permissions,
         justification: exec_params.justification.clone(),
         exec_approval_requirement,
-        known_delta: known_delta.clone(),
         validation_launch,
         workspace_operation_root,
     };
@@ -847,7 +790,6 @@ async fn run_exec_like_with_exit_code_inner(
     let retained_validation_attempt = runtime.take_last_validation_attempt_output();
     let runtime_validation_attempt_started = runtime.take_last_validation_attempt_started();
     let validation_attempt_started = is_validation
-        && !known_delta_hit
         && (retained_validation_attempt.is_some()
             || runtime_validation_attempt_started
             || shell_validation_execution_output(&out, None).is_some());
@@ -863,29 +805,6 @@ async fn run_exec_like_with_exit_code_inner(
         turn.turn_timing_state
             .record_executed_validation_duration(duration);
     }
-    if !known_delta_hit && let Some(known_delta) = known_delta.as_ref() {
-        let observation = match &out {
-            Ok(output) if is_complete_success(output) => {
-                KnownDeltaExecutionObservation::CompleteSuccess {
-                    output: output.aggregated_output.text.as_bytes(),
-                    executor_cost: output.duration,
-                }
-            }
-            Ok(output)
-                if output.aggregated_output.truncated_after_lines.is_some()
-                    || output.aggregated_output.truncated =>
-            {
-                KnownDeltaExecutionObservation::Incomplete
-            }
-            Err(_) | Ok(_) => KnownDeltaExecutionObservation::CompleteFailure,
-        };
-        known_delta_store::record_execution(
-            turn.config.codex_home.as_path(),
-            known_delta,
-            observation,
-        )
-        .await;
-    }
     let source_capture_truncated = match &out {
         Ok(output) => output.aggregated_output.truncated,
         Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
@@ -896,9 +815,7 @@ async fn run_exec_like_with_exit_code_inner(
     };
     let exit_code = out.as_ref().ok().map(|output| output.exit_code);
     let retry_exit_code = retry_exit_code(&out);
-    if !known_delta_hit
-        && let (Some(attempt_key), Some(retry_exit_code)) = (attempt_key.as_ref(), retry_exit_code)
-    {
+    if let (Some(attempt_key), Some(retry_exit_code)) = (attempt_key.as_ref(), retry_exit_code) {
         session
             .services
             .command_execution
@@ -930,21 +847,14 @@ async fn run_exec_like_with_exit_code_inner(
         .is_some_and(|projection| projection.reduced)
         && let Some(output) = execution_output
     {
-        if let Some(hit) = known_delta
-            .as_ref()
-            .and_then(known_delta_store::PreparedKnownDelta::hit)
-        {
-            Some(hit.raw_output_artifact().clone())
-        } else {
-            Some(
-                create_raw_output_artifact(
-                    turn.config.codex_home.as_path(),
-                    &session.thread_id.to_string(),
-                    output.aggregated_output.text.as_bytes(),
-                )
-                .await,
+        Some(
+            create_raw_output_artifact(
+                turn.config.codex_home.as_path(),
+                &session.thread_id.to_string(),
+                output.aggregated_output.text.as_bytes(),
             )
-        }
+            .await,
+        )
     } else {
         None
     };
@@ -1109,13 +1019,6 @@ fn canonical_exec_output_bytes(out: &Result<ExecToolCallOutput, ToolError>) -> O
         }
         Err(_) => None,
     }
-}
-
-fn is_complete_success(output: &ExecToolCallOutput) -> bool {
-    output.exit_code == 0
-        && !output.timed_out
-        && output.aggregated_output.truncated_after_lines.is_none()
-        && !output.aggregated_output.truncated
 }
 
 fn insert_metadata_before_output(content: &mut String, metadata: &str) {

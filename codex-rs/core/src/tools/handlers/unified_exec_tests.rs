@@ -197,6 +197,7 @@ async fn stall_timeout_exec_command_preserves_session_between_polls() {
     let result = output.code_mode_result(&payload);
     let process_id = result["session_id"].as_u64().expect("initial yield returns a live session");
     assert_eq!(result["process_exited"], false);
+    let initial_output = result["output"].as_str().unwrap().to_string();
     // No polling or input keeps the watchdog alive: the process owns it.
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     let poll = ToolInvocation {
@@ -215,13 +216,13 @@ async fn stall_timeout_exec_command_preserves_session_between_polls() {
         .handle(poll)
         .await
         .expect("stalled command returns its live session");
-    assert!(output.success_for_logging());
+    assert_eq!(output.outcome_for_logging(), codex_tools::ToolOutputOutcome::Yielded);
     let result = output.code_mode_result(&payload);
     assert!(result["output"].as_str().unwrap().contains("command stalled after 3500 milliseconds"));
     assert_eq!(result["execution_state"], "running");
     assert_eq!(result["process_exited"], false);
     assert_eq!(result["session_id"], process_id);
-    assert!(result["output"].as_str().unwrap().contains("ready"));
+    assert!(format!("{initial_output}{}", result["output"].as_str().unwrap()).contains("ready"));
     let wait_payload = ToolPayload::Function {
         arguments: serde_json::json!({"session_id":process_id, "wait_for_output":true}).to_string(),
     };
@@ -276,7 +277,8 @@ async fn exec_command_keeps_exact_json_stdout_separate_from_display_and_stderr()
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
             "program": "python",
-            "args": ["-c", "import json,sys; print('progress', file=sys.stderr); print(json.dumps({'value':'x'*12000}))"],
+            // Larger than the former 64 KiB script-stream limit.
+            "args": ["-c", "import json,sys; print('progress', file=sys.stderr); print(json.dumps({'value':'x'*120000}))"],
             "max_output_tokens": 64,
             "yield_time_ms": 30000,
         }).to_string(),
@@ -290,7 +292,7 @@ async fn exec_command_keeps_exact_json_stdout_separate_from_display_and_stderr()
     assert_eq!(result["streams_complete"], true);
     assert_eq!(result["output_reduced"], true);
     let parsed: serde_json::Value = serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
-    assert_eq!(parsed["value"].as_str().unwrap().len(), 12000);
+    assert_eq!(parsed["value"].as_str().unwrap().len(), 120000);
     assert_eq!(result["stderr"].as_str().unwrap().trim(), "progress");
     let visible = codex_code_mode::model_visible_tool_result(
         &codex_tools::ToolName::plain("exec_command"), &result,
@@ -316,6 +318,31 @@ async fn exec_command_keeps_exact_json_stdout_separate_from_display_and_stderr()
     assert!(result.get("stdout").is_none());
     assert!(result.get("stderr").is_none());
     assert!(result["output"].as_str().unwrap().contains("err"));
+}
+
+/// Two recorded sessions parsed `stdout` from this script shape, as the exec
+/// contract instructs, and found no exact streams for a small exit-0 result.
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_script_piped_to_python_keeps_exact_json_stdout() {
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "cmd": "@'\nimport json\nprint(json.dumps({'value': 'ok'}))\n'@ | python -",
+            "yield_time_ms": 30000,
+        })
+        .to_string(),
+    };
+    let invocation = invocation_for_payload_without_sandbox(
+        "exec_command", "powershell-script-json-stdout", payload.clone(),
+    ).await;
+    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+    let result = output.code_mode_result(&payload);
+    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_eq!(result["process_exited"], true, "{result}");
+    assert_eq!(result["streams_complete"], true, "{result}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(result["stdout"].as_str().unwrap().trim()).unwrap();
+    assert_eq!(parsed["value"], "ok");
 }
 
 #[test]
@@ -610,7 +637,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         .as_deref()
         .expect("PowerShell failure should expose model recovery guidance");
     assert!(repair_notice.starts_with(existing_repair_notice));
-    assert!(repair_notice.contains("retry with `script_body`"));
+    assert!(repair_notice.contains("correct the PowerShell script syntax"));
     assert!(projection.fragments.iter().any(|fragment| {
         fragment.kind == codex_tools::ToolOutputProjectionFragmentKind::ErrorOrDiagnostic
             && fragment.text == repair_notice
@@ -628,7 +655,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         !code_mode["output"]
             .as_str()
             .expect("code-mode output should be text")
-            .contains("retry with `script_body`")
+            .contains("correct the PowerShell script syntax")
     );
 }
 
@@ -679,7 +706,7 @@ fn terminal_powershell_nonterminating_error_exposes_recovery_hint_after_success(
         output.code_mode_result(&payload)["repair"]
             .as_str()
             .expect("visible hint")
-            .contains("retry with `script_body`")
+            .contains("check PowerShell parameter binding and quoting")
     );
 }
 
@@ -721,6 +748,75 @@ async fn invocation_for_payload_without_sandbox(
         source: ToolCallSource::Direct,
         payload,
     }
+}
+
+#[tokio::test]
+async fn write_stdin_terminates_non_pty_process_and_retains_output() {
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": "python",
+            "args": ["-u", "-c", "import time; print('termination-output'); time.sleep(60)"],
+            "yield_time_ms": 250,
+            "tty": false,
+        }).to_string(),
+    };
+    let invocation = invocation_for_payload_without_sandbox(
+        "exec_command", "termination-start", payload.clone(),
+    ).await;
+    let session = Arc::clone(&invocation.session);
+    let step_context = Arc::clone(&invocation.step_context);
+    let tracker = Arc::clone(&invocation.tracker);
+    let started = ExecCommandHandler::default().handle(invocation).await.unwrap()
+        .code_mode_result(&payload);
+    let process_id = started["session_id"].as_u64().expect("live session");
+    assert_eq!(started["session_capabilities"]["cancellation"], true);
+    if !started["output"].as_str().unwrap().contains("termination-output") {
+        let ready_payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "session_id": process_id, "wait_for_output": true,
+            }).to_string(),
+        };
+        let ready = WriteStdinHandler::default().handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: Arc::clone(&step_context),
+            tracker: Arc::clone(&tracker),
+            call_id: "termination-ready".to_string(),
+            tool_name: codex_tools::ToolName::plain("write_stdin"),
+            source: ToolCallSource::Direct,
+            payload: ready_payload.clone(),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+        }).await.unwrap().code_mode_result(&ready_payload);
+        assert!(ready["output"].as_str().unwrap().contains("termination-output"));
+    }
+    for chars in ["must-not-be-written", ""] {
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "session_id": process_id, "terminate": true, "chars": chars,
+            }).to_string(),
+        };
+        let result = WriteStdinHandler::default().handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: Arc::clone(&step_context),
+            tracker: Arc::clone(&tracker),
+            call_id: format!("termination-{chars}"),
+            tool_name: codex_tools::ToolName::plain("write_stdin"),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+        }).await;
+        if !chars.is_empty() {
+            assert!(matches!(result, Err(crate::FunctionCallError::RespondToModel(ref message))
+                if message.contains("terminate requires empty chars")));
+            continue;
+        }
+        let completed = result.unwrap().code_mode_result(&payload);
+        assert_eq!(completed["execution_state"], "exited");
+        assert_eq!(completed["process_exited"], true);
+        assert!(completed.get("session_id").is_none());
+        assert!(completed["stdout"].as_str().unwrap().contains("termination-output"));
+    }
+    assert!(session.services.unified_exec_manager
+        .list_processes().await.is_empty());
 }
 
 async fn invocation_for_payload_with_shellless_remote(
@@ -1276,289 +1372,6 @@ async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
             .as_str()
             .is_some_and(|output| output.contains("after"))
     );
-}
-
-#[tokio::test]
-async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_launches() {
-    known_delta_replay_case(300, None).await;
-}
-
-#[tokio::test]
-async fn known_delta_small_replay_stays_inline_until_budget_requires_recovery() {
-    known_delta_replay_case(1, None).await;
-    known_delta_replay_case(1, Some(0)).await;
-}
-
-async fn known_delta_replay_case(repetitions: usize, replay_budget: Option<usize>) {
-    let repo = tempfile::tempdir().unwrap();
-    let codex_home = tempfile::tempdir().unwrap();
-    let initialized = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(repo.path())
-        .output()
-        .unwrap();
-    assert!(initialized.status.success(), "{initialized:?}");
-    let fixture = "immutable cache fixture\n".repeat(repetitions);
-    let large = fixture.len()
-        > crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES;
-    std::fs::write(repo.path().join("fixture.txt"), &fixture).unwrap();
-    // Cache namespaces use root commit identities, so an unborn repository is ineligible.
-    for args in [
-        vec!["add", "fixture.txt"],
-        vec![
-            "-c",
-            "user.name=Cache Test",
-            "-c",
-            "user.email=cache@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "fixture",
-        ],
-    ] {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-    }
-    let (session, mut turn, rx_event) =
-        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-            codex_login::CodexAuth::from_api_key("Test API Key"),
-            Vec::new(),
-            codex_home.path(),
-            |config| {
-                config.cwd =
-                    codex_utils_absolute_path::AbsolutePathBuf::try_from(repo.path()).unwrap();
-                config
-                    .permissions
-                    .set_permission_profile(PermissionProfile::Disabled)
-                    .unwrap();
-                config
-                    .permissions
-                    .approval_policy
-                    .set(codex_protocol::protocol::AskForApproval::Never)
-                    .unwrap();
-            },
-        )
-        .await;
-    // Keep the model hard cap above this inline fixture. A deliberately smaller
-    // replay budget below must still materialize a recovery artifact.
-    Arc::get_mut(&mut turn)
-        .expect("unshared setup turn")
-        .model_info
-        .truncation_policy = codex_protocol::openai_models::TruncationPolicyConfig::bytes(40_000);
-    assert!(
-        session
-            .features()
-            .enabled(codex_features::Feature::KnownDeltaStore)
-    );
-    let repo_root =
-        get_git_repo_root(turn.cwd().as_path()).expect("test cwd is in a git repository");
-    let blob_output = std::process::Command::new("git")
-        .args(["hash-object", "-w", "fixture.txt"])
-        .current_dir(&repo_root)
-        .output()
-        .expect("write immutable test blob");
-    assert!(
-        blob_output.status.success(),
-        "git hash-object failed: {}",
-        String::from_utf8_lossy(&blob_output.stderr)
-    );
-    let blob = String::from_utf8(blob_output.stdout)
-        .expect("blob id is UTF-8")
-        .trim()
-        .to_string();
-    let payload = ToolPayload::Function {
-        arguments: serde_json::json!({
-            "kind": "argv",
-            "program": "git",
-            "args": ["show", blob.clone()],
-            "yield_time_ms": 10_000,
-        })
-        .to_string(),
-    };
-
-    let ((first, second, third, cached_lifecycle), launches) =
-        crate::tools::runtimes::unified_exec::test_observation::observe(
-            crate::tools::known_delta_store::test_observation::with_profitability_costs(
-                async {
-                    let first = run_exec_command_for_test(
-                        &session,
-                        &turn,
-                        "known-delta-unified-first",
-                        payload.clone(),
-                    )
-                    .await;
-                    wait_for_exec_command_end(&rx_event, "known-delta-unified-first").await;
-                    let second = run_exec_command_for_test(
-                        &session,
-                        &turn,
-                        "known-delta-unified-second",
-                        payload.clone(),
-                    )
-                    .await;
-                    wait_for_exec_command_end(&rx_event, "known-delta-unified-second").await;
-                    let third = run_exec_command_for_test(
-                        &session,
-                        &turn,
-                        "known-delta-unified-third",
-                        ToolPayload::Function {
-                            arguments: serde_json::json!({
-                                "kind": "argv",
-                                "program": "git",
-                                "args": ["-C", turn.cwd().as_path(), "show", blob.clone()],
-                                "max_output_tokens": replay_budget,
-                                "yield_time_ms": 10_000,
-                            })
-                            .to_string(),
-                        },
-                    )
-                    .await;
-                    let cached_lifecycle =
-                        wait_for_exec_command_end(&rx_event, "known-delta-unified-third").await;
-                    (first, second, third, cached_lifecycle)
-                },
-                std::time::Duration::from_millis(1),
-                std::time::Duration::from_millis(1),
-                std::time::Duration::from_secs(1),
-            ),
-        )
-        .await;
-    assert_eq!(launches.process_launches, 2);
-    assert_eq!(cached_lifecycle, (false, false));
-
-    let canonical_text = |output: &dyn ToolOutput| {
-        String::from_utf8(
-            output
-                .canonical_result(&payload)
-                .expect("exec output has canonical bytes")
-                .bytes,
-        )
-        .expect("git show output is UTF-8")
-    };
-    assert!(!canonical_text(first.as_ref()).contains("known-delta cache hit"));
-    assert!(!canonical_text(second.as_ref()).contains("known-delta cache hit"));
-    assert!(canonical_text(third.as_ref()).contains("known-delta cache hit"));
-    assert!(canonical_text(third.as_ref()).contains("command_was_executed=false"));
-    assert!(canonical_text(third.as_ref()).contains("shadow_validations=1"));
-    assert!(canonical_text(third.as_ref()).contains("not a fresh execution or exit status"));
-    let third_code_mode = third.code_mode_result(&payload);
-    assert_eq!(third_code_mode["exit_code"], 0);
-    let fresh_token_count = first.code_mode_result(&payload)["original_token_count"]
-        .as_u64()
-        .expect("fresh output has a token estimate");
-    assert!(fresh_token_count > 0);
-    assert_eq!(third_code_mode["original_token_count"], fresh_token_count);
-    assert_eq!(third_code_mode["original_token_count_is_approximate"], true);
-    let essential = third
-        .projection_metadata()
-        .expect("cache projection")
-        .essential_inline;
-    assert_eq!(essential["original_token_count"], fresh_token_count);
-    assert_eq!(essential["original_token_count_is_approximate"], true);
-    assert!(third_code_mode.get("session_id").is_none());
-    let second_json = second.code_mode_result(&payload);
-    if large || replay_budget.is_some() {
-        let third_artifact_id = third_code_mode["raw_output_artifact_id"]
-            .as_str()
-            .expect("large or reduced replay must be recoverable");
-        assert_ne!(
-            Some(third_artifact_id),
-            second_json["raw_output_artifact_id"].as_str()
-        );
-        let recovered = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
-            codex_home.path(),
-            &session.thread_id.to_string(),
-            third_artifact_id,
-        )
-        .await
-        .expect("exact cached output recovery");
-        assert_eq!(recovered, fixture.as_bytes());
-        if replay_budget.is_some() {
-            assert_eq!(third_code_mode["output_reduced"], true);
-            assert!(
-                !third_code_mode["output"]
-                    .as_str()
-                    .unwrap()
-                    .contains("immutable cache fixture")
-            );
-        }
-    } else {
-        assert!(second_json.get("raw_output_artifact_id").is_none());
-        assert!(third_code_mode.get("raw_output_artifact_id").is_none());
-        assert_eq!(third_code_mode["output_reduced"], false);
-        assert!(
-            third_code_mode["output"]
-                .as_str()
-                .unwrap()
-                .contains(&fixture)
-        );
-        assert!(
-            !codex_home
-                .path()
-                .join("tool-output")
-                .join(session.thread_id.to_string())
-                .exists()
-        );
-    }
-
-    let force_fresh_payload = ToolPayload::Function {
-        arguments: serde_json::json!({
-            "kind": "argv",
-            "program": "git",
-            "args": ["show", blob],
-            "yield_time_ms": 10_000,
-            "force_fresh": true,
-        })
-        .to_string(),
-    };
-    let (fresh, fresh_launches) = crate::tools::runtimes::unified_exec::test_observation::observe(
-        crate::tools::known_delta_store::test_observation::with_profitability_costs(
-            run_exec_command_for_test(
-                &session,
-                &turn,
-                "known-delta-unified-force-fresh",
-                force_fresh_payload.clone(),
-            ),
-            std::time::Duration::from_millis(1),
-            std::time::Duration::from_millis(1),
-            std::time::Duration::from_secs(1),
-        ),
-    )
-    .await;
-    wait_for_exec_command_end(&rx_event, "known-delta-unified-force-fresh").await;
-    assert_eq!(fresh_launches.process_launches, 1);
-    let fresh_text = String::from_utf8(
-        fresh
-            .canonical_result(&force_fresh_payload)
-            .expect("fresh exec output has canonical bytes")
-            .bytes,
-    )
-    .expect("fresh git show output is UTF-8");
-    assert!(!fresh_text.contains("known-delta cache hit"));
-
-    let (reused_after_fresh, post_fresh_launches) =
-        crate::tools::runtimes::unified_exec::test_observation::observe(
-            crate::tools::known_delta_store::test_observation::with_profitability_costs(
-                run_exec_command_for_test(
-                    &session,
-                    &turn,
-                    "known-delta-unified-after-fresh",
-                    payload.clone(),
-                ),
-                std::time::Duration::from_millis(1),
-                std::time::Duration::from_millis(1),
-                std::time::Duration::from_secs(1),
-            ),
-        )
-        .await;
-    wait_for_exec_command_end(&rx_event, "known-delta-unified-after-fresh").await;
-    assert_eq!(post_fresh_launches.process_launches, 0);
-    assert!(canonical_text(reused_after_fresh.as_ref()).contains("known-delta cache hit"));
 }
 
 #[test]
@@ -2454,6 +2267,16 @@ fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
 
     assert_eq!(command.last().map(String::as_str), Some("echo hello"));
     assert_eq!(resolved.shell_type, ShellType::PowerShell);
+    std::fs::remove_file(&powershell_path)?;
+    let missing = get_command(
+        &args, Arc::new(default_user_shell()), true, false,
+    ).err().expect("a missing explicit shell must not fall back to another installation");
+    assert!(missing.contains("stage=shell_metadata"), "{missing}");
+    std::fs::create_dir(&powershell_path)?;
+    let directory = get_command(
+        &args, Arc::new(default_user_shell()), true, false,
+    ).err().expect("a directory cannot be used as the requested shell");
+    assert!(directory.contains("is not a file"), "{directory}");
     Ok(())
 }
 

@@ -696,6 +696,64 @@ class SessionDiagnosticsTest(unittest.TestCase):
                     self.assertEqual(audit.main(command[2:] + flags), 0)
                 row = _elapsed_rows(json.loads(out.getvalue())["baselineComparison"])[0]
                 self.assertEqual(row.get("reason", row["status"]), expected)
+            # An explicit gate turns the observational comparison into an exit
+            # status, and unavailable evidence is distinct from passing.
+            for flags, status, code in (
+                ([], "regression", 1),
+                (["--comparison-threshold", "2"], "passed", 0),
+                (["--comparison-min-samples", "6"], "insufficient_evidence", 3),
+            ):
+                out = io.StringIO()
+                with self.subTest(gate=flags), contextlib.redirect_stdout(out):
+                    self.assertEqual(
+                        audit.main(command[2:] + flags + ["--gate-metric", "elapsedMs"]),
+                        code,
+                    )
+                gate = json.loads(out.getvalue())["baselineComparison"]["gate"]
+                self.assertEqual(gate["status"], status)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    audit.main(command[2:] + ["--gate-metric", "finalAnswerRecall"]), 3
+                )
+            for argv in (
+                command[2:] + ["--gate-metric", "bogus"],
+                [str(root / "rollout.jsonl"), "--gate-metric", "elapsedMs"],
+            ):
+                out, err = io.StringIO(), io.StringIO()
+                with (
+                    self.subTest(argv=argv[-2:]),
+                    contextlib.redirect_stdout(out),
+                    contextlib.redirect_stderr(err),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    audit.main(argv)
+                self.assertEqual(raised.exception.code, 2)
+                self.assertEqual(out.getvalue(), "")
+
+    def test_regression_gate_uses_metric_direction_and_never_passes_missing_proof(self):
+        def comparison(metric, *statuses):
+            return {
+                "metrics": [{"metric": metric, "status": status} for status in statuses]
+            }
+
+        for metric, statuses, expected in (
+            ("elapsedMs", ("increased", "within_threshold"), "regression"),
+            ("elapsedMs", ("decreased", "within_threshold"), "passed"),
+            ("finalAnswerRecall", ("decreased",), "regression"),
+            ("finalAnswerRecall", ("increased",), "passed"),
+            ("elapsedMs", ("within_threshold", "unavailable"), "insufficient_evidence"),
+            ("elapsedMs", (), "insufficient_evidence"),
+            ("elapsedMs", ("increased", "unavailable"), "regression"),
+        ):
+            with self.subTest(metric=metric, statuses=statuses):
+                gate = diagnostics.regression_gate(
+                    comparison(metric, *statuses), [metric]
+                )
+                self.assertEqual(gate["status"], expected)
+        for metrics in ([], ["bogus"]):
+            with self.subTest(metrics=metrics), self.assertRaises(ValueError):
+                diagnostics.regression_gate(comparison("elapsedMs"), metrics)
 
     def test_empty_and_malformed_evidence_never_reports_an_improvement(self):
         with tempfile.TemporaryDirectory() as temp:

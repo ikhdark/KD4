@@ -23,6 +23,12 @@ fn enable(turn: &mut TurnContext) {
     });
 }
 
+fn install_recovery_tools(session: &mut Session) {
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.tool_contributor(Arc::new(crate::session::tests::TokenBudgetRecoveryTools));
+    session.services.extensions = Arc::new(builder.build());
+}
+
 fn history_text(items: &[ResponseItem]) -> String {
     items
         .iter()
@@ -45,7 +51,8 @@ fn history_text(items: &[ResponseItem]) -> String {
 
 #[tokio::test]
 async fn reminders_are_opt_in_and_once_per_window() {
-    let (session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
+    install_recovery_tools(&mut session);
     let initial = session.clone_history().await.raw_items().len();
     maybe_record(&session, &turn, Some(0), true).await.unwrap();
     assert_eq!(session.clone_history().await.raw_items().len(), initial);
@@ -77,6 +84,36 @@ async fn reminders_are_opt_in_and_once_per_window() {
 }
 
 #[tokio::test]
+async fn recovery_prompts_require_recovery_tools() {
+    for recovery_tools in [false, true] {
+        let (mut session, mut turn) = make_session_and_context().await;
+        if recovery_tools {
+            install_recovery_tools(&mut session);
+        }
+        enable(&mut turn);
+        Arc::make_mut(&mut turn.config)
+            .token_budget
+            .as_mut()
+            .unwrap()
+            .guidance_message = Some("write notes before the reset".into());
+        let turn = Arc::new(turn);
+        let world =
+            crate::session::tests::build_world_state_from_turn_context(&session, &turn).await;
+        let initial = session
+            .build_initial_context_with_world_state(&turn, &world)
+            .await;
+        assert_eq!(
+            history_text(&initial).contains("write notes before the reset"),
+            recovery_tools
+        );
+        maybe_record(&session, &turn, Some(0), true).await.unwrap();
+        let text = history_text(session.clone_history().await.raw_items());
+        assert_eq!(text.contains("remaining 0"), recovery_tools);
+        assert_eq!(text.contains("save notes now"), recovery_tools);
+    }
+}
+
+#[tokio::test]
 async fn fallback_buffer_never_exceeds_physical_window_in_either_scope() {
     let (session, mut turn) = make_session_and_context().await;
     enable(&mut turn);
@@ -99,7 +136,8 @@ async fn fallback_buffer_never_exceeds_physical_window_in_either_scope() {
 
 #[tokio::test]
 async fn fresh_window_preserves_environment_and_cancellation_preserves_history() {
-    let (session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
+    install_recovery_tools(&mut session);
     enable(&mut turn);
     let session = Arc::new(session);
     let turn = Arc::new(turn);

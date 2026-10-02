@@ -216,8 +216,9 @@ async fn find_locates_rollout_file_written_by_recorder() -> std::io::Result<()> 
     let (path, session_meta) = found.expect("expected rollout path to be found");
     assert_eq!(session_meta.meta.id, thread_id);
     assert!(path.exists());
-    let contents = std::fs::read_to_string(&path)?;
-    assert!(contents.contains(&thread_id.to_string()));
+    let (_, recorded_id, parse_errors) = RolloutRecorder::load_rollout_items(&path).await?;
+    assert_eq!(parse_errors, 0);
+    assert_eq!(recorded_id, Some(thread_id));
     recorder.shutdown().await?;
     Ok(())
 }

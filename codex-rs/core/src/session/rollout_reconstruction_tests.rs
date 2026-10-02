@@ -124,6 +124,7 @@ async fn reconstruct_history_ignores_tool_manifest_records() {
     let super::rollout_reconstruction::RolloutReconstruction {
         history,
         plan: _,
+        plan_lineage: _,
         previous_turn_settings: _,
         reference_context_item: _,
         world_state_baseline: _,
@@ -325,9 +326,9 @@ async fn nested_plan_handler_persists_checklist_for_resume() {
     let rollout_path = super::tests::attach_thread_persistence(&mut session).await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
-    let expected = checklist("Implement the verified fix");
+    let original = checklist("Implement the verified fix");
     let payload = ToolPayload::Function {
-        arguments: serde_json::to_string(&expected).unwrap(),
+        arguments: serde_json::to_string(&original).unwrap(),
     };
     let output = PlanHandler
         .handle(ToolInvocation {
@@ -351,6 +352,34 @@ async fn nested_plan_handler_persists_checklist_for_resume() {
         .await
         .unwrap();
     assert_eq!(output.code_mode_result(&payload)["effect"], "initial");
+    let expected = checklist("Finish implementation");
+    let original_id = crate::plan_store::plan_step_id(&original.plan[0].step);
+    let revision_payload = ToolPayload::Function {
+        arguments: json!({
+            "expected_revision": output.code_mode_result(&payload)["revision"],
+            "plan": [{
+                "step": expected.plan[0].step,
+                "status": "in_progress",
+                "continues": [original_id],
+            }],
+        }).to_string(),
+    };
+    PlanHandler.handle(ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
+        cancellation_token: Default::default(),
+        tracker: Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
+        call_id: "nested-plan-revision".into(),
+        tool_name: codex_tools::ToolName::plain("update_plan"),
+        source: ToolCallSource::CodeMode {
+            cell_id: "plan-cell".into(),
+            parent_call_id: Some("plan-exec".into()),
+            runtime_tool_call_id: "2".into(),
+            nested_deadline: None,
+            cancellation_cause: None,
+        },
+        payload: revision_payload,
+    }).await.unwrap();
     session.flush_rollout().await.unwrap();
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
         .await
@@ -369,6 +398,16 @@ async fn nested_plan_handler_persists_checklist_for_resume() {
         restored.services.plan_store.current_for_test().await,
         Some(expected.clone())
     );
+    let (_, lineage) = restored.services.plan_store.snapshot_with_lineage().await.unwrap();
+    assert_eq!(lineage.requirements[&original_id].text, original.plan[0].step);
+    let restored_step_id = lineage.step_id(&expected.plan[0].step);
+    assert_eq!(restored_step_id, original_id, "a renamed step keeps its identity after resume");
+    assert_eq!(
+        lineage.step_requirements[&restored_step_id],
+        vec![original_id],
+    );
+    assert!(restored.clone_history().await.raw_items().iter()
+        .all(|item| crate::plan_store::plan_snapshot_from_item(item).is_none()));
     assert_eq!(
         restored.services.plan_store.update(expected).await.effect,
         crate::plan_store::PlanUpdateEffect::NoOp
@@ -1907,6 +1946,7 @@ async fn unresolved_sampling_boundary_invalidates_older_accepted_context() {
             physical_attempt_id: "attempt-new".to_string(),
             turn_id: Some(turn_context.sub_id.clone()),
             unresolved_context: true,
+            timing_checkpoint: None,
         }),
     ];
 

@@ -25,7 +25,7 @@ use codex_tools::ToolOutputProjectionMetadata;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-5.6-sol";
+pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-6-astra";
 pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {

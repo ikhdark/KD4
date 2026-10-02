@@ -111,7 +111,7 @@ impl ConnectionDriver {
     fn execute(
         &mut self,
         session: RemoteSession,
-        request: ExecuteRequest,
+        mut request: ExecuteRequest,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
     ) -> bool {
@@ -119,7 +119,32 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(err));
             return true;
         }
-        let request = match request.try_into() {
+        if request.state_path.is_some() && !self.named_state_snapshots {
+            let _ = response_tx.send(Err(
+                "code-mode host does not support named-state snapshots; no cell started".into(),
+            ));
+            return true;
+        }
+        let mut replacement = None;
+        let catalog = if self.tool_catalog_references {
+            match self.catalogs.get(&session.id) {
+                Some((revision, tools)) if tools == &request.enabled_tools => {
+                    request.enabled_tools = Arc::from([]);
+                    Some(codex_code_mode_protocol::host::WireToolCatalog { revision: *revision, register: false })
+                }
+                previous => {
+                    let Some(revision) = previous.map_or(Some(1), |(revision, _)| revision.checked_add(1)) else {
+                        let _ = response_tx.send(Err("code-mode tool catalog revision exhausted; no cell started".into()));
+                        return true;
+                    };
+                    replacement = Some((revision, request.enabled_tools.clone()));
+                    Some(codex_code_mode_protocol::host::WireToolCatalog { revision, register: true })
+                }
+            }
+        } else {
+            None
+        };
+        let mut request: codex_code_mode_protocol::host::WireExecuteRequest = match request.try_into() {
             Ok(request) => request,
             Err(err) => {
                 let _ = response_tx.send(Err(format!(
@@ -128,6 +153,7 @@ impl ConnectionDriver {
                 return true;
             }
         };
+        request.catalog = catalog;
         let request_id = match self.requests.allocate_id() {
             Ok(id) => id,
             Err(err) => {
@@ -152,6 +178,11 @@ impl ConnectionDriver {
             }
         };
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
+        if let Some(replacement) = replacement {
+            // Publish only after frame encoding succeeds. The host registers
+            // catalogs synchronously in wire order, before cell admission.
+            self.catalogs.insert(session.id.clone(), replacement);
+        }
         let cancellation = CancellableRequest::new(caller_cancellation);
         self.requests.insert_pending(
             request_id,
@@ -259,6 +290,7 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(err));
             return true;
         }
+        self.catalogs.remove(&session.id);
         self.send_request(
             HostRequest::ShutdownSession {
                 session_id: session.id.clone(),

@@ -505,6 +505,42 @@ fn turn_timing_state_records_ttfm_independently_of_visible_output() {
     );
 }
 
+#[test]
+fn final_publication_is_not_observational_nonprogress() {
+    for (phase, action, expected) in [
+        (Some("final_answer"), None, 0),
+        (Some("commentary"), None, 1),
+        (None, None, 0),
+        (None, Some("same-action"), 1),
+    ] {
+        let (_clock, state) = timing();
+        state.mark_turn_started();
+        state.begin_model_generation(&mut None, &SessionSource::Cli);
+        drop(state.begin_model_request_wait());
+        let item: ResponseItem = serde_json::from_value(serde_json::json!({
+            "type": "message", "role": "assistant", "phase": phase,
+            "content": [{"type": "output_text", "text": "The requested result is ready."}]
+        })).unwrap();
+        state.record_response_event_milestones(&ResponseEvent::OutputItemDone(item));
+        state.record_generation_outcome(Vec::new(), action.map(str::to_string), true);
+        let timing = state.complete_snapshot().protocol_timing();
+        assert_eq!(timing.observational_nonprogress_tokens.logical_generations, expected);
+    }
+}
+
+#[test]
+fn rolling_checkpoint_does_not_complete_the_live_turn() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(10);
+    let checkpoint = state.sampling_checkpoint();
+    assert!(checkpoint.tail_unknown);
+    assert_eq!(checkpoint.timing.inclusive_duration_ns, 10 * NS_PER_MS as u64);
+    assert!(state.state().completed_snapshot.is_none());
+    clock.set_ms(30);
+    assert_eq!(state.complete_snapshot().protocol_timing().inclusive_duration_ns, 30 * NS_PER_MS as u64);
+}
+
 #[tokio::test]
 async fn turn_timing_state_uses_one_wall_and_monotonic_start_sample() {
     let clock = Arc::new(FakeClock::new(10 * NS_PER_MS, 123_456));

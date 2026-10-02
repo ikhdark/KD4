@@ -80,13 +80,14 @@ fn write_global_file(
     Ok(path.abs())
 }
 
-fn remove_agents_md_world_state_section(rollout_path: &Path) -> Result<()> {
-    let rollout = std::fs::read_to_string(rollout_path)?;
+async fn remove_agents_md_world_state_section(rollout_path: &Path) -> Result<()> {
+    let mut reader = codex_rollout::open_rollout_line_reader(rollout_path).await?;
+    let mut rollout = Vec::new();
+    while let Some(line) = reader.next_line().await? {
+        rollout.push(serde_json::from_str::<RolloutLine>(&line)?);
+    }
     let mut removed_section = false;
     let retained = rollout
-        .lines()
-        .map(serde_json::from_str::<RolloutLine>)
-        .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
         .map(|mut line| {
             if let RolloutItem::WorldState(world_state) = &mut line.item
@@ -859,7 +860,7 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
     .await;
 
     // Simulate a rollout written before AGENTS.md had a persisted WorldState section.
-    remove_agents_md_world_state_section(&rollout_path)?;
+    remove_agents_md_world_state_section(&rollout_path).await?;
 
     std::fs::remove_file(old_source.as_path())?;
     let mut resume_builder = test_codex().with_home(Arc::clone(&home));

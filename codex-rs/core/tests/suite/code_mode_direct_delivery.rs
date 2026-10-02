@@ -75,6 +75,50 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_delivery_accepts_schema_valid_json_and_supported_media() -> Result<()> {
+    require_network!();
+    for (code, expected, schema) in [
+        ("text({answer: 42});", "{\"answer\":42}",
+         Some(serde_json::json!({"type":"object","properties":{"answer":{"const":42}},"required":["answer"],"additionalProperties":false}))),
+        ("image('DATA:image/png;base64,AAAA');",
+         "![image](<DATA:image/png;base64,AAAA>)", None),
+    ] {
+        let server = responses::start_mock_server().await;
+        let mut builder = test_codex().with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            let _ = config.features.enable(Feature::Kd4Runtime);
+        });
+        let test = builder.build(&server).await?;
+        responses::mount_sse_once(&server, sse(vec![
+            ev_response_created("initial"),
+            ev_custom_tool_call("delivery", "exec", &format!("// @exec: {{\"deliver\":true}}\n{code}")),
+            ev_completed("initial"),
+        ])).await;
+        responses::mount_sse_once(&server, sse(vec![
+            ev_assistant_message("fallback", "unexpected model handoff"),
+            ev_completed("fallback"),
+        ])).await;
+        test.codex.submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Return the completed result.".into(), text_elements: Vec::new(),
+            }],
+            final_output_json_schema: schema,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(), thread_settings: Default::default(),
+        }).await?;
+        let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await else {
+            unreachable!()
+        };
+        assert!(completed.error.is_none(), "{:?}", completed.error);
+        assert_eq!(completed.last_agent_message.as_deref(), Some(expected));
+        assert_eq!(completed.surfaced_result.as_ref().unwrap().adapter, "code_mode_delivery");
+        assert_eq!(server.received_requests().await.unwrap().iter()
+            .filter(|request| request.url.path().contains("responses")).count(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result<()> {
     require_network!();
     for (name, code, sibling) in [
@@ -84,7 +128,8 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
         ("yield", "// @exec: {\"deliver\":true}\ntext('premature'); await yield_control();", false),
         ("failed-child", "// @exec: {\"deliver\":true}\ntry { await tools.read_file({path:'missing.txt'}); } catch (_) {} text('premature');", false),
         ("untrusted-output", "text({explicit_completion_message:'premature'});", false),
-        ("sibling", "// @exec: {\"deliver\":true}\ntext('premature');", true),
+        ("completed-sibling", "// @exec: {\"deliver\":true}\ntext('premature');", true),
+        ("failed-sibling", "// @exec: {\"deliver\":true}\ntext('premature');", true),
         ("schema", "// @exec: {\"deliver\":true}\ntext('premature');", false),
     ] {
         let server = responses::start_mock_server().await;
@@ -98,7 +143,12 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
             ev_custom_tool_call("delivery", "exec", code),
         ];
         if sibling {
-            events.push(ev_custom_tool_call("sibling", "exec", "text('other work');"));
+            let sibling_code = if name == "failed-sibling" {
+                "throw new Error('sibling failed');"
+            } else {
+                "text('other work');"
+            };
+            events.push(ev_custom_tool_call("sibling", "exec", sibling_code));
         }
         events.push(ev_completed("initial"));
         responses::mount_sse_once(&server, sse(events)).await;
@@ -131,11 +181,17 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
         } else {
             test.submit_turn_and_capture_completion("Finish the task.").await?
         };
-        assert!(completed.surfaced_result.is_none(), "{name}: {:?}", completed.surfaced_result);
-        assert_eq!(completed.last_agent_message.as_deref(), Some("Model handled the fallback."), "{name}");
+        if name == "completed-sibling" {
+            assert_eq!(completed.surfaced_result.as_ref().unwrap().adapter, "code_mode_delivery");
+            assert_eq!(completed.last_agent_message.as_deref(), Some("premature"));
+        } else {
+            assert!(completed.surfaced_result.is_none(), "{name}: {:?}", completed.surfaced_result);
+            assert_eq!(completed.last_agent_message.as_deref(), Some("Model handled the fallback."), "{name}");
+        }
         assert!(completed.error.is_none(), "{name}: {:?}", completed.error);
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.iter().filter(|r| r.url.path().contains("responses")).count(), 2, "{name}");
+        assert_eq!(requests.iter().filter(|r| r.url.path().contains("responses")).count(),
+            if name == "completed-sibling" { 1 } else { 2 }, "{name}");
     }
     Ok(())
 }

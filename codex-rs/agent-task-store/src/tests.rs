@@ -3371,6 +3371,10 @@ async fn criterion_execution_reference_is_validated_persisted_and_projected() {
             call_id: "unlisted-or-foreign-call".to_string(),
             ..reference.clone()
         },
+        CriterionEvidenceRef {
+            kind: CriterionEvidenceKind::SourceInspection,
+            ..reference.clone()
+        },
     ] {
         let mut rejected = draft.clone();
         rejected.criterion_results[0].evidence_ref = Some(invalid);
@@ -3439,6 +3443,58 @@ async fn criterion_execution_reference_is_validated_persisted_and_projected() {
             .evidence_ref
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn source_inspection_receipts_bind_kind_and_pre_read_epoch() {
+    use sha2::Digest;
+    let fixture = Fixture::new().await;
+    initialize_validation_repository(fixture.repo.path());
+    let path = fixture.repo.path().join("src/lib.rs");
+    let (assignment, attempt) = fixture.store.create_assignment(
+        fixture.repo.path(),
+        validation_worker_draft("inspection", "src/lib.rs", "inspect:src/lib.rs"),
+    ).await.unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let fresh = fixture.store.prepare_source_inspection(
+        attempt.attempt_id, path.to_string_lossy().into_owned(),
+    ).await.unwrap().unwrap();
+    let reference = fixture.store.record_source_inspection(
+        fresh, "source-read".into(), hash, bytes.len() as u64,
+    ).await.unwrap();
+    assert_eq!(reference.kind, CriterionEvidenceKind::SourceInspection);
+    let mut draft = completed_receipt(vec![reference.call_id.clone()]);
+    draft.criterion_results[0].evidence_ref = Some(CriterionEvidenceRef {
+        kind: CriterionEvidenceKind::ValidationExecution, ..reference.clone()
+    });
+    assert!(matches!(
+        fixture.store.submit_agent_receipt(attempt.attempt_id, draft.clone()).await,
+        Err(StoreError::CriterionResultsInvalid(_))
+    ));
+    draft.criterion_results[0].evidence_ref = Some(reference);
+    fixture.store.submit_agent_receipt(attempt.attempt_id, draft).await.unwrap();
+    let task = fixture.store.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
+    assert!(task.completion_evidence_summary().contains(
+        "supported by a complete source inspection (semantic correctness not established)"
+    ));
+    let stale_fixture = Fixture::new().await;
+    initialize_validation_repository(stale_fixture.repo.path());
+    let stale_path = stale_fixture.repo.path().join("src/lib.rs");
+    let (_, stale_attempt) = stale_fixture.store.create_assignment(
+        stale_fixture.repo.path(),
+        validation_worker_draft("stale-inspection", "src/lib.rs", "inspect:src/lib.rs"),
+    ).await.unwrap();
+    let stale = stale_fixture.store.prepare_source_inspection(
+        stale_attempt.attempt_id, stale_path.to_string_lossy().into_owned(),
+    ).await.unwrap().unwrap();
+    std::fs::write(&stale_path, "pub fn changed() {}\n").unwrap();
+    let bytes = std::fs::read(&stale_path).unwrap();
+    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+    assert!(matches!(
+        stale_fixture.store.record_source_inspection(stale, "stale-read".into(), hash, bytes.len() as u64).await,
+        Err(StoreError::EvidenceSuperseded { .. })
+    ));
 }
 
 #[tokio::test]

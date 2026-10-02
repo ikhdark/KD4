@@ -9,6 +9,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:
+    from scripts.rollout_snapshot import read_rollout_records
+except ImportError:
+    from rollout_snapshot import read_rollout_records
+
 
 class MissingWebsocketsError(RuntimeError):
     pass
@@ -91,10 +96,7 @@ def load_rollout_replay(path: Path) -> list[dict[str, Any]]:
     hashes = {}
     response_ids = {}
     turn_ids = set()
-    for line in path.read_bytes().splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
+    for row, _ in read_rollout_records(path):
         payload = row["payload"]
         if row["type"] == "sampling_boundary":
             turn_ids.add(payload.get("turn_id"))

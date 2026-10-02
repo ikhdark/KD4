@@ -1879,6 +1879,34 @@
       },
       "type": "object"
     },
+    "PurposeReasoningEffort": {
+      "additionalProperties": false,
+      "description": "Opt-in reasoning defaults by generation purpose. Explicit turn effort wins, unsupported efforts are ignored, and this policy never switches models.",
+      "properties": {
+        "agent_coordination": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "failure_diagnosis": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "implementation": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "initial": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "repair": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "tool_result_interpretation": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "validation_interpretation": {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      },
+      "type": "object"
+    },
     "RawMcpServerConfig": {
       "additionalProperties": false,
       "description": "Raw MCP config shape used for deserialization and supported-field JSON Schema generation.\n\nFields that are accepted only to produce targeted validation errors should be skipped in the generated schema.\n\nKeep `TryFrom<RawMcpServerConfig> for McpServerConfig` exhaustively destructuring this struct so new TOML fields cannot be added here without updating the validation/mapping logic that produces [`McpServerConfig`].",
@@ -4004,6 +4032,14 @@
       "description": "Compact prompt used for history compaction.",
       "type": "string"
     },
+    "compaction_reasoning_effort": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      ],
+      "description": "Reasoning effort for local history compaction; unset inherits the turn effort."
+    },
     "completed_tool_history_projection": {
       "description": "Whether completed textual tool outputs may be represented by bounded, exactly retrievable receipts in manually managed prompt history.",
       "type": "boolean"
@@ -4150,9 +4186,6 @@
           "type": "boolean"
         },
         "kd4_runtime": {
-          "type": "boolean"
-        },
-        "known_delta_store": {
           "type": "boolean"
         },
         "local_thread_store_compression": {
@@ -4518,6 +4551,14 @@
       },
       "type": "object"
     },
+    "purpose_reasoning_effort": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PurposeReasoningEffort"
+        }
+      ],
+      "description": "Opt-in defaults for sampling purposes; never overrides explicit turn effort."
+    },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
       "type": "string"
@@ -4610,6 +4651,17 @@
         }
       ],
       "description": "Collection of settings that are specific to the TUI."
+    },
+    "turn_credit_limit": {
+      "description": "Observed credit consumption after which a turn requests its final summary. Unset means no credit ceiling. Requires finite provider balance reports.",
+      "format": "double",
+      "type": "number"
+    },
+    "turn_wall_time_limit_secs": {
+      "description": "Wall-clock seconds after which a turn stops starting new work and asks the model for a final summary of completed and remaining work. Unset means no limit.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
     },
     "web_search": {
       "allOf": [

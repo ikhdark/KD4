@@ -1,5 +1,5 @@
 use crate::FunctionCallError;
-use crate::plan_store::PlanStatusUpdate;
+use crate::plan_store::PlanToolArgs;
 use crate::plan_store::PlanToolResponse;
 use crate::plan_store::PlanUpdateEffect;
 use crate::tools::context::ToolInvocation;
@@ -29,18 +29,10 @@ use tokio::sync::Notify;
 
 pub struct PlanHandler;
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PlanToolArgs {
-    explanation: Option<String>,
-    plan: Option<Vec<codex_protocol::plan_tool::PlanItemArg>>,
-    set: Option<Vec<PlanStatusUpdate>>,
-}
-
 pub struct PlanToolOutput {
     current_plan: UpdatePlanArgs,
     effect: PlanUpdateEffect,
-    governor_plan: Option<UpdatePlanArgs>,
+    lineage: crate::plan_store::PlanLineage,
 }
 
 const PLAN_UPDATED_MESSAGE: &str = "Plan updated";
@@ -49,6 +41,11 @@ const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 impl PlanToolOutput {
     fn response_result(&self) -> JsonValue {
         serde_json::json!(PlanToolResponse {
+            completion_authority: crate::plan_store::checklist_completion_authority(),
+            lineage: self.lineage.clone(),
+            revision: crate::plan_store::plan_revision_with_lineage(Some(&self.current_plan), &self.lineage),
+            step_ids: self.current_plan.plan.iter()
+                .map(|item| self.lineage.step_id(&item.step)).collect(),
             message: self.message().to_string(),
             effect: self.effect.as_str().to_string(),
             no_progress: self.effect == PlanUpdateEffect::NoOp,
@@ -134,9 +131,11 @@ impl ToolOutput for PlanToolOutput {
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
+        // Every effect carries the committed plan so the turn controller never
+        // keeps a stale checklist; it counts only structural changes as revisions.
         Some(serde_json::json!({
             "kind": "plan_update",
-            "plan": self.governor_plan,
+            "plan": self.current_plan,
             "effect": self.effect.as_str(),
             "no_progress": self.effect == PlanUpdateEffect::NoOp,
         }))
@@ -203,7 +202,7 @@ impl PlanHandler {
             ));
         }
 
-        let requested_args = serde_json::from_str::<PlanToolArgs>(&arguments).map_err(|error| {
+        let mut requested_args = serde_json::from_str::<PlanToolArgs>(&arguments).map_err(|error| {
             FunctionCallError::RespondToModel(format!(
                 "failed to parse function arguments: {error}"
             ))
@@ -230,14 +229,39 @@ impl PlanHandler {
                 "update_plan was cancelled before the plan update began".to_string(),
             ));
         }
+        if let Some(workflow) = &requested_args.workflow {
+            if workflow.len() > 128 {
+                return Err(FunctionCallError::RespondToModel(
+                    "workflow may link at most 128 existing assignments".into(),
+                ));
+            }
+            let mut resolved = std::collections::BTreeMap::new();
+            let coordinator = session.services.agent_control.task_coordinator();
+            for (step_id, assignment_id) in workflow {
+                let task = coordinator.get_agent_task(*assignment_id, Some(0)).await
+                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                if task.assignment.root_session_id != session.thread_id.to_string() {
+                    return Err(FunctionCallError::RespondToModel(
+                        "workflow assignments must belong to this root session".into(),
+                    ));
+                }
+                resolved.insert(step_id.clone(), crate::plan_store::PlanExecutionNode {
+                    assignment_id: *assignment_id,
+                    dependencies: task.assignment.dependencies,
+                    capability_profile: task.assignment.capability_profile,
+                });
+            }
+            requested_args.resolved_workflow = Some(resolved);
+        }
         #[cfg(test)]
         pause_at_plan_commit_boundary(&_call_id, &cancellation_token).await;
 
-        let update = session.services.plan_store.update_tool(
-            requested_args.plan,
-            requested_args.set,
-            requested_args.explanation,
-        ).await.map_err(FunctionCallError::RespondToModel)?;
+        let update = session
+            .services
+            .plan_store
+            .update_tool(requested_args)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
         match update.effect {
             PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
             PlanUpdateEffect::StructuralRevision => {
@@ -245,22 +269,48 @@ impl PlanHandler {
             }
             PlanUpdateEffect::StatusOnly | PlanUpdateEffect::NoOp => {}
         }
-        session
-            .send_event(turn.as_ref(), EventMsg::PlanUpdate(update.current.clone()))
-            .await;
-
-        Ok(boxed_tool_output(PlanToolOutput {
-            governor_plan: update
-                .effect
-                .requests_generation()
-                .then_some(update.current.clone()),
+        let output = PlanToolOutput {
             current_plan: update.current,
             effect: update.effect,
-        }))
+            lineage: update.lineage,
+        };
+        let response = output.response_result();
+        // Even a no-op may retry an earlier failed publication or migrate a
+        // legacy snapshot that had no requirement lineage.
+        session
+            .persist_rollout_items_durable(&[
+                codex_protocol::protocol::RolloutItem::ResponseItem(
+                    crate::plan_store::plan_snapshot_item(&response),
+                ),
+            ])
+            .await
+            .map_err(|error| FunctionCallError::RespondToModel(format!(
+                "plan committed in memory but durable publication failed: {error}. Do not blindly replay this update. Committed state: {response}"
+            )))?;
+        session
+            .send_event(turn.as_ref(), EventMsg::PlanUpdate(output.current_plan.clone()))
+            .await;
+
+        Ok(boxed_tool_output(output))
     }
 }
 
 impl CoreToolRuntime for PlanHandler {
+    fn cancellation_recovery(
+        &self,
+        result: Option<&JsonValue>,
+        error: Option<&str>,
+    ) -> crate::tools::context::ToolEffectRecovery {
+        match result.filter(|value| value.get("current_plan").is_some()) {
+            Some(result) => crate::tools::context::ToolEffectRecovery::committed(result.clone()),
+            None => crate::tools::context::ToolEffectRecovery::unknown(result, error),
+        }
+    }
+
+    fn terminal_failure_reuse(&self) -> crate::tools::registry::TerminalFailureReuse {
+        crate::tools::registry::TerminalFailureReuse::RequestRevisionAndJsonSyntax
+    }
+
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
     }

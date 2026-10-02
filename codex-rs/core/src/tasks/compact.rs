@@ -31,7 +31,10 @@ impl SessionTask for CompactTask {
         cancellation_token: CancellationToken,
     ) -> BoxFuture<'static, SessionTaskResult> {
         Box::pin(async move {
-            let result = if ctx.config.features.enabled(codex_features::Feature::TokenBudget) {
+            // A fresh window discards history; without recovery tools, keep a replacement history.
+            let result = if ctx.config.features.enabled(codex_features::Feature::TokenBudget)
+                && session.token_budget_recovery_available()
+            {
                 crate::compact_token_budget::run_manual_compact_task(session.clone(), ctx, &cancellation_token).await?;
                 Ok(())
             } else if crate::compact::should_use_remote_compact_task(

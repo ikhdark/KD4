@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import time
+import tomllib
 from typing import Callable
 from typing import BinaryIO
 from typing import Iterator
@@ -1117,6 +1118,19 @@ def _cargo_watch_exec_with_target_dir(
     return command + insertion
 
 
+# Nextest's -P/--profile selects test execution policy; its Cargo build profile
+# is --cargo-profile.
+NEXTEST_GLOBAL_OPTIONS_WITH_VALUES = {
+    "--color",
+    "--manifest-path",
+    "--config-file",
+    "--user-config-file",
+    "--tool-config-file",
+    "-P",
+    "--profile",
+}
+
+
 def _cargo_subcommand_index(
     command: Sequence[str],
     *,
@@ -1210,15 +1224,7 @@ def _cargo_command_with_target_dir(
         nextest_index = _cargo_subcommand_index(
             result,
             start_index=subcommand_index + 1,
-            global_options_with_values={
-                "--color",
-                "--manifest-path",
-                "--config-file",
-                "--user-config-file",
-                "--tool-config-file",
-                "-P",
-                "--profile",
-            },
+            global_options_with_values=NEXTEST_GLOBAL_OPTIONS_WITH_VALUES,
         )
         if nextest_index is None:
             return result
@@ -1401,6 +1407,90 @@ def _cargo_command_with_target_dir(
         target_arg,
         *result[subcommand_index + 1 :],
     ]
+
+
+def _implicit_cargo_package(command: Sequence[str]) -> str | None:
+    """Name the single package Cargo selects without -p, or None if unsure.
+
+    Cargo uses the nearest manifest (or --manifest-path). A workspace root
+    selects its default members, which may include codex-core.
+    """
+    working_dir = Path.cwd()
+    manifest = None
+    tokens = iter(command)
+    for token in tokens:
+        if token == "--":
+            break
+        if token == "-C":
+            working_dir /= next(tokens, "")
+        elif token.startswith("-C"):
+            working_dir /= token[2:]
+        elif token == "--manifest-path":
+            manifest = next(tokens, "")
+        elif token.startswith("--manifest-path="):
+            manifest = token.split("=", 1)[1]
+    candidates = (
+        [working_dir / manifest]
+        if manifest is not None
+        else [directory / "Cargo.toml" for directory in (working_dir, *working_dir.parents)]
+    )
+    for path in candidates:
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return None
+        package = data.get("package")
+        if "workspace" in data or not isinstance(package, dict):
+            return None
+        name = package.get("name")
+        return name if isinstance(name, str) else None
+    return None
+
+
+def _guard_raw_lane_test_command(command: Sequence[str]) -> None:
+    """Apply the generic test-recipe package policy to raw lane test runs.
+
+    A persistent lane can hold helper binaries (codex-code-mode-host) older than
+    their inputs; only the named codex-core targets rebuild them before tests.
+    """
+    if not command or Path(command[0]).stem.lower() != "cargo":
+        return
+    index = _cargo_subcommand_index(command)
+    if index is None:
+        return
+    if command[index] in {"test", "t"}:
+        test_args = command[index + 1 :]
+    elif command[index] == "nextest":
+        run_index = _cargo_subcommand_index(
+            command,
+            start_index=index + 1,
+            global_options_with_values=NEXTEST_GLOBAL_OPTIONS_WITH_VALUES,
+        )
+        if run_index is None or command[run_index] not in {"run", "r"}:
+            return
+        test_args = command[run_index + 1 :]
+    else:
+        return
+    if any(arg in {"--help", "-h"} for arg in test_args):
+        return
+    selection = test_args[: test_args.index("--")] if "--" in test_args else test_args
+    if not cargo_package_specs(selection) and not any(
+        arg in {"--workspace", "--all"} for arg in selection
+    ):
+        # From a member crate's directory Cargo selects only that crate; judge
+        # it as the explicit -p the user would otherwise have to add.
+        package = _implicit_cargo_package(command)
+        if package is not None:
+            test_args = ["-p", package, *test_args]
+
+    from scripts.rust_test_runner import RunnerError, guard_generic_recipe_args
+
+    try:
+        guard_generic_recipe_args(test_args, recipe="raw run-lane test commands")
+    except RunnerError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _direct_reserved_lane_command(
@@ -1633,6 +1723,12 @@ def cargo_build_context(
     options = []
     config_overrides = []
     working_dir = Path.cwd()
+    cargo_index = (
+        _cargo_subcommand_index(command)
+        if command and Path(command[0]).stem.lower() == "cargo"
+        else None
+    )
+    nextest = cargo_index is not None and command[cargo_index] == "nextest"
     tokens = iter(command)
     for token in tokens:
         if token == "--":
@@ -1645,6 +1741,14 @@ def cargo_build_context(
             config_overrides.append(next(tokens, ""))
         elif token.startswith("--config="):
             config_overrides.append(token.split("=", 1)[1])
+        elif nextest and token in ("--profile", "-P"):
+            next(tokens, "")
+        elif nextest and token.startswith("--profile="):
+            continue
+        elif nextest and token == "--cargo-profile":
+            options.extend(["--profile", next(tokens, "")])
+        elif nextest and token.startswith("--cargo-profile="):
+            options.extend(["--profile", token.split("=", 1)[1]])
         elif token in ("--profile", "--target", "--features", "-F"):
             options.extend(["--features" if token == "-F" else token, next(tokens, "")])
         elif token.startswith(("--profile=", "--target=", "--features=")):
@@ -1720,6 +1824,9 @@ def run_in_cargo_lane(
         phase, previous = name, now
 
     try:
+        # Refuse before reserving: a raw core test run would otherwise build and
+        # then fail on stale helpers instead of using the named runner.
+        _guard_raw_lane_test_command(command)
         child_env = os.environ.copy()
         updates = local_rust_env(child_env, repo_root=repo_root, which=shutil.which)
         child_env.update(updates)

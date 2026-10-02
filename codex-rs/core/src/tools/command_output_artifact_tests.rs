@@ -2805,6 +2805,67 @@ async fn periodic_scan_only_reconciliation_exits_after_capacity_recovers() {
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn periodic_indexed_reconciliation_runs_after_the_triggering_commit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    drop(create_raw_output_artifact(temp.path(), "thread", b"artifact").await);
+    let root = temp.path().join("tool-output");
+    assert_eq!(
+        force_retention_reconciliation_for_test(&root).await,
+        RetentionModeKind::Indexed
+    );
+    {
+        let mut registry = lock_retention_registry();
+        let Some(RetentionRootMode::Indexed(index)) = registry
+            .roots
+            .get_mut(&normalized_tool_output_root(&root))
+            .map(|state| &mut state.mode)
+        else {
+            panic!("expected an indexed root");
+        };
+        index.logical_mutations_since_reconciliation = RETENTION_RECONCILIATION_INTERVAL;
+    }
+    let before = retention_diagnostics_for_test(&root);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    set_reconciliation_barrier(&root, Arc::clone(&barrier));
+
+    // Production calls prepare while holding this permit. Keep it through both
+    // calls so the background scan cannot race the second scheduling check.
+    let permit = retention_sweep_permit(&root)
+        .await
+        .expect("retention permit");
+    // Commits due for reconciliation keep the current index instead of scanning.
+    for _ in 0..2 {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), prepare_retention_mode(&root, false))
+                .await
+                .expect("periodic reconciliation must not block the commit"),
+            RetentionModeKind::Indexed
+        );
+    }
+    assert_eq!(
+        retention_diagnostics_for_test(&root).reconciliations,
+        before.reconciliations,
+        "the triggering commit must not run the scan"
+    );
+    drop(permit);
+    barrier.wait().await;
+    assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Reconciling);
+    barrier.wait().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while retention_mode_for_test(&root) != RetentionModeKind::Indexed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background reconciliation installs a fresh index");
+    assert_eq!(
+        retention_diagnostics_for_test(&root).reconciliations,
+        before.reconciliations + 1
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn stale_generation_invalidates_a_rebuilt_scan_only_root() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("tool-output");
@@ -3048,6 +3109,32 @@ async fn cancelled_history_protection_retains_admission_until_protection_is_visi
         BTreeSet::from([id]),
         "ordinary retry sees completed protection without stranding retention"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn batch_protection_verifies_every_artifact_before_publishing_markers() {
+    let home = tempfile::tempdir().unwrap();
+    let mut references = BTreeMap::new();
+    let mut markers = Vec::new();
+    for text in ["first result", "second result"] {
+        let canonical = CanonicalToolResult::text(text);
+        let artifact = create_canonical_output_artifact(home.path(), "thread", &canonical).await;
+        let id = artifact.artifact_id().unwrap();
+        markers.push(active_tool_history_protection_path(
+            &home.path().join("tool-output/thread").join(format!("{id}.log")),
+        ));
+        references.insert(id, (canonical.exact_bytes, canonical.sha256));
+    }
+    assert!(markers.iter().all(|marker| !marker.exists()));
+    let mut invalid = references.clone();
+    invalid.last_entry().unwrap().get_mut().1 = "0".repeat(64);
+    assert!(protect_active_tool_history_artifacts(home.path(), "thread", invalid).await.is_err());
+    assert!(markers.iter().all(|marker| !marker.exists()));
+    protect_active_tool_history_artifacts(home.path(), "thread", references).await.unwrap();
+    assert!(markers.iter().all(|marker| protection_marker_status(
+        marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+    ).unwrap()));
 }
 
 async fn create_protected_pruning_fixture(
@@ -4195,7 +4282,7 @@ async fn reclaim_releases_idle_directories_of_threads_without_rollouts_only() {
             protected_artifact_for_thread(home, thread_id).await,
         );
     }
-    let shared_store = root.join("known-delta");
+    let shared_store = root.join("shared-store");
     std::fs::create_dir_all(&shared_store).expect("shared store");
     assert_eq!(
         force_retention_reconciliation_for_test(&root).await,

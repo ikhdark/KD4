@@ -3,6 +3,7 @@ mod apps_instructions;
 mod environment;
 mod plugins_instructions;
 mod subagents;
+mod task_state;
 
 use crate::context::ContextualUserFragment;
 use codex_context_fragments::ModelContextBudget;
@@ -28,6 +29,7 @@ pub(crate) use apps_instructions::AppsInstructionsState;
 pub(crate) use environment::EnvironmentsState;
 pub(crate) use plugins_instructions::PluginsInstructionsState;
 pub(crate) use subagents::SubagentsState;
+pub(crate) use task_state::TaskState;
 
 trait ErasedWorldStateSection: Send + Sync {
     fn snapshot(&self) -> Option<Value>;
@@ -480,7 +482,14 @@ impl WorldState {
     ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
         self.render_with(|id, section| {
             if let Some(previous) = previous.and_then(|previous| previous.sections.get(id)) {
-                if !section.retained_state_supported(previous, items) {
+                if section.records_delivery()
+                    && previous.get("_retained_delivery").is_none()
+                    && !has_legacy_fragment(items, section)
+                {
+                    // An empty section can advance its snapshot without ever
+                    // delivering a fragment. It is absent, not lost history.
+                    PreviousSectionState::Absent
+                } else if !section.retained_state_supported(previous, items) {
                     PreviousSectionState::Unknown
                 } else if section.has_retained_fragment_matcher()
                     && !has_retained_fragment(items, section)

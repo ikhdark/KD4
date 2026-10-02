@@ -842,11 +842,14 @@ async fn stalled_stdin_acknowledgement_is_not_replayed_and_preserves_unconfirmed
             "once\n",
         );
         let began = Instant::now();
-        let result = WriteStdinHandler::default().handle(invocation).await;
-        let error = match result {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("unconfirmed stdin must not report success"),
-        };
+        let output = WriteStdinHandler::default()
+            .handle(invocation.clone())
+            .await
+            .expect("unconfirmed stdin returns a structured failure");
+        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+        let result = output.code_mode_result(&invocation.payload);
+        let error = result["error"].as_str().expect("failure diagnostic");
+        assert_eq!(result["process_exited"], !termination_fails);
         assert!(error.contains("stdin delivery was not confirmed before the yield deadline"));
         assert_eq!(Instant::now() - began, Duration::from_secs(30));
         assert_eq!(writes.load(Ordering::Acquire), 1);
@@ -1166,7 +1169,13 @@ async fn unified_exec_termination_failure_retains_process_owner() {
         .fail_process_with_message(process_id, &process, "network denied".to_string())
         .await;
 
-    assert!(matches!(error, UnifiedExecError::ProcessFailed { .. }));
+    let UnifiedExecError::ProcessFailedWithOutput { message, output } = error else {
+        panic!("termination failure must retain structured process output");
+    };
+    assert!(message.contains("network denied"));
+    assert!(message.contains("process termination was not confirmed"));
+    assert_eq!(output.process_id, Some(process_id));
+    assert!(!output.process_exited);
     assert!(!process.has_exited());
     assert_eq!(
         process.failure_message(),

@@ -2704,6 +2704,8 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
     assert_eq!(thread.turns.len(), 2);
     assert_eq!(thread.turns[0].status, TurnStatus::Completed);
     assert_eq!(thread.turns[1].id, turn_id);
+    // The initial snapshot interrupts stale in-progress history. Subsequent
+    // reads include the durable ProcessLost terminal record from recovery.
     assert_eq!(thread.turns[1].status, TurnStatus::Interrupted);
 
     let second_resume_id = mcp
@@ -2725,7 +2727,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
     assert_eq!(resumed_again.status, ThreadStatus::Idle);
     assert_eq!(resumed_again.turns.len(), 2);
     assert_eq!(resumed_again.turns[1].id, turn_id);
-    assert_eq!(resumed_again.turns[1].status, TurnStatus::Interrupted);
+    assert_eq!(resumed_again.turns[1].status, TurnStatus::Failed);
 
     let read_id = mcp
         .send_thread_read_request(ThreadReadParams {
@@ -2746,7 +2748,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
     assert_eq!(read_thread.status, ThreadStatus::Idle);
     assert_eq!(read_thread.turns.len(), 2);
     assert_eq!(read_thread.turns[1].id, turn_id);
-    assert_eq!(read_thread.turns[1].status, TurnStatus::Interrupted);
+    assert_eq!(read_thread.turns[1].status, TurnStatus::Failed);
 
     Ok(())
 }
@@ -3693,7 +3695,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
 
     let start_id = primary
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("gpt-5.4".to_string()),
+            model: Some("gpt-5.5".to_string()),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })

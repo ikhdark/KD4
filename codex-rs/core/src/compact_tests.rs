@@ -1105,6 +1105,23 @@ fn task_checkpoint_bounds_handoff_and_preserves_exact_recovery_text() {
 }
 
 #[test]
+fn task_checkpoint_drops_superseded_artifact_pin_sets() {
+    let request = user_message("Keep going on the parser.");
+    let pins = user_message(
+        &json!({
+            "version": 1,
+            "kind": "tool_history_artifact_pins",
+            "artifacts": [{"artifact_id": "a1", "call_id": "c1"}],
+        })
+        .to_string(),
+    );
+    let later_request = user_message("Now run the tests.");
+    let (checkpoint, _, _) =
+        build_task_input_checkpoint(&[request.clone(), pins.clone(), later_request.clone()]);
+    assert_eq!(checkpoint, vec![request, later_request]);
+}
+
+#[test]
 fn unresolved_tool_output_survives_local_compaction_as_typed_receipt() {
     let call = ResponseItem::FunctionCall {
         id: None,

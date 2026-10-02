@@ -27,8 +27,9 @@ use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
-use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_5_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -81,7 +82,12 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 async fn make_session_and_context() -> (crate::session::Session, TurnContext) {
-    let (session, turn) = make_session_and_context_base().await;
+    let (mut session, turn) = make_session_and_context_base().await;
+    session.services.models_manager = turn.provider.models_manager(
+        &turn.config.model_provider_id,
+        turn.config.codex_home.to_path_buf(),
+        Some(codex_models_manager::test_support::test_models_response().expect("test model catalog")),
+    );
     turn.multi_agent_spawn_authorized
         .store(true, std::sync::atomic::Ordering::Release);
     (session, turn)
@@ -92,7 +98,15 @@ async fn make_session_and_context_with_rx() -> (
     Arc<TurnContext>,
     async_channel::Receiver<codex_protocol::protocol::Event>,
 ) {
-    let (session, turn, events) = make_session_and_context_with_rx_base().await;
+    let (mut session, turn, events) = make_session_and_context_with_rx_base().await;
+    Arc::get_mut(&mut session)
+        .expect("unique fixture session")
+        .services
+        .models_manager = turn.provider.models_manager(
+        &turn.config.model_provider_id,
+        turn.config.codex_home.to_path_buf(),
+        Some(codex_models_manager::test_support::test_models_response().expect("test model catalog")),
+    );
     turn.multi_agent_spawn_authorized
         .store(true, std::sync::atomic::Ordering::Release);
     (session, turn, events)
@@ -398,7 +412,7 @@ async fn spawn_agent_uses_bedrock_qualified_default_model_and_reasoning() {
     );
     let mut turn = turn
         .with_model(
-            AMAZON_BEDROCK_GPT_5_4_MODEL_ID.to_string(),
+            AMAZON_BEDROCK_GPT_5_5_MODEL_ID.to_string(),
             &session.services.models_manager,
         )
         .await;
@@ -439,7 +453,7 @@ async fn spawn_agent_uses_bedrock_qualified_default_model_and_reasoning() {
         .config_snapshot()
         .await;
 
-    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID);
+    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID);
     assert_eq!(
         snapshot.reasoning_effort,
         Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
@@ -556,7 +570,7 @@ async fn spawn_agent_validates_role_locked_reasoning_against_requested_model() {
     assert_eq!(
         result.err(),
         Some(FunctionCallError::RespondToModel(
-            "Reasoning effort `ultra` is not supported for model `gpt-5.6-luna`. Supported reasoning efforts: none, low, medium, high, xhigh, max"
+            "Reasoning effort `ultra` is not supported for model `gpt-5.6-luna`. Supported reasoning efforts: low, medium, high, xhigh, max"
                 .to_string()
         ))
     );
@@ -1834,7 +1848,7 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
                 "spawn_agent",
                 function_payload(json!({
                     "message": "inspect this repo",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.5",
                     "service_tier": ServiceTier::Fast.request_value()
                 })),
             ))
@@ -1919,7 +1933,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
     {
         let (mut session, turn) = make_session_and_context().await;
         let mut turn = turn
-            .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+            .with_model("gpt-5.5".to_string(), &session.services.models_manager)
             .await;
         let mut config = (*turn.config).clone();
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
@@ -1960,7 +1974,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
     {
         let (mut session, turn) = make_session_and_context().await;
         let mut turn = turn
-            .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+            .with_model("gpt-5.5".to_string(), &session.services.models_manager)
             .await;
         let mut config = (*turn.config).clone();
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
@@ -2010,7 +2024,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
             .join("service-tier-role.toml");
         tokio::fs::write(
             &role_config_path,
-            r#"model = "gpt-5.4"
+            r#"model = "gpt-5.5"
 service_tier = "priority"
 "#,
         )
@@ -2074,7 +2088,7 @@ async fn spawn_agent_role_service_tier_falls_back_to_supported_parent_tier() {
 
     let (mut session, turn) = make_session_and_context().await;
     let mut turn = turn
-        .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+        .with_model("gpt-5.5".to_string(), &session.services.models_manager)
         .await;
     tokio::fs::create_dir_all(&turn.config.codex_home)
         .await
@@ -2082,7 +2096,7 @@ async fn spawn_agent_role_service_tier_falls_back_to_supported_parent_tier() {
     let role_config_path = turn.config.codex_home.as_path().join("tiered-role.toml");
     tokio::fs::write(
         &role_config_path,
-        r#"model = "gpt-5.4"
+        r#"model = "gpt-5.5"
 service_tier = "turbo"
 "#,
     )
@@ -4832,26 +4846,40 @@ async fn resume_agent_rejects_when_depth_limit_exceeded() {
 }
 
 #[tokio::test]
-async fn wait_agent_rejects_timeout_below_floor_with_v1_guidance() {
-    let (session, turn) = make_session_and_context().await;
-    let invocation = invocation(
-        Arc::new(session),
-        Arc::new(turn),
-        "wait_agent",
-        function_payload(json!({
-            "targets": [ThreadId::new().to_string()],
-            "timeout_ms": 0
-        })),
-    );
-    let Err(err) = WaitAgentHandler::default().handle(invocation).await else {
-        panic!("non-positive timeout should be rejected");
-    };
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel(
-            "Omit timeout_ms for the normal wait. wait_agent returns immediately when a target has already completed.".to_string()
-        )
-    );
+async fn wait_agent_uses_owned_wait_below_floor() {
+    for timeout_ms in [0, 10] {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let thread = manager
+            .start_thread((*turn.config).clone())
+            .await
+            .expect("start target thread");
+        let handler = WaitAgentHandler::default();
+        let mut waiting = Box::pin(handler.handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait_agent",
+            function_payload(json!({
+                "targets": [thread.thread_id.to_string()],
+                "timeout_ms": timeout_ms
+            })),
+        )));
+        assert!(
+            timeout(Duration::from_millis(20), &mut waiting).await.is_err(),
+            "a below-floor timeout must retain the wait rather than reject or spin"
+        );
+        thread.thread.submit(Op::Shutdown {}).await.expect("shutdown target");
+        let output = timeout(Duration::from_secs(1), waiting)
+            .await.expect("target completion wakes wait").expect("wait succeeds");
+        let (content, _) = expect_text_output(output);
+        let result: wait::WaitAgentResult = serde_json::from_str(&content).expect("wait result");
+        assert!(!result.timed_out);
+        assert_eq!(
+            result.status.get(&thread.thread_id.to_string()),
+            Some(&AgentStatus::Shutdown)
+        );
+    }
 }
 
 #[tokio::test]
@@ -4979,7 +5007,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_wait_agent_rejects_timeout_below_configured_min() {
+async fn multi_agent_v2_wait_agent_uses_owned_wait_below_configured_min() {
     let (session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
@@ -4991,22 +5019,16 @@ async fn multi_agent_v2_wait_agent_rejects_timeout_below_configured_min() {
     config.multi_agent_v2.default_wait_timeout_ms = 50;
     set_turn_config(&mut turn, config);
 
-    let Err(err) = WaitAgentHandlerV2::default()
-        .handle(invocation(
+    let handler = WaitAgentHandlerV2::default();
+    let waiting = handler.handle(invocation(
             Arc::new(session),
             Arc::new(turn),
             "wait_agent",
             function_payload(json!({"timeout_ms": 1})),
-        ))
-        .await
-    else {
-        panic!("timeout below configured minimum should be rejected");
-    };
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel(
-            "Omit timeout_ms for the normal wait. Use list_agents or get_agent_task for an immediate status snapshot.".to_string()
-        )
+        ));
+    assert!(
+        timeout(Duration::from_millis(120), waiting).await.is_err(),
+        "below-minimum timeout must remain owned across maintenance intervals"
     );
 }
 
@@ -5159,7 +5181,7 @@ async fn multi_agent_v2_wait_agent_cancellation_wakes_immediately() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_wait_agent_rejects_timeout_above_configured_max() {
+async fn multi_agent_v2_wait_agent_clamps_timeout_above_configured_max() {
     let (session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
@@ -5171,21 +5193,25 @@ async fn multi_agent_v2_wait_agent_rejects_timeout_above_configured_max() {
     config.multi_agent_v2.default_wait_timeout_ms = 1;
     set_turn_config(&mut turn, config);
 
-    let Err(err) = WaitAgentHandlerV2::default()
-        .handle(invocation(
+    let started = tokio::time::Instant::now();
+    let handler = WaitAgentHandlerV2::default();
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        handler.handle(invocation(
             Arc::new(session),
             Arc::new(turn),
             "wait_agent",
-            function_payload(json!({"timeout_ms": 500})),
-        ))
-        .await
-    else {
-        panic!("timeout above configured maximum should be rejected");
-    };
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel("timeout_ms must be at most 50".to_string())
-    );
+            function_payload(json!({"timeout_ms": 60_000})),
+        )),
+    )
+    .await
+    .expect("the configured maximum bounds the wait")
+        .expect("oversized timeout is clamped");
+    let (content, _) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait result");
+    assert!(result.timed_out);
+    assert!(started.elapsed() >= Duration::from_millis(50));
 }
 
 #[tokio::test]
@@ -5308,30 +5334,6 @@ async fn wait_agent_times_out_when_status_is_not_final() {
         .submit(Op::Shutdown {})
         .await
         .expect("shutdown should submit");
-}
-
-#[tokio::test]
-async fn wait_agent_rejects_short_timeouts_instead_of_clamping() {
-    let (session, turn) = make_session_and_context().await;
-    let invocation = invocation(
-        Arc::new(session),
-        Arc::new(turn),
-        "wait_agent",
-        function_payload(json!({
-            "targets": [ThreadId::new().to_string()],
-            "timeout_ms": 10
-        })),
-    );
-
-    let Err(err) = WaitAgentHandler::default().handle(invocation).await else {
-        panic!("short timeout should be rejected");
-    };
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel(
-            "Omit timeout_ms for the normal wait. wait_agent returns immediately when a target has already completed.".to_string()
-        )
-    );
 }
 
 #[tokio::test]

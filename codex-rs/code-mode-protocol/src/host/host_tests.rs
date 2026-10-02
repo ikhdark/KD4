@@ -95,6 +95,8 @@ where
 
 fn execute_request() -> WireExecuteRequest {
     WireExecuteRequest {
+        catalog: None,
+        state_path: None,
         tool_call_id: "call-1".to_string(),
         enabled_tools: vec![
             WireToolDefinition {
@@ -103,7 +105,7 @@ fn execute_request() -> WireExecuteRequest {
                     name: "function_tool".to_string(),
                     namespace: None,
                 },
-                description: "function tool".to_string(),
+                description: "function tool".into(),
                 kind: WireToolKind::Function,
                 input_schema: Some(json!({ "type": "object" })),
                 default_timeout_ms: None,
@@ -115,7 +117,7 @@ fn execute_request() -> WireExecuteRequest {
                     name: "freeform_tool".to_string(),
                     namespace: Some("mcp__sample__".to_string()),
                 },
-                description: "freeform tool".to_string(),
+                description: "freeform tool".into(),
                 kind: WireToolKind::Freeform,
                 input_schema: None,
                 default_timeout_ms: None,

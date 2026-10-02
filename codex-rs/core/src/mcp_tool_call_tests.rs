@@ -794,6 +794,12 @@ async fn sampled_mcp_tool_missing_from_live_catalog_skips_before_file_upload() {
     );
     sampled_tool.tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
 
+    // Runtime selection is frozen for a turn. Release the sampled turn's
+    // runtime lease before constructing the later, empty live catalog.
+    drop(sampled_step_context);
+    Arc::get_mut(&mut turn_context)
+        .expect("sampled step released its turn")
+        .mcp_runtime = Default::default();
     let (live_step_context, live_startup_token) =
         step_context_with_live_apps(&turn_context, &live_server.uri()).await;
     assert!(

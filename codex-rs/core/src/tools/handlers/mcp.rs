@@ -456,13 +456,21 @@ impl CoreToolRuntime for McpHandler {
         Box::pin(async move { tags })
     }
 
+    fn pre_tool_use_hook_name(
+        &self,
+        _tool_name: &codex_tools::ToolName,
+        payload: &ToolPayload,
+    ) -> Option<HookToolName> {
+        matches!(payload, ToolPayload::Function { .. }).then(|| self.hook_tool_name())
+    }
+
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
         let ToolPayload::Function { arguments } = &invocation.payload else {
             return None;
         };
 
         Some(PreToolUsePayload {
-            tool_name: self.hook_tool_name(),
+            tool_name: self.pre_tool_use_hook_name(&invocation.tool_name, &invocation.payload)?,
             tool_input: mcp_hook_tool_input(arguments),
         })
     }

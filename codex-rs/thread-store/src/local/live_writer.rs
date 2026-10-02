@@ -193,13 +193,15 @@ pub(super) async fn persist_thread(
 pub(super) async fn flush_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
+    durable: bool,
 ) -> ThreadStoreResult<()> {
-    store
-        .live_recorder(thread_id)
-        .await?
-        .flush()
-        .await
-        .map_err(thread_store_io_error)?;
+    let recorder = store.live_recorder(thread_id).await?;
+    if durable {
+        recorder.flush_durable().await
+    } else {
+        recorder.flush().await
+    }
+    .map_err(thread_store_io_error)?;
     sync_materialized_rollout_path(store, thread_id).await
 }
 

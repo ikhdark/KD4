@@ -188,7 +188,7 @@ async fn snapshot_retained_output(buffer: &OutputBuffer) -> (Vec<u8>, bool) {
     let guard = buffer.lock().await;
     let omitted_bytes = guard.omitted_bytes();
     let bytes = guard.to_bytes_with_loss_notice(&[]);
-    (bytes, omitted_bytes == 0)
+    (bytes, omitted_bytes == 0 && guard.lagged_chunks() == 0)
 }
 
 #[derive(Clone, Debug)]
@@ -278,7 +278,7 @@ impl std::fmt::Debug for UnifiedExecProcess {
 impl UnifiedExecProcess {
     pub(super) fn hold_workspace_operation_until_exit(
         &self,
-        permit: Arc<tokio::sync::OwnedMutexGuard<()>>,
+        permit: Arc<dyn Send + Sync>,
     ) {
         let mut state = self.state_rx.clone();
         // Spawn registration transfers ownership before the first cancellable
@@ -597,10 +597,10 @@ impl UnifiedExecProcess {
 
     pub(super) async fn snapshot_tool_output(&self, tty: bool) -> Arc<ProcessOutputSnapshot> {
         let mut snapshot = self.snapshot_completion_output().await;
-        // PTYs and the exec-server transport merge streams. Their retained bytes
-        // are still useful display output, but are not exact stdout and stderr.
-        snapshot.streams_are_exact &=
-            !tty && matches!(&self.process_handle, ProcessHandle::Local(_));
+        // A PTY merges streams; pipe-backed local and exec-server processes do not.
+        snapshot.streams_are_exact &= !tty
+            && self.output_is_closed()
+            && self.state_rx.borrow().failure_message.is_none();
         Arc::new(snapshot)
     }
 
@@ -758,8 +758,7 @@ impl UnifiedExecProcess {
         crate::tools::context::ExecSessionCapabilities {
             stdin: running && tty && !self.stdin_closed.load(Ordering::Acquire),
             interrupt: running && interrupt,
-            // write_stdin exposes polling and input, not process termination.
-            cancellation: false,
+            cancellation: running,
             polling: true,
         }
     }
@@ -1003,7 +1002,7 @@ impl UnifiedExecProcess {
             output_buffer,
             completion_output_buffer,
             stdout_buffer,
-            stderr_buffer: _,
+            stderr_buffer,
             output_notify,
             output_closed,
             output_closed_notify,
@@ -1075,7 +1074,28 @@ impl UnifiedExecProcess {
                         failure,
                         sandbox_denied,
                     } = response;
-                    for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
+                    for chunk in chunks {
+                        if chunk.seq <= last_seq {
+                            continue;
+                        }
+                        let skipped = chunk.seq.saturating_sub(last_seq.saturating_add(1));
+                        if skipped > 0 {
+                            for buffer in [
+                                &output_buffer,
+                                &completion_output_buffer,
+                                &stdout_buffer,
+                                &stderr_buffer,
+                            ] {
+                                buffer.lock().await.record_lagged_chunks(skipped);
+                            }
+                        }
+                        last_seq = chunk.seq;
+                        let (stream, stream_buffer) = match chunk.stream {
+                            codex_exec_server::ExecOutputStream::Stderr => {
+                                (ExecOutputStream::Stderr, &stderr_buffer)
+                            }
+                            _ => (ExecOutputStream::Stdout, &stdout_buffer),
+                        };
                         let bytes = chunk.chunk.into_inner();
                         if let Some(task) = artifact_task.as_mut() {
                             task.write_chunk(&bytes);
@@ -1083,12 +1103,12 @@ impl UnifiedExecProcess {
                         append_output_chunk(
                             &output_buffer,
                             &completion_output_buffer,
-                            &stdout_buffer,
+                            stream_buffer,
                             &bytes,
                         )
                         .await;
                         let _ = output_tx.send(ProcessOutputChunk {
-                            stream: ExecOutputStream::Stdout,
+                            stream,
                             bytes,
                         });
                         output_notify.notify_waiters();
@@ -1124,6 +1144,12 @@ impl UnifiedExecProcess {
                             continue;
                         }
                         last_seq = chunk.seq;
+                        let (stream, stream_buffer) = match chunk.stream {
+                            codex_exec_server::ExecOutputStream::Stderr => {
+                                (ExecOutputStream::Stderr, &stderr_buffer)
+                            }
+                            _ => (ExecOutputStream::Stdout, &stdout_buffer),
+                        };
                         let bytes = chunk.chunk.into_inner();
                         if let Some(task) = artifact_task.as_mut() {
                             task.write_chunk(&bytes);
@@ -1131,12 +1157,12 @@ impl UnifiedExecProcess {
                         append_output_chunk(
                             &output_buffer,
                             &completion_output_buffer,
-                            &stdout_buffer,
+                            stream_buffer,
                             &bytes,
                         )
                         .await;
                         let _ = output_tx.send(ProcessOutputChunk {
-                            stream: ExecOutputStream::Stdout,
+                            stream,
                             bytes,
                         });
                         output_notify.notify_waiters();

@@ -63,7 +63,7 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 29;
+pub(crate) const TIMING_SCHEMA_VERSION: u16 = 29;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -226,6 +226,7 @@ impl std::fmt::Debug for TurnTimingState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TurnTimingSnapshot {
+    pub(crate) credit_delta: Option<String>,
     pub(crate) checkout_snapshot_sha256: Option<String>,
     pub(crate) started_at_unix_ms: Option<i64>,
     pub(crate) completed_at_unix_ms: Option<i64>,
@@ -673,6 +674,7 @@ impl TurnTimingSnapshot {
         };
 
         TurnTiming {
+            credit_delta: self.credit_delta.clone(),
             checkout_snapshot_sha256: self.checkout_snapshot_sha256.clone(),
             schema_version: profile.schema_version,
             profile_valid,
@@ -777,6 +779,8 @@ pub(crate) struct ModelRequestTiming {
     structured_action_fingerprint: Option<String>,
     next_structured_action_changed: bool,
     unchanged_relevant_state: bool,
+    final_answer_emitted: bool,
+    unphased_message_emitted: bool,
     attempt_kind: TurnTimingAttemptKind,
     model_stream_wait_ns: u128,
     tool_active_union_ns: u128,
@@ -985,8 +989,10 @@ pub(crate) struct TimingCounters {
     pub(crate) saturation_count: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct TurnTimingStateInner {
+    starting_credit_balance: Option<f64>,
+    last_credit_balance: Option<f64>,
     checkout_snapshot_sha256: Option<String>,
     started_sample: Option<ClockSample>,
     last_monotonic_ns: Option<u128>,
@@ -1036,7 +1042,7 @@ struct ToolClosureEntry {
     delivering_wait: Option<ToolExecutionId>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ToolClosureLedger {
     entries: BTreeMap<ToolExecutionId, ToolClosureEntry>,
     orphan_calls: BTreeMap<ToolExecutionId, ToolClosureEntry>,
@@ -1452,6 +1458,21 @@ impl Drop for TurnPreparationPhaseGuard<'_> {
 }
 
 impl TurnTimingState {
+    pub(crate) fn observe_credits(&self, credits: Option<&codex_protocol::protocol::CreditsSnapshot>) {
+        let Some(credits) = credits.filter(|credits| !credits.unlimited) else { return; };
+        let Some(balance) = credits.balance.as_deref().and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0) else { return; };
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() { return; }
+        state.starting_credit_balance.get_or_insert(balance);
+        state.last_credit_balance = Some(balance);
+    }
+
+    pub(crate) fn credit_delta(&self) -> Option<f64> {
+        let state = self.state();
+        Some(state.starting_credit_balance? - state.last_credit_balance?)
+    }
+
     fn new(clock: Arc<dyn TurnClock>) -> Self {
         Self {
             checkout_snapshot: Default::default(),
@@ -1638,6 +1659,19 @@ impl TurnTimingState {
         let mut state = self.state();
         let sample = self.clock.sample();
         state.complete(sample)
+    }
+
+    /// Freeze an observation without terminalizing live timers or task state.
+    pub(crate) fn sampling_checkpoint(&self) -> codex_protocol::protocol::SamplingTimingCheckpoint {
+        let mut observation = self.state().clone();
+        let sample = self.clock.sample();
+        codex_protocol::protocol::SamplingTimingCheckpoint {
+            observed_at_unix_ms: sample.time.wall_unix_ms,
+            tail_unknown: true,
+            timing: observation.complete(sample).protocol_timing(),
+            runtime_identity: BTreeMap::new(),
+            harness_build: None,
+        }
     }
 
     pub(crate) fn begin_sampling(self: &Arc<Self>) -> TurnTimingGuard {
@@ -2636,11 +2670,19 @@ impl TurnTimingState {
                 .into_iter()
                 .take(MAX_MODEL_REQUEST_PROGRESS_KINDS)
                 .collect();
+            // Older providers omit phase. A visible, text-only generation is
+            // communication progress, but a preamble before an action is not
+            // sufficient to classify that action as final publication.
+            request.final_answer_emitted |= request.unphased_message_emitted
+                && request.model_emitted_tool_call_count == 0
+                && structured_action_fingerprint.is_none();
             request.structured_action_fingerprint = structured_action_fingerprint;
             // The next continuation has not been observed yet. Do not count a
             // terminal, interrupted, or unclassified request as a proven repeat.
             request.next_structured_action_changed = true;
-            request.unchanged_relevant_state = unchanged_relevant_state;
+            // Publishing a final answer or blocker changes the communication
+            // state even when it performs no further tool or repository work.
+            request.unchanged_relevant_state = unchanged_relevant_state && !request.final_answer_emitted;
         }
     }
 
@@ -3248,6 +3290,24 @@ impl TurnTimingState {
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns)?;
+        if let ResponseEvent::OutputItemDone(ResponseItem::Message {
+            role,
+            phase,
+            ..
+        }) = event
+            && role == "assistant"
+            && records_visible_output
+            && let Some(request) = state.model_requests.last_mut()
+        {
+            match phase {
+                Some(codex_protocol::models::MessagePhase::FinalAnswer) => {
+                    request.final_answer_emitted = true;
+                    request.unchanged_relevant_state = false;
+                }
+                None => request.unphased_message_emitted = true,
+                _ => {}
+            }
+        }
         if records_completion
             && let Some(request) = state.model_requests.last_mut()
             && request.completed_ns.is_none()
@@ -3900,6 +3960,8 @@ impl TurnTimingStateInner {
             .legacy
             .complete(self.last_monotonic_ns.unwrap_or(sample.time.monotonic_ns));
         let snapshot = TurnTimingSnapshot {
+            credit_delta: self.starting_credit_balance.zip(self.last_credit_balance)
+                .map(|(start, end)| (start - end).to_string()),
             checkout_snapshot_sha256: self.checkout_snapshot_sha256.clone(),
             started_at_unix_ms: started_sample.map(|started| started.time.wall_unix_ms),
             completed_at_unix_ms: started_sample.map(|_| sample.time.wall_unix_ms),
@@ -4009,7 +4071,7 @@ enum LegacyPhase {
     ToolBlocking,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct LegacyProfileState {
     started_at_ns: Option<u128>,
     last_transition_ns: Option<u128>,

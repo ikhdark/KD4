@@ -199,7 +199,7 @@ fn evidence_reuse_live_stdout_resets_soft_pressure_without_source_credit() {
 }
 
 #[tokio::test]
-async fn evidence_reuse_native_replay_tracks_paths_authority_and_freshness() {
+async fn evidence_reuse_native_replay_tracks_paths_inputs_turns_and_freshness() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source.txt");
     std::fs::write(&source, "source").unwrap();
@@ -207,14 +207,17 @@ async fn evidence_reuse_native_replay_tracks_paths_authority_and_freshness() {
     let observations = cache.begin_source_path_change_observations(
         root.path(), &[(source.clone(), false)],
     ).await.unwrap();
-    let mut control = TurnExecutionControl::new();
+    let session_replays = Arc::new(SessionPathReplays::default());
+    let mut control =
+        TurnExecutionControl::new().with_session_path_replays(Arc::clone(&session_replays));
     let baseline = control.baselines(0);
     let payload = ToolPayload::Function { arguments: json!({"path":source}).to_string() };
     let collector = control.collector(&baseline);
     let registration = collector.register_deterministic_tool_call(
         &ToolName::plain("read_file"), &payload, "initial",
     );
-    collector.record_replay_dependencies(registration.ordinal, 0, observations, None);
+    collector.record_replay_dependencies(registration.ordinal, 0, observations.clone(), None);
+    collector.record_replay_authorization(registration.ordinal, Some("a".repeat(64)));
     collector.record_response_result(
         registration.ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success), None,
         &ResponseInputItem::FunctionCallOutput {
@@ -238,12 +241,115 @@ async fn evidence_reuse_native_replay_tracks_paths_authority_and_freshness() {
     assert!(collector.register_deterministic_tool_call(
         &ToolName::plain("read_file"), &fresh_payload, "fresh",
     ).replayed_success.is_none());
-    control.input_revision += 1;
+    // Revisions are turn-local; the dispatcher re-proves path freshness, so
+    // new input and later turns keep the path-scoped candidate.
+    control.accepted_user_input();
     assert!(control.collector(&control.baselines(1)).register_deterministic_tool_call(
         &ToolName::plain("read_file"), &payload, "new-input",
-    ).replayed_success.is_none());
+    ).replayed_success.is_some());
+    let next_turn = TurnExecutionControl::new().with_session_path_replays(session_replays);
+    assert!(next_turn.collector(&next_turn.baselines(0)).register_deterministic_tool_call(
+        &ToolName::plain("read_file"), &payload, "next-turn",
+    ).replayed_success.is_some());
+    // Exact canonical outputs and their persisted provenance can seed a new
+    // turn owner; compaction prose must never become a replayable file result.
+    use codex_protocol::models::ResponseItem;
+    let ToolPayload::Function { arguments } = &payload else { unreachable!() };
+    let mut items = vec![
+        ResponseItem::FunctionCall {
+            id: None, name: "read_file".into(), namespace: None,
+            arguments: arguments.clone(), call_id: "initial".into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None, call_id: "initial".into(),
+            output: codex_protocol::models::FunctionCallOutputPayload::from_text("source".into()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let mut history = crate::tool_history::ToolHistoryState::default();
+    history.register(crate::tool_history::ToolHistoryCandidate {
+        call_id: "initial".into(),
+        tool_identity: "read_file".into(),
+        semantic_class: "file_read".into(),
+        successful: true,
+        source_dependencies: BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+        source_dependencies_current: true,
+        artifact_id: "source-artifact".into(),
+        artifact_bytes: 6,
+        artifact_sha256: format!("{:x}", Sha256::digest(b"source")),
+        original_output_sha256: format!("{:x}", Sha256::digest(b"source")),
+        original_tokens: 2,
+        preserved_non_text_tokens: None,
+        bounded_model_output: "source".into(),
+        complete: true,
+        projection_eligible: true,
+        proof_identity: None,
+        supersession_identity: Some(format!("authorized-v1:{}:read_file", "a".repeat(64))),
+        consumed_by_generation: None,
+        derived: Default::default(),
+    });
+    history.register_workspace_evidence(
+        crate::tool_history::WorkspaceEvidenceObservation::from_response_item(
+            None, &items[1], BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+        ).unwrap().with_source_path_observations(observations),
+    );
+    let restored = serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
+    let replays = Arc::new(SessionPathReplays::default());
+    replays.rehydrate(&items, &restored);
+    let rehydrated = TurnExecutionControl::new().with_session_path_replays(replays);
+    let restored_guard = rehydrated.collector(&rehydrated.baselines(0))
+        .register_deterministic_tool_call(&ToolName::plain("read_file"), &payload, "rehydrated")
+        .replayed_success.unwrap();
+    assert!(restored_guard.is_fresh(1, &cache, None));
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut items[1] {
+        *output = codex_protocol::models::FunctionCallOutputPayload::from_text("receipt".into());
+    }
+    let tampered = SessionPathReplays::default();
+    tampered.rehydrate(&items, &restored);
+    assert!(tampered.snapshot().is_empty());
     cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
     assert!(!guard.is_fresh(2, &cache, None), "a relevant edit invalidates the original proof");
+    assert!(!restored_guard.is_fresh(2, &cache, None));
+}
+
+#[test]
+fn restored_failure_memory_requires_current_syntax_failure_and_runtime_opt_in() {
+    use codex_protocol::models::ResponseItem;
+    use crate::tools::registry::TerminalFailureReuse;
+    let mut output = codex_protocol::models::FunctionCallOutputPayload::from_text(
+        "failed to parse function arguments".into(),
+    );
+    output.success = Some(false);
+    let items = vec![
+        ResponseItem::FunctionCall {
+            id: None, name: "update_plan".into(), namespace: None,
+            arguments: "{".into(), call_id: "bad".into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None, call_id: "bad".into(), output,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let mut control = TurnExecutionControl::new();
+    control.rehydrate_argument_failures(&items);
+    control.accepted_user_input();
+    let collector = control.collector(&control.baselines(9));
+    for (arguments, capability, suppressed) in [
+        ("{", TerminalFailureReuse::RequestRevisionAndJsonSyntax, true),
+        ("{}", TerminalFailureReuse::RequestRevisionAndJsonSyntax, false),
+        ("{", TerminalFailureReuse::RequestRevision, false),
+        ("{", TerminalFailureReuse::Never, false),
+    ] {
+        let registration = collector.register_deterministic_tool_call_with_reuse(
+            &ToolName::plain("update_plan"),
+            &ToolPayload::Function { arguments: arguments.into() },
+            "repeat",
+            capability,
+        );
+        assert_eq!(registration.suppressed_failure.is_some(), suppressed);
+    }
 }
 
 #[tokio::test]

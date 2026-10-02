@@ -74,6 +74,7 @@ where
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(OUTGOING_FRAME_CAPACITY);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
     let state = Arc::new(HostState {
+        catalogs: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
         seen_session_ids: Mutex::new(SeenSessionIds::default()),
         requests: Mutex::new(RequestRegistry::default()),
@@ -218,11 +219,17 @@ where
         return Ok(false);
     }
 
-    let host_capabilities = CapabilitySet::empty();
+    let catalog_capability = codex_code_mode_protocol::host::Capability::new(
+        codex_code_mode_protocol::host::TOOL_CATALOG_CAPABILITY,
+    )?;
+    let state_capability = codex_code_mode_protocol::host::Capability::new(
+        codex_code_mode_protocol::host::NAMED_STATE_CAPABILITY,
+    )?;
+    let supported_capabilities = CapabilitySet::try_new([catalog_capability, state_capability])?;
     if let Some(capability) = client_hello
         .required_capabilities()
         .iter()
-        .find(|capability| !host_capabilities.contains(capability))
+        .find(|capability| !supported_capabilities.contains(capability))
     {
         writer
             .write(&HostToClient::HandshakeRejected {
@@ -235,6 +242,10 @@ where
         return Ok(false);
     }
 
+    let host_capabilities = CapabilitySet::try_new(supported_capabilities.iter()
+        .filter(|capability| client_hello.required_capabilities().contains(capability)
+            || client_hello.optional_capabilities().contains(capability))
+        .cloned())?;
     writer
         .write(&HostToClient::HostHello(HostHello::new(
             ProtocolVersion::V1,
@@ -246,6 +257,7 @@ where
 }
 
 struct HostState {
+    catalogs: Mutex<HashMap<SessionId, (u64, Vec<codex_code_mode_protocol::host::WireToolDefinition>)>>,
     sessions: Mutex<HashMap<SessionId, Arc<InProcessCodeModeSession>>>,
     seen_session_ids: Mutex<SeenSessionIds>,
     requests: Mutex<RequestRegistry>,
@@ -260,13 +272,43 @@ impl HostState {
     fn spawn_request(
         self: &Arc<Self>,
         request_id: RequestId,
-        request: HostRequest,
+        mut request: HostRequest,
     ) -> Result<(), anyhow::Error> {
         let cancellation = self
             .requests
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .start(request_id, RequestKind::from(&request))?;
+        if let HostRequest::Execute { session_id, request } = &mut request
+            && let Some(catalog) = request.catalog.take()
+        {
+            // Resolve before spawning: even concurrent cells see catalog
+            // registrations and revocations in connection order.
+            let resolved = (|| {
+                let mut catalogs = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner);
+                self.session(session_id)?;
+                if catalog.register {
+                    if catalogs.get(session_id).is_some_and(|(revision, _)| catalog.revision <= *revision) {
+                        return Err("stale tool catalog registration; no cell started".to_string());
+                    }
+                    catalogs.insert(session_id.clone(), (catalog.revision, request.enabled_tools.clone()));
+                } else {
+                    if !request.enabled_tools.is_empty() {
+                        return Err("catalog references cannot carry tool definitions; no cell started".to_string());
+                    }
+                    let (_, tools) = catalogs.get(session_id)
+                        .filter(|(revision, _)| *revision == catalog.revision)
+                        .ok_or_else(|| "unknown or revoked tool catalog revision; no cell started".to_string())?;
+                    request.enabled_tools = tools.clone();
+                }
+                Ok(())
+            })();
+            if let Err(error) = resolved {
+                self.respond(request_id, Err(error));
+                self.finish_request(request_id);
+                return Ok(());
+            }
+        }
         let Ok(permit) = Arc::clone(&self.request_permits).try_acquire_owned() else {
             self.respond(
                 request_id,
@@ -421,6 +463,7 @@ impl HostState {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&session_id);
+                self.catalogs.lock().unwrap_or_else(PoisonError::into_inner).remove(&session_id);
                 let result = match session {
                     Some(session) => match session.shutdown().await {
                         Ok(()) => {

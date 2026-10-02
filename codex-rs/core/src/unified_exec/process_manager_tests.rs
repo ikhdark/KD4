@@ -184,7 +184,7 @@ async fn poll_advertises_noninteractive_session_capabilities() {
     assert_eq!(
         value["session_capabilities"],
         serde_json::json!({
-            "stdin": false, "interrupt": false, "cancellation": false, "polling": true
+            "stdin": false, "interrupt": false, "cancellation": true, "polling": true
         })
     );
     let response = result.to_response_item("capabilities", &payload);
@@ -297,8 +297,8 @@ async fn poll_progress_is_completed_and_silence_is_timeout() {
             ToolLifecycleWakeReason::Completed,
             250,
         ),
-        // Silence honors the explicitly requested observation timeout.
-        (b"".as_slice(), ToolLifecycleWakeReason::Timeout, 1_000),
+        // Quiet polls apply the anti-spin floor; ready output still returns promptly.
+        (b"".as_slice(), ToolLifecycleWakeReason::Timeout, 5_000),
     ] {
         process
             .output_handles()
@@ -330,7 +330,10 @@ async fn poll_progress_is_completed_and_silence_is_timeout() {
             .find(|wait| wait.wait_kind == "write_stdin_yield")
             .unwrap();
         assert_eq!(wait.wake_reason, expected);
-        assert_eq!(wait.effective_timeout_ms, Some(1_000));
+        assert_eq!(
+            wait.effective_timeout_ms,
+            Some(if bytes.is_empty() { 5_000 } else { 1_000 })
+        );
     }
     manager.process_store.lock().await.remove(1000);
     process.terminate_confirmed().await.unwrap();
@@ -1713,263 +1716,6 @@ async fn remote_registration_failure_preserves_original_error_when_cleanup_also_
     assert_remote_startup_failure_closes_command(false).await;
 }
 
-#[tokio::test]
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "Hold the real turn tracker to verify cancellation cannot interrupt cached command completion"
-)]
-async fn cancelled_known_delta_replay_closes_started_command_before_returning() {
-    use crate::tools::known_delta_store;
-
-    let (session, mut turn, events) =
-        crate::session::tests::make_session_and_context_with_rx().await;
-    let turn_mut = Arc::get_mut(&mut turn).expect("unique turn fixture");
-    turn_mut.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
-    turn_mut
-        .approval_policy
-        .set(codex_protocol::protocol::AskForApproval::Never)
-        .unwrap();
-    let repo = tempfile::tempdir().unwrap();
-    let init = tokio::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(repo.path())
-        .output()
-        .await
-        .unwrap();
-    assert!(init.status.success(), "{init:?}");
-    // Project namespace discovery requires a root commit, even for a bare blob selector.
-    let commit = tokio::process::Command::new("git")
-        .args([
-            "-c",
-            "user.name=KnownDelta Test",
-            "-c",
-            "user.email=known-delta@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "core.hooksPath=NUL",
-            "commit",
-            "--allow-empty",
-            "--quiet",
-            "-m",
-            "KnownDelta fixture root",
-        ])
-        .current_dir(repo.path())
-        .output()
-        .await
-        .unwrap();
-    assert!(commit.status.success(), "{commit:?}");
-    tokio::fs::write(repo.path().join("read.txt"), b"cached output\n")
-        .await
-        .unwrap();
-    let object = tokio::process::Command::new("git")
-        .args(["hash-object", "-w", "read.txt"])
-        .current_dir(repo.path())
-        .output()
-        .await
-        .unwrap();
-    assert!(object.status.success(), "{object:?}");
-    let args = vec![
-        "show".to_string(),
-        String::from_utf8(object.stdout).unwrap().trim().to_string(),
-    ];
-    let thread_id = session.thread_id.to_string();
-    let prepared = known_delta_store::test_observation::with_profitability_costs(
-        async {
-            for _ in 0..2 {
-                let prepared = known_delta_store::prepare_immutable_git_show(
-                    &turn.config.codex_home,
-                    &thread_id,
-                    repo.path(),
-                    "git",
-                    &args,
-                    known_delta_store::ProjectNamespaceHint::Discover,
-                    false,
-                )
-                .await
-                .expect("immutable blob supports cache preparation");
-                assert!(
-                    !prepared.is_hit(),
-                    "initial execution and shadow validation"
-                );
-                known_delta_store::record_execution(
-                    &turn.config.codex_home,
-                    &prepared,
-                    known_delta_store::KnownDeltaExecutionObservation::CompleteSuccess {
-                        output: b"cached output\n",
-                        executor_cost: Duration::from_secs(1),
-                    },
-                )
-                .await;
-            }
-            known_delta_store::prepare_immutable_git_show(
-                &turn.config.codex_home,
-                &thread_id,
-                repo.path(),
-                "git",
-                &args,
-                known_delta_store::ProjectNamespaceHint::Discover,
-                false,
-            )
-            .await
-            .expect("validated blob supports cache reuse")
-        },
-        Duration::from_millis(1),
-        Duration::from_millis(1),
-        Duration::from_millis(10),
-    )
-    .await;
-    let hit = prepared
-        .hit()
-        .expect("fixture must enter KnownDelta replay");
-    let expected_output = hit.rendered_output().to_string();
-    let artifact = hit.raw_output_artifact().clone();
-    let environment = Arc::new(codex_exec_server::Environment::create_for_tests(None).unwrap());
-    environment.wait_until_ready().await.unwrap();
-    let cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(repo.path()).unwrap();
-    let manager = &session.services.unified_exec_manager;
-    let reservation = manager.reserve_process_id().await;
-    let tracker = Arc::new(tokio::sync::Mutex::new(
-        crate::turn_diff_tracker::TurnDiffTracker::new(),
-    ));
-    let context = UnifiedExecContext::with_tracker(
-        Arc::clone(&session),
-        Arc::clone(&turn),
-        "known-delta-cancel".to_string(),
-        Arc::clone(&tracker),
-        crate::tools::context::ToolCallSource::Direct,
-    );
-    let command = std::iter::once("git".to_string())
-        .chain(args)
-        .collect::<Vec<_>>();
-    let request = ExecCommandRequest {
-        stall_timeout_ms: None,
-        validation: None,
-        command: command.clone(),
-        command_for_safety: command.clone(),
-        attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
-            "exec_command",
-            "local",
-            cwd.to_string_lossy(),
-            &command,
-        ),
-        raw_output_artifact: artifact,
-        shell_type: crate::shell::ShellType::Bash,
-        shell_wrapper_is_owned: false,
-        hook_command: command.join(" "),
-        process_id: reservation.process_id(),
-        yield_time_ms: 30_000,
-        max_output_tokens: None,
-        cwd: cwd.clone().into(),
-        normalization_cwd: None,
-        sandbox_cwd: cwd.clone().into(),
-        turn_environment: crate::session::turn_context::TurnEnvironment::new(
-            "local".to_string(),
-            environment,
-            cwd.into(),
-            None,
-        ),
-        network: None,
-        tty: false,
-        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
-        additional_permissions: None,
-        additional_permissions_uri: None,
-        additional_permissions_preapproved: false,
-        justification: None,
-        prefix_rule: None,
-        validation_launch: false,
-        known_delta: Some(prepared),
-    };
-    // Completion records the command in this real tracker before publishing its event.
-    let tracker_guard = tracker.lock().await;
-    let cancellation = CancellationToken::new();
-    let execution = manager.exec_command(request, reservation, &context, &cancellation);
-    tokio::pin!(execution);
-    let started = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            tokio::select! {
-                result = &mut execution => panic!("replay returned before completion was released: {result:?}"),
-                event = events.recv() => {
-                    if let codex_protocol::protocol::EventMsg::ItemStarted(event) = event.expect("events stay open").msg
-                        && let codex_protocol::items::TurnItem::CommandExecution(item) = event.item
-                    {
-                        break item;
-                    }
-                }
-            }
-        }
-    }).await.expect("cached replay publishes its command start");
-    assert_eq!(started.id, "known-delta-cancel");
-    assert_eq!(started.process_id, None);
-    cancellation.cancel();
-    assert!(
-        futures::poll!(&mut execution).is_pending(),
-        "cancellation must wait for cached terminal event delivery"
-    );
-    drop(tracker_guard);
-    let result = tokio::time::timeout(Duration::from_secs(10), &mut execution)
-        .await
-        .expect("cached replay settles after completion is released");
-    // Cancellation can win after delivery or replay can return in the same poll.
-    match result {
-        Ok(output) => {
-            assert_eq!(output.raw_output, expected_output.as_bytes());
-            assert_eq!(output.exit_code, Some(0));
-            assert!(output.process_exited);
-        }
-        Err(UnifiedExecError::ProcessFailed { message } | UnifiedExecError::ProcessFailedWithOutput { message, .. }) => {
-            assert_eq!(message, "unified exec cancelled");
-        }
-        Err(error) => panic!("unexpected replay failure: {error:?}"),
-    }
-    let mut completed_items = Vec::new();
-    while let Ok(event) = events.try_recv() {
-        match event.msg {
-            codex_protocol::protocol::EventMsg::ItemStarted(event) => {
-                assert!(
-                    !matches!(
-                        event.item,
-                        codex_protocol::items::TurnItem::CommandExecution(_)
-                    ),
-                    "cached replay starts only once"
-                );
-            }
-            codex_protocol::protocol::EventMsg::ItemCompleted(event) => {
-                if let codex_protocol::items::TurnItem::CommandExecution(item) = event.item {
-                    completed_items.push(item);
-                }
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(
-        completed_items.len(),
-        1,
-        "cached replay completes exactly once"
-    );
-    let completed = &completed_items[0];
-    assert_eq!(completed.id, started.id);
-    assert_eq!(
-        completed.status,
-        codex_protocol::items::CommandExecutionStatus::Completed
-    );
-    assert_eq!(completed.exit_code, Some(0));
-    assert_eq!(completed.process_id, None);
-    assert_eq!(
-        completed.aggregated_output.as_deref(),
-        Some(expected_output.as_str())
-    );
-    let store = manager.process_store.lock().await;
-    assert!(
-        store.processes.is_empty(),
-        "cached replay starts no process"
-    );
-    assert!(
-        store.reserved_process_ids.is_empty(),
-        "replay releases its reservation"
-    );
-}
-
 #[cfg(windows)]
 #[tokio::test]
 async fn cancelled_remote_registration_closes_started_command_before_returning() {
@@ -2120,7 +1866,6 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
         justification: None,
         prefix_rule: None,
         validation_launch: false,
-        known_delta: None,
     };
     let cancellation = CancellationToken::new();
     let store_guard = if cancel_during_registration {
@@ -2457,7 +2202,6 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
         justification: None,
         prefix_rule: None,
         validation_launch: false,
-        known_delta: None,
     };
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -2709,7 +2453,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         justification: None,
         prefix_rule: None,
         validation_launch: false,
-        known_delta: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
@@ -3037,7 +2780,7 @@ fn check_pending_remote_exec_drop(entered_shutdown: bool) {
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None, additional_permissions_uri: None,
                 additional_permissions_preapproved: false, justification: None, prefix_rule: None,
-                validation_launch: false, known_delta: None,
+                validation_launch: false,
             };
             let cancellation = CancellationToken::new();
             // Scheduling control only: the normal execution must attach the
@@ -3276,7 +3019,7 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None, additional_permissions_uri: None,
                 additional_permissions_preapproved: false, justification: None, prefix_rule: None,
-                validation_launch: false, known_delta: None,
+                validation_launch: false,
             };
             let cancellation = CancellationToken::new();
             let mut pending = Box::pin(manager.exec_command(request, reservation, &context, &cancellation));
@@ -3891,7 +3634,7 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None, additional_permissions_uri: None,
                 additional_permissions_preapproved: false, justification: None, prefix_rule: None,
-                validation_launch: false, known_delta: None,
+                validation_launch: false,
             };
             let cancellation = CancellationToken::new();
             // Scheduling control only: the normal execution must attach the

@@ -33,7 +33,6 @@ fn shell_request(environment_id: &str) -> ShellRequest {
             bypass_sandbox: false,
             proposed_execpolicy_amendment: None,
         },
-        known_delta: None,
         validation_launch: false,
         workspace_operation_root: None,
     }

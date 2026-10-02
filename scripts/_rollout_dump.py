@@ -20,10 +20,12 @@ try:
     from scripts.atomic_json import write_json_atomic
     from scripts.rollout_snapshot import read_rollout_records
     from scripts.rollout_snapshot import read_rollout_snapshot
+    from scripts.rollout_snapshot import hydrate_rollout_record
 except ImportError:
     from atomic_json import write_json_atomic
     from rollout_snapshot import read_rollout_records
     from rollout_snapshot import read_rollout_snapshot
+    from rollout_snapshot import hydrate_rollout_record
 
 
 def dump_complete(path, out_path):
@@ -82,7 +84,7 @@ def dump_complete(path, out_path):
                     raise ValueError(
                         f"rollout record {snapshot.path}:{number} is not an object"
                     )
-                records.append(render(row, f"/{number - 1}"))
+                records.append(render(hydrate_rollout_record(row, snapshot.path), f"/{number - 1}"))
         write_json_atomic(
             output,
             {

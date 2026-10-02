@@ -8,6 +8,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use sha2::Digest;
 
 use super::*;
 
@@ -50,6 +51,10 @@ impl ReportAgentJobResultHandler {
 }
 
 impl CoreToolRuntime for ReportAgentJobResultHandler {
+    fn terminal_result_adapter(&self) -> Option<&'static str> {
+        Some("agent_job_report")
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -106,5 +111,20 @@ pub async fn handle(
                 "failed to serialize report_agent_job_result result: {err}"
             ))
         })?;
-    Ok(FunctionToolOutput::from_text(content, Some(true)))
+    let mut output = FunctionToolOutput::from_text(content, Some(true));
+    if args.deliver && accepted {
+        let message = args.result.to_string();
+        let revision = format!("{:x}", sha2::Sha256::digest(message.as_bytes()));
+        output.sampling_request_signal = Some(serde_json::json!({
+            "authoritative_wait_owner_v1": {
+                "adapter": "agent_job_report",
+                "disposition": "terminal",
+                "owner": format!("agent-job:{}/{}", args.job_id, args.item_id),
+                "state_revision": revision,
+                "receipt_identity": revision,
+                "surfaceable_message": message,
+            },
+        }));
+    }
+    Ok(output)
 }

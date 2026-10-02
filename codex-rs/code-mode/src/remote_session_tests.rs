@@ -99,8 +99,9 @@ async fn shutdown_releases_final_host_lease() {
 
     let error = match second
         .execute(codex_code_mode_protocol::ExecuteRequest {
+            state_path: None,
             tool_call_id: "call-after-shutdown".to_string(),
-            enabled_tools: Vec::new(),
+            enabled_tools: Vec::new().into(),
             source: "text('unreachable')".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
@@ -176,8 +177,9 @@ async fn shutdown_before_open_does_not_spawn_the_host() {
     session.shutdown().await.expect("shutdown session");
     let error = session
         .execute(codex_code_mode_protocol::ExecuteRequest {
+            state_path: None,
             tool_call_id: "call-1".to_string(),
-            enabled_tools: Vec::new(),
+            enabled_tools: Vec::new().into(),
             source: "text('unreachable')".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,

@@ -212,6 +212,12 @@ impl Hooks {
         self.engine.has_handler_for(event_name)
     }
 
+    /// Matcher-aware form of `has_handler_for(PreToolUse)` for one tool identity.
+    pub fn has_pre_tool_use_handler_for(&self, tool_name: &str, matcher_aliases: &[String]) -> bool {
+        self.engine
+            .has_pre_tool_use_handler_for(tool_name, matcher_aliases)
+    }
+
     pub fn preview_user_prompt_submit(
         &self,
         request: &UserPromptSubmitRequest,

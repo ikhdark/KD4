@@ -9,6 +9,25 @@ use codex_login::CodexAuth;
 use codex_protocol::account::PlanType;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::openai_models::ModelInfo;
+use codex_tools::ToolCall as ExtensionToolCall;
+use codex_tools::ToolExecutor;
+use codex_tools::ToolName;
+
+/// A fresh context window discards conversation items. Continuity then rests on
+/// these history-notes extension tools, which register only for a supported
+/// provider and auth mode.
+const RECOVERY_TOOLS: [(&str, &str); 2] = [("notes", "write_file"), ("history", "read_item")];
+
+pub(crate) fn recovery_tools_registered(
+    executors: &[std::sync::Arc<dyn ToolExecutor<ExtensionToolCall>>],
+) -> bool {
+    RECOVERY_TOOLS.iter().all(|(namespace, name)| {
+        let expected = ToolName::namespaced(*namespace, *name);
+        executors
+            .iter()
+            .any(|executor| executor.tool_name() == expected)
+    })
+}
 
 fn experimental_context_is_eligible(auth_mode: AuthMode, plan_type: Option<PlanType>) -> bool {
     auth_mode == AuthMode::Chatgpt
@@ -19,6 +38,13 @@ fn experimental_context_is_eligible(auth_mode: AuthMode, plan_type: Option<PlanT
 }
 
 impl Session {
+    /// Whether a token-budget window reset can be recovered from. Without the
+    /// notes and history tools, compaction must keep a replacement history and
+    /// prompts must not direct the model to tools it cannot call.
+    pub(crate) fn token_budget_recovery_available(&self) -> bool {
+        recovery_tools_registered(&crate::tools::router::extension_tool_executors(self))
+    }
+
     pub(crate) async fn start_new_context_window(
         self: &std::sync::Arc<Self>,
         step_context: &std::sync::Arc<super::step_context::StepContext>,
@@ -61,6 +87,7 @@ pub(super) fn update_window_metadata(
     items: &mut Vec<codex_protocol::models::ResponseItem>,
     turn: &TurnContext,
     ids: crate::state::AutoCompactWindowIds,
+    recovery_available: bool,
 ) {
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
@@ -75,6 +102,7 @@ pub(super) fn update_window_metadata(
             .token_budget
             .as_ref()
             .and_then(|config| config.guidance_message.as_deref())
+            .filter(|_| recovery_available)
             .map(|guidance| crate::context::ContextWindowGuidance::new(guidance).render()),
     );
     for item in items.iter_mut() {
@@ -286,9 +314,12 @@ pub(super) async fn maybe_record(
         return Ok(());
     };
 
+    // Reminder and fallback prompts direct the model to notes and a window reset;
+    // both are unavailable without the recovery tools.
     if config
         .reminder_threshold_tokens
         .is_some_and(|threshold| base_window_tokens_remaining <= threshold)
+        && sess.token_budget_recovery_available()
     {
         let reminder_due = {
             let mut state = sess.state.lock().await;
@@ -316,6 +347,9 @@ pub(super) async fn maybe_record(
     let Some(prompt) = config.auto_compact_fallback_prompt.as_deref() else {
         return Ok(());
     };
+    if !sess.token_budget_recovery_available() {
+        return Ok(());
+    }
 
     let fallback_due = {
         let mut state = sess.state.lock().await;

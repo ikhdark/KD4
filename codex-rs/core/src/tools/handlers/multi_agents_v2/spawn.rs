@@ -62,8 +62,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
-const MAX_UNTRACKED_SNAPSHOT_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_UNTRACKED_SNAPSHOT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_OVERLAY_SNAPSHOT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_OVERLAY_SNAPSHOT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
@@ -970,7 +970,7 @@ impl Drop for IsolatedWorkspace {
 struct WorkspaceOverlay {
     head: String,
     tracked_diff: Vec<u8>,
-    untracked_files: Vec<(PathBuf, Vec<u8>)>,
+    working_files: Vec<(PathBuf, Vec<u8>)>,
 }
 
 async fn create_isolated_worktree(
@@ -1081,7 +1081,7 @@ async fn create_isolated_worktree(
             }
         }
         use futures::StreamExt;
-        let copies = futures::stream::iter(initial_overlay.untracked_files.into_iter().map(|(relative_path, bytes)| {
+        let copies = futures::stream::iter(initial_overlay.working_files.into_iter().map(|(relative_path, bytes)| {
             let workspace = Arc::clone(&workspace);
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -1097,7 +1097,7 @@ async fn create_isolated_worktree(
                     }
                     std::fs::write(&target, bytes).map_err(|error| {
                         FunctionCallError::RespondToModel(format!(
-                            "spawn_agent: could not copy an untracked file into the isolated snapshot: {error}"
+                            "spawn_agent: could not copy a working file into the isolated snapshot: {error}"
                         ))
                     })
                 })
@@ -1158,9 +1158,14 @@ async fn capture_workspace_overlay(
         .arg("-C")
         .arg(repo_root)
         .args(["ls-files", "--others", "--exclude-standard", "-z"]);
-    let (diff, untracked) = tokio::join!(
+    let mut tracked_paths_command = Command::new("git");
+    tracked_paths_command.arg("-C").arg(repo_root).args([
+        "diff", "--name-only", "--no-renames", "--diff-filter=ACMRT", "-z", &head, "--",
+    ]);
+    let (diff, untracked, tracked_paths) = tokio::join!(
         run_worktree_git(diff_command, None, cancellation_token, terminal_tasks),
         run_worktree_git(untracked_command, None, cancellation_token, terminal_tasks),
+        run_worktree_git(tracked_paths_command, None, cancellation_token, terminal_tasks),
     );
     let diff = diff.map_err(|error| {
         FunctionCallError::RespondToModel(format!(
@@ -1184,15 +1189,31 @@ async fn capture_workspace_overlay(
             String::from_utf8_lossy(&untracked.stderr).trim()
         )));
     }
-    let mut untracked_files = Vec::new();
-    let mut total_untracked_bytes = 0u64;
-    for raw_path in untracked.stdout.split(|byte| *byte == 0) {
+    let tracked_paths = tracked_paths.map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agent: could not enumerate changed tracked files: {error}"
+        ))
+    })?;
+    if !tracked_paths.status.success() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "spawn_agent: git diff could not enumerate changed tracked files: {}",
+            String::from_utf8_lossy(&tracked_paths.stderr).trim()
+        )));
+    }
+    let mut working_files = Vec::new();
+    let mut total_file_bytes = 0u64;
+    // Git patches use clean-filtered content, so applying one alone can change
+    // working bytes (notably LF/CRLF). Reapply captured regular-file bytes after
+    // the patch handles deletes, modes, and tracked symlinks.
+    let paths = untracked.stdout.split(|byte| *byte == 0).map(|path| (path, false))
+        .chain(tracked_paths.stdout.split(|byte| *byte == 0).map(|path| (path, true)));
+    for (raw_path, tracked) in paths {
         if raw_path.is_empty() {
             continue;
         }
         let path = PathBuf::from(String::from_utf8(raw_path.to_vec()).map_err(|_| {
             FunctionCallError::RespondToModel(
-                "spawn_agent: an untracked path is not valid UTF-8".to_string(),
+                "spawn_agent: a working file path is not valid UTF-8".to_string(),
             )
         })?);
         let source = repo_root.join(&path);
@@ -1200,65 +1221,68 @@ async fn capture_workspace_overlay(
             .await
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
-                    "spawn_agent: could not inspect untracked file {}: {error}",
+                    "spawn_agent: could not inspect working file {}: {error}",
                     path.display()
                 ))
             })?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            if tracked {
+                continue;
+            }
             return Err(FunctionCallError::RespondToModel(format!(
                 "spawn_agent: isolated snapshots reject untracked symlinks and special files: {}",
                 path.display()
             )));
         }
-        if metadata.len() > MAX_UNTRACKED_SNAPSHOT_FILE_BYTES {
+        if metadata.len() > MAX_OVERLAY_SNAPSHOT_FILE_BYTES {
             return Err(FunctionCallError::RespondToModel(format!(
-                "spawn_agent: untracked file {} is too large for an isolated snapshot ({} bytes, max {})",
+                "spawn_agent: working file {} is too large for an isolated snapshot ({} bytes, max {})",
                 path.display(),
                 metadata.len(),
-                MAX_UNTRACKED_SNAPSHOT_FILE_BYTES
+                MAX_OVERLAY_SNAPSHOT_FILE_BYTES
             )));
         }
-        total_untracked_bytes = total_untracked_bytes
+        total_file_bytes = total_file_bytes
             .checked_add(metadata.len())
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(
-                    "spawn_agent: untracked snapshot size overflowed".to_string(),
+                    "spawn_agent: working file snapshot size overflowed".to_string(),
                 )
             })?;
-        if total_untracked_bytes > MAX_UNTRACKED_SNAPSHOT_TOTAL_BYTES {
+        if total_file_bytes > MAX_OVERLAY_SNAPSHOT_TOTAL_BYTES {
             return Err(FunctionCallError::RespondToModel(format!(
-                "spawn_agent: untracked files exceed the isolated snapshot limit of {MAX_UNTRACKED_SNAPSHOT_TOTAL_BYTES} bytes"
+                "spawn_agent: working files exceed the isolated snapshot limit of {MAX_OVERLAY_SNAPSHOT_TOTAL_BYTES} bytes"
             )));
         }
         let file = tokio::fs::File::open(&source).await.map_err(|error| {
             FunctionCallError::RespondToModel(format!(
-                "spawn_agent: could not snapshot untracked file {}: {error}",
+                "spawn_agent: could not snapshot working file {}: {error}",
                 path.display()
             ))
         })?;
         let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-        file.take(MAX_UNTRACKED_SNAPSHOT_FILE_BYTES + 1)
+        file.take(MAX_OVERLAY_SNAPSHOT_FILE_BYTES + 1)
             .read_to_end(&mut bytes)
             .await
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
-                    "spawn_agent: could not snapshot untracked file {}: {error}",
+                    "spawn_agent: could not snapshot working file {}: {error}",
                     path.display()
                 ))
             })?;
         if bytes.len() as u64 != metadata.len() {
             return Err(FunctionCallError::RespondToModel(format!(
-                "spawn_agent: untracked file {} changed while the isolated snapshot was captured",
+                "spawn_agent: working file {} changed while the isolated snapshot was captured",
                 path.display()
             )));
         }
-        untracked_files.push((path, bytes));
+        working_files.push((path, bytes));
     }
-    untracked_files.sort_by(|left, right| left.0.cmp(&right.0));
+    working_files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(WorkspaceOverlay {
         head,
         tracked_diff: diff.stdout,
-        untracked_files,
+        working_files,
     })
 }
 
@@ -2200,6 +2224,7 @@ mod snapshot_tests {
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         };
         git(&["init", "-q"]);
+        git(&["config", "core.autocrlf", "true"]);
         std::fs::write(repo.path().join("tracked.txt"), b"before\n").unwrap();
         git(&["add", "tracked.txt"]);
         git(&[

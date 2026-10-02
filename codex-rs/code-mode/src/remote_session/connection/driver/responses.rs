@@ -325,6 +325,7 @@ impl ConnectionDriver {
         if !should_shutdown {
             return true;
         }
+        self.catalogs.remove(&session.id);
         let (response_tx, response_rx) = oneshot::channel();
         drop(response_rx);
         self.send_request(

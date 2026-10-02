@@ -348,6 +348,19 @@ pub(super) fn load_callback(
             return;
         }
     };
+    if let Some(state) = scope.get_slot_mut::<RuntimeState>()
+        && let Some(reads) = state.stored_value_reads.as_mut()
+    {
+        // Track missing keys too: concurrent creation can invalidate a decision.
+        // Bound metadata independently of the size of values loaded by the cell.
+        if key.len() > 4096
+            || (!reads.contains(&key) && reads.len() >= super::MAX_SESSION_STORED_VALUES)
+        {
+            state.stored_value_reads = None;
+        } else {
+            reads.insert(key.clone());
+        }
+    }
     let value = scope
         .get_slot::<RuntimeState>()
         .and_then(|state| state.stored_values.get(&key))

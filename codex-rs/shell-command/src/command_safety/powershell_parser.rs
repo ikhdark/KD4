@@ -516,11 +516,22 @@ impl PowershellParserProcess {
                 "PowerShell parser deadline expired",
             ));
         }
-        if resolution.is_none()
-            && let Some(index) = self
+        if let Some(index) = self
                 .syntax_cache
                 .iter()
-                .position(|(cached, _, _)| cached == script)
+                .position(|(cached, outcome, _)| {
+                    cached == script
+                        && (resolution.is_none()
+                            || matches!(
+                                outcome,
+                                PowershellParseOutcome::Unsupported
+                                    | PowershellParseOutcome::SyntaxError
+                                    | PowershellParseOutcome::Analysis(PowershellParseAnalysis {
+                                        direct_argv: None,
+                                        ..
+                                    })
+                            ))
+                })
         {
             let entry = self
                 .syntax_cache
@@ -530,8 +541,9 @@ impl PowershellParserProcess {
             self.syntax_cache.push_back(entry);
             return Ok(outcome);
         }
-        // Resolution depends on the current filesystem, cwd, PATH and PATHEXT. It must
-        // always reach the host, and no result from that request can enter this cache.
+        // A syntax result with no direct-argv candidate cannot perform resolution.
+        // Candidates still depend on the current filesystem, cwd, PATH and PATHEXT:
+        // their resolution must reach the host and must not enter this cache.
         // The resolution script restores cwd/PATH/PATHEXT and does not change
         // syntax or native argument mode. Keep syntax proof across those requests.
         let request = PowershellParserRequest {
@@ -1058,6 +1070,20 @@ mod tests {
             ],
         );
         assert_eq!(parser.next_request_id, 2, "changed syntax must be parsed");
+
+        let resolution = PowershellResolutionState {
+            cwd: std::env::current_dir().unwrap().display().to_string(),
+            path: String::new(),
+            pathext: ".EXE".to_string(),
+        };
+        let resolved = parser
+            .parse_request("Write-Output foo | Measure-Object", Some(&resolution))
+            .unwrap();
+        assert_eq!(resolved, PowershellParseOutcome::Analysis(second));
+        assert_eq!(
+            parser.next_request_id, 2,
+            "a pipeline has no executable to resolve; reuse syntax without IPC"
+        );
 
         let third = parser.parse("Get-Content 'foo bar'").unwrap();
         let PowershellParseOutcome::Analysis(third) = third else {

@@ -607,10 +607,7 @@ async fn recorder_persists_every_sampling_request_token_count() -> std::io::Resu
             _ => unreachable!(),
         }
         let contents = fs::read_to_string(&rollout_path)?;
-        let records = contents
-            .lines()
-            .map(serde_json::from_str::<RolloutLine>)
-            .collect::<Result<Vec<_>, _>>()?;
+        let records = recorded_lines(&rollout_path)?;
         let counts = records
             .iter()
             .filter_map(|line| match &line.item {
@@ -690,11 +687,7 @@ async fn recorder_last_handle_drop_drains_accepted_deferred_records() -> std::io
         .await
         .expect("writer drains after channel closure")
         .expect("writer task");
-    let contents = fs::read_to_string(&rollout_path)?;
-    let records = contents
-        .lines()
-        .map(serde_json::from_str::<RolloutLine>)
-        .collect::<Result<Vec<_>, _>>()?;
+    let records = recorded_lines(&rollout_path)?;
     assert_eq!(records.iter().filter(|line| matches!(&line.item,
         RolloutItem::EventMsg(EventMsg::AgentMessage(event)) if event.message == "accepted-before-last-drop"
     )).count(), 1);
@@ -765,7 +758,8 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
             },
         ))])
         .await?;
-    recorder.flush().await?;
+    // The terminal-checkpoint barrier flushes like `flush()` and then syncs the file.
+    recorder.flush_durable().await?;
 
     recorder.persist().await?;
     // Second call verifies `persist()` is idempotent after materialization.
@@ -779,7 +773,9 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
         first_value["format_version"],
         serde_json::json!(codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION)
     );
-    let session_meta: RolloutLine = serde_json::from_str(first_line)?;
+    let session_meta: RolloutLine = serde_json::from_str(
+        &crate::payload_artifact::hydrate_line(&rollout_path, first_line.to_owned())?,
+    )?;
     let RolloutItem::SessionMeta(session_meta) = session_meta.item else {
         panic!("expected session metadata in rollout");
     };
@@ -791,6 +787,14 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     assert_eq!(build.dirty, embedded.dirty);
     assert_eq!(build.profile, embedded.profile);
     assert_eq!(build.built, embedded.built);
+    assert_eq!(build.token_accounting["local_input_estimate"].estimator, "utf8_bytes_div4_ceil_v1");
+    assert_eq!(build.token_accounting["projection_text_budget"].estimator, "o200k_base_count_ordinary_v1");
+    assert_ne!(
+        build.token_accounting["canonical_tool_tokens"].scope,
+        build.token_accounting["model_facing_tool_tokens"].scope,
+        "different serialized representations must not be labeled the same accounting scope",
+    );
+    assert_eq!(build.token_accounting["provider_input_tokens"].estimator, "provider_reported_tokenizer_unknown");
     assert_eq!(
         build.executable_sha256.as_deref(),
         codex_utils_build_info::executable_sha256(),
@@ -819,6 +823,7 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
 
     recorder.shutdown().await?;
     assert!(recorder.flush().await.is_err());
+    assert!(recorder.flush_durable().await.is_err());
     assert!(recorder.record_canonical_items(&[]).await.is_err());
     assert!(recorder.shutdown().await.is_err());
     Ok(())
@@ -1288,10 +1293,13 @@ fn agent_message(message: &str) -> RolloutItem {
 }
 
 fn recorded_lines(path: &Path) -> std::io::Result<Vec<RolloutLine>> {
-    Ok(fs::read_to_string(path)?
+    fs::read_to_string(path)?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
-        .collect::<Result<Vec<_>, _>>()?)
+        .map(|line| {
+            let line = crate::payload_artifact::hydrate_line(path, line.to_owned())?;
+            serde_json::from_str::<RolloutLine>(&line).map_err(std::io::Error::from)
+        })
+        .collect()
 }
 
 fn parse_record_timestamp(timestamp: &str) -> OffsetDateTime {
@@ -2471,6 +2479,7 @@ async fn deferred_writers_install_one_canonical_header_after_both_open() -> std:
             Some(SessionMeta {
                 session_id: id.into(),
                 id,
+                timestamp: chrono::Utc::now().to_rfc3339(),
                 ..SessionMeta::default()
             }),
             home.path().to_path_buf(),

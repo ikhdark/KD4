@@ -27,7 +27,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_models_manager::bundled_models_response;
+use codex_models_manager::test_support::test_models_response as bundled_models_response;
 use codex_models_manager::collaboration_mode_presets;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;

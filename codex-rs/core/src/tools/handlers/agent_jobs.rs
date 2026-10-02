@@ -75,6 +75,8 @@ struct SpawnAgentsOnCsvArgs {
     max_concurrency: Option<usize>,
     max_workers: Option<usize>,
     max_runtime_seconds: Option<u64>,
+    #[serde(default)]
+    deliver: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +85,8 @@ struct ReportAgentJobResultArgs {
     item_id: String,
     result: Value,
     stop: Option<bool>,
+    #[serde(default)]
+    deliver: bool,
 }
 
 #[derive(Debug, Serialize)]

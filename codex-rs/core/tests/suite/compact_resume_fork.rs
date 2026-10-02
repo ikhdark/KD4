@@ -86,6 +86,7 @@ fn is_injected_user_context(text: &str) -> bool {
     text.starts_with("<environment_context>")
         || text.starts_with("<recommended_plugins>")
         || text.starts_with("# AGENTS.md instructions")
+        || text.starts_with("<codex_task_state>")
 }
 
 fn json_conversation_user_texts(request: &Value) -> Vec<String> {

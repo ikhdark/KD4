@@ -1114,49 +1114,6 @@ async fn stable_metadata_dependencies_refresh_remotes() {
     );
 }
 
-#[tokio::test]
-async fn namespace_dependencies_refresh_head_and_root_history() {
-    let (_temp_dir, repo) = create_clean_git_repo().await;
-    let source = GitWorkspaceMetadataSource {
-        cwd: repo.clone(),
-        repo_root: repo.clone(),
-        cache: GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop()))),
-    };
-    let namespace_before = source.project_namespace().await.expect("namespace");
-    let dependencies_before = StableMetadataDependencies::capture_project_namespace(&source)
-        .await
-        .expect("namespace dependencies");
-
-    run_git(
-        repo.as_path(),
-        &["commit", "--allow-empty", "-q", "-m", "next"],
-    )
-    .await;
-
-    let dependencies_after = StableMetadataDependencies::capture_project_namespace(&source)
-        .await
-        .expect("namespace dependencies");
-    assert_ne!(dependencies_before, dependencies_after);
-    assert_eq!(
-        source.project_namespace().await,
-        Some(namespace_before.clone())
-    );
-
-    run_git(
-        repo.as_path(),
-        &["checkout", "-q", "--orphan", "unrelated-root"],
-    )
-    .await;
-    run_git(
-        repo.as_path(),
-        &["commit", "--allow-empty", "-q", "-m", "unrelated root"],
-    )
-    .await;
-
-    let unrelated_namespace = source.project_namespace().await.expect("namespace");
-    assert_ne!(namespace_before, unrelated_namespace);
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn confirmed_performance_git_dependency_fingerprints_use_blocking_pool() {
     let runtime_thread = std::thread::current().id();
@@ -1165,35 +1122,6 @@ async fn confirmed_performance_git_dependency_fingerprints_use_blocking_pool() {
         .expect("blocking metadata result");
 
     assert_ne!(worker_thread, runtime_thread);
-}
-
-#[tokio::test]
-async fn missing_project_namespace_is_cached_with_its_dependencies() {
-    let temp_dir = TempDir::new().expect("temp git repository");
-    let repo =
-        AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute repository path");
-    run_git(repo.as_path(), &["init", "-q"]).await;
-    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
-    let source = GitWorkspaceMetadataSource {
-        cwd: repo.clone(),
-        repo_root: repo.clone(),
-        cache: Arc::clone(&cache),
-    };
-
-    assert_eq!(source.project_namespace().await, None);
-    {
-        let mut state = cache.state.lock().await;
-        let entry = state
-            .project_namespaces
-            .get_mut(repo.as_path())
-            .expect("negative namespace cache entry");
-        assert_eq!(entry.namespace, None);
-        entry.namespace = Some("cached-negative-entry".to_string());
-    }
-    assert_eq!(
-        source.project_namespace().await.as_deref(),
-        Some("cached-negative-entry")
-    );
 }
 
 #[tokio::test]
@@ -1206,7 +1134,6 @@ async fn watcher_generation_rejects_stable_identity_caches() {
         cache: Arc::clone(&cache),
     };
     let expected_metadata = source.metadata().await;
-    let expected_namespace = source.project_namespace().await.expect("namespace");
 
     {
         let mut state = cache.state.lock().await;
@@ -1215,11 +1142,6 @@ async fn watcher_generation_rejects_stable_identity_caches() {
             .get_mut(repo.as_path())
             .expect("metadata cache entry")
             .metadata = StableGitMetadata::default();
-        state
-            .project_namespaces
-            .get_mut(repo.as_path())
-            .expect("namespace cache entry")
-            .namespace = Some("stale-namespace".to_string());
     }
     cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
 
@@ -1231,7 +1153,6 @@ async fn watcher_generation_rejects_stable_identity_caches() {
             has_changes: Some(false),
         }
     );
-    assert_eq!(source.project_namespace().await, Some(expected_namespace));
 }
 
 #[tokio::test]
@@ -1247,7 +1168,6 @@ async fn source_watcher_generation_preserves_git_identity_caches() {
 
     cache.snapshot(&environments).await;
     source.metadata().await;
-    source.project_namespace().await.expect("namespace");
     assert_eq!(cache.root_resolution_count(), 1);
     {
         let mut state = cache.state.lock().await;
@@ -1256,11 +1176,6 @@ async fn source_watcher_generation_preserves_git_identity_caches() {
             .get_mut(repo.as_path())
             .expect("metadata cache entry")
             .metadata = StableGitMetadata::default();
-        state
-            .project_namespaces
-            .get_mut(repo.as_path())
-            .expect("namespace cache entry")
-            .namespace = Some("source-event-cache-sentinel".to_string());
     }
 
     cache.record_source_change_event(Some(vec![repo.as_path().join("src").join("lib.rs")]));
@@ -1274,10 +1189,6 @@ async fn source_watcher_generation_preserves_git_identity_caches() {
             latest_git_commit_hash: None,
             has_changes: Some(false),
         }
-    );
-    assert_eq!(
-        source.project_namespace().await.as_deref(),
-        Some("source-event-cache-sentinel")
     );
 }
 
@@ -1330,7 +1241,6 @@ async fn watcher_failure_clears_and_disables_cached_identity() {
     let state = cache.state.lock().await;
     assert!(state.root.is_none());
     assert!(state.metadata.is_empty());
-    assert!(state.project_namespaces.is_empty());
     assert!(!cache.watcher_reliable.load(Ordering::Acquire));
 }
 

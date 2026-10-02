@@ -2404,6 +2404,37 @@ fn logical_generation_budget_new_user_input_renews_the_regular_limit() {
     assert_eq!(budget.admit(false), LogicalGenerationAdmission::Exhausted);
 }
 
+#[test]
+fn wall_time_limit_forces_one_final_synthesis_that_progress_cannot_renew() {
+    let start = std::time::Instant::now();
+    let limit = Some(Duration::from_secs(60));
+    let mut budget = LogicalGenerationBudget::default();
+    budget.enforce_wall_time_limit(limit, start);
+    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+    budget.enforce_wall_time_limit(limit, start + Duration::from_secs(59));
+    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+    budget.enforce_wall_time_limit(limit, start + Duration::from_secs(60));
+    assert_eq!(budget.wall_time_limit_reached, limit);
+    budget.observe_progress(
+        /*new_evidence*/ true, /*successful_process_monitor*/ false,
+    );
+    assert_eq!(
+        budget.admit(false),
+        LogicalGenerationAdmission::Terminal { forced: true }
+    );
+    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Exhausted);
+    // New user input starts a new window.
+    budget.accepted_user_input();
+    assert_eq!(budget.wall_time_limit_reached, None);
+    budget.enforce_wall_time_limit(limit, start + Duration::from_secs(600));
+    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
+
+    let mut unlimited = LogicalGenerationBudget::default();
+    unlimited.enforce_wall_time_limit(None, start);
+    unlimited.enforce_wall_time_limit(None, start + Duration::from_secs(86_400));
+    assert_eq!(unlimited.admit(false), LogicalGenerationAdmission::Regular);
+}
+
 #[tokio::test]
 async fn regular_follow_up_admission_reports_exhaustion_once() {
     let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
@@ -2423,6 +2454,7 @@ async fn regular_follow_up_admission_reports_exhaustion_once() {
     let exhausted = LogicalGenerationBudget {
         regular_generations: MAX_REGULAR_LOGICAL_GENERATIONS,
         terminal_generation_used: true,
+        ..Default::default()
     };
     reported = false;
     assert!(!admit_regular_follow_up(&session, &turn, &exhausted, &mut reported).await);
@@ -2450,6 +2482,7 @@ fn logical_generation_budget_preview_preserves_capacity() {
         let budget = LogicalGenerationBudget {
             regular_generations,
             terminal_generation_used,
+            ..Default::default()
         };
         assert_eq!(budget.can_admit(false), regular_allowed);
         assert_eq!(budget.can_admit(true), terminal_allowed);
@@ -2775,7 +2808,7 @@ fn authoritative_wait_terminal_surface_requires_explicit_owner_projection() {
         ..Default::default()
     };
     assert_eq!(
-        authoritative_wait_terminal_surface(&without_projection),
+        authoritative_wait_terminal_surface(&without_projection, None, 10_000),
         Some(SurfacedToolResult {
             adapter: "code_mode_cell".to_string(),
             value: serde_json::json!("arbitrary raw execution output"),
@@ -2792,7 +2825,7 @@ fn authoritative_wait_terminal_surface_requires_explicit_owner_projection() {
         ..Default::default()
     };
     assert_eq!(
-        authoritative_wait_terminal_surface(&with_projection),
+        authoritative_wait_terminal_surface(&with_projection, None, 10_000),
         Some(SurfacedToolResult {
             adapter: "code_mode_cell".to_string(),
             value: serde_json::json!("arbitrary raw execution output"),
@@ -2810,7 +2843,7 @@ fn blocked_authoritative_wait_never_enters_terminal_surface() {
         )),
         ..Default::default()
     };
-    assert_eq!(authoritative_wait_terminal_surface(&blocked), None);
+    assert_eq!(authoritative_wait_terminal_surface(&blocked, None, 10_000), None);
 }
 
 fn run_turn_multi_thread_test_with_stack<F, Fut, T>(test_name: &'static str, test: F) -> T
@@ -3501,7 +3534,10 @@ fn new_context_tool_installs_fresh_window_before_next_generation() -> Result<()>
                 ],
             )
             .await;
+            let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+            extensions.tool_contributor(Arc::new(crate::session::tests::TokenBudgetRecoveryTools));
             let test = test_codex()
+                .with_extensions(Arc::new(extensions.build()))
                 .with_config(|config| {
                     config.features.enable(Feature::TokenBudget).unwrap();
                     config.features.disable(Feature::CodeModeHost).unwrap();
@@ -3549,6 +3585,73 @@ fn new_context_tool_installs_fresh_window_before_next_generation() -> Result<()>
             assert_eq!(
                 fs::read_to_string(test.workspace_path("world-state.txt"))?,
                 "persistent world"
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn token_budget_compaction_keeps_history_without_recovery_tools() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "token_budget_compaction_keeps_history_without_recovery_tools",
+        || async {
+            let server = responses::start_mock_server().await;
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![
+                    responses::sse(vec![
+                        responses::ev_function_call("continue-work", "unknown_test_tool", "{}"),
+                        responses::ev_completed_with_tokens("before-compaction", 500_000),
+                    ]),
+                    responses::sse(vec![
+                        responses::ev_assistant_message(
+                            "summary",
+                            &complete_compaction_summary(
+                                "budget window compacted; continue budget-request-sentinel",
+                            ),
+                        ),
+                        responses::ev_completed_with_tokens("compaction", 20),
+                    ]),
+                    responses::sse(vec![
+                        responses::ev_assistant_message("answer", "History kept."),
+                        responses::ev_completed("done"),
+                    ]),
+                ],
+            )
+            .await;
+            let provider = non_openai_model_provider(&server);
+            let test = test_codex()
+                .with_config(move |config| {
+                    config.model_provider = provider;
+                    config.features.enable(Feature::TokenBudget).unwrap();
+                    config.features.disable(Feature::CodeModeHost).unwrap();
+                    config.compact_prompt = Some(codex_prompts::SUMMARIZATION_PROMPT.to_string());
+                    config.model_context_window = Some(1_000_000);
+                    config.model_auto_compact_token_limit = Some(90_000);
+                })
+                .build(&server)
+                .await?;
+            let completion = test
+                .submit_turn_and_capture_completion("budget-request-sentinel")
+                .await?;
+            assert!(completion.error.is_none(), "{completion:?}");
+            assert_eq!(completion.last_agent_message.as_deref(), Some("History kept."));
+            let sent = requests.requests();
+            assert_eq!(sent.len(), 3, "compaction must generate a replacement history");
+            assert!(
+                sent[1].body_contains_text("budget-request-sentinel"),
+                "the summarizer must receive the current request"
+            );
+            // Once input has been consumed by a model step, normal local
+            // compaction carries it forward through the generated summary.
+            assert!(
+                sent[2].body_contains_text("budget-request-sentinel"),
+                "the current request must survive compaction without recovery tools"
+            );
+            assert!(
+                sent[2].body_contains_text("budget window compacted"),
+                "the replacement summary must reach the next model request"
             );
             Ok(())
         },
@@ -3940,14 +4043,14 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
 }
 
 #[test]
-fn generation_budget_survives_reentry_and_terminal_directive_is_persisted() -> Result<()> {
+fn generation_budget_renews_on_reentry_input_and_persists_terminal_directive() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
-        "generation_budget_survives_reentry_and_terminal_directive_is_persisted",
-        generation_budget_survives_reentry_and_terminal_directive_is_persisted_impl,
+        "generation_budget_renews_on_reentry_input_and_persists_terminal_directive",
+        generation_budget_renews_on_reentry_input_and_persists_terminal_directive_impl,
     )
 }
 
-async fn generation_budget_survives_reentry_and_terminal_directive_is_persisted_impl()
+async fn generation_budget_renews_on_reentry_input_and_persists_terminal_directive_impl()
 -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
@@ -3964,9 +4067,11 @@ async fn generation_budget_survives_reentry_and_terminal_directive_is_persisted_
         responses::ev_assistant_message("reentry", "ready for reentry"),
         responses::ev_completed("reentry"),
     ]));
-    let mut after_reentry = responses::ev_completed("after-reentry");
-    after_reentry["response"]["end_turn"] = serde_json::json!(false);
-    sequence.push(responses::sse(vec![after_reentry]));
+    for i in 0..limit {
+        let mut after_reentry = responses::ev_completed(&format!("after-reentry-{i}"));
+        after_reentry["response"]["end_turn"] = serde_json::json!(false);
+        sequence.push(responses::sse(vec![after_reentry]));
+    }
     for id in ["terminal", "next-turn"] {
         sequence.push(responses::sse(vec![
             responses::ev_assistant_message(id, id),
@@ -4089,8 +4194,8 @@ else:
     );
     assert_eq!(
         requests.requests().len(),
-        limit + 1,
-        "one task admits bounded regular requests and one terminal request across reentry"
+        2 * limit,
+        "accepted reentry input renews the bounded allowance before one terminal request"
     );
     assert!(requests.requests()[limit - 1].body_contains_text("queued reentry input"));
 
@@ -4098,15 +4203,15 @@ else:
     let sent = requests.requests();
     assert_eq!(
         sent.len(),
-        limit + 2,
+        2 * limit + 1,
         "the terminal request cannot trigger another generation"
     );
     for (index, request) in sent.iter().enumerate() {
-        let terminal = index == limit;
+        let terminal = index == 2 * limit - 1;
         assert_eq!(
             request.body_contains_text(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE),
-            index >= limit,
-            "the terminal instruction must remain in history after request {limit}"
+            index >= 2 * limit - 1,
+            "the terminal instruction must remain in history after the forced request"
         );
         assert_eq!(
             request.body_json()["tool_choice"],
@@ -4114,9 +4219,9 @@ else:
         );
         assert!(!request.body_json()["tools"].as_array().unwrap().is_empty());
     }
-    assert_eq!(sent[limit].body_json()["tools"], sent[limit - 1].body_json()["tools"]);
-    assert_eq!(sent[limit].body_json()["parallel_tool_calls"], sent[limit - 1].body_json()["parallel_tool_calls"]);
-    assert!(sent[limit + 1].body_contains_text("Later user input may resume work"));
+    assert_eq!(sent[2 * limit - 1].body_json()["tools"], sent[2 * limit - 2].body_json()["tools"]);
+    assert_eq!(sent[2 * limit - 1].body_json()["parallel_tool_calls"], sent[2 * limit - 2].body_json()["parallel_tool_calls"]);
+    assert!(sent[2 * limit].body_contains_text("Later user input may resume work"));
     Ok(())
 }
 
@@ -4138,7 +4243,7 @@ async fn mid_turn_compaction_failure_preserves_completed_message_impl() -> Resul
                 responses::ev_response_created("before-compaction"),
                 responses::ev_assistant_message("completed-work", "The first result is ready."),
                 responses::ev_function_call("continue-work", "unknown_test_tool", "{}"),
-                responses::ev_completed_with_tokens("before-compaction", 95_001),
+                responses::ev_completed_with_tokens("before-compaction", 90_001),
             ])),
             ResponseTemplate::new(400)
                 .set_body_json(serde_json::json!({"detail": "permanent compaction failure"})),
@@ -6594,15 +6699,15 @@ fn stop_hook_continuation_reaches_the_final_response() -> Result<()> {
 
 #[cfg(windows)]
 #[test]
-fn registered_exec_rejects_invalid_yield_without_starting_the_command() -> Result<()> {
+fn registered_exec_normalizes_yield_and_runs_the_command() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
-        "registered_exec_rejects_invalid_yield_without_starting_the_command",
-        registered_exec_rejects_invalid_yield_without_starting_the_command_impl,
+        "registered_exec_normalizes_yield_and_runs_the_command",
+        registered_exec_normalizes_yield_and_runs_the_command_impl,
     )
 }
 
 #[cfg(windows)]
-async fn registered_exec_rejects_invalid_yield_without_starting_the_command_impl() -> Result<()> {
+async fn registered_exec_normalizes_yield_and_runs_the_command_impl() -> Result<()> {
     let fixtures = tempfile::tempdir()?;
     let marker = fixtures.path().join("command-ran.txt");
     let script = format!(
@@ -6632,7 +6737,7 @@ async fn registered_exec_rejects_invalid_yield_without_starting_the_command_impl
                 responses::ev_response_created("invalid-yield-final-response"),
                 responses::ev_assistant_message(
                     "invalid-yield-final-message",
-                    "invalid wait rejected",
+                    "observation wait normalized",
                 ),
                 responses::ev_completed("invalid-yield-final-response"),
             ]),
@@ -6652,15 +6757,11 @@ async fn registered_exec_rejects_invalid_yield_without_starting_the_command_impl
     assert!(completion.error.is_none(), "{completion:?}");
     let requests = response_log.requests();
     assert_eq!(requests.len(), 2);
-    let rejected = requests[1]
+    let output = requests[1]
         .function_call_output_text("invalid-yield")
-        .expect("model receives argument rejection");
-    assert!(rejected.contains("$.yield_time_ms"), "{rejected}");
-    assert!(rejected.contains("300000"), "{rejected}");
-    assert!(
-        !marker.exists(),
-        "invalid arguments must not start the command"
-    );
+        .expect("model receives command completion and normalization notice");
+    assert!(output.contains("Adjusted `yield_time_ms` to 300000"), "{output}");
+    assert_eq!(std::fs::read_to_string(marker)?.trim(), "ran");
     Ok(())
 }
 
@@ -7439,7 +7540,7 @@ fn terminal_surface_preserves_typed_owner_result_without_json_message_synthesis(
         ..Default::default()
     };
 
-    let surfaced = authoritative_wait_terminal_surface(&decision).expect("typed surface");
+    let surfaced = authoritative_wait_terminal_surface(&decision, None, 10_000).expect("typed surface");
     assert_eq!(surfaced.adapter, "owner_adapter");
     assert_eq!(surfaced.value, value);
     assert_eq!(surfaced.canonical_message, None);
@@ -7448,7 +7549,7 @@ fn terminal_surface_preserves_typed_owner_result_without_json_message_synthesis(
 #[test]
 fn terminal_surface_preserves_owner_canonical_message_exactly() {
     let canonical = "  owner-authored completion\n";
-    let decision = SamplingConvergenceDecision {
+    let mut decision = SamplingConvergenceDecision {
         continuation: ContinuationDisposition::SurfaceExistingResult,
         authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
             AuthoritativeWaitOwnerResult {
@@ -7460,8 +7561,17 @@ fn terminal_surface_preserves_owner_canonical_message_exactly() {
         ..Default::default()
     };
 
-    let surfaced = authoritative_wait_terminal_surface(&decision).expect("typed surface");
+    let surfaced = authoritative_wait_terminal_surface(&decision, None, 10_000).expect("typed surface");
     assert_eq!(surfaced.canonical_message.as_deref(), Some(canonical));
+    let schema = serde_json::json!({
+        "type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]
+    });
+    assert!(authoritative_wait_terminal_surface(&decision, Some(&schema), 10_000).is_none());
+    if let Some(AuthoritativeWaitResolution::Terminal(result)) = &mut decision.authoritative_wait {
+        result.surfaceable_message = Some(r#"{"answer":42}"#.to_string());
+    }
+    assert!(authoritative_wait_terminal_surface(&decision, Some(&schema), 10_000).is_some());
+    assert!(authoritative_wait_terminal_surface(&decision, Some(&schema), 0).is_none());
 }
 
 #[test]
@@ -8140,8 +8250,7 @@ async fn plan_prose_prefix_survives_worker_abort_during_item_start_impl() -> Res
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
-    // The local store supports Legacy history; compare its persisted AgentMessage
-    // conversion with the live ItemCompleted payload below.
+    // Compare the persisted canonical completion with the live completion.
     let started = manager
         .start_thread_with_options(manager.start_thread_options(config))
         .await?;
@@ -8239,13 +8348,12 @@ async fn plan_prose_prefix_survives_worker_abort_during_item_start_impl() -> Res
         let completed = events
             .iter()
             .filter_map(|event| match event {
-                EventMsg::ItemCompleted(event) if name == "live" => match &event.item {
+                EventMsg::ItemCompleted(event) => match &event.item {
                     TurnItem::AgentMessage(item) if item.id == "plan-prefix-message" => {
                         Some(agent_message_text(item))
                     }
                     _ => None,
                 },
-                EventMsg::AgentMessage(event) if name == "physical" => Some(event.message.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();

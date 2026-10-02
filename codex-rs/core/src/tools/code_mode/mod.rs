@@ -107,6 +107,8 @@ struct CodeModePacketAdmission {
 #[derive(Default)]
 struct CodeModePacketMetrics {
     output_budget: Option<usize>,
+    delivery_intent: Option<CodeModeDeliveryIntent>,
+    delivery_blocked: bool,
     command_states: Vec<JsonValue>,
     next_nested_ordinal: usize,
     nested_call_count: usize,
@@ -116,6 +118,13 @@ struct CodeModePacketMetrics {
     nested_results: Vec<CodeModeNestedResultEvidence>,
     omitted_nested_result_count: usize,
     first_required_terminal: Option<CodeModeNestedTerminal>,
+}
+
+struct CodeModeDeliveryIntent {
+    turn_id: String,
+    input_activity: tokio::sync::watch::Receiver<crate::session::InputQueueActivity>,
+    schema: Option<JsonValue>,
+    limit: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -332,6 +341,64 @@ impl CodeModeService {
             .and_then(|metrics| metrics.output_budget)
     }
 
+    pub(super) fn record_delivery_intent(
+        &self,
+        cell_id: &CellId,
+        turn: &TurnContext,
+        input_activity: tokio::sync::watch::Receiver<crate::session::InputQueueActivity>,
+    ) {
+        if let Some(metrics) = self.packet_admission
+            .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cells.get_mut(cell_id.as_str())
+        {
+            metrics.delivery_intent = Some(CodeModeDeliveryIntent {
+                turn_id: turn.sub_id.clone(),
+                input_activity,
+                schema: turn.final_output_json_schema.clone(),
+                limit: metrics.output_budget.unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
+            });
+        }
+    }
+
+    pub(super) fn delivery_for_response(
+        &self,
+        cell_id: &CellId,
+        turn: &TurnContext,
+        response: &RuntimeResponse,
+    ) -> Option<String> {
+        let mut admission = self.packet_admission
+            .lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let metrics = admission.cells.get_mut(cell_id.as_str())?;
+        if let RuntimeResponse::Yielded { content_items, .. }
+            | RuntimeResponse::ExplicitYield { content_items, .. } = response
+        {
+            // A partial visible answer cannot safely be delivered again, or
+            // reconstructed from an incomplete tail. Empty yields retain intent.
+            if !content_items.is_empty() {
+                metrics.delivery_intent = None;
+            }
+            return None;
+        }
+        let intent = metrics.delivery_intent.take()?;
+        if intent.turn_id != turn.sub_id
+            || intent.schema != turn.final_output_json_schema
+            || intent.input_activity.has_changed().unwrap_or(true)
+            || metrics.delivery_blocked
+            || metrics.first_required_terminal.is_some()
+            || metrics.command_states.iter().any(|state| {
+                state.get("execution_state").and_then(JsonValue::as_str) == Some("running")
+                    || state.get("process_exited").and_then(JsonValue::as_bool) == Some(false)
+            })
+        {
+            return None;
+        }
+        execute_handler::schema_validated_delivery(
+            response,
+            intent.limit.min(metrics.output_budget.unwrap_or(intent.limit)),
+            intent.schema.as_ref(),
+        )
+    }
+
     pub(crate) fn cell_parent_call_id(&self, cell_id: &CellId) -> Option<String> {
         self.cell_parent_call_ids
             .lock()
@@ -392,6 +459,9 @@ impl CodeModeService {
         let Some(metrics) = admission.cells.get_mut(cell_id.as_str()) else {
             return;
         };
+        metrics.delivery_blocked |= required_terminal.is_some()
+            || nested_result.as_ref().is_some_and(|result| result.failed)
+            || !post_tool_use_feedback.is_empty();
         metrics.batchable_observation_count = metrics
             .batchable_observation_count
             .saturating_add(usize::from(batchable_observation));
@@ -472,11 +542,16 @@ impl CodeModeService {
             .get_mut(cell_id)
             .map(|metrics| {
                 let next_nested_ordinal = metrics.next_nested_ordinal;
-                let packet = std::mem::take(metrics);
+                let mut packet = std::mem::take(metrics);
                 // Live output and steering can cross outstanding child calls.
                 // Drain response data, but keep registration order for the cell.
                 metrics.next_nested_ordinal = next_nested_ordinal;
                 metrics.output_budget = packet.output_budget;
+                metrics.delivery_intent = packet.delivery_intent.take();
+                metrics.delivery_blocked = packet.delivery_blocked;
+                if metrics.delivery_intent.is_some() {
+                    metrics.command_states = packet.command_states.clone();
+                }
                 if retain_terminal {
                     metrics.first_required_terminal = packet.first_required_terminal.clone();
                 }
@@ -624,6 +699,23 @@ pub(super) fn handle_runtime_response(
     // Host lifecycle state stays in the canonical record. Only live handles
     // need a separate inline receipt when the script did not print them.
     let canonical_states = packet.command_states;
+    for state in &canonical_states {
+        // A script printing only result.output must not hide a crashed or
+        // unstarted command behind later successful output.
+        if state["exit_code"].as_i64().is_some_and(|code| code != 0)
+            || state["execution_state"] == "unknown"
+            || state.get("error").is_some_and(|error| !error.is_null())
+        {
+            post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
+                text: serde_json::json!({"nested_command_failure": {
+                    "call_id": state["call_id"],
+                    "exit_code": state["exit_code"],
+                    "execution_state": state["execution_state"],
+                    "process_exited": state["process_exited"],
+                }}).to_string(),
+            });
+        }
+    }
     let mut output = format_runtime_response(
         response,
         max_output_tokens,
@@ -879,6 +971,25 @@ fn format_runtime_response(
         }
     };
 
+    // Read only the runtime's error envelope, never script-printed output.
+    // Reuse the existing nested-result ledger rather than maintaining another
+    // effect journal. A returned result proves observation, not rollback.
+    let store_commit_failure = script_error.as_deref()
+        .and_then(|error| serde_json::from_str::<JsonValue>(error).ok())
+        .filter(|receipt| {
+            receipt.get("kind").and_then(JsonValue::as_str)
+                == Some("code_mode_store_commit_failure")
+                && receipt.get("version").and_then(JsonValue::as_u64) == Some(1)
+        })
+        .map(|mut receipt| {
+            receipt["automatic_replay_allowed"] = JsonValue::Bool(false);
+            receipt["observed_nested_call_ids"] = serde_json::json!(
+                nested_results.iter().map(|result| &result.call_id).collect::<Vec<_>>()
+            );
+            // Retention is bounded: absent IDs are unknown, not unexecuted.
+            receipt["nested_effect_inventory_complete"] = JsonValue::Bool(false);
+            receipt
+        });
     let canonical_nested = nested_results
         .iter()
         .map(|result| FunctionCallOutputContentItem::InputText {
@@ -987,6 +1098,9 @@ fn format_runtime_response(
         .with_outcome(typed_outcome)
         .with_sampling_request_signal(sampling_request_signal)
         .with_deterministic_continuation_owner_key(continuation_owner_key);
+    if let Some(receipt) = store_commit_failure {
+        output.essential_inline.insert("store_commit".to_string(), receipt);
+    }
     if visible_output_truncated {
         output.essential_inline.insert(
             VISIBLE_OUTPUT_TRUNCATED_KEY.to_string(),
@@ -1258,6 +1372,9 @@ async fn call_nested_tool(
         call_id: nested_call_id.clone(),
         payload: payload.clone(),
     };
+    // Capture before dispatch, not after a concurrent mutation or at the
+    // generation baseline: earlier calls in this cell may have edited files.
+    let mutation_revision_before = tool_runtime.current_mutation_revision().await;
     let result = tool_runtime
         .clone()
         .handle_tool_call_with_source(
@@ -1316,7 +1433,9 @@ async fn call_nested_tool(
         }
     };
     let outcome_context = result.outcome_context();
-    let signal = result.sampling_request_signal();
+    let mut signal = result.sampling_request_signal();
+    signal.get_or_insert_with(|| serde_json::json!({}))["validation_mutation_revision"] =
+        serde_json::json!(mutation_revision_before);
     let canonical_artifact_required = result.requires_canonical_artifact();
     let receipts = result.intrinsic_deterministic_continuation_receipts();
     let source_dependencies = result.source_dependencies.clone();
@@ -1414,7 +1533,7 @@ async fn call_nested_tool(
         ),
         command_state: nested_command_state(&tool_name, &nested_call_id, &payload, &result_value),
         ordinal: packet_ordinal,
-        call_id: nested_call_id,
+        call_id: nested_call_id.clone(),
         parent_call_id: parent_tool_call_id,
         parent_cell_id: cell_id.to_string(),
         runtime_tool_call_id,
@@ -1448,6 +1567,7 @@ async fn call_nested_tool(
             required_terminal,
         );
     tool_runtime.record_code_mode_result(
+        &nested_call_id,
         CodeModeToolResult {
             cell_id: cell_id.as_str(),
             tool_name: &tool_name,
@@ -1571,20 +1691,9 @@ fn model_visible_nested_result(tool: &ToolName, value: JsonValue) -> JsonValue {
         return value;
     }
     if matches!(tool.name.as_str(), "exec_command" | "write_stdin") {
-        let mut compact = serde_json::Map::new();
-        // A preflight advisory or repair explains output the command itself
-        // cannot, such as a literal glob path that matched nothing.
-        for key in ["exit_code", "output", "session_id", "repair"] {
-            if let Some(value) = value.get(key).filter(|value| !value.is_null()) {
-                compact.insert(key.to_string(), value.clone());
-            }
-        }
-        if value["output_reduced"] == true
-            && let Some(id) = value.get("raw_output_artifact_id").filter(|v| !v.is_null())
-        {
-            compact.insert("artifact_id".to_string(), id.clone());
-        }
-        return JsonValue::Object(compact);
+        // The shared projection returns None when no transport fields need
+        // removal. That must not trigger a second, lossy lifecycle projection.
+        return value;
     }
     if tool.name == "apply_patch" {
         return JsonValue::String(if value["success"] == true {
@@ -1824,6 +1933,7 @@ fn nested_command_state(
     }
     let mut state = serde_json::json!({"call_id": call_id, "tool": tool_name.name});
     for key in [
+        "error",
         "chunk_id",
         "session_id",
         "exit_code",
@@ -2970,13 +3080,19 @@ mod tests {
     }
 
     #[test]
-    fn nested_execution_projection_keeps_only_result_and_live_handles() {
+    fn nested_execution_projection_preserves_lifecycle_and_recovery() {
         let raw = serde_json::json!({"exit_code": 7, "output": "assertion failed: left 3 right 7",
             "wall_time_seconds": 1.5, "process_exited": true, "chunk_id": "chunk",
             "output_reduced": false, "session_id": null});
         assert_eq!(
-            super::model_visible_nested_result(&ToolName::plain("exec_command"), raw),
-            serde_json::json!({"exit_code": 7, "output": "assertion failed: left 3 right 7"})
+            super::model_visible_nested_result(
+                &ToolName::plain("exec_command"),
+                super::script_visible_nested_result(
+                    &ToolName::plain("exec_command"), raw, "call-1", 0,
+                ),
+            ),
+            serde_json::json!({"exit_code": 7, "output": "assertion failed: left 3 right 7",
+                "process_exited": true, "output_reduced": false, "session_id": null})
         );
         assert_eq!(
             super::model_visible_nested_result(
@@ -2984,7 +3100,8 @@ mod tests {
                 serde_json::json!({"session_id": 12, "output": "building", "output_reduced": true,
                 "raw_output_artifact_id": "artifact"})
             ),
-            serde_json::json!({"session_id": 12, "output": "building", "artifact_id": "artifact"})
+            serde_json::json!({"session_id": 12, "output": "building", "output_reduced": true,
+                "raw_output_artifact_id": "artifact"})
         );
         assert_eq!(
             super::model_visible_nested_result(
@@ -3280,8 +3397,9 @@ mod tests {
 
         let error = service
             .execute(ExecuteRequest {
+                state_path: None,
                 tool_call_id: "call-1".to_string(),
-                enabled_tools: Vec::new(),
+                enabled_tools: Vec::new().into(),
                 source: "text('unreachable')".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,

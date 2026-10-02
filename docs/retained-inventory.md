@@ -176,7 +176,6 @@ These mechanisms answer different questions:
 | `read_tool_output` | Exact content of a retained immutable snapshot, not current disk contents. |
 | `retained_inventory` | The selected enumeration, classifications, and their producer evidence. Refresh is explicit. |
 | Turn diff | The exact text changes observed while applying patches during the turn. |
-| Known Delta | Reusable output for an immutable Git object, keyed by object and authorization identity. |
 
 A current source read can coexist with an unavailable turn diff. Reading the
 current text does not reconstruct the text that existed before an unobserved

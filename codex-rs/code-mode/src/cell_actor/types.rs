@@ -99,7 +99,14 @@ impl CellHandle {
     }
 
     pub(crate) fn terminate(&self) -> CellEventFuture {
-        self.state.request_termination()
+        let event = self.state.request_termination();
+        let closed = self.state.closed.clone();
+        Box::pin(async move {
+            let event = event.await?;
+            // Termination is not complete until the host releases session resources.
+            closed.cancelled().await;
+            Ok(event)
+        })
     }
 }
 
@@ -116,6 +123,7 @@ pub(crate) struct CellState {
     phase: Mutex<CellPhase>,
     terminal_event: Mutex<Option<CellEvent>>,
     cancellation_token: CancellationToken,
+    closed: CancellationToken,
 }
 
 enum CellPhase {
@@ -158,6 +166,7 @@ impl CellState {
             phase: Mutex::new(CellPhase::Running),
             terminal_event: Mutex::new(None),
             cancellation_token,
+            closed: CancellationToken::new(),
         }
     }
 
@@ -211,6 +220,18 @@ impl CellState {
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         commit: impl FnOnce(),
     ) -> CompletionCommit {
+        self.commit_completion_with_event(event, pending_initial_yield_items, |event| {
+            commit();
+            event
+        })
+    }
+
+    pub(crate) fn commit_completion_with_event(
+        &self,
+        event: CellEvent,
+        pending_initial_yield_items: Option<Vec<OutputItem>>,
+        commit: impl FnOnce(CellEvent) -> CellEvent,
+    ) -> CompletionCommit {
         let mut phase = self
             .phase
             .lock()
@@ -218,7 +239,7 @@ impl CellState {
         if !matches!(*phase, CellPhase::Running) || self.cancellation_token.is_cancelled() {
             return CompletionCommit::Rejected(event);
         }
-        commit();
+        let event = commit(event);
         *phase = CellPhase::Completed {
             pending_initial_yield_items,
             event,
@@ -415,6 +436,10 @@ impl CellState {
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancellation_token.clone()
+    }
+
+    pub(crate) fn mark_closed(&self) {
+        self.closed.cancel();
     }
 }
 

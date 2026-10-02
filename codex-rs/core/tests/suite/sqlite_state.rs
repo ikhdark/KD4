@@ -242,10 +242,11 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
     })
     .await;
 
-    let mut rollout_lines = fs::read_to_string(&rollout_path)?
-        .lines()
-        .map(serde_json::from_str::<serde_json::Value>)
-        .collect::<serde_json::Result<Vec<_>>>()?;
+    let mut reader = codex_rollout::open_rollout_line_reader(&rollout_path).await?;
+    let mut rollout_lines = Vec::<serde_json::Value>::new();
+    while let Some(line) = reader.next_line().await? {
+        rollout_lines.push(serde_json::from_str(&line)?);
+    }
     rollout_lines.first_mut().expect("session metadata line")["payload"]["dynamic_tools"] = json!([{
         "namespace": namespace,
         "name": tool_name,
@@ -323,10 +324,11 @@ async fn resume_quarantines_invalid_dynamic_tools_from_rollout() -> Result<()> {
     })
     .await;
 
-    let mut rollout_lines = fs::read_to_string(&rollout_path)?
-        .lines()
-        .map(serde_json::from_str::<serde_json::Value>)
-        .collect::<serde_json::Result<Vec<_>>>()?;
+    let mut reader = codex_rollout::open_rollout_line_reader(&rollout_path).await?;
+    let mut rollout_lines = Vec::<serde_json::Value>::new();
+    while let Some(line) = reader.next_line().await? {
+        rollout_lines.push(serde_json::from_str(&line)?);
+    }
     rollout_lines.first_mut().expect("session metadata line")["payload"]["dynamic_tools"] = json!([{
         "type": "function",
         "name": "invalid tool name",

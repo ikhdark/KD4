@@ -41,7 +41,7 @@ use codex_core::config::CurrentTimeReminderConfig;
 use codex_features::CurrentTimeSource;
 use codex_features::Feature;
 use codex_login::CodexAuth;
-use codex_models_manager::bundled_models_response;
+use codex_models_manager::test_support::test_models_response as bundled_models_response;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
@@ -1019,10 +1019,10 @@ async fn code_mode_preserves_read_history_until_its_source_changes() -> Result<(
         format!(
             r#"const reads = await Promise.allSettled({read_commands:?}.map(async cmd => {{
 let result = await tools.exec_command({{cmd, max_output_tokens: 5000, yield_time_ms: 30000}});
-let output = result.original_token_count > 0 ? (result.result?.selected_text ?? result.output) : "";
+let output = result.result?.selected_text ?? result.output ?? "";
 while (result.session_id) {{
   result = await tools.write_stdin({{session_id: result.session_id, chars: "", max_output_tokens: 5000, yield_time_ms: 30000}});
-  if (result.original_token_count > 0) output += result.result?.selected_text ?? result.output;
+  output += result.result?.selected_text ?? result.output ?? "";
 }}
 if (result.exit_code !== 0) throw new Error("contract read failed");
 return output;
@@ -1878,7 +1878,9 @@ text(JSON.stringify(result));
         Some("code_mode_exec_marker")
     );
     assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(0));
-    assert!(result.get("wall_time_seconds").is_some(), "{result}");
+    assert!(result.get("wall_time_seconds").is_none(), "{result}");
+    assert_eq!(result["execution_state"], "exited");
+    assert_eq!(result["process_exited"], true);
     assert!(result.get("session_id").is_none(), "{result}");
 
     Ok(())
@@ -3484,6 +3486,13 @@ text("session b done");
     let fourth_items = function_tool_output_items(&fourth_request, "call-4");
     assert_eq!(fourth_items.len(), 1);
     assert_eq!(text_item(&fourth_items, /*index*/ 0), "session b done");
+
+    // Finish the session before the test runtime shuts down.
+    test.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
 
     Ok(())
 }
@@ -5207,6 +5216,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "Reflect",
         "RegExp",
         "resolve_tool",
+        "run_graph",
         "Set",
         "String",
         "SuppressedError",

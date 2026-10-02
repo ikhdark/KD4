@@ -9,6 +9,7 @@ use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use sha2::Digest;
 
 use super::*;
 
@@ -58,6 +59,10 @@ impl SpawnAgentsOnCsvHandler {
 }
 
 impl CoreToolRuntime for SpawnAgentsOnCsvHandler {
+    fn terminal_result_adapter(&self) -> Option<&'static str> {
+        Some("agent_job_csv_export")
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -369,6 +374,19 @@ pub async fn handle(
     } else {
         None
     };
+    let deliver = args.deliver && job.status.as_str() == "completed"
+        && progress.failed_items == 0 && progress.completed_items == progress.total_items
+        && job_error.is_none();
+    if deliver {
+        // Bind delivery to the final durable job state, not the mere presence
+        // of a CSV that may have been exported during an earlier progress step.
+        export_job_csv_snapshot(db.clone(), &job).await.map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to export final agent job {job_id}: {error}"
+            ))
+        })?;
+    }
+    let delivery_owner = format!("agent-job:{job_id}");
     let content = serde_json::to_string(&SpawnAgentsOnCsvResult {
         job_id,
         status: job.status.as_str().to_string(),
@@ -384,7 +402,21 @@ pub async fn handle(
             "failed to serialize spawn_agents_on_csv result: {err}"
         ))
     })?;
-    Ok(FunctionToolOutput::from_text(content, Some(true)))
+    let mut output = FunctionToolOutput::from_text(content.clone(), Some(true));
+    if deliver {
+        let revision = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        output.sampling_request_signal = Some(serde_json::json!({
+            "authoritative_wait_owner_v1": {
+                "adapter": "agent_job_csv_export",
+                "disposition": "terminal",
+                "owner": delivery_owner,
+                "state_revision": revision,
+                "receipt_identity": revision,
+                "surfaceable_message": content,
+            },
+        }));
+    }
+    Ok(output)
 }
 
 fn single_local_environment_cwd(turn: &TurnContext) -> Result<AbsolutePathBuf, FunctionCallError> {

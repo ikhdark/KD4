@@ -15,6 +15,7 @@ use crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING;
 use crate::tools::command_output_artifact::ReadToolOutputResult;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
+use crate::tools::command_output_artifact::select_file_snapshot_for_script;
 use crate::tools::command_output_artifact::select_file_snapshot_with_ceiling;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -32,6 +33,11 @@ const MAX_FILE_MIB: usize = 8;
 const MAX_FILE_BYTES: usize = MAX_FILE_MIB * 1024 * 1024;
 
 pub(crate) struct ReadFileHandler;
+
+struct PendingSourceInspection {
+    store: std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>,
+    start: codex_agent_task_store::SourceInspectionStart,
+}
 
 #[derive(Deserialize)]
 #[serde(try_from = "RawReadFileArgs")]
@@ -113,6 +119,20 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             "description": "First up to eight independent pages of continuation, in source order. Fetch in parallel; continuation retains the full remaining extent."
         });
         output["properties"]["snapshot_error"] = json!({"type": "string", "description": "Snapshot storage failed; inline evidence is still valid, but no recovery handle or continuation is available."});
+        output["properties"]["criterion_evidence"] = json!({
+            "type": "object",
+            "description": "Host-recorded source_inspection proof for a bound typed task requiring inspect:<repository-relative path>. A complete hash-bound read is not proof of semantic correctness.",
+            "properties": {
+                "call_id": {"type": "string"}, "workspace_id": {"type": "string"},
+                "evidence_epoch": {"type": "integer", "minimum": 0},
+                "kind": {"const": "source_inspection"}
+            },
+            "required": ["call_id", "workspace_id", "evidence_epoch", "kind"],
+            "additionalProperties": false
+        });
+        output["properties"]["inspection_proof_error"] = json!({
+            "type": "string", "description": "The read completed but no current task proof could be recorded."
+        });
         #[expect(
             clippy::expect_used,
             reason = "read_tool_output_output_schema constructs an object with a required array"
@@ -123,7 +143,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             .extend([json!("path"), json!("total_lines"), json!("file_complete")]);
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
-            description: format!("Read a UTF-8 file without shell quoting. Path alone returns useful text immediately: the whole file if it fits, otherwise its first page plus continuation. Use read_tool_output with the artifact_id and continuation for the remaining immutable snapshot. complete describes delivery of the requested page or explicit selectors; file_complete describes whole-file coverage. Explicit lines (for example start 40, end 90), bytes, or fixed-string search selectors remain exact; check each results[] status. Files may be up to {MAX_FILE_MIB} MiB. Complete inline reads need no artifact. Snapshot storage failure preserves inline evidence and reports snapshot_error without a recovery handle. Workspace results are freshness-tracked and may reuse dependency-current evidence; force_fresh bypasses replay and reads current contents. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
+            description: format!("Read a UTF-8 file without shell quoting. Path alone returns useful text immediately: the whole file if it fits, otherwise its first page plus continuation. Use read_tool_output with the artifact_id and continuation for the remaining immutable snapshot. complete describes delivery of the requested page or explicit selectors; file_complete describes whole-file coverage. Explicit lines (for example start 40, end 90), bytes, or fixed-string search selectors remain exact; check each results[] status. Files may be up to {MAX_FILE_MIB} MiB. In code mode, exact data uses a fixed 1 MiB payload cap independent of the cell's display-token budget; only printed content is display-budgeted. Complete inline reads need no artifact. Snapshot storage failure preserves inline evidence and reports snapshot_error without a recovery handle. Workspace results are freshness-tracked and may reuse dependency-current evidence; force_fresh bypasses replay and reads current contents. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema {
@@ -132,7 +152,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     ..JsonSchema::object(BTreeMap::new(), None, None)
                 }).collect()),
                 ..JsonSchema::object(BTreeMap::from([
-                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, or a `skill:` locator from the skills catalog.".to_string()))),
+                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, or `skill:catalog` for complete enabled skill metadata. Use search selectors to discover newly relevant skills.".to_string()))),
                 ("file_path".to_string(), JsonSchema::string(Some("Legacy alias for path; use only one.".to_string()))),
                 ("offset".to_string(), JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string()))),
                 ("limit".to_string(), JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string()))),
@@ -185,11 +205,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             // The catalog advertises `skill:<id>` locators, so this tool has to
             // resolve them. Without it the model can see every skill listed and
             // load none of them.
-            let (contents, resolved_path) = if args
+            let (contents, resolved_path, inspection) = if args
                 .path
                 .starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
             {
-                read_skill_locator(&invocation, &args).await?
+                let (contents, path) = read_skill_locator(&invocation, &args).await?;
+                (contents, path, None)
             } else {
                 read_environment_file(&invocation, &args).await?
             };
@@ -200,9 +221,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             }
             let thread_id = invocation.session.thread_id.to_string();
             let explicit_selection = args.selectors.is_some();
-            // Select a deliverable page before the enclosing exec projects it.
-            // Otherwise a small owner budget truncates this result again and
-            // makes the model recover a wrapper instead of the source snapshot.
+            let script_consumer = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
+            // Display-sized continuations remain useful for direct model reads.
+            // Script selection itself uses a fixed byte cap, not this budget.
             let output_budget = match &invocation.source {
                 ToolCallSource::CodeMode { cell_id, .. } => invocation
                     .session.services.code_mode_service.output_budget(cell_id),
@@ -216,7 +237,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 tokio::task::spawn_blocking(move || {
                     let total_lines = contents.lines().count();
                     let canonical = CanonicalToolResult::text(contents);
-                    select_file_snapshot_with_ceiling(&canonical, args.selectors, token_ceiling)
+                    let selection = if script_consumer {
+                        select_file_snapshot_for_script(&canonical, args.selectors)
+                    } else {
+                        select_file_snapshot_with_ceiling(&canonical, args.selectors, token_ceiling)
+                    };
+                    selection
                         .map(|(result, continuation)| {
                             let pages = match &continuation {
                                 Some(ToolOutputSelector::Bytes { start, end }) =>
@@ -321,6 +347,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             output["total_lines"] = json!(total_lines);
             output["source_sha256"] = json!(canonical.sha256);
             output["file_complete"] = json!(file_complete);
+            if file_complete && let Some(inspection) = inspection {
+                match inspection.store.record_source_inspection(
+                    inspection.start,
+                    invocation.call_id.clone(),
+                    canonical.sha256.clone(),
+                    canonical.exact_bytes,
+                ).await {
+                    Ok(reference) => output["criterion_evidence"] = json!(reference),
+                    Err(error) => output["inspection_proof_error"] = json!(error.to_string()),
+                }
+            }
             if let Some(continuation) = continuation {
                 output["continuation"] = json!(continuation);
                 if !page_selectors.is_empty() {
@@ -375,7 +412,7 @@ fn file_selection_complete(result: &ReadToolOutputResult) -> bool {
 async fn read_environment_file(
     invocation: &ToolInvocation,
     args: &ReadFileArgs,
-) -> Result<(String, String), FunctionCallError> {
+) -> Result<(String, String, Option<PendingSourceInspection>), FunctionCallError> {
     let environment = wait_for_tool_environment(
         &invocation.step_context.environments,
         args.environment_id.as_deref(),
@@ -393,6 +430,20 @@ async fn read_environment_file(
     let turn = &invocation.step_context.turn;
     let sandbox = turn.file_system_sandbox_context(None, environment.cwd());
     let fs = environment.environment.get_filesystem();
+    let coordinator = invocation.session.services.agent_control.task_coordinator();
+    let inspection = if !environment.environment.is_remote()
+        && let Some(binding) = coordinator.binding_for_source(&turn.session_source)
+        && let Some(store) = coordinator.store()
+    {
+        store.prepare_source_inspection(binding.attempt_id, path.inferred_native_path_string())
+            .await
+            .map_err(|error| FunctionCallError::RespondToModel(
+                format!("unable to prepare source inspection evidence: {error}")
+            ))?
+            .map(|start| PendingSourceInspection { store, start })
+    } else {
+        None
+    };
     // Execution backends validate the opened regular file and enforce the
     // byte limit during the stable read. Avoid a separate RPC/helper launch
     // on success; retain metadata only to explain failures as before.
@@ -435,7 +486,7 @@ async fn read_environment_file(
     let contents = String::from_utf8(contents).map_err(|_| {
         FunctionCallError::RespondToModel("read_file requires UTF-8 text".to_string())
     })?;
-    Ok((contents, path.inferred_native_path_string()))
+    Ok((contents, path.inferred_native_path_string(), inspection))
 }
 
 /// Reads a `skill:<catalog-id>` locator through the provider that discovered
@@ -461,6 +512,29 @@ async fn read_skill_locator(
         )));
     }
     let snapshot = &turn.turn_skills.snapshot;
+    if args.path == "skill:catalog" {
+        // Complete JSONL records use the same immutable snapshot and selector
+        // machinery as files. Never expose host paths or silently drop entries.
+        let mut entries = snapshot.outcome().skills_with_enabled()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(skill, _)| {
+                let locator = format!("skill:{}", codex_core_skills::skill_catalog_id(skill));
+                (skill.name.clone(), locator.clone(), json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "locator": locator,
+                    "implicit_invocation": skill.allows_implicit_invocation(),
+                }))
+            }).collect::<Vec<_>>();
+        entries.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let contents = entries.into_iter().map(|(_, _, entry)| format!("{entry}\n")).collect::<String>();
+        if contents.len() > MAX_FILE_BYTES {
+            return Err(FunctionCallError::RespondToModel(
+                "enabled skill catalog exceeds the read_file snapshot limit".to_string(),
+            ));
+        }
+        return Ok((contents, args.path.clone()));
+    }
     let skill = snapshot
         .resolve_catalog_locator(&args.path)
         .ok_or_else(|| {
@@ -482,7 +556,15 @@ async fn read_skill_locator(
     Ok((contents, path.to_string_lossy().into_owned()))
 }
 
-impl CoreToolRuntime for ReadFileHandler {}
+impl CoreToolRuntime for ReadFileHandler {
+    fn cancellation_cleanup_policy(&self) -> crate::tools::registry::ToolCleanupPolicy {
+        crate::tools::registry::ToolCleanupPolicy::InterruptibleRead
+    }
+
+    fn permits_shared_workspace_observation(&self, _payload: &ToolPayload) -> bool {
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -511,6 +593,34 @@ mod tests {
             r#"{"file_path":"a.rs","offset":1,"selectors":[]}"#,
         ] {
             assert!(parse_arguments::<ReadFileArgs>(invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn script_reads_deliver_all_large_selectors_without_display_budget_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.txt");
+        let line = format!("{}\n", "source \"text\" ".repeat(4_000));
+        std::fs::write(&path, line.repeat(3)).unwrap();
+        let mut call = invocation(&path, json!([
+            {"kind": "lines", "start": 1, "end": 1},
+            {"kind": "lines", "start": 2, "end": 2},
+            {"kind": "lines", "start": 3, "end": 3}
+        ]), false).await;
+        call.source = ToolCallSource::CodeMode {
+            cell_id: "script-read".into(),
+            parent_call_id: None,
+            runtime_tool_call_id: "script-read-file".into(),
+            nested_deadline: None,
+            cancellation_cause: None,
+        };
+        let payload = call.payload.clone();
+        let output = ReadFileHandler.handle(call).await.unwrap();
+        let result = output.code_mode_result(&payload);
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["results"].as_array().unwrap().len(), 3);
+        for selection in result["results"].as_array().unwrap() {
+            assert_eq!(selection["text"], line);
         }
     }
 
@@ -936,10 +1046,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_file_pages_honor_owner_budget_and_recover_original_snapshot() {
+    async fn nested_file_pages_ignore_display_budget_and_recover_original_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bounded.txt");
-        let original = "λ exact immutable source\r\n".repeat(6_000);
+        let original = "λ exact immutable source\r\n".repeat(60_000);
         std::fs::write(&path, &original).unwrap();
         let mut call = invocation(&path, json!(null), false).await;
         let cell = codex_code_mode::CellId::new("bounded-file-read".into());
@@ -964,8 +1074,8 @@ mod tests {
             let output = ReadFileHandler.handle(call.clone()).await.unwrap();
             let result = output.code_mode_result(&call.payload);
             assert!(
-                codex_utils_string::approx_token_count(&result.to_string()) <= budget.max(2_000),
-                "the page and recovery handles must fit the negotiated budget: {budget}"
+                result.to_string().len() <= 1024 * 1024,
+                "the page and recovery handles must fit the script payload cap: {budget}"
             );
             let delivered = result["results"][0]["text"].as_str().unwrap();
             assert!(!delivered.is_empty());
@@ -1036,10 +1146,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_file_explicit_ranges_preserve_exactness_under_owner_budget() {
+    async fn nested_file_explicit_ranges_preserve_exactness_under_script_cap() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("selected.txt");
-        let original = "exact requested source line\n".repeat(6_000);
+        let original = "exact requested source line\n".repeat(60_000);
         std::fs::write(&path, &original).unwrap();
         let cell = codex_code_mode::CellId::new("bounded-explicit-read".into());
         for end in [1_000, 16_000, original.len()] {
@@ -1056,16 +1166,16 @@ mod tests {
             call.session.services.code_mode_service.record_output_budget(&cell, Some(4_000));
             let result = ReadFileHandler.handle(call.clone()).await.unwrap()
                 .code_mode_result(&call.payload);
-            assert!(codex_utils_string::approx_token_count(&result.to_string()) <= 4_000);
+            assert!(result.to_string().len() <= 1024 * 1024);
             assert_eq!(result["results"][0]["selector"], selector);
-            if end == 1_000 {
+            if end <= 16_000 {
                 assert_eq!(result["complete"], true);
                 assert_eq!(result["results"][0]["text"], &original[..end]);
             } else {
                 assert_eq!(result["complete"], false);
                 assert_eq!(result["file_complete"], false);
                 assert!(result["artifact_id"].is_string());
-                assert!(!result["results"][0]["child_selectors"].as_array().unwrap().is_empty());
+                assert_eq!(result["results"][0]["continuation"], selector);
             }
         }
     }
@@ -1377,6 +1487,15 @@ mod tests {
     #[tokio::test]
     async fn a_skill_locator_reads_its_skill_md_through_selectors() {
         let dir = tempfile::tempdir().unwrap();
+        let (catalog_call, locator, _) = skill_invocation(dir.path(), Some("skill:catalog".to_string()), None).await;
+        let catalog_payload = catalog_call.payload.clone();
+        let catalog = ReadFileHandler.handle(catalog_call).await.unwrap().code_mode_result(&catalog_payload);
+        assert_eq!(catalog["path"], "skill:catalog");
+        let entry: serde_json::Value = serde_json::from_str(catalog["results"][0]["text"].as_str().unwrap().trim()).unwrap();
+        assert_eq!(entry["name"], "demo-skill");
+        assert_eq!(entry["locator"], locator);
+        assert_eq!(entry["description"], "demo skill for locator reads");
+        assert!(entry.get("path").is_none());
         let (call, _locator, skill_md) = skill_invocation(dir.path(), None, None).await;
         let payload = call.payload.clone();
         let result = ReadFileHandler
@@ -1436,8 +1555,7 @@ mod tests {
             panic!("ordinary paths must require an execution environment")
         };
         assert!(
-            message.contains("read_file requires a ready execution environment")
-                && message.contains("wait_for_environment"),
+            message.contains("read_file requires a selected execution environment"),
             "{message}"
         );
     }

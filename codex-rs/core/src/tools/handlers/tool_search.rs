@@ -2207,7 +2207,9 @@ mod tests {
         ]);
         let result = handler.search("repository file inventory scan", 8).unwrap();
         assert_eq!(result.activation_tools, vec![ToolName::namespaced("mcp__repo", "inventory")]);
-        assert_eq!(result.unactivated_matches, vec!["mcp__pets._validate_pet_spritesheet"]);
+        assert_eq!(result.unactivated_matches, vec![
+            ToolName::namespaced("mcp__pets", "_validate_pet_spritesheet").to_string(),
+        ]);
         assert_eq!(result.serialized_tools.len(), 1);
         let exact = handler.search("_validate_pet_spritesheet", 1).unwrap();
         assert_eq!(exact.activation_tools, vec![

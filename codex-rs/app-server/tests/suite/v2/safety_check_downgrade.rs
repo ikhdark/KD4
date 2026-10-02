@@ -255,6 +255,7 @@ async fn response_model_field_mismatch_emits_model_rerouted_notification_v2_when
 #[tokio::test]
 async fn model_verification_emits_typed_notification_and_warning_v2() -> Result<()> {
     require_network!();
+    const REQUESTED_MODEL: &str = "gpt-5.5";
 
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![

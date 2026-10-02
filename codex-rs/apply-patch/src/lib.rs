@@ -807,10 +807,23 @@ pub(crate) async fn preflight_hunks(
                     }
                 };
                 match new_contents_from_chunks(&path, &original_contents, chunks, hunk_ordinal) {
-                    Ok(new_contents) => prepared.push(Some(AppliedPatch {
-                        original_contents,
-                        new_contents,
-                    })),
+                    Ok(new_contents) => {
+                        // Validate the complete candidate before any hunk is
+                        // published. Existing JSONC and malformed documents can
+                        // still be edited; only strict-JSON regressions fail.
+                        if hunk.path().extension().is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+                            && serde_json::from_str::<serde::de::IgnoredAny>(&original_contents).is_ok()
+                            && let Err(error) = serde_json::from_str::<serde::de::IgnoredAny>(&new_contents)
+                        {
+                            failures.push(ApplyPatchError::ComputeReplacements(format!(
+                                "{} was valid JSON before this patch; candidate is invalid: {error}. No files were changed.",
+                                hunk.path().display()
+                            )));
+                            prepared.push(None);
+                        } else {
+                            prepared.push(Some(AppliedPatch { original_contents, new_contents }));
+                        }
+                    },
                     Err(error) => {
                         // Keep the ordered matching error, then enumerate later
                         // independently broken chunks against this same snapshot.
@@ -2397,6 +2410,64 @@ mod tests {
         assert_eq!(stderr_str, "");
         let contents = fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "foo\nbaz\n");
+    }
+
+    #[tokio::test]
+    async fn json_update_rejects_invalid_candidate_before_any_write() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let broken = dir.path().join("catalog.json");
+        let valid = dir.path().join("settings.json");
+        let jsonc = dir.path().join("tsconfig.json");
+        fs::write(&broken, "{\n  \"a\": 1,\n  \"b\": 2\n}\n").unwrap();
+        fs::write(&valid, "{\n  \"a\": 1\n}\n").unwrap();
+        fs::write(&jsonc, "{\n  // comment\n  \"a\": 1\n}\n").unwrap();
+        let patch = wrap_patch(&format!(
+            r#"*** Update File: {}
+@@
+   "a": 1,
+-  "b": 2
++  "b": 2,
+ }}
+*** Update File: {}
+@@
+-  "a": 1
++  "a": 2
+*** Update File: {}
+@@
+-  "a": 1
++  "a": 2"#,
+            broken.display(),
+            valid.display(),
+            jsonc.display()
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(
+            &patch,
+            &cwd,
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .unwrap_err();
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("candidate is invalid"), "{stderr}");
+        assert!(stderr.contains("line 4"), "{stderr}");
+        assert_eq!(fs::read_to_string(&valid).unwrap(), "{\n  \"a\": 1\n}\n");
+        assert_eq!(fs::read_to_string(&jsonc).unwrap(), "{\n  // comment\n  \"a\": 1\n}\n");
+        assert_eq!(
+            fs::read_to_string(&broken).unwrap(),
+            "{\n  \"a\": 1,\n  \"b\": 2\n}\n"
+        );
+        let repaired = patch.replace("+  \"b\": 2,", "+  \"b\": 3");
+        apply_patch(&repaired, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None)
+            .await.unwrap();
+        assert_eq!(fs::read_to_string(&valid).unwrap(), "{\n  \"a\": 2\n}\n");
+        assert_eq!(fs::read_to_string(&jsonc).unwrap(), "{\n  // comment\n  \"a\": 2\n}\n");
     }
 
     #[tokio::test]

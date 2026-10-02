@@ -11,7 +11,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -805,13 +804,12 @@ async fn deferred_executor_compaction_replaces_stale_environment_context() -> Re
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
     let rollout_path = test.codex.rollout_path().context("rollout path")?;
-    let rollout = fs::read_to_string(rollout_path)?;
-    let world_state_items = rollout
-        .lines()
-        .map(serde_json::from_str::<RolloutLine>)
-        .collect::<serde_json::Result<Vec<_>>>()?
+    let (items, _, parse_errors) =
+        codex_rollout::RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    anyhow::ensure!(parse_errors == 0, "invalid rollout records");
+    let world_state_items = items
         .into_iter()
-        .filter_map(|line| match line.item {
+        .filter_map(|item| match item {
             RolloutItem::WorldState(item) => Some(item),
             _ => None,
         })

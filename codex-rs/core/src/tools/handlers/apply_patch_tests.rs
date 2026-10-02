@@ -604,6 +604,18 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             panic!("registered patch must return a custom tool output");
         };
         let text = output.body.to_text().unwrap();
+        let cancellation;
+        let patch_text = if cancel_after_prefix {
+            cancellation = serde_json::from_str::<serde_json::Value>(
+                text.lines().last().expect("structured cancellation recovery"),
+            )
+            .expect("cancellation recovery JSON");
+            cancellation["details"][0]["detail"]
+                .as_str()
+                .expect("retained patch failure")
+        } else {
+            text.as_str()
+        };
         let metric_snapshot = metrics.snapshot().unwrap();
         let attempt_metric = metric_snapshot
             .scope_metrics()
@@ -638,7 +650,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
         );
         assert_eq!(
             labels["mutation"],
-            if deny_write { "uncertain" } else { "exact" }
+            if deny_write && !partial { "none" } else { "exact" }
         );
         for name in [
             "codex.apply_patch.files_requested",
@@ -690,7 +702,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                 }
             );
             assert_eq!(
-                text.matches(&format!(
+                patch_text.matches(&format!(
                     "{} {}",
                     if cancel_after_prefix { "A" } else { "M" },
                     target_uri.to_path_buf().display()
@@ -704,7 +716,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                 "{text}"
             );
             assert!(
-                text.contains("Additional filesystem changes may not be listed."),
+                !text.contains("Additional filesystem changes may not be listed."),
                 "{text}"
             );
             assert!(text.contains("do not retry the whole patch"), "{text}");
@@ -753,13 +765,20 @@ async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
 }
 
 #[tokio::test]
-async fn patch_workspace_waits_cancel_without_writing_or_publishing_a_diff() {
+async fn patch_workspace_waits_cancel_or_time_out_without_writing_or_publishing_a_diff() {
     use crate::tools::sandboxing::ExecApprovalRequirement;
     use codex_protocol::protocol::AskForApproval;
 
-    // All public patch routes must cancel while another writer still holds the
-    // gate, without creating a file or publishing a diff.
-    for route in ["handler", "runtime", "exec_command"] {
+    // All public patch routes must cancel or time out while another writer still
+    // holds the gate, without creating a file or publishing a diff.
+    for (route, cancel) in [
+        ("handler", true),
+        ("runtime", true),
+        ("exec_command", true),
+        ("handler", false),
+        ("runtime", false),
+        ("exec_command", false),
+    ] {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
         let cwd = workspace.path().abs();
@@ -792,6 +811,7 @@ async fn patch_workspace_waits_cancel_without_writing_or_publishing_a_diff() {
             .unwrap()
             .environments
             .turn_environments = vec![environment.clone()];
+        turn.turn_timing_state.mark_turn_started();
         let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let cancellation = tokio_util::sync::CancellationToken::new();
         let other_writer = crate::workspace_operation_gate::acquire_workspace_operation(&cwd).await;
@@ -833,7 +853,13 @@ async fn patch_workspace_waits_cancel_without_writing_or_publishing_a_diff() {
                     None,
                 )
                 .await
-                .map(|_| ())
+                .and_then(|output| {
+                    if output.success {
+                        Ok(())
+                    } else {
+                        Err(FunctionCallError::RespondToModel(output.text))
+                    }
+                })
             } else if route == "exec_command" {
                 crate::tools::handlers::unified_exec::ExecCommandHandler::default()
                     .handle_call(ToolInvocation {
@@ -878,14 +904,35 @@ async fn patch_workspace_waits_cancel_without_writing_or_publishing_a_diff() {
                 .await
                 .is_err()
         );
-        cancellation.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(2), call.as_mut())
+        if cancel {
+            cancellation.cancel();
+        }
+        let deadline = if cancel { 2 } else { 12 };
+        let result = tokio::time::timeout(Duration::from_secs(deadline), call.as_mut())
             .await
-            .expect("cancelled patch must not wait for the other writer to finish");
-        assert!(result.is_err(), "cancelled patch must not report success");
-        assert!(!path.exists(), "cancelled patch must not create its target");
+            .expect("patch must not wait indefinitely for the other writer to finish");
+        let error = result.expect_err("unadmitted patch must not report success");
+        if !cancel {
+            let FunctionCallError::RespondToModel(message) = error else {
+                panic!("workspace timeout must be actionable by the caller");
+            };
+            assert!(message.contains("workspace is busy"), "{route}: {message}");
+            assert!(message.contains("No files were changed"), "{route}: {message}");
+        }
+        assert!(!path.exists(), "unadmitted patch must not create its target");
         assert_eq!(tracker.lock().await.get_unified_diff(), None);
+        let timing = turn.turn_timing_state.complete_snapshot().protocol_timing();
+        assert!(
+            timing.unions.tool_active_union_ms >= 90,
+            "{route}: patch lock waiting must count as tool activity"
+        );
         drop(other_writer);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::workspace_operation_gate::acquire_workspace_operation(&cwd),
+        )
+        .await
+        .expect("a cancelled or timed-out waiter must not retain the workspace gate");
     }
 }
 

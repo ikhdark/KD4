@@ -160,6 +160,41 @@ async fn safety_buffering_cannot_restart_after_response_begins() {
 }
 
 #[tokio::test]
+async fn safety_buffering_withholds_retry_after_tool_work_starts() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+    // A patch from this turn may already have landed; re-running the whole turn
+    // on another model would apply it again.
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            started_at_ms: 0,
+            item: AppServerThreadItem::FileChange {
+                id: "patch-1".to_string(),
+                changes: vec![FileUpdateChange {
+                    path: "foo.txt".to_string(),
+                    kind: PatchChangeKind::Add,
+                    diff: "hello\n".to_string(),
+                }],
+                status: AppServerPatchApplyStatus::InProgress,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id,
+            turn_id,
+            Some("faster-model"),
+        )),
+        None,
+    );
+    assert!(!chat.can_retry_safety_buffered_turn(turn_id));
+    assert!(!render_bottom_popup(&chat, 80).contains("Retry with a faster model"));
+}
+
+#[tokio::test]
 async fn safety_buffering_offers_one_retry_with_app_wording() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);

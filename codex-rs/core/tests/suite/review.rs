@@ -200,13 +200,15 @@ async fn review_op_emits_lifecycle_and_review_output() {
     .await;
 
     let path = codex.rollout_path().expect("rollout path");
-    let text = std::fs::read_to_string(&path).expect("read rollout file");
-    let parent_thread_id = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .find_map(|line| {
-            let rollout_line: RolloutLine = serde_json::from_str(line).expect("rollout line");
-            match rollout_line.item {
+    codex.flush_rollout().await.expect("flush rollout");
+    let (items, _, parse_errors) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
+        .await
+        .expect("read rollout file");
+    assert_eq!(parse_errors, 0, "invalid rollout records");
+    let parent_thread_id = items
+        .iter()
+        .find_map(|item| {
+            match item {
                 RolloutItem::SessionMeta(session_meta) => Some(session_meta.meta.id.to_string()),
                 _ => None,
             }
@@ -237,13 +239,8 @@ async fn review_op_emits_lifecycle_and_review_output() {
     let expected_assistant_text = render_review_output_text(&expected);
     let mut saw_assistant_plain = false;
     let mut saw_assistant_xml = false;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
-        let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rl.item {
+    for item in items {
+        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = item {
             if role == "user" {
                 for c in content {
                     if let ContentItem::InputText { text } = c {

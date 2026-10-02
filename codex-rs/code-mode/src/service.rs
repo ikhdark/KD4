@@ -311,17 +311,18 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
         .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS)
         .min(MAX_TOOL_TIMEOUT_MS);
     runtime::CreateCellRequest {
+        state_path: request.state_path,
         tool_call_id: request.tool_call_id,
         enabled_tools: request
             .enabled_tools
-            .into_iter()
+            .iter()
             .map(|definition| runtime::ToolDefinition {
-                name: definition.name,
+                name: definition.name.clone(),
                 tool_name: runtime::ToolName {
-                    name: definition.tool_name.name,
-                    namespace: definition.tool_name.namespace,
+                    name: definition.tool_name.name.clone(),
+                    namespace: definition.tool_name.namespace.clone(),
                 },
-                description: definition.description,
+                description: definition.description.clone(),
                 default_timeout_ms: definition
                     .default_timeout_ms
                     .map(|timeout| timeout.clamp(1, MAX_TOOL_TIMEOUT_MS)),

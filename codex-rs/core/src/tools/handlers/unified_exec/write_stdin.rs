@@ -35,6 +35,8 @@ struct WriteStdinArgs {
     max_output_tokens: Option<usize>,
     #[serde(default)]
     wait_for_output: bool,
+    #[serde(default)]
+    terminate: bool,
 }
 
 pub struct WriteStdinHandler {
@@ -96,6 +98,11 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        if args.terminate && !args.chars.is_empty() {
+            return Err(FunctionCallError::RespondToModel(
+                "terminate requires empty chars; send input separately".to_string(),
+            ));
+        }
         if args.wait_for_output && !args.chars.is_empty() {
             return Err(FunctionCallError::RespondToModel(
                 "wait_for_output requires empty chars; send input separately".to_string(),
@@ -103,6 +110,14 @@ impl WriteStdinHandler {
         }
         validate_independent_review_stdin(&turn.session_source, &args.chars)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
+        if args.terminate
+            && !session.services.unified_exec_manager
+                .terminate_process_for_poll(args.session_id).await
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "termination could not be confirmed; inspect the session before retrying".to_string(),
+            ));
+        }
         let yield_time_ms = owner_wait_yield_time_ms(
             &args.chars,
             args.yield_time_ms,
@@ -242,8 +257,25 @@ fn owner_wait_yield_time_ms(
 }
 
 impl CoreToolRuntime for WriteStdinHandler {
+    fn permits_shared_workspace_observation(&self, payload: &ToolPayload) -> bool {
+        let ToolPayload::Function { arguments } = payload else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(arguments).is_ok_and(|arguments| {
+            arguments.get("chars").is_none_or(|chars| chars.as_str() == Some(""))
+        })
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
+    }
+
+    fn pre_tool_use_hook_name(
+        &self,
+        _tool_name: &codex_tools::ToolName,
+        _payload: &ToolPayload,
+    ) -> Option<HookToolName> {
+        None
     }
 
     fn pre_tool_use_payload(&self, _invocation: &ToolInvocation) -> Option<PreToolUsePayload> {

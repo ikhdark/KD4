@@ -70,6 +70,45 @@ where
 
 pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
 
+/// Runtime-owned recovery facts. Cancellation never implies rollback or grants
+/// permission to replay an effectful request.
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub(crate) struct ToolEffectRecovery {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) committed_effects: Vec<JsonValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) uncertain_effects: Vec<String>,
+    pub(crate) safe_next_actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observed_result: Option<JsonValue>,
+}
+
+impl ToolEffectRecovery {
+    pub(crate) fn unknown(result: Option<&JsonValue>, error: Option<&str>) -> Self {
+        Self {
+            committed_effects: Vec::new(),
+            uncertain_effects: vec![error.unwrap_or(
+                "The runtime has not established which effects committed or stopped."
+            ).to_string()],
+            safe_next_actions: vec![
+                "Inspect retained results and external state; do not replay the request automatically.".into(),
+            ],
+            observed_result: result.cloned(),
+        }
+    }
+
+    pub(crate) fn committed(result: JsonValue) -> Self {
+        Self {
+            committed_effects: vec![result],
+            uncertain_effects: Vec::new(),
+            safe_next_actions: vec![
+                "Reuse the committed result; retry only work explicitly reported as uncommitted.".into(),
+            ],
+            observed_result: None,
+        }
+    }
+}
+
 /// Linearizes tool admission, ordinary completion, and cancellation. Keeping
 /// these transitions in one atomic prevents combinations such as "cancelled
 /// before admission" and "handler completed" from being observed together.
@@ -1049,6 +1088,14 @@ impl ToolOutput for ExecCommandToolOutput {
             serde_json::json!(!self.raw_output.is_empty() || self.process_exited);
         signal["empty_output"] = serde_json::json!(self.raw_output.is_empty());
         signal["command_evidence"] = serde_json::json!(true);
+        if let Some(process_id) = self.process_id {
+            signal["background_process_id"] = serde_json::json!(process_id);
+        }
+        if self.process_exited && self.exit_code == Some(0) && self.error.is_none()
+            && let Some(receipt) = runner_execution_receipt(&self.raw_output, self.hook_command.as_deref())
+        {
+            signal["runner_execution_receipt"] = receipt;
+        }
         Some(signal)
     }
 
@@ -1196,7 +1243,8 @@ impl ToolOutput for ExecCommandToolOutput {
             (self.process_exited
                 && self.process_id.is_none()
                 && snapshot.streams_are_exact
-                && snapshot.stdout.len().saturating_add(snapshot.stderr.len()) <= 64 * 1024)
+                && snapshot.stdout.len().saturating_add(snapshot.stderr.len())
+                    <= crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES)
                 .then(|| {
                     Some((
                         String::from_utf8(snapshot.stdout.clone()).ok()?,
@@ -1205,12 +1253,15 @@ impl ToolOutput for ExecCommandToolOutput {
                 })
                 .flatten()
         });
-        let streams_complete = self.process_output.as_ref().map(|_| streams.is_some());
+        let streams_complete = Some(streams.is_some());
         let (stdout, stderr) = streams
             .map(|(stdout, stderr)| (Some(stdout), Some(stderr)))
             .unwrap_or_default();
         let result = UnifiedExecCodeModeResult {
-            error: self.error.clone(),
+            error: self
+                .error
+                .clone()
+                .or_else(|| self.exit_code.and_then(windows_abnormal_exit_notice)),
             stdout,
             stderr,
             streams_complete,
@@ -1599,6 +1650,73 @@ pub(crate) fn declared_validation_metadata(
     })
 }
 
+/// Only the repository runner's typed completed-test ledger can establish test
+/// execution. Plain command output, build success, and zero-test summaries do
+/// not become proof. Compound/wrapper commands remain conservatively unproven.
+fn runner_execution_receipt(raw_output: &[u8], command: Option<&str>) -> Option<JsonValue> {
+    let command = command?;
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let program = words.first()?.rsplit(['/', '\\']).next()?;
+    if !matches!(program, "python" | "python3" | "python.exe" | "python3.exe" | "py" | "py.exe")
+        || !words.iter().any(|word| word.trim_matches(['\'', '"'])
+            .rsplit(['/', '\\']).next() == Some("rust_test_runner.py"))
+        || !matches!(
+            crate::validation::classify_validation_script(command),
+            crate::validation::ValidationClassification::Validation {
+                exit_code_is_authoritative: true,
+                has_unclassified_targets: false,
+                ..
+            }
+        )
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(raw_output).ok()?;
+    let mut receipts = text.lines().filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
+        .filter(|value| value["kind"] == "codex_test_execution_v1");
+    let receipt = receipts.next()?;
+    if receipts.next().is_some() || receipt["runner"] != "rust_test_runner"
+        || receipt["exit_code"].as_i64() != Some(0)
+        || receipt["selected_targets"].as_array()?.is_empty()
+        || receipt["selected_targets"].as_array()?.iter()
+            .any(|target| target.as_str().is_none_or(str::is_empty))
+        || !receipt["runner_input_fingerprint"].as_str()?
+            .bytes().all(|byte| byte.is_ascii_hexdigit())
+        || receipt["runner_input_fingerprint"].as_str()?.len() != 64
+    {
+        return None;
+    }
+    let mut executed = 0_u64;
+    if let Some(manifest) = receipt.get("dependency_manifest") {
+        // The instrumented runner records provenance, not hermeticity. Keep
+        // the complete declaration with its receipt, but never let an opaque
+        // script authorize replay or narrower freshness from its own claims.
+        if manifest["version"] != 1
+            || manifest["producer"] != "rust_test_runner"
+            || manifest["captured"] != "before_execution"
+            || manifest["coverage"] != "declared_not_exhaustive"
+            || manifest["automatic_replay_allowed"] != false
+            || manifest["file_inputs"].as_array()?.len() > 256
+            || manifest["source_roots"].as_array()?.len() > 256
+            || manifest["execution_context_sha256"].as_str()?.len() != 64
+            || !manifest["execution_context_sha256"].as_str()?
+                .bytes().all(|byte| byte.is_ascii_hexdigit())
+            || manifest["unresolved_dependencies"].as_array()?.is_empty()
+        {
+            return None;
+        }
+    }
+    for tests in receipt["completed_tests"].as_object()?.values() {
+        let tests = tests.as_array()?;
+        let names = tests.iter().map(JsonValue::as_str).collect::<Option<std::collections::BTreeSet<_>>>()?;
+        if names.len() != tests.len() || names.iter().any(|name| name.is_empty()) {
+            return None;
+        }
+        executed = executed.checked_add(tests.len() as u64)?;
+    }
+    (executed > 0 && receipt["executed_tests"].as_u64() == Some(executed)).then_some(receipt)
+}
+
 impl ExecCommandToolOutput {
     fn execution_state(&self) -> &'static str {
         if self.process_exited {
@@ -1871,6 +1989,9 @@ impl ExecCommandToolOutput {
         if self.process_exited && self.exit_code.is_none() {
             text.push_str("\nProcess exited without an available exit code");
         }
+        if let Some(notice) = self.exit_code.and_then(windows_abnormal_exit_notice) {
+            text.push_str(&format!("\n{notice}"));
+        }
         if let Some(repair) = &self.repair_notice {
             text.push_str(&format!("\n{repair}"));
         }
@@ -1893,6 +2014,27 @@ impl ExecCommandToolOutput {
     pub(crate) fn response_materialization_count() -> usize {
         EXEC_COMMAND_RESPONSE_MATERIALIZATIONS.with(std::cell::Cell::get)
     }
+}
+
+/// Windows reports an abnormal termination as an NTSTATUS exit code, which reads
+/// like an ordinary failure status unless it is named.
+pub(crate) fn windows_abnormal_exit_notice(exit_code: i32) -> Option<String> {
+    let status = u32::from_ne_bytes(exit_code.to_ne_bytes());
+    let (name, meaning) = match status {
+        0xC000_0005 => ("STATUS_ACCESS_VIOLATION", "invalid memory access"),
+        0xC000_001D => ("STATUS_ILLEGAL_INSTRUCTION", "illegal CPU instruction"),
+        0xC000_0094 => ("STATUS_INTEGER_DIVIDE_BY_ZERO", "integer division by zero"),
+        0xC000_00FD => ("STATUS_STACK_OVERFLOW", "stack overflow"),
+        0xC000_0135 => ("STATUS_DLL_NOT_FOUND", "a required DLL was not found"),
+        0xC000_0142 => ("STATUS_DLL_INIT_FAILED", "DLL initialization failed"),
+        0xC000_0374 => ("STATUS_HEAP_CORRUPTION", "heap corruption"),
+        0xC000_0409 => ("STATUS_STACK_BUFFER_OVERRUN", "fail-fast abort or stack buffer overrun"),
+        0x8000_0003 => ("STATUS_BREAKPOINT", "breakpoint or debug assertion"),
+        _ => return None,
+    };
+    Some(format!(
+        "environment_crash: exit code {exit_code} is Windows status 0x{status:08X} {name} ({meaning}): the process crashed rather than reporting a failure."
+    ))
 }
 
 fn predetermined_validation_ranges(

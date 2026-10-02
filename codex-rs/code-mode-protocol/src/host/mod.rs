@@ -1,9 +1,8 @@
 //! Messages and local IPC framing for the code-mode host boundary.
 //!
 //! Protocol version 1 multiplexes session operations and delegate callbacks by
-//! request ID over one ordered connection. It defines no optional capabilities
-//! yet; capability names provide an extension point for later versions without
-//! weakening the v1 decoder.
+//! request ID over one ordered connection. Optional capabilities are negotiated
+//! before sending extension fields; legacy peers retain the original V1 shape.
 
 mod codec;
 mod error;
@@ -33,6 +32,7 @@ pub use payload::WireImageDetail;
 pub use payload::WireNestedToolCall;
 pub use payload::WireRuntimeResponse;
 pub use payload::WireToolDefinition;
+pub use payload::WireToolCatalog;
 pub use payload::WireToolKind;
 pub use payload::WireToolName;
 pub use payload::WireWaitOutcome;
@@ -53,6 +53,8 @@ pub const MAX_IN_FLIGHT_REQUESTS: usize = 256;
 /// Delegate requests a V1 host leaves awaiting client responses at once;
 /// further nested calls fail inside the host without reaching the client.
 pub const MAX_PENDING_DELEGATE_REQUESTS: usize = 256;
+pub const TOOL_CATALOG_CAPABILITY: &str = "tool-catalog-v1";
+pub const NAMED_STATE_CAPABILITY: &str = "named-state-v1";
 
 #[cfg(test)]
 #[path = "host_tests.rs"]

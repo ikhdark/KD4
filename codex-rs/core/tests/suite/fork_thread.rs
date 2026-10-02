@@ -12,7 +12,6 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
@@ -79,7 +78,7 @@ async fn fork_thread_twice_drops_to_first_message() {
 
     // Compute expected prefixes after each fork by truncating base rollout
     // strictly before the nth user input (0-based).
-    let base_items = read_rollout_items(&base_path);
+    let base_items = read_rollout_items(&base_path).await;
     let find_user_input_positions = |items: &[RolloutItem]| -> Vec<usize> {
         let mut pos = Vec::new();
         for (i, it) in items.iter().enumerate() {
@@ -119,7 +118,7 @@ async fn fork_thread_twice_drops_to_first_message() {
     let fork1_path = codex_fork1.rollout_path().expect("rollout path");
 
     // GetHistory on fork1 flushed; the file is ready.
-    let fork1_items = read_rollout_items(&fork1_path);
+    let fork1_items = read_rollout_items(&fork1_path).await;
     assert_fork_rollout(&fork1_items, &expected_after_first);
 
     // Fork again with n=0 → drops the (new) last user message, leaving only the first.
@@ -139,14 +138,14 @@ async fn fork_thread_twice_drops_to_first_message() {
 
     let fork2_path = codex_fork2.rollout_path().expect("rollout path");
     // GetHistory on fork2 flushed; the file is ready.
-    let fork1_items = read_rollout_items(&fork1_path);
+    let fork1_items = read_rollout_items(&fork1_path).await;
     let fork1_user_inputs = find_user_input_positions(&fork1_items);
     let cut_last_on_fork1 = fork1_user_inputs
         .get(fork1_user_inputs.len().saturating_sub(1))
         .copied()
         .unwrap_or(0);
     let expected_after_second: Vec<RolloutItem> = fork1_items[..cut_last_on_fork1].to_vec();
-    let fork2_items = read_rollout_items(&fork2_path);
+    let fork2_items = read_rollout_items(&fork2_path).await;
     assert_fork_rollout(&fork2_items, &expected_after_second);
 }
 
@@ -173,7 +172,7 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
         .expect("flush source rollout");
 
     let source_path = test.codex.rollout_path().expect("source rollout path");
-    let mut source_items = read_rollout_items_with_session_meta(&source_path);
+    let mut source_items = read_rollout_items_with_session_meta(&source_path).await;
     let session_meta = source_items
         .iter_mut()
         .find_map(|item| match item {
@@ -221,7 +220,7 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
     );
     forked.thread.ensure_rollout_materialized().await;
     forked.thread.flush_rollout().await.expect("flush fork");
-    let items = read_rollout_items_with_session_meta(&forked.thread.rollout_path().expect("fork rollout"));
+    let items = read_rollout_items_with_session_meta(&forked.thread.rollout_path().expect("fork rollout")).await;
     let tools = items.iter().find_map(|item| match item {
         RolloutItem::SessionMeta(meta) => Some(meta.meta.dynamic_tools.clone().unwrap_or_default()),
         _ => None,
@@ -278,7 +277,7 @@ fn fork_thread_from_history_does_not_require_source_rollout_path() {
         // finish persistence before constructing an independent stored-history snapshot.
         codex.flush_rollout().await.expect("flush source rollout");
         let source_path = codex.rollout_path().expect("source rollout path");
-        let source_items = read_rollout_items_with_session_meta(&source_path);
+        let source_items = read_rollout_items_with_session_meta(&source_path).await;
         assert!(
             source_items
                 .iter()
@@ -308,7 +307,7 @@ fn fork_thread_from_history_does_not_require_source_rollout_path() {
             .expect("fork from stored history");
 
         let forked_path = forked_thread.rollout_path().expect("forked rollout path");
-        let forked_items = read_rollout_items(&forked_path);
+        let forked_items = read_rollout_items(&forked_path).await;
         assert!(
             contains_reasoning(&forked_items, "reason-fork"),
             "forked rollout must retain the full reasoning record"
@@ -362,46 +361,36 @@ fn contains_reasoning(items: &[RolloutItem], expected_id: &str) -> bool {
 }
 
 fn assert_fork_rollout(actual: &[RolloutItem], expected_copied_prefix: &[RolloutItem]) {
-    assert_eq!(
-        actual.len(),
-        expected_copied_prefix.len() + 1,
-        "a fork should append exactly one authoritative child-settings snapshot"
-    );
+    // These forks retain the parent's settings. The recorder deduplicates the
+    // identical authoritative child snapshot instead of appending another copy.
     pretty_assertions::assert_eq!(
-        serde_json::to_value(&actual[..expected_copied_prefix.len()])
+        serde_json::to_value(actual)
             .expect("actual fork rollout prefix should serialize"),
         serde_json::to_value(expected_copied_prefix)
             .expect("expected fork rollout prefix should serialize")
     );
     assert!(
-        matches!(
-            actual.last(),
-            Some(RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_)))
-        ),
-        "fork rollout should end with the child's authoritative thread settings"
+        actual.iter().any(|item| matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+        )),
+        "fork rollout should retain the authoritative thread settings"
     );
 }
 
-fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {
+async fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {
     read_rollout_items_with_session_meta(path)
+        .await
         .into_iter()
         .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
         .collect()
 }
 
-fn read_rollout_items_with_session_meta(path: &std::path::Path) -> Vec<RolloutItem> {
+async fn read_rollout_items_with_session_meta(path: &std::path::Path) -> Vec<RolloutItem> {
     let read_message = format!("failed to read rollout file {}", path.display());
-    let text = std::fs::read_to_string(path).expect(&read_message);
-    let mut items: Vec<RolloutItem> = Vec::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parse_json_message = format!("failed to parse rollout JSON line `{line}`");
-        let v: serde_json::Value = serde_json::from_str(line).expect(&parse_json_message);
-        let parse_line_message = format!("failed to parse rollout line `{line}`");
-        let rl: RolloutLine = serde_json::from_value(v).expect(&parse_line_message);
-        items.push(rl.item);
-    }
+    let (items, _, parse_errors) = codex_rollout::RolloutRecorder::load_rollout_items(path)
+        .await
+        .expect(&read_message);
+    assert_eq!(parse_errors, 0, "invalid rollout records: {}", path.display());
     items
 }

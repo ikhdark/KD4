@@ -47,6 +47,7 @@ mod tests {
                 code: "text('hi')",
                 max_output_tokens: None,
                 deliver: false,
+                persist: false,
             }
         );
     }
@@ -59,6 +60,7 @@ mod tests {
                 code: "text('hi')",
                 max_output_tokens: None,
                 deliver: false,
+                persist: false,
             }
         );
     }
@@ -91,7 +93,7 @@ mod tests {
         let definition = ToolDefinition {
             name: "hidden_dynamic_tool".to_string(),
             tool_name: ToolName::plain("hidden_dynamic_tool"),
-            description: "Test tool".to_string(),
+            description: "Test tool".into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(json!({
                 "type": "object",
@@ -145,7 +147,7 @@ mod tests {
         let definition = ToolDefinition {
             name: "read_retained".to_string(),
             tool_name: ToolName::plain("read_retained"),
-            description: "Read retained output.".to_string(),
+            description: "Read retained output.".into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(json!({
                 "$defs": {"selector": selector},
@@ -205,7 +207,7 @@ mod tests {
         let definition = ToolDefinition {
             name: "single_use".to_string(),
             tool_name: ToolName::plain("single_use"),
-            description: "One shape, one site.".to_string(),
+            description: "One shape, one site.".into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(json!({
                 "type": "object",
@@ -258,7 +260,7 @@ mod tests {
         let definition = ToolDefinition {
             name: "lookup".to_string(),
             tool_name: ToolName::plain("lookup"),
-            description: "Look up an address.".to_string(),
+            description: "Look up an address.".into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(schema.clone()),
             default_timeout_ms: None,
@@ -269,7 +271,7 @@ mod tests {
         // TypeScript's intersection precedence makes it optional for city.
         let address = "({ city: string; } | { zip: string; }) & ({ country: string; })";
         assert_eq!(
-            augment_tool_definition(definition).description,
+            augment_tool_definition(definition).description.as_ref(),
             format!(
                 "Look up an address.\n\nexec tool declaration:\n```ts\ndeclare const tools: {{ lookup(args: {address}, options?: {{ timeout_ms?: number }}): Promise<{address}>; }};\n```"
             )
@@ -281,7 +283,7 @@ mod tests {
         let definition = ToolDefinition {
             name: "weather_tool".to_string(),
             tool_name: ToolName::plain("weather_tool"),
-            description: "Weather tool".to_string(),
+            description: "Weather tool".into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(json!({
                 "type": "object",
@@ -343,7 +345,7 @@ mod tests {
             "When `tool_search` is advertised, use it to activate tools that are not yet listed."
         ));
         assert!(
-            description.len() < 4_000,
+            description.len() < 8_500,
             "compact exec prompt unexpectedly expanded to {} bytes",
             description.len()
         );
@@ -412,7 +414,7 @@ mod tests {
         assert!(description.contains("never mask them with `|| true`"));
         assert!(!description.contains("never repeat the same call/poll"));
         assert!(!description.contains("never whole files"));
-        assert!(description.contains("retained-artifact selectors after truncation"));
+        assert!(description.contains("after truncation, select only missing evidence from the retained artifact"));
         assert_eq!(
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
             10_000,
@@ -422,7 +424,7 @@ mod tests {
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
         )));
         assert!(description.contains(&format!(
-            "Nested exec_command/write_stdin results carry at most {} output tokens",
+            "Nested exec_command/write_stdin display results carry at most {} output tokens",
             crate::MAX_NESTED_COMMAND_OUTPUT_TOKENS,
         )));
         assert!(!description.contains("the cell budget is separate"));
@@ -440,7 +442,7 @@ mod tests {
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
-        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 4_000;
+        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 8_500;
         assert!(
             description.len() <= COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET,
             "the exec contract must stay within {COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET} bytes; got {}",
@@ -455,7 +457,7 @@ mod tests {
         let tool = ToolDefinition {
             name: "sample_tool".to_string(),
             tool_name: ToolName::plain("sample_tool"),
-            description: tool_description,
+            description: tool_description.into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(json!({
                 "type": "object",
@@ -516,7 +518,7 @@ mod tests {
         ];
         for names in inventories {
             // Names, their backticks, and separators grow with the inventory.
-            // The 4,000-byte budget covers all remaining assembled instructions.
+            // The 8,500-byte budget includes delivery, persistence, and DAG contracts.
             let list_bytes = names.iter().map(|name| name.len() + 2).sum::<usize>()
                 + names.len().saturating_sub(1) * 2;
             for code_mode_only in [false, true] {
@@ -524,7 +526,7 @@ mod tests {
                     let description =
                         build_exec_tool_description(code_mode_only, has_deferred_tools, &names);
                     assert!(
-                        description.len() < 4_000 + list_bytes,
+                        description.len() < 8_500 + list_bytes,
                         "assembled exec prompt exceeded its boilerplate budget: {} bytes, \
                          {list_bytes} bytes of names, code_mode_only={code_mode_only}, \
                          has_deferred_tools={has_deferred_tools}",
@@ -552,14 +554,14 @@ mod tests {
         let definition = ToolDefinition {
             name: "sample".to_string(),
             tool_name: ToolName::plain("sample"),
-            description: "Sample tool.".to_string(),
+            description: "Sample tool.".into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(schema),
             default_timeout_ms: None,
             output_schema: None,
         };
         assert_eq!(
-            augment_tool_definition(definition).description,
+            augment_tool_definition(definition).description.as_ref(),
             format!(
                 "Sample tool.\n\nexec tool declaration:\n```ts\ndeclare const tools: {{ sample(args: {expected}, options?: {{ timeout_ms?: number }}): Promise<unknown>; }};\n```"
             )
@@ -692,7 +694,7 @@ mod tests {
         let definition = ToolDefinition {
             name: "receipt".to_string(),
             tool_name: ToolName::plain("receipt"),
-            description: "Receipt.".to_string(),
+            description: "Receipt.".into(),
             kind: CodeModeToolKind::Function,
             input_schema: None,
             default_timeout_ms: None,
@@ -726,26 +728,6 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("duplicate field"));
         assert!(!error.contains("must be a non-negative safe integer"));
-    }
-
-    #[test]
-    fn direct_only_patch_routing_and_output_pragma_are_usable() {
-        let description = build_exec_tool_description(false, false, &["apply_patch".to_string()]);
-        assert!(description.contains("nested when registered, otherwise direct"));
-        assert!(description.contains("Direct-only tools omitted from `ALL_TOOLS`: `apply_patch`"));
-        let directive = description
-            .split("first-line `")
-            .nth(1)
-            .unwrap()
-            .split('`')
-            .next()
-            .unwrap();
-        assert_eq!(
-            parse_exec_source(&format!("{directive}\ntext('hi')"))
-                .unwrap()
-                .max_output_tokens,
-            Some(10000)
-        );
     }
 
     #[test]
@@ -868,7 +850,7 @@ mod tests {
             let definition = ToolDefinition {
                 name: name.to_string(),
                 tool_name: ToolName::plain(name),
-                description: "Direct tool.".to_string(),
+                description: "Direct tool.".into(),
                 kind: CodeModeToolKind::Function,
                 input_schema: Some(json!({"type": "string"})),
                 default_timeout_ms: None,

@@ -95,7 +95,9 @@ fn invalidation_reports_unknown_changes_even_without_a_published_diff() {
             );
         }
         assert_eq!(tracker.take_invalidation_warning(), None);
+        assert_eq!(tracker.exact_changed_paths(), Some(Vec::new()));
         tracker.record_unknown_mutation();
+        assert_eq!(tracker.exact_changed_paths(), None);
         assert_eq!(
             tracker.take_unified_diff_if_changed(),
             published.then(String::new)
@@ -697,19 +699,33 @@ index {ZERO_OID}..{right_oid}
 }
 
 #[tokio::test]
-async fn invalidated_tracker_suppresses_existing_diff() {
+async fn known_command_paths_preserve_other_diffs_until_unknown_invalidation() {
     let dir = tempdir().expect("tempdir");
     let mut tracker = tracker_with_root(dir.path());
 
     let add = apply_verified_patch(
         dir.path(),
-        "*** Begin Patch\n*** Add File: a.txt\n+foo\n*** End Patch",
+        "*** Begin Patch\n*** Add File: a.txt\n+foo\n*** Add File: b.txt\n+bar\n*** End Patch",
     )
     .await;
     tracker.track_delta("", &add);
 
+    // A failing command may still change a known path. Only that path loses
+    // exactness; unrelated apply_patch content remains useful.
+    tracker.record_exec_command_end_at(
+        &["rm".into(), "b.txt".into()], 1, false, "", Some(dir.path()),
+    );
+    let partial = tracker.get_unified_diff().expect("partial turn diff");
+    assert!(partial.contains("diff --git a/a.txt b/a.txt"));
+    assert!(!partial.contains("diff --git a/b.txt b/b.txt"));
+    assert!(partial.contains("b.txt: changed, diff unavailable"));
+    assert!(tracker.exact_changed_paths().is_none());
     tracker.invalidate();
 
+    assert_eq!(tracker.get_unified_diff(), None);
+    tracker.record_exec_command_end_at(
+        &["touch".into(), "c.txt".into()], 0, false, "", Some(dir.path()),
+    );
     assert_eq!(tracker.get_unified_diff(), None);
 }
 
@@ -818,6 +834,13 @@ async fn pure_rename_yields_no_diff() {
     tracker.track_delta("", &rename);
 
     assert_eq!(tracker.get_unified_diff(), None);
+    assert_eq!(
+        tracker.exact_changed_paths(),
+        Some(vec![
+            ("".to_string(), dir.path().join("new.txt")),
+            ("".to_string(), dir.path().join("old.txt")),
+        ])
+    );
 }
 
 #[tokio::test]

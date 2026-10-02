@@ -308,7 +308,7 @@ VALUES (?, ?, TRUE, ?, 0)
         .expect("line-ending-equivalent history should be accepted");
 
     assert_eq!(migration_ledger(&pool).await, original_ledger);
-    assert_eq!(latest_known_version, 47);
+    assert_eq!(latest_known_version, 48);
     assert_eq!(
         STATE_MIGRATOR
             .migrations

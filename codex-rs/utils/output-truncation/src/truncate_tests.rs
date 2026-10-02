@@ -1008,7 +1008,8 @@ fn validation_mentions_in_command_arguments_do_not_raise_output_budget() {
     ] {
         let limits =
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000);
-        assert_eq!(limits.applied_limit, 10_000, "{command}");
+        assert_eq!(limits.applied_limit, DEFAULT_SUCCESS_OUTPUT_TOKENS, "{command}");
+        assert_eq!(crate::classify_diagnostic(Some(command), "ok"), OutputDiagnosticClass::Normal, "{command}");
     }
     for command in [
         "cargo +stable test",
@@ -1020,9 +1021,10 @@ fn validation_mentions_in_command_arguments_do_not_raise_output_budget() {
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000)
                 .applied_limit,
-            8_000,
+            DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
             "{command}"
         );
+        assert_eq!(crate::classify_diagnostic(Some(command), "ok"), OutputDiagnosticClass::HighSignal, "{command}");
     }
 }
 
@@ -1041,9 +1043,10 @@ fn diagnostic_mentions_in_prose_do_not_raise_output_budget() {
     ] {
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, None, output, 20_000).applied_limit,
-            10_000,
+            DEFAULT_SUCCESS_OUTPUT_TOKENS,
             "{output}"
         );
+        assert_eq!(crate::classify_diagnostic(None, output), OutputDiagnosticClass::Normal, "{output}");
     }
     for output in [
         "error[E0308]: mismatched types",
@@ -1053,9 +1056,10 @@ fn diagnostic_mentions_in_prose_do_not_raise_output_budget() {
     ] {
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, None, output, 20_000).applied_limit,
-            8_000,
+            DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
             "{output}"
         );
+        assert_eq!(crate::classify_diagnostic(None, output), OutputDiagnosticClass::HighSignal, "{output}");
     }
 }
 

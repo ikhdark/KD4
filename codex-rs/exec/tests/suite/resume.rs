@@ -62,15 +62,13 @@ fn find_session_file_containing_marker(
 }
 
 /// Extract the conversation UUID from the first SessionMeta line in the rollout file.
-fn extract_conversation_id(path: &std::path::Path) -> String {
-    let content = std::fs::read_to_string(path).unwrap();
-    let mut lines = content.lines();
-    let meta_line = lines.next().expect("missing meta line");
-    let meta: Value = serde_json::from_str(meta_line).expect("invalid meta json");
-    meta.get("payload")
-        .and_then(|p| p.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
+async fn extract_conversation_id(path: &std::path::Path) -> String {
+    let (_, thread_id, parse_errors) = codex_core::RolloutRecorder::load_rollout_items(path)
+        .await
+        .expect("read rollout");
+    assert_eq!(parse_errors, 0, "invalid rollout records");
+    thread_id
+        .expect("missing conversation id in meta line")
         .to_string()
 }
 
@@ -411,7 +409,7 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
             sqlx::query("UPDATE threads SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
                 .bind(seconds)
                 .bind(seconds * 1000)
-                .bind(extract_conversation_id(rollout))
+                .bind(extract_conversation_id(rollout).await)
                 .execute(&mut connection)
                 .await?;
         assert_eq!(changed.rows_affected(), 1, "fixture thread must be indexed");
@@ -458,7 +456,7 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
 
     // Make B strictly newer without depending on timestamp precision or speed.
     backdate_session(test.home_path(), &path_a).await?;
-    let session_id_b = extract_conversation_id(&path_b);
+    let session_id_b = extract_conversation_id(&path_b).await;
     let marker_b_touch = format!("resume-cwd-b-touch-{}", Uuid::new_v4());
     test.cmd_with_server(&server)
         .arg("--skip-git-repo-check")
@@ -645,7 +643,7 @@ async fn exec_resume_by_id_appends_to_existing_file() -> anyhow::Result<()> {
     let sessions_dir = test.home_path().join("sessions");
     let path = find_session_file_containing_marker(&sessions_dir, &marker)
         .expect("no session file found after first run");
-    let session_id = extract_conversation_id(&path);
+    let session_id = extract_conversation_id(&path).await;
     assert!(
         !session_id.is_empty(),
         "missing conversation id in meta line"

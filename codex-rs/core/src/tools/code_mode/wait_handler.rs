@@ -258,9 +258,13 @@ impl CodeModeWaitHandler {
                     emit_failed_code_mode_cell_item(&exec, parent_call_id, response, started_at)
                         .await;
                 }
+                let response = wait_response.into();
+                let delivery = exec.session.services.code_mode_service.delivery_for_response(
+                    &cell_id, &exec.turn, &response,
+                );
                 let mut output = handle_runtime_response(
                     &exec,
-                    wait_response.into(),
+                    response,
                     args.max_tokens,
                     started_at,
                 )
@@ -269,6 +273,14 @@ impl CodeModeWaitHandler {
                     attach_drained_wait_evidence(&exec, output, &cell_id, drained_observations);
                 if let Some(signal) = authoritative_wait_signal {
                     output = super::merge_code_mode_signal(output, signal);
+                }
+                if output.success == Some(true)
+                    && !output.essential_inline.contains_key(super::VISIBLE_OUTPUT_TRUNCATED_KEY)
+                    && let Some(message) = delivery
+                    && let Some(signal) = output.sampling_request_signal.as_mut()
+                        .and_then(serde_json::Value::as_object_mut)
+                {
+                    signal.insert("explicit_completion_message".into(), message.into());
                 }
                 Ok(boxed_tool_output(output))
             }
@@ -501,10 +513,22 @@ pub(super) fn attach_drained_wait_evidence(
 }
 
 impl CoreToolRuntime for CodeModeWaitHandler {
+    fn delegates_workspace_admission(&self) -> bool {
+        true
+    }
+
     fn waits_for_runtime_cancellation(&self) -> bool {
         // Cancellation must keep polling the handler through bounded cell
         // termination so the V8/runtime owner cannot be orphaned.
         true
+    }
+
+    fn pre_tool_use_hook_name(
+        &self,
+        _tool_name: &codex_tools::ToolName,
+        _payload: &crate::tools::context::ToolPayload,
+    ) -> Option<HookToolName> {
+        None
     }
 
     fn pre_tool_use_payload(&self, _invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
@@ -572,8 +596,9 @@ mod tests {
             let service = &session.services.code_mode_service;
             let started = service
                 .execute(codex_code_mode::ExecuteRequest {
+                    state_path: None,
                     tool_call_id: "outer-exec".to_string(),
-                    enabled_tools: Vec::new(),
+                    enabled_tools: Vec::new().into(),
                     source: "await yield_control();".to_string(),
                     yield_time_ms: None,
                     max_output_tokens: None,
@@ -665,8 +690,9 @@ mod tests {
         let service = &session.services.code_mode_service;
         let started = service
             .execute(codex_code_mode::ExecuteRequest {
+                state_path: None,
                 tool_call_id: "outer-exec".to_string(),
-                enabled_tools: Vec::new(),
+                enabled_tools: Vec::new().into(),
                 source: "await yield_control();".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,
@@ -1089,8 +1115,9 @@ mod tests {
         )));
         let started_cell = service
             .execute(codex_code_mode::ExecuteRequest {
+                state_path: None,
                 tool_call_id: "runtime-timeout-call".to_string(),
-                enabled_tools: Vec::new(),
+                enabled_tools: Vec::new().into(),
                 source: "await new Promise(() => {});".to_string(),
                 yield_time_ms: Some(1),
                 max_output_tokens: None,

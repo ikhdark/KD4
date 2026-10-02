@@ -2426,14 +2426,14 @@ mod tests {
             "When a tool returns sufficient evidence for delivery, answer from that result",
             "do not reopen internal state merely to re-derive returned information",
             "Further inspection must resolve a concrete scope or correctness question",
-            "collect candidates once",
-            "retain deduplicated paths, categories, evidence, unresolved items, and coverage",
-            "inspect content only to resolve classification uncertainty",
-            "Reuse existing inventory/report tooling",
+            "Collect candidates once",
+            "retain deduplicated paths, evidence, unresolved items, and coverage",
+            "inspect before scanning only for a named uncertainty",
+            "reuse existing inventory/report tooling",
             "when file output is permitted",
-            "render the complete records deterministically",
-            "Honor requests for inline output",
-            "do not trade completeness for brevity",
+            "complete deterministic reports with counts and limitations",
+            "honor inline-only and no-write requests",
+            "Rule matches do not prove semantic completeness or runtime activation",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
@@ -2725,7 +2725,7 @@ mod tests {
     #[test]
     fn over_truncation_marginal_local_path_overage_stays_exact() {
         let path = std::path::PathBuf::from("marginal-context.txt");
-        let content = "a ".repeat(LOCAL_PATH_CONTEXT_TOKEN_BUDGET);
+        let content = "abc ".repeat(LOCAL_PATH_CONTEXT_TOKEN_BUDGET);
         let exact = format!("<local_path_context path={path:?}>\n{content}\n</local_path_context>");
         let exact_tokens = codex_utils_string::approx_token_count(&exact);
         assert!(exact_tokens > LOCAL_PATH_CONTEXT_TOKEN_BUDGET);

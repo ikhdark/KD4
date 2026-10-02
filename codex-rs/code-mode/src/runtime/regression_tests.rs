@@ -15,16 +15,17 @@ use super::*;
 async fn start(source: &str) -> (std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle, mpsc::UnboundedReceiver<RuntimeEvent>) {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let request = ExecuteRequest {
+        state_path: None,
         tool_call_id: "regression".to_string(),
         enabled_tools: vec![ToolDefinition {
             name: "sample_tool".to_string(),
             tool_name: ToolName::plain("sample_tool"),
             kind: CodeModeToolKind::Function,
-            description: String::new(),
+            description: "".into(),
             input_schema: None,
             output_schema: None,
             default_timeout_ms: None,
-        }],
+        }].into(),
         source: source.to_string(),
         yield_time_ms: Some(1),
         max_output_tokens: None,

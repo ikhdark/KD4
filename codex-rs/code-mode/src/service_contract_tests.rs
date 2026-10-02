@@ -200,8 +200,9 @@ fn cell_id(value: &str) -> CellId {
 
 fn execute_request(source: &str) -> ExecuteRequest {
     ExecuteRequest {
+        state_path: None,
         tool_call_id: "call-1".to_string(),
-        enabled_tools: Vec::new(),
+        enabled_tools: Vec::new().into(),
         source: source.to_string(),
         yield_time_ms: Some(1),
         max_output_tokens: None,
@@ -213,7 +214,7 @@ fn blocking_tool() -> ToolDefinition {
     ToolDefinition {
         name: "block".to_string(),
         tool_name: ToolName::plain("block"),
-        description: String::new(),
+        description: "".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
         default_timeout_ms: None,
@@ -230,7 +231,7 @@ async fn flattened_tool_identifier_collisions_are_rejected_before_cell_start() {
                 ToolDefinition {
                     name: "acme__lookup".to_string(),
                     tool_name: ToolName::plain("acme__lookup"),
-                    description: "plain tool".to_string(),
+                    description: "plain tool".into(),
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
                     default_timeout_ms: None,
@@ -239,13 +240,13 @@ async fn flattened_tool_identifier_collisions_are_rejected_before_cell_start() {
                 ToolDefinition {
                     name: "acme__lookup".to_string(),
                     tool_name: ToolName::namespaced("acme", "lookup"),
-                    description: "namespaced tool".to_string(),
+                    description: "namespaced tool".into(),
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
                     default_timeout_ms: None,
                     output_schema: None,
                 },
-            ],
+            ].into(),
             ..execute_request("text('unreachable');")
         })
         .await;
@@ -312,7 +313,7 @@ async fn yields_again_after_the_previous_yield_was_observed() {
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()],
+            enabled_tools: vec![blocking_tool()].into(),
             source: r#"yield_control(); await tools.block({}); text("second"); yield_control();"#
                 .to_string(),
             yield_time_ms: Some(60_000),
@@ -363,7 +364,7 @@ async fn passive_command_wait_has_no_default_nested_deadline() {
     tool.tool_name = ToolName::plain("write_stdin");
     tool.default_timeout_ms = Some(10);
     let cell = service.execute(ExecuteRequest {
-        enabled_tools: vec![tool],
+        enabled_tools: vec![tool].into(),
         source: "await tools.write_stdin({session_id:7, wait_for_output:true}); text('completed');".into(),
         yield_time_ms: Some(60_000),
         ..execute_request("")
@@ -383,7 +384,7 @@ async fn bounded_parallel_nested_tool_timeout_rejects_only_the_expired_call() {
     let service = InProcessCodeModeSession::with_delegate(delegate);
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()],
+            enabled_tools: vec![blocking_tool()].into(),
             source: r#"
 const outcome = await tools.block({}, { timeout_ms: 10 }).then(
   () => "unexpected success",
@@ -420,7 +421,7 @@ async fn explicit_nested_tool_timeout_still_wins_over_a_host_supplied_default() 
     tool.default_timeout_ms = Some(300_000);
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![tool],
+            enabled_tools: vec![tool].into(),
             source: r#"
 const outcome = await tools.block({}, { timeout_ms: 10 }).then(
   () => "unexpected success",
@@ -460,7 +461,7 @@ async fn per_tool_default_survives_runtime_conversion_without_extending_other_to
     tool.default_timeout_ms = Some(80);
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![tool],
+            enabled_tools: vec![tool].into(),
             source: "try { await tools.block({}); } catch (error) { text(String(error)); }".into(),
             yield_time_ms: Some(60_000),
             default_tool_timeout_ms: Some(5),
@@ -488,7 +489,7 @@ async fn per_tool_default_survives_runtime_conversion_without_extending_other_to
 
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()],
+            enabled_tools: vec![blocking_tool()].into(),
             source: "try { await tools.block({}); } catch (error) { text(String(error)); }".into(),
             yield_time_ms: Some(60_000),
             default_tool_timeout_ms: Some(5),
@@ -523,7 +524,7 @@ async fn two_independent_nested_calls_start_before_either_completes() {
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()],
+            enabled_tools: vec![blocking_tool()].into(),
             source: r#"
 const first = tools.block({id: 1});
 const second = tools.block({id: 2});
@@ -577,7 +578,7 @@ yield_control();
     );
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()],
+            enabled_tools: vec![blocking_tool()].into(),
             source,
             yield_time_ms: Some(60_000),
             ..execute_request("")
@@ -662,7 +663,7 @@ async fn bounded_parallel_termination_delivers_pending_notification_before_respo
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()],
+            enabled_tools: vec![blocking_tool()].into(),
             source: r#"
 const reported = Promise.resolve("fast").then(async (value) => {
   await notify(`fast:${value}`);
@@ -895,7 +896,7 @@ async fn dropped_initial_response_leaves_the_running_cell_owned_by_the_session()
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()],
+            enabled_tools: vec![blocking_tool()].into(),
             yield_time_ms: Some(60_000),
             ..execute_request("await tools.block({});")
         })
@@ -941,7 +942,7 @@ async fn natural_completion_cleans_up_callbacks_before_responding() {
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());
     let cell = service
         .execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()],
+            enabled_tools: vec![blocking_tool()].into(),
             source: r#"tools.block({}); text("done");"#.to_string(),
             yield_time_ms: Some(60_000),
             ..execute_request("")

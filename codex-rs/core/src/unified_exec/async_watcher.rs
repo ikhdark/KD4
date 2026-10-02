@@ -32,9 +32,6 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventFailure;
 use crate::tools::events::ToolEventStage;
-use crate::tools::known_delta_store;
-use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
-use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_features::Feature;
@@ -408,8 +405,6 @@ pub(crate) fn spawn_exit_watcher(
     started_at: Instant,
     source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
-    known_delta: Option<PreparedKnownDelta>,
-    known_delta_executor_started_at: Option<Instant>,
     tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
     network_approval: Option<crate::tools::network_approval::DeferredNetworkApproval>,
     validation_started_at: Option<Instant>,
@@ -558,20 +553,6 @@ pub(crate) fn spawn_exit_watcher(
             );
         }
 
-        if let Some(known_delta) = known_delta.as_ref() {
-            let completion_output = process.snapshot_completion_output().await;
-            record_known_delta_from_process_output(
-                turn_ref.config.codex_home.as_path(),
-                known_delta,
-                &completion_output,
-                failure_message.is_none() && exit_code == 0 && !process.termination_was_requested(),
-                known_delta_executor_started_at
-                    .map(|started_at| Instant::now().saturating_duration_since(started_at))
-                    .unwrap_or(duration),
-            )
-            .await;
-        }
-
         if let Some(mut finalized_artifact) = process.raw_output_artifact().await {
             if let Some(message) = failure_message.as_ref() {
                 let separator = if matches!(
@@ -692,27 +673,6 @@ pub(crate) fn spawn_exit_watcher(
             "background exec lifecycle finalized"
         );
     });
-}
-
-pub(crate) async fn record_known_delta_from_process_output(
-    codex_home: &std::path::Path,
-    prepared: &PreparedKnownDelta,
-    output: &ProcessOutputSnapshot,
-    success: bool,
-    executor_cost: Duration,
-) {
-    let exact_output = output
-        .aggregated_output_is_exact
-        .then_some(output.aggregated_output.as_slice());
-    let observation = match (exact_output, success) {
-        (Some(output), true) => KnownDeltaExecutionObservation::CompleteSuccess {
-            output,
-            executor_cost,
-        },
-        (Some(_), false) => KnownDeltaExecutionObservation::CompleteFailure,
-        (None, _) => KnownDeltaExecutionObservation::Incomplete,
-    };
-    known_delta_store::record_execution(codex_home, prepared, observation).await;
 }
 
 #[allow(clippy::too_many_arguments)]

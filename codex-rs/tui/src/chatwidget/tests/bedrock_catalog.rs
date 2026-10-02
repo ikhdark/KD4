@@ -45,8 +45,8 @@ async fn bedrock_model_and_reasoning_pickers() {
         );
         let mut previous = 0;
         for name in [
-            "gpt-6-sol",
             "gpt-6-astra",
+            "gpt-6-sol",
             "gpt-6-luna",
             "gpt-5.6-sol",
             "gpt-5.6-terra",

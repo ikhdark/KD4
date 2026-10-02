@@ -124,7 +124,6 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
                     EventMsg::TurnStarted(_),
                     EventMsg::UserMessage(_),
                     EventMsg::ItemCompleted(_),
-                    EventMsg::AgentMessage(_),
                     EventMsg::TokenCount(_),
                     EventMsg::TurnComplete(_),
                 ]
@@ -142,21 +141,19 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
             EventMsg::TurnStarted(started),
             EventMsg::UserMessage(first_user),
             EventMsg::ItemCompleted(canonical),
-            EventMsg::AgentMessage(assistant_message),
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
         ] => {
             assert_eq!(first_user.message, "Record some messages");
             assert_eq!(first_user.text_elements, text_elements);
-            assert_eq!(assistant_message.message, "Completed first turn");
             assert_eq!(canonical.turn_id, started.turn_id);
             let codex_protocol::items::TurnItem::AgentMessage(item) = &canonical.item else {
                 panic!("expected canonical assistant message: {canonical:?}");
             };
             assert_eq!(item.id, "msg-1");
-            assert_eq!(item.phase, assistant_message.phase);
+            assert_eq!(item.phase, None);
             assert!(
-                matches!(item.content.as_slice(), [codex_protocol::items::AgentMessageContent::Text { text }] if text == &assistant_message.message)
+                matches!(item.content.as_slice(), [codex_protocol::items::AgentMessageContent::Text { text }] if text == "Completed first turn")
             );
             assert_eq!(completed.turn_id, started.turn_id);
             assert_eq!(

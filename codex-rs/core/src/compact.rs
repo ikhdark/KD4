@@ -1420,13 +1420,23 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
         if let ResponseItem::Message { content, .. } = item {
             content.retain(|part| {
                 !matches!(part, ContentItem::InputText { text }
-                if text.starts_with("<codex_internal_context source=\"compaction_plan\">"))
+                if text.starts_with("<codex_internal_context source=\"compaction_plan\">")
+                    || is_artifact_pin_text(text))
             });
             return !content.is_empty();
         }
         true
     });
     retained
+}
+
+/// Earlier pin sidecars are superseded: each compaction rebuilds one current pin set from
+/// every reference in the source history, including references inside earlier pin sets.
+fn is_artifact_pin_text(text: &str) -> bool {
+    text.starts_with('{')
+        && text.contains("\"tool_history_artifact_pins\"")
+        && serde_json::from_str::<serde_json::Value>(text)
+            .is_ok_and(|value| value["kind"] == "tool_history_artifact_pins")
 }
 
 pub(crate) fn build_task_input_checkpoint(
@@ -1785,10 +1795,11 @@ pub(crate) async fn retained_plan_context(sess: &Session) -> CodexResult<Option<
     use crate::context::InternalContextSource;
     use crate::context::InternalModelContextFragment;
 
-    let Some(plan) = sess.services.plan_store.snapshot().await else {
+    let Some((plan, lineage)) = sess.services.plan_store.snapshot_with_lineage().await else {
         return Ok(None);
     };
-    let serialized = serde_json::to_string(&plan)
+    let retained = serde_json::json!({"current_plan": plan, "lineage": lineage});
+    let serialized = serde_json::to_string(&retained)
         .map_err(|error| CodexErr::Fatal(format!("could not preserve compaction plan: {error}")))?;
     let bounded = truncate_text_to_token_ceiling(&serialized, COMPACT_TASK_STATE_MAX_TOKENS);
     let mut body = format!(
@@ -1799,11 +1810,11 @@ completed plan steps do not establish acceptance.\n{bounded}"
     if bounded != serialized {
         let recovery = persist_compaction_recovery(
             sess,
-            CanonicalToolResult::json(serde_json::json!({"items": [{"current_plan": plan}]})),
+            CanonicalToolResult::json(serde_json::json!({"items": [retained]})),
         )
         .await?;
         body.push_str(
-            "\nChecklist excerpt is incomplete. Recover the full plan at /items/0/current_plan.\n",
+            "\nChecklist excerpt is incomplete. Recover the full plan and requirement lineage at /items/0.\n",
         );
         body.push_str(&recovery);
     }
@@ -2239,7 +2250,8 @@ async fn drain_to_completed(
             &turn_context.session_telemetry,
             crate::client::request_effort_for_model(
                 &turn_context.model_info,
-                turn_context.reasoning_effort.clone(),
+                turn_context.config.compaction_reasoning_effort.clone()
+                    .or_else(|| turn_context.reasoning_effort.clone()),
             ),
             turn_context.reasoning_summary,
             turn_context.config.service_tier.clone(),

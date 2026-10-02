@@ -50,6 +50,28 @@ fn native_request_preserves_native_launch_fields() {
     assert_eq!(prepared.arg0, params.arg0);
 }
 
+#[tokio::test]
+async fn native_admission_identifies_missing_cwd_and_executable_without_starting() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("not-present");
+    for (cwd, expected) in [
+        (missing.as_path(), "stage=cwd_metadata"),
+        (temp.path(), "stage=executable_metadata"),
+    ] {
+        let prepared = super::PreparedExecRequest {
+            command: vec![missing.to_string_lossy().into_owned()],
+            cwd: AbsolutePathBuf::from_absolute_path(cwd).unwrap(),
+            env: HashMap::new(),
+            arg0: None,
+            sandbox: codex_sandboxing::SandboxType::None,
+            windows_sandbox: None,
+        };
+        let error = prepared.spawn(false, false).await.err().expect("admission must fail");
+        assert!(error.contains("process not started"), "{error}");
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
 #[test]
 fn windows_restricted_token_request_prepares_session_launch() {
     let temp = tempfile::tempdir().expect("temporary cwd");
