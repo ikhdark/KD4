@@ -16,7 +16,6 @@ use std::sync::atomic::Ordering;
 
 use codex_config::schema::canonicalize as canonicalize_json;
 use codex_protocol::models::ResponseInputItem;
-#[cfg(test)]
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
@@ -2601,6 +2600,13 @@ impl TurnExecutionControl {
         .then(|| LIGHTWEIGHT_HANDOFF_ADVISORY.to_string())
     }
 
+    /// This turn's latest plan has steps, and every step is completed.
+    pub(crate) fn plan_completed(&self) -> bool {
+        self.plan
+            .as_ref()
+            .is_some_and(|plan| !plan.plan.is_empty() && !plan_is_unfinished(plan))
+    }
+
     pub(crate) fn take_soft_convergence_directive(
         &mut self,
         is_continuation: bool,
@@ -3379,7 +3385,6 @@ impl TurnExecutionControl {
     }
 }
 
-#[cfg(test)]
 fn plan_is_unfinished(plan: &UpdatePlanArgs) -> bool {
     !plan.plan.is_empty()
         && plan

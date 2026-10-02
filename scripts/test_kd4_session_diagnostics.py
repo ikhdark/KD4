@@ -237,6 +237,52 @@ class SessionDiagnosticsTest(unittest.TestCase):
             self.assertIsNone(metrics["usefulCheckpoints"])
             self.assertEqual(metrics["checkpointAttempts"], 2)
 
+    def test_successful_code_mode_wrapper_is_not_zero_failed_commands(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "rollout.jsonl"
+            source.write_text(
+                "\n".join(
+                    [
+                        _meta(str(root)),
+                        _event({"type": "task_started", "turn_id": "t"}),
+                        _response(
+                            {
+                                "type": "function_call",
+                                "call_id": "wrapped",
+                                "name": "functions.exec",
+                                "arguments": "text(await exec(...))",
+                            },
+                            "2026-08-17T00:00:00Z",
+                        ),
+                        _response(
+                            {
+                                "type": "function_call_output",
+                                "call_id": "wrapped",
+                                "output": '{"exit_code":0}',
+                            },
+                            "2026-08-17T00:00:01Z",
+                        ),
+                        _event(
+                            {
+                                "type": "task_complete",
+                                "turn_id": "t",
+                                "timing": _timing(),
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            measured = audit.analyze_session_path(source, root)["perTurn"][0][
+                "diagnostics"
+            ]
+            self.assertIsNone(measured["metrics"]["failedCommands"])
+            self.assertEqual(
+                measured["unavailableReasons"]["failedCommands"],
+                "nested_command_outcomes_not_observed",
+            )
+
     def test_evidence_truth_set_cli_and_snapshot_validation(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -494,6 +540,39 @@ class SessionDiagnosticsTest(unittest.TestCase):
                 for row in comparison["metrics"]
             ),
             3 * len(result["cohorts"][0]["metrics"]),
+        )
+
+    def test_cohorts_flag_sessions_from_different_builds(self):
+        # Two dirty builds of one commit differ only in the executable hash.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, executable in (("a", "1" * 64), ("b", "2" * 64)):
+                build = {
+                    "version": "0.0.0",
+                    "commit": "2aa8319174f7",
+                    "dirty": "true",
+                    "profile": "release",
+                    "built": "2026-09-30T00:00:00Z",
+                    "executable_sha256": executable,
+                }
+                meta = {"cwd": str(root), "harness_build": build}
+                lines = [
+                    json.dumps({"type": "session_meta", "payload": meta}),
+                    _event({"type": "task_started", "turn_id": name}),
+                    _event(
+                        {"type": "task_complete", "turn_id": name, "timing": _timing()}
+                    ),
+                ]
+                (root / f"rollout-{name}.jsonl").write_text(
+                    "\n".join(lines) + "\n", encoding="utf-8"
+                )
+            report = audit.analyze_session_path(root, root)
+        [cohort] = report["sessionDiagnostics"]["cohorts"]
+        self.assertEqual(
+            cohort["builds"], {f"sha256:{'1' * 64}": 1, f"sha256:{'2' * 64}": 1}
+        )
+        self.assertIn(
+            "mixed builds", "\n".join(diagnostics.render_diagnostics(report))
         )
 
     def test_coverage_blocks_comparisons_and_partial_metrics(self):

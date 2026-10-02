@@ -151,6 +151,7 @@ def tool_observation(name: str, arguments: str, output: str) -> dict[str, Any]:
         "signature": hashlib.sha256((name + "\0" + arguments).encode()).hexdigest(),
         "command": command,
         "commandFailed": exit_code != 0 if command and type(exit_code) is int else None,
+        "mayHideCommands": tool in ("exec", "wait"),
         "checkpoint": tool == "context_checkpoint",
         "checkpointUseful": checkpoint_useful,
     }
@@ -292,6 +293,12 @@ def _turn_metrics(record: dict, turn: dict, coverage: dict, annotation: dict) ->
         ):
             if all(type(row[key]) is bool for row in rows):
                 metrics[name] = sum(row[key] for row in rows)
+        if any(row.get("mayHideCommands") for row in observations):
+            # A successful JS wrapper is not evidence of successful children.
+            # Runtime outcome labels also lack process exit codes and may count
+            # several polls of one process, so do not substitute those counts.
+            metrics["failedCommands"] = None
+            reasons["failedCommands"] = "nested_command_outcomes_not_observed"
     for name in (
         "failedCommands",
         "duplicateToolRequests",
@@ -299,7 +306,7 @@ def _turn_metrics(record: dict, turn: dict, coverage: dict, annotation: dict) ->
         "usefulCheckpoints",
     ):
         if metrics[name] is None:
-            reasons[name] = "incomplete_top_level_tool_observations"
+            reasons.setdefault(name, "incomplete_top_level_tool_observations")
     if "redundantToolRequestIds" in annotation:
         metrics["redundantToolRequests"] = len(annotation["redundantToolRequestIds"])
     if "discoveredEvidenceIds" in annotation and "finalEvidenceIds" in annotation:
@@ -385,12 +392,15 @@ def build_diagnostics(
             ),
             key=lambda row: (-row["totalMs"], row["metric"]),
         )
+        # Builds stay out of the cohort key: baselines compare across builds.
+        builds = collections.Counter(row.get("build") or "unknown" for row in rows)
         cohorts.append(
             {
                 "population": population,
                 "status": status,
                 "lifecycle": lifecycle,
                 "timingSchemaVersion": schema,
+                "builds": dict(sorted(builds.items())),
                 "turns": len(rows),
                 "metrics": metrics,
                 "rankedTimeCosts": ranked,
@@ -574,6 +584,8 @@ def render_diagnostics(report: dict[str, Any]) -> list[str]:
             f"  {cohort['population']}/{cohort['lifecycle']}/schema-{cohort['timingSchemaVersion']}: "
             f"{cohort['turns']} turns; time costs={cohort['rankedTimeCosts']}"
         )
+        if len(cohort.get("builds", {})) > 1:
+            lines.append(f"    WARNING mixed builds in one cohort: {cohort['builds']}")
         for name in cohort["metrics"]:
             metric = cohort["metrics"][name]
             lines.append(

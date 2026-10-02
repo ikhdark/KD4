@@ -1770,9 +1770,11 @@ pub struct TurnTiming {
     pub local: TurnTimingLocal,
     pub milestones: TurnTimingMilestones,
     pub counters: TurnTimingCounters,
-    /// Additive terminalization phase timings captured as part of the terminal timing profile.
-    #[serde(default)]
-    pub terminalization: TurnTimingTerminalization,
+    /// Legacy timings from the retired turn-finalization pipeline.
+    /// Absent or null means not measured; current runtimes omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub terminalization: Option<TurnTimingTerminalization>,
     /// Per-sampling-request milestones, ordered by request. Times are offsets
     /// from turn start and are diagnostic only; they are not additive buckets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4336,6 +4338,11 @@ pub struct SessionBuildInfo {
     pub dirty: String,
     pub profile: String,
     pub built: String,
+    /// SHA-256 of the running executable; the fields above cannot tell two
+    /// dirty builds of one commit apart. Absent in older rollouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub executable_sha256: Option<String>,
 }
 
 /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
@@ -6153,10 +6160,7 @@ mod tests {
         assert_eq!(decoded.counters.tool_output_recursive_spill_count, 0);
         assert_eq!(decoded.counters.attributable_recovery_generation_count, 0);
         assert_eq!(decoded.counters.truncation_induced_continuation_count, 0);
-        assert_eq!(
-            decoded.terminalization,
-            TurnTimingTerminalization::default()
-        );
+        assert_eq!(decoded.terminalization, None);
         assert_eq!(decoded.model_requests.len(), 1);
         assert_eq!(
             decoded.model_requests[0].generation_reason,

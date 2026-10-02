@@ -1,5 +1,13 @@
 //! Shared runtime build metadata for executable surfaces.
 
+use std::io;
+use std::io::Read;
+use std::path::Path;
+use std::sync::OnceLock;
+
+use sha2::Digest;
+use sha2::Sha256;
+
 /// Version an executable reports about itself: `--version`, the TUI,
 /// `codex doctor`, and app-server build info. Release packaging embeds it
 /// through `CODEX_RELEASE_VERSION`; other builds use the Cargo package version.
@@ -66,6 +74,34 @@ impl BuildInfo {
             },
         }
     }
+}
+
+/// Lowercase hex SHA-256 of a file's contents.
+pub fn file_sha256(path: &Path) -> io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// SHA-256 of the running executable, hashed once per process. Commit, dirty
+/// flag, and the reproducible build timestamp cannot tell two dirty builds of
+/// one commit apart; this can. Hashing blocks, so call it off async workers.
+pub fn executable_sha256() -> Option<&'static str> {
+    static HASH: OnceLock<Option<String>> = OnceLock::new();
+    HASH.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(|path| file_sha256(&path))
+            .ok()
+    })
+    .as_deref()
 }
 
 #[cfg(test)]

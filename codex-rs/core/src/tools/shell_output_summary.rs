@@ -76,9 +76,18 @@ pub(crate) fn summarize_shell_output_for_model(
     {
         return None;
     }
-    if options.command_text.is_some_and(is_read_only_command) {
+    if options.command_text.is_some_and(|command| {
+        is_read_only_command(command)
+            || powershell_command_segments(command).is_some_and(|segments| {
+                segments
+                    .into_iter()
+                    .any(|segment| source_read_output_budget(segment).is_some())
+            })
+    }) {
         // Preserve the requested source order and the existing truncation/raw
         // artifact recovery path instead of ranking code as diagnostic prose.
+        // A later failing command does not make earlier source reads diagnostics.
+        // Without per-segment output boundaries, keep the entire mixed stream.
         return None;
     }
 
@@ -595,6 +604,41 @@ fn powershell_command_segments(script: &str) -> Option<Vec<&str>> {
     }
     segments.push(&script[start..]);
     Some(segments)
+}
+
+/// Whether exit 1 means "no matches": the final pipeline stage of a `;` or
+/// newline sequence is a native search (`rg`, `grep`, `findstr`), which owns
+/// the exit code. `&&`/`||` chains and blocks are excluded because an earlier
+/// command can own the exit code there.
+pub(crate) fn ends_with_native_search(command: &str) -> bool {
+    if command.contains("&&") || command.contains("||") {
+        return false;
+    }
+    let Some(last) = powershell_command_segments(command).and_then(|segments| {
+        segments
+            .into_iter()
+            .map(str::trim)
+            .rfind(|segment| !segment.is_empty())
+    }) else {
+        return false;
+    };
+    if last.contains(['}', ')']) {
+        return false;
+    }
+    let program = last
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['"', '\'']);
+    let program = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    matches!(
+        program.strip_suffix(".exe").unwrap_or(&program),
+        "rg" | "grep" | "findstr"
+    )
 }
 
 #[derive(Clone, Copy, Default)]

@@ -1,97 +1,75 @@
 //! Complete core turns; the provider is scripted, not live inference.
 use super::assert_eq;
 use super::*;
-use std::io::Write;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_delivery_preserves_answer_and_removes_final_model_request() -> Result<()> {
     require_network!();
-    let benchmark_path = std::env::var_os("DIRECT_DELIVERY_BENCH_OUTPUT");
-    for sample in 0..if benchmark_path.is_some() { 3 } else { 1 } {
-        for candidate in if sample % 2 == 0 {
-            [false, true]
+    for candidate in [false, true] {
+        let server = responses::start_mock_server().await;
+        let mut builder = test_codex().with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            let _ = config.features.enable(Feature::Kd4Runtime);
+        });
+        let test = builder.build(&server).await?;
+        let answer = "Verified answer: α → β.\nPreserve this exact text.\n";
+        fs::write(test.cwd.path().join("answer.txt"), answer)?;
+        let prefix = if candidate {
+            "// @exec: {\"deliver\": true}\n"
         } else {
-            [true, false]
-        } {
-            let server = responses::start_mock_server().await;
-            let mut builder = test_codex().with_config(|config| {
-                let _ = config.features.enable(Feature::CodeMode);
-                let _ = config.features.enable(Feature::Kd4Runtime);
-            });
-            let test = builder.build(&server).await?;
-            let answer = "Verified answer: α → β.\nPreserve this exact text.\n";
-            fs::write(test.cwd.path().join("answer.txt"), answer)?;
-            let prefix = if candidate {
-                "// @exec: {\"deliver\": true}\n"
-            } else {
-                ""
-            };
-            let code = format!(
-                "{prefix}const r = await tools.read_file({{path:'answer.txt'}}); if (!r.file_complete) throw new Error('incomplete source'); text(r.results[0].text);"
-            );
-            responses::mount_sse_once(
-                &server,
-                sse(vec![
-                    ev_response_created("initial"),
-                    ev_custom_tool_call("compute-answer", "exec", &code),
-                    ev_completed("initial"),
-                ]),
+            ""
+        };
+        let code = format!(
+            "{prefix}const r = await tools.read_file({{path:'answer.txt'}}); if (!r.file_complete) throw new Error('incomplete source'); text(r.results[0].text);"
+        );
+        responses::mount_sse_once(
+            &server,
+            sse(vec![
+                ev_response_created("initial"),
+                ev_custom_tool_call("compute-answer", "exec", &code),
+                ev_completed("initial"),
+            ]),
+        )
+        .await;
+        // Also mounted for the candidate: a regression finishes normally
+        // and fails our request-count assertion rather than timing out.
+        let final_response = responses::mount_sse_once(
+            &server,
+            sse(vec![
+                ev_assistant_message("answer", answer),
+                ev_completed("final"),
+            ]),
+        )
+        .await;
+        let completed = test
+            .submit_turn_and_capture_completion("Return the complete contents of answer.txt.")
+            .await?;
+        assert!(completed.error.is_none(), "{:?}", completed.error);
+        assert_eq!(completed.last_agent_message.as_deref(), Some(answer));
+        if candidate {
+            let surfaced = completed.surfaced_result.as_ref().expect("direct answer");
+            assert_eq!(surfaced.adapter, "code_mode_delivery");
+            assert_eq!(surfaced.canonical_message.as_deref(), Some(answer));
+        } else {
+            assert!(completed.surfaced_result.is_none());
+            let output = custom_tool_output_last_non_empty_text(
+                &final_response.single_request(),
+                "compute-answer",
             )
-            .await;
-            // Also mounted for the candidate: a regression finishes normally
-            // and fails our request-count assertion rather than timing out.
-            let final_response = responses::mount_sse_once(
-                &server,
-                sse(vec![
-                    ev_assistant_message("answer", answer),
-                    ev_completed("final"),
-                ]),
-            )
-            .await;
-            let started = Instant::now();
-            let completed = test
-                .submit_turn_and_capture_completion("Return the complete contents of answer.txt.")
-                .await?;
-            let elapsed = started.elapsed();
-            assert!(completed.error.is_none(), "{:?}", completed.error);
-            assert_eq!(completed.last_agent_message.as_deref(), Some(answer));
-            if candidate {
-                let surfaced = completed.surfaced_result.as_ref().expect("direct answer");
-                assert_eq!(surfaced.adapter, "code_mode_delivery");
-                assert_eq!(surfaced.canonical_message.as_deref(), Some(answer));
-            } else {
-                assert!(completed.surfaced_result.is_none());
-                let output = custom_tool_output_last_non_empty_text(
-                    &final_response.single_request(),
-                    "compute-answer",
-                )
-                .expect("computed answer");
-                assert_eq!(output, answer);
-            }
-            let model_requests = server
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .filter(|r| r.url.path().contains("responses"))
-                .count();
-            assert_eq!(model_requests, if candidate { 1 } else { 2 });
-            let timing = completed.timing.as_ref().expect("turn timing");
-            assert_eq!(timing.counters.logical_generation_count as usize, model_requests);
-            assert_eq!(timing.counters.model_request_count as usize, model_requests);
-            if let Some(path) = &benchmark_path {
-                let record = serde_json::json!({
-                    "sample": sample, "candidate": candidate,
-                    "complete_turn_ns": elapsed.as_nanos() as u64,
-                    "model_requests": model_requests,
-                    "logical_generations": timing.counters.logical_generation_count,
-                    "task_success": true,
-                    "scope": "complete core turn, code-mode host and real file read; scripted provider, not live inference"
-                });
-                let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
-                writeln!(file, "{record}")?;
-            }
+            .expect("computed answer");
+            assert_eq!(output, answer);
         }
+        let model_requests = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().contains("responses"))
+            .count();
+        assert_eq!(model_requests, if candidate { 1 } else { 2 });
+        let timing = completed.timing.as_ref().expect("turn timing");
+        assert_eq!(timing.counters.logical_generation_count as usize, model_requests);
+        assert_eq!(timing.counters.model_request_count as usize, model_requests);
     }
     Ok(())
 }

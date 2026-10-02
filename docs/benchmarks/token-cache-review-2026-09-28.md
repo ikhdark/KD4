@@ -179,20 +179,13 @@ part of this follow-up. The new test does not cover live inference, cancellation
 all output modalities, or production deployment. Broader production integration
 and live-model A/B remain separate requirements.
 
-## Reproduction and evidence
+## Historical evidence
 
-From the checkout root, using fresh output directories:
+The Rust benchmark system and its Python runners have been removed. This report
+preserves historical measurements, not instructions for a supported benchmark.
 
-```powershell
-python scripts/benchmark_token_cache.py components --output codex-rs/target/token-cache-review/new-components
-python scripts/benchmark_token_cache.py e2e --output codex-rs/target/token-cache-review/new-e2e
-python scripts/benchmark_token_cache.py candidate-e2e --output codex-rs/target/token-cache-review/new-candidate-e2e
-# Focused rerun, if this specific test changes:
-python scripts/benchmark_token_cache.py e2e --test code_mode_truncated_cell_output_names_a_recoverable_artifact --output codex-rs/target/token-cache-review/new-recovery
-```
-
-The runner reserves the repository's core-tests Cargo lane, validates execution
-counts/order, and records commands, timestamps, exit status, and before/after
+The retired runner reserved the repository's core-tests Cargo lane, validated execution
+counts/order, and recorded commands, timestamps, exit status, and before/after
 SHA-256 hashes for relevant source files (12 originally, 13 with the candidate
 E2E source). This is a scoped source manifest,
 not a hermetic dependency/build fingerprint. Successful component and focused
@@ -224,8 +217,8 @@ edited benchmark compile failure. The latter no longer blocked the successful
 run; its source was not modified by this work. Partial attempts are not used
 as final measurement evidence.
 
-Harness sources: `scripts/benchmark_token_cache.py` and
-`codex-rs/core/src/tools/code_mode/token_cache_benchmarks.rs`, plus
-`codex-rs/core/tests/suite/code_mode_token_cache_e2e.rs`.
+The production full-turn regression remains in
+`codex-rs/core/tests/suite/code_mode_token_cache_e2e.rs`, without the retired
+component, candidate-on/off, or live-model benchmark machinery.
 No provider cache improvement or reduced model output is claimed. Production
 implementation and live-model A/B remain separate follow-up work.

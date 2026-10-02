@@ -373,6 +373,7 @@ pub(crate) async fn run_turn(
     let mut last_stop_repair = None;
     let mut completion_evidence = None;
     let mut provider_overflow_recovery_attempted = false;
+    let mut final_answer_compaction_deferred = false;
     if run_pending_session_start_hooks(&sess, &turn_context).await {
         return Ok(finish_stopped_session_start(&sess, input).await);
     }
@@ -940,8 +941,20 @@ pub(crate) async fn run_turn(
                     );
                 }
 
+                let defer_compaction = !new_context_requested
+                    && needs_follow_up
+                    && token_limit_reached
+                    && !final_answer_compaction_deferred
+                    && defer_compaction_for_final_answer(
+                        turn_execution.plan_completed(),
+                        token_status.active_context_tokens,
+                        turn_context.model_context_window(),
+                    );
+                final_answer_compaction_deferred |= defer_compaction;
                 // Automatic compaction verifies that the replacement fits before continuing.
-                if new_context_requested || (needs_follow_up && token_limit_reached) {
+                if !defer_compaction
+                    && (new_context_requested || (needs_follow_up && token_limit_reached))
+                {
                     record_convergence_decision(
                         sess.as_ref(),
                         turn_context.as_ref(),
@@ -2688,6 +2701,26 @@ fn projected_prompt_tokens_from_estimates(
     let server_usage_with_pending_body =
         active_context_tokens.saturating_add(pending_body_growth_tokens);
     locally_estimated_prompt.max(server_usage_with_pending_body)
+}
+
+/// Recorded final-answer requests used at most ~1.5K output and reasoning tokens.
+const FINAL_ANSWER_TOKEN_RESERVE: i64 = 8_192;
+
+/// A completed plan means the next request is most likely the final answer.
+/// Compacting first spends a summarization request (96 s in a recorded turn)
+/// only to answer from a summary. Defer once while the answer still fits:
+/// another tool call compacts on the next check, and a provider overflow still
+/// compacts and retries. `active_context_tokens` is server usage plus the
+/// unsent tail, not the local whole-prompt estimate.
+fn defer_compaction_for_final_answer(
+    plan_completed: bool,
+    active_context_tokens: i64,
+    context_window: Option<i64>,
+) -> bool {
+    plan_completed
+        && context_window.is_some_and(|window| {
+            active_context_tokens.saturating_add(FINAL_ANSWER_TOKEN_RESERVE) <= window
+        })
 }
 
 fn build_bounded_skill_context_items<'a, F>(

@@ -415,7 +415,7 @@ fn validation_invocation(mut words: &[&str]) -> bool {
                     ["build" | "check" | "test" | "nextest" | "clippy", ..]
                 )
             }
-            ("rustc" | "pytest" | "tsc" | "eslint" | "ruff" | "mypy", _) => true,
+            ("rustc" | "pytest" | "vitest" | "tsc" | "eslint" | "ruff" | "mypy", _) => true,
             ("python" | "python3" | "py", ["-m", "unittest" | "pytest", ..]) => true,
             ("python" | "python3" | "py", [script, ..]) => {
                 script.rsplit(['/', '\\']).next() == Some("rust_test_runner.py")

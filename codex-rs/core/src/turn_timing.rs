@@ -49,7 +49,6 @@ use codex_protocol::protocol::TurnTimingProgressKind;
 use codex_protocol::protocol::TurnTimingProviderTokenUsage;
 use codex_protocol::protocol::TurnTimingRequestDiagnosticsStatus;
 use codex_protocol::protocol::TurnTimingRequestTokenCategories;
-use codex_protocol::protocol::TurnTimingTerminalization;
 use codex_protocol::protocol::TurnTimingToolCall;
 use codex_protocol::protocol::TurnTimingToolCallIdentity;
 use codex_protocol::protocol::TurnTimingToolCallSource;
@@ -689,7 +688,7 @@ impl TurnTimingSnapshot {
             local,
             milestones,
             counters,
-            terminalization: profile.terminalization.clone(),
+            terminalization: None,
             model_requests,
             tool_calls: profile.tool_calls.clone(),
             tool_call_details_artifact_id: None,
@@ -759,7 +758,6 @@ pub(crate) struct TurnTimingProfile {
     pub(crate) deterministic_continuation_receipts: Vec<TurnTimingDeterministicContinuationReceipt>,
     pub(crate) deterministic_continuation_receipt_overflow: u32,
     pub(crate) pre_first_model_output: Option<PreFirstModelOutputTiming>,
-    pub(crate) terminalization: TurnTimingTerminalization,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1020,7 +1018,6 @@ struct TurnTimingStateInner {
     dispatch_ready_snapshot: Option<(u128, u128, ClientCriticalPhaseTiming)>,
     ready_to_sample_ns: Option<u128>,
     pre_first_model_output: Option<PreFirstModelOutputTiming>,
-    terminalization: TurnTimingTerminalization,
     tool_output_truncation_pending_continuation: bool,
     tool_output_recovery_read_pending_continuation: bool,
     deterministic_continuation_receipts:
@@ -3898,7 +3895,6 @@ impl TurnTimingStateInner {
             deterministic_continuation_receipt_overflow: self
                 .deterministic_continuation_receipt_overflow,
             pre_first_model_output: self.pre_first_model_output.clone(),
-            terminalization: self.terminalization.clone(),
         };
         let legacy_profile = self
             .legacy

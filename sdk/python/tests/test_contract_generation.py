@@ -94,6 +94,10 @@ def test_public_notification_payload_matches_generated_registry() -> None:
     assert ServerInfo not in payload_types
 
 
+def test_retired_terminalization_defaults_to_unmeasured() -> None:
+    assert generated_v2.TurnTiming.model_fields["terminalization"].default is None
+
+
 def test_removed_protocol_contracts_are_absent() -> None:
     retired_notification_methods = {
         "item/fileChange/outputDelta",

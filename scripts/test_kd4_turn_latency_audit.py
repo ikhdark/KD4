@@ -733,6 +733,36 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                 report["runnerDiagnostics"]["coverage"]["nativeTimingProfiles"], 2
             )
 
+    def test_checkout_overlaps_name_files_edited_by_concurrent_sessions(self):
+        # One session patches directly with a Windows path; the other embeds the
+        # patch in exec code, where separators and newlines are JS escapes.
+        direct = (
+            "*** Begin Patch\n*** Update File: C:\\repo\\src\\replay.ts\n"
+            "@@\n-a\n+b\n*** End Patch"
+        )
+        embedded = (
+            'await tools.apply_patch("*** Begin Patch\\n*** Update File: '
+            'src\\\\replay.ts\\n@@\\n-a\\n+b\\n*** End Patch")'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, tool, source in (
+                ("a", "apply_patch", direct),
+                ("b", "exec", embedded),
+            ):
+                call = {"type": "custom_tool_call", "name": tool, "call_id": name}
+                lines = [
+                    _meta("C:\\repo"),
+                    _event({"type": "task_started", "turn_id": name}),
+                    _response(call | {"input": source}, "2026-08-17T00:00:00Z"),
+                    _event({"type": "task_complete", "turn_id": name, "timing": _timing()}),
+                ]
+                (root / f"{name}.jsonl").write_text("\n".join(lines), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(root, root)
+        overlaps = report["checkoutOverlaps"]
+        self.assertEqual(overlaps["pairs"], 1)
+        self.assertEqual(overlaps["overlaps"][0]["sharedPaths"], ["c:/repo/src/replay.ts"])
+
     def test_behavior_counter_maxima_are_unavailable_even_without_saturation_flag(self):
         for key, maximum in (
             ("provenLoopActivationCount", 2**32 - 1),

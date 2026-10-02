@@ -110,6 +110,22 @@ fn a_failing_flat_list_is_still_summarized() {
 }
 
 #[test]
+fn a_later_failure_does_not_rank_away_source_reads() {
+    let output = format!("{}error: unknown help option\n", "source evidence\n".repeat(700));
+    for command in [
+        "Get-Content README.md; pnpm inspect:vendor --help",
+        "cat README.md; custom-command",
+        "rg 'error|warning' src; cargo test",
+    ] {
+        assert_eq!(
+            summarize_shell_output_for_model(&output, 1, false, options(Some(command), Some(1000))),
+            None,
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn small_output_is_unchanged() {
     let output = "ok\n";
 
@@ -787,18 +803,28 @@ fn powershell_read_pipelines_use_ordered_truncation() {
         );
     }
 
-    // A script that also mutates or builds is not a read; its diagnostics still rank.
+    // A mixed script is not read-only, but its source output still must not
+    // be ranked as diagnostics merely because another segment builds or writes.
     for command in [
         "Get-Content src/lib.rs; Remove-Item src/old.rs",
         "Get-Content src/lib.rs; cargo build",
         "git checkout -- src/lib.rs; Get-Content src/lib.rs",
         "Get-ChildItem src | ForEach-Object { Set-Content $_ '' }",
         "rg -n 'a|b' src; Remove-Item 'old|new.rs'",
+        "Get-Content src/lib.rs; $removed = Remove-Item src/old.rs",
+        "[IO.File]::Delete('src/old.rs'); Get-Content src/lib.rs",
+    ] {
+        assert!(!is_read_only_command(command), "{command}");
+        assert_eq!(
+            summarize_shell_output_for_model(&output, 0, false, options(Some(command), Some(400))),
+            None,
+            "{command}"
+        );
+    }
+    for command in [
         // A single quote inside a double-quoted string must not hide a command.
         "Write-Output \"it's\"; Remove-Item src/old.rs; Write-Output 'done'",
-        "Get-Content src/lib.rs; $removed = Remove-Item src/old.rs",
         "Write-Output \"$(Remove-Item src/old.rs)\"",
-        "[IO.File]::Delete('src/old.rs'); Get-Content src/lib.rs",
     ] {
         assert!(
             summarize_shell_output_for_model(&output, 0, false, options(Some(command), Some(400)))
@@ -1023,5 +1049,27 @@ fn source_reads_get_room_without_expanding_noisy_command_defaults() {
         "cat file; cargo test",
     ] {
         assert_eq!(super::source_read_output_budget(command), None, "{command}");
+    }
+}
+
+#[test]
+fn exit_one_means_no_matches_only_when_a_final_search_owns_the_exit_code() {
+    for command in [
+        "rg -n foo src",
+        "Get-Content README.md -TotalCount 40; rg -n 'a|b' src",
+        "Get-ChildItem src\nrg.exe -n foo",
+        "Get-Content log.txt | findstr ERROR",
+    ] {
+        assert!(super::ends_with_native_search(command), "{command}");
+    }
+    for command in [
+        "pnpm build && rg foo src",
+        "rg foo src || echo none",
+        "if ($ok) { rg foo src }",
+        "rg foo src; exit $LASTEXITCODE",
+        "pnpm replay -- help corpus",
+        "Get-NetTCPConnection -LocalPort 3005 -ErrorAction SilentlyContinue",
+    ] {
+        assert!(!super::ends_with_native_search(command), "{command}");
     }
 }

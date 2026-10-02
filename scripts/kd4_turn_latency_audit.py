@@ -822,6 +822,131 @@ def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_PATCHED_FILE = re.compile(r"\*\*\* (?:Update|Add|Delete) File: ([^\r\n]+)")
+# In JS source a patch line ends at a `\n` escape, and path separators are `\\`.
+_PATCHED_FILE_IN_CODE = re.compile(
+    r"\*\*\* (?:Update|Add|Delete) File: (.+?)(?=\\[nr]|[\r\n\"'`]|$)"
+)
+
+
+def _patched_paths(tool_input: str, cwd: str, *, embedded: bool) -> set[str]:
+    """Files named by patch headers, including patches embedded in exec code."""
+    if embedded:
+        tool_input = tool_input.replace("\\\\", "/")
+    pattern = _PATCHED_FILE_IN_CODE if embedded else _PATCHED_FILE
+    paths = set()
+    for match in pattern.finditer(tool_input):
+        path = match.group(1).strip().strip("\"'`")
+        if not re.match(r"^(?:[A-Za-z]:[\\/]|[\\/])", path):
+            path = f"{cwd}/{path}"
+        paths.add(path.replace("\\", "/").casefold())
+    return paths
+
+
+def _request_cost_model(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Least-squares fit of model wait per request against its output tokens."""
+    points = []
+    for record in records:
+        for request in record["timing"].get("modelRequests") or []:
+            usage = request.get("tokenUsage") or {}
+            wait_ns = request.get("modelStreamWaitNs")
+            if isinstance(wait_ns, (int, float)):
+                tokens = (usage.get("visibleOutputTokens") or 0) + (
+                    usage.get("reasoningTokens") or 0
+                )
+                points.append((tokens, wait_ns / 1e9))
+    count = len(points)
+    if count < 3:
+        return None
+    mean_x = sum(x for x, _ in points) / count
+    mean_y = sum(y for _, y in points) / count
+    sxx = sum((x - mean_x) ** 2 for x, _ in points)
+    syy = sum((y - mean_y) ** 2 for _, y in points)
+    sxy = sum((x - mean_x) * (y - mean_y) for x, y in points)
+    if not sxx or not syy:
+        return None
+    slope = sxy / sxx
+    return {
+        "requests": count,
+        "fixedSeconds": round(mean_y - slope * mean_x, 2),
+        "perOutputTokenMs": round(slope * 1000, 1),
+        "correlation": round(sxy / (sxx * syy) ** 0.5, 3),
+    }
+
+
+def _output_channels(
+    visible_bytes: collections.Counter[str], records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Visible output by channel (byte shares) and reasoning's share of output tokens."""
+    total = sum(visible_bytes.values())
+    visible_tokens = reasoning_tokens = 0
+    for record in records:
+        for request in record["timing"].get("modelRequests") or []:
+            usage = request.get("tokenUsage") or {}
+            visible_tokens += usage.get("visibleOutputTokens") or 0
+            reasoning_tokens += usage.get("reasoningTokens") or 0
+    output_tokens = visible_tokens + reasoning_tokens
+    return {
+        "visibleByteShares": {
+            name: round(count / total, 3) for name, count in sorted(visible_bytes.items())
+        }
+        if total
+        else {},
+        "reasoningTokenShare": round(reasoning_tokens / output_tokens, 3)
+        if output_tokens
+        else None,
+    }
+
+
+def _checkout_overlaps(
+    records: list[dict[str, Any]],
+    edited_paths: dict[tuple[str, str], set[str]],
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Editing turns from different sessions that ran at once in one checkout."""
+    turns = []
+    for record in records:
+        timing = record["timing"]
+        start = timing.get("startedAtUnixMs")
+        end = timing.get("completedAtUnixMs")
+        paths = edited_paths.get((record["file"], record["turn_id"]))
+        if paths and isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            checkout = str(record.get("cwd") or "").replace("\\", "/").casefold()
+            turns.append((checkout, record["file"], record["turn_id"], start, end, paths))
+    pairs = []
+    for index, first in enumerate(turns):
+        for second in turns[index + 1 :]:
+            if first[0] != second[0] or first[1] == second[1]:
+                continue
+            overlap_ms = min(first[4], second[4]) - max(first[3], second[3])
+            if overlap_ms > 0:
+                pairs.append(
+                    {
+                        "checkout": first[0],
+                        "sessions": [Path(first[1]).name, Path(second[1]).name],
+                        "turns": [first[2], second[2]],
+                        "overlapSeconds": round(overlap_ms / 1000, 1),
+                        "sharedPaths": sorted(first[5] & second[5])[:10],
+                    }
+                )
+    pairs.sort(key=lambda pair: (-len(pair["sharedPaths"]), -pair["overlapSeconds"]))
+    return {
+        "pairs": len(pairs),
+        "overlaps": pairs[:limit],
+        "omittedPairs": max(0, len(pairs) - limit),
+    }
+
+
+def _build_identity(session_meta: dict[str, Any]) -> str | None:
+    """Running harness binary; commit and dirty flag cannot separate dirty builds."""
+    build = session_meta.get("harness_build")
+    if not isinstance(build, dict):
+        return None
+    if build.get("executable_sha256"):
+        return f"sha256:{build['executable_sha256']}"
+    return f"commit:{build.get('commit', 'unknown')}/dirty:{build.get('dirty', 'unknown')}"
+
+
 def _terminal_record(
     file: Path, line_number: int, timestamp: Any, cwd: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1549,6 +1674,8 @@ def analyze_session_path(
     first_timestamp_ns: int | None = None
     last_timestamp_ns: int | None = None
     native_events: list[dict[str, Any]] = []
+    output_channel_bytes: collections.Counter[str] = collections.Counter()
+    edited_paths: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
 
     def record_tool_batch(count: int) -> None:
         if count:
@@ -1572,6 +1699,7 @@ def analyze_session_path(
         snapshots.append(snapshot.metadata())
         byte_count += snapshot.byte_length
         cwd = ""
+        build = None
         with contextlib.closing(snapshot.stream), snapshot.open_lines() as handle:
             for line_number, line in enumerate(handle, 1):
                 line_count += 1
@@ -1658,7 +1786,18 @@ def analyze_session_path(
                     last_tool_output_ns = None
                 if item.get("type") == "session_meta":
                     cwd = str(payload.get("cwd") or cwd)
+                    build = _build_identity(payload) or build
                 payload_type = payload.get("type")
+                if (
+                    item.get("type") == "response_item"
+                    and payload_type == "message"
+                    and payload.get("role") == "assistant"
+                ):
+                    output_channel_bytes["prose"] += sum(
+                        len(str(part.get("text") or "").encode("utf-8"))
+                        for part in payload.get("content") or []
+                        if isinstance(part, dict)
+                    )
                 if item.get("type") == "response_item" and payload_type in (
                     "custom_tool_call",
                     "function_call",
@@ -1675,6 +1814,19 @@ def analyze_session_path(
                             timestamp_ns - current_sampling_boundary_ns
                         )
                     calls_since_sampling_boundary += 1
+                    tool_input = _tool_input_text(payload)
+                    tool_name = str(payload.get("name") or "")
+                    output_channel_bytes[
+                        {"exec": "execCode", "apply_patch": "patches"}.get(
+                            tool_name, "otherToolInput"
+                        )
+                    ] += len(tool_input.encode("utf-8"))
+                    if active_turn_id is not None:
+                        edited_paths[(str(file), active_turn_id)].update(
+                            _patched_paths(
+                                tool_input, cwd, embedded=tool_name != "apply_patch"
+                            )
+                        )
                     if call_id and timestamp_ns is not None:
                         pending_tool_calls[str(call_id)] = {
                             "callId": str(call_id),
@@ -1684,7 +1836,7 @@ def analyze_session_path(
                             "diagnosticToolName": str(payload.get("name") or "unknown"),
                             "turnId": active_turn_id,
                             "timestamp": item.get("timestamp"),
-                            "input": _tool_input_text(payload),
+                            "input": tool_input,
                         }
                 elif item.get("type") == "response_item" and payload_type in (
                     "custom_tool_call_output",
@@ -1817,6 +1969,7 @@ def analyze_session_path(
                     file, line_number, item.get("timestamp"), cwd, payload
                 )
                 record["turn_id"] = turn_id
+                record["build"] = build
                 terminal_lifecycle_counts[record["lifecycle"]] += 1
                 timing = record["timing"]
                 if not isinstance(timing, dict):
@@ -2058,6 +2211,9 @@ def analyze_session_path(
         per_turn=per_turn,
         evidence=diagnostic_evidence,
     )
+    report["requestCostModel"] = _request_cost_model(valid)
+    report["outputChannels"] = _output_channels(output_channel_bytes, valid)
+    report["checkoutOverlaps"] = _checkout_overlaps(valid, edited_paths)
     if startup_log is not None:
         report["startupTiming"] = _startup_log_report(startup_log)
     return report
@@ -2113,6 +2269,31 @@ def render_report(report: dict[str, Any]) -> str:
             f"{execution_loop.get('pairedToolRoundTripNs', 0) / 1e9:.1f}s "
             f"wall-union={execution_loop.get('pairedToolRoundTripUnionNs', 0) / 1e9:.1f}s "
             f"handoff={execution_loop.get('postToolHandoffNs', 0) / 1e9:.1f}s"
+        )
+    cost = report.get("requestCostModel")
+    if cost is not None:
+        lines.append(
+            f"request cost: {cost['fixedSeconds']}s + {cost['perOutputTokenMs']}ms per "
+            f"output token (r={cost['correlation']}, n={cost['requests']})"
+        )
+    channels = report.get("outputChannels") or {}
+    if channels.get("visibleByteShares"):
+        shares = ", ".join(
+            f"{name}={share:.0%}" for name, share in channels["visibleByteShares"].items()
+        )
+        lines.append(
+            f"visible output (byte shares): {shares}; "
+            f"reasoning={channels['reasoningTokenShare']:.0%} of output tokens"
+            if channels.get("reasoningTokenShare") is not None
+            else f"visible output (byte shares): {shares}"
+        )
+    overlaps = report.get("checkoutOverlaps") or {}
+    if overlaps.get("pairs"):
+        top = overlaps["overlaps"][0]
+        lines.append(
+            f"checkout overlaps: {overlaps['pairs']} pairs of editing turns from different "
+            f"sessions ran at once; top {top['overlapSeconds']}s in {top['checkout']} "
+            f"({', '.join(top['sessions'])}; shared files={len(top['sharedPaths'])})"
         )
     orchestration = report["commandOrchestration"]
     if orchestration["reportedChildRuntimeCalls"]:

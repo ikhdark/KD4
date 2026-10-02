@@ -984,7 +984,7 @@ impl ContextManager {
     }
 
     // Estimate token usage using byte-based heuristics from the truncation helpers.
-    // This is a coarse lower bound, not a tokenizer-accurate count.
+    // This is a coarse estimate, not a tokenizer-accurate count or a guaranteed lower bound.
     pub(crate) fn estimate_token_count(&self, turn_context: &TurnContext) -> Option<i64> {
         self.estimate_prepared_token_count_with_base_instructions(
             &turn_context.model_info.input_modalities,

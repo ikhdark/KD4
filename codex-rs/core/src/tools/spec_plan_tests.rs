@@ -906,7 +906,6 @@ async fn wait_is_always_registered_when_code_mode_is_enabled() {
 }
 
 #[tokio::test]
-#[allow(clippy::print_stdout)]
 async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
     let configure = |turn: &mut TurnContext, code_mode_only| {
         set_features(
@@ -1008,24 +1007,6 @@ async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
             mixed_exec.description.contains(&format!("{name}(args: unknown")),
             "{name} projection did not reach the model-visible exec contract"
         );
-        let record = json!({
-            "tool": name,
-            "before_tokens": before_tokens,
-            "after_tokens": after_tokens,
-            "before_bytes": before.len(),
-            "after_bytes": after.len(),
-            "scope": "duplicate declaration only; direct schema remains unchanged"
-        });
-        println!("MIXED_SCHEMA_BENCH {record}");
-        if let Some(path) = std::env::var_os("KD4_TOKEN_CACHE_BENCH_OUTPUT") {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .unwrap();
-            writeln!(file, "{record}").unwrap();
-        }
     }
 }
 

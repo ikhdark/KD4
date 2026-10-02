@@ -1629,7 +1629,11 @@ impl UnifiedExecProcessManager {
                 .map(|_| process.session_capabilities(request.tty)),
             exit_code,
             process_exited,
-            search_no_match: request.attempt_key.is_search_no_match(exit_code),
+            search_no_match: request.attempt_key.is_search_no_match(exit_code)
+                || (exit_code == Some(1)
+                    && crate::tools::shell_output_summary::ends_with_native_search(
+                        &request.hook_command,
+                    )),
             original_token_count: Some(original_token_count),
             hook_command: Some(request.hook_command.clone()),
             raw_output_artifact: match poll_bound {
@@ -2266,8 +2270,9 @@ impl UnifiedExecProcessManager {
             process_id,
             cwd: cwd.clone(),
             initial_exec_command_active,
+            search_exit_one_is_no_match: attempt_key.is_search_no_match(Some(1))
+                || crate::tools::shell_output_summary::ends_with_native_search(&hook_command),
             hook_command,
-            search_exit_one_is_no_match: attempt_key.is_search_no_match(Some(1)),
             tty,
             validation_launch,
             network_approval: network_approval.clone(),

@@ -16,10 +16,6 @@ test = false
 [lints]
 workspace = true
 
-[features]
-# Opt-in prototypes for integrated live-model measurements; never a default feature.
-bench-generation-opportunities = []
-
 [dependencies]
 codex-client = { workspace = true }
 anyhow = { workspace = true }

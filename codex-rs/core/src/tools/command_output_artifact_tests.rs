@@ -68,7 +68,6 @@ async fn logical_artifact_for_test(
 }
 
 #[tokio::test]
-#[cfg(not(feature = "bench-generation-opportunities"))]
 #[serial_test::serial(command_output_artifact)]
 async fn shared_search_hydration_preserves_evidence_and_independent_recovery() {
     let temp = tempfile::tempdir().unwrap();
@@ -138,7 +137,6 @@ async fn shared_search_hydration_preserves_evidence_and_independent_recovery() {
 }
 
 #[test]
-#[cfg(not(feature = "bench-generation-opportunities"))]
 fn shared_search_hydration_rejects_missing_tiny_or_non_saving_evidence() {
     let range = CanonicalByteRange::new(0, 512);
     let reference = serde_json::json!({"selector":{"kind":"lines","start":1,"end":1},"canonical_range":range,"exact_bytes":512});
@@ -4308,68 +4306,6 @@ async fn threads_with_live_or_archived_compressed_rollouts_are_resumable() {
             .expect("archived")
     );
     assert!(!thread_rollout_exists(home, deleted).await.expect("deleted"));
-}
-fn generation_search_projection(result: &ReadToolOutputResult, coordinates_only: bool) -> Value {
-    let mut result = serde_json::to_value(result).unwrap();
-    let mut shared = Vec::<Value>::new();
-    for selection in result["results"].as_array_mut().unwrap() {
-        let Some(value) = selection.get_mut("value") else {continue};
-        let Some(ranges) = value.get_mut("hydrated_ranges").and_then(Value::as_array_mut) else {continue};
-        if coordinates_only {ranges.clear();continue;}
-        for range in ranges {
-            if let Some(index) = shared.iter().position(|previous| previous == range) {
-                *range = serde_json::json!({"shared_excerpt":index});
-            } else {
-                shared.push(range.clone());
-                *range = serde_json::json!({"shared_excerpt":shared.len()-1});
-            }
-        }
-    }
-    if !coordinates_only {result["shared_excerpts"] = serde_json::json!(shared);}
-    result
-}
-
-async fn generation_search_case(finding:u32, queries:&[&str], dense:bool) {
-    use crate::generation_benchmarks::{emit,measure,tokens};
-    let home = tempfile::tempdir().unwrap();
-    let text = (0..24).map(|i|format!("line {i:03} {} {} {}\n",if dense {"ALPHA BETA GAMMA"} else if i%3 == 0 {"ALPHA"} else if i%3 == 1 {"BETA"} else {"GAMMA"},"source evidence ".repeat(5),"é")).collect::<String>();
-    let (metadata,snapshot) = logical_artifact_for_test(home.path(),&text).await;
-    let selectors = queries.iter().map(|query|ToolOutputSelector::Search{ case_insensitive: false,query:(*query).into(),start_byte:0,max_results:100,context_lines:0}).collect::<Vec<_>>();
-    let select = ||select_tool_output_snapshot(&metadata,&snapshot,selectors.clone(),10_000).unwrap();
-    let baseline_result = select();
-    assert!(baseline_result.complete);
-    let baseline = serde_json::to_value(&baseline_result).unwrap();
-    let prototype = generation_search_projection(&baseline_result,finding==10);
-    for (a,b) in baseline["results"].as_array().unwrap().iter().zip(prototype["results"].as_array().unwrap()) {
-        for key in ["matches","total_matches","remaining_match_count","coverage_complete"] {assert_eq!(a["value"][key],b["value"][key]);}
-        if finding==12 {
-            for (original,reference) in a["value"]["hydrated_ranges"].as_array().unwrap().iter().zip(b["value"]["hydrated_ranges"].as_array().unwrap()) {
-                assert_eq!(*original,prototype["shared_excerpts"][reference["shared_excerpt"].as_u64().unwrap() as usize]);
-            }
-        } else {assert!(b["value"]["hydrated_ranges"].as_array().unwrap().is_empty());}
-    }
-    assert_eq!(snapshot,text.as_bytes(),"raw recovery evidence remains intact");
-    emit(finding,&format!("{}_{}queries",if dense {"overlap"}else{"disjoint"},queries.len()),serde_json::json!({
-        "baseline_select":measure(||serde_json::to_string(&select()).unwrap()),
-        "prototype_select_and_project":measure(||generation_search_projection(&select(),finding==10).to_string()),
-        "baseline_tokens":tokens(&baseline.to_string()),"prototype_tokens":tokens(&prototype.to_string()),
-        "baseline_output":baseline,"prototype_output":prototype,
-        "limits":"Post-selection prototype includes its full transformation cost; an integrated producer could differ. No model/API round trip is measured."}));
-}
-
-#[tokio::test]
-#[ignore = "opt-in ordered generation opportunity benchmark"]
-async fn generation_bench_12() {
-    generation_search_case(12,&["ALPHA","BETA","GAMMA"],true).await;
-    generation_search_case(12,&["ALPHA","BETA","GAMMA"],false).await;
-    generation_search_case(12,&["ALPHA"],true).await;
-}
-
-#[tokio::test]
-#[ignore = "opt-in ordered generation opportunity benchmark"]
-async fn generation_bench_10() {
-    generation_search_case(10,&["ALPHA"],true).await;
-    generation_search_case(10,&["MISSING"],true).await;
 }
 #[test]
 fn recovery_pages_are_independently_sized_against_original_utf8_bytes() {

@@ -538,14 +538,22 @@ mod worker {
             );
             return;
         };
-        handle.spawn(async move {
+        handle.spawn(run_periodically(codex_home, RUN_MARKER_STALE_AFTER));
+    }
+
+    /// Workers start with their process, and a long-lived app-server can start
+    /// inside another process's cooldown. Retry every cooldown period so cold
+    /// rollouts are still compressed while such a process keeps running.
+    pub(super) async fn run_periodically(codex_home: PathBuf, interval: Duration) {
+        loop {
             if let Err(err) = run(codex_home.clone()).await {
                 warn!(
                     "rollout compression worker failed for {}: {err}",
                     codex_home.display()
                 );
             }
-        });
+            tokio::time::sleep(interval).await;
+        }
     }
 
     pub(super) async fn run(codex_home: PathBuf) -> io::Result<()> {

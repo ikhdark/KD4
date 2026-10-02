@@ -15,12 +15,7 @@ mime_guess = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-divan = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [lib]
 doctest = false
-
-[[bench]]
-name = "prompt_images"
-harness = false

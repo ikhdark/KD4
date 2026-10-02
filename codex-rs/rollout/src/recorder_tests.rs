@@ -791,6 +791,11 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     assert_eq!(build.dirty, embedded.dirty);
     assert_eq!(build.profile, embedded.profile);
     assert_eq!(build.built, embedded.built);
+    assert_eq!(
+        build.executable_sha256.as_deref(),
+        codex_utils_build_info::executable_sha256(),
+        "the binary hash distinguishes dirty builds of one commit"
+    );
     assert_eq!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated);
     assert_eq!(
         session_meta

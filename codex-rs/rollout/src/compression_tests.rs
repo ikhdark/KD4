@@ -816,6 +816,44 @@ async fn worker_skips_when_fresh_run_marker_exists() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn long_lived_worker_compresses_after_a_fresh_marker_expires() -> anyhow::Result<()> {
+    // The process starts inside another process's cooldown and keeps running.
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(12);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "long-lived worker")?;
+    set_old_mtime(&rollout_path)?;
+    let marker_path = home.path().join(".tmp").join("rollout-compression.lock");
+    fs::create_dir_all(home.path().join(".tmp"))?;
+    fs::write(&marker_path, "recent run")?;
+
+    let worker = tokio::spawn(worker::run_periodically(
+        home.path().to_path_buf(),
+        Duration::from_millis(50),
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !compressed_rollout_path(&rollout_path).exists(),
+        "the cooldown is respected"
+    );
+
+    set_old_mtime(&marker_path)?;
+    let compressed = tokio::time::timeout(Duration::from_secs(10), async {
+        while !compressed_rollout_path(&rollout_path).exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    worker.abort();
+    assert!(
+        compressed.is_ok(),
+        "the same process retries once the cooldown expires"
+    );
+    Ok(())
+}
+
 #[test]
 fn run_marker_is_reusable_unless_persisted() -> anyhow::Result<()> {
     let home = TempDir::new()?;

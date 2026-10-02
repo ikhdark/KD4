@@ -106,10 +106,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             required.push(json!("source_sha256"));
         }
         output["properties"]["file_complete"] = json!({"type": "boolean", "description": "The returned exact bytes and hydrated ranges together cover the entire file in this response, including explicit selections. Retention, match coordinates, and recovery selectors alone do not establish coverage."});
-        #[cfg(feature = "bench-generation-opportunities")]
-        if !crate::generation_live_bench::production_enabled(13) {
-            output["properties"]["file_complete"] = json!({"type": "boolean", "description": "The returned default page contains the entire file. Explicit selectors do not imply whole-file coverage."});
-        }
         output["properties"]["continuation"] =
             serde_json::to_value(file_selector_schema()).unwrap_or_default();
         output["properties"]["page_selectors"] = json!({
@@ -169,8 +165,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 )));
             }
             if args.selectors.iter().flatten().any(|selector| {
-                #[cfg(feature = "bench-generation-opportunities")]
-                if matches!(selector, ToolOutputSelector::SearchIndex { .. }) { return false; }
                 !matches!(
                     selector,
                     ToolOutputSelector::Bytes { .. }
@@ -243,16 +237,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 })?
                 .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
             let file_complete = file_selection_complete(&result);
-            #[cfg(feature = "bench-generation-opportunities")]
-            let file_complete = if crate::generation_live_bench::production_enabled(13) {
-                if crate::generation_live_bench::active(13)
-                    && file_complete != (!explicit_selection && continuation.is_none()) {
-                    crate::generation_live_bench::record(13, "whole_file_coverage_corrected");
-                }
-                file_complete
-            } else {
-                !explicit_selection && continuation.is_none()
-            };
             // Explicit selections retain the existing immutable-snapshot contract.
             // Complete default reads stay inline; omitted bytes need one durable
             // snapshot, but selecting them never rereads the file just written.
@@ -550,45 +534,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[ignore = "opt-in ordered generation opportunity benchmark"]
-    async fn generation_bench_13() {
-        use crate::generation_benchmarks::{emit,summarize,tokens};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("coverage.txt");
-        let text = "FIRST evidence\r\nUnicode é evidence\r\nLAST evidence\r\n";
-        std::fs::write(&path,text).unwrap();
-        for (name,selectors,expected_coverage) in [
-            ("default",serde_json::Value::Null,true),
-            ("all_lines",json!([{"kind":"lines","start":1,"end":3}]),true),
-            ("partial",json!([{"kind":"lines","start":1,"end":1}]),false),
-        ] {
-            let mut elapsed = Vec::new();
-            let mut result = serde_json::Value::Null;
-            for _ in 0..7 {
-                let call = invocation(&path,selectors.clone(),false).await;
-                let payload = call.payload.clone();
-                let start = std::time::Instant::now();
-                result = ReadFileHandler.handle(call).await.unwrap().code_mode_result(&payload);
-                elapsed.push(u64::try_from(start.elapsed().as_nanos()).unwrap());
-            }
-            assert_eq!(result["complete"],true);
-            let returned = result["results"].as_array().unwrap().iter().map(|r|r["text"].as_str().unwrap()).collect::<String>();
-            assert_eq!(returned == text,expected_coverage);
-            let mut ranges = result["results"].as_array().unwrap().iter().map(|r|(
-                r["canonical_range"]["start"].as_u64().unwrap(),r["canonical_range"]["end"].as_u64().unwrap())).collect::<Vec<_>>();
-            ranges.sort_unstable();
-            let mut covered = 0;
-            for (start,end) in ranges {if start > covered {break;} covered = covered.max(end);}
-            assert_eq!(covered == text.len() as u64,expected_coverage);
-            let mut prototype = result.clone();
-            prototype["file_complete"] = json!(expected_coverage);
-            emit(13,name,json!({"handler":summarize(elapsed),"baseline_file_complete":result["file_complete"],
-                "verified_byte_coverage":expected_coverage,"baseline_tokens":tokens(&result.to_string()),"prototype_tokens":tokens(&prototype.to_string()),
-                "result":result,"limits":"Coverage prototype replaces the flag only. Cross-call coverage accumulation is not measured."}));
-        }
-    }
-
     async fn invocation(
         path: &Path,
         selectors: serde_json::Value,
@@ -650,7 +595,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(feature = "bench-generation-opportunities"))]
     async fn explicit_file_coverage_tracks_delivered_bytes_and_preserves_snapshots() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coverage.txt");
@@ -748,7 +692,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(feature = "bench-generation-opportunities"))]
     async fn complete_explicit_read_does_not_depend_on_snapshot_storage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coverage.txt");

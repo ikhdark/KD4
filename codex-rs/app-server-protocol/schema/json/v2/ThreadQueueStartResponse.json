@@ -1868,32 +1868,15 @@
           ]
         },
         "terminalization": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/TurnTimingTerminalization"
+            },
+            {
+              "type": "null"
             }
           ],
-          "default": {
-            "deliveryAttemptNs": 0,
-            "diffRefreshCount": 0,
-            "diffReuseCount": 0,
-            "durableCommitNs": 0,
-            "fenceNs": 0,
-            "finalMutationToSealNs": 0,
-            "freshnessNs": 0,
-            "gateNs": 0,
-            "hooksQuiescenceNs": 0,
-            "interactionReleaseNs": 0,
-            "postCleanupNs": 0,
-            "preparationNs": 0,
-            "terminalMemoHitCount": 0,
-            "unclassifiedNs": 0,
-            "validationAggregateCount": 0,
-            "validationAggregateNs": 0,
-            "validationLaunchCount": 0,
-            "validationProcessNs": 0
-          },
-          "description": "Additive terminalization phase timings captured as part of the terminal timing profile."
+          "description": "Legacy timings from the retired turn-finalization pipeline. Absent or null means not measured; current runtimes omit this field."
         },
         "toolCallDetailsArtifactId": {
           "description": "Optional full per-call lifecycle detail in the thread's tool-output artifact store. Subject to that store's retention policy; aggregate timings and per-call summary fields remain usable without the artifact.",

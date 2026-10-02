@@ -1,6 +1,4 @@
-use std::fs::File;
 use std::io;
-use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -16,8 +14,6 @@ use codex_install_context::InstallMethod;
 use codex_utils_absolute_path as path_utils;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_build_info::BuildInfo;
-use sha2::Digest;
-use sha2::Sha256;
 
 const LOCAL_PUBLISH_DIR_ENV: &str = "CODEX_LOCAL_PUBLISH_DIR";
 const LOCAL_CLI_PATH_ENV: &str = "CODEX_CLI_PATH";
@@ -31,7 +27,9 @@ pub(crate) fn write_desktop_runtime_receipt(
         return Ok(None);
     }
     let executable_path = std::env::current_exe()?;
-    let executable_sha256 = file_sha256(&executable_path)?;
+    let executable_sha256 = codex_utils_build_info::executable_sha256()
+        .ok_or_else(|| io::Error::other("could not hash the running executable"))?
+        .to_string();
     let build_info = BuildInfo::current();
     let receipt = DesktopRuntimeReceipt {
         schema_version: 1,
@@ -50,20 +48,6 @@ pub(crate) fn write_desktop_runtime_receipt(
     let receipt_path = codex_home.join(DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH);
     codex_file_system::write_atomically(&receipt_path, &contents)?;
     Ok(Some(receipt_path))
-}
-
-fn file_sha256(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 pub(crate) fn current() -> ServerRuntimeInfo {
@@ -465,7 +449,8 @@ mod tests {
         assert_eq!(receipt.client_name, DESKTOP_CLIENT_NAME);
         assert_eq!(
             receipt.executable_sha256,
-            file_sha256(&receipt.executable_path).expect("hash receipt executable")
+            codex_utils_build_info::file_sha256(&receipt.executable_path)
+                .expect("hash receipt executable")
         );
         assert_eq!(
             receipt_path,

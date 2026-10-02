@@ -6,9 +6,6 @@ mod direct_delivery;
 #[path = "code_mode_owned_continuation.rs"]
 mod owned_continuation;
 
-#[path = "code_mode_output_recovery_bench.rs"]
-mod output_recovery_bench;
-
 #[path = "code_mode_token_cache_e2e.rs"]
 mod token_cache_e2e;
 

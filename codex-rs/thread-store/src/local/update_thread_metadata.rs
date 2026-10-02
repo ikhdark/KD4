@@ -143,12 +143,21 @@ pub(super) async fn update_thread_metadata(
                     message: format!("thread metadata unavailable before git update: {thread_id}"),
                 });
             };
+            let existing = (
+                metadata.git_sha.clone(),
+                metadata.git_branch.clone(),
+                metadata.git_origin_url.clone(),
+            );
             let existing_git_info = git_info_from_parts(
                 metadata.git_sha,
                 metadata.git_branch,
                 metadata.git_origin_url,
             );
-            Some(resolve_git_info_patch(existing_git_info, git_info))
+            let resolved = resolve_git_info_patch(existing_git_info, git_info);
+            // Clients resend unchanged git info every turn, and each rollout write
+            // appends a full session metadata copy. SQLite is updated only after
+            // the rollout, so matching SQLite means the rollout already has it.
+            (resolved != existing).then_some(resolved)
         }
         None => None,
     };
@@ -1059,23 +1068,35 @@ mod tests {
         let store = LocalThreadStore::new(config, Some(runtime));
         let uuid = Uuid::from_u128(309);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        write_session_file(home.path(), "2025-01-03T17-00-00", uuid).expect("session file");
+        let path =
+            write_session_file(home.path(), "2025-01-03T17-00-00", uuid).expect("session file");
+        let params = UpdateThreadMetadataParams {
+            thread_id,
+            patch: ThreadMetadataPatch {
+                git_info: Some(GitInfoPatch {
+                    sha: Some(Some("abc123".to_string())),
+                    branch: Some(Some("main".to_string())),
+                    origin_url: Some(Some("https://github.com/openai/codex".to_string())),
+                }),
+                ..Default::default()
+            },
+            include_archived: false,
+        };
 
         let thread = store
-            .update_thread_metadata(UpdateThreadMetadataParams {
-                thread_id,
-                patch: ThreadMetadataPatch {
-                    git_info: Some(GitInfoPatch {
-                        sha: Some(Some("abc123".to_string())),
-                        branch: Some(Some("main".to_string())),
-                        origin_url: Some(Some("https://github.com/openai/codex".to_string())),
-                    }),
-                    ..Default::default()
-                },
-                include_archived: false,
-            })
+            .update_thread_metadata(params.clone())
             .await
             .expect("set git metadata");
+        let rollout = std::fs::read_to_string(&path).expect("read rollout");
+        store
+            .update_thread_metadata(params)
+            .await
+            .expect("resend unchanged git metadata");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read rollout"),
+            rollout,
+            "unchanged git info must not append another session metadata copy"
+        );
 
         let git_info = thread.git_info.expect("git info should be present");
         assert_eq!(

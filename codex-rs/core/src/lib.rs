@@ -200,9 +200,3 @@ pub use exec_policy::load_exec_policy;
 pub use installation_id::resolve_installation_id;
 pub mod compact;
 pub mod otel_init;
-
-#[cfg(test)]
-mod generation_benchmarks;
-
-#[cfg(feature = "bench-generation-opportunities")]
-mod generation_live_bench;

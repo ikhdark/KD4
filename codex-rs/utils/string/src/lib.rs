@@ -216,7 +216,7 @@ mod tests {
             TokenCountEstimate::new("a")
                 .then(TokenCountEstimate::new("b"), 1)
                 .tokens(),
-            2
+            1
         );
     }
 

@@ -662,6 +662,12 @@ class SourceInventoryTests(unittest.TestCase):
             self.assertEqual(inventory.main(["--describe"]), 0)
         contract = json.loads(stdout.getvalue())
         self.assertIn("describe -> scan -> final", contract["workflow"]["default"])
+        self.assertIn("same execution cell", contract["workflow"]["default"])
+        self.assertIn('// @exec: {"deliver": true}', contract["delivery"])
+        self.assertIn("streams_complete", contract["delivery"])
+        self.assertIn("scan_pending and unresolved_count are zero", contract["delivery"])
+        self.assertIn("await yield_control()", contract["delivery"])
+        self.assertIn("not that its scope answers the entire task", contract["delivery"])
         self.assertIn("restricted request", contract["workflow"]["scope"])
         self.assertIn("uncertainty", contract["workflow"]["inspection_exception"])
         assets = {

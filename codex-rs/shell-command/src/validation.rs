@@ -352,6 +352,24 @@ fn classify_argv_at_depth(
     }
     let binary = normalized_program_name(program);
 
+    if matches!(binary.as_str(), "npm" | "pnpm" | "yarn")
+        && let Some(index) = node_command_index(&binary, args)
+        && args[index] == "exec"
+    {
+        let mut nested = &args[index + 1..];
+        if nested.first().is_some_and(|arg| arg == "--") {
+            nested = &nested[1..];
+        }
+        let Some((program, arguments)) = nested.split_first() else {
+            return ValidationClassification::Opaque;
+        };
+        // Do not mistake package/launcher option values for executables.
+        if program.starts_with('-') {
+            return ValidationClassification::Opaque;
+        }
+        return classify_argv_at_depth(program, arguments, depth + 1);
+    }
+
     if binary == "uv" && args.first().is_some_and(|arg| arg == "run") {
         let Some(program) = args.get(1).filter(|arg| !arg.starts_with('-')) else {
             return ValidationClassification::Opaque;
@@ -470,6 +488,17 @@ fn recognize_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperati
     match binary {
         "cargo" => cargo_operations(args),
         "pytest" => (vec![ValidationOperation::Test], false),
+        "vitest" | "jest" => (
+            if args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
+            {
+                Vec::new()
+            } else {
+                vec![ValidationOperation::Test]
+            },
+            false,
+        ),
         binary if is_python_launcher(binary) => {
             (python_operation(args).into_iter().collect(), false)
         }
@@ -1143,6 +1172,50 @@ mod tests {
         ] {
             assert!(is_validation(&invocation), "{invocation:?}");
         }
+    }
+
+    #[test]
+    fn package_exec_classifies_the_runner_not_its_arguments() {
+        for script in [
+            "pnpm exec vitest run src/example.test.ts",
+            "pnpm --filter app exec vitest run",
+            "npm exec -- vitest run",
+            "yarn exec jest --runInBand",
+        ] {
+            assert!(
+                matches!(
+                    classify_script(script),
+                    ValidationClassification::Validation {
+                        exit_code_is_authoritative: true,
+                        ..
+                    }
+                ),
+                "{script}"
+            );
+        }
+        for script in [
+            "pnpm exec echo vitest",
+            "pnpm exec vitest --help",
+            "npm exec -- vitest --version",
+            "pnpm exec node test.js",
+        ] {
+            assert_eq!(
+                classify_script(script),
+                ValidationClassification::NonValidation,
+                "{script}"
+            );
+        }
+        assert_eq!(
+            classify_script("npm exec --package vitest echo"),
+            ValidationClassification::Opaque
+        );
+        assert!(matches!(
+            classify_script("pnpm exec vitest run; echo done"),
+            ValidationClassification::Validation {
+                exit_code_is_authoritative: false,
+                ..
+            }
+        ));
     }
 
     #[test]

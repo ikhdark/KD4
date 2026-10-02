@@ -848,6 +848,9 @@ impl RolloutRecorder {
                         dirty: build.dirty.to_string(),
                         profile: build.profile.to_string(),
                         built: build.built.to_string(),
+                        // Hashed when the metadata is first written, off the
+                        // session-creation path.
+                        executable_sha256: None,
                     }),
                     agent_nickname: source.get_nickname(),
                     agent_role: source.get_agent_role(),
@@ -1991,9 +1994,19 @@ impl RolloutWriterState {
     }
 
     async fn session_meta_item_if_needed(&self) -> std::io::Result<Option<CapturedRolloutItem>> {
-        let Some(session_meta) = self.meta.as_ref().cloned() else {
+        let Some(mut session_meta) = self.meta.as_ref().cloned() else {
             return Ok(None);
         };
+        if let Some(build) = session_meta.harness_build.as_mut()
+            && build.executable_sha256.is_none()
+        {
+            build.executable_sha256 =
+                tokio::task::spawn_blocking(codex_utils_build_info::executable_sha256)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(str::to_owned);
+        }
         let git_info = match self.known_repository_context.clone() {
             Some(repository_context) => repository_context.map(|context| context.git_info),
             None if get_git_repo_root(&self.cwd).is_some() => collect_git_info(&self.cwd).await,

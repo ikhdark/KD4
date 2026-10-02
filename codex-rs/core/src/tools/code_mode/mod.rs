@@ -107,8 +107,6 @@ struct CodeModePacketAdmission {
 #[derive(Default)]
 struct CodeModePacketMetrics {
     output_budget: Option<usize>,
-    #[cfg(feature = "bench-generation-opportunities")]
-    recovery_index: Vec<(usize, JsonValue)>,
     command_states: Vec<JsonValue>,
     next_nested_ordinal: usize,
     nested_call_count: usize,
@@ -144,8 +142,6 @@ struct CodeModeNestedResultEvidence {
 }
 
 struct CodeModePacketReceipt {
-    #[cfg(feature = "bench-generation-opportunities")]
-    recovery_index: Vec<(usize, JsonValue)>,
     command_states: Vec<JsonValue>,
     nested_call_count: usize,
     batchable_observation_count: usize,
@@ -491,8 +487,6 @@ impl CodeModeService {
             .nested_results
             .sort_unstable_by_key(|result| result.ordinal);
         CodeModePacketReceipt {
-            #[cfg(feature = "bench-generation-opportunities")]
-            recovery_index: metrics.recovery_index,
             command_states: metrics.command_states,
             nested_call_count: metrics.nested_call_count,
             batchable_observation_count: metrics.batchable_observation_count,
@@ -616,17 +610,6 @@ pub(super) fn handle_runtime_response(
     let mut post_tool_use_feedback = packet.post_tool_use_feedback;
     let nested_results = if response_needs_retained_nested_results(&response) {
         if packet.omitted_nested_result_count > 0 {
-            #[cfg(feature = "bench-generation-opportunities")]
-            if crate::generation_live_bench::active(14) && !packet.recovery_index.is_empty() {
-                let mut index = packet.recovery_index;
-                index.sort_unstable_by_key(|(ordinal, _)| *ordinal);
-                post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
-                    text: serde_json::json!({"recovery_tool":"read_tool_output",
-                        "retained_nested_results":index.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
-                        "instruction":"Recover these existing complete snapshots instead of rerunning successful reads. Index covers only listed results, not all tool types."}).to_string(),
-                });
-                crate::generation_live_bench::record(14, "omitted_result_recovery_index_delivered");
-            }
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
                 text: format!(
                     "{} additional nested tool results were omitted from this fallback output; it retains at most {MAX_RETAINED_NESTED_RESULTS} results. Use text(...) to include the results needed from a script.",
@@ -1357,27 +1340,6 @@ async fn call_nested_tool(
             .turn_timing_state
             .record_nested_tool_output_reduction();
     }
-    // Reuse source artifacts already retained by read_file. No duplicate blob,
-    // no assertion that a truncated fallback contains the omitted evidence.
-    #[cfg(feature = "bench-generation-opportunities")]
-    if crate::generation_live_bench::active(14)
-        && tool_name == ToolName::plain("read_file")
-        && result_value["retained_artifact_complete"] == true
-        && let (Some(artifact_id), Some(bytes)) = (
-            result_value["artifact_id"].as_str(), result_value["canonical_bytes"].as_u64())
-    {
-        let mut admission = exec.session.services.code_mode_service.packet_admission
-            .lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(metrics) = admission.cells.get_mut(cell_id.as_str())
-            && metrics.recovery_index.len() < 32
-        {
-            metrics.recovery_index.push((packet_ordinal, serde_json::json!({
-                "call_id":nested_call_id,"tool":"read_file","path":result_value["path"],
-                "artifact_id":artifact_id,"canonical_sha256":result_value["canonical_sha256"],
-                "selectors":[{"kind":"bytes","start":0,"end":bytes}]
-            })));
-        }
-    }
     let (retained_output, output_truncated, result_bytes) = bounded_serialized_json(&result_value);
     if let Some(parent_call_id) = parent_tool_call_id.as_ref()
         && source_dependencies
@@ -2003,12 +1965,6 @@ fn build_freeform_tool_payload(
 #[cfg(test)]
 #[path = "response_tests.rs"]
 mod response_tests;
-
-#[cfg(test)]
-mod token_cache_benchmarks;
-
-#[cfg(test)]
-mod output_recovery_benchmarks;
 
 #[cfg(test)]
 mod tests {

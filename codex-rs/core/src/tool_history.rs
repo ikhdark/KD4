@@ -1448,16 +1448,6 @@ impl ToolHistoryState {
                 git_workspace,
             )
         };
-        #[cfg(feature = "bench-generation-opportunities")]
-        {
-            let shared = Arc::ptr_eq(&projection.items, &projection.unreplaced_items);
-            projection.items = crate::generation_live_bench::checkpoint_notes(projection.items);
-            projection.unreplaced_items = if shared {
-                Arc::clone(&projection.items)
-            } else {
-                crate::generation_live_bench::checkpoint_notes(projection.unreplaced_items)
-            };
-        }
         projection
     }
 
@@ -4783,21 +4773,11 @@ fn source_dependencies_from_arguments(
         }
         // A selected environment can have a different cwd or path convention.
         // Keep its evidence conservative until classification has that context.
-        #[cfg(not(feature = "bench-generation-opportunities"))]
-        let selected_local_environment = false;
-        #[cfg(feature = "bench-generation-opportunities")]
-        let selected_local_environment = crate::generation_live_bench::active(21)
-            && arguments["environment_id"].as_str() == Some(codex_exec_server::LOCAL_ENVIRONMENT_ID);
         if arguments
             .get("environment_id")
             .is_some_and(|id| !id.is_null())
-            && !selected_local_environment
         {
             return BTreeSet::new();
-        }
-        #[cfg(feature = "bench-generation-opportunities")]
-        if selected_local_environment {
-            crate::generation_live_bench::record(21, "explicit_local_environment_dependency");
         }
         return codex_utils_path_uri::PathUri::from_host_native_path(cwd)
             .ok()
@@ -5693,25 +5673,6 @@ fn plain_command_source_dependencies(
         // Without a path the cmdlet filters its pipeline input.
         .unwrap_or(PlainCommandDependencies::Transparent),
         "git" if crate::turn_diff_tracker::command_is_read_only_git(command) => {
-            // Deliberately bounded experiment: literal status pathspec in a
-            // standalone local repository, not arbitrary Git command parsing.
-            #[cfg(feature = "bench-generation-opportunities")]
-            if crate::generation_live_bench::active(22)
-                && arguments.len() == 5
-                && arguments[..4] == ["status", "--short", "--untracked-files=all", "--"]
-                && !arguments[4].is_empty()
-                && !arguments[4].contains(['*', '?', '[', ']', ':', '$'])
-                && Path::new(&arguments[4]).components().all(|part| matches!(part, std::path::Component::Normal(_)))
-                && cwd.join(".git").is_dir()
-            {
-                crate::generation_live_bench::record(22, "literal_git_status_pathspec_dependency");
-                return PlainCommandDependencies::Scoped(BTreeSet::from([
-                    SourceDependencyV1::new(&cwd.join(&arguments[4]), true),
-                    SourceDependencyV1::new(&cwd.join(".git"), true),
-                    SourceDependencyV1::new(&cwd.join(".gitignore"), false),
-                    SourceDependencyV1::new(&cwd.join(".gitattributes"), false),
-                ]));
-            }
             PlainCommandDependencies::Scoped(BTreeSet::from([SourceDependencyV1::new(cwd, true)]))
         }
         _ => {

@@ -29,14 +29,14 @@ fn token_estimates_preserve_unicode_and_ascii_boundaries() {
         ("", 0),
         ("abcd", 1),
         ("abcde", 2),
-        ("a b c", 3),
-        ("!!!", 3),
+        ("a b c", 2),
+        ("!!!", 1),
         ("_abcd", 2),
-        ("a\u{b}b", 2),
+        ("a\u{b}b", 1),
         ("é雪_1", 2),
-        ("a\u{a0}b", 2),
-        ("a💥b", 3),
-        ("e\u{301}", 2),
+        ("a\u{a0}b", 1),
+        ("a💥b", 2),
+        ("e\u{301}", 1),
         ("  \t\r\n  ", 2),
     ] {
         assert_eq!(approx_token_count(text), expected, "{text:?}");
@@ -48,28 +48,6 @@ fn token_estimates_preserve_unicode_and_ascii_boundaries() {
             );
         }
         assert!(!approx_token_count_exceeds(text, usize::MAX));
-    }
-}
-
-#[test]
-fn token_estimates_match_character_reference_for_all_scalar_values() {
-    // Include ASCII/Unicode seams, word endings, whitespace and punctuation.
-    for ch in (0..=0x10ffff).filter_map(char::from_u32) {
-        let text = format!("abcd{ch}ef!");
-        let mut lexical = 0usize;
-        let mut word_bytes = 0usize;
-        for ch in text.chars() {
-            if ch.is_alphanumeric() || ch == '_' {
-                word_bytes += ch.len_utf8();
-            } else {
-                lexical += word_bytes.div_ceil(4) + usize::from(!ch.is_whitespace());
-                word_bytes = 0;
-            }
-        }
-        let expected = text.len().div_ceil(4).max(lexical + word_bytes.div_ceil(4));
-        assert_eq!(approx_token_count(&text), expected, "{ch:?}");
-        assert!(approx_token_count_exceeds(&text, expected - 1), "{ch:?}");
-        assert!(!approx_token_count_exceeds(&text, expected), "{ch:?}");
     }
 }
 
@@ -214,11 +192,15 @@ fn split_string_respects_utf8_boundaries() {
 
 #[test]
 fn truncate_with_token_budget_returns_original_when_under_limit() {
-    let s = "short output";
-    let limit = 100;
-    let (out, original) = truncate_middle_with_token_budget(s, limit);
-    assert_eq!(out, s);
-    assert_eq!(original, None);
+    for (s, limit) in [
+        ("short output", 100),
+        (r#"{"a":[1,2,3],"b":{"c":true}}"#, 7),
+        ("!!!", 1),
+    ] {
+        let (out, original) = truncate_middle_with_token_budget(s, limit);
+        assert_eq!(out, s);
+        assert_eq!(original, None);
+    }
 }
 
 #[test]
@@ -237,16 +219,6 @@ fn truncate_middle_tokens_handles_utf8_content() {
     assert!(out.ends_with("text\n"));
     assert!(approx_token_count(&out) <= 12);
     assert_eq!(tokens, Some(16));
-}
-
-#[test]
-fn token_estimate_is_conservative_for_punctuation_heavy_code() {
-    let json = r#"{"a":[1,2,3],"b":{"c":true}}"#;
-
-    assert!(approx_token_count(json) > json.len().div_ceil(4));
-    let (out, original) = truncate_middle_with_token_budget(json, 10);
-    assert!(original.is_some());
-    assert!(approx_token_count(&out) <= 10);
 }
 
 #[test]

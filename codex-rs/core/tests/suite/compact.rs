@@ -4964,6 +4964,61 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_plan_defers_mid_turn_compaction_for_one_request() -> Result<()> {
+    // The completed plan crosses the 90K compaction limit with room left in
+    // the window for an answer; the model then makes one more tool call anyway.
+    let completed_plan = serde_json::json!({
+        "plan": [{"step": "implement and validate", "status": "completed"}],
+    })
+    .to_string();
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_function_call("plan-call", "update_plan", &completed_plan),
+                ev_completed_with_tokens("plan-response", /*total_tokens*/ 96_000),
+            ]),
+            sse(vec![
+                ev_function_call("extra-call", "unsupported_tool", "{}"),
+                ev_completed_with_tokens("extra-response", /*total_tokens*/ 97_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "summary"),
+                ev_completed_with_tokens("compact-response", /*total_tokens*/ 10_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("final-message", "done"),
+                ev_completed_with_tokens("final-response", /*total_tokens*/ 11_000),
+            ]),
+        ],
+    )
+    .await;
+    let provider = local_compaction_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.model_context_window = Some(200_000);
+        config.model_auto_compact_token_limit = Some(90_000);
+    });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("finish the planned work").await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        !requests[1].body_contains_text(SUMMARIZATION_PROMPT),
+        "a completed plan must not compact before the request that may answer"
+    );
+    assert!(
+        requests[2].body_contains_text(SUMMARIZATION_PROMPT),
+        "the deferral covers one request; continued work must compact before the next"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_mutation()
 -> Result<()> {
     require_network!();

@@ -32,9 +32,10 @@ checkoutSnapshotSha256?: string, schemaVersion: number, profileValid: boolean, c
  */
 machineDurationNs: bigint, machineDurationMs: bigint, exclusive: TurnTimingExclusive, unions: TurnTimingUnions, local: TurnTimingLocal, milestones: TurnTimingMilestones, counters: TurnTimingCounters,
 /**
- * Additive terminalization phase timings captured as part of the terminal timing profile.
+ * Legacy timings from the retired turn-finalization pipeline.
+ * Absent or null means not measured; current runtimes omit this field.
  */
-terminalization: TurnTimingTerminalization,
+terminalization?: TurnTimingTerminalization,
 /**
  * Per-sampling-request milestones, ordered by request. Times are offsets
  * from turn start and are diagnostic only; they are not additive buckets.

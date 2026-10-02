@@ -308,17 +308,8 @@ impl RecoveryContinuationState {
     }
 
     fn next_step(&self) -> ContinuationStep {
-        #[cfg(feature = "bench-generation-opportunities")]
-        let mut isolated_failure = None;
         for (result_index, result) in self.output.results.iter().enumerate() {
             if let Some(reason) = selector_stop_reason(result.status) {
-                #[cfg(feature = "bench-generation-opportunities")]
-                if crate::generation_live_bench::active(11)
-                    && matches!(result.status, ToolOutputSelectorStatus::Invalid | ToolOutputSelectorStatus::NotFound)
-                {
-                    isolated_failure.get_or_insert(reason);
-                    continue;
-                }
                 return ContinuationStep::Stop(reason);
             }
             let Some(selector) = result.continuation.as_ref() else {
@@ -344,18 +335,10 @@ impl RecoveryContinuationState {
             {
                 return ContinuationStep::Stop(ContinuationStopReason::RepeatedSelector);
             }
-            #[cfg(feature = "bench-generation-opportunities")]
-            if isolated_failure.is_some() {
-                crate::generation_live_bench::record(11, "drain_past_selector_local_failure");
-            }
             return ContinuationStep::Follow {
                 result_index,
                 selector: selector.clone(),
             };
-        }
-        #[cfg(feature = "bench-generation-opportunities")]
-        if let Some(reason) = isolated_failure {
-            return ContinuationStep::Stop(reason);
         }
         ContinuationStep::Complete
     }
@@ -1031,8 +1014,6 @@ async fn handle_read_tool_output(
     let token_ceiling = if let Some(budget) = outer_budget {
         // A small wait projection must not disable recovery inside the live cell.
         let budget = budget.max(896);
-        #[cfg(feature = "bench-generation-opportunities")]
-        crate::generation_live_bench::record(5, "outer_budget_negotiated");
         CODE_MODE_RECOVERY_TOKEN_CEILING.min(budget.saturating_sub(384))
     } else if code_mode_recovery {
         CODE_MODE_RECOVERY_TOKEN_CEILING

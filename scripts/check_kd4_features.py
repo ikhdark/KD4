@@ -114,7 +114,7 @@ ALLOWED_RUNTIME_VERIFICATION_KINDS = frozenset({"contract_test", "integration_te
 ALLOWED_FEATURE_KEYS = frozenset(
     "id version status capability_kind owner external_owner summary "
     "upstream_equivalent config_keys runtime_feature_key runtime_status "
-    "runtime_status_source benchmark_on benchmark_control runtime_verification "
+    "runtime_status_source runtime_verification "
     "evidence generated_artifacts retired_paths".split()
 )
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")

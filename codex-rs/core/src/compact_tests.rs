@@ -1989,32 +1989,3 @@ async fn local_compaction_keeps_consumed_resume_invalidation() {
     }
     assert_eq!(retained, notice);
 }
-#[test]
-#[ignore = "opt-in ordered generation opportunity benchmark"]
-fn generation_bench_19() {
-    use crate::generation_benchmarks::{emit,measure,tokens};
-    for words in [1,64,256] {
-        let sections = COMPACTION_SECTIONS.iter().map(|(heading,_)|((*heading).to_string(),format!("EVIDENCE_FOR_{heading}: {}", "preserve requirement and verified result ".repeat(words)))).collect::<std::collections::BTreeMap<_,_>>();
-        let render = |sections:&std::collections::BTreeMap<String,String>|COMPACTION_SECTIONS.iter().map(|(heading,_)|format!("{heading}\n{}",sections[*heading])).collect::<Vec<_>>().join("\n\n");
-        let prose = render(&sections);
-        let structured = serde_json::to_string(&sections).unwrap();
-        assert!(validate_generated_compaction_summary(None,&prose).is_ok());
-        let convert = || {
-            let parsed:std::collections::BTreeMap<String,String> = serde_json::from_str(&structured).unwrap();
-            assert_eq!(parsed.len(),COMPACTION_SECTIONS.len());
-            let prose = render(&parsed);
-            validate_generated_compaction_summary(None,&prose).unwrap();
-            prose
-        };
-        assert_eq!(convert(),prose);
-        let incomplete = COMPACTION_SECTIONS[..COMPACTION_SECTIONS.len()-1].iter().map(|(h,_)|format!("{h}\n{}",sections[*h])).collect::<Vec<_>>().join("\n\n");
-        assert!(validate_generated_compaction_summary(None,&incomplete).is_err());
-        let schema = json!({"type":"object","properties":COMPACTION_SECTIONS.iter().map(|(h,_)|((*h).to_string(),json!({"type":"string","minLength":1}))).collect::<serde_json::Map<String,serde_json::Value>>(),
-            "required":COMPACTION_SECTIONS.iter().map(|(h,_)|*h).collect::<Vec<_>>(),"additionalProperties":false});
-        assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&serde_json::to_value(&sections).unwrap()));
-        emit(19,&format!("section_words_{words}"),json!({"baseline_validation":measure(||validate_generated_compaction_summary(None,&prose).unwrap()),
-            "structured_parse_render_validate":measure(convert),"prose_tokens":tokens(&prose),"structured_output_tokens":tokens(&structured),
-            "schema_request_tokens":tokens(&schema.to_string()),"prose":prose,"structured":structured,"schema":schema,
-            "limits":"No model called: malformed-output rate, actual request tokens, retries avoided and final synthesis quality are unmeasured. Local shape validity is not semantic sufficiency."}));
-    }
-}

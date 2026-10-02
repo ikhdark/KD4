@@ -26,7 +26,8 @@ fn token_ceiling_borrows_unchanged_text_and_reports_actual_omission() {
         ("", 0, "", false),
         ("abcd", 1, "abcd", false),
         ("abcd", 0, "", true),
-        ("!!!", 2, "!…", true),
+        ("!!!", 1, "!!!", false),
+        ("!!!!!", 1, "…", true),
     ] {
         let text = crate::truncate_text_to_token_ceiling_cow(source, limit);
         assert_eq!(matches!(text, std::borrow::Cow::Owned(_)), truncated);
@@ -103,12 +104,26 @@ fn truncate_tokens_less_than_placeholder_retains_bounded_omission_signal() {
 
 #[test]
 fn truncate_tokens_under_limit_returns_original() {
-    let content = "example output";
-
-    assert_eq!(
-        content,
-        formatted_truncate_text(content, TruncationPolicy::Tokens(10)),
-    );
+    for (content, budget) in [
+        ("example output", 10),
+        (r#"{"a":[1,2,3],"b":{"c":true}}"#, 7),
+        ("!!!", 1),
+    ] {
+        assert_eq!(
+            content,
+            formatted_truncate_text(content, TruncationPolicy::Tokens(budget)),
+        );
+        let limits = resolve_output_limits(
+            Some(budget),
+            OutputOutcome::Success,
+            None,
+            content,
+            budget,
+        );
+        let output = formatted_truncate_text_with_output_limit(content, limits);
+        assert_eq!(output.text, content);
+        assert!(!output.was_truncated);
+    }
 }
 
 #[test]
@@ -136,7 +151,7 @@ fn truncate_bytes_over_limit_returns_truncated() {
     let content = "this is an example of a long output that should be truncated";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 17)\nTotal output lines: 1\n\nthis is an exam…30 chars truncated…ld be truncated",
+        "Warning: truncated output (original token count: 15)\nTotal output lines: 1\n\nthis is an exam…30 chars truncated…ld be truncated",
         formatted_truncate_text(content, TruncationPolicy::Bytes(30)),
     );
 }
@@ -147,7 +162,7 @@ fn truncate_bytes_reports_original_line_count_when_truncated() {
         "this is an example of a long output that should be truncated\nalso some other line";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 22)\nTotal output lines: 2\n\nthis is an exam…51 chars truncated…some other line",
+        "Warning: truncated output (original token count: 21)\nTotal output lines: 2\n\nthis is an exam…51 chars truncated…some other line",
         formatted_truncate_text(content, TruncationPolicy::Bytes(30)),
     );
 }
@@ -434,7 +449,7 @@ fn formatted_truncate_text_content_items_with_policy_merges_all_text_for_token_b
     assert_eq!(
         output,
         vec![FunctionCallOutputContentItem::InputText {
-            text: "a…".to_string(),
+            text: "ab…op".to_string(),
         }]
     );
     assert_eq!(original_token_count, Some(5));
@@ -864,12 +879,25 @@ fn validation_launcher_chains_do_not_require_recursive_stack_space() {
 #[test]
 fn validation_launchers_preserve_diagnostic_budgets_without_promoting_arguments() {
     for launcher in ["pnpm exec", "bunx", "poetry run", "pipx run"] {
-        for (invocation, expected) in [
-            ("pytest -q", DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS),
-            ("pytest --help", DEFAULT_SUCCESS_OUTPUT_TOKENS),
-            ("echo pytest", DEFAULT_SUCCESS_OUTPUT_TOKENS),
+        for (invocation, validation) in [
+            ("pytest -q", true),
+            ("vitest run", true),
+            ("pytest --help", false),
+            ("vitest --help", false),
+            ("echo pytest", false),
+            ("echo vitest", false),
         ] {
             let command = format!("{launcher} {invocation}");
+            assert_eq!(
+                crate::looks_like_validation_command(&command),
+                validation,
+                "{command}"
+            );
+            let expected = if validation {
+                DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS
+            } else {
+                DEFAULT_SUCCESS_OUTPUT_TOKENS
+            };
             let limits =
                 resolve_output_limits(None, OutputOutcome::Success, Some(&command), "ok", 20_000);
             assert_eq!(limits.applied_limit, expected, "{command}");
@@ -945,8 +973,8 @@ fn formatted_content_items_enforce_dense_token_budget_and_preserve_nontext() {
         encrypted.clone(),
     ];
     let (output, original_tokens) =
-        formatted_truncate_text_content_items_with_policy(&items, TruncationPolicy::Tokens(4));
-    assert_eq!(original_tokens, Some(13));
+        formatted_truncate_text_content_items_with_policy(&items, TruncationPolicy::Tokens(3));
+    assert_eq!(original_tokens, Some(4));
     let [
         FunctionCallOutputContentItem::InputText { text },
         preserved_image,
@@ -955,7 +983,7 @@ fn formatted_content_items_enforce_dense_token_budget_and_preserve_nontext() {
     else {
         panic!("expected text, image, and encrypted content")
     };
-    assert!(approx_token_count(text) <= 4);
+    assert!(approx_token_count(text) <= 3);
     assert!(!text.is_empty());
     assert_eq!(preserved_image, &image);
     assert_eq!(preserved_encrypted, &encrypted);

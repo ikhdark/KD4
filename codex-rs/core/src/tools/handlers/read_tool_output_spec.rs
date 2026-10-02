@@ -122,13 +122,6 @@ fn selector_schema(include_structured: bool) -> JsonSchema {
                 vec!["query"],
             )
     );
-    #[cfg(feature = "bench-generation-opportunities")]
-    if crate::generation_live_bench::active(10) {
-        let mut index = variants.last().expect("search selector").clone();
-        index.properties.as_mut().expect("selector properties").insert("kind".to_string(),
-            JsonSchema::string_enum(vec![serde_json::json!("search_index")], Some("Counts and match coordinates only: no hydrated text. Use child_selectors when exact context is required.".to_string())));
-        variants.push(index);
-    }
     JsonSchema::one_of(
         variants,
         Some("Ordered search or exact-select operations over the original artifact.".to_string()),

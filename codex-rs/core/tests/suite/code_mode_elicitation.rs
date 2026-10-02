@@ -349,7 +349,7 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
     assert!(timing.profile_valid);
     assert!(timing.classification_complete);
     assert_eq!(timing.exclusive.unclassified_ns, 0);
-    assert_eq!(timing.terminalization.unclassified_ns, 0);
+    assert_eq!(timing.terminalization, None);
     assert_eq!(timing.counters.model_request_count, 2);
     assert_eq!(timing.counters.logical_generation_count, 2);
     assert_eq!(timing.counters.attempts_by_kind.primary, 2);
@@ -507,7 +507,7 @@ await tools.request_permissions({
     assert!(timing.profile_valid);
     assert!(timing.classification_complete);
     assert_eq!(timing.exclusive.unclassified_ns, 0);
-    assert_eq!(timing.terminalization.unclassified_ns, 0);
+    assert_eq!(timing.terminalization, None);
     assert_eq!(timing.counters.invalid_transition_count, 0);
     assert_eq!(timing.counters.clock_regression_count, 0);
     assert_eq!(timing.counters.saturation_count, 0);
@@ -634,7 +634,7 @@ async fn code_mode_failure_returns_to_model_for_repair() -> Result<()> {
     assert!(timing.profile_valid);
     assert!(timing.classification_complete);
     assert_eq!(timing.exclusive.unclassified_ns, 0);
-    assert_eq!(timing.terminalization.unclassified_ns, 0);
+    assert_eq!(timing.terminalization, None);
     assert_eq!(timing.counters.model_request_count, 2);
     assert_eq!(timing.counters.logical_generation_count, 2);
     assert_eq!(timing.counters.attempts_by_kind.primary, 2);
@@ -726,7 +726,7 @@ async fn code_mode_nested_nonzero_returns_to_model_for_repair() -> Result<()> {
     assert!(timing.profile_valid);
     assert!(timing.classification_complete);
     assert_eq!(timing.exclusive.unclassified_ns, 0);
-    assert_eq!(timing.terminalization.unclassified_ns, 0);
+    assert_eq!(timing.terminalization, None);
     assert_eq!(timing.counters.model_request_count, 2);
     assert_eq!(timing.counters.logical_generation_count, 2);
     assert_eq!(timing.counters.attempts_by_kind.primary, 2);

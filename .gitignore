@@ -77,8 +77,7 @@ apply_patch/
 # coverage
 coverage/
 
-# benchmarks
-/docs/benchmarks/repo-benchmark/accepted/
+# Historical performance reports
 /audits_benchmarks
 
 # personal files

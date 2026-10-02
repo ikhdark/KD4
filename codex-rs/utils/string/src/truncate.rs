@@ -116,36 +116,34 @@ fn truncate_with_byte_estimate(s: &str, max_bytes: usize, use_tokens: bool) -> S
     assemble_truncated_output(left, right, &marker)
 }
 
+/// Estimate tokens as UTF-8 bytes divided by four, rounded up.
+/// This heuristic may overestimate or underestimate tokenizer-specific counts.
 pub fn approx_token_count(text: &str) -> usize {
     TokenCountEstimate::new(text).tokens()
 }
 
-/// Cached components of the approximate token count. Keeping both components
-/// avoids rounding each fragment before combining whitespace-separated text.
+/// Cached byte count, rounded only after fragments have been combined.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TokenCountEstimate {
     bytes: usize,
-    lexical: usize,
 }
 
 impl TokenCountEstimate {
     pub fn new(text: &str) -> Self {
         Self {
             bytes: text.len(),
-            lexical: lexical_token_count(text, usize::MAX),
         }
     }
 
     pub fn tokens(self) -> usize {
-        token_byte_estimate(self.bytes).max(self.lexical)
+        token_byte_estimate(self.bytes)
     }
 
     /// Add independently delimited fragments (for example, complete JSON values).
-    /// The caller must ensure no word spans the join; delimiters count separately.
+    /// Include delimiter bytes separately; rounding happens in `tokens`.
     pub fn add_delimited(self, next: Self) -> Self {
         Self {
             bytes: self.bytes.saturating_add(next.bytes),
-            lexical: self.lexical.saturating_add(next.lexical),
         }
     }
 
@@ -153,70 +151,31 @@ impl TokenCountEstimate {
     pub fn subtract_delimited(self, previous: Self) -> Self {
         Self {
             bytes: self.bytes - previous.bytes,
-            lexical: self.lexical - previous.lexical,
         }
     }
 
     /// Combine fragments with a nonempty separator consisting only of whitespace.
-    /// The separator terminates words, so their lexical counts are additive.
     pub fn then(self, next: Self, whitespace_bytes: usize) -> Self {
         assert!(
             whitespace_bytes > 0,
-            "a separator must terminate the preceding word"
+            "a whitespace separator must be nonempty"
         );
         Self {
             bytes: self
                 .bytes
                 .saturating_add(whitespace_bytes)
                 .saturating_add(next.bytes),
-            lexical: self.lexical.saturating_add(next.lexical),
         }
     }
 }
 
-/// Compare against the same estimate as `approx_token_count`, stopping as soon
-/// as either its byte lower bound or its lexical lower bound exceeds the limit.
+/// Compare against the same byte-based estimate as `approx_token_count`.
 pub fn approx_token_count_exceeds(text: &str, limit: usize) -> bool {
-    token_byte_estimate(text.len()) > limit || lexical_token_count(text, limit) > limit
+    token_byte_estimate(text.len()) > limit
 }
 
 fn token_byte_estimate(bytes: usize) -> usize {
     bytes.div_ceil(APPROX_BYTES_PER_TOKEN)
-}
-
-fn lexical_token_count(text: &str, limit: usize) -> usize {
-    let mut lexical_estimate = 0usize;
-    let mut word_bytes = 0usize;
-    let mut offset = 0;
-    while let Some(&byte) = text.as_bytes().get(offset) {
-        let (word, whitespace, width) = if byte.is_ascii() {
-            (
-                byte.is_ascii_alphanumeric() || byte == b'_',
-                matches!(byte, b' ' | b'\t'..=b'\r'),
-                1,
-            )
-        } else {
-            // `offset` always advances by a complete UTF-8 character.
-            let Some(ch) = text[offset..].chars().next() else {
-                break;
-            };
-            (ch.is_alphanumeric(), ch.is_whitespace(), ch.len_utf8())
-        };
-        offset += width;
-        if word {
-            word_bytes = word_bytes.saturating_add(width);
-            continue;
-        }
-        lexical_estimate = lexical_estimate.saturating_add(token_byte_estimate(word_bytes));
-        word_bytes = 0;
-        if !whitespace {
-            lexical_estimate = lexical_estimate.saturating_add(1);
-        }
-        if lexical_estimate > limit {
-            return lexical_estimate;
-        }
-    }
-    lexical_estimate.saturating_add(token_byte_estimate(word_bytes))
 }
 
 pub fn approx_bytes_for_tokens(tokens: usize) -> usize {

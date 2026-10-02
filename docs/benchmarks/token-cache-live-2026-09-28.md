@@ -113,24 +113,16 @@ default suite timeouts are unchanged.
 Combined recorded usage across the interrupted run and completed pair is
 **468,225 tokens**. No repeat was made to seek a more favorable live result.
 
-## Reproduce and inspect
+## Historical evidence
 
-From the checkout root, with the fork's existing `CODEX_HOME` set and a new output
-directory (this explicitly authorizes real model usage):
-
-```powershell
-python scripts/benchmark_token_cache.py live-e2e --allow-live --output codex-rs/target/token-cache-review/new-live
-```
-
-The runner reads the model and reasoning effort from the active fork config;
-it does not modify them. Current live auth support is the existing ChatGPT
-`auth.json` shape, not every provider or credential store.
+The Rust benchmark system and its Python runners have been removed. This report
+preserves historical measurements; no live-model benchmark command remains.
 
 Evidence: `codex-rs/target/token-cache-review/live-3/` contains `manifest.json`,
 `records.jsonl`, `baseline-attempts.jsonl`, `candidate-attempts.jsonl`, synthetic
 request JSONL, and `runner.log`. These are ignored local artifacts. The manifest
 is a scoped source-hash check, not a hermetic dependency fingerprint.
 
-Sources: `codex-rs/core/tests/suite/code_mode_token_cache_live.rs`, shared fixture
-`code_mode_token_cache_e2e.rs`, and `scripts/benchmark_token_cache.py`.
+The production full-turn regression remains in `code_mode_token_cache_e2e.rs`
+without live forwarding or benchmark reporting.
 Production adoption, a #2 ablation, and broader live non-regression remain unperformed.

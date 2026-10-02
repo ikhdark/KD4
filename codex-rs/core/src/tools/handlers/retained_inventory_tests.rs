@@ -1080,6 +1080,12 @@ async fn inventory_evidence_accepts_exact_small_ranges_and_rejects_truncation_or
     ] {
         assert!(call(&context, decision(source)).await.is_err());
     }
+    let mut wrong_id = decision(json!({"artifact_id":artifact_id,"lines":[1,1]}));
+    wrong_id["decisions"][0]["candidate_id"] = json!("./a");
+    let error = call(&context, wrong_id).await.unwrap_err().to_string();
+    assert!(error.contains(r#""rejected_id":"./a""#), "{error}");
+    assert!(error.contains(r#""candidate_ids":["a"]"#), "{error}");
+    assert!(error.contains(r#""candidate_count":1"#), "{error}");
     let old = call(
         &context,
         json!({"operation":"read","inventory_id":imported["inventory_id"]}),

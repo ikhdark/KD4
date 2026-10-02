@@ -1120,6 +1120,9 @@ fn is_read_only_powershell_command(command: &[String]) -> bool {
         return false;
     };
     let script = command[command_position.saturating_add(1)..].join(" ");
+    let Some(script) = powershell_literal_syntax_mask(&script) else {
+        return false;
+    };
     if script.trim().is_empty()
         || script.contains(['>', '<', '`', '&'])
         || script.contains("$(")
@@ -1132,6 +1135,49 @@ fn is_read_only_powershell_command(command: &[String]) -> bool {
         .split([';', '|', '\n', '\r'])
         .filter(|segment| !segment.trim().is_empty())
         .all(powershell_segment_is_read_only)
+}
+
+// Keep the existing conservative command classifier, but do not interpret
+// literal regex/path characters as redirects, pipelines, or statement breaks.
+// Expansion and unfamiliar syntax remain uncertain, not evidence of a read.
+fn powershell_literal_syntax_mask(script: &str) -> Option<String> {
+    if script.contains(['\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}']) {
+        return None;
+    }
+    let mut quote = None;
+    let mut masked = String::with_capacity(script.len());
+    let mut chars = script.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '`' || (quote == Some('"') && ch == '$') {
+            return None;
+        }
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                if delimiter == '\'' && chars.peek() == Some(&'\'') {
+                    masked.push_str("''");
+                    chars.next();
+                    continue;
+                }
+                quote = None;
+            }
+            masked.push(
+                if matches!(ch, '>' | '<' | '&' | ';' | '|' | '{' | '}' | '\n' | '\r') {
+                    'x'
+                } else {
+                    ch
+                },
+            );
+        } else {
+            if ch == '#' || (ch == '@' && matches!(chars.peek(), Some('\'' | '"'))) {
+                return None;
+            }
+            if matches!(ch, '\'' | '"') {
+                quote = Some(ch);
+            }
+            masked.push(ch);
+        }
+    }
+    quote.is_none().then_some(masked)
 }
 
 fn powershell_segment_is_read_only(segment: &str) -> bool {

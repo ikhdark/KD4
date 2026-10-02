@@ -10073,28 +10073,9 @@ class TurnTiming(BaseModel):
     terminalization: Annotated[
         TurnTimingTerminalization | None,
         Field(
-            description="Additive terminalization phase timings captured as part of the terminal timing profile."
+            description="Legacy timings from the retired turn-finalization pipeline. Absent or null means not measured; current runtimes omit this field."
         ),
-    ] = {
-        "deliveryAttemptNs": 0,
-        "diffRefreshCount": 0,
-        "diffReuseCount": 0,
-        "durableCommitNs": 0,
-        "fenceNs": 0,
-        "finalMutationToSealNs": 0,
-        "freshnessNs": 0,
-        "gateNs": 0,
-        "hooksQuiescenceNs": 0,
-        "interactionReleaseNs": 0,
-        "postCleanupNs": 0,
-        "preparationNs": 0,
-        "terminalMemoHitCount": 0,
-        "unclassifiedNs": 0,
-        "validationAggregateCount": 0,
-        "validationAggregateNs": 0,
-        "validationLaunchCount": 0,
-        "validationProcessNs": 0,
-    }
+    ] = None
     tool_call_details_artifact_id: Annotated[
         str | None,
         Field(

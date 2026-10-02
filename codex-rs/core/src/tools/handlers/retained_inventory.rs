@@ -985,7 +985,23 @@ async fn resolve_evidence(
         .get(&decision.category)
         .and_then(|records| records.get(&decision.candidate_id))
         .ok_or_else(|| {
-            invalid("decision names a candidate absent from the retained enumeration")
+            let records = snapshot.records.get(&decision.category);
+            let ids = records
+                .into_iter()
+                .flat_map(|records| records.keys())
+                .take(10)
+                .collect::<Vec<_>>();
+            invalid(format!(
+                "decision names a candidate absent from the retained enumeration: {}",
+                json!({
+                    "rejected_id": decision.candidate_id,
+                    "category": decision.category,
+                    "identity_namespace": "exact retained candidate IDs (not normalized paths)",
+                    "candidate_ids": ids,
+                    "candidate_count": records.map_or(0, BTreeMap::len),
+                    "hint": "Use an exact candidate ID; read the same inventory snapshot for remaining IDs. Do not guess path aliases.",
+                })
+            ))
         })?;
     let mut pending = decision
         .evidence

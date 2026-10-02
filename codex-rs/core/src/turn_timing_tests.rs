@@ -277,15 +277,13 @@ async fn checkout_snapshot_cancels_pending_work_without_waiting() {
 }
 
 #[test]
-fn legacy_turn_timing_deserializes_with_empty_terminalization_phases() {
+fn terminalization_is_unmeasured_and_legacy_timings_remain_readable() {
     let (_clock, state) = timing();
     state.mark_turn_started();
     let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.terminalization, None);
     let mut legacy = serde_json::to_value(timing).expect("serialize timing");
-    legacy
-        .as_object_mut()
-        .expect("timing object")
-        .remove("terminalization");
+    assert!(legacy.get("terminalization").is_none());
     legacy
         .as_object_mut()
         .expect("timing object")
@@ -295,10 +293,29 @@ fn legacy_turn_timing_deserializes_with_empty_terminalization_phases() {
         .expect("timing object")
         .remove("toolCallTimingOverflow");
 
-    let restored: TurnTiming = serde_json::from_value(legacy).expect("legacy timing");
-    assert_eq!(restored.terminalization, Default::default());
+    let restored: TurnTiming = serde_json::from_value(legacy.clone()).expect("legacy timing");
+    assert_eq!(restored.terminalization, None);
     assert!(restored.tool_calls.is_empty());
     assert_eq!(restored.tool_call_timing_overflow, 0);
+
+    legacy["terminalization"] = serde_json::Value::Null;
+    let restored: TurnTiming = serde_json::from_value(legacy.clone()).expect("unmeasured timing");
+    assert_eq!(restored.terminalization, None);
+
+    legacy["terminalization"] = serde_json::json!({
+        "validationProcessNs": 17,
+        "validationLaunchCount": 2,
+    });
+    let restored: TurnTiming = serde_json::from_value(legacy).expect("historical timing");
+    let measured = restored
+        .terminalization
+        .as_ref()
+        .expect("legacy measurements");
+    assert_eq!(measured.validation_process_ns, 17);
+    assert_eq!(measured.validation_launch_count, 2);
+    let encoded = serde_json::to_value(restored).expect("serialize historical timing");
+    assert_eq!(encoded["terminalization"]["validationProcessNs"], 17);
+    assert_eq!(encoded["terminalization"]["validationLaunchCount"], 2);
 }
 
 #[test]

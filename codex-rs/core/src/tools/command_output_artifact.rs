@@ -106,26 +106,12 @@ pub(crate) enum ToolOutputSelector {
         #[serde(default = "artifact_search_default_context_lines")]
         context_lines: usize,
     },
-    #[cfg(feature = "bench-generation-opportunities")]
-    SearchIndex {
-        query: String,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        case_insensitive: bool,
-        #[serde(default)]
-        start_byte: u64,
-        #[serde(default = "artifact_search_default_max_results")]
-        max_results: usize,
-        #[serde(default = "artifact_search_default_context_lines")]
-        context_lines: usize,
-    },
 }
 
 impl ToolOutputSelector {
     pub(crate) fn is_search(&self) -> bool {
         match self {
             Self::Search { .. } => true,
-            #[cfg(feature = "bench-generation-opportunities")]
-            Self::SearchIndex { .. } => true,
             _ => false,
         }
     }
@@ -976,6 +962,60 @@ fn artifact_retention_record_with_bytes_blocking(
     }))
 }
 
+/// Retention record from directory-listing metadata. Reconciliation discards
+/// a scan that raced an internal mutation, so the scan needs no per-file reopen.
+fn listed_retention_record(
+    path: &Path,
+    bytes: u64,
+    metadata: &std::fs::Metadata,
+    marker: Option<&(PathBuf, std::fs::Metadata)>,
+) -> std::io::Result<ArtifactRetentionRecord> {
+    if metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "artifact path is a link or reparse point",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "artifact path is not a regular file",
+        ));
+    }
+    let protected = match marker {
+        None => false,
+        Some((_, marker))
+            if marker.is_file()
+                && !metadata_is_reparse_point(marker)
+                && marker.len() == ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES.len() as u64 =>
+        {
+            true
+        }
+        Some((marker_path, _)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid retention protection marker `{}`",
+                    marker_path.display()
+                ),
+            ));
+        }
+    };
+    // The scan root is normalized and listing names are exact, so the joined
+    // path is already normalized; canonicalizing would reopen every artifact.
+    let path = path.to_path_buf();
+    Ok(ArtifactRetentionRecord {
+        thread_directory: path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+        path,
+        bytes,
+        modified: metadata.modified()?,
+        protected,
+    })
+}
+
 fn logical_artifact_stem(name: &str) -> Option<&str> {
     if let Some(stem) = name.strip_suffix(".log") {
         return Some(stem);
@@ -1007,7 +1047,11 @@ fn scan_retention_root_blocking(
         }
         directories_visited = directories_visited.saturating_add(1);
         let mut entries = std::fs::read_dir(thread_entry.path())?;
-        let mut artifacts_by_stem = BTreeMap::<String, (u64, Option<PathBuf>)>::new();
+        // Listing metadata carries size, times, and link attributes, so a full
+        // scan opens no files; per-artifact opens took ~6 s at 14.5K records.
+        let mut artifacts_by_stem =
+            BTreeMap::<String, (u64, Option<(PathBuf, std::fs::Metadata)>)>::new();
+        let mut markers = BTreeMap::<String, (PathBuf, std::fs::Metadata)>::new();
         while let Some(entry) = entries.next().transpose()? {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -1025,10 +1069,18 @@ fn scan_retention_root_blocking(
             if oversized {
                 continue;
             }
+            if let Some(stem) = name
+                .strip_suffix(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
+                .and_then(|name| name.strip_suffix('.'))
+            {
+                markers.insert(stem.to_string(), (path, entry.metadata()?));
+                continue;
+            }
             let Some(stem) = logical_artifact_stem(name) else {
                 continue;
             };
-            let bytes = entry.metadata()?.len();
+            let metadata = entry.metadata()?;
+            let bytes = metadata.len();
             let (entry_bytes, log_path) = if let Some(entry) = artifacts_by_stem.get_mut(stem) {
                 entry
             } else {
@@ -1041,22 +1093,17 @@ fn scan_retention_root_blocking(
                 )
             })?;
             if is_log {
-                *log_path = Some(path);
+                *log_path = Some((path, metadata));
             }
         }
         if oversized {
             continue;
         }
-        for (bytes, path) in artifacts_by_stem.into_values() {
-            let Some(path) = path else {
+        for (stem, (bytes, log)) in artifacts_by_stem {
+            let Some((path, metadata)) = log else {
                 continue;
             };
-            let Some(record) = artifact_retention_record_with_bytes_blocking(&path, bytes)? else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "artifact disappeared during retention reconciliation",
-                ));
-            };
+            let record = listed_retention_record(&path, bytes, &metadata, markers.get(&stem))?;
             let Some(candidate_index) = index.as_mut() else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -4305,8 +4352,6 @@ fn selector_range_and_children(
             }
         }
         ToolOutputSelector::Search { .. } => Err(ToolOutputSelectorStatus::Invalid),
-        #[cfg(feature = "bench-generation-opportunities")]
-        ToolOutputSelector::SearchIndex { .. } => Err(ToolOutputSelectorStatus::Invalid),
     }
 }
 
@@ -4315,10 +4360,6 @@ fn normalized_selector_order_key(
     metadata: &LogicalArtifactMetadata,
 ) -> (u64, u64, u8, String) {
     let serialized = serde_json::to_string(selector).unwrap_or_default();
-    #[cfg(feature = "bench-generation-opportunities")]
-    if let ToolOutputSelector::SearchIndex { start_byte, .. } = selector {
-        return (*start_byte, *start_byte, 4, serialized);
-    }
     if let ToolOutputSelector::Search { start_byte, .. } = selector {
         return (*start_byte, *start_byte, 4, serialized);
     }
@@ -4330,8 +4371,6 @@ fn normalized_selector_order_key(
                 ToolOutputSelector::Section { .. } => 2,
                 ToolOutputSelector::JsonPointer { .. } => 3,
                 ToolOutputSelector::Search { .. } => unreachable!(),
-                #[cfg(feature = "bench-generation-opportunities")]
-                ToolOutputSelector::SearchIndex { .. } => unreachable!(),
             };
             (range.start, range.end, kind, serialized)
         }
@@ -4532,10 +4571,6 @@ fn share_search_hydration(
     previous_results: &[ToolOutputSelectorResult],
     reference: &mut Value,
 ) -> bool {
-    #[cfg(feature = "bench-generation-opportunities")]
-    if !crate::generation_live_bench::production_enabled(12) {
-        return false;
-    }
     if range.len() < 256 {
         return false;
     }
@@ -4556,10 +4591,6 @@ fn share_search_hydration(
     if codex_utils_output_truncation::model_token_count(&reference.to_string())
         < codex_utils_output_truncation::model_token_count(&previous.to_string())
     {
-        #[cfg(feature = "bench-generation-opportunities")]
-        if crate::generation_live_bench::active(12) {
-            crate::generation_live_bench::record(12, "exact_hydration_shared");
-        }
         true
     } else {
         if let Some(object) = reference.as_object_mut() {
@@ -4576,19 +4607,14 @@ fn search_logical_artifact(
     token_ceiling: usize,
     previous_results: &[ToolOutputSelectorResult],
 ) -> ToolOutputSelectorResult {
-    let (query, start_byte, max_results, context_lines, case_insensitive, coordinates_only) = match &selector {
+    let (query, start_byte, max_results, context_lines, case_insensitive) = match &selector {
         ToolOutputSelector::Search {
             query,
             start_byte,
             max_results,
             context_lines,
             case_insensitive,
-        } => (query.clone(), *start_byte, *max_results, *context_lines, *case_insensitive, false),
-        #[cfg(feature = "bench-generation-opportunities")]
-        ToolOutputSelector::SearchIndex {query,start_byte,max_results,context_lines,case_insensitive} => {
-            crate::generation_live_bench::record(10,"search_index_executed");
-            (query.clone(),*start_byte,*max_results,*context_lines,*case_insensitive,true)
-        },
+        } => (query.clone(), *start_byte, *max_results, *context_lines, *case_insensitive),
         _ => unreachable!("search helper requires a search selector"),
     };
     if query.is_empty() || query.len() > ARTIFACT_SEARCH_MAX_QUERY_BYTES {
@@ -4683,16 +4709,8 @@ fn search_logical_artifact(
             max_results,
             context_lines,
         });
-        #[cfg(feature = "bench-generation-opportunities")]
-        let continuation = if coordinates_only {
-            continuation.map(|next| {
-                let ToolOutputSelector::Search {query,start_byte,max_results,context_lines,case_insensitive} = next else {unreachable!()};
-                ToolOutputSelector::SearchIndex {query,start_byte,max_results,context_lines,case_insensitive}
-            })
-        } else { continuation };
         let hydrated_ranges = child_selectors
             .iter()
-            .filter(|_| !coordinates_only)
             .filter_map(|child| {
                 let (range, _, _) = selector_range_and_children(child, metadata).ok()?;
                 let range = range?;
@@ -4731,7 +4749,6 @@ fn search_logical_artifact(
         result.child_selectors = child_selectors;
         result.continuation = continuation;
         result.message = match remaining_match_count > 0 {
-            true if coordinates_only => Some("more indexed matches are available; use continuation for the next page or child_selectors for exact text".to_string()),
             true => Some(
                 "more matches are available; exact context for this page is already hydrated and continuation advances to the next page"
                     .to_string(),
@@ -4906,8 +4923,6 @@ fn successful_exact_selector_result(
             }
         }
         ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Search { .. } => unreachable!(),
-        #[cfg(feature = "bench-generation-opportunities")]
-        ToolOutputSelector::SearchIndex { .. } => unreachable!(),
     }
     result
 }

@@ -21,18 +21,6 @@ pub struct LoopbackResponsesServer {
 
 impl LoopbackResponsesServer {
     pub fn start() -> Result<Self> {
-        Self::start_handler(None)
-    }
-
-    /// Serve programmable Responses events through the existing bounded HTTP
-    /// transport. The handler receives only the JSON body, never auth headers.
-    pub fn start_scripted(
-        handler: impl Fn(serde_json::Value) -> Result<Vec<serde_json::Value>> + Send + Sync + 'static,
-    ) -> Result<Self> {
-        Self::start_handler(Some(Arc::new(handler)))
-    }
-
-    fn start_handler(handler: Option<Arc<ResponseHandler>>) -> Result<Self> {
         let listener =
             TcpListener::bind("127.0.0.1:0").context("bind loopback Responses API server")?;
         listener
@@ -46,7 +34,7 @@ impl LoopbackResponsesServer {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         if let Err(err) =
-                            handle_model_connection(stream, &thread_shutdown, handler.as_deref())
+                            handle_model_connection(stream, &thread_shutdown)
                         {
                             eprintln!("loopback Responses API server error: {err}");
                         }
@@ -82,12 +70,9 @@ impl Drop for LoopbackResponsesServer {
     }
 }
 
-type ResponseHandler = dyn Fn(serde_json::Value) -> Result<Vec<serde_json::Value>> + Send + Sync;
-
 fn handle_model_connection(
     mut stream: TcpStream,
     shutdown: &AtomicBool,
-    handler: Option<&ResponseHandler>,
 ) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -102,29 +87,6 @@ fn handle_model_connection(
         .and_then(|line| std::str::from_utf8(line).ok())
         .unwrap_or_default();
     if request_line.starts_with("POST ") && request_line.contains("/responses ") {
-        if let Some(handler) = handler {
-            let header_end = request
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "missing HTTP header end")
-                })?
-                + 4;
-            let parsed = serde_json::from_slice(&request[header_end..])
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            return match handler(parsed) {
-                Ok(events) => {
-                    let mut body = String::new();
-                    for event in events {
-                        let event_type = event["type"].as_str().unwrap_or("message");
-                        body.push_str(&format!("event: {event_type}\ndata: {event}\n\n"));
-                    }
-                    write_http_response(&mut stream, "200 OK", "text/event-stream", &body)
-                }
-                Err(err) => write_http_response(&mut stream, "400 Bad Request", "application/json",
-                    &serde_json::json!({"error":{"message":format!("scripted scenario rejected request: {err:#}"),"type":"invalid_request_error"}}).to_string()),
-            };
-        }
         let body = concat!(
             "event: response.created\n",
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-plugin-analytics\"}}\n\n",

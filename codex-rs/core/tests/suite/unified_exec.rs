@@ -1129,7 +1129,7 @@ async fn exec_command_interrupt_closes_unpublished_retained_process_before_turn_
     assert!(timing.profile_valid);
     assert!(timing.classification_complete);
     assert_eq!(timing.exclusive.unclassified_ns, 0);
-    assert_eq!(timing.terminalization.unclassified_ns, 0);
+    assert_eq!(timing.terminalization, None);
     assert_eq!(timing.counters.invalid_transition_count, 0);
     assert_eq!(timing.counters.clock_regression_count, 0);
     assert_eq!(timing.counters.saturation_count, 0);
