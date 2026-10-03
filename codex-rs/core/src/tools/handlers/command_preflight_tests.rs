@@ -6,6 +6,59 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(ToString::to_string).collect()
 }
 
+#[tokio::test]
+async fn missing_rg_paths_are_advisory_and_use_the_execution_workdir() {
+    let fixture = tempfile::tempdir().unwrap();
+    let cwd = fixture.path();
+    std::fs::create_dir(cwd.join("tools")).unwrap();
+    std::fs::write(cwd.join("tools/spec_plan.rs"), "needle\n").unwrap();
+    let invocation = CommandInvocation::Argv {
+        program: "rg".into(),
+        args: strings(&["--no-config", "-n", "needle", "tools/spec.rs", "tools/spec_plan.rs"]),
+    };
+    let command = invocation.to_direct_argv().unwrap();
+    let outcome = preflight_invocation_for_kd4_runtime(
+        true, false, &invocation, &command, None, Some(cwd),
+    ).await.unwrap();
+    assert_eq!(outcome.invocation, invocation);
+    assert!(!outcome.repaired());
+    assert_eq!(outcome.validation_invocations, vec![invocation.clone()]);
+    let notice = outcome.model_notice().unwrap();
+    assert!(notice.contains("rg_missing_path"), "{notice}");
+    assert!(notice.contains("spec_plan.rs"), "{notice}");
+    assert!(notice.contains("not verified replacements"), "{notice}");
+    // The advisory never suppresses execution, the original error, or valid
+    // results from the other path.
+    let output = std::process::Command::new(&command[0]).args(&command[1..])
+        .current_dir(cwd).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("needle"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("spec.rs"));
+    for (enabled, direct, local_cwd) in [
+        (false, false, Some(cwd)), (true, true, Some(cwd)), (true, false, None),
+    ] {
+        let outcome = preflight_invocation_for_kd4_runtime(
+            enabled, direct, &invocation, &command, None, local_cwd,
+        ).await.unwrap();
+        assert_eq!(outcome.invocation, invocation);
+        assert_eq!(outcome.advisory, None);
+    }
+    for args in [
+        strings(&["rg", "-n", "missing-pattern", "tools/spec_plan.rs"]),
+        strings(&["rg", "-e", "tools/spec.rs", "tools/spec_plan.rs"]),
+        strings(&["rg", "-n", "needle", "$TARGET"]),
+        strings(&["rg", "-n", "needle", "-"]),
+        strings(&["rg", "-n", "needle", "../spec.rs"]),
+    ] {
+        assert_eq!(missing_rg_path_advisory(&args, None, cwd), None);
+    }
+    let moved = strings(&["bash", "-c", "cd tools; rg needle spec.rs"]);
+    assert_eq!(missing_rg_path_advisory(&moved, Some(ShellType::Bash), cwd), None);
+    let script = strings(&["bash", "-c", "rg needle tools/spec.rs"]);
+    assert!(missing_rg_path_advisory(&script, Some(ShellType::Bash), cwd)
+        .unwrap().contains("spec_plan.rs"));
+}
+
 #[test]
 fn rg_argument_roles_preserve_flag_like_patterns_and_dependencies() {
     use crate::tools::handlers::command_search::rg_search_path_operands;
@@ -1190,6 +1243,7 @@ async fn enabled_preflight_preserves_valid_shell_constructs_and_shell_owned_erro
             &invocation,
             &strings(&[launcher, flag, script]),
             Some(shell),
+            None,
         )
         .await
         .expect("shell owns syntax, command names and wildcard expansion");
@@ -1205,13 +1259,13 @@ async fn kd4_runtime_off_preserves_command_without_repair() {
         args: strings(&["--ignorecase", "needle", "input.txt"]),
     };
     let command = invocation.to_direct_argv().unwrap();
-    let disabled = preflight_invocation_for_kd4_runtime(false, false, &invocation, &command, None)
+    let disabled = preflight_invocation_for_kd4_runtime(false, false, &invocation, &command, None, None)
         .await
         .expect("disabled preflight leaves command execution to the tool");
     assert_eq!(disabled.invocation, invocation);
     assert_eq!(disabled.repair_notice, None);
     assert_eq!(disabled.validation_invocations, vec![invocation.clone()]);
-    let enabled = preflight_invocation_for_kd4_runtime(true, false, &invocation, &command, None)
+    let enabled = preflight_invocation_for_kd4_runtime(true, false, &invocation, &command, None, None)
         .await
         .expect("enabled preflight repairs known read-only flag typo");
     assert_eq!(

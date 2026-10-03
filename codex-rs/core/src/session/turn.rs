@@ -2336,15 +2336,6 @@ async fn stabilize_pending_turn_plan(
     completed_mcp_effect: &mut Option<(String, Option<HashSet<String>>)>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<PendingTurnPlan> {
-    // Seed task context before pure planning builds the first prompt. This is
-    // turn-local derived state, not a skill activation or a persistent effect.
-    let mut catalog_input = Vec::new();
-    for item in input {
-        if let TurnInput::UserInput { content, .. } = item {
-            catalog_input.extend(content);
-        }
-    }
-    turn_context.turn_skills.update_catalog_task(catalog_input).await;
     let mut check_previous_model_compaction = true;
     let mut incoming_precompaction_completed = false;
     let mut last_retry_reason = "retry budget was exhausted before this planning invocation";

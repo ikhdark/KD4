@@ -69,10 +69,10 @@ fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
         ("dotnet build", 30_000),
         ("git clone repo", 30_000),
         ("echo cargo build", 2_000),
-        ("just test-fast -p codex-config --lib", 30_000),
-        ("just app-server-runtime-check", 30_000),
-        ("just core-test-fast core_lib -E test(parser)", 30_000),
-        ("just core-gate tool-output-recovery", 30_000),
+        ("just test-fast -p codex-config --lib", 2_000),
+        ("just app-server-runtime-check", 2_000),
+        ("just core-test-fast core_lib -E test(parser)", 2_000),
+        ("just core-gate tool-output-recovery", 2_000),
         ("uv run pytest -q", 30_000),
     ] {
         let decoded: ExecCommandArgs =
@@ -87,6 +87,20 @@ fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
 
 #[test]
 fn nested_exec_observation_window_preserves_explicit_and_interactive_handoffs() {
+    for command in ["just ci", "make verify", "npm run e2e"] {
+        for (extra, wait, stall) in [
+            (serde_json::json!({}), 30_000, None),
+            (serde_json::json!({"yield_time_ms":500,"stall_timeout_ms":123}), 500, Some(123)),
+            (serde_json::json!({"stall_timeout_ms":0}), 30_000, None),
+        ] {
+            let mut arguments = extra;
+            arguments["cmd"] = serde_json::json!(command);
+            let mut decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
+            decoded.apply_validation_observation_policy(true);
+            assert_eq!(decoded.yield_time_ms, wait);
+            assert_eq!(decoded.stall_timeout_ms, stall);
+        }
+    }
     for (command, direct_default, interactive_default) in
         [("rg --files", 2_000, 10_000), ("cargo build", 30_000, 30_000)]
     {
@@ -142,7 +156,7 @@ fn stall_timeout_exec_command_defaults_and_overrides() {
         "go build ./...",
         "dotnet build",
         "git clone repo",
-        "python scripts/validate.py run library | ForEach-Object { $_ | ConvertFrom-Json }; exit $LASTEXITCODE",
+        "python -m pytest library | ForEach-Object { $_ | ConvertFrom-Json }; exit $LASTEXITCODE",
         "cargo test -p codex-core | ForEach-Object { $_ }",
     ] {
         let decoded: ExecCommandArgs = parse_arguments(&serde_json::json!({"cmd": command}).to_string()).unwrap();
@@ -1757,6 +1771,36 @@ async fn mutating_preflight_rejection_does_not_reserve_process_id() {
         .unified_exec_manager
         .release_process_id(process_id)
         .await;
+}
+
+#[tokio::test]
+async fn missing_rg_path_advisory_reaches_the_model_without_hiding_results_or_errors() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("spec_plan.rs"), "needle\n").unwrap();
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": "rg",
+            "args": ["--no-config", "-n", "needle", "spec.rs", "spec_plan.rs"],
+            "workdir": fixture.path(),
+            "yield_time_ms": 10_000,
+        }).to_string(),
+    };
+    let invocation = invocation_for_payload_without_sandbox(
+        "exec_command", "missing-rg-path", payload.clone(),
+    ).await;
+    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+    let result = output.code_mode_result(&payload);
+    assert_eq!(result["exit_code"], 2, "{result}");
+    let notice = result["repair"].as_str().unwrap();
+    assert!(notice.contains("rg_missing_path"), "{notice}");
+    assert!(notice.contains("spec_plan.rs"), "{notice}");
+    assert!(notice.contains("command is unchanged"), "{notice}");
+    assert!(!notice.contains("Hint: `rg`"), "the post-execution fallback must not duplicate preflight: {notice}");
+    let text = result["output"].as_str().unwrap();
+    assert!(text.contains("needle"), "{result}");
+    assert!(text.contains("spec.rs"), "{result}");
+    assert!(!text.contains("rg_missing_path"), "advisories must not alter raw output");
+    assert!(result.get("session_id").is_none(), "{result}");
 }
 
 #[tokio::test]

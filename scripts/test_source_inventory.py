@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -617,6 +618,24 @@ class SourceInventoryTests(unittest.TestCase):
             self.assertEqual(first[key], second[key])
         self.assertNotEqual(first["artifact"], second["artifact"])
         delivered = json.loads(Path(first["canonical_paths"]).read_text(encoding="utf-8"))
+        lineage = first["evidence_lineage"]
+        self.assertEqual(delivered["evidence_lineage"]["identity"], lineage["identity"])
+        state = json.loads(Path(first["artifact"]).read_text(encoding="utf-8"))
+        self.assertEqual(state["evidence_lineage"]["identity"], lineage["identity"])
+        for document in (delivered, state):
+            payload = {key: value for key, value in document.items() if key != "evidence_lineage"}
+            content = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":")).encode("utf-8")
+            self.assertEqual(document["evidence_lineage"]["content_sha256"],
+                             hashlib.sha256(content).hexdigest())
+        header = Path(first["report"]).read_text(encoding="utf-8").splitlines()[0]
+        self.assertTrue(header.startswith("<!-- codex-evidence: "))
+        self.assertEqual(json.loads(header.removeprefix("<!-- codex-evidence: ")
+            .removesuffix(" -->"))["evidence_lineage"]["identity"], lineage["identity"])
+        body = Path(first["report"]).read_bytes().split(b"\n", 1)[1]
+        self.assertEqual(json.loads(header.removeprefix("<!-- codex-evidence: ")
+            .removesuffix(" -->"))["evidence_lineage"]["content_sha256"],
+            hashlib.sha256(body).hexdigest())
         self.assertEqual(delivered["paths"], paths)
         self.assertEqual(delivered["categories"], {key: sorted(value) for key, value in expected.items()})
         self.assertEqual(delivered["evidence_counts"], first["evidence_counts"])
@@ -636,6 +655,7 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual(changed["query_id"], first["query_id"])
         self.assertEqual(changed["count"], first["count"] + 1)
         self.assertNotEqual(changed["source_snapshot_sha256"], first["source_snapshot_sha256"])
+        self.assertNotEqual(changed["evidence_lineage"]["identity"], lineage["identity"])
 
     def test_query_exclusions_cannot_be_silently_bypassed(self):
         self.file("src/a.rs", "content")

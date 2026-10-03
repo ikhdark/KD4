@@ -6,6 +6,103 @@ use codex_shell_command::validation::classify_argv;
 use codex_shell_command::validation::classify_powershell_script;
 use codex_shell_command::validation::combine_validation_classifications;
 
+/// Launch-time metadata, retained with the process through polling. Repository
+/// trust is never deserialized from model arguments or inferred from stdout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandValidation {
+    pub(crate) declared: Option<codex_protocol::validation::ValidationCommandContext>,
+    pub(crate) classification: ValidationClassification,
+    pub(crate) receipt_runner: Option<String>,
+}
+
+impl CommandValidation {
+    pub(crate) fn is_validation(&self) -> bool {
+        matches!(self.classification, ValidationClassification::Validation { .. })
+    }
+
+    pub(crate) fn is_test(&self) -> bool {
+        matches!(&self.classification, ValidationClassification::Validation { leaves, .. }
+            if leaves.iter().any(|leaf| leaf.operation == ValidationOperation::Test))
+    }
+
+    pub(crate) fn signal(&self) -> serde_json::Value {
+        serde_json::json!({
+            "validation": self.is_validation(),
+            "proof": matches!(self.classification, ValidationClassification::Validation {
+                exit_code_is_authoritative: true, has_unclassified_targets: false, ..
+            }),
+            "tests": self.is_test(),
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryRunners {
+    version: u32,
+    runners: Vec<codex_shell_command::validation::RepositoryRunner>,
+}
+
+fn repository_runners(cwd: &std::path::Path) -> Vec<codex_shell_command::validation::RepositoryRunner> {
+    let Some(root) = codex_git_utils::get_git_repo_root(cwd) else { return Vec::new() };
+    // HEAD, not the index or working tree: writing a declaration during a turn
+    // must not let an arbitrary echo authenticate a fabricated execution ledger.
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C").arg(&root).args(["show", "HEAD:.codex/test-runners.json"]).output()
+    else { return Vec::new() };
+    if !output.status.success() || output.stdout.len() > 64 * 1024 {
+        return Vec::new();
+    }
+    let Ok(mut config) = serde_json::from_slice::<RepositoryRunners>(&output.stdout)
+    else { return Vec::new() };
+    if config.version != 1 || config.runners.len() > 256
+        || config.runners.iter().any(|runner| runner.options.values().any(|count| *count > 2))
+    {
+        return Vec::new();
+    }
+    for runner in &mut config.runners {
+        runner.path_context = Some((root.clone(), cwd.to_path_buf()));
+    }
+    config.runners
+}
+
+fn classify_with_runners(
+    invocation: &CommandInvocation,
+    runners: &[codex_shell_command::validation::RepositoryRunner],
+) -> ValidationClassification {
+    use codex_shell_command::validation as commands;
+    match invocation {
+        CommandInvocation::Argv { program, args } => commands::classify_argv_with_runners(program, args, runners),
+        CommandInvocation::Script(script) => commands::classify_script_with_runners(script, runners),
+        CommandInvocation::PowerShellScript(script) => commands::classify_powershell_script_with_runners(script, runners),
+    }
+}
+
+pub(crate) async fn resolve_command_validation(
+    invocation: &CommandInvocation,
+    cwd: Option<&std::path::Path>,
+    declared: Option<codex_protocol::validation::ValidationCommandContext>,
+) -> Option<CommandValidation> {
+    let invocation = invocation.clone();
+    let cwd = cwd.map(std::path::Path::to_path_buf);
+    crate::tools::run_blocking_command_analysis(move || {
+        let runners = cwd.as_deref().map(repository_runners).unwrap_or_default();
+        let classification = classify_with_runners(&invocation, &runners);
+        let argv = match &invocation {
+            CommandInvocation::Argv { program, args } => Some(
+                std::iter::once(program.clone()).chain(args.iter().cloned()).collect::<Vec<_>>()
+            ),
+            CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) =>
+                codex_shell_command::validation::standalone_argv(script),
+        };
+        let receipt_runner = argv.as_ref().and_then(|argv| argv.split_first())
+            .and_then(|(program, args)| runners.iter().find(|runner| runner.matches(program, args)))
+            .and_then(|runner| runner.receipt_runner.clone());
+        (declared.is_some() || matches!(classification, ValidationClassification::Validation { .. }))
+            .then_some(CommandValidation { declared, classification, receipt_runner })
+    }).await.ok().flatten()
+}
+
 pub(crate) fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {
     #[cfg(test)]
     VALIDATION_CLASSIFICATION_COUNT.with(|count| count.set(count.get() + 1));
@@ -85,6 +182,21 @@ mod tests {
 
     mod manifest_runner {
         use super::*;
+
+        fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {
+            let runner = serde_json::from_value(serde_json::json!({
+                "programs": ["python", "py"],
+                "prefixes": [["scripts/validate.py", "run"]],
+                "options": {"-I": 0},
+                "allow_extra_args": true,
+                "operations": ["test"]
+            })).unwrap();
+            classify_with_runners(invocation, &[runner])
+        }
+
+        fn is_validation(invocation: &CommandInvocation) -> bool {
+            matches!(classify_validation(invocation), ValidationClassification::Validation { .. })
+        }
 
         #[test]
         fn manifest_validation_runner_recognizes_only_execution() {

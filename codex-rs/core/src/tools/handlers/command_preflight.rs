@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::path::Component;
+use std::path::Path;
 
 use super::command_search::rg_search_path_operands;
 use crate::shell::ShellType;
@@ -246,6 +248,7 @@ pub(crate) async fn preflight_invocation_for_kd4_runtime(
     invocation: &CommandInvocation,
     command: &[String],
     shell_type: Option<ShellType>,
+    local_cwd: Option<&Path>,
 ) -> Result<CommandPreflightOutcome, String> {
     if !kd4_runtime {
         return Ok(CommandPreflightOutcome {
@@ -255,7 +258,95 @@ pub(crate) async fn preflight_invocation_for_kd4_runtime(
             advisory: None,
         });
     }
-    preflight_invocation_for_runtime(direct_runtime, invocation, command, shell_type).await
+    let mut outcome =
+        preflight_invocation_for_runtime(direct_runtime, invocation, command, shell_type).await?;
+    // Never inspect the host filesystem for a remote command. Direct-runtime
+    // bypass remains authoritative, including for optional advisories.
+    if !direct_runtime && let Some(cwd) = local_cwd {
+        let cwd = cwd.to_path_buf();
+        let (command, shell_type) = match outcome.invocation.to_direct_argv() {
+            Some(argv) => (argv, None),
+            None => (command.to_vec(), shell_type),
+        };
+        if let Ok(Some(notice)) = crate::tools::run_blocking_command_analysis(move || {
+            missing_rg_path_advisory(&command, shell_type, &cwd)
+        }).await {
+            outcome.advisory = Some(match outcome.advisory {
+                Some(existing) => format!("{existing}\n{notice}"),
+                None => notice,
+            });
+        }
+    }
+    Ok(outcome)
+}
+
+fn missing_rg_path_advisory(
+    command: &[String],
+    shell_type: Option<ShellType>,
+    cwd: &Path,
+) -> Option<String> {
+    let commands = argv_commands(command, shell_type.or_else(|| infer_direct_shell_type(command)))?;
+    // A preceding cd, assignment, helper or mutating command can change what
+    // these operands mean. Do not guess shell state or run a repository scan.
+    if commands.is_empty() || commands.iter().any(|argv| {
+        !argv.first().is_some_and(|program| is_rg_program(program))
+            || !codex_shell_command::is_safe_command::is_known_safe_direct_argv(argv)
+    }) {
+        return None;
+    }
+    let operands = rg_search_path_operands(&commands)?;
+    let mut notices = Vec::new();
+    for operand in operands.into_iter().take(8) {
+        if operand == "-" || operand.contains(['*', '?', '[', ']', '$', '%', '~', '`']) {
+            continue;
+        }
+        let path = cwd.join(&operand);
+        // Suggestions are local to the declared working directory, not an
+        // excuse to enumerate its ancestors or unrelated absolute paths.
+        if !path.starts_with(cwd)
+            || path.components().any(|part| part == Component::ParentDir)
+            || !matches!(std::fs::symlink_metadata(&path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            continue;
+        }
+        let mut nearest = path.as_path();
+        let parent = loop {
+            let parent = nearest.parent()?;
+            if !parent.starts_with(cwd) {
+                break None;
+            }
+            match std::fs::symlink_metadata(parent) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    break Some(parent);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => nearest = parent,
+                _ => break None,
+            }
+        };
+        let Some(parent) = parent else { continue };
+        // Do not traverse directory symlinks/junctions outside the workdir.
+        let (Ok(root), Ok(resolved_parent)) = (cwd.canonicalize(), parent.canonicalize()) else {
+            continue;
+        };
+        if !resolved_parent.starts_with(root) {
+            continue;
+        }
+        let candidates = super::command_search::nearest_existing_paths(&path, cwd)
+            .into_iter()
+            .map(|path| json_string(&path.to_string_lossy()))
+            .collect::<Vec<_>>();
+        let guidance = if candidates.is_empty() {
+            format!("Nearest existing directory: {}.", json_string(&parent.to_string_lossy()))
+        } else {
+            format!("Possible existing paths (not verified replacements): {}.", candidates.join(", "))
+        };
+        notices.push(format!(
+            "Command preflight advisory (rg_missing_path): {} was not found relative to working directory {} at preflight time. {guidance} The command is unchanged; a path error is not evidence of no matches.",
+            json_string(&operand), json_string(&cwd.to_string_lossy()),
+        ));
+    }
+    (!notices.is_empty()).then(|| notices.join("\n"))
 }
 
 pub(crate) async fn preflight_invocation_for_runtime(

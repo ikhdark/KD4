@@ -65,6 +65,7 @@ yarn-error.log*
 
 # package
 *.tgz
+*.whl
 
 # ci
 .vercel/
@@ -111,7 +112,7 @@ CHANGELOG.ignore.md
 
 # Python bytecode files
 __pycache__/
-*.pyc
+*.py[co]
 
 # Retired repository map/ownership artifacts and generators. Do not restore.
 /SOURCEMAP.md

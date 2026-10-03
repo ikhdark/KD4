@@ -361,6 +361,7 @@ impl ShellCommandHandler {
             &original_invocation,
             &original_safety_command,
             original_shell_type,
+            (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
         )
         .await
         .map_err(|issue| {
@@ -373,7 +374,12 @@ impl ShellCommandHandler {
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
         let invocation_changed = command_invocation != original_invocation;
-        let validation_launch = params.validation.is_some()
+        let validation = crate::validation::resolve_command_validation(
+            &command_invocation,
+            (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
+            params.validation.clone(),
+        ).await;
+        let validation_launch = validation.is_some()
             || matches!(
                 classify_validation_invocations(&validation_invocations),
                 ValidationClassification::Validation { .. }
@@ -422,7 +428,11 @@ impl ShellCommandHandler {
             exec_params.windows_sandbox_private_desktop,
         );
         let timeout_ms = exec_params.expiration.timeout_ms();
-        let stall_timeout_ms = effective_stall_timeout_ms(timeout_ms, params.stall_timeout_ms);
+        let stall_timeout_ms = if validation_launch && params.stall_timeout_ms.is_none() {
+            None
+        } else {
+            effective_stall_timeout_ms(timeout_ms, params.stall_timeout_ms)
+        };
         let runtime_context = format!(
             "shell={shell_type:?};login={use_login_shell};capture={:?};network_environment={:?};network={:?};stall_timeout_ms={:?}",
             exec_params.capture_policy,
@@ -503,7 +513,7 @@ impl ShellCommandHandler {
         };
         let run_args = RunExecLikeArgs {
             max_output_tokens: params.max_output_tokens,
-            validation: params.validation,
+            validation,
             tool_name,
             exec_params,
             stall_timeout_ms,

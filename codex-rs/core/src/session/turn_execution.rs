@@ -215,7 +215,11 @@ pub(crate) fn validation_scope_signal(
         }
         return Some(signal);
     }
-    let (_, proof, test_execution) = validation_status_from_arguments(tool_name, &arguments);
+    let (_, mut proof, mut test_execution) = validation_status_from_arguments(tool_name, &arguments);
+    if let Some(validation) = signal.get("command_validation") {
+        proof = validation["proof"] == true;
+        test_execution = validation["tests"] == true;
+    }
     if !proof || arguments.get("environment_id").and_then(Value::as_str)
         .is_some_and(|selected| selected != environment_id)
     {
@@ -598,6 +602,21 @@ struct SamplingRequestSignalState {
 }
 
 impl SamplingRequestSignalState {
+    fn observe_command_validation(&mut self, ordinal: u64, signal: Option<&Value>) {
+        let Some(validation) = signal.and_then(|signal| signal.get("command_validation")) else {
+            return;
+        };
+        if validation["validation"] == true {
+            self.saw_validation = true;
+            self.validation_ordinals.insert(ordinal);
+        }
+        if validation["proof"] == true {
+            self.validation_proof_ordinals.insert(ordinal);
+        }
+        if validation["tests"] == true {
+            self.test_validation_ordinals.insert(ordinal);
+        }
+    }
     fn wrapper_ordinals(&self) -> BTreeSet<u64> {
         self.outcomes.iter()
             .filter_map(|outcome| outcome.code_mode_cell_id.as_ref())
@@ -1135,6 +1154,7 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.code_mode_nested_tool_count = state.code_mode_nested_tool_count.saturating_add(1);
+        state.observe_command_validation(ordinal, signal);
         if let Some(call_id) = call_id {
             state.call_ordinals.insert(call_id.to_string(), ordinal);
         }
@@ -1386,6 +1406,7 @@ impl SamplingRequestSignalCollector {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.observe_command_validation(ordinal, signal.as_ref());
         if outcome.kind == SamplingToolOutcomeKind::Success
             && (state
                 .code_mode_call_ordinals
@@ -4896,16 +4917,16 @@ mod tests {
             ("exec_command", json!({"cmd": "python -m unittest -q"})),
             (
                 "exec_command",
-                json!({"cmd": "just core-test-fast core_lib -E test(parser)"}),
+                json!({"cmd": "just test"}),
             ),
             (
                 "exec_command",
-                json!({"cmd": "just core-gate tool-output-recovery"}),
+                json!({"cmd": "npm run test:unit"}),
             ),
             ("exec_command", json!({"cmd": "uv run pytest -q"})),
             (
                 "exec_command",
-                json!({"kind": "argv", "program": "python", "args": ["scripts/rust_test_runner.py", "run-target", "core_lib", "-E", "test(parser)"]}),
+                json!({"kind": "argv", "program": "cargo", "args": ["test", "-p", "example"]}),
             ),
             (
                 "exec_command",

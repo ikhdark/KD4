@@ -20,7 +20,6 @@ use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
-#[cfg(test)]
 use crate::build_available_skills;
 use crate::compact;
 use crate::config::ManagedFeatures;
@@ -4948,10 +4947,10 @@ impl Session {
         }
         let permissions_index = developer_sections.len();
 
-        let catalog_task = turn_context.turn_skills.catalog_task.lock().await.clone();
-        let projected_instructions = turn_context.developer_instructions.as_deref().map(|text| {
-            crate::context::desktop_instructions::project(text, &catalog_task)
-        });
+        let projected_instructions = turn_context
+            .developer_instructions
+            .as_deref()
+            .map(crate::context::desktop_instructions::project);
         let configured_developer_instructions =
             crate::stable_context::configured_developer_instructions_sections(
                 projected_instructions
@@ -4995,7 +4994,7 @@ impl Session {
             developer_sections.push(PersonalitySpecInstructions::new(personality_message).render());
         }
         if turn_context.config.include_skill_instructions {
-            let available_skills = codex_core_skills::render::build_available_skills_for_task(
+            let available_skills = build_available_skills(
                 turn_context.turn_skills.snapshot.outcome(),
                 default_skill_metadata_budget(turn_context.model_info.context_window),
                 if estimate {
@@ -5005,7 +5004,6 @@ impl Session {
                         session_telemetry: &self.services.session_telemetry,
                     }
                 },
-                &catalog_task,
             );
             if let Some(available_skills) = available_skills {
                 if turn_context.model_info.include_skills_usage_instructions {
@@ -6325,9 +6323,6 @@ impl Session {
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         self.record_conversation_items_ordered(turn_context, std::slice::from_ref(&response_item))
             .await?;
-        // Use only accepted user input, not tool output or injected instructions.
-        // Explicit skill injection retains its independent authorization path.
-        turn_context.turn_skills.update_catalog_task(input).await;
         let turn_item = TurnItem::UserMessage(user_message_item);
         self.emit_turn_item_started(turn_context, &turn_item).await;
         self.emit_turn_item_completed(turn_context, turn_item).await;

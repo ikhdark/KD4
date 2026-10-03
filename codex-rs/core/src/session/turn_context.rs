@@ -31,7 +31,6 @@ use tracing::instrument;
 #[derive(Clone, Debug)]
 pub(crate) struct TurnSkillsContext {
     pub(crate) snapshot: HostSkillsSnapshot,
-    pub(crate) catalog_task: Arc<Mutex<String>>,
     pub(crate) implicit_invocation_seen_skills: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -39,18 +38,8 @@ impl TurnSkillsContext {
     pub(crate) fn new(snapshot: HostSkillsSnapshot) -> Self {
         Self {
             snapshot,
-            catalog_task: Arc::new(Mutex::new(String::new())),
             implicit_invocation_seen_skills: Arc::new(Mutex::new(HashSet::new())),
         }
-    }
-
-    pub(crate) async fn update_catalog_task<'a>(&self, input: impl IntoIterator<Item = &'a UserInput>) {
-        let task = input.into_iter().filter_map(|item| match item {
-            UserInput::Text { text, .. } => Some(text.as_str()),
-            UserInput::Skill { name, .. } | UserInput::Mention { name, .. } => Some(name.as_str()),
-            _ => None,
-        }).collect::<Vec<_>>().join("\n");
-        *self.catalog_task.lock().await = task;
     }
 }
 

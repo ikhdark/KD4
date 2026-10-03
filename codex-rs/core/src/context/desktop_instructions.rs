@@ -1,4 +1,4 @@
-//! Task projection of the known Desktop envelope. Unknown instructions stay eager.
+//! Stable projection of the known Desktop envelope. Unknown instructions stay eager.
 
 use std::borrow::Cow;
 
@@ -10,13 +10,12 @@ pub(crate) fn full(instructions: &str) -> Option<&str> {
     Some(&instructions[start..end])
 }
 
-pub(crate) fn project<'a>(instructions: &'a str, task: &str) -> Cow<'a, str> {
+pub(crate) fn project(instructions: &str) -> Cow<'_, str> {
     let Some(block) = full(instructions) else {
         return Cow::Borrowed(instructions);
     };
     // Do not interpret arbitrary XML/Markdown as the Desktop's supported envelope.
-    if task.trim().is_empty()
-        || instructions.matches("<app-context>").count() != 1
+    if instructions.matches("<app-context>").count() != 1
         || instructions.matches("</app-context>").count() != 1
         || !block
             .trim_start_matches("<app-context>")
@@ -29,7 +28,6 @@ pub(crate) fn project<'a>(instructions: &'a str, task: &str) -> Cow<'a, str> {
     {
         return Cow::Borrowed(instructions);
     }
-    let task = task.to_lowercase();
     let body = block
         .strip_prefix("<app-context>")
         .unwrap_or(block)
@@ -43,20 +41,18 @@ pub(crate) fn project<'a>(instructions: &'a str, task: &str) -> Cow<'a, str> {
             continue;
         }
         let heading = section.lines().next().unwrap_or_default().trim();
-        let triggers: &[&str] = match heading {
-            "Automations" => &["automat", "remind", "monitor", "schedul", "heartbeat", "recurr"],
-            "Thread Coordination" => &[
-                "thread", "chat", "conversation", "handoff", "hand off", "pin", "archiv", "fork",
-            ],
-            "Worktrees" => &["worktree", "checkout", "branch", "parallel", "isolat", "archiv"],
-            "Sidebar Organization" => &["sidebar", "pin", "project", "section", "organiz"],
-            "Pull request diff links" => &["pull request", "pr", "github", "review"],
-            "Inline Code Comments" => &["review", "comment", "feedback"],
-            "Inline Artifact Follow-Ups" => &["follow", "artifact"],
-            // File/media rendering, Git, and future headings remain authoritative.
-            _ => &[],
-        };
-        if !triggers.is_empty() && !triggers.iter().any(|trigger| task.contains(trigger)) {
+        // Keep the prefix independent of the current request. Feature-specific
+        // guidance remains available through the locator before using a feature.
+        if matches!(
+            heading,
+            "Automations"
+                | "Thread Coordination"
+                | "Worktrees"
+                | "Sidebar Organization"
+                | "Pull request diff links"
+                | "Inline Code Comments"
+                | "Inline Artifact Follow-Ups"
+        ) {
             deferred.push(heading);
         } else {
             kept.push_str("\n### ");

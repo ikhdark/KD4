@@ -343,7 +343,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     }
                 }
             }
-            let evidence = result.delivered_evidence().map(|identity| json!({
+            let evidence = result.delivered_evidence().map(|identity| {
+                crate::tools::context::declared_file_lineage_evidence(&canonical.bytes)
+                    .unwrap_or_else(|| json!({
                 "source": "read_file",
                 "scope": {
                     "path": resolved_path,
@@ -359,7 +361,8 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     },
                 },
                 "identity": identity,
-            }));
+                    }))
+            });
             let mut output = serde_json::to_value(result)
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
             output["artifact_id"] = json!(artifact_id);
@@ -663,6 +666,53 @@ mod tests {
             first.sampling_request_signal().unwrap()["semantic_evidence"],
             other.sampling_request_signal().unwrap()["semantic_evidence"],
         );
+    }
+
+    #[tokio::test]
+    async fn report_reads_reuse_lineage_but_changed_or_unsigned_files_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.txt");
+        let payload = json!({"paths": ["a.rs", "café.rs"]});
+        let lineage = json!({
+            "source": "source_inventory",
+            "identity": "captured-query-and-source-snapshot",
+            // Produced by Python's documented sorted, compact UTF-8 JSON
+            // serialization, not by the Rust implementation under test.
+            "content_sha256": "0644fbe7bdd8d11f529902ad44409b8ca97d23a60690383de7769744ecb8e975",
+        });
+        let stdout = json!({"evidence_lineage": lineage});
+        let expected = crate::tools::context::declared_lineage_evidence(
+            &json!({"evidence_lineage": {
+                "source": "source_inventory", "identity": "captured-query-and-source-snapshot"
+            }}).to_string().into_bytes(),
+        ).unwrap();
+        let mut document = payload;
+        document["evidence_lineage"] = stdout["evidence_lineage"].clone();
+        let body = "Captured paths: a.rs, café.rs\n";
+        let mut header = stdout;
+        header["evidence_lineage"]["content_sha256"] = json!(crate::tool_history::sha256(body.as_bytes()));
+        for report in [
+            serde_json::to_string_pretty(&document).unwrap(),
+            format!("<!-- codex-evidence: {header} -->\n{body}"),
+        ] {
+            std::fs::write(&path, &report).unwrap();
+            let first = ReadFileHandler.handle(invocation(
+                &path, json!([{"kind":"lines", "start":1, "end":100}]), false,
+            ).await).await.unwrap();
+            assert_eq!(first.sampling_request_signal().unwrap()["semantic_evidence"], expected);
+            // A stale copied header must not hide an edit to the report.
+            std::fs::write(&path, report.replace("a.rs", "b.rs")).unwrap();
+            let changed = ReadFileHandler.handle(invocation(
+                &path, json!([{"kind":"lines", "start":1, "end":100}]), false,
+            ).await).await.unwrap();
+            assert_eq!(changed.sampling_request_signal().unwrap()["semantic_evidence"]["source"], "read_file");
+            assert_ne!(changed.sampling_request_signal().unwrap()["semantic_evidence"], expected);
+        }
+        std::fs::write(&path, r#"{"evidence_lineage":{"source":"source_inventory","identity":"old"}}"#).unwrap();
+        let unsigned = ReadFileHandler.handle(invocation(
+            &path, json!([{"kind":"lines", "start":1, "end":100}]), false,
+        ).await).await.unwrap();
+        assert_eq!(unsigned.sampling_request_signal().unwrap()["semantic_evidence"]["source"], "read_file");
     }
 
     async fn invocation(

@@ -59,6 +59,8 @@ fn record(
 
 #[tokio::test]
 async fn declared_lineage_projections_share_evidence_but_changed_sources_are_novel() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("report.json");
     let mut control = TurnExecutionControl::new();
     let baseline = control.baselines(0);
     // Commands and output bytes differ; only the declared lineage decides.
@@ -109,6 +111,124 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
                 .contains(&TurnTimingProgressKind::NewSourceEvidence),
             novel, "{command} {scope:?} {identity}",
         );
+        for markdown in [false, true] {
+            let bytes = if markdown {
+                format!("<!-- codex-evidence: {} -->\n# Report\n",
+                    json!({"evidence_lineage": lineage})).into_bytes()
+            } else {
+                result.raw_output.clone()
+            };
+            std::fs::write(&path, bytes).unwrap();
+            let call = invocation("read_file", json!({"path":path})).await;
+            let read = ReadFileHandler.handle(call.clone()).await.unwrap();
+            let collector = control.collector(&baseline);
+            record(&collector, "read_file", &call.payload, read.as_ref(), "report");
+            assert!(!control.observe_progress(&baseline, &collector, &settled())
+                .contains(&TurnTimingProgressKind::NewSourceEvidence));
+            // Even a selected projection retains attribution, not a new source
+            // identity. Byte coverage still belongs to the ordinary read result.
+            let call = invocation("read_file", json!({"path":path,
+                "selectors":[{"kind":"lines","start":1,"end":1}]})).await;
+            let read = ReadFileHandler.handle(call.clone()).await.unwrap();
+            let collector = control.collector(&baseline);
+            record(&collector, "read_file", &call.payload, read.as_ref(), "selection");
+            assert!(!control.observe_progress(&baseline, &collector, &settled())
+                .contains(&TurnTimingProgressKind::NewSourceEvidence));
+        }
+    }
+}
+
+#[tokio::test]
+async fn repository_runners_require_committed_declarations_and_supply_execution_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let result = std::process::Command::new("git").current_dir(dir.path())
+            .args(args).output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    };
+    git(&["init", "-q"]);
+    std::fs::create_dir(dir.path().join(".codex")).unwrap();
+    let config = json!({"version":1,"runners":[
+        {"programs":["just"],"prefixes":[["ci"]],"operations":["test"],"receipt_runner":"ci"},
+        {"programs":["make"],"prefixes":[["verify"]],"operations":["test"],"receipt_runner":"ci"},
+        {"programs":["npm"],"prefixes":[["run","e2e"]],"operations":["test"],"receipt_runner":"ci"}
+    ]});
+    let manifest = dir.path().join(".codex/test-runners.json");
+    std::fs::write(&manifest, config.to_string()).unwrap();
+    let resolve = |command: &str| CommandInvocation::Script(command.to_string());
+    assert!(crate::validation::resolve_command_validation(&resolve("just ci"),
+        Some(dir.path()), None).await.is_none());
+    git(&["add", ".codex/test-runners.json"]);
+    git(&["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "declare runners"]);
+    // A worktree/index edit cannot introduce a trusted echo producer.
+    std::fs::write(&manifest, json!({"version":1,"runners":[
+        {"programs":["echo"],"prefixes":[["fake"]],"operations":["test"],"receipt_runner":"ci"}
+    ]}).to_string()).unwrap();
+    git(&["add", ".codex/test-runners.json"]);
+    assert!(crate::validation::resolve_command_validation(&resolve("echo fake"),
+        Some(dir.path()), None).await.is_none());
+
+    let receipt = json!({"kind":"codex_test_execution_v1","runner":"ci","exit_code":0,
+        "selected_targets":["suite"],"runner_input_fingerprint":"a".repeat(64),
+        "completed_tests":{"suite":["case"]},"executed_tests":1});
+    for command in ["just ci", "make verify", "npm run e2e"] {
+        let validation = crate::validation::resolve_command_validation(&resolve(command),
+            Some(dir.path()), None).await.unwrap();
+        assert!(validation.is_test());
+        for nested in [false, true] {
+            let mut control = TurnExecutionControl::new();
+            let baseline = control.baselines(0);
+            let collector = control.collector(&baseline);
+            let payload = ToolPayload::Function { arguments: json!({"cmd":command}).to_string() };
+            let output = ExecCommandToolOutput {
+                process_output: None, error: None, validation: Some(validation.clone()),
+                event_call_id: "runner".into(), chunk_id: "chunk".into(),
+                wall_time: std::time::Duration::ZERO, raw_output: receipt.to_string().into_bytes(),
+                truncation_policy: TruncationPolicy::Tokens(1000), max_output_tokens: None,
+                process_id: None, session_capabilities: None, exit_code: Some(0),
+                process_exited: true, search_no_match: false, original_token_count: None,
+                hook_command: Some(command.into()), raw_output_artifact: None, repair_notice: None,
+                pending_deferred_completions: Vec::new(),
+            };
+            if nested {
+                let signal = output.sampling_request_signal();
+                let value = output.code_mode_result(&payload);
+                collector.record_code_mode_result(CodeModeToolResult {
+                    cell_id: "cell", tool_name: &ToolName::plain("exec_command"),
+                    payload: &payload, source_dependencies: None,
+                    outcome_context: output.outcome_context(), signal: signal.as_ref(),
+                    result: &value, canonical_artifact_required: false,
+                });
+            } else {
+                record(&collector, "exec_command", &payload, &output, "runner");
+            }
+            assert!(collector.fresh_successful_validation(), "{command} nested={nested}");
+            assert!(control.observe_progress(&baseline, &collector, &settled())
+                .contains(&TurnTimingProgressKind::ValidationResult));
+        }
+        for (field, value) in [
+            ("executed_tests", json!(0)),
+            ("runner", json!("undeclared")),
+            ("completed_tests", json!({"suite":["case","case"]})),
+            ("runner_input_fingerprint", json!("invalid")),
+        ] {
+            let mut bad = receipt.clone();
+            bad[field] = value;
+            let mut signal = json!({});
+            crate::tools::context::attach_command_validation(&mut signal,
+                bad.to_string().as_bytes(), Some(&validation), Some(0), true);
+            assert!(signal.get("runner_execution_receipt").is_none());
+        }
+    }
+    for command in ["echo fake", "just ci; echo fake", "just ci && echo fake",
+        "just ci | cat", "just ci > receipt.json", "just ci --help"] {
+        let validation = crate::validation::resolve_command_validation(&resolve(command),
+            Some(dir.path()), None).await;
+        let mut signal = json!({});
+        crate::tools::context::attach_command_validation(&mut signal, receipt.to_string().as_bytes(),
+            validation.as_ref(), Some(0), true);
+        assert!(signal.get("runner_execution_receipt").is_none(), "{command}");
     }
 }
 

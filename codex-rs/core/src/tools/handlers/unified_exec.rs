@@ -33,6 +33,7 @@ pub(crate) struct ExecCommandArgs {
     /// Whether the caller chose `yield_time_ms` rather than its default.
     yield_time_requested: bool,
     stall_timeout_ms: Option<u64>,
+    stall_timeout_requested: bool,
     max_output_tokens: Option<usize>,
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
@@ -143,6 +144,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
                 .stall_timeout_ms
                 .or_else(|| (!long_running).then_some(crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS))
                 .filter(|timeout| *timeout != 0),
+            stall_timeout_requested: raw.stall_timeout_ms.is_some(),
             max_output_tokens: raw.max_output_tokens,
             sandbox_permissions: raw.sandbox_permissions,
             additional_permissions: raw.additional_permissions,
@@ -156,6 +158,17 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
 }
 
 impl ExecCommandArgs {
+    pub(super) fn apply_validation_observation_policy(&mut self, validation: bool) {
+        if validation {
+            if !self.yield_time_requested {
+                self.yield_time_ms = crate::unified_exec::MAX_YIELD_TIME_MS;
+            }
+            if !self.stall_timeout_requested {
+                self.stall_timeout_ms = None;
+            }
+        }
+    }
+
     pub(crate) fn command_invocation(&self) -> &CommandInvocation {
         &self.command
     }

@@ -1,3 +1,9 @@
 /target/
 /target-*/
 *.pdb
+
+# Local operation evidence, receipts, and test logs.
+/.kda/
+
+# Pending Insta snapshots; accepted .snap fixtures remain versioned.
+*.snap.new

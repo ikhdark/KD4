@@ -596,6 +596,177 @@ pub(crate) fn rg_search_path_operands(commands: &[Vec<String>]) -> Option<Vec<St
     saw_search.then_some(operands)
 }
 
+const MAX_MISSING_PATH_NOTES: usize = 3;
+const MAX_PATH_SUGGESTIONS: usize = 3;
+const MAX_SUGGESTION_DEPTH: usize = 3;
+const MAX_SUGGESTION_ENTRIES: usize = 4_000;
+const MAX_SUGGESTION_CLIMBS: usize = 2;
+
+/// `rg` reports each search path it cannot open and still searches the rest.
+/// A guessed path, such as a file this repository renamed, otherwise costs
+/// another search, so name the closest existing paths. Advisory only: the
+/// command and its results are unchanged.
+pub(crate) fn missing_rg_path_advisory(output: &str, cwd: &Path) -> Option<String> {
+    static MISSING_PATH: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(r"(?m)^rg: (.+?): [^\r\n]*\(os error [23]\)\r?$")
+            .expect("valid rg missing-path regex")
+    });
+    let mut reported = Vec::<&str>::new();
+    for capture in MISSING_PATH.captures_iter(output) {
+        let path = capture.get(1).map_or("", |path| path.as_str()).trim();
+        if !path.is_empty() && !reported.contains(&path) {
+            reported.push(path);
+        }
+    }
+    let notes = reported
+        .into_iter()
+        .filter_map(|reported| {
+            let missing = cwd.join(reported);
+            // A script can search from another directory; never contradict it.
+            if missing.exists() {
+                return None;
+            }
+            let suggestions = nearest_existing_paths(&missing, cwd);
+            (!suggestions.is_empty()).then(|| {
+                let suggestions = suggestions
+                    .iter()
+                    .map(|path| format!("`{}`", display_suggestion(path, cwd)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("`{reported}` -> {suggestions}")
+            })
+        })
+        .take(MAX_MISSING_PATH_NOTES)
+        .collect::<Vec<_>>();
+    (!notes.is_empty()).then(|| {
+        format!(
+            "Hint: `rg` could not open these search paths; possible existing paths (not verified replacements) are {}. The other paths still ran, and a path error is not evidence of no matches.",
+            notes.join("; ")
+        )
+    })
+}
+
+/// Search below the deepest existing ancestor, climbing at most two levels and
+/// never above the working directory for a path requested inside it.
+pub(super) fn nearest_existing_paths(missing: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let Some(name) = missing
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return Vec::new();
+    };
+    let stem = Path::new(&name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(&name)
+        .to_string();
+    let mut base = missing.parent();
+    while let Some(directory) = base.filter(|directory| !directory.is_dir()) {
+        base = directory.parent();
+    }
+    let within_cwd = missing.starts_with(cwd);
+    let mut climbs = 0;
+    while let Some(directory) = base {
+        let mut candidates = suggestion_candidates(directory, &name, &stem);
+        if !candidates.is_empty() {
+            candidates.sort();
+            return candidates
+                .into_iter()
+                .take(MAX_PATH_SUGGESTIONS)
+                .map(|(_, _, _, path)| path)
+                .collect();
+        }
+        if climbs == MAX_SUGGESTION_CLIMBS || (within_cwd && directory == cwd) {
+            break;
+        }
+        climbs += 1;
+        base = directory.parent();
+    }
+    Vec::new()
+}
+
+/// Breadth-first so a bounded walk covers the nearest levels first; ranked by
+/// match strength, then depth, then name length.
+fn suggestion_candidates(
+    base: &Path,
+    name: &str,
+    stem: &str,
+) -> Vec<(std::cmp::Reverse<u8>, usize, usize, PathBuf)> {
+    let mut candidates = Vec::new();
+    let mut pending = std::collections::VecDeque::from([(base.to_path_buf(), 1)]);
+    let mut visited = 0;
+    while let Some((directory, depth)) = pending.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            visited += 1;
+            if visited > MAX_SUGGESTION_ENTRIES {
+                return candidates;
+            }
+            let Some(entry_name) = entry.file_name().to_str().map(str::to_ascii_lowercase) else {
+                continue;
+            };
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if let Some(score) = suggestion_score(&entry_name, is_dir, name, stem) {
+                candidates.push((
+                    std::cmp::Reverse(score),
+                    depth,
+                    entry_name.len(),
+                    entry.path(),
+                ));
+            }
+            if is_dir
+                && depth < MAX_SUGGESTION_DEPTH
+                && !matches!(entry_name.as_str(), ".git" | "target" | "node_modules")
+            {
+                pending.push_back((entry.path(), depth + 1));
+            }
+        }
+    }
+    candidates
+}
+
+/// Exact names first, then the same stem (`code_mode.rs` -> `code_mode/`),
+/// then a stem that extends or shortens the request (`spec` -> `spec_plan`).
+fn suggestion_score(candidate: &str, is_dir: bool, name: &str, stem: &str) -> Option<u8> {
+    if candidate == name {
+        return Some(3);
+    }
+    let candidate_stem = if is_dir {
+        candidate
+    } else {
+        Path::new(candidate)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(candidate)
+    };
+    if candidate_stem == stem {
+        return Some(2);
+    }
+    let extends = |longer: &str, shorter: &str| {
+        shorter.len() >= 3
+            && longer
+                .strip_prefix(shorter)
+                .is_some_and(|rest| rest.starts_with(['_', '-', '.']))
+    };
+    (extends(candidate_stem, stem) || extends(stem, candidate_stem)).then_some(1)
+}
+
+fn display_suggestion(path: &Path, cwd: &Path) -> String {
+    let mut display = path.strip_prefix(cwd).map_or_else(
+        |_| path.display().to_string(),
+        |relative| relative.to_string_lossy().replace('\\', "/"),
+    );
+    if path.is_dir() {
+        display.push('/');
+    }
+    display
+}
+
 struct RgArgumentRoles<'a> {
     path_indices: Vec<usize>,
     input_files: Vec<&'a str>,
@@ -924,5 +1095,52 @@ mod deadline_tests {
             .unwrap();
         assert_eq!(search.scope_state_identity, None);
         assert!(done.await.unwrap(), "late worker must observe cancellation");
+    }
+}
+
+#[cfg(test)]
+mod missing_path_tests {
+    use super::*;
+
+    #[test]
+    fn missing_rg_paths_name_the_nearest_existing_paths() {
+        let root = tempfile::tempdir().unwrap();
+        for file in [
+            "codex-rs/core/src/tools/spec_plan.rs",
+            "codex-rs/core/src/tools/code_mode/mod.rs",
+            "codex-rs/core/src/tools/handlers/shell.rs",
+            "justfile",
+        ] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        // Misses recorded in real sessions: a renamed file, a module that moved
+        // directories, a file one level up, and a path that exists nowhere.
+        let output = concat!(
+            "codex-rs/core/src/tools/spec_plan.rs:1:needle\n",
+            "rg: codex-rs/core/src/tools/spec.rs: The system cannot find the file specified. (os error 2)\r\n",
+            "rg: codex-rs/core/src/tools/handlers/code_mode.rs: IO error for operation on codex-rs/core/src/tools/handlers/code_mode.rs: No such file or directory (os error 2)\n",
+            "rg: codex-rs/justfile: No such file or directory (os error 2)\n",
+            "rg: .github: The system cannot find the path specified. (os error 3)\n",
+        );
+        let advisory = missing_rg_path_advisory(output, root.path()).expect("advisory");
+        for expected in [
+            "`codex-rs/core/src/tools/spec.rs` -> `codex-rs/core/src/tools/spec_plan.rs`",
+            "`codex-rs/core/src/tools/handlers/code_mode.rs` -> `codex-rs/core/src/tools/code_mode/`",
+            "`codex-rs/justfile` -> `justfile`",
+        ] {
+            assert!(advisory.contains(expected), "{advisory}");
+        }
+        assert!(!advisory.contains(".github"), "{advisory}");
+        // No hint without an rg path error, or for a path that exists here.
+        assert_eq!(missing_rg_path_advisory("src/a.rs:1:needle\n", root.path()), None);
+        assert_eq!(
+            missing_rg_path_advisory(
+                "rg: justfile: No such file or directory (os error 2)\n",
+                root.path()
+            ),
+            None
+        );
     }
 }

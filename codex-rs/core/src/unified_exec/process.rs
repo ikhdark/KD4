@@ -236,7 +236,7 @@ type TerminalCompletionReceiver = watch::Receiver<Option<Result<(), String>>>;
 /// Unified wrapper over directly spawned PTY sessions and exec-server-backed
 /// processes.
 pub(crate) struct UnifiedExecProcess {
-    validation: std::sync::OnceLock<codex_protocol::validation::ValidationCommandContext>,
+    validation: std::sync::OnceLock<crate::validation::CommandValidation>,
     process_handle: ProcessHandle,
     termination_owner: std::sync::OnceLock<ProcessTerminationOwner>,
     output_tx: broadcast::Sender<ProcessOutputChunk>,
@@ -359,7 +359,7 @@ impl UnifiedExecProcess {
 
     pub(super) fn set_validation(
         &self,
-        context: Option<codex_protocol::validation::ValidationCommandContext>,
+        context: Option<crate::validation::CommandValidation>,
     ) {
         if let Some(context) = context {
             let _ = self.validation.set(context);
@@ -368,7 +368,7 @@ impl UnifiedExecProcess {
 
     pub(super) fn validation(
         &self,
-    ) -> Option<codex_protocol::validation::ValidationCommandContext> {
+    ) -> Option<crate::validation::CommandValidation> {
         self.validation.get().cloned()
     }
 

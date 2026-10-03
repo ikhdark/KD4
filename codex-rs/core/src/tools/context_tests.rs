@@ -151,6 +151,65 @@ fn orchestration_audit_tool_dispatch_state_has_one_terminal_transition_owner() {
     assert!(cancelled_after_admission.is_aborted());
 }
 
+#[test]
+fn parallel_test_failures_ignore_runner_noise_but_preserve_failure_changes() {
+    let first = concat!(
+        "run id: 1234\nFAIL [ 1.793s] (1/2) suite case_a\n",
+        "---- STDERR: (1/2) suite case_a ----\n",
+        "thread 'case_a' (101) panicked at src/a.rs:10:2:\n",
+        "assertion failed: expected 1s; log_id=abcd\n",
+        "FAIL [ 2.420s] (2/2) suite case_b\n",
+        "---- STDERR: (2/2) suite case_b ----\n",
+        "thread 'case_b' (102) panicked at src/b.rs:20:3:\n",
+        "missing fixture\nSummary [4.213s] 2 tests run: 2 failed\n",
+    );
+    let reordered = concat!(
+        "run id: 5678\nFAIL [ 9.003s] (1/2) suite case_b\n",
+        "---- STDERR: (1/2) suite case_b ----\n",
+        "thread 'case_b' (555) panicked at src/b.rs:20:3:\n",
+        "missing fixture\nFAIL [ 4.002s] (2/2) suite case_a\n",
+        "---- STDERR: (2/2) suite case_a ----\n",
+        "thread 'case_a' (666) panicked at src/a.rs:10:2:\n",
+        "assertion failed: expected 1s; log_id=efgh\n",
+        "Summary [13.005s] 2 tests run: 2 failed\n",
+    );
+    let fingerprint = |text: &str| command_failure_signature(
+        &failed_command_evidence(text.as_bytes(), Some("cargo nextest run")), Some(1),
+    );
+    assert_eq!(fingerprint(first), fingerprint(reordered));
+    assert_ne!(fingerprint(first), fingerprint(&reordered.replace("case_b", "case_c")));
+    assert_ne!(fingerprint(first), fingerprint(&reordered.replace("expected 1s", "expected 2s")));
+    let assertion = first.replace("assertion failed: expected 1s; log_id=abcd",
+        "assertion `left == right` failed\n  left: 10\n right: 20");
+    assert_ne!(fingerprint(&assertion), fingerprint(&assertion.replace("left: 10", "left: 11")));
+    let identifier = assertion.replace("left: 10", "left: run_id=10");
+    assert_ne!(fingerprint(&identifier), fingerprint(&identifier.replace("left: run_id=10", "left: run_id=11")));
+    assert_ne!(fingerprint(first), fingerprint(&first
+        .replace("thread 'case_a'", "thread 'swapped'")
+        .replace("thread 'case_b'", "thread 'case_a'")
+        .replace("thread 'swapped'", "thread 'case_b'")));
+    assert_ne!(successful_command_evidence(first.as_bytes(), Some("cat failure.txt")),
+        successful_command_evidence(reordered.as_bytes(), Some("cat failure.txt")));
+    assert_eq!(
+        test_failure_evidence(b"FAILED tests/a.py::test_one - AssertionError: run_id=123 expected 1s\n"),
+        test_failure_evidence(b"FAILED tests/a.py::test_one - AssertionError: run_id=456 expected 1s\n"),
+    );
+}
+
+#[test]
+fn search_evidence_preserves_exact_output_including_file_order() {
+    let first = b"a.rs:1:first\na.rs:2:second\nb.rs:1:other\n";
+    let reordered = b"b.rs:1:other\na.rs:1:first\na.rs:2:second\n";
+    let search = |bytes: &[u8]| successful_command_evidence(bytes, Some("rg -n pattern src"));
+    assert_ne!(search(first), search(reordered));
+    assert_ne!(search(first), search(b"a.rs:2:second\na.rs:1:first\nb.rs:1:other\n"));
+    assert_ne!(search(first), search(b"a.rs:1:changed\na.rs:2:second\nb.rs:1:other\n"));
+    for command in ["cat report.txt", "rg -n pattern src; cat report.txt", "rg -n --json pattern src"] {
+        assert_ne!(successful_command_evidence(first, Some(command)),
+            successful_command_evidence(reordered, Some(command)));
+    }
+}
+
 fn mcp_tool_output(
     result: CallToolResult,
     wall_time: std::time::Duration,

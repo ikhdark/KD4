@@ -91,7 +91,7 @@ fn parse_shell_command_hook_invocation(
 
 pub(super) struct RunExecLikeArgs {
     pub(super) max_output_tokens: Option<usize>,
-    pub(super) validation: Option<codex_protocol::validation::ValidationCommandContext>,
+    pub(super) validation: Option<crate::validation::CommandValidation>,
     pub(super) tool_name: ToolName,
     pub(super) exec_params: ExecParams,
     pub(super) stall_timeout_ms: Option<u64>,
@@ -165,6 +165,11 @@ pub(super) fn shell_sampling_signal(
                 ));
                 signal["command_evidence"] = json!(true);
                 signal["empty_output"] = json!(canonical_output.unwrap_or_default().is_empty());
+                if let Some(lineage) = crate::tools::context::declared_lineage_evidence(
+                    canonical_output.unwrap_or_default(),
+                ) {
+                    signal["semantic_evidence"] = lineage;
+                }
                 signal
             })
     })
@@ -315,10 +320,18 @@ pub(super) async fn run_exec_like(
     args: RunExecLikeArgs,
 ) -> Result<LegacyShellToolOutput, FunctionCallError> {
     let call_id = args.call_id.clone();
-    let validation = args.validation.clone();
+    let command_validation = args.validation.clone();
+    let validation = command_validation.as_ref().and_then(|validation| validation.declared.clone());
     let validation_output_owned = args.validation_launch;
     let max_output_tokens = args.max_output_tokens;
     let mut result = run_exec_like_with_exit_code(args).await?;
+    if let Some(signal) = result.output.sampling_request_signal.as_mut() {
+        crate::tools::context::attach_command_validation(
+            signal, result.canonical_output.as_deref().unwrap_or_default(),
+            command_validation.as_ref(), result.exit_code,
+            result.validation_execution_outcome != ValidationExecutionOutcome::NotExecuted,
+        );
+    }
     if let Some(validation) = validation.as_ref() {
         let metadata = crate::tools::context::declared_validation_metadata(validation);
         result.output.body.push(

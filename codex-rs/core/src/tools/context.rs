@@ -1005,7 +1005,7 @@ pub struct ExecCommandToolOutput {
     pub(crate) process_output: Option<Arc<crate::unified_exec::ProcessOutputSnapshot>>,
     pub(crate) error: Option<String>,
     /// Model-declared attribution only; it does not establish successful coverage.
-    pub validation: Option<codex_protocol::validation::ValidationCommandContext>,
+    pub validation: Option<crate::validation::CommandValidation>,
     pub event_call_id: String,
     pub chunk_id: String,
     pub wall_time: Duration,
@@ -1065,7 +1065,7 @@ impl ToolOutput for ExecCommandToolOutput {
         // Successful observations may be source text, diffs, or external data.
         // Diagnostic normalization must not erase their whitespace, values, or metadata.
         let semantic_evidence = if outcome == ToolOutputOutcome::Failure {
-            semantic_evidence_for_command_output(&self.raw_output)
+            failed_command_evidence(&self.raw_output, self.hook_command.as_deref())
         } else {
             successful_command_evidence(&self.raw_output, self.hook_command.as_deref())
         };
@@ -1096,11 +1096,10 @@ impl ToolOutput for ExecCommandToolOutput {
         if let Some(process_id) = self.process_id {
             signal["background_process_id"] = serde_json::json!(process_id);
         }
-        if self.process_exited && self.exit_code == Some(0) && self.error.is_none()
-            && let Some(receipt) = runner_execution_receipt(&self.raw_output, self.hook_command.as_deref())
-        {
-            signal["runner_execution_receipt"] = receipt;
-        }
+        let validation_output = self.process_output.as_ref()
+            .map_or(self.raw_output.as_slice(), |output| output.aggregated_output.as_slice());
+        attach_command_validation(&mut signal, validation_output, self.validation.as_ref(),
+            self.exit_code, self.process_exited && self.error.is_none());
         Some(signal)
     }
 
@@ -1411,7 +1410,18 @@ fn canonical_output_evidence(raw_output: &[u8]) -> Vec<String> {
     )]
 }
 
-fn declared_lineage_evidence(raw_output: &[u8]) -> Option<JsonValue> {
+pub(crate) fn declared_lineage_evidence(raw_output: &[u8]) -> Option<JsonValue> {
+    declared_lineage_evidence_with_integrity(raw_output, false)
+}
+
+pub(crate) fn declared_file_lineage_evidence(raw_output: &[u8]) -> Option<JsonValue> {
+    declared_lineage_evidence_with_integrity(raw_output, true)
+}
+
+fn declared_lineage_evidence_with_integrity(
+    raw_output: &[u8],
+    require_content_hash: bool,
+) -> Option<JsonValue> {
     // Any producer whose whole output is a JSON object may declare the source,
     // optional scope, and identity it projects, so re-rendering retained
     // evidence is not counted as new source evidence. Attribution only, never
@@ -1421,8 +1431,31 @@ fn declared_lineage_evidence(raw_output: &[u8]) -> Option<JsonValue> {
     if !raw_output.windows(KEY.len()).any(|window| window == KEY) {
         return None;
     }
-    let value: JsonValue = serde_json::from_slice(raw_output).ok()?;
-    let lineage = value.get("evidence_lineage")?;
+    let mut body = None;
+    let mut value: JsonValue = serde_json::from_slice(raw_output).ok().or_else(|| {
+        // Human-readable reports carry one explicit header, not arbitrary JSON
+        // found in quoted source or examples elsewhere in the document.
+        let (header, contents) = std::str::from_utf8(raw_output).ok()?.split_once('\n')?;
+        body = Some(contents.as_bytes());
+        serde_json::from_str(header.strip_prefix("<!-- codex-evidence: ")?
+            .strip_suffix(" -->")?).ok()
+    })?;
+    let lineage = value.as_object_mut()?.remove("evidence_lineage")?;
+    if require_content_hash || lineage.get("content_sha256").is_some() {
+        let expected = lineage.get("content_sha256")?.as_str()?;
+        let actual = match body {
+            Some(body) => crate::tool_history::sha256(body),
+            None => {
+                // File producers use compact UTF-8 JSON with recursively
+                // sorted keys, excluding the top-level lineage metadata.
+                value.sort_all_objects();
+                crate::tool_history::sha256(&serde_json::to_vec(&value).ok()?)
+            }
+        };
+        if expected != actual {
+            return None;
+        }
+    }
     let source = lineage.get("source")?.as_str().filter(|source| {
         !source.is_empty() && !matches!(*source, "read_file" | "artifact" | "workspace-command")
     })?;
@@ -1446,6 +1479,101 @@ pub(crate) fn successful_command_evidence(raw_output: &[u8], command: Option<&st
     } else {
         canonical_output_evidence(raw_output)
     }
+}
+
+pub(crate) fn failed_command_evidence(raw_output: &[u8], command: Option<&str>) -> Vec<String> {
+    if command.is_some_and(|command| matches!(
+        crate::validation::classify_validation_script(command),
+        crate::validation::ValidationClassification::Validation { leaves, .. }
+            if leaves.iter().any(|leaf| leaf.operation == crate::validation::ValidationOperation::Test)
+    )) && let Some(evidence) = test_failure_evidence(raw_output) {
+        return evidence;
+    }
+    semantic_evidence_for_command_output(raw_output)
+}
+
+fn test_failure_evidence(raw_output: &[u8]) -> Option<Vec<String>> {
+    static FAILED_TEST: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(concat!(
+            r"^(?:FAIL\s+\[\s*[^]]+\]\s+(?:\(\s*\d+/\d+\)\s+)?(?P<nextest>.+)",
+            r"|test (?P<rust>.+) \.\.\. FAILED",
+            r"|FAILED (?P<pytest>\S+)(?: - (?P<message>.*))?)$"
+        )).expect("valid failed test regex")
+    });
+    static RUNNER_INDEX: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(r"\(\s*\d+/\d+\)\s*").expect("valid runner index regex")
+    });
+    let output = strip_ansi_sequences(std::str::from_utf8(raw_output).ok()?);
+    let mut names = std::collections::BTreeSet::new();
+    let mut diagnostics = Vec::<(String, Vec<String>)>::new();
+    let mut current = None;
+    let mut section = String::new();
+    for line in output.lines() {
+        if let Some(captures) = FAILED_TEST.captures(line.trim()) {
+            let name = captures.name("nextest").or_else(|| captures.name("rust"))
+                .or_else(|| captures.name("pytest"))?;
+            names.insert(name.as_str().to_string());
+            if let Some(message) = captures.name("message") {
+                diagnostics.push((name.as_str().to_string(),
+                    vec![normalize_test_diagnostic_line(message.as_str())]));
+            }
+            current = None;
+            continue;
+        }
+        let normalized = normalize_test_diagnostic_line(line);
+        let line = normalized.trim();
+        if line.starts_with("---") || line.starts_with("___") {
+            // nextest/libtest/pytest delimit diagnostic blocks. Retain the
+            // owning test/binary rather than mixing messages across tests.
+            section = RUNNER_INDEX.replace_all(line.trim_matches(['-', '_', ' ']), "").into_owned();
+            current = None;
+        } else if line.starts_with("thread '") && line.contains(" panicked at ") {
+            let (owner, location) = line.split_once(" panicked at ")?;
+            diagnostics.push((format!("{section}\n{owner}"), vec![location.to_string()]));
+            current = Some(diagnostics.len() - 1);
+        } else if line.starts_with("stack backtrace:")
+            || line.starts_with("note: run with ")
+            || line.starts_with("test result:")
+            || line.starts_with("Summary ")
+            || line.starts_with("failures:")
+            || line.starts_with("error: test failed")
+            || ["PASS ", "SKIP ", "TIMEOUT ", "test "].iter().any(|prefix| line.starts_with(prefix))
+        {
+            current = None;
+        } else if !line.is_empty() {
+            if let Some(index) = current {
+                // Keep the whole assertion, including left/right values and
+                // multiline messages. Only block order is insignificant.
+                diagnostics[index].1.push(line.to_string());
+            } else if line.starts_with("E ") {
+                diagnostics.push((section.clone(), vec![line.to_string()]));
+            }
+        }
+    }
+    if names.is_empty() || diagnostics.is_empty() {
+        return None;
+    }
+    diagnostics.sort();
+    Some(vec![format!("test-failures-v2:{}", crate::tool_history::sha256(
+        serde_json::to_vec(&(names, diagnostics)).ok()?.as_slice()
+    ))])
+}
+
+fn normalize_test_diagnostic_line(line: &str) -> String {
+    if ["left:", "right:", "expected:", "actual:"].iter()
+        .any(|prefix| line.trim_start().starts_with(prefix))
+    {
+        return line.to_string();
+    }
+    static VOLATILE: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(concat!(
+            r"(?P<duration>^\s*(?:FAIL|PASS|SKIP|TIMEOUT)\s+\[)\s*\d+(?:\.\d+)?s\]",
+            r"|(?P<thread>^thread '[^']*') \(\d+\)",
+            r"|(?P<id>\b(?:run[-_ ]id|log[-_ ]id)[=: ]+)[A-Za-z0-9_-]+"
+        )).expect("valid test diagnostic regex")
+    });
+    VOLATILE.replace_all(&normalize_command_diagnostic_line(line),
+        "${duration}${thread}${id}<volatile>").into_owned()
 }
 
 fn command_failure_signature(semantic_evidence: &[String], exit_code: Option<i32>) -> String {
@@ -1678,32 +1806,16 @@ pub(crate) fn declared_validation_metadata(
     })
 }
 
-/// Only the repository runner's typed completed-test ledger can establish test
+/// Only a repository-declared producer's typed completed-test ledger can establish test
 /// execution. Plain command output, build success, and zero-test summaries do
 /// not become proof. Compound/wrapper commands remain conservatively unproven.
-fn runner_execution_receipt(raw_output: &[u8], command: Option<&str>) -> Option<JsonValue> {
-    let command = command?;
-    let words = command.split_whitespace().collect::<Vec<_>>();
-    let program = words.first()?.rsplit(['/', '\\']).next()?;
-    if !matches!(program, "python" | "python3" | "python.exe" | "python3.exe" | "py" | "py.exe")
-        || !words.iter().any(|word| word.trim_matches(['\'', '"'])
-            .rsplit(['/', '\\']).next() == Some("rust_test_runner.py"))
-        || !matches!(
-            crate::validation::classify_validation_script(command),
-            crate::validation::ValidationClassification::Validation {
-                exit_code_is_authoritative: true,
-                has_unclassified_targets: false,
-                ..
-            }
-        )
-    {
-        return None;
-    }
+fn runner_execution_receipt(raw_output: &[u8], trusted_runner: Option<&str>) -> Option<JsonValue> {
+    let runner = trusted_runner.filter(|runner| !runner.is_empty())?;
     let text = std::str::from_utf8(raw_output).ok()?;
     let mut receipts = text.lines().filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
         .filter(|value| value["kind"] == "codex_test_execution_v1");
     let receipt = receipts.next()?;
-    if receipts.next().is_some() || receipt["runner"] != "rust_test_runner"
+    if receipts.next().is_some() || receipt["runner"] != runner
         || receipt["exit_code"].as_i64() != Some(0)
         || receipt["selected_targets"].as_array()?.is_empty()
         || receipt["selected_targets"].as_array()?.iter()
@@ -1720,7 +1832,7 @@ fn runner_execution_receipt(raw_output: &[u8], command: Option<&str>) -> Option<
         // the complete declaration with its receipt, but never let an opaque
         // script authorize replay or narrower freshness from its own claims.
         if manifest["version"] != 1
-            || manifest["producer"] != "rust_test_runner"
+            || manifest["producer"] != runner
             || manifest["captured"] != "before_execution"
             || manifest["coverage"] != "declared_not_exhaustive"
             || manifest["automatic_replay_allowed"] != false
@@ -1745,6 +1857,43 @@ fn runner_execution_receipt(raw_output: &[u8], command: Option<&str>) -> Option<
     (executed > 0 && receipt["executed_tests"].as_u64() == Some(executed)).then_some(receipt)
 }
 
+pub(crate) fn attach_command_validation(
+    signal: &mut JsonValue,
+    raw_output: &[u8],
+    validation: Option<&crate::validation::CommandValidation>,
+    exit_code: Option<i32>,
+    terminal: bool,
+) {
+    let Some(validation) = validation else { return };
+    signal["command_validation"] = validation.signal();
+    if !terminal || !validation.is_validation() {
+        return;
+    }
+    let failed = exit_code != Some(0);
+    let evidence = if failed && validation.is_test() {
+        test_failure_evidence(raw_output).unwrap_or_else(|| {
+            let normalized = String::from_utf8_lossy(raw_output).lines()
+                .map(normalize_test_diagnostic_line).collect::<Vec<_>>().join("\n");
+            semantic_evidence_for_command_output(normalized.as_bytes())
+        })
+    } else {
+        semantic_evidence_for_command_output(raw_output)
+    };
+    signal["semantic_evidence"] = serde_json::json!(evidence);
+    if failed {
+        signal["failure_signature"] = serde_json::json!(command_failure_signature(&evidence, exit_code));
+    } else {
+        if let Some(lineage) = declared_lineage_evidence(raw_output) {
+            signal["semantic_evidence"] = lineage;
+        }
+        if validation.is_test()
+            && let Some(receipt) = runner_execution_receipt(raw_output, validation.receipt_runner.as_deref())
+        {
+            signal["runner_execution_receipt"] = receipt;
+        }
+    }
+}
+
 impl ExecCommandToolOutput {
     fn execution_state(&self) -> &'static str {
         if self.process_exited {
@@ -1763,7 +1912,8 @@ impl ExecCommandToolOutput {
     }
 
     fn declared_validation_metadata(&self) -> Option<JsonValue> {
-        self.validation.as_ref().map(declared_validation_metadata)
+        self.validation.as_ref().and_then(|validation| validation.declared.as_ref())
+            .map(declared_validation_metadata)
     }
 
     fn projection_metadata_from_raw(&self, raw_output: &str) -> ToolOutputProjectionMetadata {

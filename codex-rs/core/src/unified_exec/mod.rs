@@ -120,7 +120,7 @@ impl UnifiedExecContext {
 
 #[derive(Debug)]
 pub(crate) struct ExecCommandRequest {
-    pub validation: Option<codex_protocol::validation::ValidationCommandContext>,
+    pub validation: Option<crate::validation::CommandValidation>,
     pub command: Vec<String>,
     pub command_for_safety: Vec<String>,
     pub attempt_key: CommandAttemptKey,

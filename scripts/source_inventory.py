@@ -1249,7 +1249,7 @@ def describe_contract():
             "scan_pending": "number of files awaiting another scan batch",
             "source_bytes_read": "source bytes read in this batch",
             "source_bytes_reused": "bytes not reread because full file revisions and required rule hashes matched retained observations; --refresh bypasses this metadata-guarded cache",
-            "evidence_lineage": "kind (source_scan or retained_projection), source, and identity (digest of query_id and source_snapshot_sha256); attribution only, not semantic completeness or current runtime authority",
+            "evidence_lineage": "kind (source_scan or retained_projection), source, and identity (digest of query_id and source_snapshot_sha256); attribution only, not semantic completeness or current runtime authority. Disk JSON adds content_sha256 over compact UTF-8 JSON with sorted keys and no top-level evidence_lineage; Markdown hashes the exact UTF-8 body after its header. Changed or legacy unsigned files fall back to ordinary file evidence.",
             "scope_delta": "on a scope correction: added/removed selected source counts and up to 50 paths each, with an explicit completeness flag; prior scope and correction reason remain in state",
             "evidence_scope": "captured evidence freshness and scope",
             "unresolved_count": "records requiring inspection",
@@ -1400,6 +1400,31 @@ def record_delivery(state, delivery):
         stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def evidence_lineage(state, kind="retained_projection"):
+    output = state["output"]
+    snapshot = output.get("source_snapshot_sha256")
+    if not snapshot:
+        return {}
+    query_id = output.get("query_id", query_identity(state["query"]))
+    return {"evidence_lineage": {
+        "kind": kind,
+        "source": "source_inventory",
+        "identity": hashlib.sha256(f"{query_id}:{snapshot}".encode()).hexdigest()[:16],
+    }}
+
+def file_lineage_document(document, lineage):
+    """Bind a report's attribution to its payload, never to a stale copied header."""
+    payload = {key: value for key, value in document.items() if key != "evidence_lineage"}
+    if not lineage:
+        return payload
+    content = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return {**payload, "evidence_lineage": {
+        **lineage["evidence_lineage"],
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+    }}
+
+
 def export_delivery(state, report):
     """Content-addressed delivery survives later state/report revisions."""
     # Reports describe repository-relative paths and can be shared by isolated
@@ -1407,6 +1432,7 @@ def export_delivery(state, report):
     state = {**state, "root": "."}
     output = state["output"]
     document = {
+        **evidence_lineage(state),
         "format": RESULT_FORMAT,
         "query_id": output.get("query_id", query_identity(state["query"])),
         "profile": query_profile(state["query"]),
@@ -1448,6 +1474,7 @@ def export_delivery(state, report):
              "sha256": value["sha256"]}
             for path, value in sorted(state["files"].items())
         ]
+    document = file_lineage_document(document, evidence_lineage(state))
     data = (
         json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
@@ -1458,6 +1485,12 @@ def export_delivery(state, report):
         render_report(state)
         + f"\nCanonical path data: [{canonical.name}]({canonical.name})\n"
     ).encode("utf-8")
+    if lineage := evidence_lineage(state):
+        lineage["evidence_lineage"]["content_sha256"] = hashlib.sha256(rendered).hexdigest()
+        rendered = (
+            f"<!-- codex-evidence: {json.dumps(lineage, sort_keys=True)} -->\n".encode("utf-8")
+            + rendered
+        )
     for path, content in ((canonical, data), (readable, rendered)):
         write_bytes_atomic(path, content, immutable=True)
     write_bytes_atomic(report, rendered)
@@ -1716,7 +1749,7 @@ def main(argv=None):
             while state["scan"]["pending"]:
                 # Persist only completed batches, after validating all output
                 # destinations. Interrupted work resumes from this checkpoint.
-                write_json_atomic(args.state, state)
+                write_json_atomic(args.state, file_lineage_document(state, evidence_lineage(state)))
                 prior_pending = set(state["scan"]["pending"])
                 output, state = inventory(args.root, query, state)
                 if not set(state["scan"]["pending"]) < prior_pending:
@@ -1724,7 +1757,7 @@ def main(argv=None):
             if default_report:
                 args.report = report_directory(state) / "inventory.md"
         args.state.parent.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(args.state, state)
+        write_json_atomic(args.state, file_lineage_document(state, evidence_lineage(state)))
         if not args.review:
             try:
                 save_source_cache(state)
@@ -1826,15 +1859,9 @@ def main(argv=None):
         summary.update(delivery)
         if output["ready_to_render"]:
             summary["next_action"] = "deliver_report"
-    if summary.get("source_snapshot_sha256"):
-        # Harness lineage contract: a projection of the same query and snapshot
-        # declares the same identity, so it is not counted as new evidence.
-        lineage = f"{summary['query_id']}:{summary['source_snapshot_sha256']}"
-        summary["evidence_lineage"] = {
-            "kind": "retained_projection" if args.render_only or args.review else "source_scan",
-            "source": "source_inventory",
-            "identity": hashlib.sha256(lineage.encode()).hexdigest()[:16],
-        }
+    summary.update(evidence_lineage(
+        state, "retained_projection" if args.render_only or args.review else "source_scan",
+    ))
     if answer := delivery_answer(summary):
         summary["final_answer"] = answer
     print(json.dumps(summary, ensure_ascii=False))

@@ -23,6 +23,7 @@ use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
 use crate::tools::handlers::command_search::classify_rg_search_narrowing_without_native_scope;
 use crate::tools::handlers::command_search::classify_rg_search_with_repository;
+use crate::tools::handlers::command_search::missing_rg_path_advisory;
 use crate::tools::handlers::command_search::observe_rg_search_scope_state_with_freshness;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
@@ -200,6 +201,30 @@ pub(super) fn attach_powershell_failure_advisory(
     }
 }
 
+/// Lists only host directories, so the caller passes a native local cwd.
+async fn attach_missing_rg_path_advisory(response: &mut ExecCommandToolOutput, cwd: &Path) {
+    const RG_ERROR: &[u8] = b"rg: ";
+    if response.process_id.is_some()
+        || response.repair_notice.as_deref().is_some_and(|notice| notice.contains("rg_missing_path"))
+        || !response.raw_output.windows(RG_ERROR.len()).any(|window| window == RG_ERROR)
+    {
+        return;
+    }
+    let output = String::from_utf8_lossy(&response.raw_output).into_owned();
+    let cwd = cwd.to_path_buf();
+    let Ok(Some(advisory)) = crate::tools::run_blocking_command_analysis(move || {
+        missing_rg_path_advisory(&output, &cwd)
+    })
+    .await
+    else {
+        return;
+    };
+    response.repair_notice = Some(match response.repair_notice.take() {
+        Some(repair_notice) => format!("{repair_notice}\n\n{advisory}"),
+        None => advisory,
+    });
+}
+
 pub(super) async fn finalize_sandbox_denial_artifact(
     pending_artifact: &crate::tools::command_output_artifact::RawOutputArtifact,
     preserved_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
@@ -373,6 +398,7 @@ impl ExecCommandHandler {
             original_invocation,
             &original_resolved_command.safety_command,
             original_resolved_command.preflight_shell_type,
+            if environment_is_remote { None } else { native_cwd.as_ref().map(|cwd| cwd.as_path()) },
         )
         .await
         .map_err(|issue| {
@@ -405,8 +431,16 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
+        let validation = crate::validation::resolve_command_validation(
+            &command_invocation,
+            if environment_is_remote { None } else { native_cwd.as_ref().map(|cwd| cwd.as_path()) },
+            args.validation.clone(),
+        ).await;
+        args.apply_validation_observation_policy(
+            validation.as_ref().is_some_and(|validation| validation.is_validation()),
+        );
         let validation_launch = !direct_runtime
-            && (args.validation.is_some()
+            && (validation.is_some()
                 || matches!(
                     classify_validation_invocations(&validation_invocations),
                     ValidationClassification::Validation { .. }
@@ -693,7 +727,7 @@ impl ExecCommandHandler {
                     ExecCommandToolOutput {
                         process_output: None,
                         error: None,
-                        validation: args.validation.clone(),
+                        validation: validation.clone(),
                         event_call_id: String::new(),
                         chunk_id: String::new(),
                         wall_time: interception_wall_time,
@@ -735,7 +769,7 @@ impl ExecCommandHandler {
         let exec_result = manager
             .exec_command(
                 ExecCommandRequest {
-                    validation: args.validation.clone(),
+                    validation: validation.clone(),
                     command,
                     command_for_safety: safety_command,
                     attempt_key: attempt_key.clone(),
@@ -840,6 +874,9 @@ impl ExecCommandHandler {
                     }
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
+                if !environment_is_remote && let Some(native_cwd) = native_cwd.as_ref() {
+                    attach_missing_rg_path_advisory(&mut response, native_cwd.as_path()).await;
+                }
                 Ok(boxed_tool_output(
                     response,
                 ))
@@ -886,7 +923,7 @@ impl ExecCommandHandler {
                 let mut response = ExecCommandToolOutput {
                     process_output: None,
                     error: None,
-                    validation: args.validation.clone(),
+                    validation: validation.clone(),
                     event_call_id: context.call_id.clone(),
                     chunk_id: generate_chunk_id(),
                     wall_time: output.duration,

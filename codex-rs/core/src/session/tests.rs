@@ -12853,33 +12853,84 @@ async fn build_initial_context_omits_prompt_fragments_without_extension_state() 
 }
 
 #[tokio::test]
-async fn desktop_guidance_tracks_task_without_dropping_unknown_or_full_instructions() {
+async fn desktop_and_skill_prefixes_stay_stable_across_task_changes() {
     let (session, mut turn) = make_session_and_context().await;
+    let session = Arc::new(session);
     let original = "outside-before\n<app-context>\n# Codex desktop context\n\
 ### Images/Visuals/Files\nKeep file rendering rules.\n\
 ### Automations\nUse automation_update and preserve notification intent.\n\
 ### Future Feature\nKeep unknown rules.\n\
 ### Git\nPreserve branch rules.\n</app-context>\noutside-after";
     turn.developer_instructions = Some(original.to_string());
+    let mut outcome = SkillLoadOutcome::default();
+    outcome.skills = [("alpha", "database migrations"), ("beta", "image generation")]
+        .into_iter()
+        .map(|(name, description)| SkillMetadata {
+            name: name.to_string(),
+            description: description.repeat(10),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: test_path_buf(&format!("/tmp/{name}/SKILL.md")).abs(),
+            scope: SkillScope::Repo,
+            plugin_id: None,
+        })
+        .collect();
+    let snapshot = HostSkillsSnapshot::new(Arc::new(outcome));
+    turn.turn_skills = TurnSkillsContext::new(snapshot.clone());
     let mut turn = Arc::new(turn);
-    *turn.turn_skills.catalog_task.lock().await = "Fix the Rust parser".to_string();
     let built = build_initial_context(&session, &turn).await;
     let text = developer_input_texts(&built).join("\n");
     assert!(!text.contains("Use automation_update"));
-    for retained in ["Keep file rendering", "Keep unknown", "Preserve branch", "outside-before", "outside-after", "context:desktop"] {
+    for retained in [
+        "Keep file rendering",
+        "Keep unknown",
+        "Preserve branch",
+        "outside-before",
+        "outside-after",
+        "context:desktop",
+        "- alpha",
+        "- beta",
+    ] {
         assert!(text.contains(retained), "missing {retained}");
     }
     assert_eq!(turn.developer_instructions.as_deref(), Some(original));
-
-    *turn.turn_skills.catalog_task.lock().await = "Create a recurring reminder".to_string();
-    let built = build_initial_context(&session, &turn).await;
-    assert!(developer_input_texts(&built).join("\n").contains("Use automation_update"));
-    turn.turn_skills.catalog_task.lock().await.clear();
-    let built = build_initial_context(&session, &turn).await;
-    assert!(developer_input_texts(&built).join("\n").contains("Use automation_update"));
+    let digests = session
+        .build_context_fragment_digests(&turn, &WorldState::default())
+        .await;
+    for (index, task) in [
+        "Fix database migrations",
+        "Use image generation and create a recurring reminder",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let next = Arc::get_mut(&mut turn).expect("unique fixture turn");
+        next.sub_id = format!("catalog-turn-{index}");
+        next.turn_skills = TurnSkillsContext::new(snapshot.clone());
+        session
+            .record_user_prompt_and_emit_turn_item(
+                &turn,
+                &[UserInput::Text {
+                    text: task.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                None,
+            )
+            .await
+            .expect("record user input");
+        let built = build_initial_context(&session, &turn).await;
+        assert_eq!(developer_input_texts(&built).join("\n"), text);
+        assert_eq!(
+            session
+                .build_context_fragment_digests(&turn, &WorldState::default())
+                .await,
+            digests
+        );
+    }
 
     // An unsupported envelope must fail open, not silently remove instructions.
-    *turn.turn_skills.catalog_task.lock().await = "Fix the parser".to_string();
     for unsupported in [
         original.replace("# Codex desktop context", "# Custom context"),
         original.replace("</app-context>", ""),

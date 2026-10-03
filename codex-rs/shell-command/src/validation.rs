@@ -1,8 +1,9 @@
 //! Pure command recognition. Classification is not proof that a command ran.
 
+use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationOperation {
     Test,
@@ -15,6 +16,80 @@ pub enum ValidationOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationCommandDescriptor {
     pub operation: ValidationOperation,
+}
+
+/// Repository-owned entrypoints. These declarations must be loaded from trusted
+/// repository state by the caller, never from command output or tool arguments.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryRunner {
+    #[serde(skip)]
+    pub path_context: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    pub programs: Vec<String>,
+    pub prefixes: Vec<Vec<String>>,
+    pub operations: Vec<ValidationOperation>,
+    #[serde(default)]
+    pub options: std::collections::BTreeMap<String, usize>,
+    #[serde(default)]
+    pub allow_extra_args: bool,
+    #[serde(default)]
+    pub receipt_runner: Option<String>,
+}
+
+impl RepositoryRunner {
+    pub fn matches(&self, program: &str, args: &[String]) -> bool {
+        if self.operations.is_empty()
+            || !self.programs.iter().any(|expected| expected == &normalized_program_name(program))
+            || args.iter().any(|arg| matches!(arg.as_str(), "-h" | "--help" | "--version"))
+        {
+            return false;
+        }
+        self.prefixes.iter().any(|prefix| {
+            if prefix.is_empty() {
+                return false;
+            }
+            let mut index = 0;
+            for expected in prefix {
+                while let Some(arg) = args.get(index) {
+                    if let Some(count) = self.options.get(arg) {
+                        index += count + 1;
+                    } else if arg.split_once('=').is_some_and(|(key, _)|
+                        self.options.get(key) == Some(&1))
+                    {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let matches = args.get(index).is_some_and(|actual| {
+                    if expected.contains('/')
+                        && let Some((root, cwd)) = &self.path_context
+                    {
+                        use codex_utils_absolute_path::AbsolutePathBuf;
+                        AbsolutePathBuf::resolve_path_against_base(expected, root)
+                            == AbsolutePathBuf::resolve_path_against_base(actual, cwd)
+                    } else {
+                        actual == expected
+                    }
+                });
+                if !matches {
+                    return false;
+                }
+                index += 1;
+            }
+            index == args.len() || self.allow_extra_args
+        })
+    }
+}
+
+/// Only a standalone deterministic command may authenticate a receipt. In
+/// particular, `runner; echo receipt`, pipelines, and shell expansion cannot.
+pub fn standalone_argv(script: &str) -> Option<Vec<String>> {
+    let (commands, _) = split_deterministic_script(script)?;
+    if commands.len() != 1 || script.contains(['$', '`', '>', '<']) {
+        return None;
+    }
+    shlex::split(commands[0])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,9 +106,13 @@ pub enum ValidationClassification {
 }
 
 pub fn classify_powershell_script(script: &str) -> ValidationClassification {
+    classify_powershell_script_with_runners(script, &[])
+}
+
+pub fn classify_powershell_script_with_runners(script: &str, runners: &[RepositoryRunner]) -> ValidationClassification {
     // Preserve control-flow information before the PowerShell parser flattens
     // pipelines and command chains into argv leaves.
-    let simple = classify_simple_script(script, 0);
+    let simple = classify_simple_script(script, 0, runners);
     if matches!(
         simple,
         ValidationClassification::Validation {
@@ -58,7 +137,7 @@ pub fn classify_powershell_script(script: &str) -> ValidationClassification {
     combine_validation_classifications(commands.into_iter().filter_map(|argv| {
         let mut arguments = argv.into_iter();
         let program = arguments.next()?;
-        Some(classify_argv(&program, &arguments.collect::<Vec<_>>()))
+        Some(classify_argv_with_runners(&program, &arguments.collect::<Vec<_>>(), runners))
     }))
 }
 
@@ -105,7 +184,7 @@ pub fn combine_validation_classifications(
 
 const MAX_WRAPPER_DEPTH: usize = 4;
 
-fn classify_simple_script(script: &str, depth: usize) -> ValidationClassification {
+fn classify_simple_script(script: &str, depth: usize, runners: &[RepositoryRunner]) -> ValidationClassification {
     if depth > MAX_WRAPPER_DEPTH {
         return ValidationClassification::Opaque;
     }
@@ -125,7 +204,7 @@ fn classify_simple_script(script: &str, depth: usize) -> ValidationClassificatio
                 return Some(combine_validation_classifications(
                     parts
                         .into_iter()
-                        .map(|part| classify_simple_script(part, depth + 1)),
+                        .map(|part| classify_simple_script(part, depth + 1, runners)),
                 ));
             }
             let Some(words) = shlex::split(command) else {
@@ -140,6 +219,7 @@ fn classify_simple_script(script: &str, depth: usize) -> ValidationClassificatio
                 program,
                 &words[first_command + 1..],
                 depth + 1,
+                runners,
             ))
         })
         .collect::<Vec<_>>();
@@ -339,18 +419,26 @@ fn bracketed_prefix(text: &str, open: u8) -> Option<(&str, &str)> {
 }
 
 pub fn classify_argv(program: &str, args: &[String]) -> ValidationClassification {
-    classify_argv_at_depth(program, args, 0)
+    classify_argv_with_runners(program, args, &[])
+}
+
+pub fn classify_argv_with_runners(program: &str, args: &[String], runners: &[RepositoryRunner]) -> ValidationClassification {
+    classify_argv_at_depth(program, args, 0, runners)
 }
 
 fn classify_argv_at_depth(
     program: &str,
     args: &[String],
     depth: usize,
+    runners: &[RepositoryRunner],
 ) -> ValidationClassification {
     if depth > MAX_WRAPPER_DEPTH {
         return ValidationClassification::Opaque;
     }
     let binary = normalized_program_name(program);
+    if let Some(runner) = runners.iter().find(|runner| runner.matches(program, args)) {
+        return classification_from_operations(runner.operations.clone(), false);
+    }
 
     if matches!(binary.as_str(), "npm" | "pnpm" | "yarn")
         && let Some(index) = node_command_index(&binary, args)
@@ -367,21 +455,21 @@ fn classify_argv_at_depth(
         if program.starts_with('-') {
             return ValidationClassification::Opaque;
         }
-        return classify_argv_at_depth(program, arguments, depth + 1);
+        return classify_argv_at_depth(program, arguments, depth + 1, runners);
     }
 
     if binary == "uv" && args.first().is_some_and(|arg| arg == "run") {
         let Some(program) = args.get(1).filter(|arg| !arg.starts_with('-')) else {
             return ValidationClassification::Opaque;
         };
-        return classify_argv_at_depth(program, &args[2..], depth + 1);
+        return classify_argv_at_depth(program, &args[2..], depth + 1, runners);
     }
 
     if matches!(binary.as_str(), "env" | "command" | "time") {
         let Some(index) = wrapper_program_index(&binary, args) else {
             return ValidationClassification::Opaque;
         };
-        return classify_argv_at_depth(&args[index], &args[index + 1..], depth + 1);
+        return classify_argv_at_depth(&args[index], &args[index + 1..], depth + 1, runners);
     }
     if matches!(binary.as_str(), "bash" | "sh") {
         let Some(index) = args.iter().position(|arg| shell_executes_command_arg(arg)) else {
@@ -390,7 +478,7 @@ fn classify_argv_at_depth(
         let Some(script) = args.get(index + 1) else {
             return ValidationClassification::Opaque;
         };
-        return classify_simple_script(script, depth + 1);
+        return classify_simple_script(script, depth + 1, runners);
     }
     if matches!(binary.as_str(), "pwsh" | "powershell") {
         let Some(index) = args
@@ -402,7 +490,7 @@ fn classify_argv_at_depth(
         if args.get(index + 1).is_none() {
             return ValidationClassification::Opaque;
         }
-        return classify_simple_script(&args[index + 1..].join(" "), depth + 1);
+        return classify_simple_script(&args[index + 1..].join(" "), depth + 1, runners);
     }
     if binary == "cmd" {
         let Some(index) = args
@@ -414,7 +502,7 @@ fn classify_argv_at_depth(
         if args.get(index + 1).is_none() {
             return ValidationClassification::Opaque;
         }
-        return classify_simple_script(&args[index + 1..].join(" "), depth + 1);
+        return classify_simple_script(&args[index + 1..].join(" "), depth + 1, runners);
     }
 
     let (operations, has_unclassified_targets) = recognize_operations(&binary, args);
@@ -618,30 +706,6 @@ fn python_operation(args: &[String]) -> Option<ValidationOperation> {
             return None;
         }
         if !argument.starts_with('-') {
-            if normalized_program_name(argument) == "validate.py" {
-                return (args.get(index + 1).is_some_and(|action| action == "run")
-                    && !args[index + 2..]
-                        .iter()
-                        .any(|option| matches!(option.as_str(), "-h" | "--help")))
-                .then_some(ValidationOperation::Test);
-            }
-            if normalized_program_name(argument) == "rust_test_runner.py" {
-                let mut runner_index = index + 1;
-                while let Some(option) = args.get(runner_index) {
-                    if matches!(option.as_str(), "--manifest" | "--target-dir" | "--profile") {
-                        args.get(runner_index + 1)?;
-                        runner_index += 2;
-                    } else if option.starts_with("--manifest=")
-                        || option.starts_with("--target-dir=")
-                        || option.starts_with("--profile=")
-                    {
-                        runner_index += 1;
-                    } else {
-                        return matches!(option.as_str(), "run-target" | "run-gate" | "parity")
-                            .then_some(ValidationOperation::Test);
-                    }
-                }
-            }
             return None;
         }
         if argument == "-" {
@@ -777,51 +841,6 @@ fn wrapper_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperation
         if selector == "--" || selector.starts_with('-') || selector.contains('=') {
             index += 1;
             continue;
-        }
-        // Named fork recipes own their remaining arguments (target, gate, and
-        // filters). These are not additional recipes or validation operations.
-        if binary == "just" && operations.is_empty() && !has_unclassified_targets {
-            match selector.as_str() {
-                "core-test"
-                | "core-test-fast"
-                | "core-test-small"
-                | "core-test-lane"
-                | "_core-test-lane-reserved"
-                | "core-gate"
-                | "core-test-parity" => {
-                    return (vec![ValidationOperation::Test], false);
-                }
-                "test-fast"
-                | "test-fast-nosccache"
-                | "test-lane"
-                | "test-lane-main"
-                | "test-lane-fast"
-                | "test-lane-package"
-                | "validate-crate-focused"
-                | "config-schema-protocol-check"
-                | "app-server-schema-protocol-check"
-                | "hooks-schema-check"
-                | "test-slow-boundaries"
-                | "app-server-runtime-check"
-                | "tui-large-widget-check"
-                | "app-server-command-exec-check"
-                | "app-server-process-exec-check"
-                | "app-server-thread-status-check" => {
-                    return (vec![ValidationOperation::Test], false);
-                }
-                "validate-crate" | "validate-crate-full" => {
-                    return (
-                        vec![ValidationOperation::Lint, ValidationOperation::Test],
-                        false,
-                    );
-                }
-                "fmt-check" | "fmt-check-fast" | "clippy-lane" => {
-                    return (vec![ValidationOperation::Lint], false);
-                }
-                "check-lane" => return (vec![ValidationOperation::Check], false),
-                "core-test-list" | "core-test-plan" => return (Vec::new(), false),
-                _ => {}
-            }
         }
         let found = exact_selector_operations(selector);
         if found.is_empty() {
@@ -1009,7 +1028,11 @@ fn normalized_program_name(program: &str) -> String {
 }
 
 pub fn classify_script(script: &str) -> ValidationClassification {
-    classify_simple_script(script, 0)
+    classify_script_with_runners(script, &[])
+}
+
+pub fn classify_script_with_runners(script: &str, runners: &[RepositoryRunner]) -> ValidationClassification {
+    classify_simple_script(script, 0, runners)
 }
 
 /// Build and inventory commands may compile, but do not establish a test pass.
@@ -1093,6 +1116,14 @@ mod tests {
 
     fn is_validation(classification: &ValidationClassification) -> bool {
         matches!(classification, ValidationClassification::Validation { .. })
+    }
+
+    fn repository_argv(program: &str, args: &[&str]) -> ValidationClassification {
+        let config: serde_json::Value = serde_json::from_str(
+            include_str!("../../../.codex/test-runners.json"),
+        ).unwrap();
+        let runners: Vec<RepositoryRunner> = serde_json::from_value(config["runners"].clone()).unwrap();
+        classify_argv_with_runners(program, &args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>(), &runners)
     }
 
     #[test]
@@ -1220,12 +1251,11 @@ mod tests {
 
     #[test]
     fn fork_validation_routes_exclude_inventory_and_unrelated_scripts() {
+        let argv = repository_argv;
         for invocation in [
             argv(
                 "just",
                 &[
-                    "--justfile",
-                    "justfile",
                     "core-test-fast",
                     "core_lib",
                     "-E",
@@ -1298,6 +1328,7 @@ mod tests {
 
     #[test]
     fn focused_recipes_own_arguments_without_inventing_checks() {
+        let argv = repository_argv;
         for recipe in [
             "test-fast",
             "validate-crate-focused",
