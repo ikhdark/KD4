@@ -425,9 +425,24 @@ impl ToolRouter {
                 })
             })
             .collect::<Vec<_>>();
+        let model_visible = serde_json::to_value(model_visible.specs()).unwrap_or_default();
+        // The activated surface is `model_visible` plus activated deferred tools.
+        // Persist only those additions; storing the full activated snapshot
+        // repeated every model-visible schema in each manifest definition.
+        let activated_additional_schemas = match serde_json::to_value(schemas.specs()) {
+            Ok(serde_json::Value::Array(specs)) => specs
+                .into_iter()
+                .filter(|spec| {
+                    !model_visible
+                        .as_array()
+                        .is_some_and(|visible| visible.contains(spec))
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
         let manifest = canonicalize_json(&serde_json::json!({
-            "model_visible": model_visible.specs(),
-            "activated_schemas": schemas.specs(),
+            "model_visible": model_visible,
+            "activated_additional_schemas": activated_additional_schemas,
             "registered": registered,
         }));
         let fingerprint_input = serde_json::json!({

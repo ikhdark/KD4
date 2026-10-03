@@ -4929,12 +4929,13 @@ impl Session {
         let mut stable_developer_sections = Vec::<String>::with_capacity(4);
         let mut stable_contextual_user_sections = Vec::<String>::with_capacity(2);
         let mut stable_separate_developer_sections = Vec::<String>::new();
-        let (previous_turn_settings, collaboration_mode, session_source) = {
+        let (previous_turn_settings, collaboration_mode, session_source, retractable) = {
             let state = self.state.lock().await;
             (
                 state.previous_turn_settings(),
                 state.session_configuration.collaboration_mode.clone(),
                 state.session_configuration.session_source.clone(),
+                crate::stable_context::retractable_markers(state.history.raw_items()),
             )
         };
         if let Some(model_switch_message) =
@@ -4947,15 +4948,26 @@ impl Session {
         }
         let permissions_index = developer_sections.len();
 
+        let catalog_task = turn_context.turn_skills.catalog_task.lock().await.clone();
+        let projected_instructions = turn_context.developer_instructions.as_deref().map(|text| {
+            crate::context::desktop_instructions::project(text, &catalog_task)
+        });
         let configured_developer_instructions =
             crate::stable_context::configured_developer_instructions_sections(
-                turn_context
-                    .developer_instructions
+                projected_instructions
                     .as_deref()
                     .filter(|instructions| !instructions.is_empty()),
             );
 
-        developer_sections.extend(configured_developer_instructions.iter().cloned());
+        // A lone removal marker is injected only when history still shows the slot
+        // present; otherwise it retracts nothing. Fragment digests still include
+        // it, which keeps change detection on later turns exact.
+        if !crate::stable_context::is_redundant_retraction(
+            &configured_developer_instructions,
+            &retractable,
+        ) {
+            developer_sections.extend(configured_developer_instructions.iter().cloned());
+        }
         stable_developer_sections.extend(configured_developer_instructions.iter().cloned());
 
         // Add developer instructions from collaboration_mode if they exist and are non-empty
@@ -4983,7 +4995,6 @@ impl Session {
             developer_sections.push(PersonalitySpecInstructions::new(personality_message).render());
         }
         if turn_context.config.include_skill_instructions {
-            let catalog_task = turn_context.turn_skills.catalog_task.lock().await.clone();
             let available_skills = codex_core_skills::render::build_available_skills_for_task(
                 turn_context.turn_skills.snapshot.outcome(),
                 default_skill_metadata_budget(turn_context.model_info.context_window),
@@ -5190,6 +5201,7 @@ impl Session {
             }
         }
         if let Some(usage_hint_sections) = multi_agent_v2_usage_hint_sections
+            && !crate::stable_context::is_redundant_retraction(&usage_hint_sections, &retractable)
             && let Some(usage_hint_message) =
                 crate::context_manager::updates::build_developer_update_item(usage_hint_sections)
         {
@@ -6091,14 +6103,32 @@ impl Session {
         result
     }
 
+    pub(crate) async fn calibrated_prompt_tokens(&self, turn_context: &TurnContext, local: i64) -> i64 {
+        self.state.lock().await.prompt_token_calibration.estimate(
+            &turn_context.config.model_provider_id,
+            &turn_context.model_info.slug,
+            local,
+        )
+    }
+
     pub(crate) async fn record_token_usage_info(
         &self,
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
     ) -> CodexResult<()> {
         if let Some(token_usage) = token_usage {
+            // Release the timing lock before acquiring session state.
+            let calibration = turn_context.turn_timing_state.prompt_token_calibration_sample(
+                &turn_context.model_info.slug,
+                token_usage,
+            );
             let token_info = {
                 let mut state = self.state.lock().await;
+                state.prompt_token_calibration.observe(
+                    &turn_context.config.model_provider_id,
+                    &turn_context.model_info.slug,
+                    calibration,
+                );
                 state
                     .update_token_info_from_usage(token_usage, turn_context.model_context_window());
                 if matches!(
@@ -6132,6 +6162,11 @@ impl Session {
         } else {
             // Successful generation can lack usable provider accounting. Keep
             // budget protection using the existing prepared-history estimate.
+            self.state.lock().await.prompt_token_calibration.observe(
+                &turn_context.config.model_provider_id,
+                &turn_context.model_info.slug,
+                None,
+            );
             self.recompute_token_usage(turn_context).await;
         }
         let coordinator = self.services.agent_control.task_coordinator();

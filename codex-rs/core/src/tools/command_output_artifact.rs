@@ -5096,6 +5096,7 @@ pub(crate) async fn read_tool_output_selectors(
 /// Host-side exact read for transformations of retained evidence. Reuses the
 /// selector reader's identity, confinement, integrity, and writer-lock checks;
 /// unlike a model projection it must reject any incomplete source.
+#[cfg(test)]
 pub(crate) async fn read_complete_canonical_snapshot(
     codex_home: &Path,
     thread_id: &str,

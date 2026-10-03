@@ -5662,27 +5662,23 @@ async fn includes_timed_out_message() {
 }
 
 #[tokio::test]
-async fn purpose_effort_is_opt_in_capability_checked_and_preserves_explicit_choice() {
-    use codex_protocol::protocol::TurnTimingGenerationPurpose;
+async fn request_effort_uses_model_default_and_preserves_explicit_choice() {
     let (_, mut turn) = make_session_and_context().await;
-    let supported = turn.model_info.supported_reasoning_levels.first()
-        .expect("fixture advertises reasoning efforts").effort.clone();
     let original_model = turn.model_info.slug.clone();
     turn.configured_reasoning_effort = None;
     turn.model_info.supports_reasoning_summaries = true;
     turn.model_info.default_reasoning_level = None;
-    let purpose = Some(TurnTimingGenerationPurpose::FailureDiagnosis);
-    assert_eq!(turn.request_reasoning_effort(purpose), None);
-    Arc::make_mut(&mut turn.config).purpose_reasoning_effort =
-        Some(codex_config::config_toml::PurposeReasoningEffort {
-            failure_diagnosis: Some(supported.clone()), ..Default::default()
-        });
-    assert_eq!(turn.request_reasoning_effort(purpose), Some(supported));
-    assert_eq!(turn.request_reasoning_effort(None), None);
-    turn.model_info.supported_reasoning_levels.clear();
-    assert_eq!(turn.request_reasoning_effort(purpose), None);
+    assert_eq!(turn.request_reasoning_effort(), None);
+    turn.model_info.default_reasoning_level = Some(ReasoningEffortConfig::High);
+    assert_eq!(
+        turn.request_reasoning_effort(),
+        Some(ReasoningEffortConfig::High)
+    );
     turn.configured_reasoning_effort = Some(ReasoningEffortConfig::Minimal);
-    assert_eq!(turn.request_reasoning_effort(purpose), Some(ReasoningEffortConfig::Minimal));
+    assert_eq!(
+        turn.request_reasoning_effort(),
+        Some(ReasoningEffortConfig::Minimal)
+    );
     assert_eq!(turn.model_info.slug, original_model);
 }
 
@@ -5744,6 +5740,39 @@ async fn turn_context_with_model_updates_model_fields() {
     assert!(updated_build.is_some(), "current process identity is independent of session creation metadata");
     assert_eq!(original_identity["config_layers_v1"], updated_identity["config_layers_v1"]);
     assert_ne!(original_identity["turn_settings_v1"], updated_identity["turn_settings_v1"]);
+}
+
+#[tokio::test]
+async fn runtime_identity_ignores_per_thread_visualization_roots() {
+    let (_session, mut turn) = make_session_and_context().await;
+    let cwd = turn.cwd().clone();
+    let visualization = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+        turn.config
+            .codex_home
+            .as_path()
+            .join("visualizations/2026/10/03/01a0ff25-778f-7681-893c-8325b84d8bbf"),
+    )
+    .expect("absolute visualization root");
+    let other_root = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+        cwd.as_path().join("other-root"),
+    )
+    .expect("absolute workspace root");
+    let mut identities = Vec::new();
+    for roots in [
+        vec![cwd.clone()],
+        vec![cwd.clone(), visualization],
+        vec![cwd, other_root],
+    ] {
+        turn.effective_workspace_roots = roots.into();
+        turn.runtime_identity_cache = Default::default();
+        let shared = Arc::new(turn);
+        identities.push(shared.runtime_identity().await.0["turn_settings_v1"].clone());
+        turn = Arc::try_unwrap(shared).expect("sole turn context owner");
+    }
+    // Desktop's per-thread output root must not make identical settings look
+    // different, while a real workspace root still changes the identity.
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
 }
 
 #[test]
@@ -12824,6 +12853,45 @@ async fn build_initial_context_omits_prompt_fragments_without_extension_state() 
 }
 
 #[tokio::test]
+async fn desktop_guidance_tracks_task_without_dropping_unknown_or_full_instructions() {
+    let (session, mut turn) = make_session_and_context().await;
+    let original = "outside-before\n<app-context>\n# Codex desktop context\n\
+### Images/Visuals/Files\nKeep file rendering rules.\n\
+### Automations\nUse automation_update and preserve notification intent.\n\
+### Future Feature\nKeep unknown rules.\n\
+### Git\nPreserve branch rules.\n</app-context>\noutside-after";
+    turn.developer_instructions = Some(original.to_string());
+    let mut turn = Arc::new(turn);
+    *turn.turn_skills.catalog_task.lock().await = "Fix the Rust parser".to_string();
+    let built = build_initial_context(&session, &turn).await;
+    let text = developer_input_texts(&built).join("\n");
+    assert!(!text.contains("Use automation_update"));
+    for retained in ["Keep file rendering", "Keep unknown", "Preserve branch", "outside-before", "outside-after", "context:desktop"] {
+        assert!(text.contains(retained), "missing {retained}");
+    }
+    assert_eq!(turn.developer_instructions.as_deref(), Some(original));
+
+    *turn.turn_skills.catalog_task.lock().await = "Create a recurring reminder".to_string();
+    let built = build_initial_context(&session, &turn).await;
+    assert!(developer_input_texts(&built).join("\n").contains("Use automation_update"));
+    turn.turn_skills.catalog_task.lock().await.clear();
+    let built = build_initial_context(&session, &turn).await;
+    assert!(developer_input_texts(&built).join("\n").contains("Use automation_update"));
+
+    // An unsupported envelope must fail open, not silently remove instructions.
+    *turn.turn_skills.catalog_task.lock().await = "Fix the parser".to_string();
+    for unsupported in [
+        original.replace("# Codex desktop context", "# Custom context"),
+        original.replace("</app-context>", ""),
+        original.replace("Keep unknown rules.", "```\n### Automations\nKeep unknown rules.\n```"),
+    ] {
+        Arc::get_mut(&mut turn).expect("unique fixture turn").developer_instructions = Some(unsupported);
+        let built = build_initial_context(&session, &turn).await;
+        assert!(developer_input_texts(&built).join("\n").contains("Use automation_update"));
+    }
+}
+
+#[tokio::test]
 async fn build_initial_context_omits_multi_agent_usage_hint_when_prohibited() {
     let (session, turn_context) = make_multi_agent_v2_usage_hint_test_session(true).await;
     turn_context
@@ -12831,6 +12899,13 @@ async fn build_initial_context_omits_multi_agent_usage_hint_when_prohibited() {
         .store(false, std::sync::atomic::Ordering::Release);
     let initial = build_initial_context(&session, &turn_context).await;
     assert!(multi_agent_usage_hint_payloads(&initial).is_empty());
+    // A fresh context never sent the hint, so it must not carry a retraction.
+    assert!(
+        !developer_input_texts(&initial)
+            .iter()
+            .any(|text| text.contains("state=\"removed\"")),
+        "fresh context must not retract slots it never sent"
+    );
 }
 
 #[tokio::test]

@@ -40,7 +40,10 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
             }
             RolloutItem::SamplingBoundary(value) => {
                 if let Some(observation) = &value.timing_checkpoint {
-                    timing = observation.timing.clone();
+                    let previous = std::mem::replace(&mut timing, observation.timing.clone());
+                    if observation.incremental {
+                        merge_checkpoint_entries(&mut timing, previous);
+                    }
                     timing_observed_at = Some(observation.observed_at_unix_ms);
                 }
                 if let Some(request) = timing.model_requests.iter_mut().find(|request|
@@ -101,6 +104,49 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
         notice.push_str(&plan);
     }
     (notice, timing)
+}
+
+/// Rebuilds the arrays that incremental checkpoints omit: earlier entries
+/// remain, and an entry recorded again because it changed (for example, a
+/// request that has since completed) replaces its earlier version.
+fn merge_checkpoint_entries(timing: &mut TurnTiming, previous: TurnTiming) {
+    timing.model_requests = merge_by_identity(
+        previous.model_requests,
+        std::mem::take(&mut timing.model_requests),
+        |request| (request.sampling_request_id.clone(), request.generation_index),
+    );
+    timing.tool_calls = merge_by_identity(
+        previous.tool_calls,
+        std::mem::take(&mut timing.tool_calls),
+        |call| call.call_id.clone(),
+    );
+    timing.deterministic_continuation_receipts = merge_by_identity(
+        previous.deterministic_continuation_receipts,
+        std::mem::take(&mut timing.deterministic_continuation_receipts),
+        |receipt| {
+            (
+                receipt.class,
+                receipt.resource_identity_hash.clone(),
+                receipt.state_revision.clone(),
+                receipt.host_action,
+            )
+        },
+    );
+}
+
+fn merge_by_identity<T, K: PartialEq>(
+    mut merged: Vec<T>,
+    updates: Vec<T>,
+    identity: impl Fn(&T) -> K,
+) -> Vec<T> {
+    for update in updates {
+        let key = identity(&update);
+        match merged.iter().position(|entry| identity(entry) == key) {
+            Some(index) => merged[index] = update,
+            None => merged.push(update),
+        }
+    }
+    merged
 }
 
 #[derive(Debug, Clone, PartialEq)]

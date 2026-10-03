@@ -1300,6 +1300,53 @@ fn stable_identity_sections(
     }
 }
 
+/// Removal markers that would retract a slot `history` currently represents as
+/// present. Any other lone removal marker retracts nothing and is noise.
+pub(crate) fn retractable_markers(history: &[ResponseItem]) -> Vec<&'static str> {
+    let mut developer_instructions = None;
+    let mut usage_hint = None;
+    for item in history.iter().rev() {
+        if developer_instructions.is_some() && usage_hint.is_some() {
+            break;
+        }
+        let ResponseItem::Message { role, content, .. } = item else {
+            continue;
+        };
+        for part in content.iter().rev() {
+            let ContentItem::InputText { text } = part else {
+                continue;
+            };
+            let Some(classification) = classify_stable_text(role, text) else {
+                continue;
+            };
+            let latest = match classification.slot {
+                StableContextSlot::DeveloperInstructions => &mut developer_instructions,
+                StableContextSlot::MultiAgentUsageHint => &mut usage_hint,
+                _ => continue,
+            };
+            latest.get_or_insert(classification.payload);
+        }
+    }
+    [
+        (developer_instructions, DEVELOPER_INSTRUCTIONS_REMOVED_MARKER),
+        (usage_hint, MULTI_AGENT_USAGE_HINT_REMOVED_MARKER),
+    ]
+    .into_iter()
+    .filter(|(payload, _)| payload.is_some_and(|payload| payload != StablePayload::Removed))
+    .map(|(_, marker)| marker)
+    .collect()
+}
+
+/// True when identity sections are only a removal marker that retracts nothing.
+pub(crate) fn is_redundant_retraction(sections: &[String], retractable: &[&str]) -> bool {
+    matches!(
+        sections,
+        [marker] if (marker == DEVELOPER_INSTRUCTIONS_REMOVED_MARKER
+            || marker == MULTI_AGENT_USAGE_HINT_REMOVED_MARKER)
+            && !retractable.contains(&marker.as_str())
+    )
+}
+
 pub(crate) fn configured_developer_instructions_sections(text: Option<&str>) -> Vec<String> {
     stable_identity_sections(
         text,

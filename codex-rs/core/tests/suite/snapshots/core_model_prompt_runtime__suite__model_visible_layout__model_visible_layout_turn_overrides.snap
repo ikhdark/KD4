@@ -5,33 +5,27 @@ expression: "format_labeled_requests_snapshot(\"Second turn changes cwd, approva
 Scenario: Second turn changes cwd, approval policy, and personality while keeping model constant.
 
 ## First Request (Baseline)
-00:message/developer[4]:
+00:message/developer[3]:
     [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <configured_developer_instructions state="removed" />
-    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-    [04] <SKILLS_INSTRUCTIONS>
-01:message/developer:<multi_agent_usage_hint state="removed" />
-02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:message/user:first turn
-05:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
-06:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
+    [02] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [03] <SKILLS_INSTRUCTIONS>
+01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+02:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+03:message/user:first turn
+04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
 
 ## Second Request (Turn Overrides)
-00:message/developer[4]:
+00:message/developer[3]:
     [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <configured_developer_instructions state="removed" />
-    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-    [04] <SKILLS_INSTRUCTIONS>
-01:message/developer:<multi_agent_usage_hint state="removed" />
-02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:message/user:first turn
-05:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
-06:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
-07:message/assistant:turn one complete
-08:message/developer[2]:
+    [02] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [03] <SKILLS_INSTRUCTIONS>
+01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+02:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+03:message/user:first turn
+04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+05:message/assistant:turn one complete
+06:message/developer[2]:
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <personality_spec>Use the following communication style for future messages:\nBe warm, collabora...
-09:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-10:message/user:second turn with context updates
+07:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+08:message/user:second turn with context updates

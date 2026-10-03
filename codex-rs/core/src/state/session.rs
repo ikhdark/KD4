@@ -38,11 +38,54 @@ pub(crate) struct ContextBaselineCandidate {
 }
 use codex_utils_output_truncation::TruncationPolicy;
 
+/// Ephemeral calibration: resume starts with the local estimator until a fresh
+/// completed request supplies a matching provider measurement. The largest of
+/// four recent ratios avoids reacting optimistically to one cheap prompt.
+#[derive(Default)]
+pub(crate) struct PromptTokenCalibration {
+    basis: Option<(String, String)>,
+    samples: VecDeque<(u64, u64)>,
+}
+
+impl PromptTokenCalibration {
+    pub(crate) fn observe(&mut self, provider: &str, model: &str, sample: Option<(u64, u64)>) {
+        if self.basis.as_ref().is_none_or(|(p, m)| p != provider || m != model) {
+            self.samples.clear();
+            self.basis = Some((provider.to_string(), model.to_string()));
+        }
+        let Some((local, measured)) = sample.filter(|(local, measured)| {
+            *local > 0 && *local <= i64::MAX as u64 && *measured > 0 && *measured <= i64::MAX as u64
+        }) else {
+            self.samples.clear();
+            return;
+        };
+        self.samples.push_back((local, measured));
+        if self.samples.len() > 4 {
+            self.samples.pop_front();
+        }
+    }
+
+    pub(crate) fn estimate(&self, provider: &str, model: &str, local: i64) -> i64 {
+        if self.basis.as_ref().is_none_or(|(p, m)| p != provider || m != model) {
+            return local;
+        }
+        let Some(&(denominator, numerator)) = self.samples.iter().max_by(|(al, ap), (bl, bp)| {
+            (u128::from(*ap) * u128::from(*bl)).cmp(&(u128::from(*bp) * u128::from(*al)))
+        }) else {
+            return local;
+        };
+        let adjusted = (local.max(0) as u128 * u128::from(numerator))
+            .div_ceil(u128::from(denominator));
+        i64::try_from(adjusted).unwrap_or(i64::MAX)
+    }
+}
+
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
+    pub(crate) prompt_token_calibration: PromptTokenCalibration,
     pub(crate) command_output_classes: HashMap<String, String>,
     pub(crate) recovered_output_classes: HashSet<String>,
     pub(crate) server_reasoning_included: bool,
@@ -88,6 +131,7 @@ impl SessionState {
             session_configuration,
             history,
             latest_rate_limits: None,
+            prompt_token_calibration: PromptTokenCalibration::default(),
             command_output_classes: HashMap::new(),
             recovered_output_classes: HashSet::new(),
             server_reasoning_included: false,

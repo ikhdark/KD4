@@ -101,7 +101,7 @@ def invoke(script, root, directory, selection, *, replay=False):
                     "--report", str(Path(previous["report"]).parent / "inventory.md"),
                     "--render-only"]
     else:
-        command += selection
+        command += ["--complete", *selection]
     started = time.perf_counter()
     result = subprocess.run(command, capture_output=True, check=False)
     elapsed = (time.perf_counter() - started) * 1000
@@ -111,14 +111,32 @@ def invoke(script, root, directory, selection, *, replay=False):
     if result.returncode:
         raise RuntimeError(f"{label} failed ({result.returncode}); see {directory}")
     output = json.loads(result.stdout)
-    if output.get("next_action") != "deliver_report":
+    if (
+        output.get("next_action") != "deliver_report"
+        or output.get("ready_to_render") is not True
+        or output.get("scan_pending") != 0
+        or output.get("unresolved_count") != 0
+        or output.get("missing_categories")
+        or not output.get("final_answer")
+    ):
         raise ValueError(f"{label} did not complete; see {directory}")
     return {"elapsed_ms": elapsed, "count": output["count"],
             "query_id": output["query_id"],
             "source_snapshot_sha256": output["source_snapshot_sha256"],
             "delivery_sha256": output["delivery_sha256"],
             "report": output["report"], "canonical_paths": output["canonical_paths"],
-            "report_sha256": sha256(Path(output["report"]))}
+            "report_sha256": sha256(Path(output["report"])),
+            "source_bytes_read": output.get("source_bytes_read"),
+            "source_bytes_reused": output.get("source_bytes_reused")}
+
+
+def correctness_checks(actual, expected):
+    """Expected artifacts are explicit proof obligations, not inferred truth."""
+    return {
+        key: key in actual and key in expected and actual[key] == expected[key]
+        for key in ("query_id", "source_snapshot_sha256", "paths", "categories",
+                    "untracked_paths", "unresolved", "missing_categories")
+    }
 
 
 def main():
@@ -129,10 +147,18 @@ def main():
     parser.add_argument("--query", type=Path, required=True,
                         help="Fixed source_inventory query; no model-generated selection.")
     parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--expected", type=Path,
+                        help="Reviewed canonical result for the fixed fixture; required for a correctness gate")
+    parser.add_argument("--max-scan-ms", type=float,
+                        help="Explicit median scan latency gate; requires --expected")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.runs < 2:
         parser.error("--runs must be at least 2")
+    if args.max_scan_ms is not None and (
+        not args.expected or not 0 < args.max_scan_ms < float("inf")
+    ):
+        parser.error("--max-scan-ms requires --expected and a finite positive budget")
     root = args.root.resolve()
     scope = inventory.normalized_path(args.scope)
     output = args.output.resolve()
@@ -176,8 +202,20 @@ def main():
     keys = ("query_id", "source_snapshot_sha256", "delivery_sha256",
             "report", "canonical_paths", "report_sha256")
     checks = {key: len({row[key] for row in runs + replay}) == 1 for key in keys}
+    if args.expected:
+        expected = json.loads(args.expected.read_bytes())
+        actual = json.loads(Path(runs[0]["canonical_paths"]).read_bytes())
+        checks.update({f"correct_{key}": value
+                       for key, value in correctness_checks(actual, expected).items()})
+        manifest["expected_sha256"] = sha256(args.expected)
+        write_json_atomic(output / "manifest.json", manifest)
+    if args.max_scan_ms is not None:
+        checks["scan_latency_budget"] = statistics.median(
+            row["elapsed_ms"] for row in runs
+        ) <= args.max_scan_ms
     unchanged = all(sha256(snapshot / row["path"]) == row["sha256"] for row in sources)
     report = {"scope": "fixed-source inventory scans and retained replay; no live-model speedup claim",
+              "correctness_verified": bool(args.expected) and unchanged and all(checks.values()),
               "manifest_sha256": sha256(output / "manifest.json"),
               "baseline": baseline, "runs": runs, "replays": replay,
               "checks": {**checks, "captured_sources_unchanged": unchanged},

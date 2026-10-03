@@ -496,8 +496,17 @@ impl CategoryAccumulator {
 
 #[derive(Debug, Default)]
 pub(crate) struct PromptContextBreakdown {
+    /// Length of the leading run of input items whose contributions are all
+    /// fixed-prefix categories: the provider-cacheable fixed prefix.
     pub(crate) fixed_prefix_item_count: usize,
     fixed_contribution_count: usize,
+    /// Every recorded contribution, fixed or not. Compared with the fixed
+    /// count, it shows whether one item contributed only fixed categories.
+    contribution_count: usize,
+    /// Set by the first input item with any non-fixed contribution. Fixed
+    /// categories after it (for example a notice appended after history) are
+    /// appended context and cannot extend or invalidate the cacheable prefix.
+    prefix_closed: bool,
     categories: BTreeMap<PromptContextCategory, CategoryAccumulator>,
 }
 
@@ -513,11 +522,9 @@ impl PromptContextBreakdown {
             let aligned = index
                 .checked_sub(aligned_offset)
                 .and_then(|index| sidecar.aligned_item(index));
-            let before = breakdown.fixed_contribution_count;
+            let before = breakdown.contribution_counts();
             breakdown.record_response_item(item, &serialized_item, sidecar, aligned)?;
-            if breakdown.fixed_contribution_count != before {
-                breakdown.fixed_prefix_item_count = index + 1;
-            }
+            breakdown.observe_prefix_item(index, before);
         }
         // The array envelope grows with the item count. Keep its bytes in the
         // injected category for reconciliation, but leave it out of the
@@ -550,25 +557,42 @@ impl PromptContextBreakdown {
         let mut breakdown = Self::default();
         for (index, (item, raw_item)) in items.iter().zip(serialized_items.iter()).enumerate() {
             let serialized_item = raw_item.get().as_bytes();
+            let before = breakdown.contribution_counts();
             if embedded_base_index == Some(index) {
                 breakdown.record_serialized(PromptContextCategory::BaseSystem, serialized_item);
-                breakdown.fixed_prefix_item_count = index + 1;
+                breakdown.observe_prefix_item(index, before);
                 continue;
             }
             let aligned = index
                 .checked_sub(aligned_offset)
                 .and_then(|index| sidecar.aligned_item(index));
-            let before = breakdown.fixed_contribution_count;
             breakdown.record_serialized_response_item(item, serialized_item, raw_item, aligned)?;
-            if breakdown.fixed_contribution_count != before {
-                breakdown.fixed_prefix_item_count = index + 1;
-            }
+            breakdown.observe_prefix_item(index, before);
         }
         breakdown.record_overhead_unhashed(
             PromptContextCategory::OtherInjected,
             sequence_envelope_bytes(items.len()),
         );
         Ok(breakdown)
+    }
+
+    fn contribution_counts(&self) -> (usize, usize) {
+        (self.fixed_contribution_count, self.contribution_count)
+    }
+
+    /// Extends the fixed prefix through the leading run of items whose every
+    /// contribution is a fixed-prefix category; the first other item closes it.
+    fn observe_prefix_item(&mut self, index: usize, (fixed_before, total_before): (usize, usize)) {
+        if self.prefix_closed {
+            return;
+        }
+        let fixed = self.fixed_contribution_count - fixed_before;
+        let total = self.contribution_count - total_before;
+        if fixed > 0 && fixed == total {
+            self.fixed_prefix_item_count = index + 1;
+        } else {
+            self.prefix_closed = true;
+        }
     }
 
     pub(crate) fn record_serialized(&mut self, category: PromptContextCategory, serialized: &[u8]) {
@@ -803,6 +827,7 @@ impl PromptContextBreakdown {
         estimated_tokens: u64,
         stable_source: &[u8],
     ) {
+        self.contribution_count += 1;
         if PromptContextCategory::FIXED_PREFIX.contains(&category) {
             self.fixed_contribution_count += 1;
         }

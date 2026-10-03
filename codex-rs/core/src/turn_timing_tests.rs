@@ -515,7 +515,11 @@ fn final_publication_is_not_observational_nonprogress() {
     ] {
         let (_clock, state) = timing();
         state.mark_turn_started();
-        state.begin_model_generation(&mut None, &SessionSource::Cli);
+        state.begin_model_generation_with_metadata(
+            &mut None, &SessionSource::Cli,
+            Some(TurnTimingGenerationPurpose::ArtifactContinuation),
+            TurnTimingGenerationDisposition::DecisionBearing, None,
+        );
         drop(state.begin_model_request_wait());
         let item: ResponseItem = serde_json::from_value(serde_json::json!({
             "type": "message", "role": "assistant", "phase": phase,
@@ -525,6 +529,9 @@ fn final_publication_is_not_observational_nonprogress() {
         state.record_generation_outcome(Vec::new(), action.map(str::to_string), true);
         let timing = state.complete_snapshot().protocol_timing();
         assert_eq!(timing.observational_nonprogress_tokens.logical_generations, expected);
+        assert_eq!(timing.counters.generations_by_purpose.terminal_completion_reasoning,
+                   u32::from(expected == 0));
+        assert_eq!(timing.counters.generations_by_purpose.artifact_continuation, expected);
     }
 }
 
@@ -539,6 +546,54 @@ fn rolling_checkpoint_does_not_complete_the_live_turn() {
     assert!(state.state().completed_snapshot.is_none());
     clock.set_ms(30);
     assert_eq!(state.complete_snapshot().protocol_timing().inclusive_duration_ns, 30 * NS_PER_MS as u64);
+}
+
+#[test]
+fn sampling_checkpoints_write_only_changed_entries_and_recovery_merges_them() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    state.begin_model_generation_with_metadata(
+        &mut None, &SessionSource::Cli,
+        Some(TurnTimingGenerationPurpose::InitialReasoning),
+        TurnTimingGenerationDisposition::DecisionBearing, None,
+    );
+    drop(state.begin_model_request_wait());
+    state.record_model_attempt_identity("sampling-1", "attempt-1");
+    clock.set_ms(5);
+    let first = state.sampling_checkpoint();
+    assert!(first.incremental);
+    assert_eq!(first.timing.model_requests.len(), 1);
+    // An unchanged request is not written again, while scalars stay cumulative.
+    clock.set_ms(10);
+    let unchanged = state.sampling_checkpoint();
+    assert!(unchanged.timing.model_requests.is_empty());
+    assert_eq!(unchanged.timing.inclusive_duration_ns, 10 * NS_PER_MS as u64);
+    // A changed request (a retry attempt) is written again in full.
+    state.record_model_attempt_identity("sampling-1", "attempt-2");
+    let retried = state.sampling_checkpoint();
+    assert_eq!(retried.timing.model_requests.len(), 1);
+
+    let boundary = |attempt: &str, checkpoint| {
+        codex_protocol::protocol::RolloutItem::SamplingBoundary(
+            codex_protocol::protocol::SamplingBoundaryItem {
+                sampling_request_id: "sampling-1".to_string(),
+                physical_attempt_id: attempt.to_string(),
+                turn_id: None,
+                unresolved_context: true,
+                timing_checkpoint: Some(checkpoint),
+            },
+        )
+    };
+    let (_, recovered) = crate::context::lost_turn_recovery(&[
+        boundary("attempt-1", first),
+        boundary("attempt-1", unchanged),
+        boundary("attempt-2", retried),
+    ]);
+    assert_eq!(recovered.model_requests.len(), 1);
+    assert_eq!(
+        recovered.model_requests[0].physical_attempt_ids,
+        vec!["attempt-1".to_string(), "attempt-2".to_string()]
+    );
 }
 
 #[tokio::test]

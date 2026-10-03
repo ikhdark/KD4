@@ -1033,11 +1033,17 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
                 })
             })
     );
+    // Direct calls carry activated schemas in the model-visible tools array, so
+    // the manifest exposes the deferred tool there without storing it twice.
     assert!(
-        activated_manifest["activated_schemas"]
+        activated_manifest["model_visible"]
             .to_string()
             .contains(hidden_tool),
         "the manifest and activated schema snapshot must expose the same deferred tool"
+    );
+    assert_eq!(
+        activated_manifest["activated_additional_schemas"],
+        serde_json::json!([])
     );
 
     Ok(())
@@ -2773,9 +2779,13 @@ async fn code_mode_activation_keeps_provider_schemas_but_registers_dispatch_tool
         manifest["model_visible"],
         serde_json::to_value(after.specs()).unwrap()
     );
+    let additions = manifest["activated_additional_schemas"]
+        .as_array()
+        .expect("activated additions are an array");
+    assert!(serde_json::Value::from(additions.clone()).to_string().contains("deferred_reader"));
+    let visible = manifest["model_visible"].as_array().expect("model-visible schemas");
     assert!(
-        manifest["activated_schemas"]
-            .to_string()
-            .contains("deferred_reader")
+        additions.iter().all(|spec| !visible.contains(spec)),
+        "activated additions must not repeat model-visible schemas"
     );
 }

@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import source_inventory as inventory
+from scripts import benchmark_harness_determinism as benchmark
 
 
 class SourceInventoryTests(unittest.TestCase):
@@ -60,6 +61,33 @@ class SourceInventoryTests(unittest.TestCase):
                 "--root", str(root or self.root), "--query", "-", *args,
             ]), 0)
         return json.loads(stdout.getvalue())
+
+    def test_correctness_gate_requires_complete_reviewed_evidence_not_equal_counts(self):
+        self.file("templates/a.md")
+        query = {"categories": [{"name": "templates", "paths": ["templates/*.md"],
+                                 "verification": "path"}]}
+        result = self.scan_stdin(query)
+        actual = json.loads(Path(result["canonical_paths"]).read_bytes())
+        self.assertTrue(all(benchmark.correctness_checks(actual, actual).values()))
+        self.assertFalse(any(benchmark.correctness_checks({}, {}).values()))
+        wrong = {**actual, "paths": ["templates/wrong.md"]}
+        self.assertFalse(benchmark.correctness_checks(actual, wrong)["paths"])
+        incomplete = {key: value for key, value in actual.items() if key != "unresolved"}
+        self.assertFalse(benchmark.correctness_checks(actual, incomplete)["unresolved"])
+        query_path = Path(self.temp.name) / "query.json"
+        query_path.write_text(json.dumps(query), encoding="utf-8")
+        output = Path(self.temp.name) / "benchmark"
+        with mock.patch.object(sys, "argv", [
+            "benchmark", "--root", str(self.root), "--scope", "templates",
+            "--query", str(query_path), "--runs", "2",
+            "--expected", result["canonical_paths"], "--output", str(output),
+        ]), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(benchmark.main(), 0)
+        report = json.loads((output / "report.json").read_bytes())
+        self.assertTrue(report["correctness_verified"])
+        self.assertTrue(all(report["checks"].values()))
+        self.assertEqual(len(report["runs"]), 2)
+        self.assertEqual(len(report["replays"]), 2)
 
     def test_stdin_utf8_matches_file_query_and_preserves_explicit_paths(self):
         self.file("src/café.md", "日本語")
@@ -228,7 +256,7 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual([r["path"] for r in document["sources"]], ["a.md", "b.md"])
 
         with mock.patch.object(inventory, "MAX_SCAN_BYTES", 6):
-            pending = self.scan_stdin(query)
+            pending = self.scan_stdin(query, "--refresh")
         self.assertGreater(pending["scan_pending"], 0)
         self.assertNotIn("source_snapshot_sha256", pending)
         saved = Path(pending["artifact"]).read_bytes()
@@ -239,6 +267,97 @@ class SourceInventoryTests(unittest.TestCase):
         refreshed = self.scan_stdin(query, "--state", pending["artifact"], "--refresh")
         self.assertEqual(refreshed["scan_pending"], 0)
         self.assertNotEqual(refreshed["scan_epoch"], pending["scan_epoch"])
+
+    def test_cached_sources_revalidate_only_changed_dependencies_and_new_rules(self):
+        a = self.file("src/a.md", "prompt")
+        self.file("src/b.md", "absent")
+        query = {"categories": [{"name": "text", "paths": ["src/*.md"],
+                                 "contains": "prompt", "verification": "path"}]}
+        first = self.scan_stdin(query)
+        again = self.scan_stdin(query)
+        self.assertEqual(again["source_bytes_read"], 0)
+        self.assertEqual(again["source_bytes_reused"], 12)
+        self.assertEqual(again["delivery_sha256"], first["delivery_sha256"])
+        self.file("unrelated.txt", "changed")
+        self.assertEqual(self.scan_stdin(query)["source_bytes_read"], 0)
+        a.write_text("absent", encoding="utf-8")
+        changed = self.scan_stdin(query)
+        self.assertEqual(changed["count"], 0)
+        self.assertEqual(changed["source_bytes_read"], 6)
+        self.assertNotEqual(changed["source_snapshot_sha256"], first["source_snapshot_sha256"])
+        self.assertEqual(self.scan_stdin(query, "--refresh")["source_bytes_read"], 12)
+        expanded = json.loads(json.dumps(query))
+        expanded["categories"].append({"name": "assets", "paths": ["src/*.md"],
+                                       "verification": "path"})
+        expanded["scope_change"] = {"from_query_id": changed["query_id"],
+                                    "reason": "include keyword-free assets"}
+        result = self.scan_stdin(expanded, "--state", changed["artifact"])
+        self.assertEqual(result["source_bytes_read"], 0)
+        self.assertEqual(result["scope_delta"]["added_count"], 2)
+        expanded["categories"][0]["contains"] = "absent"
+        self.assertEqual(self.scan_stdin(expanded)["source_bytes_read"], 12)
+
+    def test_complete_checkpoints_interruptions_and_resumes_without_duplicate_reads(self):
+        self.file("a.md", "aaaa")
+        self.file("b.md", "bbbb")
+        query = {"categories": [{"name": "docs", "paths": ["*.md"], "verification": "path"}]}
+        state_path = Path(self.temp.name) / "resume.json"
+        original = inventory.inventory
+        calls = 0
+
+        def interrupt(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise KeyboardInterrupt()
+            return original(*args, **kwargs)
+
+        with (mock.patch.object(inventory, "MAX_SCAN_BYTES", 4),
+              mock.patch.object(inventory, "inventory", side_effect=interrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            self.scan_stdin(query, "--complete", "--state", str(state_path))
+        retained = json.loads(state_path.read_bytes())
+        self.assertEqual(retained["scan"]["pending"], ["b.md"])
+        with mock.patch.object(inventory, "MAX_SCAN_BYTES", 4):
+            resumed = self.scan_stdin(query, "--complete", "--state", str(state_path),
+                                     "--report", str(Path(self.temp.name) / "report.md"))
+        self.assertEqual(resumed["source_bytes_read"], 4)
+        self.assertEqual(resumed["count"], 2)
+        self.assertIn("final_answer", resumed)
+        with (mock.patch.object(inventory, "inventory", side_effect=AssertionError("rescan")),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            inventory.main(["--state", str(state_path), "--render-only", "--paths",
+                            "--category", "docs"])
+        self.assertEqual(json.loads(stdout.getvalue())["paths"], ["a.md", "b.md"])
+        retained["version"] = 999
+        with self.assertRaisesRegex(ValueError, "unsupported retained"):
+            original(self.root, query, retained)
+
+    def test_publication_failure_replays_the_same_immutable_delivery(self):
+        self.file("a.md")
+        query = {"categories": [{"name": "docs", "paths": ["*.md"], "verification": "path"}]}
+        state_path = Path(self.temp.name) / "state.json"
+        report = Path(self.temp.name) / "report.md"
+        write = inventory.write_bytes_atomic
+
+        def fail_readable(path, content, **kwargs):
+            if path.suffix == ".md":
+                raise OSError("injected publication interruption")
+            return write(path, content, **kwargs)
+
+        with (mock.patch.object(inventory, "write_bytes_atomic", side_effect=fail_readable),
+              self.assertRaisesRegex(OSError, "publication interruption")):
+            self.scan_stdin(query, "--state", str(state_path), "--report", str(report))
+        canonical = next(Path(self.temp.name).glob("report-*.json"))
+        before = canonical.read_bytes()
+        with (mock.patch.object(inventory, "inventory", side_effect=AssertionError("rescan")),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            inventory.main(["--state", str(state_path), "--render-only", "--report", str(report)])
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(canonical.read_bytes(), before)
+        self.assertEqual(result["canonical_paths"], str(canonical.resolve()))
+        self.assertIn("final_answer", result)
+        self.assertEqual(len(list(Path(self.temp.name).glob("report-*.json"))), 1)
 
     def test_stdin_malformed_or_non_utf8_query_does_not_create_run(self):
         for raw in (b"", b"{", b"\xff"):
@@ -298,6 +417,9 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertIn("--render-only", contract["paging"])
         self.assertIn("unique", contract["control_files"])
         self.assertIn("not that its scope answers the entire task", contract["delivery"])
+        self.assertNotIn("profile", contract["invocation"])
+        self.assertIn("--list-queries", contract["invocation"]["list_queries"])
+        self.assertIn("final_answer", contract["result"])
 
     def test_documented_powershell_stdin_preserves_unicode_scope_and_failure_status(self):
         shells = [path for name in ("powershell", "pwsh") if (path := shutil.which(name))]
@@ -439,15 +561,128 @@ class SourceInventoryTests(unittest.TestCase):
              for p in second["prior_queries"]],
             [(first["query_id"], ["rust"], first["canonical_paths"])],
         )
+        # Scope lookup must happen without another scan, state file or report.
+        with (mock.patch.object(inventory, "repository_source_records", side_effect=AssertionError("scan")),
+              mock.patch.object(tempfile, "mkdtemp", side_effect=AssertionError("temp")),
+              mock.patch.object(inventory, "export_delivery", side_effect=AssertionError("report")),
+              contextlib.redirect_stdout(io.StringIO()) as stdout):
+            self.assertEqual(inventory.main(["--root", str(self.root), "--list-queries"]), 0)
+        available = json.loads(stdout.getvalue())["prior_queries"]
+        self.assertEqual([entry["query_id"] for entry in available],
+                         [second["query_id"], first["query_id"]])
         with (mock.patch.object(tempfile, "tempdir", self.temp.name),
               contextlib.redirect_stdout(io.StringIO()) as stdout):
             self.assertEqual(inventory.main([
-                "--root", str(self.root), "--query", first["canonical_paths"],
+                "--root", str(self.root), "--query", available[1]["canonical_paths"],
             ]), 0)
         reproduced = json.loads(stdout.getvalue())
         self.assertEqual(reproduced["query_id"], first["query_id"])
         self.assertEqual(reproduced["count"], first["count"])
         self.assertEqual(reproduced["prior_queries"][0]["query_id"], second["query_id"])
+
+    def test_query_is_deterministic_classified_and_delivered_in_one_scan(self):
+        groups = {
+            "source": ["src/a.rs", "src/nested/b.rs"],
+            "documentation": ["docs/a.md"],
+        }
+        query = {"categories": [
+            {"name": "source", "paths": ["src/*.rs"], "verification": "path"},
+            {"name": "documentation", "paths": ["docs/*.md"], "verification": "path"},
+        ]}
+        expected = groups
+        for category, paths in groups.items():
+            for path in paths:
+                self.file(path, "content")
+        excluded = ["target/a.rs", "elsewhere/a.md"]
+        for path in excluded:
+            self.file(path, "content")
+        self.file("docs/local.md", "content", tracked=False)
+
+        results = []
+        for _ in range(2):
+            with (mock.patch.object(inventory, "inventory", wraps=inventory.inventory) as scan,
+                  mock.patch.object(inventory, "export_delivery", wraps=inventory.export_delivery) as publish):
+                result = self.scan_stdin(query, "--complete")
+            self.assertEqual(scan.call_count, 1)
+            self.assertEqual(publish.call_count, 1)
+            results.append(result)
+        first, second = results
+        paths = sorted(path for values in expected.values() for path in values)
+        self.assertEqual(first["count"], len(paths))
+        self.assertEqual(first["untracked_count"], 1)
+        self.assertEqual(first["evidence_counts"], {
+            "rule_matched_files": len(paths) + 1, "consumer_verified_files": 0, "unresolved_files": 0,
+        })
+        for key in ("query_id", "source_snapshot_sha256", "delivery_sha256", "category_counts", "final_answer"):
+            self.assertEqual(first[key], second[key])
+        self.assertNotEqual(first["artifact"], second["artifact"])
+        delivered = json.loads(Path(first["canonical_paths"]).read_text(encoding="utf-8"))
+        self.assertEqual(delivered["paths"], paths)
+        self.assertEqual(delivered["categories"], {key: sorted(value) for key, value in expected.items()})
+        self.assertEqual(delivered["evidence_counts"], first["evidence_counts"])
+        self.assertTrue(set(excluded).isdisjoint(source["path"] for source in delivered["sources"]))
+        self.assertIn(f"**{len(paths)} unique matching tracked files**", first["final_answer"])
+        self.assertIn("not proof of semantic completeness", first["final_answer"])
+        self.assertIn(Path(first["report"]).as_posix(), first["final_answer"])
+        self.assertIn("0 consumer-verified", first["final_answer"])
+        self.assertIn("Consumer-verified: 0", Path(first["report"]).read_text(encoding="utf-8"))
+
+        # Canonical replay keeps the exact rules; it must not reuse stale contents.
+        replayed = self.scan_stdin(delivered)
+        self.assertEqual(replayed["query_id"], first["query_id"])
+        self.assertEqual(replayed["delivery_sha256"], first["delivery_sha256"])
+        self.file("src/new.rs", "content")
+        changed = self.scan_stdin(delivered)
+        self.assertEqual(changed["query_id"], first["query_id"])
+        self.assertEqual(changed["count"], first["count"] + 1)
+        self.assertNotEqual(changed["source_snapshot_sha256"], first["source_snapshot_sha256"])
+
+    def test_query_exclusions_cannot_be_silently_bypassed(self):
+        self.file("src/a.rs", "content")
+        self.file("src/generated.rs", "content")
+        query = {"categories": [{
+            "name": "source", "paths": ["src/*.rs"],
+            "exclude_paths": ["src/generated.rs"], "verification": "path",
+        }]}
+        result = self.scan_stdin(query, "--paths")
+        self.assertEqual(result["paths"], ["src/a.rs"])
+        # Explicit out-of-rule candidates stay unresolved.
+        query["candidates"] = [{"path": "src/generated.rs", "category": "source"}]
+        rejected = self.scan_stdin(query)
+        self.assertEqual(rejected["unresolved_count"], 1)
+        self.assertNotIn("final_answer", rejected)
+        for args in (
+            ["--profile", "anything"],
+            ["--scope", "src"],
+            ["--list-queries", "--query", "-"],
+            ["--list-queries", "--complete"],
+            ["--list-queries", "--category", "assets"],
+        ):
+            with (self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()),
+                  mock.patch.object(tempfile, "mkdtemp", side_effect=AssertionError("temp")),
+                  self.assertRaises(SystemExit)):
+                inventory.main(["--root", str(self.root), *args])
+
+    def test_final_delivery_waits_for_coverage_and_never_finishes_semantic_review(self):
+        self.file("src/a.md", "prompt")
+        self.file("src/b.md", "prompt")
+        query = {"categories": [{"name": "assets", "paths": ["src/*.md"], "verification": "path"}]}
+        with mock.patch.object(inventory, "MAX_SCAN_BYTES", 6):
+            partial = self.scan_stdin(query)
+        self.assertGreater(partial["scan_pending"], 0)
+        self.assertNotIn("final_answer", partial)
+        complete = self.scan_stdin(query, "--state", partial["artifact"],
+                                   "--report", str(Path(self.temp.name) / "complete.md"))
+        self.assertIn("final_answer", complete)
+        # Each guard prevents a specific false-completion contract, independent of other flags.
+        for changed in (
+            {"ready_to_render": False}, {"scan_pending": 1}, {"unresolved_count": 1},
+            {"missing_categories": ["runtime"]}, {"next_action": "resolve_remaining"},
+            {"source_snapshot_sha256": None}, {"report": None}, {"canonical_paths": None},
+            {"review_progress": {"reviewed_files": 0, "remaining_bytes": 12}},
+        ):
+            with self.subTest(changed=changed):
+                self.assertIsNone(inventory.delivery_answer({**complete, **changed}))
 
     def test_reuses_coverage_and_invalidates_only_changed_inputs(self):
         first = self.file("src/a.rs", "first prompt")
@@ -547,6 +782,9 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual(output["next_action"], "render")
         self.assertEqual({r["path"]: r["status"] for r in state["records"]},
                          {"prompts/runtime.md": "verified", "prompts/orchestrator.md": "excluded"})
+        self.assertEqual(inventory.evidence_counts(state), {
+            "rule_matched_files": 0, "consumer_verified_files": 1, "unresolved_files": 0,
+        })
         without_decisions = {key: value for key, value in query.items() if key != "decisions"}
         reused, _ = inventory.inventory(self.root, without_decisions, state)
         self.assertEqual(reused["paths"], output["paths"])

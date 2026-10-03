@@ -41,6 +41,7 @@ use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
@@ -1143,6 +1144,7 @@ pub(crate) async fn execute_recovery_transaction(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_recovery_transaction_with_continuations(
     codex_home: &Path,
     thread_id: &str,

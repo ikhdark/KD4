@@ -21,6 +21,33 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn oversized_json_line_is_outlined_instead_of_byte_sliced() {
+    // A short listing followed by one huge serialized JSON line: byte slicing
+    // kept an uninterpretable fragment of that line. The outline keeps every
+    // surrounding line, the structure, and the original line count.
+    let paths = (0..2_000)
+        .map(|index| serde_json::Value::String(format!("codex-rs/src/module_{index}.rs")))
+        .collect::<Vec<_>>();
+    let document = serde_json::json!({"count": 2_000, "paths": paths});
+    let names = (0..20).map(|index| format!("field_{index}")).collect::<Vec<_>>().join("\n");
+    let content = format!("{names}\n{document}\ntrailer\n");
+    for text in [
+        truncate_text_to_token_ceiling(&content, 600),
+        crate::truncate_text_with_line_markers(&content, 600),
+    ] {
+        assert!(approx_token_count(&text) <= 600, "{text}");
+        assert_eq!(text.lines().count(), content.lines().count(), "{text}");
+        assert!(text.contains("field_0\n") && text.contains("field_19\n") && text.contains("trailer"));
+        assert!(text.contains("[JSON line of"), "{text}");
+        assert!(text.contains(r#""count":2000"#), "{text}");
+        assert!(text.contains(r#""paths":[2000 items; first "codex-rs/src/module_0.rs"; last "codex-rs/src/module_1999.rs"]"#), "{text}");
+    }
+    // Non-JSON long lines keep the existing head/middle/tail projection.
+    let plain = format!("{names}\n{}\ntrailer\n", "x".repeat(40_000));
+    assert!(!truncate_text_to_token_ceiling(&plain, 600).contains("[JSON line of"));
+}
+
+#[test]
 fn token_ceiling_borrows_unchanged_text_and_reports_actual_omission() {
     for (source, limit, expected, truncated) in [
         ("", 0, "", false),

@@ -646,10 +646,6 @@ pub struct Config {
     /// active context or only tokens after the carried compaction-window prefix.
     pub model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope,
 
-    /// Wall-clock limit after which a turn requests its final summary instead of new work.
-    pub turn_wall_time_limit: Option<std::time::Duration>,
-    pub turn_credit_limit: Option<f64>,
-
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
 
@@ -924,10 +920,6 @@ pub struct Config {
     /// Value to use for `reasoning.effort` when making a request using the
     /// Responses API.
     pub model_reasoning_effort: Option<ReasoningEffort>,
-    /// Local compaction override; unset preserves the turn's reasoning effort.
-    pub compaction_reasoning_effort: Option<ReasoningEffort>,
-    /// Opt-in purpose defaults; explicit turn effort remains authoritative.
-    pub purpose_reasoning_effort: Option<codex_config::config_toml::PurposeReasoningEffort>,
     /// Optional Plan-mode-specific reasoning effort override used by the TUI.
     ///
     /// When unset, Plan mode uses the built-in Plan preset default (currently
@@ -3248,19 +3240,6 @@ impl Config {
                 ));
             }
         }
-        // A zero limit would end every turn before its first request.
-        if cfg.turn_wall_time_limit_secs == Some(0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "turn_wall_time_limit_secs must be greater than zero",
-            ));
-        }
-        if cfg.turn_credit_limit.is_some_and(|limit| !limit.is_finite() || limit <= 0.0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "turn_credit_limit must be finite and greater than zero",
-            ));
-        }
         let agent_max_threads = cfg.agents.as_ref().and_then(|agents| agents.max_threads);
         if agent_max_threads == Some(0) {
             return Err(std::io::Error::new(
@@ -3521,10 +3500,6 @@ impl Config {
             model_auto_compact_token_limit_scope: cfg
                 .model_auto_compact_token_limit_scope
                 .unwrap_or_default(),
-            turn_wall_time_limit: cfg
-                .turn_wall_time_limit_secs
-                .map(std::time::Duration::from_secs),
-            turn_credit_limit: cfg.turn_credit_limit,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,
@@ -3629,8 +3604,6 @@ impl Config {
                 .or(cfg.show_raw_agent_reasoning)
                 .unwrap_or(false),
             model_reasoning_effort: cfg.model_reasoning_effort,
-            compaction_reasoning_effort: cfg.compaction_reasoning_effort,
-            purpose_reasoning_effort: cfg.purpose_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_catalog,

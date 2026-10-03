@@ -7,6 +7,7 @@ mod available_skills_instructions;
 mod collaboration_mode_instructions;
 mod contextual_user_message;
 mod current_time_reminder;
+pub(crate) mod desktop_instructions;
 mod environment_context;
 mod hook_additional_context;
 mod image_generation_instructions;
@@ -32,6 +33,7 @@ mod user_shell_command;
 pub(crate) mod world_state;
 
 pub(crate) use approved_command_prefix_saved::ApprovedCommandPrefixSaved;
+pub(crate) use environment_context::is_session_visualization_directory;
 pub(crate) use apps_instructions::AppsInstructions;
 pub(crate) use apps_instructions::AppsInstructionsUnavailable;
 pub(crate) use available_plugins_instructions::AvailablePluginsInstructions;

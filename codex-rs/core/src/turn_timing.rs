@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU32;
@@ -208,12 +209,30 @@ pub(crate) struct TurnTimingState {
     process_output_waiter_count: AtomicU32,
     active_tool_count: AtomicU32,
     tool_closure_changed: Notify,
+    /// Content digests of per-request, per-call, and receipt entries already
+    /// written by an earlier sampling checkpoint of this turn. Checkpoints
+    /// persist only new or changed entries, so their size no longer grows with
+    /// every prior request.
+    checkpointed_entries: StdMutex<HashSet<[u8; 32]>>,
 }
 
 impl Default for TurnTimingState {
     fn default() -> Self {
         Self::new(Arc::new(SystemTurnClock::default()))
     }
+}
+
+/// Keeps only entries whose exact serialized content no earlier checkpoint of
+/// this turn recorded. An entry that changed (for example, a request that has
+/// since completed) is written again; unserializable entries are always kept.
+fn retain_new_checkpoint_entries<T: serde::Serialize>(
+    entries: &mut Vec<T>,
+    checkpointed: &mut HashSet<[u8; 32]>,
+) {
+    entries.retain(|entry| match serde_json::to_vec(entry) {
+        Ok(bytes) => checkpointed.insert(Sha256::digest(&bytes).into()),
+        Err(_) => true,
+    });
 }
 
 impl std::fmt::Debug for TurnTimingState {
@@ -1468,11 +1487,6 @@ impl TurnTimingState {
         state.last_credit_balance = Some(balance);
     }
 
-    pub(crate) fn credit_delta(&self) -> Option<f64> {
-        let state = self.state();
-        Some(state.starting_credit_balance? - state.last_credit_balance?)
-    }
-
     fn new(clock: Arc<dyn TurnClock>) -> Self {
         Self {
             checkout_snapshot: Default::default(),
@@ -1484,6 +1498,7 @@ impl TurnTimingState {
             process_output_waiter_count: AtomicU32::new(0),
             active_tool_count: AtomicU32::new(0),
             tool_closure_changed: Notify::new(),
+            checkpointed_entries: Default::default(),
         }
     }
 
@@ -1662,15 +1677,34 @@ impl TurnTimingState {
     }
 
     /// Freeze an observation without terminalizing live timers or task state.
+    ///
+    /// Scalar aggregates stay cumulative, but per-request, per-call, and
+    /// receipt entries already written unchanged by an earlier checkpoint of
+    /// this turn are omitted. A full snapshot on every request made checkpoint
+    /// size, and the work done before each dispatch, grow with the turn.
     pub(crate) fn sampling_checkpoint(&self) -> codex_protocol::protocol::SamplingTimingCheckpoint {
         let mut observation = self.state().clone();
         let sample = self.clock.sample();
+        let mut timing = observation.complete(sample).protocol_timing();
+        {
+            let mut checkpointed = self
+                .checkpointed_entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            retain_new_checkpoint_entries(&mut timing.model_requests, &mut checkpointed);
+            retain_new_checkpoint_entries(&mut timing.tool_calls, &mut checkpointed);
+            retain_new_checkpoint_entries(
+                &mut timing.deterministic_continuation_receipts,
+                &mut checkpointed,
+            );
+        }
         codex_protocol::protocol::SamplingTimingCheckpoint {
             observed_at_unix_ms: sample.time.wall_unix_ms,
             tail_unknown: true,
-            timing: observation.complete(sample).protocol_timing(),
+            timing,
             runtime_identity: BTreeMap::new(),
             harness_build: None,
+            incremental: true,
         }
     }
 
@@ -2648,6 +2682,7 @@ impl TurnTimingState {
         let Some(generation_index) = state.current_generation_index else {
             return;
         };
+        let mut terminal_interpretation = false;
         if let Some(index) = state.model_requests.iter().position(|request| {
             request.generation_index == generation_index
                 && request.attempt_kind == TurnTimingAttemptKind::Primary
@@ -2683,6 +2718,23 @@ impl TurnTimingState {
             // Publishing a final answer or blocker changes the communication
             // state even when it performs no further tool or repository work.
             request.unchanged_relevant_state = unchanged_relevant_state && !request.final_answer_emitted;
+            terminal_interpretation = request.final_answer_emitted
+                && request.model_emitted_tool_call_count == 0
+                && request.generation_purpose == Some(TurnTimingGenerationPurpose::ArtifactContinuation);
+        }
+        if terminal_interpretation {
+            // Classify observed terminal communication, not a predicted purpose.
+            // A preamble or a generation that also calls tools is not terminal.
+            for request in &mut state.model_requests {
+                if request.generation_index == generation_index {
+                    request.generation_purpose = Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning);
+                }
+            }
+            state.counters.generations_by_purpose.artifact_continuation =
+                state.counters.generations_by_purpose.artifact_continuation.saturating_sub(1);
+            state.counters.generations_by_purpose.terminal_completion_reasoning =
+                state.counters.generations_by_purpose.terminal_completion_reasoning.saturating_add(1);
+            state.current_generation_purpose = Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning);
         }
     }
 
@@ -2714,6 +2766,42 @@ impl TurnTimingState {
                 total_tokens: u64::try_from(usage.total_tokens.max(0)).unwrap_or(u64::MAX),
             });
         }
+    }
+
+    /// Pair only an unambiguous completed physical request. Partial responses,
+    /// retries, missing diagnostics, and a changed model cannot train estimates.
+    pub(crate) fn prompt_token_calibration_sample(
+        &self,
+        model: &str,
+        usage: &TokenUsage,
+    ) -> Option<(u64, u64)> {
+        let state = self.state();
+        let request = state.model_requests.last()?;
+        if request.completed_ns.is_none()
+            || request.attempt_kind != TurnTimingAttemptKind::Primary
+            || request.physical_attempt_ids.len() != 1
+            || usage.input_tokens <= 0
+        {
+            return None;
+        }
+        let sections = request
+            .request_section_sha256_by_attempt
+            .get(request.physical_attempt_ids.last()?)?;
+        let expected_model = format!("{:x}", Sha256::digest(serde_json::json!(model).to_string().as_bytes()));
+        if sections.get("model") != Some(&expected_model)
+            || request.token_usage.as_ref()?.input_tokens != usage.input_tokens as u64
+        {
+            return None;
+        }
+        let categories = request.request_token_categories.as_ref()?;
+        if categories.accounting_basis
+            != codex_protocol::protocol::TurnTimingTokenCategoryBasis::FullLogicalPrompt
+            || categories.local_input_estimate == 0
+            || categories.local_input_estimate > i64::MAX as u64
+        {
+            return None;
+        }
+        Some((categories.local_input_estimate, usage.input_tokens as u64))
     }
 
     pub(crate) fn record_model_request_diagnostics_unavailable(

@@ -152,7 +152,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     ..JsonSchema::object(BTreeMap::new(), None, None)
                 }).collect()),
                 ..JsonSchema::object(BTreeMap::from([
-                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, or `skill:catalog` for complete enabled skill metadata. Use search selectors to discover newly relevant skills.".to_string()))),
+                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for complete enabled skill metadata, or `context:desktop` for full configured Desktop guidance. Omit environment_id for host-owned locators. Use search selectors to discover newly relevant guidance.".to_string()))),
                 ("file_path".to_string(), JsonSchema::string(Some("Legacy alias for path; use only one.".to_string()))),
                 ("offset".to_string(), JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string()))),
                 ("limit".to_string(), JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string()))),
@@ -205,7 +205,26 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             // The catalog advertises `skill:<id>` locators, so this tool has to
             // resolve them. Without it the model can see every skill listed and
             // load none of them.
-            let (contents, resolved_path, inspection) = if args
+            let (contents, resolved_path, inspection) = if args.path
+                == crate::context::desktop_instructions::LOCATOR
+            {
+                if args.environment_id.is_some() {
+                    return Err(FunctionCallError::RespondToModel(
+                        "omit environment_id for host-owned Desktop guidance".to_string(),
+                    ));
+                }
+                let contents = turn.developer_instructions.as_deref()
+                    .and_then(crate::context::desktop_instructions::full)
+                    .ok_or_else(|| FunctionCallError::RespondToModel(
+                        "no Desktop guidance is configured for this turn".to_string(),
+                    ))?;
+                if contents.len() > MAX_FILE_BYTES {
+                    return Err(FunctionCallError::RespondToModel(
+                        "Desktop guidance exceeds the read_file size limit".to_string(),
+                    ));
+                }
+                (contents.to_string(), args.path.clone(), None)
+            } else if args
                 .path
                 .starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
             {
@@ -330,6 +349,8 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     "path": resolved_path,
                     "environment": if args.path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX) {
                         "host-skills"
+                    } else if args.path == crate::context::desktop_instructions::LOCATOR {
+                        "host-context"
                     } else {
                         args.environment_id.as_deref()
                             .or_else(|| invocation.step_context.environments.primary()
@@ -667,6 +688,33 @@ mod tests {
                 arguments: json!({"path": path, "selectors": selectors}).to_string(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn desktop_locator_recovers_full_current_guidance_without_workspace_dependencies() {
+        let mut hashes = Vec::new();
+        for source in ["original", "updated"] {
+            let mut call = invocation(Path::new(crate::context::desktop_instructions::LOCATOR), json!(null), true).await;
+            let full = format!("<app-context>\n# Codex desktop context\n### Automations\n{source}\n</app-context>");
+            Arc::get_mut(&mut Arc::make_mut(&mut call.step_context).turn)
+                .expect("unique fixture turn").developer_instructions =
+                Some(format!("private outside\n{full}\nother instructions"));
+            assert!(crate::tool_history::source_dependencies_for_tool_call(
+                "read_file", &call.payload, Path::new("."),
+            ).is_empty());
+            let payload = call.payload.clone();
+            let output = ReadFileHandler.handle(call).await.unwrap();
+            let raw = output.code_mode_result(&payload);
+            assert_eq!(raw["file_complete"], true);
+            assert_eq!(raw["results"][0]["text"], full);
+            assert_eq!(output.sampling_request_signal().unwrap()["semantic_evidence"]["scope"]["environment"], "host-context");
+            hashes.push(raw["source_sha256"].clone());
+        }
+        assert_ne!(hashes[0], hashes[1]);
+        let mut missing = invocation(Path::new(crate::context::desktop_instructions::LOCATOR), json!(null), false).await;
+        Arc::get_mut(&mut Arc::make_mut(&mut missing.step_context).turn)
+            .expect("unique fixture turn").developer_instructions = None;
+        assert!(ReadFileHandler.handle(missing).await.is_err());
     }
 
     #[tokio::test]

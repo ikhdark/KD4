@@ -24,6 +24,10 @@ _METRICS = {
     "humanOnlyWaitMs": ("ms", ("exclusive", "interactiveOnlyWaitNs"), 1_000_000),
     "generations": ("count", ("counters", "logicalGenerationCount"), 1),
     "toolCalls": ("count", ("counters", "toolCallCount"), 1),
+    "commandTruncations": ("count", ("counters", "toolOutputTruncationCount"), 1),
+    "truncationContinuationGenerations": (
+        "count", ("counters", "truncationInducedContinuationCount"), 1,
+    ),
     "samePurposeContinuations": (
         "count",
         ("counters", "samePurposeContinuationCount"),
@@ -54,6 +58,11 @@ _METRICS = {
     ),
 }
 _DERIVED_UNITS = {
+    "rootToolCalls": "count",
+    "nestedToolCalls": "count",
+    "terminalGenerations": "count",
+    "terminalModelMs": "ms",
+    "inputEstimateAbsoluteErrorTokens": "tokens",
     "inputTokens": "tokens",
     "cachedInputTokens": "tokens",
     "uncachedInputTokens": "tokens",
@@ -253,6 +262,33 @@ def _turn_metrics(record: dict, turn: dict, coverage: dict, annotation: dict) ->
             reasons[name] = "missing_invalid_or_saturated_measurement"
     metrics.update(dict.fromkeys(_DERIVED_UNITS))
     requests = timing.get("modelRequests", [])
+    closure = timing.get("toolClosure", {})
+    calls = timing.get("toolCalls", [])
+    if (
+        closure.get("complete") is True
+        and type(metrics["toolCalls"]) is int
+        and len(calls) == metrics["toolCalls"]
+        and not timing.get("toolCallTimingOverflow")
+        and all(row.get("source") in ("direct", "code_mode") for row in calls)
+        and len({row.get("callId") for row in calls}) == len(calls)
+    ):
+        metrics["rootToolCalls"] = sum(row["source"] == "direct" for row in calls)
+        metrics["nestedToolCalls"] = sum(row["source"] == "code_mode" for row in calls)
+    if turn.get("requestRetention", {}).get("complete") is True:
+        terminal = [row for row in requests if row.get("generationPurpose") == "terminal"]
+        if all(type(row.get("generationIndex")) is int for row in terminal):
+            metrics["terminalGenerations"] = len({row["generationIndex"] for row in terminal})
+        if all(_number(row.get("modelStreamWaitNs")) for row in terminal):
+            metrics["terminalModelMs"] = sum(row["modelStreamWaitNs"] for row in terminal) / 1e6
+        categories = [row.get("requestTokenCategories", {}) for row in requests]
+        if categories and all(
+            _number(row.get("localInputEstimate"))
+            and _number(row.get("providerInputTokens")) for row in categories
+        ):
+            metrics["inputEstimateAbsoluteErrorTokens"] = sum(
+                abs(row["localInputEstimate"] - row["providerInputTokens"])
+                for row in categories
+            )
     if (
         metrics["nonprogressGenerations"] is None
         and "observationalNonprogressLatency" not in timing
@@ -342,13 +378,25 @@ def _turn_metrics(record: dict, turn: dict, coverage: dict, annotation: dict) ->
                 reasons[name] = "empty_denominator"
     for name in _DERIVED_UNITS:
         if metrics[name] is None:
-            reasons.setdefault(name, "explicit_evidence_or_truth_set_required")
+            reasons.setdefault(name, (
+                "complete_valid_tool_call_ledger_required"
+                if name in ("rootToolCalls", "nestedToolCalls")
+                else "complete_valid_request_measurements_required"
+                if name in ("terminalGenerations", "terminalModelMs", "inputEstimateAbsoluteErrorTokens")
+                else "explicit_evidence_or_truth_set_required"
+            ))
     return {
         "metrics": metrics,
         "unavailableReasons": reasons,
         "truncationCountBySource": {
+            "commandOutput": metrics["commandTruncations"],
             "runtimeProjection": metrics["projectionTruncations"],
             "recoverySections": metrics["recoveryRetruncations"],
+        },
+        "truncationAttribution": {
+            "attributedContinuationGenerations": metrics["truncationContinuationGenerations"],
+            "unattributedOmissionDisposition": "unknown",
+            "note": "Zero recovery/continuation counts do not prove omitted bytes were irrelevant or recovered.",
         },
     }
 

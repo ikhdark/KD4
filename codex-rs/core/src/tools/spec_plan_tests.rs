@@ -401,34 +401,6 @@ async fn read_file_is_available_without_an_execution_environment() {
 }
 
 #[tokio::test]
-async fn retained_inventory_is_visible_and_registered_for_text_models() {
-    let plan = probe(|turn| {
-        turn.model_info.input_modalities = vec![InputModality::Text];
-        turn.model_info.supports_search_tool = false;
-    })
-    .await;
-    plan.assert_visible_contains(&["inventory"]);
-    plan.assert_registered_contains(&["inventory"]);
-}
-
-#[tokio::test]
-async fn retained_inventory_is_discoverable_without_loading_its_schema_upfront() {
-    let plan = probe(|turn| {
-        set_feature(turn, Feature::CodeMode, true);
-        turn.model_info.supports_search_tool = true;
-    })
-    .await;
-    plan.assert_registered_contains(&["inventory"]);
-    plan.assert_visible_lacks(&["inventory"]);
-    assert_eq!(plan.exposure("inventory"), ToolExposure::Deferred);
-    assert!(
-        plan.tool_search_texts
-            .iter()
-            .any(|text| text.contains("inventory"))
-    );
-}
-
-#[tokio::test]
 async fn planning_tools_keep_their_schemas_in_plan_mode() {
     let default_mode = probe(|_| {}).await;
     default_mode.assert_visible_contains(&["update_plan", "context_checkpoint"]);
@@ -954,7 +926,8 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
     let nested_only = probe(|turn| configure(turn, true)).await;
     mixed.assert_visible_contains(&["exec_command", "apply_patch"]);
     nested_only.assert_visible_lacks(&["exec_command"]);
-    nested_only.assert_visible_contains(&["apply_patch"]);
+    nested_only.assert_visible_lacks(&["apply_patch"]);
+    assert_eq!(nested_only.exposure("apply_patch"), ToolExposure::Direct);
     for plan in [&mixed, &nested_only] {
         plan.assert_registered_contains(&["exec_command", "apply_patch"]);
     }
@@ -1004,8 +977,6 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
             "session_id",
             "wall_time_seconds",
             "timeout_ms",
-            "read_file(args:",
-            "read_tool_output(args:",
         ] {
             assert!(
                 exec.description.contains(contract_field),
@@ -1014,6 +985,8 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         }
         assert!(!exec.description.contains("curr_time(args:"));
         assert!(!exec.description.contains("Return the current time in UTC."));
+        assert!(!exec.description.contains("read_file(args:"));
+        assert!(!exec.description.contains("read_tool_output(args:"));
     }
     assert!(mixed_exec.description.len() < nested_exec.description.len());
     let clock = ToolName::namespaced("clock", "curr_time").to_string();
@@ -1035,10 +1008,12 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         let before_tokens = codex_utils_output_truncation::model_token_count(&before);
         let after_tokens = codex_utils_output_truncation::model_token_count(&after);
         assert!(after_tokens < before_tokens, "{name} arguments duplicated");
-        assert!(
-            mixed_exec.description.contains(&format!("{name}(args: unknown")),
-            "{name} projection did not reach the model-visible exec contract"
-        );
+        if name == "exec_command" {
+            assert!(mixed_exec.description.contains("exec_command(args: unknown"));
+        } else {
+            mixed.assert_registered_contains(&[name]);
+            nested_only.assert_registered_contains(&[name]);
+        }
     }
 }
 
@@ -1673,10 +1648,6 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
     )
     .await;
     missing_model_capability.assert_visible_lacks(&["tool_search"]);
-    assert_eq!(
-        missing_model_capability.exposure("inventory"),
-        ToolExposure::Direct
-    );
 
     let builtin_deferred_tools = probe(|turn| {
         set_feature(turn, Feature::Collab, /*enabled*/ false);
@@ -1684,15 +1655,9 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
         turn.model_info.supports_search_tool = true;
     })
     .await;
-    // The retained inventory remains deferred even with no external tools or
-    // agent tools. Search must still expose a route to that built-in contract.
+    // Built-in deferred tools remain deferred even with no external tools or
+    // agent tools. Search must still expose a route to those contracts.
     builtin_deferred_tools.assert_visible_contains(&["tool_search"]);
-    builtin_deferred_tools.assert_visible_lacks(&["inventory"]);
-    builtin_deferred_tools.assert_registered_contains(&["inventory"]);
-    assert_eq!(
-        builtin_deferred_tools.exposure("inventory"),
-        ToolExposure::Deferred
-    );
     builtin_deferred_tools.assert_visible_lacks(&[
         "list_mcp_resources",
         "list_mcp_resource_templates",
@@ -3065,7 +3030,6 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
             "exec",
             "wait",
             "request_user_input",
-            "apply_patch",
             "agents",
             // Hosted Responses tool.
             "web_search",
@@ -3189,7 +3153,6 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
             codex_code_mode::PUBLIC_TOOL_NAME,
             codex_code_mode::WAIT_TOOL_NAME,
             "request_user_input",
-            "apply_patch",
             // Multi-agent v2 tools.
             MULTI_AGENT_V2_NAMESPACE,
             // Hosted Responses tools.

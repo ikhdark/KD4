@@ -629,79 +629,6 @@ text(JSON.stringify(shape));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retained_inventory_runs_through_code_mode_and_renders_exact_identifiers() -> Result<()> {
-    require_network!();
-    let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        let _ = config.features.enable(Feature::CodeMode);
-        config.completed_tool_history_projection = true;
-    });
-    let test = builder.build(&server).await?;
-    fs::write(
-        test.cwd_path().join("inventory-component.txt"),
-        "component evidence\ninventory-missing.txt is excluded from this inventory\n",
-    )?;
-    let script = r#"
-const initial = await tools.inventory({operation:"create",scope:{roots:["."],purpose:"component inventory"},
-  profile:{categories:["components"],classifications:["included","excluded"],required_categories:["components"]}});
-const observed = await tools.inventory({operation:"observe",inventory_id:initial.inventory_id,
-  category:"components",paths:["inventory-component.txt","inventory-component.txt","inventory-missing.txt"],complete:true});
-const page = await tools.inventory({operation:"read",inventory_id:observed.inventory_id});
-const source = await tools.read_file({path:"inventory-component.txt",selectors:[{kind:"lines",start:1,end:1}]});
-const exclusion = await tools.read_file({path:"inventory-component.txt",selectors:[{kind:"lines",start:2,end:2}]});
-const decisions = page.records.map(row => ({category:"components",candidate_id:row.candidate.id,
-  classification:row.candidate.exists ? "included" : "excluded",
-  evidence:row.candidate.exists ? [{artifact_id:source.artifact_id,lines:[1,1]}] : [{artifact_id:exclusion.artifact_id,lines:[2,2]}]}));
-const classified = await tools.inventory({operation:"classify",inventory_id:observed.inventory_id,decisions});
-const rendered = await tools.inventory({operation:"render",inventory_id:classified.inventory_id,classifications:["included"]});
-text(JSON.stringify({rendered,observed:observed.summary,ids:page.records.map(row => row.candidate.id)}));
-"#;
-    responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("inventory-1"),
-            ev_custom_tool_call("inventory-call", "exec", script),
-            ev_completed("inventory-1"),
-        ]),
-    )
-    .await;
-    let completion = responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("inventory-done", "done"),
-            ev_completed("inventory-2"),
-        ]),
-    )
-    .await;
-    test.submit_turn("inventory the components using the retained records")
-        .await?;
-    let request = completion.single_request();
-    let items = custom_tool_output_items(&request, "inventory-call");
-    assert_eq!(items.len(), 1);
-    let reported = text_item(&items, 0);
-    let result: Value = serde_json::from_str(reported).unwrap_or_else(|error| {
-        panic!("inventory must return a result through Code Mode: {reported:?}: {error}")
-    });
-    assert_eq!(result["observed"]["unique_candidates"], 2);
-    assert_eq!(result["rendered"]["count"], 1);
-    assert_eq!(result["rendered"]["summary"]["complete"], true);
-    let rendered: Value = serde_json::from_slice(&fs::read(
-        result["rendered"]["rendered_path"]
-            .as_str()
-            .expect("exact rendered file"),
-    )?)?;
-    assert_eq!(
-        rendered["identifiers"],
-        serde_json::json!([test
-            .cwd_path()
-            .join("inventory-component.txt")
-            .to_string_lossy()])
-    );
-    assert_eq!(rendered["count"], 1);
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_process_host_falls_back_to_in_process_code_mode() -> Result<()> {
     require_network!();
 
@@ -4907,10 +4834,15 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
                 .as_str()
                 .unwrap();
         let direct = tools.iter().find(|tool| tool["name"] == "apply_patch");
-        let direct = direct.expect("raw apply_patch stays directly available in both modes");
         assert_eq!(exec_description.matches("declare const tools:").count(), 1);
-        assert!(exec_description.contains("apply_patch(input: string"));
-        assert_eq!(direct["description"], description);
+        if code_mode_only {
+            assert!(direct.is_none(), "code-mode-only patches resolve lazily");
+            assert!(!exec_description.contains("apply_patch(input: string"));
+        } else {
+            let direct = direct.expect("mixed mode retains raw apply_patch");
+            assert_eq!(direct["description"], description);
+            assert!(exec_description.contains("apply_patch(input: string"));
+        }
         assert!(!exec_description.contains(description));
         assert_eq!(output["result"]["success"], true);
         assert_eq!(output["result"]["changes_exact"], true);

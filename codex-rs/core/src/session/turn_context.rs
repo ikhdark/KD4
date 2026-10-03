@@ -244,7 +244,16 @@ pub struct TurnContext {
     /// by the turn reports the turn's reason. A call that recorded its own
     /// cause — a runtime deadline, say — keeps that more specific attribution.
     pub(crate) cancellation_cause: Arc<OnceLock<CancellationCause>>,
+    /// The runtime identity is a pure function of this immutable context, so
+    /// it is computed once instead of re-serializing the effective config and
+    /// model metadata before every sampling request of the turn.
+    pub(crate) runtime_identity_cache: tokio::sync::OnceCell<RuntimeIdentity>,
 }
+
+type RuntimeIdentity = (
+    BTreeMap<String, String>,
+    Option<codex_protocol::protocol::SessionBuildInfo>,
+);
 
 enum TurnMultiAgentRuntime {
     ResolveAndStore,
@@ -484,30 +493,10 @@ impl TurnContext {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    pub(crate) fn request_reasoning_effort(
-        &self,
-        purpose: Option<codex_protocol::protocol::TurnTimingGenerationPurpose>,
-    ) -> Option<ReasoningEffortConfig> {
-        use codex_protocol::protocol::TurnTimingGenerationPurpose;
-        let policy_effort = self.config.purpose_reasoning_effort.as_ref().and_then(|policy| {
-            match purpose? {
-                TurnTimingGenerationPurpose::InitialReasoning => policy.initial.clone(),
-                TurnTimingGenerationPurpose::ImplementationDecision => policy.implementation.clone(),
-                TurnTimingGenerationPurpose::FailureDiagnosis => policy.failure_diagnosis.clone(),
-                TurnTimingGenerationPurpose::Repair => policy.repair.clone(),
-                TurnTimingGenerationPurpose::ValidationInterpretation => policy.validation_interpretation.clone(),
-                TurnTimingGenerationPurpose::ArtifactContinuation => policy.tool_result_interpretation.clone(),
-                TurnTimingGenerationPurpose::Coordination => policy.agent_coordination.clone(),
-                _ => None,
-            }
-        }).filter(|effort| {
-            self.model_info.supports_reasoning_summaries
-                && self.model_info.supported_reasoning_levels.iter()
-                    .any(|supported| supported.effort == *effort)
-        });
+    pub(crate) fn request_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
         crate::client::request_effort_for_model(
             &self.model_info,
-            self.configured_reasoning_effort.clone().or(policy_effort),
+            self.configured_reasoning_effort.clone(),
         )
     }
 
@@ -645,6 +634,7 @@ impl TurnContext {
             ),
             dispatched_tool_names: Arc::clone(&self.dispatched_tool_names),
             cancellation_cause: Arc::new(OnceLock::new()),
+            runtime_identity_cache: Default::default(),
         }
     }
 
@@ -711,16 +701,31 @@ impl TurnContext {
     }
 
     /// Identity only: never persist config bodies, which can contain secrets.
-    /// Work runs off the async executor and once per logical request, not once
-    /// per physical transport retry. Existing manifests identify tool schemas.
-    pub(crate) async fn runtime_identity(
-        self: &Arc<Self>,
-    ) -> (BTreeMap<String, String>, Option<codex_protocol::protocol::SessionBuildInfo>) {
+    /// Work runs off the async executor once per turn context, not once per
+    /// logical request or physical retry. Existing manifests identify tool schemas.
+    pub(crate) async fn runtime_identity(self: &Arc<Self>) -> RuntimeIdentity {
+        self.runtime_identity_cache
+            .get_or_init(|| self.compute_runtime_identity())
+            .await
+            .clone()
+    }
+
+    async fn compute_runtime_identity(self: &Arc<Self>) -> RuntimeIdentity {
         let turn = Arc::clone(self);
         let result = tokio::task::spawn_blocking(move || -> Result<_, serde_json::Error> {
             let mut settings = turn.to_turn_context_item();
             settings.turn_id = None;
             settings.current_date = None;
+            // Desktop's per-thread visualization root is not a runtime
+            // setting; keeping it made every thread's settings identity unique.
+            if let Some(roots) = settings.workspace_roots.as_mut() {
+                roots.retain(|root| {
+                    !crate::context::is_session_visualization_directory(
+                        &turn.config.codex_home,
+                        root.as_path(),
+                    )
+                });
+            }
             let parts = [
                 ("config_layers_v1", serde_json::to_value(turn.config.config_layer_stack.effective_config())?),
                 ("turn_settings_v1", serde_json::to_value((
@@ -728,7 +733,6 @@ impl TurnContext {
                     &turn.reasoning_summary,
                     &turn.config.service_tier,
                     turn.config.web_search_mode.value(),
-                    &turn.config.purpose_reasoning_effort,
                 ))?),
                 ("selected_model_v1", serde_json::to_value(&turn.model_info)?),
             ];
@@ -990,6 +994,7 @@ impl Session {
             model_verification_emitted: AtomicBool::new(false),
             dispatched_tool_names: Arc::new(std::sync::Mutex::new(Vec::new())),
             cancellation_cause: Arc::new(OnceLock::new()),
+            runtime_identity_cache: Default::default(),
         }
     }
 

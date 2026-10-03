@@ -161,6 +161,8 @@ mod tests {
 
         for compatibility_key in [
             "model_supports_reasoning_summaries",
+            "purpose_reasoning_effort",
+            "compaction_reasoning_effort",
             "experimental_use_unified_exec_tool",
             "ghost_snapshot",
             "profile",

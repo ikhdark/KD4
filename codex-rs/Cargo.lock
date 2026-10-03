@@ -4096,6 +4096,7 @@ dependencies = [
  "codex-protocol",
  "codex-utils-string",
  "pretty_assertions",
+ "serde_json",
  "tiktoken-rs",
 ]
 

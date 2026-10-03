@@ -535,11 +535,10 @@ pub(crate) async fn run_turn(
             .await
         else {
             defer_pending_input = true;
-            report_generation_budget_stop(
+            report_logical_generation_budget_exhausted(
                 sess.as_ref(),
                 turn_context.as_ref(),
                 &mut generation_budget_error_reported,
-                logical_generation_budget,
             )
             .await;
             break 'sampling_loop;
@@ -631,14 +630,6 @@ pub(crate) async fn run_turn(
         turn_context.turn_timing_state.observe_credits(
             previous_rates.as_ref().and_then(|rates| rates.credits.as_ref()),
         );
-        logical_generation_budget.enforce_credit_limit(
-            turn_context.config.turn_credit_limit,
-            turn_context.turn_timing_state.credit_delta(),
-        );
-        logical_generation_budget.enforce_wall_time_limit(
-            turn_context.config.turn_wall_time_limit,
-            std::time::Instant::now(),
-        );
         let generation_budget_admission =
             logical_generation_budget.admit(generation_request.terminal_completion_only);
         let budget_forced_terminal = match generation_budget_admission {
@@ -649,24 +640,16 @@ pub(crate) async fn run_turn(
             }
             LogicalGenerationAdmission::Exhausted => {
                 defer_pending_input = true;
-                report_generation_budget_stop(
+                report_logical_generation_budget_exhausted(
                     sess.as_ref(),
                     turn_context.as_ref(),
                     &mut generation_budget_error_reported,
-                    logical_generation_budget,
                 )
                 .await;
                 break 'sampling_loop;
             }
         };
-        let wall_time_terminal = budget_forced_terminal
-            .then_some(logical_generation_budget.wall_time_limit_reached)
-            .flatten();
-        let credit_terminal = budget_forced_terminal
-            .then_some(logical_generation_budget.credit_limit_reached).flatten();
-        if let Some(limit) = wall_time_terminal {
-            record_wall_time_terminal_boundary(sess.as_ref(), turn_context.as_ref(), limit).await;
-        } else if budget_forced_terminal && credit_terminal.is_none() {
+        if budget_forced_terminal {
             record_forced_terminal_budget_boundary(sess.as_ref(), turn_context.as_ref()).await;
         }
         if kd4_runtime {
@@ -710,28 +693,9 @@ pub(crate) async fn run_turn(
                 sess.as_ref(),
                 turn_context.as_ref(),
                 step_context.mcp_tool_snapshot().await.temporarily_unavailable,
-                budget_forced_terminal && wall_time_terminal.is_none() && credit_terminal.is_none(),
+                budget_forced_terminal,
             )
             .await?;
-            if let Some(limit) = wall_time_terminal {
-                record_context_notice_if_changed(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    "forced_terminal_notice",
-                    &format!(
-                        "Applies only to the final synthesis in turn {}. Later user input may resume work.\n{}",
-                        turn_context.sub_id,
-                        wall_time_terminal_directive(limit)
-                    ),
-                )
-                .await?;
-            }
-            if let Some(limit) = credit_terminal {
-                record_context_notice_if_changed(
-                    sess.as_ref(), turn_context.as_ref(), "forced_terminal_notice",
-                    &format!("This turn reached its configured observed-credit ceiling of {limit}. Work is suspended, not completed. This is the final tool-free synthesis request. Do not call tools. Summarize completed and unfinished work, failed checks, running processes, saved results, and how to resume."),
-                ).await?;
-            }
             let sampling_request_input: PreparedPromptInput = async {
                 let history_snapshot_guard = turn_context
                     .turn_timing_state
@@ -877,11 +841,10 @@ pub(crate) async fn run_turn(
                     // it must not reopen this exhausted sampling loop.
                     defer_pending_input = true;
                     needs_follow_up = false;
-                    report_generation_budget_stop(
+                    report_logical_generation_budget_exhausted(
                         sess.as_ref(),
                         turn_context.as_ref(),
                         &mut generation_budget_error_reported,
-                        logical_generation_budget,
                     )
                     .await;
                 }
@@ -937,11 +900,10 @@ pub(crate) async fn run_turn(
                     )
                 {
                     defer_pending_input = true;
-                    report_generation_budget_stop(
+                    report_logical_generation_budget_exhausted(
                         sess.as_ref(),
                         turn_context.as_ref(),
                         &mut generation_budget_error_reported,
-                        logical_generation_budget,
                     )
                     .await;
                     needs_follow_up = false;
@@ -1472,20 +1434,10 @@ enum LogicalGenerationAdmission {
 pub(crate) struct LogicalGenerationBudget {
     regular_generations: u32,
     terminal_generation_used: bool,
-    /// Start of the work for the current user input; the optional wall-time
-    /// limit counts from here.
-    window_started_at: Option<std::time::Instant>,
-    /// The configured wall-time limit, once it has ended regular work.
-    wall_time_limit_reached: Option<std::time::Duration>,
-    credit_limit_reached: Option<f64>,
 }
 
 impl LogicalGenerationBudget {
     fn observe_progress(&mut self, new_evidence: bool, successful_process_monitor: bool) {
-        if self.wall_time_limit_reached.is_some() || self.credit_limit_reached.is_some() {
-            // Progress renews the no-progress allowance, never elapsed time.
-            return;
-        }
         if new_evidence {
             self.regular_generations = 0;
         } else if successful_process_monitor {
@@ -1496,35 +1448,6 @@ impl LogicalGenerationBudget {
     fn accepted_user_input(&mut self) {
         self.regular_generations = 0;
         self.terminal_generation_used = false;
-        self.window_started_at = None;
-        self.wall_time_limit_reached = None;
-        self.credit_limit_reached = None;
-    }
-
-    fn enforce_credit_limit(&mut self, limit: Option<f64>, consumed: Option<f64>) {
-        if let (Some(limit), Some(consumed)) = (limit, consumed)
-            && consumed >= limit
-        {
-            self.credit_limit_reached = Some(limit);
-            self.regular_generations = MAX_REGULAR_LOGICAL_GENERATIONS;
-        }
-    }
-
-    /// Ends regular work once the configured wall-time limit has elapsed, so the
-    /// next admission is the forced final synthesis of completed and remaining work.
-    fn enforce_wall_time_limit(
-        &mut self,
-        limit: Option<std::time::Duration>,
-        now: std::time::Instant,
-    ) {
-        let started_at = *self.window_started_at.get_or_insert(now);
-        if let Some(limit) = limit
-            && self.wall_time_limit_reached.is_none()
-            && now.saturating_duration_since(started_at) >= limit
-        {
-            self.wall_time_limit_reached = Some(limit);
-            self.regular_generations = MAX_REGULAR_LOGICAL_GENERATIONS;
-        }
     }
 
     fn is_exhausted(self) -> bool {
@@ -1594,34 +1517,6 @@ async fn record_forced_terminal_budget_boundary(sess: &Session, turn_context: &T
         turn_context,
         EventMsg::Warning(WarningEvent {
             message: format!("This turn reached {MAX_REGULAR_LOGICAL_GENERATIONS} generations without new evidence. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."),
-        }),
-    )
-    .await;
-}
-
-fn wall_time_limit_minutes(limit: std::time::Duration) -> u64 {
-    limit.as_secs().div_ceil(60)
-}
-
-fn wall_time_terminal_directive(limit: std::time::Duration) -> String {
-    format!(
-        "The turn reached its configured wall-time limit of {} minute(s). Work is suspended, not completed. This is the final tool-free synthesis request. Do not call tools. Summarize completed work and truthfully report remaining work, failed validation, running processes, files that hold partial results, and how to resume.",
-        wall_time_limit_minutes(limit)
-    )
-}
-
-async fn record_wall_time_terminal_boundary(
-    sess: &Session,
-    turn_context: &TurnContext,
-    limit: std::time::Duration,
-) {
-    sess.send_event(
-        turn_context,
-        EventMsg::Warning(WarningEvent {
-            message: format!(
-                "This turn reached its {}-minute wall-time limit (turn_wall_time_limit_secs). Work is suspended; the assistant will report completed and unfinished work. Send another message to resume.",
-                wall_time_limit_minutes(limit)
-            ),
         }),
     )
     .await;
@@ -1728,39 +1623,6 @@ async fn report_logical_generation_budget_exhausted(
     .await;
 }
 
-/// Reports why the turn stopped: the wall-time limit when it ended regular work,
-/// otherwise the no-progress generation allowance.
-async fn report_generation_budget_stop(
-    sess: &Session,
-    turn_context: &TurnContext,
-    reported: &mut bool,
-    budget: &LogicalGenerationBudget,
-) {
-    if let Some(limit) = budget.credit_limit_reached {
-        if !std::mem::replace(reported, true) {
-            emit_status_affecting_turn_error(sess, turn_context,
-                format!("This turn reached its observed-credit ceiling of {limit} and gave one final summary. Work is suspended. Send another message to resume.")).await;
-        }
-        return;
-    }
-    let Some(limit) = budget.wall_time_limit_reached else {
-        report_logical_generation_budget_exhausted(sess, turn_context, reported).await;
-        return;
-    };
-    if std::mem::replace(reported, true) {
-        return;
-    }
-    emit_status_affecting_turn_error(
-        sess,
-        turn_context,
-        format!(
-            "This turn reached its {}-minute wall-time limit and gave one final summary. Work is suspended before all requested work completed. Send another message to resume.",
-            wall_time_limit_minutes(limit)
-        ),
-    )
-    .await;
-}
-
 async fn admit_regular_follow_up(
     sess: &Session,
     turn_context: &TurnContext,
@@ -1768,7 +1630,7 @@ async fn admit_regular_follow_up(
     exhaustion_reported: &mut bool,
 ) -> bool {
     if *exhaustion_reported || !budget.can_admit(/*terminal_requested*/ false) {
-        report_generation_budget_stop(sess, turn_context, exhaustion_reported, budget).await;
+        report_logical_generation_budget_exhausted(sess, turn_context, exhaustion_reported).await;
         false
     } else {
         true
@@ -2881,10 +2743,18 @@ async fn projected_prompt_pressure(
         )
         .await;
     let committed_history_tokens = committed_history_tokens.unwrap_or(active_context_tokens);
+    let calibrated_local_prompt = sess
+        .calibrated_prompt_tokens(
+            turn_context,
+            committed_history_tokens.saturating_add(pending_token_estimate.total_tokens),
+        )
+        .await;
+    // Calibration changes only the local estimate, never the measured-usage
+    // floor or the configured compaction/context-window limits.
     let total_tokens = projected_prompt_tokens_from_estimates(
         active_context_tokens,
-        committed_history_tokens,
-        pending_token_estimate.total_tokens,
+        calibrated_local_prompt,
+        0,
         pending_token_estimate.body_growth_tokens,
     );
     let auto_compact_scope_tokens = match turn_context.config.model_auto_compact_token_limit_scope {
@@ -4166,7 +4036,6 @@ async fn run_sampling_request(
             Arc::clone(&pending_tool_manifest),
             cancellation_token.child_token(),
             &mut attempt_progress,
-            generation_request.purpose,
         )
         .await
         {
@@ -5697,7 +5566,6 @@ async fn try_run_sampling_request(
     pending_tool_manifest: Arc<Mutex<Option<codex_protocol::protocol::ToolManifestItem>>>,
     cancellation_token: CancellationToken,
     attempt_progress: &mut SamplingAttemptProgress,
-    generation_purpose: Option<TurnTimingGenerationPurpose>,
 ) -> CodexResult<SamplingRequestResult> {
     let mut active_without_pending_passes = 0_u8;
     let next_sample_reason = hold_sampling_readiness_for_ordered_prefix(reconcile_turn_progress(
@@ -5761,7 +5629,7 @@ async fn try_run_sampling_request(
         }
         return Err(CodexErr::TurnAborted);
     }
-    let request_effort = turn_context.request_reasoning_effort(generation_purpose);
+    let request_effort = turn_context.request_reasoning_effort();
     let service_tier = service_tier_for_sampling(&sess, &turn_context).await;
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
@@ -5929,6 +5797,11 @@ async fn try_run_sampling_request(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
+            // Checkpointing, ordered persistence, and the rollout flush run on
+            // the critical path before every provider dispatch. Attribute them to
+            // the persistence phase rather than leaving them inside transport
+            // readiness, where they were indistinguishable from connection setup.
+            let persistence_guard = turn_timing_state.begin_local_phase(TurnLocalPhase::Persistence);
             let mut timing_checkpoint = turn_timing_state.sampling_checkpoint();
             timing_checkpoint.runtime_identity = runtime_identity;
             timing_checkpoint.harness_build = harness_build;
@@ -5949,6 +5822,7 @@ async fn try_run_sampling_request(
             // Their all-commits barrier belongs to terminalization; requiring
             // quiescence here can starve sampling while background tools poll.
             sess.flush_rollout().await?;
+            drop(persistence_guard);
             if sess
                 .bind_context_baseline_candidate(
                     &identity.sampling_request_id,

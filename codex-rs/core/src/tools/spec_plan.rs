@@ -27,7 +27,6 @@ use crate::tools::handlers::ReadToolOutputHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
-use crate::tools::handlers::RetainedInventoryHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
@@ -648,9 +647,6 @@ fn is_hidden_by_code_mode_only(
     let tool_mode = effective_tool_mode(turn_context);
     tool_mode == ToolMode::CodeModeOnly
         && exposure != ToolExposure::DirectModelOnly
-        // Keep raw patches available without JavaScript string escaping. The
-        // nested entry remains callable for compatibility with existing cells.
-        && tool_name != &ToolName::plain("apply_patch")
         && !is_excluded_from_code_mode(turn_context, tool_name)
         && codex_code_mode::is_code_mode_nested_tool(&codex_tools::code_mode_name_for_tool_name(
             tool_name,
@@ -705,7 +701,8 @@ fn build_code_mode_executors(
             }
             deferred_code_mode_nested_tool_specs.push(spec);
         } else {
-            // Keep only execution, editing, and recovery contracts eager.
+            // Keep execution/bootstrap contracts eager. File and artifact
+            // selectors remain registered and resolve lazily when needed.
             // Planning and directory discovery remain callable through
             // resolve_tool without charging every generation for their schemas.
             // Keep descriptions and argument
@@ -716,7 +713,12 @@ fn build_code_mode_executors(
             if executor.authorization_class() != TypedToolClass::DynamicExternal
                 && matches!(executor.tool_name().name.as_str(),
                     "exec_command" | "shell_command" | "write_stdin" | "apply_patch"
-                    | "read_file" | "read_tool_output" | "tool_search")
+                    | "tool_search")
+                // Freeform contracts cannot be loaded by tool_search. In
+                // code-mode-only sessions resolve_tool exposes the registered
+                // patch contract on demand instead of charging every read turn.
+                && !(tool_mode == ToolMode::CodeModeOnly
+                    && executor.tool_name() == &ToolName::plain("apply_patch"))
                 && let Some(mut definition) = codex_tools::code_mode_tool_definition_for_spec(&spec)
             {
                 if !is_hidden_by_code_mode_only(turn_context, executor.tool_name(), exposure)
@@ -993,8 +995,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add_with_authorization_class(ReadToolOutputHandler, TypedToolClass::ReadSearch);
-    planned_tools
-        .add_with_authorization_class(RetainedInventoryHandler, TypedToolClass::ReadSearch);
     // Host skill locators remain readable even when no execution environment exists.
     // The handler still requires an environment for ordinary filesystem paths.
     planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);

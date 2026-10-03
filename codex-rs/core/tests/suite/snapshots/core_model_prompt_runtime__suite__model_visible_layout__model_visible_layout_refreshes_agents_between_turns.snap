@@ -5,59 +5,50 @@ expression: "format_labeled_requests_snapshot(\"Normal turns refresh AGENTS.md a
 Scenario: Normal turns refresh AGENTS.md after a cwd change and after a same-cwd, same-length content edit.
 
 ## First Request (agents_one)
-00:message/developer[4]:
+00:message/developer[3]:
     [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <configured_developer_instructions state="removed" />
-    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-    [04] <SKILLS_INSTRUCTIONS>
-01:message/developer:<multi_agent_usage_hint state="removed" />
-02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-03:message/user[2]:
+    [02] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [03] <SKILLS_INSTRUCTIONS>
+01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+02:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:message/user:first turn in agents_one
-05:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
-06:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
+03:message/user:first turn in agents_one
+04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
 
 ## Second Request (agents_two cwd)
-00:message/developer[4]:
+00:message/developer[3]:
     [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <configured_developer_instructions state="removed" />
-    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-    [04] <SKILLS_INSTRUCTIONS>
-01:message/developer:<multi_agent_usage_hint state="removed" />
-02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-03:message/user[2]:
+    [02] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [03] <SKILLS_INSTRUCTIONS>
+01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+02:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:message/user:first turn in agents_one
-05:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
-06:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
-07:message/assistant:turn one complete
-08:message/user[2]:
+03:message/user:first turn in agents_one
+04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+05:message/assistant:turn one complete
+06:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-09:message/user:second turn in agents_two
+07:message/user:second turn in agents_two
 
 ## Third Request (agents_two edited)
-00:message/developer[4]:
+00:message/developer[3]:
     [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <configured_developer_instructions state="removed" />
-    [03] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
-    [04] <SKILLS_INSTRUCTIONS>
-01:message/developer:<multi_agent_usage_hint state="removed" />
-02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-03:message/user[2]:
+    [02] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
+    [03] <SKILLS_INSTRUCTIONS>
+01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+02:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:message/user:first turn in agents_one
-05:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
-06:message/developer:<tool_search_sources>\n- Deferred built-in or extension tools (named source metadata is unavaila...
-07:message/assistant:turn one complete
-08:message/user[2]:
+03:message/user:first turn in agents_one
+04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+05:message/assistant:turn one complete
+06:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-09:message/user:second turn in agents_two
-10:message/assistant:turn two complete
-11:message/user:<AGENTS_MD>
-12:message/user:third turn after same-cwd AGENTS edit
+07:message/user:second turn in agents_two
+08:message/assistant:turn two complete
+09:message/user:<AGENTS_MD>
+10:message/user:third turn after same-cwd AGENTS edit

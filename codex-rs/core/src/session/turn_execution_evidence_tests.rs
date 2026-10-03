@@ -58,6 +58,61 @@ fn record(
 }
 
 #[tokio::test]
+async fn declared_lineage_projections_share_evidence_but_changed_sources_are_novel() {
+    let mut control = TurnExecutionControl::new();
+    let baseline = control.baselines(0);
+    // Commands and output bytes differ; only the declared lineage decides.
+    for (command, scope, identity, novel) in [
+        ("tool scan", Some("query-1"), "snapshot-1", true),
+        ("tool render --retained", Some("query-1"), "snapshot-1", false),
+        ("tool scan", Some("query-1"), "snapshot-2", true),
+        ("tool scan", Some("query-2"), "snapshot-2", true),
+        ("tool scan", None, "snapshot-3", true),
+        ("tool render --retained", None, "snapshot-3", false),
+    ] {
+        let mut lineage = json!({"source": "example_index", "identity": identity});
+        if let Some(scope) = scope {
+            lineage["scope"] = json!(scope);
+        }
+        let command = command.to_string();
+        let payload = ToolPayload::Function {
+            arguments: json!({"cmd": command}).to_string(),
+        };
+        let result = ExecCommandToolOutput {
+            process_output: None,
+            error: None,
+            validation: None,
+            event_call_id: "lineage".into(),
+            chunk_id: command.clone(),
+            wall_time: std::time::Duration::ZERO,
+            raw_output: serde_json::to_vec(&json!({
+                "rendered_by": command,
+                "evidence_lineage": lineage,
+            })).unwrap(),
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            max_output_tokens: None,
+            process_id: None,
+            session_capabilities: None,
+            exit_code: Some(0),
+            process_exited: true,
+            search_no_match: false,
+            original_token_count: None,
+            hook_command: Some(command.clone()),
+            raw_output_artifact: None,
+            repair_notice: None,
+            pending_deferred_completions: Vec::new(),
+        };
+        let collector = control.collector(&baseline);
+        record(&collector, "exec_command", &payload, &result, "lineage");
+        assert_eq!(
+            control.observe_progress(&baseline, &collector, &settled())
+                .contains(&TurnTimingProgressKind::NewSourceEvidence),
+            novel, "{command} {scope:?} {identity}",
+        );
+    }
+}
+
+#[tokio::test]
 async fn evidence_reuse_preserves_unscoped_commands_and_substantive_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source.py");

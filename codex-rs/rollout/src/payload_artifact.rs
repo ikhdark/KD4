@@ -27,7 +27,10 @@ fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
     if line.len() < INLINE_BYTES { return Ok(line.to_vec()); }
     let mut item: serde_json::Value = serde_json::from_slice(line)?;
+    // Full tool-manifest definitions are usually byte-identical across threads,
+    // so the content address stores one copy for every rollout that uses them.
     let selected = item["type"] == "session_meta"
+        || item["type"] == "tool_manifest"
         || (item["type"] == "sampling_boundary" && item["payload"]["timing_checkpoint"].is_object())
         || (item["type"] == "event_msg" && matches!(item["payload"]["type"].as_str(),
             Some("patch_apply_end" | "task_complete" | "turn_aborted")));
@@ -41,19 +44,24 @@ pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
     let directory = root(path);
     std::fs::create_dir_all(&directory)?;
     let destination = directory.join(format!("{sha256}.json"));
+    let mut published_here = false;
     if !destination.exists() {
         let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
         temporary.write_all(&bytes)?;
         temporary.as_file().sync_all()?;
         match temporary.persist_noclobber(&destination) {
-            Ok(_) => {}
+            // The destination is exactly the fsynced temporary file we wrote.
+            Ok(_) => published_here = true,
             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.error),
         }
     }
-    // A concurrent writer may have won admission. Never reference a partial,
-    // corrupted, or substituted object, including a preexisting symlink.
-    read_payload(&directory, &sha256, bytes.len() as u64)?;
+    // A preexisting object or a concurrent writer that won admission is
+    // verified: never reference a partial, corrupted, or substituted object,
+    // including a preexisting symlink.
+    if !published_here {
+        read_payload(&directory, &sha256, bytes.len() as u64)?;
+    }
     let mut reference = serde_json::json!({
         "timestamp": timestamp, "format_version": format_version,
         "type": KIND, "payload": {"sha256": sha256, "bytes": bytes.len()}

@@ -2404,37 +2404,6 @@ fn logical_generation_budget_new_user_input_renews_the_regular_limit() {
     assert_eq!(budget.admit(false), LogicalGenerationAdmission::Exhausted);
 }
 
-#[test]
-fn wall_time_limit_forces_one_final_synthesis_that_progress_cannot_renew() {
-    let start = std::time::Instant::now();
-    let limit = Some(Duration::from_secs(60));
-    let mut budget = LogicalGenerationBudget::default();
-    budget.enforce_wall_time_limit(limit, start);
-    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
-    budget.enforce_wall_time_limit(limit, start + Duration::from_secs(59));
-    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
-    budget.enforce_wall_time_limit(limit, start + Duration::from_secs(60));
-    assert_eq!(budget.wall_time_limit_reached, limit);
-    budget.observe_progress(
-        /*new_evidence*/ true, /*successful_process_monitor*/ false,
-    );
-    assert_eq!(
-        budget.admit(false),
-        LogicalGenerationAdmission::Terminal { forced: true }
-    );
-    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Exhausted);
-    // New user input starts a new window.
-    budget.accepted_user_input();
-    assert_eq!(budget.wall_time_limit_reached, None);
-    budget.enforce_wall_time_limit(limit, start + Duration::from_secs(600));
-    assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
-
-    let mut unlimited = LogicalGenerationBudget::default();
-    unlimited.enforce_wall_time_limit(None, start);
-    unlimited.enforce_wall_time_limit(None, start + Duration::from_secs(86_400));
-    assert_eq!(unlimited.admit(false), LogicalGenerationAdmission::Regular);
-}
-
 #[tokio::test]
 async fn regular_follow_up_admission_reports_exhaustion_once() {
     let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
@@ -7590,6 +7559,73 @@ fn projected_prompt_pressure_does_not_add_stable_tools_to_server_usage_twice() {
         ),
         1_200
     );
+}
+
+#[tokio::test]
+async fn completed_measurements_calibrate_next_prompt_pressure_with_safe_fallbacks() {
+    use codex_protocol::protocol::TokenUsage;
+
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let pending = PendingTokenEstimate {
+        total_tokens: 10_000,
+        body_growth_tokens: 10,
+        resolves_active_reasoning: false,
+    };
+    assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 301);
+    // A pessimistic recent sample stays in force until four new samples replace it.
+    for (local, measured, numerator, denominator) in [
+        (200, 100, 1, 2), (50, 100, 2, 1), (200, 100, 2, 1),
+        (200, 100, 2, 1), (200, 100, 2, 1), (200, 100, 1, 2),
+    ] {
+        turn.turn_timing_state = Arc::new(crate::turn_timing::TurnTimingState::default());
+        let timing = &turn.turn_timing_state;
+        timing.mark_turn_started();
+        drop(timing.begin_model_request_wait());
+        timing.record_model_attempt_identity("measurement", "physical");
+        timing.record_model_request_payload(
+            "measurement", "physical",
+            serde_json::json!({"model": turn.model_info.slug}).to_string().as_bytes(),
+        );
+        timing.record_model_request_token_categories(
+            "measurement", "physical",
+            codex_protocol::protocol::TurnTimingRequestTokenCategories {
+                local_input_estimate: local,
+                ..Default::default()
+            },
+        );
+        let usage = TokenUsage { input_tokens: measured, total_tokens: measured, ..Default::default() };
+        timing.record_generation_token_usage(Some(&usage));
+        assert_eq!(timing.prompt_token_calibration_sample(&turn.model_info.slug, &usage), None);
+        timing.record_response_event_milestones(&ResponseEvent::Completed {
+            response_id: "response".to_string(), token_usage: Some(usage.clone()), end_turn: Some(true),
+        });
+        assert_eq!(timing.prompt_token_calibration_sample("different-model", &usage), None);
+        session.record_token_usage_info(&turn, Some(&usage)).await.unwrap();
+        assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, (301 * numerator + denominator - 1) / denominator);
+        let local_prompt = session.get_estimated_token_count(&turn).await.unwrap()
+            + pending.total_tokens;
+        let floor = session.get_total_token_usage().await + pending.body_growth_tokens;
+        let expected = ((local_prompt * numerator + denominator - 1) / denominator).max(floor);
+        assert_eq!(projected_prompt_pressure(&session, &turn, pending).await.total_tokens, expected);
+    }
+    let mut next = session.new_default_turn_with_sub_id("calibrated-next-turn".to_string()).await;
+    assert_eq!(session.calibrated_prompt_tokens(&next, 301).await, 151);
+    let next = Arc::get_mut(&mut next).expect("unique next-turn fixture");
+    next.model_info.slug = "different-model".to_string();
+    assert_eq!(session.calibrated_prompt_tokens(next, 301).await, 301);
+    next.model_info.slug = turn.model_info.slug.clone();
+    Arc::make_mut(&mut next.config).model_provider_id = "different-provider".to_string();
+    assert_eq!(session.calibrated_prompt_tokens(next, 301).await, 301);
+
+    // An accounting-less completion invalidates the old calibration; no billing
+    // is invented and subsequent planning falls back to the local estimator.
+    session.record_token_usage_info(&turn, None).await.unwrap();
+    assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 301);
+    let usage = TokenUsage { input_tokens: 100, total_tokens: 100, ..Default::default() };
+    turn.turn_timing_state.record_model_attempt_identity("measurement", "retry");
+    assert_eq!(turn.turn_timing_state.prompt_token_calibration_sample(&turn.model_info.slug, &usage), None);
+    session.record_token_usage_info(&turn, Some(&usage)).await.unwrap();
+    assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 301);
 }
 
 #[test]

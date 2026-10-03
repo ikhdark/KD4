@@ -4512,6 +4512,13 @@ pub struct SamplingTimingCheckpoint {
     /// process that created the rollout before resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_build: Option<SessionBuildInfo>,
+    /// When true, `timing` keeps its cumulative scalar aggregates but carries
+    /// only the model requests, tool calls, and continuation receipts that are
+    /// new or changed since the previous checkpoint of the same turn. Readers
+    /// rebuild those arrays by merging the turn's checkpoints in order. Older
+    /// rollouts hold full snapshots and omit this field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incremental: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]

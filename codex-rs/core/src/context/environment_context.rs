@@ -10,6 +10,26 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// Desktop's per-session output directory,
+/// `<codex_home>/visualizations/YYYY/MM/DD/<uuid>`. It is unique per thread and
+/// is neither model-relevant context nor a runtime setting.
+pub(crate) fn is_session_visualization_directory(codex_home: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(codex_home.join("visualizations")) else {
+        return false;
+    };
+    let parts = relative
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>();
+    parts.len() == 4
+        && chrono::NaiveDate::parse_from_str(
+            &format!("{}/{}/{}", parts[0], parts[1], parts[2]),
+            "%Y/%m/%d",
+        )
+        .is_ok()
+        && uuid::Uuid::parse_str(&parts[3]).is_ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileSystemContext {
     workspace_roots: Vec<String>,
@@ -62,23 +82,8 @@ impl FileSystemContext {
     /// Hide Desktop's per-session output directory in the prompt only. Runtime
     /// permissions and the actual workspace roots remain unchanged.
     pub(super) fn without_session_visualizations(mut self, codex_home: &Path) -> Self {
-        let base = codex_home.join("visualizations");
-        let is_session_directory = |path: &Path| {
-            let Ok(relative) = path.strip_prefix(&base) else {
-                return false;
-            };
-            let parts = relative
-                .iter()
-                .map(|part| part.to_string_lossy())
-                .collect::<Vec<_>>();
-            parts.len() == 4
-                && chrono::NaiveDate::parse_from_str(
-                    &format!("{}/{}/{}", parts[0], parts[1], parts[2]),
-                    "%Y/%m/%d",
-                )
-                .is_ok()
-                && uuid::Uuid::parse_str(&parts[3]).is_ok()
-        };
+        let is_session_directory =
+            |path: &Path| is_session_visualization_directory(codex_home, path);
         self.workspace_roots
             .retain(|root| !is_session_directory(Path::new(root)));
         if let FileSystemPermissionProfileContext::Managed(

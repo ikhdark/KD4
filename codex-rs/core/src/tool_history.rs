@@ -4971,7 +4971,10 @@ fn workspace_call_observes_from_arguments(
             .get("path")
             .or_else(|| arguments.get("file_path"))
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|path| path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX));
+            .is_some_and(|path| {
+                path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
+                    || path == crate::context::desktop_instructions::LOCATOR
+            });
     }
     let Some(command) = dependency_command(arguments) else {
         return true;
@@ -5030,7 +5033,9 @@ fn source_dependencies_from_arguments(
             .and_then(serde_json::Value::as_str) else {
             return BTreeSet::new();
         };
-        if path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX) {
+        if path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
+            || path == crate::context::desktop_instructions::LOCATOR
+        {
             return BTreeSet::new();
         }
         // A selected environment can have a different cwd or path convention.

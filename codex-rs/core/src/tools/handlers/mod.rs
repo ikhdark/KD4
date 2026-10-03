@@ -39,7 +39,6 @@ mod request_plugin_install;
 pub(crate) mod request_plugin_install_spec;
 mod request_user_input;
 pub(crate) mod request_user_input_spec;
-mod retained_inventory;
 mod shell;
 pub(crate) use shell::validation_diagnostic_range;
 #[cfg(test)]
@@ -102,7 +101,6 @@ pub(crate) use read_tool_output::execute_recovery_transaction_with_continuations
 pub use request_permissions::RequestPermissionsHandler;
 pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
-pub(crate) use retained_inventory::RetainedInventoryHandler;
 pub use shell::ShellCommandHandler;
 pub(crate) use shell::ShellCommandHandlerOptions;
 pub use sleep::SleepHandler;

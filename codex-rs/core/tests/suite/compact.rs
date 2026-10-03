@@ -865,6 +865,7 @@ async fn manual_compact_openai_provider_uses_custom_prompt_locally() {
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         config.compact_prompt = Some(custom_prompt.to_string());
+        config.model_reasoning_effort = Some(codex_protocol::openai_models::ReasoningEffort::Low);
     });
     let codex = builder
         .build(&server)
@@ -902,6 +903,8 @@ async fn manual_compact_openai_provider_uses_custom_prompt_locally() {
         "expected first turn and compact requests"
     );
     let body = requests[1].body_json();
+    assert_eq!(requests[0].body_json()["reasoning"]["effort"], "low");
+    assert_eq!(body["reasoning"]["effort"], "low");
 
     let input = body
         .get("input")

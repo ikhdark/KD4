@@ -784,7 +784,15 @@ impl ModelRequestMeasurements {
             .iter()
             .map(|measurement| (measurement.category, measurement.hash))
             .collect::<BTreeMap<_, _>>();
-        let ordered_fixed_hashes = PromptContextCategory::FIXED_PREFIX
+        // Instructions and tool schemas are request sections ahead of every
+        // input item. Fixed input items are compared below by exact per-item
+        // digest over the leading fixed run, so whole-request category hashes
+        // must not decide reuse: context appended after history (such as a
+        // developer notice) would otherwise make an intact prefix look changed.
+        let ordered_fixed_hashes = [
+            PromptContextCategory::BaseSystem,
+            PromptContextCategory::ToolSchemas,
+        ]
             .into_iter()
             .filter_map(|category| {
                 category_hashes

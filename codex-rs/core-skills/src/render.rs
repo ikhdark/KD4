@@ -17,12 +17,13 @@ use codex_utils_output_truncation::approx_token_count;
 const SKILL_METADATA_CONTEXT_WINDOW_PERCENT: usize = 2;
 const MAX_SKILL_METADATA_TOKEN_BUDGET: usize = 2_000;
 const MAX_DEFAULT_CONTEXT_SKILL_DESCRIPTION_CHARS: usize = 240;
+const TASK_CATALOG_ENTRIES: usize = 12;
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
 const SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS: usize = 100;
 pub const SKILL_DESCRIPTION_TRUNCATED_WARNING: &str = "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.";
 pub const SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX: &str =
     "Exceeded skills context budget. All skill descriptions were removed and";
-pub const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "Entries prioritize the current task and may shorten other descriptions. Load full instructions through the skill locator. For complete enabled names, descriptions, and locators, read_file(path=\"skill:catalog\", force_fresh=true); search selectors can find newly relevant skills when the task changes.";
+pub const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "This is a task-ranked selection, not the complete capability catalog. Load full instructions through the skill locator. For omitted or newly relevant skills, search read_file(path=\"skill:catalog\") before assuming a capability is unavailable; use force_fresh=true after a catalog change.";
 const SKILLS_INTRO_WITH_ALIASES: &str = "Catalog entries give a skill name, concise purpose, and deterministic `SKILL.md` locator. Expand `rN/...` locators through the roots below.";
 pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by the user or clearly matched by the task. Announce each skill on first use in the conversation, state ordering when needed, and reassess relevance on later turns without repeating the announcement.
 - Before task actions, the main agent must read each selected `SKILL.md` completely. Do not delegate that reading or interpretation.
@@ -166,6 +167,10 @@ pub fn build_available_skills_for_task(
         };
         // Stable sort preserves scope/name order for equal relevance.
         skill_lines.sort_by_cached_key(|line| std::cmp::Reverse(score(line)));
+        // Explicitly named skills always survive the task projection. The
+        // unfiltered snapshot and skill:catalog remain authoritative.
+        let named_count = skill_lines.iter().take_while(|line| score(line).0).count();
+        skill_lines.truncate(TASK_CATALOG_ENTRIES.max(named_count));
         for line in &mut skill_lines {
             if score(line) == (false, 0) {
                 // Keep a trigger, not just a name: lexical relevance is only a
@@ -174,7 +179,15 @@ pub fn build_available_skills_for_task(
             }
         }
     }
-    let selected = build_available_skills_from_lines(skill_lines, skills.len(), budget)?;
+    let task_omitted = skills.len().saturating_sub(skill_lines.len());
+    let mut selected = build_available_skills_from_lines(skill_lines, skills.len(), budget)?;
+    selected.report.omitted_count = selected.report.omitted_count.saturating_add(task_omitted);
+    if task_omitted > 0 {
+        selected.warning_message = Some(format!(
+            "The task-ranked skills projection omits {task_omitted} skills; {} skills are omitted in total after budgeting. The complete enabled catalog remains available through read_file(path=\"skill:catalog\").",
+            selected.report.omitted_count
+        ));
+    }
 
     record_available_skills_side_effects(&selected, budget, side_effects);
     Some(selected)
@@ -812,6 +825,22 @@ mod tests {
             assert!(result.skill_lines[0].starts_with(&format!("- {first} —")));
             assert_eq!(result.report.omitted_count, 0);
         }
+        let skills = (0..30).map(|index|
+            make_skill_with_description(&format!("skill{index}"), SkillScope::Repo, "capability trigger")
+        ).collect::<Vec<_>>();
+        let outcome = SkillLoadOutcome { skills, ..Default::default() };
+        let task = (15..30).map(|index| format!("skill{index}")).collect::<Vec<_>>().join(" ");
+        let result = build_available_skills_for_task(
+            &outcome, SkillMetadataBudget::Characters(100_000),
+            SkillRenderSideEffects::None, &task,
+        ).unwrap();
+        assert_eq!(result.report.included_count, 15);
+        assert_eq!(result.report.omitted_count, 15);
+        for skill in &outcome.skills[15..] {
+            assert!(result.skill_lines.iter().any(|line|
+                line.starts_with(&format!("- {} —", skill.name))));
+        }
+        assert_eq!(outcome.skills.len(), 30, "projection must not mutate discovery");
     }
 
     #[test]

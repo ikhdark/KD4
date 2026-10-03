@@ -204,7 +204,117 @@ pub fn first_omitted_line_range(source: &str, projection: &str) -> Option<(usize
     start.map(|start| (start, end))
 }
 
+/// A line that alone needs more than this share of the budget crowds out every
+/// other line, and a byte slice of it is rarely interpretable.
+const JSON_LINE_OUTLINE_BUDGET_DIVISOR: usize = 2;
+const JSON_OUTLINE_MAX_KEYS: usize = 32;
+const JSON_OUTLINE_STRING_CHARS: usize = 48;
+const JSON_OUTLINE_MAX_DEPTH: usize = 3;
+
+/// Replaces each oversized single-line JSON value with a one-line structural
+/// outline. Line count and order are unchanged, so line coordinates and
+/// recovery selectors still refer to the original output; the outlined line
+/// reads as omitted, and exact values remain recoverable from the retained
+/// output with JSON pointer selectors.
+fn outline_oversized_json_lines(content: &str, max_tokens: usize) -> Option<String> {
+    let line_budget = max_tokens / JSON_LINE_OUTLINE_BUDGET_DIVISOR;
+    let mut outlined = String::new();
+    let mut replaced = false;
+    for line in content.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let trimmed = body.trim();
+        let outline = (trimmed.starts_with('{') || trimmed.starts_with('['))
+            .then(|| approx_token_count_exceeds(body, line_budget))
+            .filter(|oversized| *oversized)
+            .and_then(|_| serde_json::from_str::<serde_json::Value>(trimmed).ok())
+            .map(|value| json_line_outline(&value, body.len(), line_budget));
+        match outline {
+            Some(outline) => {
+                outlined.push_str(&outline);
+                outlined.push_str(&line[body.len()..]);
+                replaced = true;
+            }
+            None => outlined.push_str(line),
+        }
+    }
+    replaced.then_some(outlined)
+}
+
+fn json_line_outline(value: &serde_json::Value, bytes: usize, max_tokens: usize) -> String {
+    let mut best = String::new();
+    for depth in (0..=JSON_OUTLINE_MAX_DEPTH).rev() {
+        best.clear();
+        let _ = write!(
+            best,
+            "[JSON line of {bytes} bytes outlined; select exact values with JSON pointers] "
+        );
+        json_outline(value, depth, &mut best);
+        if !approx_token_count_exceeds(&best, max_tokens) {
+            break;
+        }
+    }
+    best
+}
+
+fn json_outline(value: &serde_json::Value, depth: usize, out: &mut String) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) if depth == 0 => {
+            let _ = write!(out, "{{…{} keys}}", map.len());
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (index, (key, child)) in map.iter().enumerate() {
+                if index == JSON_OUTLINE_MAX_KEYS {
+                    let _ = write!(out, ",…{} more keys", map.len() - index);
+                    break;
+                }
+                if index > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "{}:", Value::String(key.clone()));
+                json_outline(child, depth - 1, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) if depth == 0 || items.is_empty() => {
+            let _ = write!(out, "[…{} items]", items.len());
+        }
+        Value::Array(items) => {
+            let _ = write!(out, "[{} items; first ", items.len());
+            json_outline(&items[0], depth - 1, out);
+            if let Some(last) = items.get(1..).and_then(<[Value]>::last) {
+                out.push_str("; last ");
+                json_outline(last, depth - 1, out);
+            }
+            out.push(']');
+        }
+        Value::String(text) => {
+            let chars = text.chars().count();
+            if chars <= JSON_OUTLINE_STRING_CHARS {
+                let _ = write!(out, "{value}");
+            } else {
+                let prefix = text.chars().take(JSON_OUTLINE_STRING_CHARS).collect::<String>();
+                let _ = write!(out, "{}…({chars} chars)", Value::String(prefix));
+            }
+        }
+        other => {
+            let _ = write!(out, "{other}");
+        }
+    }
+}
+
 fn truncate_over_budget_text_with_markers(content: &str, max_tokens: usize, line_markers: bool) -> String {
+    if let Some(outlined) = outline_oversized_json_lines(content, max_tokens) {
+        if !approx_token_count_exceeds(&outlined, max_tokens) {
+            return outlined;
+        }
+        return truncate_over_budget_lines_with_markers(&outlined, max_tokens, line_markers);
+    }
+    truncate_over_budget_lines_with_markers(content, max_tokens, line_markers)
+}
+
+fn truncate_over_budget_lines_with_markers(content: &str, max_tokens: usize, line_markers: bool) -> String {
     const BEFORE_MIDDLE: &str = "\n[omitted before retained middle]\n";
     const AFTER_MIDDLE: &str = "\n[omitted after retained middle]\n";
     let marker_tokens = approx_token_count(BEFORE_MIDDLE) + approx_token_count(AFTER_MIDDLE);

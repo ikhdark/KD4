@@ -4034,6 +4034,53 @@ fn fixed_prefix_reuse_rejects_reordered_request_items() {
     );
 }
 
+#[test]
+fn appended_developer_context_keeps_an_intact_fixed_prefix_reusable() {
+    let developer = |text: &str| ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let measure = |items: Vec<ResponseItem>| {
+        let request = history_test_request(items);
+        let provenance = PromptProvenanceSidecar::default().with_response_item_category(
+            &request.input,
+            0,
+            PromptContextCategory::Repository,
+        );
+        ModelRequestMeasurements::for_responses_request(&request, &provenance, "").unwrap()
+    };
+    let repository = history_test_item("repository instructions", None);
+    let task = history_test_item("task", Some("turn-1"));
+    let notice = developer("<notice>first</notice>");
+    let mut baseline = None;
+    let mut first = measure(vec![repository.clone(), task.clone(), notice.clone()]);
+    first.compare_and_remember_prompt_context(&mut baseline, Some("cache"), Default::default());
+    assert_eq!(first.fixed_prefix_item_count, 1);
+
+    // A developer notice appended after history changes the whole-request
+    // injected-context hash, yet the provider-cacheable prefix is intact.
+    let mut second = measure(vec![
+        repository,
+        task.clone(),
+        notice.clone(),
+        history_test_tool_output("call-1", "result"),
+        developer("<notice>second</notice>"),
+    ]);
+    second.compare_and_remember_prompt_context(&mut baseline, Some("cache"), Default::default());
+    assert_eq!(second.fixed_prefix_item_count, 1);
+    assert!(second.fixed_prefix_reuse_eligible);
+
+    // Editing the leading fixed item still breaks reuse.
+    let mut third = measure(vec![history_test_item("edited instructions", None), task, notice]);
+    third.compare_and_remember_prompt_context(&mut baseline, Some("cache"), Default::default());
+    assert!(!third.fixed_prefix_reuse_eligible);
+}
+
 #[tokio::test]
 async fn cancelled_diagnostic_task_records_unavailable_in_completed_snapshot() {
     let timing = Arc::new(TurnTimingState::default());

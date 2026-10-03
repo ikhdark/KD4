@@ -1088,6 +1088,11 @@ impl ToolOutput for ExecCommandToolOutput {
             serde_json::json!(!self.raw_output.is_empty() || self.process_exited);
         signal["empty_output"] = serde_json::json!(self.raw_output.is_empty());
         signal["command_evidence"] = serde_json::json!(true);
+        if outcome == ToolOutputOutcome::Success
+            && let Some(evidence) = declared_lineage_evidence(&self.raw_output)
+        {
+            signal["semantic_evidence"] = evidence;
+        }
         if let Some(process_id) = self.process_id {
             signal["background_process_id"] = serde_json::json!(process_id);
         }
@@ -1404,6 +1409,29 @@ fn canonical_output_evidence(raw_output: &[u8]) -> Vec<String> {
         "canonical-output-v1:{}",
         crate::tool_history::sha256(raw_output)
     )]
+}
+
+fn declared_lineage_evidence(raw_output: &[u8]) -> Option<JsonValue> {
+    // Any producer whose whole output is a JSON object may declare the source,
+    // optional scope, and identity it projects, so re-rendering retained
+    // evidence is not counted as new source evidence. Attribution only, never
+    // completion authority or permission to skip a command. Output cannot
+    // claim harness-owned sources; undeclared output stays exact byte evidence.
+    const KEY: &[u8] = b"\"evidence_lineage\"";
+    if !raw_output.windows(KEY.len()).any(|window| window == KEY) {
+        return None;
+    }
+    let value: JsonValue = serde_json::from_slice(raw_output).ok()?;
+    let lineage = value.get("evidence_lineage")?;
+    let source = lineage.get("source")?.as_str().filter(|source| {
+        !source.is_empty() && !matches!(*source, "read_file" | "artifact" | "workspace-command")
+    })?;
+    let identity = lineage.get("identity").filter(|identity| !identity.is_null())?;
+    Some(serde_json::json!({
+        "source": source,
+        "scope": lineage.get("scope").cloned().unwrap_or(JsonValue::Null),
+        "identity": identity,
+    }))
 }
 
 pub(crate) fn successful_command_evidence(raw_output: &[u8], command: Option<&str>) -> Vec<String> {

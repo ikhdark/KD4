@@ -39,6 +39,34 @@ def _elapsed_rows(comparison: dict) -> list[dict]:
 
 
 class SessionDiagnosticsTest(unittest.TestCase):
+    def test_nested_calls_terminal_cost_and_calibration_require_complete_measurements(self):
+        timing = {
+            "counters": {"toolCallCount": 2, "toolOutputTruncationCount": 1,
+                         "truncationInducedContinuationCount": 0},
+            "toolClosure": {"complete": True},
+            "toolCalls": [{"callId": "parent", "source": "direct"},
+                          {"callId": "child", "source": "code_mode", "parentCallId": "parent"}],
+            "modelRequests": [{"generationIndex": 0, "generationPurpose": "terminal",
+                               "modelStreamWaitNs": 5_000_000,
+                               "requestTokenCategories": {
+                                   "localInputEstimate": 120, "providerInputTokens": 100,
+                               }}],
+        }
+        turn = {"requestRetention": {"complete": True}}
+        result = diagnostics._turn_metrics({"timing": timing}, turn, {}, {})
+        metrics = result["metrics"]
+        self.assertEqual((metrics["rootToolCalls"], metrics["nestedToolCalls"]), (1, 1))
+        self.assertEqual(metrics["terminalGenerations"], 1)
+        self.assertEqual(metrics["terminalModelMs"], 5)
+        self.assertEqual(metrics["inputEstimateAbsoluteErrorTokens"], 20)
+        self.assertEqual(result["truncationAttribution"]["unattributedOmissionDisposition"], "unknown")
+        timing["toolCallTimingOverflow"] = 1
+        turn["requestRetention"]["complete"] = False
+        metrics = diagnostics._turn_metrics({"timing": timing}, turn, {}, {})["metrics"]
+        for key in ("rootToolCalls", "nestedToolCalls", "terminalGenerations",
+                    "terminalModelMs", "inputEstimateAbsoluteErrorTokens"):
+            self.assertIsNone(metrics[key], key)
+
     def test_nonprogress_fallback_requires_complete_explicit_observations(self):
         timing = _timing()
         timing.pop("observationalNonprogressLatency")
@@ -107,6 +135,7 @@ class SessionDiagnosticsTest(unittest.TestCase):
             toolOutputArtifactRereadCount=2,
             toolOutputRecoveryRetruncationCount=1,
             toolOutputProjectionTruncationCount=3,
+            toolOutputTruncationCount=2,
         )
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -155,7 +184,7 @@ class SessionDiagnosticsTest(unittest.TestCase):
             )
             self.assertEqual(
                 report["perTurn"][0]["diagnostics"]["truncationCountBySource"],
-                {"runtimeProjection": 3, "recoverySections": 1},
+                {"commandOutput": 2, "runtimeProjection": 3, "recoverySections": 1},
             )
             disabled = audit.analyze_session_path(
                 root / "rollout.jsonl", root, include_tokens=False
@@ -734,7 +763,11 @@ class SessionDiagnosticsTest(unittest.TestCase):
     def test_regression_gate_uses_metric_direction_and_never_passes_missing_proof(self):
         def comparison(metric, *statuses):
             return {
-                "metrics": [{"metric": metric, "status": status} for status in statuses]
+                "metrics": [{"metric": metric, "status": status} for status in statuses],
+                "minSamples": 5,
+                "relativeThreshold": 0.1,
+                "absoluteThresholds": {},
+                "unmatchedBaselineCohorts": 0,
             }
 
         for metric, statuses, expected in (
