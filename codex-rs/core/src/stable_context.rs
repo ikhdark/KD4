@@ -573,7 +573,14 @@ struct StableItemSignatureEntry<'a> {
     payload: &'a str,
 }
 
-fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSignatureEntry<'_>>> {
+/// One classified section and the content items it occupies. A presence
+/// marker and its following payload form a single section.
+struct StableItemSection<'a> {
+    entry: StableItemSignatureEntry<'a>,
+    content: std::ops::Range<usize>,
+}
+
+fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSection<'_>>> {
     let ResponseItem::Message { role, content, .. } = item else {
         return None;
     };
@@ -596,18 +603,24 @@ fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSignatureE
                 (text.as_str(), 2)
             }
         };
-        signature.push(StableItemSignatureEntry {
-            slot: classification.slot,
-            role,
-            payload,
+        signature.push(StableItemSection {
+            entry: StableItemSignatureEntry {
+                slot: classification.slot,
+                role,
+                payload,
+            },
+            content: content_index..content_index + consumed,
         });
         content_index += consumed;
     }
     (!signature.is_empty()).then_some(signature)
 }
 
-/// Removes an unchanged non-volatile stable injection that is already the
-/// latest value in history. Volatile or ambiguous items remain turn-scoped.
+/// Removes unchanged non-volatile stable sections that are already the latest
+/// value of their slot in history. A full startup reinjection caused by one
+/// changed fragment therefore appends only its changed and volatile sections;
+/// an item with nothing left is removed. Untrusted or ambiguous items remain
+/// whole, and volatile sections remain turn-scoped.
 pub(crate) fn filter_unchanged_stable_context_items(
     history: &[ResponseItem],
     candidates: Vec<ResponseItem>,
@@ -615,34 +628,50 @@ pub(crate) fn filter_unchanged_stable_context_items(
     let mut latest = HashMap::<StableContextSlot, StableItemSignatureEntry>::new();
     for item in history {
         if let Some(signature) = stable_item_signature(item) {
-            for entry in signature {
-                latest.insert(entry.slot, entry);
+            for section in signature {
+                latest.insert(section.entry.slot, section.entry);
             }
         }
     }
 
-    let retained = candidates
+    let removed_content = candidates
         .iter()
         .map(|item| {
             let Some(signature) = stable_item_signature(item) else {
-                return true;
+                return Vec::new();
             };
-            let unchanged = signature
+            let removed = signature
                 .iter()
-                .all(|entry| !entry.slot.is_volatile() && latest.get(&entry.slot) == Some(entry));
-            if unchanged {
-                return false;
+                .filter(|section| {
+                    !section.entry.slot.is_volatile()
+                        && latest.get(&section.entry.slot) == Some(&section.entry)
+                })
+                .map(|section| section.content.clone())
+                .collect::<Vec<_>>();
+            for section in signature {
+                latest.insert(section.entry.slot, section.entry);
             }
-            for entry in signature {
-                latest.insert(entry.slot, entry);
-            }
-            true
+            removed
         })
         .collect::<Vec<_>>();
     candidates
         .into_iter()
-        .zip(retained)
-        .filter_map(|(item, keep)| keep.then_some(item))
+        .zip(removed_content)
+        .filter_map(|(mut item, removed)| {
+            if removed.is_empty() {
+                return Some(item);
+            }
+            let ResponseItem::Message { content, .. } = &mut item else {
+                return Some(item);
+            };
+            let mut content_index = 0;
+            content.retain(|_| {
+                let keep = !removed.iter().any(|range| range.contains(&content_index));
+                content_index += 1;
+                keep
+            });
+            (!content.is_empty()).then_some(item)
+        })
         .collect()
 }
 
@@ -1608,6 +1637,86 @@ mod tests_optimization {
                 vec![selected_skill.clone()]
             ),
             vec![selected_skill]
+        );
+    }
+
+    #[test]
+    fn partially_changed_injection_appends_only_changed_sections() {
+        let message = |role: &str, sections: &[&str]| {
+            let mut item = ResponseItem::Message {
+                id: None,
+                role: role.to_string(),
+                content: sections
+                    .iter()
+                    .map(|text| ContentItem::InputText {
+                        text: (*text).to_string(),
+                    })
+                    .collect(),
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            };
+            mark_trusted_stable_context_item(&mut item);
+            item
+        };
+        let permissions = "<permissions instructions>sandboxed</permissions instructions>";
+        let collaboration = "<collaboration_mode>keep the task focused</collaboration_mode>";
+        let repository =
+            "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>";
+        let environment = "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>";
+        let history = [
+            message(
+                "developer",
+                &[
+                    permissions,
+                    DEVELOPER_INSTRUCTIONS_PRESENT_MARKER,
+                    "old instructions",
+                    collaboration,
+                ],
+            ),
+            message("user", &[repository, environment]),
+        ];
+
+        let retained = filter_unchanged_stable_context_items(
+            &history,
+            vec![
+                message(
+                    "developer",
+                    &[
+                        permissions,
+                        DEVELOPER_INSTRUCTIONS_PRESENT_MARKER,
+                        "new instructions",
+                        collaboration,
+                    ],
+                ),
+                message("user", &[repository, environment]),
+            ],
+        );
+
+        // The changed payload keeps its presence marker; unchanged sections are
+        // already authoritative in history. Volatile environment context stays
+        // with its turn even when its text repeats.
+        let retained = retained
+            .iter()
+            .map(|item| {
+                let ResponseItem::Message { role, content, .. } = item else {
+                    panic!("stable context is retained as messages");
+                };
+                assert!(is_trusted_stable_context_item(item));
+                (
+                    role.as_str(),
+                    content.iter().filter_map(content_text).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            vec![
+                (
+                    "developer",
+                    vec![DEVELOPER_INSTRUCTIONS_PRESENT_MARKER, "new instructions"]
+                ),
+                ("user", vec![environment]),
+            ]
         );
     }
 

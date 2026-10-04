@@ -1184,7 +1184,7 @@ type WorkspaceEvidenceBaselineSlot = Arc<Mutex<Option<(WorkspaceEvidenceBaseline
 struct ToolCallWorkspaceEvidenceContext {
     projection_source_dependencies:
         Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
-    workspace_admission_hint: Option<crate::tool_history::WorkspaceCallClassification>,
+    workspace_admission_hint: Option<(crate::tool_history::WorkspaceCallClassification, bool)>,
     baseline_slot: Option<WorkspaceEvidenceBaselineSlot>,
     dispatch_state: Option<Arc<ToolDispatchState>>,
 }
@@ -1975,7 +1975,7 @@ impl ToolCallRuntime {
         call: ToolCall,
         cancellation_token: CancellationToken,
         timing: Arc<ToolDispatchTiming>,
-        admission_hint: Option<crate::tool_history::WorkspaceCallClassification>,
+        admission_hint: Option<(crate::tool_history::WorkspaceCallClassification, bool)>,
     ) -> impl std::future::Future<Output = Result<ToolCallCompletion, CodexErr>> {
         self.step_context
             .workspace_evidence_generation_batch
@@ -2024,7 +2024,7 @@ impl ToolCallRuntime {
             self.ensure_execution_allowed().map_err(|error| CodexErr::Fatal(error.to_string()))?;
             timing.mark_first_poll();
             let _tool_call_timing_guard = tool_call_timing_guard;
-            let workspace_call_classification = match admission_hint {
+            let (workspace_call_classification, read_only) = match admission_hint {
                 Some(classification) => classification,
                 None => crate::tool_history::classify_workspace_tool_call_at_admission(
                     call.tool_name.name.to_string(),
@@ -2032,7 +2032,7 @@ impl ToolCallRuntime {
                     self.step_context.turn.config.cwd.to_path_buf(),
                 ).await.map_err(|error| CodexErr::Fatal(format!(
                     "workspace admission analysis failed: {error}"
-                )))?.0,
+                )))?,
             };
             let workspace_call_classification = native_file_classification(
                 workspace_call_classification, call.tool_name.name.as_str(), &call.payload,
@@ -2200,7 +2200,7 @@ impl ToolCallRuntime {
                     projection_source_dependencies: Some(
                         workspace_call_classification.source_dependencies.clone(),
                     ),
-                    workspace_admission_hint: Some(workspace_call_classification.clone()),
+                    workspace_admission_hint: Some((workspace_call_classification.clone(), read_only)),
                     baseline_slot: workspace_evidence_baseline_slot.clone(),
                     dispatch_state: Some(Arc::clone(&dispatch_state)),
                 },
@@ -2668,14 +2668,14 @@ impl ToolCallRuntime {
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
-                let admission = match workspace_admission_hint {
+                let (admission, mut read_only) = match workspace_admission_hint {
                     Some(classification) => classification,
                     None => crate::tool_history::classify_workspace_tool_call_at_admission(
                         admission_tool_name.name.to_string(), dispatch_call.payload.clone(),
                         turn.config.cwd.to_path_buf(),
                     ).await.map_err(|error| FunctionCallError::Fatal(format!(
                         "workspace admission analysis failed: {error}"
-                    )))?.0,
+                    )))?,
                 };
                 let admission = native_file_classification(
                     admission, admission_tool_name.name.as_str(), &dispatch_call.payload,
@@ -2710,12 +2710,15 @@ impl ToolCallRuntime {
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
                 let (workspace_admission_classification, workspace_call_classification) =
                     if hook_rewrote_input {
-                        let classification = crate::tool_history::classify_workspace_tool_call_at_admission(
+                        let (classification, rewritten_read_only) = crate::tool_history::classify_workspace_tool_call_at_admission(
                             admission_tool_name.name.to_string(), dispatch_call.payload.clone(),
                             turn.config.cwd.to_path_buf(),
                         ).await.map_err(|error| FunctionCallError::Fatal(format!(
                             "rewritten workspace admission analysis failed: {error}"
-                        )))?.0;
+                        )))?;
+                        // A hook may turn a read into a writer. Never retain
+                        // the original payload's admission proof after rewriting.
+                        read_only = rewritten_read_only;
                         let classification = native_file_classification(
                             classification, admission_tool_name.name.as_str(), &dispatch_call.payload,
                             &step_context.environments,
@@ -2772,7 +2775,14 @@ impl ToolCallRuntime {
                 timing.record_boundary(ToolLifecycleBoundary::ResourceResolutionEnd);
                 let workspace_admission = workspace_admission_plan(
                     router.delegates_workspace_admission(&evidence_call),
-                    router.permits_shared_workspace_observation(&evidence_call),
+                    router.permits_shared_workspace_observation(&evidence_call)
+                        // Reuse the shell-aware proof already needed for eager
+                        // dispatch. A public name alone cannot opt a custom
+                        // handler into shared execution.
+                        || (read_only && matches!(
+                            router.semantic_capabilities(&evidence_call.tool_name).command,
+                            Some(crate::tools::registry::CommandArgumentFormat::Exec)
+                        )),
                     &workspace_admission_classification,
                     resource_key,
                     supports_parallel,
@@ -4122,6 +4132,7 @@ mod tests {
             ToolRegistry::from_tools([
                 Arc::new(ReadFileHandler) as Arc<dyn CoreToolRuntime>,
                 Arc::new(ListFilesHandler) as Arc<dyn CoreToolRuntime>,
+                Arc::new(crate::tools::handlers::ExecCommandHandler::default()) as Arc<dyn CoreToolRuntime>,
             ]),
             Vec::new(),
         ));
@@ -4142,16 +4153,17 @@ mod tests {
         )
         .await;
 
-        for (name, path, expected) in [
-            ("read_file", "evidence.txt", "reader evidence"),
-            ("list_files", ".", "evidence.txt"),
+        for (name, arguments, expected) in [
+            ("read_file", serde_json::json!({"path":"evidence.txt"}), "reader evidence"),
+            ("list_files", serde_json::json!({"path":"."}), "evidence.txt"),
+            ("exec_command", serde_json::json!({"cmd":"git status --short --untracked-files=all"}), "evidence.txt"),
         ] {
             for nested in [false, true] {
                 let call = ToolCall {
                     tool_name: codex_tools::ToolName::plain(name),
                     call_id: format!("{name}-{nested}"),
                     payload: ToolPayload::Function {
-                        arguments: serde_json::json!({"path": path}).to_string(),
+                        arguments: arguments.to_string(),
                     },
                 };
                 let result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -4177,10 +4189,13 @@ mod tests {
                             })
                             .map_err(|error| error.to_string())
                     } else {
-                        runtime
-                            .clone()
-                            .handle_tool_call(call, CancellationToken::new())
-                            .await
+                        let admission = crate::tool_history::classify_workspace_tool_call_at_admission(
+                            call.tool_name.name.to_string(), call.payload.clone(), workspace.path().to_path_buf(),
+                        ).await.expect("admission proof");
+                        let timing = runtime.create_tool_dispatch_timing(TokioInstant::now(), false);
+                        runtime.clone().handle_model_tool_call_with_admission(
+                            call, CancellationToken::new(), timing, Some(admission),
+                        ).await.map(|completion| completion.response)
                             .map_err(|error| error.to_string())
                     }
                 })
@@ -4196,6 +4211,40 @@ mod tests {
                 };
                 assert!(text.contains(expected), "{text}");
             }
+        }
+        // The same real command path must retain exclusion for redirection
+        // and unknown programs. Observe a queued gate, not merely a slow spawn.
+        for cmd in ["git status --short > blocked.txt", "unknown_audit_program"] {
+            let cancellation = CancellationToken::new();
+            let pending = runtime.clone().handle_tool_call(
+                ToolCall {
+                    tool_name: codex_tools::ToolName::plain("exec_command"),
+                    call_id: format!("writer-{cmd}"),
+                    payload: ToolPayload::Function {
+                        arguments: serde_json::json!({"cmd":cmd}).to_string(),
+                    },
+                },
+                cancellation.clone(),
+            );
+            tokio::pin!(pending);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        result = &mut pending => panic!("writer bypassed reader lease: {result:?}"),
+                        _ = tokio::task::yield_now() => {
+                            if timing.lifecycle_context().parallel_gate_waiter_count > 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }).await.expect("writer should queue without entering its handler");
+            assert!(!workspace.path().join("blocked.txt").exists());
+            cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(10), pending)
+                .await.expect("queued cancellation must release admission")
+                .expect("cancelled call has an inspectable terminal result");
+            assert_eq!(timing.lifecycle_context().parallel_gate_waiter_count, 0);
         }
         drop(reader);
     }
@@ -7618,6 +7667,97 @@ mod tests {
             actual
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_early_finish_notification_preserves_start_failure()
+    -> anyhow::Result<()> {
+        let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe_records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (finish_started_tx, finish_started_rx) = oneshot::channel();
+        let allow_finish = Arc::new(Notify::new());
+        let mut builder =
+            codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+        builder.tool_lifecycle_contributor(Arc::new(LifecyclePanicProbe {
+            label: "failed-start",
+            panic_at: Some("poll"),
+            records: Arc::clone(&probe_records),
+        }));
+        builder.tool_lifecycle_contributor(Arc::new(BlockingFinishContributor {
+            records: Arc::clone(&records),
+            finish_started: std::sync::Mutex::new(Some(finish_started_tx)),
+            allow_finish: Arc::clone(&allow_finish),
+        }));
+        session.services.extensions = Arc::new(builder.build());
+
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let tool_name = codex_tools::ToolName::plain("test_tool");
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([Arc::new(ImmediateHandler {
+                tool_name: tool_name.clone(),
+            }) as Arc<dyn CoreToolRuntime>]),
+            Vec::new(),
+        ));
+        let step_context = StepContext::for_test(Arc::clone(&turn_context))
+            .with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            Arc::clone(&session),
+            step_context,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let cancellation_token = CancellationToken::new();
+        let mut response_task = tokio::spawn(runtime.handle_tool_call(
+            ToolCall {
+                tool_name,
+                call_id: "observer-panic-call".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            },
+            cancellation_token.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), finish_started_rx).await??;
+
+        // The early failure has reached its finish observer. Let cancellation
+        // settle while that observer stays held, without a wall-clock race.
+        tokio::time::pause();
+        cancellation_token.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut response_task)
+                .await
+                .is_err(),
+            "terminal delivery must wait for the held finish observer"
+        );
+        tokio::time::resume();
+        allow_finish.notify_waiters();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), response_task).await?;
+        let error = result?.expect_err("cancellation must preserve the start failure");
+        assert!(
+            matches!(error, CodexErr::Fatal(ref message) if message.contains("start-poll-sentinel"))
+        );
+        session.terminal_tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait()).await?;
+
+        let expected = ToolCallOutcome::Failed {
+            handler_executed: false,
+        };
+        assert_eq!(records.lock().unwrap().as_slice(), &[expected]);
+        assert_eq!(
+            probe_records.lock().unwrap().as_slice(),
+            &[
+                ("failed-start", "start", None),
+                ("failed-start", "finish", Some(expected)),
+            ]
+        );
+        let timing = turn_context.turn_timing_state.complete_snapshot().protocol_timing();
+        let call = timing.tool_calls.iter()
+            .find(|call| call.call_id == "observer-panic-call")
+            .expect("failed call timing");
+        assert!(call.handler_entry_at_ms.is_none(), "handler must not execute");
         Ok(())
     }
 

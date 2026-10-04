@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import urllib.parse
 import urllib.request
 
 
@@ -18,4 +19,7 @@ def github_request(url: str, user_agent: str) -> bytes:
 
 
 def github_api_contents_url(repo: str, path: str, ref: str) -> str:
-    return f"https://api.github.com/repos/{repo}/contents/{path}?ref={ref}"
+    repo = urllib.parse.quote(repo, safe="/")
+    path = urllib.parse.quote(path, safe="/")
+    query = urllib.parse.urlencode({"ref": ref})
+    return f"https://api.github.com/repos/{repo}/contents/{path}?{query}"

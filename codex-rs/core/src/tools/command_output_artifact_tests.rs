@@ -4,6 +4,42 @@ use std::time::Duration;
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+#[expect(clippy::print_stdout, reason = "emit deterministic audit fixture measurements")]
+async fn complete_json_inventory_omits_redundant_children_without_losing_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let value = Value::Object((0..1000).map(|index| (format!("path/{index}"), serde_json::json!(index))).collect());
+    let canonical = CanonicalToolResult::json(value.clone());
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let id = artifact.artifact_id().unwrap();
+    let result = read_tool_output_selectors(temp.path(), "thread", &id, vec![
+        ToolOutputSelector::JsonPointer { pointer: String::new() },
+    ]).await.unwrap();
+    assert!(result.complete);
+    assert_eq!(result.results[0].value, Some(value));
+    assert!(result.results[0].child_selectors.is_empty());
+    let compact_bytes = serde_json::to_vec(&result).unwrap().len();
+    let mut redundant = result.clone();
+    redundant.results[0].child_selectors = canonical.json_pointers[""].direct_children.iter()
+        .map(|pointer| ToolOutputSelector::JsonPointer { pointer: pointer.clone() }).collect();
+    let redundant_bytes = serde_json::to_vec(&redundant).unwrap().len();
+    assert!(compact_bytes < 24_000);
+    assert!(redundant_bytes > 40_000);
+    println!("projection_audit json_inventory before_bytes={redundant_bytes} after_bytes={compact_bytes}");
+    let schema = crate::tools::handlers::read_tool_output_spec::read_tool_output_output_schema(
+        crate::tools::handlers::read_tool_output_spec::tool_output_selector_schema(),
+    );
+    jsonschema::validator_for(&schema).unwrap().validate(&serde_json::to_value(&result).unwrap()).unwrap();
+    // Child addresses are derivable from the delivered keys. An independent
+    // later read, including RFC 6901 escaping, still recovers exact evidence.
+    let child = read_tool_output_selectors(temp.path(), "thread", &id, vec![
+        ToolOutputSelector::JsonPointer { pointer: "/path~1999".into() },
+    ]).await.unwrap();
+    assert_eq!(child.results[0].value, Some(serde_json::json!(999)));
+    assert_eq!(read_complete_canonical_snapshot(temp.path(), "thread", &id, canonical.bytes.len()).await.unwrap(), canonical.bytes);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn raw_command_json_supports_pointer_recovery_without_rewriting_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let body = format!(" {{ \"z\": \"{}\", \"a/b\": [{{\"~key\": \"λ evidence\"}}] }}\n", "padding".repeat(3200));
@@ -42,6 +78,41 @@ async fn recovery_searches_share_remaining_capacity_and_keep_exact_evidence() {
         }
     }
     assert!(!result.complete);
+}
+
+/// Envelope pressure must preserve the requested scope and exact recovery path.
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn recovery_batch_pressure_keeps_every_selector_resumable() {
+    let temp = tempfile::tempdir().unwrap();
+    let text = "exact source evidence; ".repeat(800);
+    let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
+    let selectors = vec![
+        ToolOutputSelector::Bytes { start: 0, end: 6_000 },
+        ToolOutputSelector::Bytes { start: 6_100, end: 12_100 },
+    ];
+    for ceiling in [500, 800, 1_200, 1_800, 3_000] {
+        let result = select_tool_output_snapshot(
+            &metadata, &snapshot, selectors.clone(), ceiling,
+        ).expect("a fitting selector directory must not discard the batch");
+        assert_eq!(result.results.len(), selectors.len());
+        assert!(response_fits_recovery_retry_avoidance_ceiling(&result, ceiling));
+        for (selected, original) in result.results.iter().zip(&selectors) {
+            assert_eq!(&selected.selector, original);
+            if selected.complete {
+                let range = selected.canonical_range.unwrap();
+                assert_eq!(selected.text.as_deref(), Some(&text[range.start as usize..range.end as usize]));
+            } else {
+                assert!(selected.continuation.is_some() || !selected.child_selectors.is_empty());
+            }
+            let resumed = read_tool_output_selectors(
+                temp.path(), "thread", &metadata.artifact_id, vec![original.clone()],
+            ).await.unwrap();
+            assert!(resumed.complete, "unchanged requested evidence is independently recoverable");
+            let range = resumed.results[0].canonical_range.unwrap();
+            assert_eq!(resumed.results[0].text.as_deref(), Some(&text[range.start as usize..range.end as usize]));
+        }
+    }
 }
 
 /// Loads an artifact's metadata and validated bytes the way a read does.

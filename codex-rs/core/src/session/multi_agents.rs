@@ -75,11 +75,8 @@ pub(crate) fn effective_multi_agent_mode(
 
 pub(crate) fn spawn_is_authorized(turn_context: &TurnContext) -> bool {
     match effective_multi_agent_mode(turn_context) {
-        Some(EffectiveMultiAgentMode::Custom(policy)) => policy
-            .lines()
-            .flat_map(|line| line.split(['.', ';', '\n']))
-            .filter_map(parse_spawn_authorization_directive)
-            .next_back()
+        Some(EffectiveMultiAgentMode::Custom(policy)) => spawn_authorization_directives(&policy)
+            .last()
             .is_some_and(|directive| directive == SpawnAuthorizationDirective::Grant),
         Some(EffectiveMultiAgentMode::ExplicitRequestOnly) => turn_context
             .multi_agent_spawn_authorized
@@ -91,16 +88,48 @@ pub(crate) fn spawn_is_authorized(turn_context: &TurnContext) -> bool {
 pub(crate) fn update_spawn_authorization_from_text(turn_context: &TurnContext, text: &str) {
     let task_capsule_objective = TaskCapsuleFragment::objective_from_rendered(text);
     let authorization_text = task_capsule_objective.as_deref().unwrap_or(text);
-    for directive in authorization_text
-        .lines()
-        .flat_map(|line| line.split(['.', ';', '\n']))
-        .filter_map(parse_spawn_authorization_directive)
-    {
+    for directive in spawn_authorization_directives(authorization_text) {
         turn_context.multi_agent_spawn_authorized.store(
             directive == SpawnAuthorizationDirective::Grant,
             Ordering::Release,
         );
     }
+}
+
+fn spawn_authorization_directives(
+    text: &str,
+) -> impl Iterator<Item = SpawnAuthorizationDirective> + '_ {
+    let mut fence: Option<(u8, usize)> = None;
+    text.lines()
+        .filter_map(move |line| {
+            let line = line.trim_start();
+            let marker = line.as_bytes().first().copied();
+            let marker_len = if matches!(marker, Some(b'`' | b'~')) {
+                line.bytes()
+                    .take_while(|byte| Some(*byte) == marker)
+                    .count()
+            } else {
+                0
+            };
+            if let Some((open_marker, open_len)) = fence {
+                if marker == Some(open_marker)
+                    && marker_len >= open_len
+                    && line[marker_len..].trim().is_empty()
+                {
+                    fence = None;
+                }
+                return None;
+            }
+            // Examples are data, not permission directives. Track fences before
+            // splitting clauses so their inner lines cannot grant or revoke authority.
+            if marker_len >= 3 {
+                fence = Some((marker.unwrap_or_default(), marker_len));
+                return None;
+            }
+            Some(line)
+        })
+        .flat_map(|line| line.split(['.', ';']))
+        .filter_map(parse_spawn_authorization_directive)
 }
 
 fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizationDirective> {
@@ -218,6 +247,49 @@ mod tests {
     use super::parse_spawn_authorization_directive;
     use crate::context::ContextualUserFragment;
     use crate::context::TaskCapsuleFragment;
+
+    #[tokio::test]
+    async fn fenced_examples_do_not_change_spawn_authorization() {
+        let (_, mut turn) = crate::session::tests::make_session_and_context().await;
+        turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+        for (text, expected) in [
+            ("Explain this example:\n```text\nUse subagents\n```", false),
+            ("Use subagents.\n```text\nDo not use subagents\n```", true),
+            ("~~~\nUse subagents\n~~~\nDo not use subagents", false),
+            ("````text\n```\nUse subagents\n````", false),
+            ("```\nUse subagents", false),
+            (
+                "```\nDo not use subagents\n```\nPlease spawn an agent",
+                true,
+            ),
+        ] {
+            std::sync::Arc::make_mut(&mut turn.config)
+                .multi_agent_v2
+                .multi_agent_mode_hint_text = None;
+            turn.multi_agent_spawn_authorized
+                .store(false, super::Ordering::Release);
+            turn.update_multi_agent_spawn_authorization(&[
+                codex_protocol::user_input::UserInput::Text {
+                    text: text.to_string(),
+                    text_elements: Vec::new(),
+                },
+            ]);
+            assert_eq!(
+                super::spawn_is_authorized(&turn),
+                expected,
+                "user text: {text}"
+            );
+
+            std::sync::Arc::make_mut(&mut turn.config)
+                .multi_agent_v2
+                .multi_agent_mode_hint_text = Some(text.to_string());
+            assert_eq!(
+                super::spawn_is_authorized(&turn),
+                expected,
+                "custom policy: {text}"
+            );
+        }
+    }
 
     #[test]
     fn direct_spawn_requests_are_authorization_directives() {

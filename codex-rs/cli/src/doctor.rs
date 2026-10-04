@@ -2776,7 +2776,7 @@ fn provider_reachability_plan_from_parts(
         }],
         ProviderAuthReachabilityMode::Chatgpt => vec![ReachabilityEndpoint {
             label: "ChatGPT".to_string(),
-            url: chatgpt_base_url.to_string(),
+            url: provider_base_url.unwrap_or(chatgpt_base_url).to_string(),
             required: true,
             route_probe_url: None,
         }],
@@ -3933,6 +3933,28 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn provider_reachability_chatgpt_honors_explicit_provider_endpoint() {
+        for provider_base_url in [None, Some("https://provider.example/responses")] {
+            let plan = provider_reachability_plan_from_parts(
+                ProviderAuthReachabilityMode::Chatgpt,
+                "openai",
+                "OpenAI",
+                provider_base_url,
+                None,
+                false,
+                "https://chatgpt.example/backend-api/",
+            );
+            assert_eq!(plan.endpoints.len(), 1);
+            assert_eq!(
+                plan.endpoints[0].url,
+                provider_base_url.unwrap_or("https://chatgpt.example/backend-api/")
+            );
+            assert!(plan.endpoints[0].required);
+            assert_eq!(plan.endpoints[0].route_probe_url, None);
+        }
     }
 
     #[test]

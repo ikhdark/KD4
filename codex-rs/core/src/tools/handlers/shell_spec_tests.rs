@@ -53,6 +53,13 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
         assert!(description.contains("correct only the failed search"));
         assert!(description.contains("Derive search roots from observed paths"));
         assert!(description.contains("record missing paths as coverage gaps"));
+        assert!(description.contains("For a known source file, read whole useful regions."));
+        assert!(description.contains(
+            "Omit `max_output_tokens` unless deliberately requesting a smaller display;"
+        ));
+        assert!(description.contains("the host enforces output caps."));
+        assert!(description.contains("recover only missing evidence from the retained artifact."));
+        assert!(!description.contains("read a bounded range that fits"));
         assert!(description.contains("PowerShell and cmd do not expand wildcard paths"));
         assert!(description.contains("PowerShell `foreach` statements cannot feed a pipeline"));
         assert!(
@@ -197,6 +204,13 @@ fn command_tools_steer_to_the_script_field_without_round_tripping_metadata() {
             allow_login_shell: true,
             exec_permission_approvals_enabled: false,
         }),
+        create_foreign_shell_command_tool(
+            CommandToolOptions {
+                allow_login_shell: true,
+                exec_permission_approvals_enabled: true,
+            },
+            true,
+        ),
     ] {
         let tool = serde_json::to_value(tool).expect("serialize command tool");
         let description = tool["description"]
@@ -209,6 +223,12 @@ fn command_tools_steer_to_the_script_field_without_round_tripping_metadata() {
         } else {
             "command"
         };
+        if script_field == "command" {
+            assert!(
+                !tool.to_string().contains("`cmd`"),
+                "shell_command guidance must not refer to the exec_command-only field"
+            );
+        }
         let script_description = tool["parameters"]["properties"][script_field]["description"]
             .as_str()
             .expect("script description");
@@ -408,7 +428,7 @@ fn write_stdin_tool_matches_expected_spec() {
         ),
         (
             "wait_for_output".to_string(),
-            JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
+            JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Defaults to true when chars is empty, yield_time_ms is omitted, and terminate is false; false preserves bounded polling. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
         ),
         (
             "session_id".to_string(),
@@ -427,7 +447,7 @@ fn write_stdin_tool_matches_expected_spec() {
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to 300000 ms and cap at 300000 ms; waits below 5000 ms are honored down to 250 ms only when new output is pending, otherwise a 5000 ms floor applies. A wait deadline does not terminate the process.".to_string(),
+                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Bounded empty polls default to 300000 ms and cap at 300000 ms; waits below 5000 ms are honored down to 250 ms only when new output is pending, otherwise a 5000 ms floor applies. Omitting this on an empty poll defaults to waiting for output or exit. A wait deadline does not terminate the process.".to_string(),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
             ),
@@ -525,7 +545,7 @@ fn shell_command_tool_matches_expected_spec() {
         (
             "program".to_string(),
             JsonSchema::string(Some(
-                "Executable to launch directly, bypassing the shell. Use only when `cmd` cannot express the command.".to_string(),
+                "Executable to launch directly, bypassing the shell. Use only when `command` cannot express the command.".to_string(),
             )),
         ),
         (
@@ -538,7 +558,7 @@ fn shell_command_tool_matches_expected_spec() {
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script that Codex encodes at runtime. Use only when `cmd` quoting cannot express the script."
+                "Plain PowerShell script that Codex encodes at runtime. Use only when `command` quoting cannot express the script."
                     .to_string(),
             )),
         ),

@@ -230,6 +230,9 @@ async fn resolve_environment_id(ctx: &BackendContext, requested: &str) -> anyhow
 
 fn resolve_query_input(query_arg: Option<String>) -> anyhow::Result<String> {
     match query_arg {
+        Some(q) if q != "-" && q.trim().is_empty() => {
+            Err(anyhow!("no query provided (received empty argument)."))
+        }
         Some(q) if q != "-" => Ok(q),
         maybe_dash => {
             let force_stdin = matches!(maybe_dash.as_deref(), Some("-"));
@@ -1016,6 +1019,8 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                         }
                         // (removed TaskSummaryUpdated; unused in this prototype)
                         app::AppEvent::ApplyPreflightFinished { id, title, message, level, skipped, conflicts } => {
+                            app.apply_preflight_inflight = false;
+                            needs_redraw = true;
                             // Only update if modal is still open and ids match
                             if let Some(m) = app.apply_modal.as_mut()
                                 && m.task_id == id
@@ -1025,8 +1030,6 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                     m.result_level = Some(level);
                                     m.skipped_paths = skipped;
                                     m.conflict_paths = conflicts;
-                                    app.apply_preflight_inflight = false;
-                                    needs_redraw = true;
                                     let _ = frame_tx.send(Instant::now());
                             }
                         }
@@ -1284,13 +1287,14 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                             needs_redraw = true;
                         }
                         app::AppEvent::ApplyFinished { id, result } => {
+                            app.apply_inflight = false;
+                            needs_redraw = true;
                             // Only update if the modal still corresponds to this id.
                             if let Some(m) = &app.apply_modal {
                                 if m.task_id != id { continue; }
                             } else {
                                 continue;
                             }
-                            app.apply_inflight = false;
                             match result {
                                 Ok(outcome) => {
                                     app.status = outcome.message.clone();
@@ -1753,7 +1757,7 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                             hay.contains(&q)
                                         }).collect();
                                         // Keep original order (already sorted) — no need to re-sort
-                                        let idx = state.selected;
+                                        let idx = state.selected.min(filtered.len());
                                         if idx == 0 { app.env_filter = None; append_error_log("env.select: All"); }
                                         else {
                                             let env_idx = idx.saturating_sub(1);
@@ -1996,7 +2000,8 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                         // Redraw immediately on resize for snappier UX.
                         render_if_needed(&mut terminal, &mut app, &mut needs_redraw)?;
                     }
-                    Some(Err(_)) | None => {}
+                    Some(Err(_)) => break 1,
+                    None => break 0,
                     _ => {}
                 }
                 // Fallback: if any other event path requested a redraw, render now.
@@ -2112,7 +2117,7 @@ fn pretty_lines_from_error(raw: &str) -> Vec<String> {
     if lines.len() == 1 {
         // Parsing yielded nothing; include a trimmed, short raw message tail for context.
         let tail = if raw.len() > 320 {
-            format!("{}…", &raw[..320])
+            format!("{}…", &raw[..raw.floor_char_boundary(320)])
         } else {
             raw.to_string()
         };
@@ -2145,6 +2150,37 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+
+    #[test]
+    fn query_argument_rejects_blank_input_and_preserves_nonblank_text() {
+        for query in ["", " \t\r\n", "\u{2003}"] {
+            assert!(resolve_query_input(Some(query.to_string())).is_err());
+        }
+        let query = "  explain café\n";
+        assert_eq!(
+            resolve_query_input(Some(query.to_string())).expect("nonblank query"),
+            query
+        );
+    }
+
+    #[test]
+    fn pretty_error_fallback_truncates_at_a_utf8_boundary() {
+        for suffix in ["é", "界", "🦀"] {
+            let prefix = "x".repeat(319);
+            let raw = format!("{prefix}{suffix}rest");
+            assert_eq!(
+                pretty_lines_from_error(&raw),
+                vec!["Failed to load task details.".to_string(), format!("{prefix}…")]
+            );
+        }
+        for raw in ["short error".to_string(), "é".repeat(160)] {
+            assert_eq!(pretty_lines_from_error(&raw)[1], raw);
+        }
+        assert_eq!(
+            pretty_lines_from_error(&"x".repeat(321))[1],
+            format!("{}…", "x".repeat(320))
+        );
+    }
 
     struct StubGitInfo {
         default_branch: Option<String>,

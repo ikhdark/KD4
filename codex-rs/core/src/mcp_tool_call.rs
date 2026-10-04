@@ -1855,6 +1855,9 @@ fn parse_mcp_tool_approval_response(
     let Some(response) = response else {
         return McpToolApprovalDecision::Cancel;
     };
+    if response.interrupted {
+        return McpToolApprovalDecision::Cancel;
+    }
     let answers = response
         .answers
         .get(question_id)

@@ -107,6 +107,10 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
         .properties
         .as_ref()
         .expect("typed assignment properties");
+    assert_eq!(
+        assignment_properties["write_scope"].description.as_deref(),
+        Some("Intended repository write scopes; overlaps are advisory and require coordination. Use an empty array for read-only roles.")
+    );
     let relevant_handles = assignment_properties
         .get("relevant_handles")
         .expect("relevant handle schema");
@@ -178,11 +182,18 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         panic!("spawn_agent v1 should be a namespace tool");
     };
     assert_eq!(namespace.name, MULTI_AGENT_V1_NAMESPACE);
-    let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool { parameters, .. })) =
-        namespace.tools.first()
+    let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+        parameters,
+        description,
+        ..
+    })) = namespace.tools.first()
     else {
         panic!("spawn_agent should be a namespace function tool");
     };
+    assert!(description.contains("Sub-agents share the parent's workspace."));
+    assert!(description.contains("preserve others' changes"));
+    assert!(!description.contains("forked workspace"));
+    assert!(!description.contains("uploaded changes"));
     assert_eq!(
         parameters.schema_type.clone(),
         Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))

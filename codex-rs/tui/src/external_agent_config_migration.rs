@@ -540,6 +540,14 @@ impl ExternalAgentConfigMigrationScreen {
         if key_event.kind == KeyEventKind::Release {
             return;
         }
+        if key_event.kind == KeyEventKind::Repeat
+            && !matches!(
+                key_event.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k')
+            )
+        {
+            return;
+        }
         if is_ctrl_exit_combo(key_event) {
             self.skip();
             return;
@@ -988,6 +996,43 @@ mod tests {
                 items[2].clone(),
                 items[3].clone(),
             ])
+        );
+    }
+
+    #[test]
+    fn repeated_keys_do_not_toggle_or_confirm_import() {
+        let items = sample_items();
+        let mut screen = ExternalAgentConfigMigrationScreen::new(
+            FrameRequester::test_dummy(),
+            &items,
+            &items,
+            None,
+        );
+        screen.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        let selected = screen.selected_items();
+        for code in [KeyCode::Char(' '), KeyCode::Enter, KeyCode::Char('a')] {
+            screen.handle_key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            ));
+            assert_eq!(screen.selected_items(), selected);
+        }
+        screen.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(screen.view, MigrationView::Summary);
+        for code in [KeyCode::Enter, KeyCode::Char('1'), KeyCode::Esc] {
+            screen.handle_key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            ));
+            assert!(!screen.is_done());
+        }
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            screen.outcome(),
+            ExternalAgentConfigMigrationOutcome::Proceed(selected)
         );
     }
 

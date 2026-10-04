@@ -364,8 +364,6 @@ impl McpConnectionManager {
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         required_servers.sort();
-        let mut clients = HashMap::new();
-        let mut server_metadata = HashMap::new();
         let mut reused_server_names = Vec::new();
         let mut join_set = JoinSet::new();
         let tool_plugin_provenance = Arc::new(tool_plugin_provenance);
@@ -424,18 +422,40 @@ impl McpConnectionManager {
             .filter(|(_, server)| server.enabled())
             .map(|(name, server)| (name.clone(), server.clone()))
             .collect();
+        // Own each manager lease before any later constructor await. If construction
+        // is cancelled, the ordinary manager Drop releases even partially adopted clients.
+        let mut manager = Self {
+            clients: HashMap::new(),
+            server_definitions,
+            server_metadata: HashMap::new(),
+            required_servers,
+            tool_plugin_provenance: Arc::clone(&tool_plugin_provenance),
+            tool_catalog_revision: Arc::clone(&tool_catalog_revision),
+            tool_catalog_cache: StdMutex::new(None),
+            resource_cache_generation: previous_manager.map_or_else(
+                || Arc::new(AtomicU64::new(0)),
+                |previous| Arc::clone(&previous.resource_cache_generation),
+            ),
+            prefix_mcp_tool_names,
+            elicitation_requests: elicitation_requests.clone(),
+            client_reuse_context,
+            shutdown_started: AtomicBool::new(false),
+            shutdown_complete: tokio::sync::watch::channel(false).0,
+        };
         for (server_name, server) in mcp_servers
             .into_iter()
             .filter(|(_, server)| server.enabled())
         {
-            server_metadata.insert(server_name.clone(), McpServerMetadata::from(&server));
+            manager
+                .server_metadata
+                .insert(server_name.clone(), McpServerMetadata::from(&server));
             let reusable_client = match reusable_previous_manager {
                 Some(previous) => previous.reusable_client(&server_name, &server).await,
                 None => None,
             };
             if let Some(client) = reusable_client {
                 client.retain_for_manager();
-                clients.insert(server_name.clone(), client.clone());
+                manager.clients.insert(server_name.clone(), client.clone());
                 reused_server_names.push(server_name);
                 continue;
             }
@@ -523,7 +543,9 @@ impl McpConnectionManager {
                 Arc::clone(&tool_catalog_revision),
             )
             .await;
-            clients.insert(server_name.clone(), async_managed_client.clone());
+            manager
+                .clients
+                .insert(server_name.clone(), async_managed_client.clone());
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let auth_entry = auth_entries.get(&server_name).cloned();
@@ -589,24 +611,6 @@ impl McpConnectionManager {
                 (server_name, outcome)
             });
         }
-        let manager = Self {
-            clients,
-            server_definitions,
-            server_metadata,
-            required_servers,
-            tool_plugin_provenance,
-            tool_catalog_revision,
-            tool_catalog_cache: StdMutex::new(None),
-            resource_cache_generation: previous_manager.map_or_else(
-                || Arc::new(AtomicU64::new(0)),
-                |previous| Arc::clone(&previous.resource_cache_generation),
-            ),
-            prefix_mcp_tool_names,
-            elicitation_requests: elicitation_requests.clone(),
-            client_reuse_context,
-            shutdown_started: AtomicBool::new(false),
-            shutdown_complete: tokio::sync::watch::channel(false).0,
-        };
         tokio::spawn(async move {
             let outcomes = join_set.join_all().await;
             let mut summary = McpStartupCompleteEvent::default();

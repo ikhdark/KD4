@@ -124,6 +124,38 @@ model_reasoning_effort = "high"
 }
 
 #[test]
+fn feature_toggle_overrides_lower_precedence_config_regardless_of_default() {
+    for default_enabled in [false, true] {
+        let feature = codex_features::FEATURES
+            .iter()
+            .find(|feature| feature.default_enabled == default_enabled)
+            .expect("feature with this default");
+        let tmp = tempdir().expect("tmpdir");
+        let config_path = tmp.path().join(CONFIG_TOML_FILE);
+        std::fs::write(&config_path, "model = \"existing-model\"\n").expect("seed config");
+
+        for enabled in [false, true] {
+            ConfigEditsBuilder::new(tmp.path())
+                .set_feature_enabled(feature.key, enabled)
+                .apply_blocking()
+                .expect("persist feature toggle");
+            let contents = std::fs::read_to_string(&config_path).expect("read config");
+            let persisted: TomlValue = toml::from_str(&contents).expect("parse config");
+            assert_eq!(persisted["model"].as_str(), Some("existing-model"));
+
+            let mut inherited: TomlValue =
+                toml::from_str(&format!("[features]\n{} = {}\n", feature.key, !enabled))
+                    .expect("parse lower-precedence config");
+            codex_config::merge_toml_values(&mut inherited, &persisted);
+            let cfg = inherited.try_into().expect("deserialize effective config");
+            let features = crate::config::resolve_configured_features(&cfg, None)
+                .expect("resolve effective features");
+            assert_eq!(features.enabled(feature.id), enabled, "{}", feature.key);
+        }
+    }
+}
+
+#[test]
 fn set_service_tier_saves_default_as_default() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
@@ -426,6 +458,75 @@ enabled = false
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     assert_eq!(contents, "");
+}
+
+#[test]
+fn set_skill_config_updates_all_duplicate_selectors() {
+    for by_name in [false, true] {
+        for enabled in [false, true] {
+            let tmp = tempdir().expect("tmpdir");
+            let (key, selector) = if by_name {
+                ("name", "github:yeet")
+            } else {
+                ("path", "/tmp/skills/demo/SKILL.md")
+            };
+            let config_path = tmp.path().join(CONFIG_TOML_FILE);
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[[skills.config]]\n{key} = {selector:?}\nenabled = false\n\n\
+                     [[skills.config]]\nname = \"unrelated\"\nenabled = false\n\n\
+                     [[skills.config]]\n{key} = {selector:?}\nenabled = {}\n",
+                    !enabled,
+                ),
+            )
+            .expect("seed config");
+            let edit = if by_name {
+                ConfigEdit::SetSkillConfigByName {
+                    name: selector.to_string(),
+                    enabled,
+                }
+            } else {
+                ConfigEdit::SetSkillConfig {
+                    path: PathBuf::from(selector),
+                    enabled,
+                }
+            };
+            ConfigEditsBuilder::new(tmp.path())
+                .with_edits([edit])
+                .apply_blocking()
+                .expect("persist");
+
+            let contents = std::fs::read_to_string(&config_path).expect("read config");
+            let config: TomlValue = toml::from_str(&contents).expect("parse config");
+            let entries = config["skills"]["config"]
+                .as_array()
+                .expect("skill overrides");
+            let matching: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.get(key).and_then(TomlValue::as_str) == Some(selector))
+                .collect();
+            if enabled {
+                assert!(
+                    matching.is_empty(),
+                    "enabling must remove every disabled override"
+                );
+            } else {
+                assert_eq!(matching.len(), 2);
+                assert!(
+                    matching
+                        .iter()
+                        .all(|entry| entry["enabled"].as_bool() == Some(false))
+                );
+            }
+            let unrelated: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.get("name").and_then(TomlValue::as_str) == Some("unrelated"))
+                .collect();
+            assert_eq!(unrelated.len(), 1);
+            assert_eq!(unrelated[0]["enabled"].as_bool(), Some(false));
+        }
+    }
 }
 
 #[test]

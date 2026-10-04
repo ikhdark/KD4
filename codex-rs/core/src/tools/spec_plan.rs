@@ -701,8 +701,8 @@ fn build_code_mode_executors(
             }
             deferred_code_mode_nested_tool_specs.push(spec);
         } else {
-            // Keep execution/bootstrap contracts eager. File and artifact
-            // selectors remain registered and resolve lazily when needed.
+            // Keep execution/bootstrap and native file-read contracts eager.
+            // Artifact recovery remains registered and resolves lazily when needed.
             // Planning and directory discovery remain callable through
             // resolve_tool without charging every generation for their schemas.
             // Keep descriptions and argument
@@ -712,8 +712,8 @@ fn build_code_mode_executors(
             // an external inventory that can change between turns.
             if executor.authorization_class() != TypedToolClass::DynamicExternal
                 && matches!(executor.tool_name().name.as_str(),
-                    "exec_command" | "shell_command" | "write_stdin" | "apply_patch"
-                    | "tool_search")
+                    "exec_command" | "shell_command" | "write_stdin" | "apply_patch" | "read_file"
+                )
                 // Freeform contracts cannot be loaded by tool_search. In
                 // code-mode-only sessions resolve_tool exposes the registered
                 // patch contract on demand instead of charging every read turn.

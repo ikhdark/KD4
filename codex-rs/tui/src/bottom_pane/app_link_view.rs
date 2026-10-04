@@ -5,6 +5,7 @@ use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_protocol::ThreadId;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
@@ -722,6 +723,7 @@ impl BottomPaneView for AppLinkView {
             KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
                 ..
             } => {
                 if let Some(index) = c
@@ -737,6 +739,7 @@ impl BottomPaneView for AppLinkView {
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
                 ..
             } => self.activate_selected_action(),
             _ => {}
@@ -1402,6 +1405,16 @@ mod tests {
             Err(err) => panic!("missing app event: {err}"),
         }
         assert_eq!(view.screen, AppLinkScreen::InstallConfirmation);
+
+        // A held activation key must not confirm the browser flow it just opened.
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            for code in [KeyCode::Enter, KeyCode::Char('1'), KeyCode::Char('2')] {
+                view.handle_key_event(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind));
+                assert_eq!(view.screen, AppLinkScreen::InstallConfirmation);
+                assert!(!view.is_complete());
+                assert!(rx.try_recv().is_err());
+            }
+        }
 
         view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match rx.try_recv() {

@@ -220,7 +220,7 @@ class SourceInventoryTests(unittest.TestCase):
         query = {"categories": [{"name": "docs", "paths": ["*.md"],
                                  "verification": "path"}]}
         with mock.patch.object(inventory, "MAX_SCAN_BYTES", 4):
-            first = self.scan_stdin(query, "--paths")
+            first = self.scan_stdin(query, "--paths", "--single-batch")
             self.assertEqual(first["scan_pending"], 1)
             self.assertEqual(first["paths"], ["a.md"])
             report = Path(first["artifact"]).parent / "inventory.md"
@@ -257,7 +257,7 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual([r["path"] for r in document["sources"]], ["a.md", "b.md"])
 
         with mock.patch.object(inventory, "MAX_SCAN_BYTES", 6):
-            pending = self.scan_stdin(query, "--refresh")
+            pending = self.scan_stdin(query, "--refresh", "--single-batch")
         self.assertGreater(pending["scan_pending"], 0)
         self.assertNotIn("source_snapshot_sha256", pending)
         saved = Path(pending["artifact"]).read_bytes()
@@ -279,6 +279,17 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertEqual(again["source_bytes_read"], 0)
         self.assertEqual(again["source_bytes_reused"], 12)
         self.assertEqual(again["delivery_sha256"], first["delivery_sha256"])
+        # Changing scope must not turn A -> B -> A into a full reread, including
+        # when B adds a second category for one of A's source files.
+        self.file("notes/info.txt", "notes")
+        other_query = {"categories": [{"name": "other", "paths": ["notes/*.txt", "src/b.md"],
+                                      "verification": "path"}]}
+        self.scan_stdin(other_query)
+        self.assertEqual(self.scan_stdin(query)["source_bytes_read"], 0)
+        # A failed fresh observation must remove previously reusable evidence.
+        with mock.patch.object(inventory, "MAX_FILE_BYTES", 2):
+            self.assertGreater(self.scan_stdin(other_query, "--refresh")["unresolved_count"], 0)
+        self.assertEqual(self.scan_stdin(query)["source_bytes_read"], 6)
         self.file("unrelated.txt", "changed")
         self.assertEqual(self.scan_stdin(query)["source_bytes_read"], 0)
         a.write_text("absent", encoding="utf-8")
@@ -316,7 +327,7 @@ class SourceInventoryTests(unittest.TestCase):
         with (mock.patch.object(inventory, "MAX_SCAN_BYTES", 4),
               mock.patch.object(inventory, "inventory", side_effect=interrupt),
               self.assertRaises(KeyboardInterrupt)):
-            self.scan_stdin(query, "--complete", "--state", str(state_path))
+            self.scan_stdin(query, "--state", str(state_path))
         retained = json.loads(state_path.read_bytes())
         self.assertEqual(retained["scan"]["pending"], ["b.md"])
         with mock.patch.object(inventory, "MAX_SCAN_BYTES", 4):
@@ -405,7 +416,7 @@ class SourceInventoryTests(unittest.TestCase):
               mock.patch.object(inventory, "MAX_FILE_BYTES", 123),
               mock.patch.object(inventory, "MAX_SCAN_BYTES", 456),
               contextlib.redirect_stdout(io.StringIO()) as stdout):
-            self.assertEqual(inventory.main(["--describe"]), 0)
+            self.assertEqual(inventory.main(["--describe", "full"]), 0)
         contract = json.loads(stdout.getvalue())
         self.assertEqual(contract["budget"]["max_file_bytes"], 123)
         self.assertEqual(contract["budget"]["max_scan_bytes"], 456)
@@ -415,6 +426,8 @@ class SourceInventoryTests(unittest.TestCase):
         self.assertIn("fnmatch.fnmatchcase", contract["globs"])
         self.assertIn("re.search", contract["contains"])
         self.assertIn("--refresh", contract["invocation"]["refresh"])
+        self.assertIn("by default", contract["invocation"]["complete"])
+        self.assertIn("--single-batch", contract["invocation"]["complete"])
         self.assertIn("--render-only", contract["paging"])
         self.assertIn("unique", contract["control_files"])
         self.assertIn("not that its scope answers the entire task", contract["delivery"])
@@ -552,8 +565,10 @@ class SourceInventoryTests(unittest.TestCase):
     def test_delivered_scope_is_listed_and_reproducible(self):
         self.file("src/a.rs")
         self.file("docs/b.md")
-        first = self.scan_stdin(
-            {"categories": [{"name": "rust", "paths": ["*.rs"], "verification": "path"}]})
+        first_query = {"categories": [{"name": "rust", "paths": ["src/*.rs"],
+                                      "exclude_paths": ["src/test_*.rs"],
+                                      "contains": "prompt", "verification": "path"}]}
+        first = self.scan_stdin(first_query)
         second = self.scan_stdin(
             {"categories": [{"name": "docs", "paths": ["*.md"], "verification": "path"}]})
         self.assertNotIn("prior_queries", first)
@@ -571,6 +586,33 @@ class SourceInventoryTests(unittest.TestCase):
         available = json.loads(stdout.getvalue())["prior_queries"]
         self.assertEqual([entry["query_id"] for entry in available],
                          [second["query_id"], first["query_id"]])
+        self.assertEqual(available[1]["profile"], inventory.query_profile(first_query))
+        self.assertNotIn("profile", second["prior_queries"][0])
+        # Indexed scopes remain usable without reopening canonical reports.
+        read_text = Path.read_text
+        reports = {Path(entry["canonical_paths"]) for entry in available}
+
+        def metadata_only(path, *args, **kwargs):
+            self.assertNotIn(path, reports, "scope lookup reopened a canonical report")
+            return read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", metadata_only):
+            self.assertEqual(inventory.prior_queries(str(self.root), include_scope=True), available)
+
+        # Old indexes lack profiles. Resolve them without a source rescan, and
+        # verify their identity before presenting them as selectable scopes.
+        index = inventory.recent_index_path()
+        legacy = [json.loads(line) for line in index.read_text(encoding="utf-8").splitlines()]
+        for entry in legacy:
+            entry.pop("profile")
+        index.write_text("\n".join(map(json.dumps, legacy)) + "\n", encoding="utf-8")
+        with mock.patch.object(inventory, "repository_source_records", side_effect=AssertionError("scan")):
+            self.assertEqual(inventory.prior_queries(str(self.root), include_scope=True), available)
+        legacy[-1]["canonical_paths"] = first["canonical_paths"]
+        index.write_text("\n".join(map(json.dumps, legacy)) + "\n", encoding="utf-8")
+        mismatch = inventory.prior_queries(str(self.root), include_scope=True)[0]
+        self.assertNotIn("profile", mismatch)
+        self.assertIn("scope_unavailable", mismatch)
         with (mock.patch.object(tempfile, "tempdir", self.temp.name),
               contextlib.redirect_stdout(io.StringIO()) as stdout):
             self.assertEqual(inventory.main([
@@ -688,7 +730,7 @@ class SourceInventoryTests(unittest.TestCase):
         self.file("src/b.md", "prompt")
         query = {"categories": [{"name": "assets", "paths": ["src/*.md"], "verification": "path"}]}
         with mock.patch.object(inventory, "MAX_SCAN_BYTES", 6):
-            partial = self.scan_stdin(query)
+            partial = self.scan_stdin(query, "--single-batch")
         self.assertGreater(partial["scan_pending"], 0)
         self.assertNotIn("final_answer", partial)
         complete = self.scan_stdin(query, "--state", partial["artifact"],
@@ -997,7 +1039,7 @@ class SourceInventoryTests(unittest.TestCase):
         with (mock.patch.object(inventory, "inventory", side_effect=AssertionError("must not scan")),
               mock.patch.object(Path, "read_text", side_effect=AssertionError("must not read state")),
               contextlib.redirect_stdout(io.StringIO()) as stdout):
-            self.assertEqual(inventory.main(["--describe"]), 0)
+            self.assertEqual(inventory.main(["--describe", "full"]), 0)
         contract = json.loads(stdout.getvalue())
         self.assertEqual(contract["format"], "source_inventory_result_v1")
         self.assertIn("json_summaries", contract["result"])
@@ -1046,6 +1088,10 @@ class SourceInventoryTests(unittest.TestCase):
               contextlib.redirect_stdout(io.StringIO()) as stdout):
             self.assertEqual(inventory.main(["--describe"]), 0)
         contract = json.loads(stdout.getvalue())
+        self.assertNotIn("review", contract)
+        self.assertNotIn("decisions", contract["query"])
+        self.assertIn("--describe full", contract["extensions"])
+        self.assertLess(len(stdout.getvalue()), len(json.dumps(inventory.describe_contract())) * 0.75)
         self.assertIn("describe -> scan -> final", contract["workflow"]["default"])
         self.assertIn("same execution cell", contract["workflow"]["default"])
         self.assertIn('// @exec: {"deliver": true}', contract["delivery"])

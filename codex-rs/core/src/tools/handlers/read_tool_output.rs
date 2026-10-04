@@ -1015,16 +1015,11 @@ async fn handle_read_tool_output(
         FunctionCallError::RespondToModel(format!("failed to serialize recovery selectors: {err}"))
     })?;
     let action_bounds_hash = format!("{:x}", action_bounds_digest.finalize());
-    let outer_budget = match &invocation.source {
-        ToolCallSource::CodeMode { cell_id, .. } => invocation
-            .session.services.code_mode_service.output_budget(cell_id),
-        _ => None,
-    };
-    let token_ceiling = if let Some(budget) = outer_budget {
-        // A small wait projection must not disable recovery inside the live cell.
-        let budget = budget.max(896);
-        CODE_MODE_RECOVERY_TOKEN_CEILING.min(budget.saturating_sub(384))
-    } else if code_mode_recovery {
+    // JavaScript consumes exact data before choosing what to print. Coupling
+    // this selection to its display budget makes a small summary require extra
+    // recovery calls. Keep the existing byte/envelope caps and bound only the
+    // printed projection by the cell budget, as read_file already does.
+    let token_ceiling = if code_mode_recovery {
         CODE_MODE_RECOVERY_TOKEN_CEILING
     } else {
         RECOVERY_AGGREGATE_TOKEN_CEILING
@@ -1084,7 +1079,13 @@ async fn handle_read_tool_output(
 }
 
 fn recovery_tool_output(output: Value, successful: bool, evidence: Option<Value>) -> JsonToolOutput {
+    let projected = codex_code_mode::model_visible_tool_result(
+        &ToolName::plain(READ_TOOL_OUTPUT_TOOL_NAME), &output,
+    );
     let mut result = JsonToolOutput::with_success(output, Some(successful));
+    if let Some(projected) = projected {
+        result = result.with_model_value(projected);
+    }
     if successful {
         if let Some(evidence) = evidence {
             result = result.with_sampling_request_signal(

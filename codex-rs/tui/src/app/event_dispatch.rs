@@ -47,6 +47,9 @@ impl App {
             crate::session_log::log_inbound_app_event(&event).await;
         }
         match event {
+            AppEvent::IdeContextCompleted { id, result } => {
+                self.chat_widget.on_ide_context_completed(id, result);
+            }
             AppEvent::NewSession => {
                 self.start_fresh_session_with_summary_hint(
                     tui, app_server, /*session_start_source*/ None,

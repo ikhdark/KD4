@@ -2113,6 +2113,12 @@ async fn broad_runtime_prefixes_offer_only_the_specific_command_for_approval() {
         vec!["C:\\Windows\\System32\\CMD.EXE", "/C"],
         vec!["/opt/bin/python3", "-c"],
         vec!["NODE.EXE", "-e"],
+        vec!["pwsh", "-command"],
+        vec!["PWSH.EXE", "-C"],
+        vec![
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.EXE",
+            "-cOmMaNd",
+        ],
     ] {
         let prefix_rule = vec_str(&prefix);
         let mut command = prefix_rule.clone();
@@ -2144,6 +2150,7 @@ async fn broad_runtime_prefixes_offer_only_the_specific_command_for_approval() {
         vec!["dotnet", "build"],
         vec!["cmd.exe", "/D", "/C", "echo fixture"],
         vec!["cscript.exe", "fixture.vbs"],
+        vec!["pwsh", "-COMMAND", "Write-Output fixture"],
     ] {
         let prefix = vec_str(&prefix);
         assert_eq!(

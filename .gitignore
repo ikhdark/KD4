@@ -81,6 +81,9 @@ coverage/
 # Historical performance reports
 /audits_benchmarks
 
+# Local documentation
+/docs/
+
 # personal files
 /current-diff.txt
 # Local diff dumps; use .scratch/ for new scratch output.

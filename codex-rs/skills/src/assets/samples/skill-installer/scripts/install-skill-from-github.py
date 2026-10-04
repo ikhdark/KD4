@@ -61,7 +61,7 @@ def _parse_github_url(url: str, default_ref: str) -> tuple[str, str, str, str | 
     parsed = urllib.parse.urlparse(url)
     if parsed.netloc != "github.com":
         raise InstallError("Only GitHub URLs are supported for download mode.")
-    parts = [p for p in parsed.path.split("/") if p]
+    parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
     if len(parts) < 2:
         raise InstallError("Invalid GitHub URL.")
     owner, repo = parts[0], parts[1]
@@ -79,6 +79,9 @@ def _parse_github_url(url: str, default_ref: str) -> tuple[str, str, str, str | 
 
 
 def _download_repo_zip(owner: str, repo: str, ref: str, dest_dir: str) -> str:
+    owner, repo, ref = (
+        urllib.parse.quote(value, safe="") for value in (owner, repo, ref)
+    )
     zip_url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
     zip_path = os.path.join(dest_dir, "repo.zip")
     try:
@@ -116,13 +119,22 @@ def _safe_extract_zip(zip_file: zipfile.ZipFile, dest_dir: str) -> None:
 
 
 def _validate_relative_path(path: str) -> None:
-    if os.path.isabs(path) or os.path.normpath(path).startswith(".."):
+    if (
+        os.path.splitdrive(path)[0]
+        or os.path.isabs(path)
+        or os.path.normpath(path).startswith("..")
+    ):
         raise InstallError("Skill path must be a relative path inside the repo.")
 
 
 def _validate_skill_name(name: str) -> None:
     altsep = os.path.altsep
-    if not name or os.path.sep in name or (altsep and altsep in name):
+    if (
+        not name
+        or os.path.splitdrive(name)[0]
+        or os.path.sep in name
+        or (altsep and altsep in name)
+    ):
         raise InstallError("Skill name must be a single path segment.")
     if name in (".", ".."):
         raise InstallError("Invalid skill name.")

@@ -150,6 +150,104 @@ class TimingEvidenceRegressionsTest(unittest.TestCase):
 
 
 class SharedTimingAnalysisTest(unittest.TestCase):
+    def test_rollout_response_usage_reconciles_turns_and_rejects_partial_evidence(self):
+        def usage(input_tokens, cached, output, reasoning):
+            return {
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached,
+                "output_tokens": output,
+                "reasoning_output_tokens": reasoning,
+            }
+
+        rows = []
+        for turn_index, turn in enumerate(("a", "b")):
+            rows.append({"type": "event_msg", "payload": {
+                "type": "task_started", "turn_id": turn,
+            }})
+            for index, counts in enumerate((usage(100, 80, 15, 5), usage(50, 40, 8, 3))):
+                cumulative = counts if index == 0 else usage(150, 120, 23, 8)
+                record = {"type": "token_usage_record", "payload": {
+                    "thread_id": "embedded-session-uuid", "turn_id": turn,
+                    "response_id": f"response-{index}", "usage": counts,
+                    "turn_token_usage": cumulative,
+                    "thread_token_usage": {
+                        key: value + turn_index * usage(150, 120, 23, 8)[key]
+                        for key, value in cumulative.items()
+                    },
+                }}
+                rows.append(record)
+                if index == 0:
+                    rows.append(copy.deepcopy(record))  # Replayed provider receipt.
+            rows.append({"type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    key: value * (turn_index + 1)
+                    for key, value in usage(150, 120, 23, 8).items()
+                }},
+            }})
+            rows.append({"type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": turn,
+            }})
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "official.jsonl"
+
+            def analyze(records, *, tokens=True):
+                source.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+                return audit.analyze_session_path(source, root, include_tokens=tokens)["runnerDiagnostics"]
+
+            report = analyze(rows)
+            self.assertTrue(report["tokens"]["complete"])
+            self.assertEqual(report["tokens"]["source"], "rollout_response_usage")
+            self.assertEqual(report["tokens"]["inputTokens"], 300)
+            self.assertEqual(report["tokens"]["outputTokens"], 46)
+            self.assertEqual(report["tokens"]["reasoningTokens"], 16)
+            self.assertEqual(report["tokens"]["deduplicatedRequestRecords"], 2)
+            self.assertEqual(report["physicalRequests"], 4)
+            self.assertEqual(report["cacheHitRate"], 0.8)
+            self.assertEqual(report["nativeCumulativeTokens"]["inputTokens"], 300)
+            self.assertEqual(len(report["nativeProviderUsage"]), 1)
+            self.assertIsNone(report["runtime"])
+            self.assertIsNone(report["logicalGenerations"])
+
+            for defect in (
+                "missing_request", "conflicting_replay", "missing_identity",
+                "invalid_total", "unfinished",
+            ):
+                with self.subTest(defect=defect):
+                    damaged = copy.deepcopy(rows)
+                    if defect == "missing_request":
+                        damaged = [row for row in damaged if not (
+                            row["payload"].get("turn_id") == "a"
+                            and row["payload"].get("response_id") == "response-0"
+                        )]
+                    elif defect == "conflicting_replay":
+                        damaged[2]["payload"]["usage"]["input_tokens"] += 1
+                    elif defect == "missing_identity":
+                        del damaged[1]["payload"]["response_id"]
+                    elif defect == "invalid_total":
+                        damaged[1]["payload"]["usage"]["total_tokens"] = 1
+                    else:
+                        damaged.pop()
+                    partial = analyze(damaged)
+                    self.assertFalse(partial["tokens"]["complete"])
+                    self.assertIsNone(partial["tokens"]["inputTokens"])
+                    self.assertIsNone(partial["cacheHitRate"])
+
+            mixed = copy.deepcopy(rows)
+            profile = timing_profile()
+            profile["counters"]["modelRequestCount"] = 2
+            for request, counts in zip(profile["modelRequests"], (usage(100, 80, 15, 5), usage(50, 40, 8, 3))):
+                request.pop("physicalAttemptIds", None)
+                request["tokenUsage"] = analysis._native_usage(counts)
+            mixed[5]["payload"]["timing"] = profile
+            report = analyze(mixed)
+            self.assertEqual(report["tokens"]["source"], "mixed_request_usage")
+            self.assertEqual(report["tokens"]["inputTokens"], 300)
+            self.assertTrue(report["tokens"]["complete"])
+            self.assertEqual(report["physicalRequests"], 4)
+            self.assertFalse(analyze(rows, tokens=False)["tokens"]["enabled"])
+
     def test_response_outputs_pair_by_call_id_without_crossing_turns_or_threads(self):
         events = []
         for call_type in ("function_call", "custom_tool_call"):

@@ -1689,6 +1689,11 @@ def analyze_runner_evidence(
     terminal: dict[tuple[str | None, str], str] = {}
     usage_by_thread: dict[str, dict[str, Any]] = {}
     usage_baselines: dict[str, dict[str, Any]] = {}
+    response_requests: dict[tuple[str | None, str], list[dict[str, Any]]] = (
+        collections.defaultdict(list)
+    )
+    response_turn_totals: dict[tuple[str | None, str], dict[str, Any]] = {}
+    started_turns: set[tuple[str | None, str]] = set()
     observed_work_threads: set[str | None] = set()
     sampling_count = 0
     last_progress = None
@@ -1723,6 +1728,11 @@ def analyze_runner_evidence(
         turn = params.get("turn", {})
         turn = turn if isinstance(turn, dict) else {}
         thread_id = params.get("threadId", params.get("thread_id", row.get("file")))
+        # Rollout events without a thread ID already use their source file as
+        # identity. Usage records must join that same thread, not create a
+        # second population under their embedded session UUID.
+        if "method" not in message and isinstance(row.get("file"), str):
+            thread_id = row["file"]
         thread_id = thread_id if isinstance(thread_id, str) else None
         active_turn = str(
             params.get(
@@ -1737,6 +1747,7 @@ def analyze_runner_evidence(
         turn_key = (thread_id, active_turn)
         payload_type = params.get("type", "")
         if method in ("turn/started", "turn.started") or payload_type == "task_started":
+            started_turns.add(turn_key)
             if thread_id not in observed_work_threads and thread_id in usage_by_thread:
                 usage_baselines[thread_id] = usage_by_thread[thread_id]
             observed_work_threads.add(thread_id)
@@ -1790,10 +1801,35 @@ def analyze_runner_evidence(
                         **counts,
                         **location,
                     }
-        if include_tokens and isinstance(params.get("usage"), dict):
+        if include_tokens and method == "token_usage_record":
+            counts = _native_usage(params.get("usage"))
+            if counts is not None and "total_tokens" in params["usage"]:
+                counts["totalTokens"] = params["usage"]["total_tokens"]
+            response_requests[turn_key].append({
+                "_turnKey": turn_key,
+                "samplingRequestId": params.get("response_id"),
+                "tokenUsage": counts,
+            })
+            turn_counts = _native_usage(params.get("turn_token_usage"))
+            if turn_counts and turn_counts["totalTokens"] >= response_turn_totals.get(
+                turn_key, {}
+            ).get("totalTokens", -1):
+                response_turn_totals[turn_key] = turn_counts
+            thread_counts = _native_usage(params.get("thread_token_usage"))
+            if thread_counts:
+                usage_by_thread[thread_id] = {**thread_counts, **location}
+        elif include_tokens and payload_type == "token_count":
+            info = params.get("info")
+            counts = (
+                _native_usage(info.get("total_token_usage"))
+                if isinstance(info, dict) else None
+            )
+            if counts:
+                usage_by_thread[thread_id] = {**counts, **location}
+        elif include_tokens and isinstance(params.get("usage"), dict):
             counts = _native_usage(params["usage"])
             if counts:
-                usage_by_thread[active_turn] = {**counts, **location}
+                usage_by_thread[thread_id] = {**counts, **location}
         item = params.get("item", params)
         if not isinstance(item, dict):
             continue
@@ -2080,16 +2116,38 @@ def analyze_runner_evidence(
                 )
     # Timing classification validity does not establish or invalidate provider
     # usage. Account every captured request, including profiles rejected above.
+    # Prefer a native profile for each turn. Adding response records to that
+    # profile would count the same provider work twice and invent generations.
+    response_only = {
+        key: rows for key, rows in response_requests.items() if key not in profiles
+    }
+    unreconciled_response_turns = []
+    for key, rows in response_only.items():
+        observed = _token_report(rows)
+        if (
+            key not in started_turns
+            or not observed["complete"]
+            or any(
+                not isinstance(row["samplingRequestId"], str)
+                or not row["samplingRequestId"]
+                for row in rows
+            )
+            or observed["observedTotals"] != response_turn_totals.get(key)
+        ):
+            unreconciled_response_turns.append(turn_label(key))
+    token_requests = requests + [
+        row for rows in response_only.values() for row in rows
+    ]
     totals = (
-        _token_report(requests)
-        if include_tokens and requests
+        _token_report(token_requests)
+        if include_tokens and token_requests
         else disabled_tokens()
         if not include_tokens
         else None
     )
     retention = _request_retention(record["timing"] for record in profiles.values())
     usage_turns = (
-        {request["_turnKey"] for request in requests} if include_tokens else set()
+        {request["_turnKey"] for request in token_requests} if include_tokens else set()
     )
     if include_tokens:
         usage_turns.update(
@@ -2108,10 +2166,12 @@ def analyze_runner_evidence(
         {
             "requestRetention": retention,
             "requestProfileTurns": len(usage_turns),
+            "responseUsageTurns": len(response_only),
+            "unreconciledResponseUsageTurnIds": sorted(unreconciled_response_turns),
             "terminalTurns": len(terminal),
             "missingTerminalTurnIds": missing_usage_turns,
             "unfinishedProfileTurnIds": sorted(
-                turn_label(key) for key in set(profiles) - set(terminal)
+                turn_label(key) for key in (set(profiles) | set(response_only)) - set(terminal)
             ),
             "timingValidityRequired": False,
         }
@@ -2119,15 +2179,20 @@ def analyze_runner_evidence(
         else None
     )
     if include_tokens and totals is not None:
-        totals["source"] = "captured_request_usage"
+        totals["source"] = (
+            "mixed_request_usage" if requests and response_only
+            else "rollout_response_usage" if response_only
+            else "captured_request_usage"
+        )
         totals["scope"] = (
-            "all captured native request profiles, independent of timing validity"
+            "captured provider requests, independent of timing validity; response-only turns require identified usage reconciled with observed turn totals"
         )
         totals["turnCoverage"] = usage_coverage
         totals["complete"] = bool(
             totals["complete"]
             and terminal
             and not missing_usage_turns
+            and not unreconciled_response_turns
             and not usage_coverage["unfinishedProfileTurnIds"]
             and retention["complete"] is not False
         )
@@ -2326,7 +2391,9 @@ def analyze_runner_evidence(
         if runtime
         else sampling_count or None,
         "physicalRequests": runtime["decisionLatency"]["physicalAttempts"]
-        if runtime and retention["complete"] is not False
+        if runtime and not response_only and retention["complete"] is not False
+        else totals.get("physicalAttempts")
+        if include_tokens and totals and totals.get("complete")
         else None,
         "capturedRequests": _captured_request_metrics(evidence),
         "toolActivity": _observed_tool_activity(

@@ -27,14 +27,14 @@ fn build_permissions_update_item(
     }
 
     let prev = previous?;
-    if prev.permission_profile() == next.permission_profile()
+    let settings_unchanged = prev.permission_profile() == next.permission_profile()
         && prev.approval_policy == next.approval_policy.value()
-        && prev.model == next.model_info.slug
-    {
+        && prev.model == next.model_info.slug;
+    if settings_unchanged && prev.cwd == *next.cwd() {
         return None;
     }
 
-    Some(
+    let render = |cwd: &std::path::Path| {
         PermissionsInstructions::from_permission_profile(
             &next.permission_profile,
             next.approval_policy.value(),
@@ -45,7 +45,7 @@ fn build_permissions_update_item(
                     .and_then(|messages| messages.approvals.as_ref()),
             ),
             exec_policy,
-            next.cwd(),
+            cwd,
             next.config
                 .features
                 .enabled(Feature::ExecPermissionApprovals),
@@ -53,8 +53,15 @@ fn build_permissions_update_item(
                 .features
                 .enabled(Feature::RequestPermissionsTool),
         )
-        .render(),
-    )
+        .render()
+    };
+    let instructions = render(next.cwd().as_path());
+    // Relative deny globs and root exclusions can change with cwd even when the
+    // stored profile does not. Avoid reinjecting cwd-independent instructions.
+    if settings_unchanged && instructions == render(prev.cwd.as_path()) {
+        return None;
+    }
+    Some(instructions)
 }
 
 fn build_collaboration_mode_update_item(
@@ -260,7 +267,78 @@ mod tests {
     use super::build_personality_update_item;
     use super::generic_personality_message;
     use crate::session::tests::make_session_and_context;
+    use codex_execpolicy::Policy;
     use codex_protocol::config_types::Personality;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::FileSystemSpecialPath;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cwd_changes_refresh_only_cwd_sensitive_permissions() {
+        let (_session, mut next) = make_session_and_context().await;
+        let original_cwd = next.cwd().clone();
+        let next_cwd = original_cwd.join("nested");
+        let relative_pattern = std::path::Path::new("private").join("**");
+        let old_glob = original_cwd.join(&relative_pattern);
+        let new_glob = next_cwd.join(&relative_pattern);
+        let policy = Policy::empty();
+        Arc::make_mut(&mut next.config).include_permissions_instructions = true;
+
+        for (pattern, cwd_sensitive) in [
+            (relative_pattern.to_string_lossy().into_owned(), true),
+            (old_glob.to_string_lossy().into_owned(), false),
+        ] {
+            Arc::make_mut(&mut next.config).cwd = original_cwd.clone();
+            next.permission_profile = PermissionProfile::from_runtime_permissions(
+                &FileSystemSandboxPolicy::restricted(vec![
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
+                    },
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::GlobPattern { pattern },
+                        access: FileSystemAccessMode::Deny,
+                    },
+                ]),
+                NetworkSandboxPolicy::Restricted,
+            );
+            let previous = next.to_turn_context_item();
+            assert!(
+                super::build_settings_update_items(Some(&previous), None, &next, &policy, false)
+                    .is_empty()
+            );
+
+            Arc::make_mut(&mut next.config).cwd = next_cwd.clone();
+            let updates =
+                super::build_settings_update_items(Some(&previous), None, &next, &policy, false);
+            if cwd_sensitive {
+                let [ResponseItem::Message { role, content, .. }] = updates.as_slice() else {
+                    panic!("expected one permissions update: {updates:?}");
+                };
+                assert_eq!(role, "developer");
+                let [ContentItem::InputText { text }] = content.as_slice() else {
+                    panic!("expected only permission instructions: {content:?}");
+                };
+                assert!(text.contains("<permissions instructions>"));
+                assert!(text.contains(&format!("glob `{}`", new_glob.to_string_lossy())));
+                assert!(!text.contains(old_glob.to_string_lossy().as_ref()));
+            } else {
+                assert!(
+                    updates.is_empty(),
+                    "unchanged permissions repeated: {updates:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn generic_personality_fallback_covers_template_less_models() {

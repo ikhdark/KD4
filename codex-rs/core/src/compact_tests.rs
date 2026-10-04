@@ -1469,14 +1469,15 @@ fn should_use_remote_compact_task_for_azure_provider() {
 }
 
 #[test]
-fn custom_compact_prompt_also_governs_incremental_summaries() {
+fn incremental_guidance_does_not_repeat_or_override_custom_compact_prompt() {
     assert_eq!(
         incremental_summarization_prompt(Some("preserve the custom structure")),
-        "preserve the custom structure"
+        None,
+        "the initial input already contains the custom prompt"
     );
     assert_eq!(
         incremental_summarization_prompt(None),
-        INCREMENTAL_SUMMARIZATION_PROMPT
+        Some(INCREMENTAL_SUMMARIZATION_PROMPT)
     );
 }
 #[tokio::test]

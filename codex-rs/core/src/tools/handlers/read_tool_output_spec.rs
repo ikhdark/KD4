@@ -142,7 +142,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: format!("Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Returns as much exact content as fits plus continuation metadata; structured selections use JSON pointers. Recovery also has a {} token envelope ceiling ({} in code mode, further reduced by the cell budget), independent of max_bytes. complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.",
+        description: format!("Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Returns as much exact content as fits plus continuation metadata; structured selections use JSON pointers. Recovery also has a {} token envelope ceiling ({} in code mode), independent of max_bytes. In code mode, the cell's display budget bounds printed output, not exact data returned to JavaScript. complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.",
             crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING,
             codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS.saturating_sub(1_000)),
         strict: false,

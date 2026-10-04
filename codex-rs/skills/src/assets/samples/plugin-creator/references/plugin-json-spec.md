@@ -102,16 +102,16 @@ Or as an object directly in `plugin.json`:
 - `websiteURL` (`string`): Public website for the plugin.
 - `privacyPolicyURL` (`string`): Privacy policy URL.
 - `termsOfServiceURL` (`string`): Terms of service URL.
-- `defaultPrompt` (`array` of `string`): Starter prompts shown in composer/UX context.
+- `defaultPrompt` (`array` of `string`, or a legacy single `string`): Starter prompts shown in composer/UX context. Use this camelCase field; `default_prompt` is not read by the native loader.
   - Include at most 3 strings. Entries after the first 3 are ignored and will not be included.
-  - Each string is capped at 128 characters. Longer entries are truncated.
+  - Each string is capped at 128 characters after whitespace normalization. Longer entries are ignored by the loader and rejected by the validator.
   - Prefer short starter prompts around 50 characters so they scan well in the UI.
 - `brandColor` (`string`): Theme color for the plugin card.
 - `composerIcon` (`string`): Path to icon asset.
 - `logo` (`string`): Path to logo asset.
 - `logoDark` (`string`): Optional path to the logo asset used in dark mode.
 - `screenshots` (`array` of `string`): List of screenshot asset paths.
-  - Screenshot entries must be PNG filenames and stored under `./assets/`.
+  - Screenshot entries must point to existing files inside the plugin root; `./assets/` is the recommended location.
   - Keep file paths relative to plugin root.
 
 ### Path conventions and defaults
@@ -200,6 +200,7 @@ personal marketplace unless the caller explicitly requests a repo-local destinat
 - Choose marketplace location to match the selected destination:
   - Personal plugin: `~/.agents/plugins/marketplace.json`
   - Repo/team plugin: `<repo-root>/.agents/plugins/marketplace.json`
+- With `--with-marketplace`, set `--path` to `<marketplace-root>/plugins`; the helper rejects a mismatched destination before writing, rather than creating an entry that points elsewhere.
 
 ### Plugin validation notes
 

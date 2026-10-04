@@ -1309,7 +1309,7 @@ fn resolve_nested_path_fields(value: &mut TomlValue) -> io::Result<()> {
     }
     if let Some(lock) = value
         .get_mut("debug")
-        .and_then(|debug| debug.get_mut("config_lock"))
+        .and_then(|debug| debug.get_mut("config_lockfile"))
     {
         for key in ["export_dir", "load_path"] {
             if let Some(value) = lock.get_mut(key) {

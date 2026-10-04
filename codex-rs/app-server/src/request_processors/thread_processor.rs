@@ -2864,25 +2864,26 @@ impl ThreadRequestProcessor {
         thread: Arc<CodexThread>,
         connection_ids: &[ConnectionId],
     ) {
-        if connection_ids.is_empty() {
-            if let Err(error) = super::thread_lifecycle::supervise_unsubscribed_thread(
-                self.listener_task_context(),
-                thread_id,
-                thread,
-            )
-            .await
-            {
-                warn!(
-                    "failed to supervise unsubscribed thread {thread_id}: {}",
-                    error.message
-                );
-            }
-            return;
-        }
         // Listener attachment is idempotent and must be retried for the current
         // connection set after receiver lag or a duplicate creation event.
-        self.attach_thread_listeners(thread_id, thread, connection_ids)
-            .await;
+        if !connection_ids.is_empty() {
+            self.attach_thread_listeners(thread_id, Arc::clone(&thread), connection_ids)
+                .await;
+        }
+        // Every snapshotted recipient may have disconnected before attachment.
+        // Reuse an attached listener or start one to own idle unloading.
+        if let Err(error) = super::thread_lifecycle::supervise_unsubscribed_thread(
+            self.listener_task_context(),
+            thread_id,
+            thread,
+        )
+        .await
+        {
+            warn!(
+                "failed to supervise created thread {thread_id}: {}",
+                error.message
+            );
+        }
     }
 
     async fn attach_thread_listeners(

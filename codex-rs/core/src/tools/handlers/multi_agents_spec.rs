@@ -563,7 +563,7 @@ fn wait_output_schema_v1() -> Value {
         "properties": {
             "status": {
                 "type": "object",
-                "description": "Final statuses keyed by agent id.",
+                "description": "Final statuses keyed by canonical task path when available, otherwise agent id.",
                 "additionalProperties": agent_status_output_schema()
             },
             "timed_out": {
@@ -929,7 +929,7 @@ fn typed_assignment_schema() -> JsonSchema {
                 JsonSchema::array(
                     repo_scope,
                     Some(
-                        "Exclusive repository write scopes; use an empty array for read-only roles."
+                        "Intended repository write scopes; overlaps are advisory and require coordination. Use an empty array for read-only roles."
                             .to_string(),
                     ),
                 ),
@@ -1063,7 +1063,7 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 - Avoid issuing multiple delegate calls on the same unresolved thread unless the new delegated task is genuinely different and necessary.
 - Narrow the delegated ask to the concrete output you need next.
 - For coding tasks, prefer delegating concrete code-change worker subtasks over read-only explorer analysis when the subagent can make a bounded patch in a clear write scope.
-- When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.
+- Sub-agents share the parent's workspace. When delegating coding work, instruct the submodel to preserve others' changes and list the file paths it changed in the final answer.
 - For code-edit subtasks, describe intended write sets and call out known overlap so agents can reconcile shared changes.
 
 ### After you delegate
@@ -1071,7 +1071,7 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 - Do not redo delegated subagent tasks yourself; focus on integrating results or tackling useful parallel work.
 - While the subagent is running in the background, do meaningful work immediately and communicate before touching the same contract surface.
 - Do not repeatedly wait by reflex.
-- When a delegated coding task returns, quickly review the uploaded changes, then integrate or refine them.
+- When a delegated coding task returns, review the agent's changes in the shared workspace, then refine them as needed.
 
 ### Parallel delegation patterns
 - Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.

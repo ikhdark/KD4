@@ -2081,12 +2081,13 @@ async fn notify_tool_finish_if_unclaimed(
     dispatch_state: &ToolDispatchState,
     outcome: ToolCallOutcome,
 ) -> bool {
-    if dispatch_state.is_aborted() {
+    // Claim terminal ownership before an observer can yield to cancellation.
+    if !dispatch_state.try_complete() {
         return false;
     }
 
     notify_tool_finish(invocation, outcome).await;
-    dispatch_state.try_complete()
+    true
 }
 
 async fn handle_any_tool(

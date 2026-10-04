@@ -17,6 +17,11 @@ Use this flow when all of the following are true:
 If the user still needs the initial plugin entry or marketplace structure created, use the scaffold
 flow first and only then switch to this reinstall flow.
 
+When scaffolding a repo/team plugin with `--with-marketplace`, pair
+`--path <repo-root>/plugins` with
+`--marketplace-path <repo-root>/.agents/plugins/marketplace.json`. The source entry
+is resolved from the marketplace root, not from the directory containing its JSON.
+
 ## Update Loop
 
 1. Update the plugin manifest to a single Codex cachebuster suffix:

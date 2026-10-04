@@ -15,7 +15,7 @@ pub struct PluginManifest<Resource> {
     pub interface: Option<PluginManifestInterface<Resource>>,
     /// Optional skill-scoped declarations for MCP operations promoted while a skill is selected.
     ///
-    /// Missing metadata preserves the legacy whole-server promotion behavior. Invalid explicit
+    /// Missing metadata requests no skill-specific promotion. Invalid explicit
     /// metadata is retained as a diagnostic so it cannot accidentally broaden exposure.
     pub tool_exposure: Option<PluginToolExposure>,
 }

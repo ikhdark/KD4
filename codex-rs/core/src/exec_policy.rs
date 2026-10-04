@@ -1019,7 +1019,14 @@ fn derive_requested_execpolicy_amendment_from_prefix_rule(
             && prefix_rule[1..]
                 .iter()
                 .map(String::as_str)
-                .eq(banned[1..].iter().copied())
+                .zip(banned[1..].iter().copied())
+                .all(|(actual, banned)| {
+                    if matches!(program, "pwsh" | "powershell") {
+                        actual.eq_ignore_ascii_case(banned)
+                    } else {
+                        actual == banned
+                    }
+                })
     }) {
         return None;
     }

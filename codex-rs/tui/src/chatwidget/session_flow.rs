@@ -9,6 +9,10 @@ impl ChatWidget {
         display: SessionConfiguredDisplay,
         fork_parent_title: Option<String>,
     ) {
+        if self.thread_id != Some(session.thread_id) || self.config.cwd != session.cwd {
+            self.cancel_pending_ide_prompt();
+            self.ide_context.invalidate_requests();
+        }
         self.transcript.reset_copy_history();
         let history_metadata = session.message_history.unwrap_or_default();
         self.bottom_pane.set_history_metadata(

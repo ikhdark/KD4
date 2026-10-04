@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Bounded, evidence-backed source inventory. Run --describe for the public contract.
+"""Bounded, evidence-backed source inventory. Run --describe for the scan contract.
+
+Use --describe full for advanced verification, review, and paging contracts.
 
 Categories default to runtime verification: matches remain unresolved until a
 decision supplies exact consumer evidence. Use verification=path for inventories
@@ -399,6 +401,30 @@ def source_revision(path):
 def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
     root = root.resolve()
     categories = compile_categories(query)
+    # Compile each glob set once, and classify each distinct path once per scan.
+    # Keep the cache local: a later scan must rediscover additions and deletions.
+    path_rules = {
+        name: (
+            re.compile("|".join(fnmatch.translate(p) for p in rule["paths"])),
+            re.compile("|".join(fnmatch.translate(p) for p in rule["exclude_paths"]))
+            if rule.get("exclude_paths") else None,
+        )
+        for name, (rule, _) in categories.items()
+    }
+    path_categories = {}
+
+    def matching_categories(path):
+        if path not in path_categories:
+            path_categories[path] = {
+                name for name, (included, excluded) in path_rules.items()
+                if included.match(path) and not (excluded and excluded.match(path))
+            }
+        return path_categories[path]
+
+    rule_hashes = {
+        name: digest(json.dumps(rule, sort_keys=True).encode())
+        for name, (rule, _) in categories.items()
+    }
     previous = previous or {}
     if previous and previous.get("version") not in (2, 3):
         raise ValueError("unsupported retained inventory version; start a new scan")
@@ -452,7 +478,7 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
     def selected_sources(sources):
         return {
             path: tracking for path, tracking in sources.items()
-            if any(matches_path(path, rule) for rule, _ in categories.values())
+            if matching_categories(path)
         }
 
     source_set = selected_sources(states)
@@ -486,12 +512,24 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
             raise ValueError(f"unknown category: {name}")
         requested.setdefault(path, set()).add(name)
 
+    def reusable_source(path, matching, revision):
+        old = old_files.get(path, {})
+        return (
+            not refresh
+            and bool(old.get("sha256"))
+            and revision is not None
+            and old_revisions.get(path) == revision
+            and all(
+                (pattern is None and not rule.get("json_summary"))
+                or old.get("categories", {}).get(name, {}).get("rule_hash")
+                == rule_hashes[name]
+                for name in matching
+                for rule, pattern in (categories[name],)
+            )
+        )
+
     for path in sorted(set(states) | set(requested)):
-        matching = {
-            name
-            for name, (rule, _) in categories.items()
-            if matches_path(path, rule)
-        }
+        matching = matching_categories(path)
         selected = matching | requested.get(path, set())
         if not selected:
             continue
@@ -511,19 +549,7 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
         old = old_files.get(path, {})
         # Reuse only hash-bound rule observations with an unchanged full file
         # revision. A new text/JSON rule needs bytes; path-only rules do not.
-        reusable = (
-            not refresh
-            and bool(old.get("sha256"))
-            and source_revisions.get(path) is not None
-            and old_revisions.get(path) == source_revisions.get(path)
-            and all(
-                (pattern is None and not rule.get("json_summary"))
-                or old.get("categories", {}).get(name, {}).get("rule_hash")
-                == digest(json.dumps(rule, sort_keys=True).encode())
-                for name in matching
-                for rule, pattern in (categories[name],)
-            )
-        )
+        reusable = reusable_source(path, matching, source_revisions.get(path))
         retained = old if old and (continuing or reusable) else None
         if excluded:
             error = "excluded directory"
@@ -582,7 +608,7 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
         text = None
         for name in sorted(selected):
             rule, pattern = categories[name]
-            rule_hash = digest(json.dumps(rule, sort_keys=True).encode())
+            rule_hash = rule_hashes[name]
             prior = old.get("categories", {}).get(name, {})
             evidence = None
             reason = error
@@ -1145,11 +1171,11 @@ def describe_contract():
         "snapshot": "Scans reject source/revision drift within a retained epoch. Complete results include source_snapshot_sha256 over all selected source hashes, including negative matches. This identifies captured evidence, not an atomic filesystem snapshot; --render-only replays it without reading live sources.",
         "invocation": {
             "file": "python -X utf8 scripts/source_inventory.py --root . --query QUERY --state STATE --report REPORT",
-            "list_queries": "python -X utf8 scripts/source_inventory.py --root . --list-queries; reads only the delivery index, before any source scan. Select a canonical_paths entry only when its scope fits the request, then pass it as --query. Never assume the latest entry has the same intent.",
+            "list_queries": "python -X utf8 scripts/source_inventory.py --root . --list-queries; returns each exact profile from retained metadata, without a source scan. Compare paths, exclusions, content rules and verification in profile; do not reopen reports to discover the scope. Legacy index entries load their canonical query metadata. scope_unavailable means no verified profile could be loaded. Select a matching canonical_paths entry and pass it as --query; never assume the latest entry has the same intent.",
             "powershell_stdin": "& {\n  $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n  @'\n{\"categories\":[{\"name\":\"templates\",\"paths\":[\"templates/*.md\",\"*/templates/*.md\"],\"verification\":\"path\"}]}\n'@ | python -X utf8 scripts/source_inventory.py --root . --query -\n}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             "stdin": "--query - reads UTF-8 JSON from stdin (an optional UTF-8 BOM is accepted). The PowerShell example scopes OutputEncoding to the script block; it changes no global setting.",
             "continuation": "Reuse the query with --root ROOT --query QUERY --state ARTIFACT (or pipe it with --query -). Add --report REPORT to deliver the updated report; explicit --state does not imply a report. ARTIFACT is the returned state path. Omitting --state starts a new independent run, not a continuation.",
-            "complete": "--complete drains progressing batches locally, checkpointing each completed batch before continuing. Resume interrupted work with the same query and explicit --state. Unresolved evidence still prevents final delivery.",
+            "complete": "Scans drain progressing batches locally by default, checkpointing every completed batch. --single-batch opts out; --complete remains compatible. Resume interruptions with the same query and explicit --state. Unresolved evidence still prevents final delivery.",
             "refresh": "Add --refresh to a scan with the retained state to start a new epoch and read current sources instead of continuing captured evidence.",
         },
         "workflow": {
@@ -1165,7 +1191,7 @@ def describe_contract():
         "budget": {
             "max_file_bytes": MAX_FILE_BYTES,
             "max_scan_bytes": MAX_SCAN_BYTES,
-            "continuation": "When scan_pending > 0, continue with the returned artifact and the same query. Oversized files remain unresolved; continuation does not lift the per-file limit. A continuation returning no newly required inventory evidence is unnecessary unless needed to establish completion.",
+            "continuation": "Default scans drain progressing batches locally. With --single-batch, scan_pending > 0 requires the returned artifact and the same query to continue. Oversized files stay unresolved; continuation never lifts the per-file limit.",
         },
         "query": {
             "required_categories": "Optional names whose coverage must be retained; defaults to all declared categories. Omit unless overriding that default. Raw queries and retained state.query may omit this key; adding a category does not require appending to an absent list.",
@@ -1325,8 +1351,21 @@ def save_source_cache(state):
     # Never publish pending or ambiguous observations as reusable source state.
     if state["scan"]["pending"]:
         return
-    files = state["files"]
-    revisions = state["scan"]["source_revisions"]
+    cached = load_source_cache(Path(state["root"]))
+    observed = state["scan"]["source_revisions"]
+    # A different query must not evict unrelated hash-bound rule observations.
+    # Observed failures/deletions do evict old evidence. Reuse still requires
+    # the current full file revision and rule hash in inventory(). No consumer
+    # decisions, review state or delivery authority are merged here.
+    files = {path: value for path, value in cached.get("files", {}).items()
+             if path not in observed}
+    revisions = {path: value for path, value in cached.get("source_revisions", {}).items()
+                 if path not in observed}
+    for path, current in state["files"].items():
+        old = cached.get("files", {}).get(path, {})
+        categories = old.get("categories", {}) if old.get("sha256") == current["sha256"] else {}
+        files[path] = {**current, "categories": {**categories, **current["categories"]}}
+        revisions[path] = observed[path]
     value = {
         "version": 1, "root": state["root"], "files": files,
         "scanner_sha256": digest(Path(__file__).read_bytes()),
@@ -1349,7 +1388,7 @@ def query_from_delivery(document):
     return query
 
 
-def prior_queries(root, query_id=None):
+def prior_queries(root, query_id=None, *, include_scope=False):
     """Pre-scan scope discovery; optionally omit a just-delivered query."""
     try:
         lines = recent_index_path().read_text(encoding="utf-8").splitlines()
@@ -1364,18 +1403,31 @@ def prior_queries(root, query_id=None):
         if not isinstance(entry, dict) or entry.get("root") != root or entry.get("query_id") in seen:
             continue
         seen.add(entry["query_id"])
-        prior.append(
-            {
-                key: entry.get(key)
-                for key in (
-                    "query_id",
-                    "categories",
-                    "count",
-                    "ready_to_render",
-                    "canonical_paths",
-                )
-            }
-        )
+        projected = {
+            key: entry.get(key)
+            for key in (
+                "query_id",
+                "categories",
+                "count",
+                "ready_to_render",
+                "canonical_paths",
+            )
+        }
+        if include_scope:
+            try:
+                # New indexes carry their exact query, not just category labels.
+                # Older entries recover that metadata here rather than requiring
+                # model turns to open and interpret whole canonical reports.
+                profile = entry.get("profile")
+                if profile is None:
+                    document = json.loads(Path(entry["canonical_paths"]).read_text(encoding="utf-8"))
+                    profile = document["profile"]
+                if query_identity(query_from_delivery({"profile": profile})) != entry["query_id"]:
+                    raise ValueError("retained query identity mismatch")
+                projected["profile"] = profile
+            except (OSError, ValueError, KeyError, TypeError):
+                projected["scope_unavailable"] = "retained query metadata is missing, invalid, or identity-mismatched"
+        prior.append(projected)
         if len(prior) == PRIOR_QUERY_LIMIT:
             break
     return prior
@@ -1393,6 +1445,7 @@ def record_delivery(state, delivery):
         "count": output["count"],
         "ready_to_render": output["ready_to_render"],
         "canonical_paths": delivery["canonical_paths"],
+        "profile": query_profile(state["query"]),
     }
     index = recent_index_path()
     index.parent.mkdir(parents=True, exist_ok=True)
@@ -1545,19 +1598,22 @@ def delivery_answer(summary):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Use --describe for query fields, a path/JSON example, result fields, and paging. Successful JSON summaries are returned automatically when a category requests json_summary=true.",
+        epilog="Use --describe for the scan contract and --describe full for advanced verification, review, JSON summaries, and paging.",
     )
     parser.add_argument(
         "--describe",
-        nargs="?", const="full", choices=("full", "scan"),
-        help="Print the versioned query/result contract without reading the repository",
+        nargs="?", const="scan", choices=("full", "scan"),
+        help="Print the compact scan contract (default) or full contract, without reading the repository",
     )
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--query", type=Path, help="Query JSON file, or - for UTF-8 stdin")
     parser.add_argument("--list-queries", action="store_true",
-                        help="List reusable scopes before scanning; reads only the delivery index")
-    parser.add_argument("--complete", action="store_true",
-                        help="Drain progressing scan batches locally; checkpoint every batch and stop on errors or unresolved evidence")
+                        help="List exact reusable query profiles from retained metadata, without scanning sources")
+    batching = parser.add_mutually_exclusive_group()
+    batching.add_argument("--complete", action="store_true",
+                          help="Compatibility flag: scans already drain progressing batches by default")
+    batching.add_argument("--single-batch", action="store_true",
+                          help="Checkpoint after one bounded scan batch instead of draining locally")
     parser.add_argument("--review", type=Path, help="Apply hash-bound review coverage JSON to an explicit retained --state, without rescanning")
     parser.add_argument(
         "--state",
@@ -1607,11 +1663,11 @@ def main(argv=None):
         parser.error("--review requires --state and cannot scan, refresh, discover, or render-only")
     if args.list_queries:
         if (args.query or args.state or args.report or args.instructions or args.describe
-                or args.paths or args.category or args.render_only or args.remaining or args.offset or args.refresh or args.complete):
+                or args.paths or args.category or args.render_only or args.remaining or args.offset or args.refresh or args.complete or args.single_batch):
             parser.error("--list-queries is a standalone index operation")
         print(json.dumps({
             "format": RESULT_FORMAT,
-            "prior_queries": prior_queries(str(args.root.resolve())),
+            "prior_queries": prior_queries(str(args.root.resolve()), include_scope=True),
         }, ensure_ascii=False))
         return 0
     if args.describe:
@@ -1626,6 +1682,7 @@ def main(argv=None):
             or args.offset
             or args.category
             or args.complete
+            or args.single_batch
             or args.refresh
         ):
             parser.error("--describe is a standalone contract operation")
@@ -1636,12 +1693,20 @@ def main(argv=None):
                 "invocation": contract["invocation"],
                 "workflow": contract["workflow"],
                 "globs": contract["globs"],
-                "completion": "--complete drains progressing batches and checkpoints each batch. Use an explicit --state to resume after interruption. Never treat unresolved evidence as complete.",
+                "contains": contract["contains"],
+                "budget": contract["budget"],
+                "query": {key: contract["query"][key] for key in (
+                    "categories", "required_categories", "candidates", "reuse",
+                )},
+                "example": contract["example"],
+                "control_files": contract["control_files"],
+                "delivery": contract["delivery"],
+                "completion": "Scans drain progressing batches locally by default and checkpoint each batch. --single-batch opts out; --complete remains compatible. Use an explicit --state to resume after interruption. Unresolved evidence prevents final delivery.",
                 "result": {key: contract["result"][key] for key in (
                     "ready_to_render", "scan_pending", "unresolved_count",
                     "next_action", "final_answer", "source_bytes_reused",
                 )},
-                "extensions": "Use --describe for custom query/review/paging schemas. No second inventory tool is needed.",
+                "extensions": "Use --describe full for consumer decisions, review, JSON-summary schemas, and paging. No second inventory tool is needed.",
             }
         print(json.dumps(contract, ensure_ascii=False))
         return 0
@@ -1655,6 +1720,7 @@ def main(argv=None):
             or args.remaining
             or args.category
             or args.complete
+            or args.single_batch
             or args.refresh
             or args.offset
         ):
@@ -1674,8 +1740,8 @@ def main(argv=None):
         )
     if args.category and not args.paths:
         parser.error("--category requires --paths")
-    if args.complete and (args.render_only or args.review):
-        parser.error("--complete requires a source scan")
+    if (args.complete or args.single_batch) and (args.render_only or args.review):
+        parser.error("batch controls require a source scan")
     query_path = args.query if args.query != Path("-") else None
     default_report = not args.state and not args.report
     if args.render_only and not args.state:
@@ -1745,7 +1811,7 @@ def main(argv=None):
         if args.report.resolve().is_relative_to(Path(state["root"]).resolve()):
             parser.error("report must be outside the source tree")
     if not args.render_only:
-        if args.complete:
+        if not args.single_batch and not args.review:
             while state["scan"]["pending"]:
                 # Persist only completed batches, after validating all output
                 # destinations. Interrupted work resumes from this checkpoint.

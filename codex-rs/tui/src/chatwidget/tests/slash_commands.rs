@@ -2972,15 +2972,34 @@ async fn queued_input_cannot_drain_before_session_configuration() {
 
 #[tokio::test]
 async fn ide_status_failure_preserves_enabled_preference() {
+    async fn complete_request(
+        chat: &mut ChatWidget,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = rx.recv().await {
+                if let AppEvent::IdeContextCompleted { id, result } = event {
+                    chat.on_ide_context_completed(id, result);
+                    return;
+                }
+            }
+            panic!("IDE completion channel closed");
+        })
+        .await
+        .expect("IDE completion");
+    }
+
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.handle_ide_command_args_with_fetch("on", |_| {
         Ok(serde_json::from_str(r#"{"openTabs":[]}"#).expect("IDE context"))
     });
+    complete_request(&mut chat, &mut rx).await;
     assert!(chat.ide_context.is_enabled());
     chat.handle_ide_command_args_with_fetch(
         "status",
         |_| Err("temporary test failure".to_string()),
     );
+    complete_request(&mut chat, &mut rx).await;
     assert!(chat.ide_context.is_enabled());
     let history = drain_insert_history(&mut rx)
         .iter()
@@ -2992,5 +3011,6 @@ async fn ide_status_failure_preserves_enabled_preference() {
     );
     chat.handle_ide_command_args("off");
     chat.handle_ide_command_args_with_fetch("on", |_| Err("initial test failure".to_string()));
+    complete_request(&mut chat, &mut rx).await;
     assert!(!chat.ide_context.is_enabled());
 }

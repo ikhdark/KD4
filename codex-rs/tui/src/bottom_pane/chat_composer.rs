@@ -958,8 +958,10 @@ impl ChatComposer {
     /// Clears pending paste placeholders and keeps only attachments whose
     /// placeholder labels still appear in the new text. Image placeholders
     /// are renumbered to `[Image #M+1]..[Image #N]` (where `M` is the number of
-    /// remote images). Cursor is placed at the end after rebuilding elements.
+    /// remote images). Rebinds retained mentions using the draft's selected targets.
+    /// Cursor is placed at the end after rebuilding elements.
     pub(crate) fn apply_external_edit(&mut self, text: String) {
+        let mention_bindings = self.snapshot_mention_bindings();
         self.history.invalidate_pending_navigation();
         self.draft.pending_pastes.clear();
         let (text, _) = self.imported_text_for_textarea(text, Vec::new());
@@ -1031,6 +1033,8 @@ impl ChatComposer {
         // remote-image prefix.
         self.attachments
             .relabel_local_images(&mut self.draft.textarea);
+        // Rebuild surviving mention elements after image relabeling has settled byte ranges.
+        self.bind_mentions_from_snapshot(mention_bindings);
         self.draft
             .textarea
             .set_cursor(self.draft.textarea.text().len());
@@ -3900,7 +3904,7 @@ impl ChatComposer {
             .custom_footer_height()
             .unwrap_or_else(|| footer_height(&footer_props));
         let footer_spacing = Self::footer_spacing(footer_hint_height);
-        let footer_total_height = footer_hint_height + footer_spacing;
+        let footer_total_height = footer_hint_height.saturating_add(footer_spacing);
         const COLS_WITH_MARGIN: u16 = LIVE_PREFIX_COLS + 1;
         let inner_width =
             width.saturating_sub(COLS_WITH_MARGIN.saturating_add(textarea_right_reserve));
@@ -3911,16 +3915,18 @@ impl ChatComposer {
             .try_into()
             .unwrap_or(u16::MAX);
         let remote_images_separator = u16::from(remote_images_height > 0);
-        self.draft.textarea.desired_height(inner_width)
-            + remote_images_height
-            + remote_images_separator
-            + 2
-            + match &self.popups.active {
+        self.draft
+            .textarea
+            .desired_height(inner_width)
+            .saturating_add(remote_images_height)
+            .saturating_add(remote_images_separator)
+            .saturating_add(2)
+            .saturating_add(match &self.popups.active {
                 ActivePopup::None => footer_total_height,
                 ActivePopup::Command(c) => c.calculate_required_height(width),
                 ActivePopup::Skill(c) => c.calculate_required_height(width),
                 ActivePopup::MentionV2(c) => c.calculate_required_height(width),
-            }
+            })
     }
 }
 
@@ -10657,6 +10663,106 @@ mod tests {
             composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(result, InputResult::None);
         assert_eq!(composer.current_text(), "/plan investigate this");
+    }
+
+    #[test]
+    fn apply_external_edit_preserves_mention_targets_through_submission() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut composer = ChatComposer::new(
+            true,
+            AppEventSender::new(tx),
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        let bindings = vec![
+            MentionBinding {
+                sigil: '@',
+                mention: "figma".to_string(),
+                path: "plugin://figma@one".to_string(),
+            },
+            MentionBinding {
+                sigil: '@',
+                mention: "figma".to_string(),
+                path: "plugin://figma@two".to_string(),
+            },
+            MentionBinding {
+                sigil: '$',
+                mention: "app".to_string(),
+                path: "app://app-id".to_string(),
+            },
+            MentionBinding {
+                sigil: '$',
+                mention: "skill".to_string(),
+                path: "/tmp/skill/SKILL.md".to_string(),
+            },
+        ];
+        let text = "[Image #1] @figma @figma $app $skill".to_string();
+        composer.set_text_content_with_mention_bindings(
+            text.clone(),
+            Vec::new(),
+            vec![PathBuf::from("img.png")],
+            bindings.clone(),
+        );
+
+        composer.apply_external_edit(text.clone());
+
+        assert_eq!(composer.mention_bindings(), bindings);
+        assert_eq!(
+            composer.attachments.local_image_paths(),
+            vec![PathBuf::from("img.png")]
+        );
+        let (submitted, _) = composer.prepare_submission_text(false).expect("submission");
+        assert_eq!(submitted, text);
+        assert_eq!(composer.take_recent_submission_mention_bindings(), bindings);
+    }
+
+    #[test]
+    fn apply_external_edit_drops_removed_or_renamed_mentions() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut composer = ChatComposer::new(
+            true,
+            AppEventSender::new(tx),
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        for edited in ["deleted", "@figma-new", "user@figma", "@figma/path"] {
+            composer.set_text_content_with_mention_bindings(
+                "@figma".to_string(),
+                Vec::new(),
+                Vec::new(),
+                vec![MentionBinding {
+                    sigil: '@',
+                    mention: "figma".to_string(),
+                    path: "plugin://figma@test".to_string(),
+                }],
+            );
+
+            composer.apply_external_edit(edited.to_string());
+
+            assert_eq!(composer.current_text(), edited);
+            assert!(composer.mention_bindings().is_empty(), "{edited}");
+        }
+    }
+
+    #[test]
+    fn apply_external_edit_saturates_composer_height() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut composer = ChatComposer::new(
+            true,
+            AppEventSender::new(tx),
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.apply_external_edit("x\n".repeat(65_536));
+        for reserve in [0, 10] {
+            assert_eq!(
+                composer.desired_height_with_textarea_right_reserve(80, reserve),
+                u16::MAX
+            );
+        }
     }
 
     #[test]

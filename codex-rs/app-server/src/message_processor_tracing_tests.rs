@@ -882,6 +882,52 @@ fn thread_created_lag_resync_uses_only_missed_broadcast_instances() -> Result<()
             })
             .await
             .expect("spawned child should enter the thread-created recovery registry");
+            // A transport can snapshot a recipient immediately before it disconnects.
+            // The created child still needs a listener to own idle unloading.
+            harness
+                .processor
+                .thread_processor
+                .thread_state_manager
+                .remove_connection(TEST_CONNECTION_ID)
+                .await;
+            assert!(
+                harness
+                    .processor
+                    .thread_processor
+                    .handle_thread_created_event(Ok(missed_thread_id), vec![TEST_CONNECTION_ID])
+                    .await
+            );
+            assert!(
+                harness
+                    .processor
+                    .thread_processor
+                    .thread_state_manager
+                    .current_listener_command_tx(missed_thread_id)
+                    .is_some(),
+                "a stale recipient snapshot must not leave the child without an unload supervisor"
+            );
+            assert!(
+                harness
+                    .processor
+                    .thread_processor
+                    .thread_state_manager
+                    .subscribed_connection_ids(missed_thread_id)
+                    .await
+                    .is_empty(),
+                "a disconnected recipient must not be subscribed"
+            );
+            harness
+                .processor
+                .thread_processor
+                .thread_state_manager
+                .connection_initialized(
+                    TEST_CONNECTION_ID,
+                    ConnectionCapabilities {
+                        request_attestation: false,
+                        experimental_api: true,
+                    },
+                )
+                .await;
             assert!(
                 harness
                     .processor

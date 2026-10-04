@@ -1588,39 +1588,53 @@ async fn list_threads_from_files_asc(
     archived: bool,
     search_term: Option<&str>,
 ) -> std::io::Result<ThreadsPage> {
-    let scan_page_size = search_term.map_or(page_size, |_| usize::MAX);
-    let mut page = if archived {
-        get_threads_in_root_ascending(
-            codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
-            scan_page_size,
-            cursor,
-            sort_key,
-            ThreadListConfig {
+    let scan_page_size =
+        search_term.map_or(page_size, |_| page_size.saturating_mul(8).clamp(256, 2048));
+    let mut page = ThreadsPage::default();
+    let mut page_cursor = cursor.cloned();
+    loop {
+        let mut scanned = if archived {
+            get_threads_in_root_ascending(
+                codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
+                scan_page_size,
+                page_cursor.as_ref(),
+                sort_key,
+                ThreadListConfig {
+                    allowed_sources,
+                    model_providers,
+                    cwd_filters,
+                    default_provider,
+                    layout: ThreadListLayout::Flat,
+                },
+            )
+            .await?
+        } else {
+            get_threads_ascending(
+                codex_home,
+                scan_page_size,
+                page_cursor.as_ref(),
+                sort_key,
                 allowed_sources,
                 model_providers,
                 cwd_filters,
                 default_provider,
-                layout: ThreadListLayout::Flat,
-            },
-        )
-        .await?
-    } else {
-        get_threads_ascending(
-            codex_home,
-            scan_page_size,
-            cursor,
-            sort_key,
-            allowed_sources,
-            model_providers,
-            cwd_filters,
-            default_provider,
-        )
-        .await?
-    };
+            )
+            .await?
+        };
+        page.num_scanned_files = page
+            .num_scanned_files
+            .saturating_add(scanned.num_scanned_files);
+        page.reached_scan_cap |= scanned.reached_scan_cap;
+        filter_thread_items_by_search_term(codex_home, &mut scanned.items, search_term).await?;
+        page.items.extend(scanned.items);
+        page_cursor = scanned.next_cursor;
+        if search_term.is_none() || page.items.len() > page_size || page_cursor.is_none() {
+            break;
+        }
+    }
 
-    filter_thread_items_by_search_term(codex_home, &mut page.items, search_term).await?;
     let more_matches_available =
-        page.next_cursor.is_some() || page.items.len() > page_size || page.reached_scan_cap;
+        page_cursor.is_some() || page.items.len() > page_size || page.reached_scan_cap;
     page.items.truncate(page_size);
     page.next_cursor = if more_matches_available {
         page.items
@@ -1641,9 +1655,8 @@ async fn filter_thread_items_by_search_term(
         return Ok(());
     };
 
-    // The file-backed fallback only has the thread title in the sidecar session index.
-    // Match the SQLite path's title substring filter so search pagination behaves the same
-    // whether the state DB is available or not.
+    // Titles come from the sidecar index and previews from the rollout summary.
+    // Match SQLite's title-or-preview substring predicate in both fallback sort orders.
     let thread_ids = items
         .iter()
         .filter_map(|item| item.thread_id)
@@ -1653,6 +1666,10 @@ async fn filter_thread_items_by_search_term(
         item.thread_id
             .and_then(|thread_id| thread_names.get(&thread_id))
             .is_some_and(|title| title.contains(search_term))
+            || item
+                .preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains(search_term))
     });
     Ok(())
 }

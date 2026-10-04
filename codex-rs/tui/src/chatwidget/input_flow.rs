@@ -116,7 +116,8 @@ impl ChatWidget {
 
     /// If idle and there are queued inputs, submit exactly one to start the next turn.
     pub(crate) fn maybe_send_next_queued_input(&mut self) -> bool {
-        if self.input_queue.suppress_queue_autosend
+        if self.ide_context.prompt_pending()
+            || self.input_queue.suppress_queue_autosend
             || !self.is_session_configured()
             || self.is_plan_streaming_in_tui()
             || self.is_user_turn_pending_or_running()
@@ -167,7 +168,9 @@ impl ChatWidget {
     }
 
     pub(super) fn is_user_turn_pending_or_running(&self) -> bool {
-        self.input_queue.user_turn_pending_start || self.bottom_pane.is_task_running()
+        self.ide_context.prompt_pending()
+            || self.input_queue.user_turn_pending_start
+            || self.bottom_pane.is_task_running()
     }
 
     pub(super) fn only_user_shell_commands_running(&self) -> bool {

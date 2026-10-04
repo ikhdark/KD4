@@ -119,7 +119,8 @@ impl ChatComposer {
             query: String::new(),
             status: HistorySearchStatus::Idle,
         });
-        self.history.reset_search();
+        // A pending Up/Down lookup must not replace the draft after search takes ownership.
+        self.history.reset_navigation();
         (InputResult::None, true)
     }
 
@@ -556,6 +557,32 @@ mod tests {
         assert!(composer.history_search_active());
         assert!(composer.draft.textarea.is_empty());
         assert_eq!(composer.footer_mode(), FooterMode::HistorySearch);
+    }
+
+    #[test]
+    fn history_search_ignores_pending_navigation_response() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let mut composer =
+            ChatComposer::new(true, AppEventSender::new(tx), true, String::new(), true);
+        composer.set_history_metadata(codex_protocol::ThreadId::new(), 7, 1);
+
+        composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(
+            rx.try_recv().expect("history lookup"),
+            AppEvent::LookupMessageHistoryEntry {
+                log_id: 7,
+                offset: 0,
+                ..
+            }
+        ));
+        composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+        assert!(!composer.on_history_entry_response(7, 0, Some("late recall".to_string())));
+        assert!(composer.draft.textarea.is_empty());
+        assert!(matches!(
+            composer.history_search.as_ref().unwrap().status,
+            HistorySearchStatus::Idle
+        ));
     }
 
     #[test]

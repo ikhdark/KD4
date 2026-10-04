@@ -33,7 +33,8 @@ impl ChatWidget {
     /// and MCP-startup lifecycles.
     pub(super) fn update_task_running_state(&mut self) {
         self.bottom_pane.set_task_running(
-            self.input_queue.user_turn_pending_start
+            self.ide_context.prompt_pending()
+                || self.input_queue.user_turn_pending_start
                 || self.turn_lifecycle.agent_turn_running
                 || self.mcp_startup_status.is_some(),
         );

@@ -148,17 +148,23 @@ impl OllamaClient {
             )));
         }
         let val = resp.json::<JsonValue>().await.map_err(io::Error::other)?;
-        let names = val
-            .get("models")
+        val.get("models")
             .and_then(|m| m.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "No 'models' array in response")
+            })?
+            .iter()
+            .map(|model| {
+                model
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid model name in response")
+                    })
             })
-            .unwrap_or_default();
-        Ok(names)
+            .collect()
     }
 
     /// Query the server for its version string, returning `None` when unavailable.
@@ -365,31 +371,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_models_reports_a_rejected_listing_instead_of_no_models() {
+    async fn fetch_models_reports_invalid_listings_instead_of_missing_models() {
         if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
             tracing::info!(
-                "{} is set; skipping fetch_models_reports_a_rejected_listing_instead_of_no_models",
+                "{} is set; skipping fetch_models_reports_invalid_listings_instead_of_missing_models",
                 codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
             );
             return;
         }
 
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/api/tags"))
-            .respond_with(wiremock::ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
+        for (status, body) in [
+            (503, serde_json::json!(null)),
+            (200, serde_json::json!({})),
+            (200, serde_json::json!({"models": null})),
+            (200, serde_json::json!({"models": {}})),
+            (
+                200,
+                serde_json::json!({"models": [{"name": "valid"}, null]}),
+            ),
+            (200, serde_json::json!({"models": [{"name": "valid"}, {}]})),
+            (200, serde_json::json!({"models": [{"name": 7}]})),
+            (200, serde_json::json!({"models": [{"name": "  "}]})),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/tags"))
+                .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(&body))
+                .expect(1)
+                .mount(&server)
+                .await;
 
-        let client = OllamaClient::from_host_root(server.uri()).expect("shared HTTP client");
-        let error = client
-            .fetch_models()
-            .await
-            .expect_err("an unavailable listing must not look like an empty model list");
-        assert_eq!(
-            error.to_string(),
-            "failed to list models: HTTP 503 Service Unavailable"
-        );
+            let client = OllamaClient::from_host_root(server.uri()).expect("shared HTTP client");
+            let error = client
+                .fetch_models()
+                .await
+                .expect_err("an invalid listing must not look like missing models");
+            if status == 503 {
+                assert_eq!(
+                    error.to_string(),
+                    "failed to list models: HTTP 503 Service Unavailable"
+                );
+            } else {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{body}");
+            }
+        }
     }
 
     #[tokio::test]

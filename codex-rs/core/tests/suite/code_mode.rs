@@ -1564,6 +1564,145 @@ async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Resu
     Ok(())
 }
 
+/// Live sessions re-sent every answered task's raw tool output on each later
+/// request. After a final answer and a new user request, the consumed result
+/// must reach the provider as a compact pin whose exact bytes stay recoverable
+/// without rerunning the producer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_answered_task_evidence_is_pinned_and_recoverable_in_next_task() -> Result<()> {
+    require_network!();
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+            config.completed_tool_history_projection = true;
+        })
+        .build(&server)
+        .await?;
+    let final_answer = |id: &str, text: &str| {
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "id": id,
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        })
+    };
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("collect"),
+            ev_custom_tool_call(
+                "answered-evidence",
+                "exec",
+                "text('answered-task\\n' + 'evidence\\n'.repeat(1000));",
+            ),
+            ev_completed("collect"),
+        ]),
+    )
+    .await;
+    let answered = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("answer"),
+            final_answer("answer-message", "Collected."),
+            ev_completed("answer"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Collect the evidence.").await?;
+    let raw = raw_custom_tool_output_text(&answered.single_request(), "answered-evidence");
+    assert!(
+        raw.contains("answered-task\nevidence\nevidence\n"),
+        "the answering request reads the raw result: {raw}"
+    );
+
+    let next_task = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("next"),
+            final_answer("next-message", "Next task done."),
+            ev_completed("next"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Start an unrelated task.").await?;
+    let next_request = next_task.single_request();
+    let pinned = raw_custom_tool_output_text(&next_request, "answered-evidence");
+    let pin: Value = serde_json::from_str(&pinned)
+        .unwrap_or_else(|error| panic!("expected a recovery pin: {error}: {pinned}"));
+    assert_eq!(pin["kind"], "tool_history_artifact_pin", "{pin}");
+    assert_eq!(pin["retrieval"]["tool"], "read_tool_output", "{pin}");
+    assert!(
+        codex_utils_output_truncation::approx_token_count(&pinned) * 4
+            < codex_utils_output_truncation::approx_token_count(&raw),
+        "the pin must be much smaller than the raw result: {pinned}"
+    );
+    let input = next_request.body_json()["input"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        input.iter().any(
+            |item| item["type"] == "custom_tool_call" && item["call_id"] == "answered-evidence"
+        ),
+        "the pinned result keeps its call"
+    );
+    assert!(
+        input
+            .iter()
+            .any(|item| item["role"] == "assistant" && item["content"][0]["text"] == "Collected."),
+        "the answered task's final answer remains visible"
+    );
+    let artifact_id = pin["artifact_id"]
+        .as_str()
+        .expect("the pin names its artifact")
+        .to_string();
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("recover"),
+            ev_custom_tool_call(
+                "recover-pinned",
+                "exec",
+                &format!(
+                    "const r = await tools.read_tool_output({{artifact_id: {artifact_id:?}, selectors: [{{kind: 'lines', start: 1, end: 8}}]}}); text(JSON.stringify(r));"
+                ),
+            ),
+            ev_completed("recover"),
+        ]),
+    )
+    .await;
+    let recovered = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("recovered"),
+            final_answer("recovered-message", "Recovered."),
+            ev_completed("recovered"),
+        ]),
+    )
+    .await;
+    test.submit_turn("Recover the pinned evidence.").await?;
+    let output = raw_custom_tool_output_text(&recovered.single_request(), "recover-pinned");
+    let recovery: Value = output
+        .find('{')
+        .and_then(|start| serde_json::from_str(&output[start..]).ok())
+        .unwrap_or_else(|| panic!("expected a recovery result: {output}"));
+    assert_eq!(recovery["complete"], true, "{recovery}");
+    assert_eq!(recovery["canonical_sha256"], pin["sha256"], "{recovery}");
+    assert_eq!(recovery["canonical_bytes"], pin["bytes"], "{recovery}");
+    let text = recovery["results"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("answered-task\nevidence\n"),
+        "the pinned artifact recovers the original evidence: {recovery}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_output_only_preserves_running_command_and_recovers_middle() -> Result<()> {
     output_only_preserves_running_command_and_recovers_middle(false).await

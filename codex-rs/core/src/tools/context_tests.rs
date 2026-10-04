@@ -1965,6 +1965,34 @@ async fn code_mode_command_result_fits_its_cell_when_printed() {
     assert_eq!(result["output_reduced"], true);
     assert_eq!(result["output_complete"], false);
     assert_eq!(result["raw_output_artifact_id"], artifact_id.to_string());
+    // Each gap names its raw-output lines, so a reader recovers exactly the
+    // missing lines instead of rereading the file. Periodic braces and blank
+    // lines cannot shift a gap or the selector derived from it.
+    let source = raw_output.lines().collect::<Vec<_>>();
+    let mut rest = result["output"]
+        .as_str()
+        .unwrap()
+        .split_once("\n\n")
+        .expect("truncation header")
+        .1;
+    let (mut next, mut gaps) = (1, Vec::new());
+    while let Some((retained, marked)) = rest.split_once("\n[omitted lines ") {
+        let (marker, after) = marked.split_once("]\n").expect("marker end");
+        let (span, total) = marker.split_once(" of ").expect("marker total");
+        assert_eq!(total, source.len().to_string(), "whole boundary lines");
+        let (first, last) = span.split_once('-').expect("marker span");
+        let (first, last) = (first.parse::<usize>().unwrap(), last.parse::<usize>().unwrap());
+        assert_eq!(retained.lines().collect::<Vec<_>>(), source[next - 1..first - 1].to_vec());
+        gaps.push((first, last));
+        (next, rest) = (last + 1, after);
+    }
+    assert_eq!(rest.lines().collect::<Vec<_>>(), source[next - 1..].to_vec());
+    assert_eq!(gaps.len(), 2);
+    let (first, last) = gaps[0];
+    assert_eq!(
+        result["recovery_selector"],
+        json!({"kind": "lines", "start": first, "end": last.min(first + 199)})
+    );
     let direct: JsonValue = serde_json::from_str(&output.response_text()).unwrap();
     assert!(
         codex_utils_string::approx_token_count(direct["output"].as_str().unwrap())

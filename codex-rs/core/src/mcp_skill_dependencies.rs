@@ -179,55 +179,14 @@ async fn install_planned_mcp_dependencies(
     cancellation_token: &CancellationToken,
 ) -> Result<(), String> {
     let codex_home = config.codex_home.clone();
-    let mut servers = tokio::select! {
+    let setup = tokio::select! {
         _ = cancellation_token.cancelled() => {
             return Err("MCP dependency installation was cancelled".to_string());
         }
-        result = load_global_mcp_servers(&codex_home) => result.map_err(|err| {
-            format!("failed to load MCP servers while installing dependencies: {err}")
+        result = persist_mcp_dependencies_for_setup(&codex_home, missing) => result.map_err(|err| {
+            format!("failed to persist planned MCP dependencies: {err}")
         })?,
     };
-    let mut added = Vec::new();
-    let mut setup = Vec::new();
-    let mut entries = missing.iter().collect::<Vec<_>>();
-    entries.sort_by_key(|(left, _)| *left);
-    for (name, server_config) in entries {
-        if let Some(existing) = servers.get(name) {
-            // Only resume the exact approved definition. Never enable a disabled
-            // server or authenticate a concurrently replaced registration.
-            if existing.enabled && existing == server_config {
-                setup.push((name.clone(), existing.clone()));
-            }
-            continue;
-        }
-        if !server_config.enabled {
-            continue;
-        }
-        setup.push((name.clone(), server_config.clone()));
-        servers.insert(name.clone(), server_config.clone());
-        added.push((name.clone(), server_config.clone()));
-    }
-
-    // Persist the server definitions before starting OAuth. OAuth login writes
-    // credentials as its terminal action, so this ordering guarantees that any
-    // credential created before cancellation or a later failure always has a
-    // matching durable server definition instead of becoming an orphaned
-    // secret. Existing names still win inside the serialized merge.
-    if !added.is_empty() {
-        let additions = added.iter().cloned().collect::<BTreeMap<_, _>>();
-        tokio::select! {
-            _ = cancellation_token.cancelled() => {
-                return Err("MCP dependency installation was cancelled".to_string());
-            }
-            result = ConfigEditsBuilder::new(&codex_home)
-                .merge_mcp_servers(&additions)
-                .apply() => {
-                result.map_err(|err| {
-                    format!("failed to persist planned MCP dependencies: {err}")
-                })?;
-            }
-        }
-    }
 
     for (name, server_config) in &setup {
         let oauth_support = tokio::select! {
@@ -317,7 +276,7 @@ async fn install_planned_mcp_dependencies(
 
     // OAuth can be interactive. Re-read after it completes so runtime refresh
     // observes concurrent config edits instead of the stale snapshot.
-    servers = tokio::select! {
+    let servers = tokio::select! {
         _ = cancellation_token.cancelled() => {
             return Err("MCP dependency installation was cancelled".to_string());
         }
@@ -348,6 +307,28 @@ async fn install_planned_mcp_dependencies(
         ) => {}
     }
     Ok(())
+}
+
+async fn persist_mcp_dependencies_for_setup(
+    codex_home: &std::path::Path,
+    missing: &HashMap<String, McpServerConfig>,
+) -> std::io::Result<Vec<(String, McpServerConfig)>> {
+    let additions = missing
+        .iter()
+        .filter(|(_, config)| config.enabled)
+        .map(|(name, config)| (name.clone(), config.clone()))
+        .collect::<BTreeMap<_, _>>();
+    // Existing names win under the config lock. Select OAuth work only after
+    // reloading that merge, not from a snapshot that may have lost a race.
+    ConfigEditsBuilder::new(codex_home)
+        .merge_mcp_servers(&additions)
+        .apply()
+        .await?;
+    let persisted = load_global_mcp_servers(codex_home).await?;
+    Ok(additions
+        .into_iter()
+        .filter(|(name, approved)| persisted.get(name) == Some(approved))
+        .collect())
 }
 
 async fn should_install_planned_mcp_dependencies(
@@ -715,4 +696,46 @@ fn collect_missing_mcp_dependencies(
     warnings.sort();
 
     (missing, warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn setup_uses_only_approved_definitions_in_the_merged_config() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let approved: McpServerConfig = toml::from_str("url = 'https://approved.example/mcp'")?;
+        let missing = ["added", "disabled", "replaced", "resume"]
+            .into_iter()
+            .map(|name| (name.to_string(), approved.clone()))
+            .collect::<HashMap<_, _>>();
+        // The plan is already approved when newer registrations reach disk.
+        let newer_config = "\
+[mcp_servers.disabled]\nurl = 'https://approved.example/mcp'\nenabled = false\n\
+[mcp_servers.replaced]\nurl = 'https://replacement.example/mcp'\n\
+[mcp_servers.resume]\nurl = 'https://approved.example/mcp'\n";
+        std::fs::write(
+            home.path().join(codex_config::CONFIG_TOML_FILE),
+            newer_config,
+        )?;
+
+        let setup = persist_mcp_dependencies_for_setup(home.path(), &missing).await?;
+        assert_eq!(
+            setup,
+            vec![
+                ("added".to_string(), approved.clone()),
+                ("resume".to_string(), approved),
+            ]
+        );
+        let persisted = load_global_mcp_servers(home.path()).await?;
+        assert!(!persisted["disabled"].enabled);
+        assert_eq!(
+            persisted["replaced"],
+            toml::from_str::<McpServerConfig>("url = 'https://replacement.example/mcp'")?
+        );
+        assert_eq!(persisted.len(), 4);
+        Ok(())
+    }
 }

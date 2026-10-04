@@ -104,6 +104,98 @@ fn db_hits_already_reconciled_from_filesystem_are_not_reconciled_again() {
     ));
 }
 
+#[tokio::test]
+async fn filesystem_search_matches_preview_or_title_in_both_sort_orders() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let first = Uuid::from_u128(30_001);
+    let second = Uuid::from_u128(30_002);
+    write_session_file(home.path(), "2025-01-03T12-00-00", first).unwrap();
+    write_session_file(home.path(), "2025-01-03T12-01-00", second).unwrap();
+    let first_id = ThreadId::from_string(&first.to_string()).unwrap();
+    let second_id = ThreadId::from_string(&second.to_string()).unwrap();
+    crate::append_thread_name(home.path(), first_id, "Chosen title")
+        .await
+        .unwrap();
+
+    for direction in [SortDirection::Asc, SortDirection::Desc] {
+        for (term, expected) in [
+            (
+                "Hello",
+                if direction == SortDirection::Asc {
+                    vec![first_id, second_id]
+                } else {
+                    vec![second_id, first_id]
+                },
+            ),
+            ("Chosen", vec![first_id]),
+            ("absent", vec![]),
+        ] {
+            let mut cursor = None;
+            let mut found = Vec::new();
+            loop {
+                let page = RolloutRecorder::list_threads(
+                    None,
+                    &config,
+                    1,
+                    cursor.as_ref(),
+                    ThreadSortKey::CreatedAt,
+                    direction,
+                    &[],
+                    None,
+                    None,
+                    &config.model_provider_id,
+                    Some(term),
+                )
+                .await
+                .expect("filesystem search");
+                found.extend(page.items.into_iter().map(|item| item.thread_id.unwrap()));
+                assert!(
+                    found.len() <= expected.len(),
+                    "search must not repeat pages"
+                );
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(found, expected, "search term: {term}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ascending_filesystem_search_continues_after_a_nonmatching_page() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    for index in 0..257 {
+        let timestamp = format!("2025-01-03T12-{:02}-{:02}", index / 60, index % 60);
+        write_session_file(home.path(), &timestamp, Uuid::from_u128(40_000 + index)).unwrap();
+    }
+    let last_id = ThreadId::from_string(&Uuid::from_u128(40_256).to_string()).unwrap();
+    crate::append_thread_name(home.path(), last_id, "Late match")
+        .await
+        .unwrap();
+    let page = RolloutRecorder::list_threads(
+        None,
+        &config,
+        1,
+        None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Asc,
+        &[],
+        None,
+        None,
+        &config.model_provider_id,
+        Some("Late match"),
+    )
+    .await
+    .expect("search beyond the first scan page");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].thread_id, Some(last_id));
+    assert!(page.next_cursor.is_none());
+}
+
 struct EventCountingSubscriber(Arc<AtomicUsize>);
 
 impl tracing::Subscriber for EventCountingSubscriber {

@@ -2498,12 +2498,26 @@ async fn spawn_agent_errors_when_manager_dropped() {
     );
 }
 
+#[test_case::test_case(false; "direct_encrypted")]
+#[test_case::test_case(true; "code_mode_plaintext")]
 #[tokio::test]
-async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_failure() {
+async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_failure(
+    code_mode: bool,
+) {
     async fn dispatch(
         mut invocation: ToolInvocation,
+        code_mode: bool,
     ) -> codex_protocol::models::FunctionCallOutputPayload {
         invocation.call_id = format!("message-{}", ThreadId::new());
+        if code_mode {
+            invocation.source = crate::tools::context::ToolCallSource::CodeMode {
+                cell_id: "message-cell".to_string(),
+                parent_call_id: Some("message-exec".to_string()),
+                runtime_tool_call_id: invocation.call_id.clone(),
+                nested_deadline: None,
+                cancellation_cause: None,
+            };
+        }
         let router = Arc::new(crate::tools::router::ToolRouter::from_context(
             invocation.step_context.as_ref(),
             crate::tools::router::ToolRouterParams {
@@ -2528,17 +2542,25 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
             invocation.step_context,
             invocation.tracker,
         );
-        let response = runtime
-            .handle_tool_call(
-                crate::tools::router::ToolCall {
-                    tool_name: invocation.tool_name,
-                    call_id: invocation.call_id,
-                    payload: invocation.payload,
-                },
+        let call = crate::tools::router::ToolCall {
+            tool_name: invocation.tool_name,
+            call_id: invocation.call_id,
+            payload: invocation.payload,
+        };
+        let response = match runtime
+            .handle_tool_call_with_source(
+                call.clone(),
+                invocation.source,
                 invocation.cancellation_token,
             )
             .await
-            .expect("registered message returns");
+        {
+            Ok(result) => result.into_response(),
+            Err(FunctionCallError::RespondToModel(message)) => {
+                crate::tools::parallel::ToolCallRuntime::failure_response_for_message(&call, message)
+            }
+            Err(error) => panic!("registered message failed: {error}"),
+        };
         let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
             panic!("message must return a function result");
         };
@@ -2579,15 +2601,18 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
             .expect("child starts");
     }
     let before = manager.captured_ops().len();
-    let output = dispatch(invocation(
-        session.clone(),
-        turn.clone(),
-        "send_message",
-        function_payload(json!({
-            "targets": ["batch_one", foreign.thread_id.to_string(), "missing", "/root/batch_two"],
-            "message": "shared information"
-        })),
-    ))
+    let output = dispatch(
+        invocation(
+            session.clone(),
+            turn.clone(),
+            "send_message",
+            function_payload(json!({
+                "targets": ["batch_one", foreign.thread_id.to_string(), "missing", "/root/batch_two"],
+                "message": "shared information"
+            })),
+        ),
+        code_mode,
+    )
     .await;
     assert_eq!(
         output.success,
@@ -2615,10 +2640,7 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
         .filter_map(|(_, op)| {
             if let Op::InterAgentCommunication { communication } = op {
                 assert!(!communication.trigger_turn);
-                assert_eq!(
-                    communication.encrypted_content.as_deref(),
-                    Some("shared information")
-                );
+                assert_message_encoding(communication, "shared information", code_mode);
                 assert!(communication.other_recipients.is_empty());
                 Some(communication.recipient.to_string())
             } else {
@@ -2637,7 +2659,7 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
         function_payload(json!({"targets": ["batch_one", "batch_two"], "message": "cancelled"})),
     );
     cancelled.cancellation_token.cancel();
-    let output = dispatch(cancelled).await;
+    let output = dispatch(cancelled, code_mode).await;
     assert_eq!(output.success, None);
     assert!(
         serde_json::to_string(&output)
@@ -2656,12 +2678,15 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
         json!({"targets": ["batch_one"], "message": " "}),
     ] {
         let before = manager.captured_ops().len();
-        let output = dispatch(invocation(
-            session.clone(),
-            turn.clone(),
-            "send_message",
-            function_payload(args),
-        ))
+        let output = dispatch(
+            invocation(
+                session.clone(),
+                turn.clone(),
+                "send_message",
+                function_payload(args),
+            ),
+            code_mode,
+        )
         .await;
         assert_eq!(output.success, Some(false));
         assert_eq!(
@@ -2672,23 +2697,56 @@ async fn multi_agent_v2_registered_message_batch_preserves_delivery_and_partial_
     }
     for (tool, trigger_turn) in [("send_message", false), ("followup_task", true)] {
         let before = manager.captured_ops().len();
-        let output = dispatch(invocation(
-            session.clone(),
-            turn.clone(),
-            tool,
-            function_payload(json!({"target": "batch_one", "message": "single update"})),
-        ))
+        let output = dispatch(
+            invocation(
+                session.clone(),
+                turn.clone(),
+                tool,
+                function_payload(json!({"target": "batch_one", "message": "single update"})),
+            ),
+            code_mode,
+        )
         .await;
         assert_eq!(output.success, Some(true));
-        assert!(
-            manager.captured_ops()[before..]
-                .iter()
-                .any(|(_, op)| matches!(op,
-                    Op::InterAgentCommunication { communication }
-                        if communication.trigger_turn == trigger_turn
-                            && communication.recipient.as_str() == "/root/batch_one"
-                ))
-        );
+        let ops = manager.captured_ops();
+        let deliveries: Vec<_> = ops[before..]
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::InterAgentCommunication { communication } => Some(communication),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deliveries.len(), 1);
+        let communication = deliveries[0];
+        assert_eq!(communication.trigger_turn, trigger_turn);
+        assert_eq!(communication.recipient.as_str(), "/root/batch_one");
+        assert_message_encoding(communication, "single update", code_mode);
+    }
+
+    fn assert_message_encoding(
+        communication: &InterAgentCommunication,
+        message: &str,
+        code_mode: bool,
+    ) {
+        let item = serde_json::to_value(communication.to_model_input_item()).unwrap();
+        if code_mode {
+            assert_eq!(communication.content, message);
+            assert_eq!(communication.encrypted_content, None);
+            assert_eq!(
+                item["content"],
+                json!([{"type": "input_text", "text": message}])
+            );
+        } else {
+            assert!(communication.content.is_empty());
+            assert_eq!(communication.encrypted_content.as_deref(), Some(message));
+            assert_eq!(
+                item["content"][1],
+                json!({
+                    "type": "encrypted_content",
+                    "encrypted_content": message,
+                })
+            );
+        }
     }
 }
 

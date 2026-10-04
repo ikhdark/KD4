@@ -422,6 +422,100 @@ async fn refresh_adopts_an_unchanged_client_without_old_manager_shutdown_cancell
 }
 
 #[tokio::test]
+async fn cancelled_manager_construction_releases_adopted_client_lease() {
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut previous = McpConnectionManager::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    let runtime_context = McpRuntimeContext::new(
+        Arc::new(EnvironmentManager::without_environments()),
+        PathBuf::from("/tmp/reuse"),
+    );
+    let codex_home = tempdir().expect("tempdir");
+    let cache_key = CodexAppsToolsCacheKey {
+        account_id: None,
+        chatgpt_user_id: None,
+        is_workspace_account: false,
+        chatgpt_base_url: "https://chatgpt.com".to_string(),
+        mcp_endpoint: "https://chatgpt.com/backend-api/apps".to_string(),
+        product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
+    };
+    previous.client_reuse_context = ClientReuseContext {
+        store_mode: OAuthCredentialsStoreMode::default(),
+        keyring_backend_kind: AuthKeyringBackendKind::default(),
+        runtime_context: runtime_context.clone(),
+        codex_home: codex_home.path().to_path_buf(),
+        codex_apps_tools_cache_key: cache_key.clone(),
+        client_elicitation_capability: ElicitationCapability::default(),
+        supports_openai_form_elicitation: false,
+    };
+    let server = EffectiveMcpServer::configured(test_stdio_server_config("echo"));
+    let mcp_servers = HashMap::from([
+        ("first".to_string(), server.clone()),
+        ("second".to_string(), server.clone()),
+    ]);
+    // Match the constructor's cloned-map iteration: adopt its first entry, then
+    // block the second entry's Starting notification without launching a process.
+    let adopted_name = mcp_servers
+        .clone()
+        .into_keys()
+        .next()
+        .expect("first server");
+    let client = create_ready_async_managed_client(Vec::new()).await;
+    let owners = Arc::clone(&client.manager_owners);
+    let cancel_token = client.cancel_token.clone();
+    previous.server_definitions.insert(adopted_name.clone(), server);
+    previous.clients.insert(adopted_name, client);
+    let (tx_event, _rx_event) = async_channel::bounded(1);
+    tx_event
+        .try_send(Event {
+            id: "occupied".to_string(),
+            msg: EventMsg::McpStartupComplete(McpStartupCompleteEvent::default()),
+        })
+        .expect("fill notification channel");
+
+    let mut construction = Box::pin(McpConnectionManager::new(
+        &mcp_servers,
+        OAuthCredentialsStoreMode::default(),
+        AuthKeyringBackendKind::default(),
+        HashMap::new(),
+        &approval_policy,
+        "refresh".to_string(),
+        tx_event,
+        CancellationToken::new(),
+        PermissionProfile::default(),
+        runtime_context,
+        codex_home.path().to_path_buf(),
+        CodexAppsToolsCache::default(),
+        cache_key,
+        /*prefix_mcp_tool_names*/ true,
+        ElicitationCapability::default(),
+        /*supports_openai_form_elicitation*/ false,
+        ToolPluginProvenance::default(),
+        /*auth*/ None,
+        /*codex_apps_auth_manager*/ None,
+        /*elicitation_lifecycle*/ None,
+        ElicitationRequestRouter::default(),
+        Some(&previous),
+    ));
+    assert!(futures::poll!(construction.as_mut()).is_pending());
+    assert_eq!(owners.load(Ordering::Acquire), 2);
+
+    drop(construction);
+    assert_eq!(owners.load(Ordering::Acquire), 1);
+    assert!(!cancel_token.is_cancelled());
+
+    previous.shutdown().await;
+    assert_eq!(owners.load(Ordering::Acquire), 0);
+    assert!(cancel_token.is_cancelled());
+    drop(previous);
+    assert_eq!(owners.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
 async fn resource_cache_key_changes_when_a_server_connection_is_replaced() {
     let mut manager = McpConnectionManager::new_uninitialized(
         &Constrained::allow_any(AskForApproval::OnRequest),
@@ -885,12 +979,12 @@ fn tool_with_model_visible_input_schema_masks_file_params() {
             "properties": {
                 "file": {
                     "type": "string",
-                    "description": "Original file payload. Absolute local path to the file to upload."
+                    "description": "Original file payload. Path to the file to upload, relative to the primary execution environment's working directory. Absolute paths and parent-directory (`..`) components are not allowed."
                 },
                 "files": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Absolute local paths to the files to upload."
+                    "description": "Paths to the files to upload, relative to the primary execution environment's working directory. Absolute paths and parent-directory (`..`) components are not allowed."
                 }
             }
         })

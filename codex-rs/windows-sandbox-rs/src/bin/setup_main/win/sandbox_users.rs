@@ -4,7 +4,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngCore;
 use rand::SeedableRng;
-use rand::rngs::SmallRng;
+use rand::rngs::StdRng;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::ffi::c_void;
@@ -397,7 +397,8 @@ pub fn sid_bytes_to_local_sid(sid: &[u8]) -> Result<codex_windows_sandbox::Local
 fn random_password() -> String {
     const CHARS: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+";
-    let mut rng = SmallRng::from_os_rng();
+    // These bytes become persistent Windows account credentials.
+    let mut rng = StdRng::from_os_rng();
     let mut buf = [0u8; 24];
     rng.fill_bytes(&mut buf);
     buf.iter()

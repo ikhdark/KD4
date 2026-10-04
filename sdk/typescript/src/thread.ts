@@ -1,5 +1,5 @@
 import { CodexOptions } from "./codexOptions";
-import { ThreadEvent, ThreadError, Usage } from "./events";
+import { ThreadEvent, ThreadError, TurnCompletedEvent, Usage } from "./events";
 import { CodexExec } from "./exec";
 import { ThreadItem } from "./items";
 import { ThreadOptions } from "./threadOptions";
@@ -11,6 +11,8 @@ export type Turn = {
   items: ThreadItem[];
   finalResponse: string;
   usage: Usage | null;
+  /** Authoritative typed result when a tool directly completes the turn. */
+  surfacedResult?: TurnCompletedEvent["surfaced_result"];
 };
 
 /** Alias for `Turn` to describe the result of `run()`. */
@@ -72,28 +74,28 @@ export class Thread {
     turnOptions: TurnOptions = {},
   ): AsyncGenerator<ThreadEvent> {
     const { schemaPath, cleanup } = await createOutputSchemaFile(turnOptions.outputSchema);
-    const options = this._threadOptions;
-    const { prompt, images } = normalizeInput(input);
-    const generator = this._exec.run({
-      input: prompt,
-      baseUrl: this._options.baseUrl,
-      apiKey: this._options.apiKey,
-      threadId: this._id,
-      images,
-      model: options?.model,
-      sandboxMode: options?.sandboxMode,
-      workingDirectory: options?.workingDirectory,
-      skipGitRepoCheck: options?.skipGitRepoCheck,
-      outputSchemaFile: schemaPath,
-      modelReasoningEffort: options?.modelReasoningEffort,
-      signal: turnOptions.signal,
-      networkAccessEnabled: options?.networkAccessEnabled,
-      webSearchMode: options?.webSearchMode,
-      webSearchEnabled: options?.webSearchEnabled,
-      approvalPolicy: options?.approvalPolicy,
-      additionalDirectories: options?.additionalDirectories,
-    });
     try {
+      const options = this._threadOptions;
+      const { prompt, images } = normalizeInput(input);
+      const generator = this._exec.run({
+        input: prompt,
+        baseUrl: this._options.baseUrl,
+        apiKey: this._options.apiKey,
+        threadId: this._id,
+        images,
+        model: options?.model,
+        sandboxMode: options?.sandboxMode,
+        workingDirectory: options?.workingDirectory,
+        skipGitRepoCheck: options?.skipGitRepoCheck,
+        outputSchemaFile: schemaPath,
+        modelReasoningEffort: options?.modelReasoningEffort,
+        signal: turnOptions.signal,
+        networkAccessEnabled: options?.networkAccessEnabled,
+        webSearchMode: options?.webSearchMode,
+        webSearchEnabled: options?.webSearchEnabled,
+        approvalPolicy: options?.approvalPolicy,
+        additionalDirectories: options?.additionalDirectories,
+      });
       for await (const item of generator) {
         let parsed: ThreadEvent;
         try {
@@ -117,6 +119,7 @@ export class Thread {
     const items: ThreadItem[] = [];
     let finalResponse: string = "";
     let usage: Usage | null = null;
+    let surfacedResult: Turn["surfacedResult"];
     let turnFailure: ThreadError | null = null;
     let streamFailure: string | null = null;
     for await (const event of generator) {
@@ -127,6 +130,10 @@ export class Thread {
         items.push(event.item);
       } else if (event.type === "turn.completed") {
         usage = event.usage;
+        if (event.surfaced_result) {
+          surfacedResult = event.surfaced_result;
+          finalResponse = surfacedResult.canonicalMessage ?? "";
+        }
       } else if (event.type === "turn.failed") {
         turnFailure = event.error;
         break;
@@ -141,7 +148,7 @@ export class Thread {
     if (turnFailure) {
       throw new Error(turnFailure.message);
     }
-    return { items, finalResponse, usage };
+    return { items, finalResponse, usage, ...(surfacedResult ? { surfacedResult } : {}) };
   }
 }
 

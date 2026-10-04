@@ -1521,6 +1521,19 @@ async fn command_receipts_share_the_script_budget_and_keep_latest_canonical_stat
             "chunk_id": format!("DISTINCT_{index}"),
             "raw_output_artifact_error": "large diagnostic".repeat(100),
         }));
+        if index == 99 {
+            let state = result.command_state.as_mut().unwrap();
+            state["output_reduced"] = true.into();
+            state["raw_output_artifact_id"] = "retained-tail".into();
+            state["raw_output_artifact_retention_limit_hit"] = true.into();
+            state["recovery"] = serde_json::json!({
+                "tool": "read_tool_output",
+                "arguments": {
+                    "artifact_id": "retained-tail",
+                    "selectors": [{"kind": "lines", "start": 12, "end": 24}],
+                },
+            });
+        }
         service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
     }
     let output = super::handle_runtime_response(
@@ -1549,6 +1562,17 @@ async fn command_receipts_share_the_script_budget_and_keep_latest_canonical_stat
     assert_eq!(inline.len(), 101);
     assert!(!visible.contains("DISTINCT_"));
     assert!(visible.contains("Running command session_id: 99"));
+    let receipt = output.body.iter().find_map(|item| match item {
+        FunctionCallOutputContentItem::InputText { text } => {
+            serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(|value| value["artifact_id"] == "retained-tail")
+        }
+        _ => None,
+    }).expect("text-only output must retain actionable recovery metadata");
+    assert_eq!(receipt["recovery"]["arguments"]["selectors"],
+        serde_json::json!([{"kind": "lines", "start": 12, "end": 24}]));
+    assert_eq!(receipt["raw_output_artifact_retention_limit_hit"], true);
     let canonical = output.canonical_body.as_ref().unwrap();
     let states = canonical
         .iter()
@@ -1576,4 +1600,47 @@ async fn command_receipts_share_the_script_budget_and_keep_latest_canonical_stat
             .any(|state| state["chunk_id"] == "DISTINCT_99")
     );
     service.finish_cell_dispatch(&cell);
+}
+
+#[tokio::test]
+async fn live_session_receipt_is_added_only_when_its_handle_is_not_visible() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let exec = super::ExecContext {
+        session: Arc::new(session),
+        turn: Arc::new(turn),
+    };
+    let service = &exec.session.services.code_mode_service;
+    for (name, printed, receipts) in [
+        ("envelope", r#"{"session_id":12,"execution_state":"running"}"#, 0),
+        ("output-only", "building", 1),
+        ("longer-id", r#"{"session_id":123,"execution_state":"running"}"#, 1),
+    ] {
+        let cell = CellId::new(name.to_string());
+        service.record_cell_parent_call_id(&cell, &format!("outer-{name}"));
+        let ordinal = service.begin_packet_call(&cell).unwrap();
+        let mut result = nested_result_evidence("building");
+        result.command_state = Some(serde_json::json!({"session_id": 12, "process_exited": false}));
+        service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
+        let output = super::handle_runtime_response(
+            &exec,
+            RuntimeResponse::Result {
+                cell_id: cell.clone(),
+                content_items: vec![RuntimeContentItem::InputText {
+                    text: printed.into(),
+                }],
+                error_text: None,
+                output_loss: None,
+            },
+            None,
+            Instant::now(),
+        )
+        .unwrap();
+        let visible = super::code_mode_text_content(&output.body);
+        assert_eq!(
+            visible.matches("Running command session_id: 12").count(),
+            receipts,
+            "{name}: {visible}"
+        );
+        service.finish_cell_dispatch(&cell);
+    }
 }

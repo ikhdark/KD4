@@ -7,6 +7,7 @@ use super::*;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolCallSource;
 use crate::tools::handlers::multi_agents_spec::create_followup_task_tool;
 use crate::tools::handlers::multi_agents_spec::create_send_message_tool;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -191,6 +192,7 @@ pub(crate) async fn handle_message_string_tool(
         session,
         step_context,
         call_id,
+        source,
         ..
     } = invocation;
     let turn = Arc::clone(&step_context.turn);
@@ -224,8 +226,16 @@ pub(crate) async fn handle_message_string_tool(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication =
-        communication_from_tool_message(author, receiver_agent_path.clone(), message);
+    let communication = match source {
+        ToolCallSource::Direct => {
+            communication_from_tool_message(author, receiver_agent_path.clone(), message)
+        }
+        // Nested JavaScript arguments do not pass through the provider's encrypted
+        // parameter encoding. Sending them as ciphertext poisons the recipient's history.
+        ToolCallSource::CodeMode { .. } => {
+            communication_from_plaintext_message(author, receiver_agent_path.clone(), message)
+        }
+    };
     let kind = match mode {
         MessageDeliveryMode::QueueOnly => AgentCommunicationKind::Message,
         MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,

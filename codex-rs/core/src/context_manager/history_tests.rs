@@ -1370,7 +1370,14 @@ fn pending_user_boundary_estimate_uses_sampling_projection() {
         )
         .unwrap();
 
-    assert_eq!(projected, raw);
+    let sampled = history.clone().prepare_for_sampling_prompt(
+        &[InputModality::Text], StableContextTarget::Sampling,
+    );
+    let expected = ContextManager::estimate_items_token_count_with_base_instructions(
+        sampled.items(), &base_instructions,
+    ).unwrap();
+    assert_eq!(projected, expected);
+    assert_eq!(projected, raw - estimate_item_token_count(&history.raw_items()[0]));
 }
 
 #[test]
@@ -2810,7 +2817,9 @@ fn sampling_preparation_preserves_stable_context_in_original_positions() {
         crate::stable_context::mark_trusted_stable_context_item(&mut old);
         crate::stable_context::mark_trusted_stable_context_item(&mut current);
         let dynamic = user_input_text_msg("dynamic request or compaction checkpoint");
-        let items = vec![old, dynamic.clone(), current];
+        let untrusted = user_input_text_msg(current_repository);
+        let expected = vec![old.clone(), dynamic.clone(), current.clone(), untrusted.clone()];
+        let items = vec![old.clone(), old, dynamic.clone(), current.clone(), current, untrusted];
         let mut history = ContextManager::new();
         if replace_history {
             history.replace(items.clone());
@@ -2846,7 +2855,7 @@ fn sampling_preparation_preserves_stable_context_in_original_positions() {
             };
             assert_eq!(
                 sampled.items(),
-                items.as_slice(),
+                expected.as_slice(),
                 "replace_history={replace_history}, completed_tool_projection={completed_tool_projection}"
             );
             assert!(sampled.stable_context_manifest().fail_open());
@@ -3000,6 +3009,41 @@ fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
         third.items().last(),
         Some(&user_input_text_msg("now finish it"))
     );
+
+    let old_reasoning = reasoning_with_encrypted_content(2000);
+    let active_reasoning = reasoning_with_encrypted_content(1000);
+    let mut answer = assistant_msg("Implemented; the remaining warning still needs investigation.");
+    if let ResponseItem::Message { phase, .. } = &mut answer {
+        *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+    }
+    let next_request = user_input_text_msg("Investigate that warning, preserving the constraints.");
+    history.record_items(
+        [&old_reasoning, &answer, &next_request, &active_reasoning],
+        TruncationPolicy::Tokens(10_000),
+    );
+    let canonical = history.raw_items().to_vec();
+    let next = prepare(&history);
+    assert!(!next.items().contains(&old_reasoning));
+    for required in [&answer, &next_request, &active_reasoning] {
+        assert!(next.items().contains(required));
+    }
+    for index in 0..20 {
+        let id = format!("saved-{index:03}");
+        let text = next.items().iter().find_map(|item| {
+            crate::tool_history::canonical_textual_output_identity(item)
+                .filter(|(call_id, _)| *call_id == id).map(|(_, text)| text.into_owned())
+        }).unwrap();
+        let pin: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(pin["kind"], "tool_history_artifact_pin");
+        assert_eq!(pin["artifact_id"], format!("artifact-{id}"));
+    }
+    assert!(next.items().contains(&output("saved-020", evidence(20))), "unread evidence remains inline");
+    assert_eq!(history.raw_items(), canonical);
+    let continuation = assistant_msg("Continuing the new task.");
+    history.record_items([&continuation], TruncationPolicy::Tokens(10_000));
+    let continued = prepare(&history);
+    assert_eq!(&continued.items()[..next.items().len()], next.items());
+    assert_eq!(continued.items().last(), Some(&continuation));
 }
 
 #[test]

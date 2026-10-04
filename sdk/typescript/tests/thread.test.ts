@@ -1,10 +1,96 @@
-import { describe, expect, it } from "@jest/globals";
+import { promises as fs } from "node:fs";
+import { describe, expect, it, jest } from "@jest/globals";
 
 import type { CodexExec } from "../src/exec";
-import type { CodeModeCellItem, CommandExecutionItem, ContextCompactionItem } from "../src/index";
+import type {
+  CodeModeCellItem,
+  CommandExecutionItem,
+  ContextCompactionItem,
+  RunResult,
+  ThreadEvent,
+} from "../src/index";
 import { Thread } from "../src/thread";
 
 describe("Thread", () => {
+  it("removes the output schema when input normalization fails", async () => {
+    const mkdtemp = jest.spyOn(fs, "mkdtemp");
+    const exec = { run: jest.fn() };
+    const thread = new Thread(exec as unknown as CodexExec, {}, {});
+    try {
+      await expect(
+        thread.run(
+          [
+            {
+              type: "text",
+              get text(): string {
+                throw new Error("input failed");
+              },
+            },
+          ],
+          { outputSchema: { type: "object" } },
+        ),
+      ).rejects.toThrow("input failed");
+
+      expect(exec.run).not.toHaveBeenCalled();
+      expect(mkdtemp).toHaveBeenCalledTimes(1);
+      const schemaDir = (await mkdtemp.mock.results[0]!.value) as string;
+      await expect(fs.stat(schemaDir)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      const created = mkdtemp.mock.results[0];
+      mkdtemp.mockRestore();
+      if (created?.type === "return") {
+        await fs.rm(await created.value, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it.each([null, undefined, "", "Owner-authored final response"])(
+    "preserves terminal tool results with canonical message %j",
+    async (canonicalMessage) => {
+      const surfacedResult =
+        canonicalMessage === null
+          ? undefined
+          : {
+              adapter: "owner",
+              value: { answer: 42 },
+              ...(canonicalMessage === undefined ? {} : { canonicalMessage }),
+            };
+      const item = { id: "item_0", type: "agent_message" as const, text: "Earlier message" };
+      const usage = {
+        input_tokens: 10,
+        cached_input_tokens: 0,
+        output_tokens: 5,
+        reasoning_output_tokens: 0,
+      };
+      const events: ThreadEvent[] = [
+        { type: "item.completed", item },
+        {
+          type: "turn.completed",
+          usage,
+          ...(surfacedResult ? { surfaced_result: surfacedResult } : {}),
+        },
+      ];
+      const exec = {
+        async *run(): AsyncGenerator<string> {
+          for (const event of events) yield JSON.stringify(event);
+        },
+      } as unknown as CodexExec;
+      const thread = new Thread(exec, {}, {});
+      const result: RunResult = await thread.run("hello");
+
+      expect(result).toEqual({
+        items: [item],
+        finalResponse: surfacedResult ? (canonicalMessage ?? "") : item.text,
+        usage,
+        ...(surfacedResult ? { surfacedResult } : {}),
+      });
+      const streamed = await thread.runStreamed("hello");
+      const received = [];
+      for await (const event of streamed.events) received.push(event);
+      expect(received).toEqual(events);
+    },
+  );
+
   it("preserves compaction lifecycle events and collects the completed item once", async () => {
     const item: ContextCompactionItem = { id: "item_0", type: "context_compaction" };
     const events = [

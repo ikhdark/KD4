@@ -214,7 +214,7 @@ enum CliCommand {
     /// Start a V2 turn that elicits an ExecCommand approval.
     #[command(name = "trigger-cmd-approval")]
     TriggerCmdApproval {
-        /// Optional prompt; defaults to a simple python command.
+        /// Optional prompt; defaults to creating a file with touch.
         user_message: Option<String>,
     },
     /// Start a V2 turn that elicits an ApplyPatch approval.

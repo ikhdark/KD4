@@ -34,9 +34,17 @@ struct WriteStdinArgs {
     #[serde(default)]
     max_output_tokens: Option<usize>,
     #[serde(default)]
-    wait_for_output: bool,
+    wait_for_output: Option<bool>,
     #[serde(default)]
     terminate: bool,
+}
+
+impl WriteStdinArgs {
+    fn waits_for_output(&self) -> bool {
+        self.wait_for_output.unwrap_or_else(|| {
+            self.chars.is_empty() && self.yield_time_ms.is_none() && !self.terminate
+        })
+    }
 }
 
 pub struct WriteStdinHandler {
@@ -98,12 +106,13 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        let wait_for_output = args.waits_for_output();
         if args.terminate && !args.chars.is_empty() {
             return Err(FunctionCallError::RespondToModel(
                 "terminate requires empty chars; send input separately".to_string(),
             ));
         }
-        if args.wait_for_output && !args.chars.is_empty() {
+        if wait_for_output && !args.chars.is_empty() {
             return Err(FunctionCallError::RespondToModel(
                 "wait_for_output requires empty chars; send input separately".to_string(),
             ));
@@ -135,14 +144,14 @@ impl WriteStdinHandler {
                 nested_deadline: source.nested_deadline(),
             };
             let manager = &session.services.unified_exec_manager;
-            let response = if args.wait_for_output {
+            let response = if wait_for_output {
                 manager.write_stdin_until_output(request)
                     .or_cancel(&cancellation_token).await
                     .map_err(|_| FunctionCallError::RespondToModel("command wait cancelled; process state remains inspectable".to_string()))?
             } else {
                 manager.write_stdin(request).await
             };
-            if !args.wait_for_output || response.as_ref().map_or(true, |output| {
+            if !wait_for_output || response.as_ref().map_or(true, |output| {
                 output.process_exited || !output.raw_output.is_empty()
                     || !output.pending_deferred_completions.is_empty()
                     || source.nested_deadline().is_some_and(|deadline| std::time::Instant::now() >= deadline)
@@ -303,6 +312,24 @@ impl CoreToolRuntime for WriteStdinHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passive_poll_default_preserves_explicit_bounds_and_writes() {
+        for (fields, passive) in [
+            (serde_json::json!({}), true),
+            (serde_json::json!({"chars":""}), true),
+            (serde_json::json!({"wait_for_output":false}), false),
+            (serde_json::json!({"yield_time_ms":1000}), false),
+            (serde_json::json!({"chars":"input"}), false),
+            (serde_json::json!({"terminate":true}), false),
+            (serde_json::json!({"yield_time_ms":1000,"wait_for_output":true}), true),
+        ] {
+            let mut value = fields;
+            value["session_id"] = 7.into();
+            let args: WriteStdinArgs = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(args.waits_for_output(), passive, "{value}");
+        }
+    }
 
     #[test]
     fn accepts_full_unsigned_session_id_range() {

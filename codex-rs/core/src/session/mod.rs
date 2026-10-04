@@ -6060,6 +6060,12 @@ impl Session {
             {
                 return Ok(None);
             }
+            // One changed fragment selects the full startup context. Append only
+            // sections whose latest value in history differs, as turn injections do.
+            let context_items = crate::stable_context::filter_unchanged_stable_context_items(
+                state.history.raw_items(),
+                context_items,
+            );
             let rollout_items = context_items
                 .iter()
                 .cloned()

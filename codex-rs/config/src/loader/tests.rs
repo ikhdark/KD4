@@ -1121,6 +1121,10 @@ fn invalid_nested_sibling_preserves_source_relative_paths() {
 [sandbox_workspace_write]
 network_access = "invalid"
 writable_roots = ["./scratch", 42]
+[debug.config_lockfile]
+export_dir = "./locks"
+load_path = "./session.lock"
+allow_codex_version_mismatch = "invalid"
 [agents.worker]
 config_file = "./worker.toml"
 nickname_candidates = 42
@@ -1142,6 +1146,18 @@ model_instructions_file = "./instructions.md"
     );
     assert_eq!(
         resolved["sandbox_workspace_write"]["network_access"].as_str(),
+        Some("invalid")
+    );
+    assert_eq!(
+        resolved["debug"]["config_lockfile"]["export_dir"].as_str(),
+        source.path().join("locks").to_str()
+    );
+    assert_eq!(
+        resolved["debug"]["config_lockfile"]["load_path"].as_str(),
+        source.path().join("session.lock").to_str()
+    );
+    assert_eq!(
+        resolved["debug"]["config_lockfile"]["allow_codex_version_mismatch"].as_str(),
         Some("invalid")
     );
     assert_eq!(

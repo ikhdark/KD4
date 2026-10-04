@@ -14,6 +14,10 @@ pub struct LMStudioClient {
 
 const LMSTUDIO_CONNECTION_ERROR: &str = "LM Studio is not responding. Install from https://lmstudio.ai/download and run 'lms server start'.";
 
+// A server may accept a connection without ever answering a metadata request.
+// Downloads and model warm-up can legitimately take longer and use separate paths.
+const SETUP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn error_with_sources(err: &dyn std::error::Error) -> String {
     let mut message = err.to_string();
     let mut source = err.source();
@@ -74,12 +78,18 @@ impl LMStudioClient {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         // Setup can run before logging is initialized, so the returned error is
         // the only place the transport cause (refused, timeout, proxy) surfaces.
-        let resp = self.client.get(&url).send().await.map_err(|err| {
-            io::Error::other(format!(
-                "{LMSTUDIO_CONNECTION_ERROR} Request to {url} failed: {}",
-                error_with_sources(&err)
-            ))
-        })?;
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(SETUP_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|err| {
+                io::Error::other(format!(
+                    "{LMSTUDIO_CONNECTION_ERROR} Request to {url} failed: {}",
+                    error_with_sources(&err)
+                ))
+            })?;
         if resp.status().is_success() {
             Ok(resp)
         } else {
@@ -126,6 +136,7 @@ impl LMStudioClient {
         let response = self
             .client
             .get(&url)
+            .timeout(SETUP_REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|e| io::Error::other(format!("Request failed: {e}")))?;
@@ -352,6 +363,35 @@ mod tests {
             .await
             .expect("server check should pass");
         assert_eq!(response.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn metadata_requests_time_out_after_connecting() {
+        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": []}))
+                    .set_delay(SETUP_REQUEST_TIMEOUT * 2),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = LMStudioClient::from_host_root(server.uri()).expect("shared HTTP client");
+        let (check, models) = tokio::time::timeout(
+            SETUP_REQUEST_TIMEOUT + std::time::Duration::from_secs(5),
+            async { tokio::join!(client.check_server(), client.fetch_models()) },
+        )
+        .await
+        .expect("metadata requests must not hang after connecting");
+        assert!(check.is_err(), "silent server probe must time out");
+        assert!(models.is_err(), "silent model listing must time out");
     }
 
     #[tokio::test]

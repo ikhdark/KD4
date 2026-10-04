@@ -1207,7 +1207,7 @@ impl BottomPaneView for RequestUserInputOverlay {
                 || self.composer.current_text_with_pending().is_empty();
         }
 
-        key_event.kind != KeyEventKind::Release
+        key_event.kind == KeyEventKind::Press
             && !self.confirm_unanswered_active()
             && !(matches!(key_event.code, KeyCode::Esc)
                 && self.has_options()
@@ -1221,6 +1221,18 @@ impl BottomPaneView for RequestUserInputOverlay {
         }
 
         self.snooze_auto_resolution();
+
+        // A held decision key must not answer the next question, queued request,
+        // or newly opened confirmation. Repeats still navigate and edit notes.
+        if key_event.kind != KeyEventKind::Press
+            && (self.interrupt_turn_keys.is_pressed(key_event)
+                || (self.focus_is_notes() && self.composer_submit_keys.is_pressed(key_event))
+                || ((self.confirm_unanswered_active() || !self.focus_is_notes())
+                    && (key_event.code == KeyCode::Enter
+                        || matches!(key_event.code, KeyCode::Char(ch) if ch.is_ascii_digit()))))
+        {
+            return;
+        }
 
         if self.confirm_unanswered_active() {
             self.handle_confirm_unanswered_key_event(key_event);
@@ -1787,6 +1799,114 @@ mod tests {
 
         overlay.submit_answers();
         assert_eq!(overlay.request.turn_id, "turn-3");
+    }
+
+    #[test]
+    fn repeated_decision_keys_do_not_answer_following_questions_or_requests() {
+        for code in [KeyCode::Enter, KeyCode::Char('1')] {
+            let (tx, mut rx) = test_sender();
+            let mut overlay = RequestUserInputOverlay::new(
+                request_event(
+                    "turn-1",
+                    vec![
+                        question_with_options("q1", "First"),
+                        question_with_options("q2", "Second"),
+                    ],
+                ),
+                tx,
+                true,
+                false,
+                true,
+            );
+            let mut queued = request_event("turn-2", vec![question_with_options("q3", "Third")]);
+            queued.item_id = "call-2".to_string();
+            overlay.try_consume_user_input_request(queued);
+            overlay.handle_key_event(KeyEvent::from(code));
+            assert_eq!(overlay.current_index(), 1);
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                overlay.handle_key_event(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind));
+                assert!(!overlay.answers[1].answer_committed);
+                assert!(rx.try_recv().is_err());
+            }
+            overlay.handle_key_event(KeyEvent::from(code));
+            assert!(matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::UserInputAnswer { .. }))));
+            assert!(matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_))));
+            assert_eq!(overlay.request.turn_id, "turn-2");
+            overlay.handle_key_event(KeyEvent::new_with_kind(
+                code, KeyModifiers::NONE, KeyEventKind::Repeat,
+            ));
+            assert!(!overlay.done);
+            assert!(!overlay.answers[0].answer_committed);
+            assert!(rx.try_recv().is_err());
+            overlay.handle_key_event(KeyEvent::from(code));
+            assert!(overlay.done);
+            assert!(matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::UserInputAnswer { .. }))));
+        }
+    }
+
+    #[test]
+    fn repeated_enter_does_not_confirm_unanswered_questions() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event("turn-1", vec![question_without_options("q1", "Notes")]),
+            tx,
+            true,
+            false,
+            true,
+        );
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(overlay.confirm_unanswered_active());
+        overlay.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat,
+        ));
+        assert!(overlay.confirm_unanswered_active());
+        assert!(!overlay.done);
+        assert!(rx.try_recv().is_err());
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(overlay.done);
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::UserInputAnswer { .. }))));
+    }
+
+    #[test]
+    fn repeated_remapped_submit_and_interrupt_do_not_decide_but_navigation_repeats() {
+        let (tx, mut rx) = test_sender();
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.composer.submit = vec![crate::key_hint::ctrl(KeyCode::Char('n'))];
+        keymap.chat.interrupt_turn = vec![crate::key_hint::ctrl(KeyCode::Char('x'))];
+        let mut overlay = RequestUserInputOverlay::new_with_keymap(
+            request_event("turn-1", vec![
+                question_without_options("q1", "Notes"),
+                question_with_options("q2", "Options"),
+            ]),
+            tx,
+            true,
+            false,
+            true,
+            keymap,
+        );
+        overlay.composer.set_text_content("draft".to_string(), Vec::new(), Vec::new());
+        for code in [KeyCode::Char('n'), KeyCode::Char('x')] {
+            let event = KeyEvent::new_with_kind(code, KeyModifiers::CONTROL, KeyEventKind::Repeat);
+            assert!(!overlay.will_interrupt_turn_on_key_event(event));
+            overlay.handle_key_event(event);
+            assert_eq!(overlay.current_index(), 0);
+            assert!(!overlay.answers[0].answer_committed);
+            assert!(!overlay.done);
+            assert!(rx.try_recv().is_err());
+        }
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(overlay.current_index(), 1);
+        assert!(overlay.answers[0].answer_committed);
+        overlay.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat,
+        ));
+        assert_eq!(overlay.selected_option_index(), Some(1));
+        let interrupt = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(overlay.will_interrupt_turn_on_key_event(interrupt));
+        overlay.handle_key_event(interrupt);
+        assert!(overlay.done);
+        let response = expect_interrupted_answer(&mut rx);
+        assert_eq!(response.answers["q1"].answers, vec!["user_note: draft"]);
     }
 
     #[test]

@@ -640,11 +640,20 @@ fn cargo_operations(args: &[String]) -> (Vec<ValidationOperation>, bool) {
 }
 
 fn cargo_subcommand_index(args: &[String]) -> Result<Option<usize>, ()> {
+    // Cargo accepts help after the subcommand too. Arguments after `--`
+    // belong to the test binary or another delegated tool, not Cargo itself.
+    if args
+        .iter()
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    {
+        return Ok(None);
+    }
     let mut index = 0;
     while let Some(argument) = args.get(index) {
         if matches!(
             argument.as_str(),
-            "--version" | "-V" | "--list" | "--help" | "-h"
+            "--version" | "-V" | "--list"
         ) {
             return Ok(None);
         }
@@ -1296,6 +1305,49 @@ mod tests {
             argv("uv", &["run", "python", "script.py", "pytest"]),
         ] {
             assert!(!is_validation(&invocation), "{invocation:?}");
+        }
+    }
+
+    #[test]
+    fn cargo_help_is_neither_validation_nor_long_running_build_work() {
+        for command in ["check", "build", "clippy", "fmt", "test", "bench"] {
+            for help in ["--help", "-h"] {
+                for args in [
+                    vec![command, help],
+                    vec![help, command],
+                    vec!["+stable", "--locked", command, "--verbose", help],
+                ] {
+                    assert_eq!(argv("cargo", &args), ValidationClassification::NonValidation, "{args:?}");
+                    let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+                    assert!(!is_build_or_discovery("cargo", &args), "{args:?}");
+                }
+            }
+        }
+        assert_eq!(
+            argv("cargo", &["nextest", "run", "--help"]),
+            ValidationClassification::NonValidation
+        );
+        assert_eq!(
+            classify_script("cargo check --help"),
+            ValidationClassification::NonValidation
+        );
+    }
+
+    #[test]
+    fn cargo_test_binary_arguments_do_not_request_cargo_help() {
+        for args in [
+            vec!["test", "--", "--help"],
+            vec!["test", "--", "-h"],
+            vec!["+stable", "test", "--", "--exact", "help"],
+        ] {
+            assert!(matches!(
+                argv("cargo", &args),
+                ValidationClassification::Validation {
+                    leaves,
+                    has_unclassified_targets: false,
+                    exit_code_is_authoritative: true,
+                } if leaves == vec![ValidationCommandDescriptor { operation: ValidationOperation::Test }]
+            ), "{args:?}");
         }
     }
 

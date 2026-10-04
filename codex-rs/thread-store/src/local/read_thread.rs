@@ -287,13 +287,8 @@ async fn read_thread_from_rollout_path(
     thread.forked_from_id = meta_line.meta.forked_from_id;
     thread.parent_thread_id = meta_line.meta.parent_thread_id;
     thread.history_mode = meta_line.meta.history_mode;
-    if let Some(model_provider) = meta_line
-        .meta
-        .model_provider
-        .filter(|provider| !provider.is_empty())
-    {
-        thread.model_provider = model_provider;
-    }
+    // The rollout summary already applies later persisted settings to the provider.
+    // SessionMeta supplies creation-only fields, not the current provider.
     if let Ok(Some(title)) =
         find_thread_name_by_id(store.config.codex_home.as_path(), &thread.thread_id).await
     {
@@ -603,6 +598,58 @@ mod tests {
             Some(std::fs::canonicalize(active_path).expect("canonical path"))
         );
         assert_eq!(thread.preview, "Hello from user");
+    }
+
+    #[tokio::test]
+    async fn rollout_reads_preserve_the_latest_model_provider() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = Uuid::from_u128(212);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let settings = serde_json::json!({
+            "timestamp": "2025-01-03T12:01:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_settings": {
+                    "model": "test-model",
+                    "model_provider_id": "updated-provider",
+                    "approval_policy": "never",
+                    "permission_profile": {"type": "disabled"},
+                    "cwd": home.path(),
+                    "collaboration_mode": {"mode": "default", "settings": {
+                        "model": "test-model",
+                        "reasoning_effort": null,
+                        "developer_instructions": null
+                    }}
+                }
+            }
+        });
+        let line: codex_protocol::protocol::RolloutLine =
+            serde_json::from_value(settings).expect("valid settings event");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open rollout");
+        writeln!(file, "{}", serde_json::to_string(&line).unwrap()).expect("append settings");
+        drop(file);
+
+        let by_id = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect("read thread");
+        let by_path = store
+            .read_thread_by_rollout_path(path, false, false)
+            .await
+            .expect("read rollout path");
+        assert_eq!(by_id.model_provider, "updated-provider");
+        assert_eq!(by_path.model_provider, "updated-provider");
     }
 
     #[tokio::test]

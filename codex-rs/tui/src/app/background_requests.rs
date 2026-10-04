@@ -441,7 +441,7 @@ impl App {
             let plugin_id_for_event = plugin_id.clone();
             let result = write_plugin_enabled(request_handle, plugin_id, enabled)
                 .await
-                .map(|_| ())
+                .and_then(config_write_applied)
                 .map_err(|err| format!("Failed to update plugin config: {err}"));
             app_event_tx.send(AppEvent::PluginEnabledSet {
                 cwd: cwd_for_event,
@@ -479,7 +479,7 @@ impl App {
             let key_for_event = key.clone();
             let result = write_hook_enabled(request_handle, key, enabled)
                 .await
-                .map(|_| ())
+                .and_then(config_write_applied)
                 .map_err(|err| {
                     format!(
                         "Failed to update hook config: {}",
@@ -505,7 +505,7 @@ impl App {
         tokio::spawn(async move {
             let result = write_hook_trust(request_handle, key, current_hash)
                 .await
-                .map(|_| ())
+                .and_then(config_write_applied)
                 .map_err(|err| format!("Failed to trust hook: {}", format_config_error(&err)));
             app_event_tx.send(AppEvent::HookTrusted { result });
         });
@@ -521,7 +521,7 @@ impl App {
         tokio::spawn(async move {
             let result = write_hook_trusts(request_handle, updates)
                 .await
-                .map(|_| ())
+                .and_then(config_write_applied)
                 .map_err(|err| format!("Failed to trust hooks: {}", format_config_error(&err)));
             app_event_tx.send(AppEvent::HookTrusted { result });
         });
@@ -1136,6 +1136,18 @@ pub(super) async fn fetch_plugin_uninstall(
         .wrap_err("plugin/uninstall failed in TUI")
 }
 
+fn config_write_applied(response: ConfigWriteResponse) -> Result<()> {
+    if response.status == WriteStatus::OkOverridden {
+        let reason = response
+            .overridden_metadata
+            .as_ref()
+            .map(|metadata| metadata.message.as_str())
+            .unwrap_or("the effective config is overridden by a higher-priority layer");
+        color_eyre::eyre::bail!("Changes were saved but not applied: {reason}");
+    }
+    Ok(())
+}
+
 pub(super) async fn write_plugin_enabled(
     request_handle: AppServerRequestHandle,
     plugin_id: String,
@@ -1227,6 +1239,25 @@ mod tests {
     use codex_app_server_protocol::PluginMarketplaceEntry;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn config_toggle_does_not_report_overridden_write_as_applied() {
+        use crate::test_support::PathBufExt;
+
+        let response = |status| ConfigWriteResponse {
+            status,
+            version: "version-1".to_string(),
+            file_path: crate::test_support::test_path_buf("/config.toml").abs(),
+            overridden_metadata: None,
+        };
+        config_write_applied(response(WriteStatus::Ok)).expect("effective write is applied");
+        let error = config_write_applied(response(WriteStatus::OkOverridden))
+            .expect_err("persisting an overridden toggle must not update the UI as applied");
+        assert_eq!(
+            error.to_string(),
+            "Changes were saved but not applied: the effective config is overridden by a higher-priority layer"
+        );
+    }
 
     #[tokio::test]
     async fn mcp_inventory_preserves_pages_and_rejects_repeated_cursors() {

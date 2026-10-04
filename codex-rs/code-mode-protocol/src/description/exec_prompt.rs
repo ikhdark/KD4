@@ -1,6 +1,6 @@
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str =
     "Some deferred nested tools may be omitted from this description.";
-const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Stable built-in tool contracts may be included below. Use those declarations directly; external and omitted contracts remain lazy. When `tool_search` is advertised, use it to activate tools that are not yet listed."#;
+const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Stable built-in tool contracts may be included below; external and omitted contracts remain lazy. When `tool_search` is advertised, use it to activate tools that are not yet listed. Use `resolve_tool("tool_search")` if needed. Resolve missing receipt contracts and execute those arguments in the same cell."#;
 pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JSON/Markdown; no Node/filesystem/network.
 - Nested tools live on the global `tools` object: `await tools.exec_command({cmd:"..."})`, `await tools.apply_patch(patchText)` if registered. Bare `exec(...)` / `exec_command(...)` alias `tools.exec_command`; `console.log(...)` aliases `text(...)`. Only `ALL_TOOL_NAMES` entries are callable.
 - Edit with `apply_patch`: nested when registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper.
@@ -16,7 +16,7 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - For a quiet running command, use `write_stdin({session_id, wait_for_output:true})` to await output or exit without periodic model handoffs. If it yields only routine progress, await the next observation in this same cell. Stop for terminal state, pending_deferred_completions, new input, cancellation, no progress requiring diagnosis, or a genuine decision. Never restart the producer.
 - Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
 - When required missing ranges or continuations are already known, recover them with bounded calls in the same exec before returning to the model. Retain full results; emit only the needed projection plus completeness and continuation controls. A successful byte fragment is not a complete JSON/JSONL record: concatenate contiguous ranges in source order and check aggregate coverage before parsing; never parse each subdivision independently. Stop on no progress, cancellation, or a new decision; do not drain unrelated output or exceed the combined output budget.
-- Output defaults to 10000 tokens, with a 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin display results carry at most 8000 output tokens, bounded by the cell hard cap. Budget the combined emitted output, not each nested call independently; reserve space for JSON escaping and lifecycle metadata rather than summing per-call maxima up to the cell limit. Use `store` to retain results and emit only the evidence needed for the next decision. Read whole useful regions; after truncation, select only missing evidence from the retained artifact. If recovery stops at its budget, follow its unconsumed selector rather than repeating the original range; preserve completion and continuation metadata when filtering recovered output.
+- Output defaults to 10000 tokens, with a 10000-token hard cap. Override with first-line `// @exec: {"max_output_tokens": 10000}`. Nested exec_command/write_stdin display results carry at most 8000 output tokens, bounded by the cell hard cap. Omit per-call `max_output_tokens` unless deliberately requesting a smaller display; the host enforces the combined emitted-output cap. Do not divide the cell budget into smaller per-call caps. Use `store` to retain results and emit only the evidence needed for the next decision. Read whole useful regions; after truncation, select only missing evidence from the retained artifact. If recovery stops at its budget, follow its unconsumed selector rather than repeating the original range; preserve completion and continuation metadata when filtering recovered output.
 
 Helpers:
 - `await run_graph([{id, deps?: string[], step_id?: string, requires?: string[], run: async (dependencies) => value, accept: async (value) => boolean}], {concurrency?: number})` executes a cell-local DAG (1–256 nodes, concurrency 1–16, default 4). Link nodes to existing update_plan step IDs with step_id; graph execution never changes checklist status or proves the whole task complete. requires lists exact ALL_TOOL_NAMES capabilities; missing capabilities, unknown dependencies, and cycles fail before any node runs. Every node requires an explicit success predicate; check tool status/exit codes there. Failed dependencies skip their descendants; independent nodes finish, then failure throws with `.results` containing every fulfilled/rejected/skipped node. Successful results are keyed by node ID with `{status:"fulfilled", value}` and the supplied step_id. No automatic retries, effect rollback, live-cell resume after a crash, or authorization to spawn agents. Use existing task-coordination tools inside nodes for authorized agent assignments, not a separate task ledger. All nested calls keep normal admission and cancellation. Prefer ordinary awaits for simple chains.
@@ -144,7 +144,9 @@ mod tests {
                     "A resolved `exec_command` call may still return a running command session.",
                     "continue that session within the current evaluation.",
                     "bounded by the cell hard cap.",
-                    "Budget the combined emitted output, not each nested call independently;",
+                    "Omit per-call `max_output_tokens` unless deliberately requesting a smaller display;",
+                    "the host enforces the combined emitted-output cap.",
+                    "Do not divide the cell budget into smaller per-call caps.",
                     "Use `store` to retain results",
                     "select only missing evidence from the retained artifact.",
                     "follow its unconsumed selector rather than repeating the original range;",
@@ -173,6 +175,7 @@ mod tests {
                     "never repeat the same call/poll",
                     "never duplicate a timed-out operation",
                     "request a larger cell budget",
+                    "Budget the combined emitted output, not each nested call independently;",
                 ] {
                     assert!(
                         !description.contains(retired),

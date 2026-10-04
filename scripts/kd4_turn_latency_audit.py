@@ -70,14 +70,16 @@ except ImportError:
     from rollout_snapshot import discover_rollouts, existing_rollout_path
 
 
-REPORT_SCHEMA_VERSION = 21
+REPORT_SCHEMA_VERSION = 22
 BEHAVIOR_SCHEMA_VERSION = 2
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 
 _MAX_RENDERED_TURNS = 10
 _MAX_SUMMARY_TURNS = 20
 _MAX_SUMMARY_TOKEN_INTERVALS = 16
-_MAX_SUMMARY_BYTES = 32 * 1024
+# Leave room for the tool envelope and other evidence in a normal model packet.
+# Detailed rows remain in --json; totals and explicit omissions are retained.
+_MAX_SUMMARY_BYTES = 16 * 1024
 # argparse owns exit status 2, so insufficient evidence cannot share it.
 _GATE_EXIT_CODES = {"passed": 0, "regression": 1, "insufficient_evidence": 3}
 _SAMPLING_PASS_TARGET_PER_COMPLETED_TURN = 8
@@ -807,6 +809,8 @@ def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
     if not representative_evidence:
         reasons.append("limited_representative_evidence")
 
+    # Compatibility field: readiness concerns timing attribution, not completion
+    # of the user's investigation, implementation, or validation requirements.
     ready = not blockers
     return {
         "readyToFinalize": ready,
@@ -819,9 +823,13 @@ def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
         "reasonCodes": reasons,
         "blockerCodes": blockers,
         "instruction": (
-            "Stop rollout inspection and answer from this report."
+            "Timing attribution is ready to summarize. Reuse this report instead of repeating covered inspection. "
             if ready
-            else "Answer from the valid evidence and state unresolved blockers. Reinspect only when an identified missing or changed input can resolve a blocker; otherwise report the limitation."
+            else "Timing attribution has unresolved blockers. Reinspect only when an identified missing or changed input can resolve a blocker; otherwise report the limitation. "
+        ) + (
+            "This timing decision does not establish completion of the user's request. "
+            "Reconcile the original request and any user-approved narrowing before final delivery. "
+            "Continue any obtainable required investigation, implementation, and validation."
         ),
     }
 
@@ -1681,8 +1689,8 @@ def analyze_session_path(
     output_channel_bytes: collections.Counter[str] = collections.Counter()
     edited_paths: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
 
-    def record_tool_batch(count: int) -> None:
-        if count:
+    def record_tool_batch(count: int, boundary_observed: bool) -> None:
+        if count and boundary_observed:
             execution_loop_counts["samplingPassesWithTools"] += 1
             if count > 1:
                 execution_loop_counts["multiToolCallSamplingPasses"] += 1
@@ -1695,6 +1703,7 @@ def analyze_session_path(
         task_started_at: dict[str, int] = {}
         active_turn_id: str | None = None
         current_sampling_boundary_ns: int | None = None
+        sampling_boundary_observed = False
         calls_since_sampling_boundary = 0
         last_tool_output_ns: int | None = None
         snapshot = read_rollout_snapshot(file)
@@ -1776,7 +1785,8 @@ def analyze_session_path(
                         else max(last_timestamp_ns, timestamp_ns)
                     )
                 if item.get("type") == "sampling_boundary":
-                    record_tool_batch(calls_since_sampling_boundary)
+                    record_tool_batch(calls_since_sampling_boundary, sampling_boundary_observed)
+                    sampling_boundary_observed = True
                     execution_loop_counts["samplingPasses"] += 1
                     if (
                         timestamp_ns is not None
@@ -1819,6 +1829,8 @@ def analyze_session_path(
                             timestamp_ns - current_sampling_boundary_ns
                         )
                     calls_since_sampling_boundary += 1
+                    if not sampling_boundary_observed:
+                        execution_loop_counts["toolCallsWithoutSamplingBoundary"] += 1
                     tool_input = _tool_input_text(payload)
                     tool_name = str(payload.get("name") or "")
                     output_channel_bytes[
@@ -1931,7 +1943,8 @@ def analyze_session_path(
                 if payload_type == "task_started" and turn_id:
                     turn_id = str(turn_id)
                     if active_turn_id != turn_id:
-                        record_tool_batch(calls_since_sampling_boundary)
+                        record_tool_batch(calls_since_sampling_boundary, sampling_boundary_observed)
+                        sampling_boundary_observed = False
                         current_sampling_boundary_ns = None
                         last_tool_output_ns = None
                         calls_since_sampling_boundary = 0
@@ -1964,7 +1977,8 @@ def analyze_session_path(
                 if pending_at_terminal and turn_id not in unresolved_tools_by_turn:
                     unresolved_tools_by_turn[turn_id] = pending_at_terminal
                 if active_turn_id == turn_id:
-                    record_tool_batch(calls_since_sampling_boundary)
+                    record_tool_batch(calls_since_sampling_boundary, sampling_boundary_observed)
+                    sampling_boundary_observed = False
                     current_sampling_boundary_ns = None
                     last_tool_output_ns = None
                     calls_since_sampling_boundary = 0
@@ -1994,7 +2008,7 @@ def analyze_session_path(
                 unresolved_tools_by_turn[str(pending_turn_id)].append(
                     str(pending.get("tool") or "unknown")
                 )
-        record_tool_batch(calls_since_sampling_boundary)
+        record_tool_batch(calls_since_sampling_boundary, sampling_boundary_observed)
 
     records = list(timed_records.values())
     for key, record in timed_records.items():
@@ -2023,6 +2037,7 @@ def analyze_session_path(
     execution_loop = {
         **dict(execution_loop_counts),
         **dict(execution_loop_ns),
+        "samplingBatchMeasurement": "observed sampling boundaries only; calls without a boundary are unclassified, not a batch",
         "unpairedToolCalls": max(
             0,
             execution_loop_counts["toolCalls"]
@@ -2264,11 +2279,12 @@ def render_report(report: dict[str, Any]) -> str:
     if execution_loop.get("samplingPasses") or execution_loop.get("toolCalls"):
         lines.append(
             "execution loop: "
-            f"{execution_loop.get('samplingPasses', 0)} sampling passes; "
+            f"{execution_loop.get('samplingPasses', 0)} observed sampling passes; "
             f"{execution_loop.get('pairedToolCalls', 0)}/"
             f"{execution_loop.get('toolCalls', 0)} tool calls paired; "
             f"multi-call passes={execution_loop.get('multiToolCallSamplingPasses', 0)}/"
             f"{execution_loop.get('samplingPassesWithTools', 0)}; "
+            f"calls without sampling boundary={execution_loop.get('toolCallsWithoutSamplingBoundary', 0)}; "
             f"sampling-to-call={execution_loop.get('samplingToFirstToolCallNs', 0) / 1e9:.1f}s "
             f"tool-round-trip per-call-sum="
             f"{execution_loop.get('pairedToolRoundTripNs', 0) / 1e9:.1f}s "

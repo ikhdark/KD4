@@ -224,6 +224,55 @@ async fn long_session_prompt_pressure_comparison() {
                 .as_u64()
                 .unwrap()
     );
+
+    // The next task uses the real sampling owner, including restart recovery.
+    // Unlike a phase checkpoint, an explicit final answer + new user boundary
+    // needs no additional model round to retire the completed task's evidence.
+    persist_tool_history_state(home.path(), "pressure", &original).await.unwrap();
+    let restored = expect_loaded_tool_history(load_tool_history_state(home.path(), "pressure").await);
+    let mut history = crate::context_manager::ContextManager::new();
+    history.set_tool_history_state(restored);
+    let message = |role: &str, text: &str, phase| ResponseItem::Message {
+        id: None, role: role.into(),
+        content: vec![codex_protocol::models::ContentItem::InputText { text: text.into() }],
+        phase, internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items(items.iter(), TruncationPolicy::Tokens(100_000));
+    history.record_items([
+        &message("assistant", "The source review is complete; the failure remains unresolved.", Some(codex_protocol::models::MessagePhase::FinalAnswer)),
+        &message("user", "Use the review to fix the failure.", None),
+    ], TruncationPolicy::Tokens(100_000));
+    let canonical = history.raw_items().to_vec();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let sampled = history.clone().prepare_for_sampling_prompt_with_completed_tool_projection(
+        &[codex_protocol::openai_models::InputModality::Text],
+        crate::stable_context::StableContextTarget::Sampling, None, &cache,
+    );
+    assert!(sampled.items().contains(&text_output("active", active)));
+    for index in 0..18 {
+        let id = format!("completed-{index}");
+        let (_, text) = sampled.items().iter().filter_map(canonical_textual_output_identity)
+            .find(|(call_id, _)| *call_id == id).unwrap();
+        let pin: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(pin["kind"], "tool_history_artifact_pin");
+        assert_eq!(pin["bytes"], source.len());
+        assert_eq!(pin["sha256"], sha256(source.as_bytes()));
+        assert_eq!(read_exact_tool_output_artifact(
+            home.path(), "pressure", pin["artifact_id"].as_str().unwrap(),
+        ).await.unwrap(), source.as_bytes());
+        let (recovered, _) = crate::tools::handlers::execute_recovery_transaction(
+            home.path(), "pressure", pin["artifact_id"].as_str().unwrap(),
+            vec![ToolOutputSelector::Lines { start: 1, end: 2 }], false,
+        ).await.unwrap();
+        assert!(recovered.complete);
+        assert_eq!(recovered.results[0].text.as_deref().unwrap().lines().collect::<Vec<_>>(),
+            source.lines().take(2).collect::<Vec<_>>());
+    }
+    let tokens = |items: &[ResponseItem]| items.iter().filter_map(canonical_textual_output_identity)
+        .map(|(_, text)| codex_utils_output_truncation::model_token_count(&text)).sum::<usize>();
+    assert!(tokens(sampled.items()) * 2 < tokens(&canonical));
+    assert_eq!(history.raw_items(), canonical, "canonical evidence remains unchanged");
+    eprintln!("completed-task-projection input_tool_tokens_before={} after={}", tokens(&canonical), tokens(sampled.items()));
 }
 
 #[test]
@@ -1037,6 +1086,7 @@ use crate::tools::handlers::command_search::RgSearchBreadth;
 use crate::tools::handlers::command_search::RgSearchNarrowing;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_tools::CanonicalToolResult;
+use codex_utils_output_truncation::TruncationPolicy;
 use pretty_assertions::assert_eq;
 
 fn bounded_output() -> String {
@@ -2343,6 +2393,103 @@ fn listings_git_reads_and_path_cmdlets_scope_without_making_batches_opaque() {
             expected,
             "{shell}: {command}"
         );
+    }
+}
+
+#[test]
+fn select_string_named_pattern_retains_positional_paths() {
+    let cases: &[&[&str]] = &[
+        &["-Pattern", "needle", "src/second.rs"],
+        &["src/second.rs", "-Pattern", "needle"],
+        &["src/second.rs", "-pAtTeRn", "needle"],
+        &["needle", "src/second.rs"],
+        &["-Pattern", "needle", "-Path", "src/second.rs"],
+        &["-Path", "src/second.rs", "needle"],
+    ];
+    for case in cases {
+        let arguments = case.iter().map(|word| (*word).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            powershell_path_operands(&arguments, &["-pattern"], true),
+            Some(vec!["src/second.rs".to_string()]),
+            "{case:?}"
+        );
+    }
+    assert_eq!(
+        powershell_path_operands(&["-Pattern".into(), "needle".into()], &["-pattern"], true),
+        Some(Vec::new()),
+        "a named pattern without a path remains a pipeline filter"
+    );
+    for case in [&["-Pattern"][..], &["-Pattern", "-Path", "src/second.rs"][..]] {
+        let arguments = case.iter().map(|word| (*word).to_string()).collect::<Vec<_>>();
+        assert_eq!(powershell_path_operands(&arguments, &["-pattern"], true), None);
+    }
+    let wildcard = powershell_path_operands(
+        &["-Pattern".into(), "needle".into(), "src/*.rs".into()],
+        &["-pattern"],
+        true,
+    );
+    assert!(matches!(
+        literal_path_dependencies(wildcard, Path::new("/repo")),
+        Some(PlainCommandDependencies::Unknown)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn select_string_named_pattern_batch_invalidates_when_positional_path_changes() {
+    let cwd = Path::new("/repo");
+    for search in [
+        "Select-String -Pattern 'needle' src/second.rs",
+        "Select-String src/second.rs -pAtTeRn 'needle'",
+    ] {
+        let arguments = serde_json::json!({
+            "cmd": format!("Get-Content src/first.rs; {search}"),
+            "shell": "powershell",
+        });
+        let payload = ToolPayload::Function { arguments: arguments.to_string() };
+        let classification = classify_workspace_tool_call("exec_command", &payload, cwd);
+        assert_eq!(
+            classification.source_dependencies,
+            BTreeSet::from([
+                SourceDependencyV1::new(&cwd.join("src/first.rs"), false),
+                SourceDependencyV1::new(&cwd.join("src/second.rs"), false),
+            ]),
+            "{search}"
+        );
+        let call_id = "named-pattern-batch";
+        let output = text_output(call_id, "first file and matching second file".to_string());
+        let canonical: Arc<[ResponseItem]> = Arc::from([
+            named_function_call_with_arguments(call_id, "exec_command", arguments),
+            output.clone(),
+        ]);
+        let mut state = ToolHistoryState::default();
+        state.register_workspace_evidence(
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(workspace_identity("captured")),
+                &output,
+                classification.source_dependencies,
+            )
+            .expect("batch observation"),
+        );
+        let unrelated = workspace_identity("unrelated");
+        state.invalidate_source_dependencies(
+            Some(&BTreeSet::from([cwd.join("notes.txt")])),
+            Some(&unrelated),
+        );
+        assert_eq!(
+            state.project_with_workspace_identity(Arc::clone(&canonical), Some(&unrelated)).items,
+            canonical
+        );
+        let changed = workspace_identity("second-file-changed");
+        state.invalidate_source_dependencies(
+            Some(&BTreeSet::from([cwd.join("src/second.rs")])),
+            Some(&changed),
+        );
+        let projected = state.project_with_workspace_identity(canonical, Some(&changed));
+        let (_, text) = textual_output_identity(&projected.items[1]).expect("stale result");
+        let notice: serde_json::Value = serde_json::from_str(text).expect("stale evidence notice");
+        assert_eq!(notice["stale_workspace_evidence"], true, "{search}");
+        assert_eq!(notice["reason_code"], "source_dependencies_invalidated", "{search}");
     }
 }
 

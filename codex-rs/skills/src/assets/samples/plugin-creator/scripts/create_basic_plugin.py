@@ -53,6 +53,22 @@ def display_name_from_plugin_name(plugin_name: str) -> str:
     return " ".join(part.capitalize() for part in re.split(r"[-_]+", plugin_name))
 
 
+def validate_marketplace_destination(marketplace_path: Path, plugin_root: Path) -> None:
+    # Match the layouts resolved by core-plugins' marketplace_root_dir.
+    for layout in (
+        Path(".agents/plugins/marketplace.json"),
+        Path(".agents/plugins/api_marketplace.json"),
+        Path(".claude-plugin/marketplace.json"),
+    ):
+        if marketplace_path.parts[-len(layout.parts):] == layout.parts:
+            root = marketplace_path.parents[len(layout.parts) - 1]
+            expected = (root / "plugins" / plugin_root.name).resolve()
+            if plugin_root != expected:
+                raise ValueError(f"Use --path {expected.parent} for this marketplace.")
+            return
+    raise ValueError("Marketplace file is not in a supported marketplace layout.")
+
+
 def build_plugin_json(
     plugin_name: str, *, with_mcp: bool, with_apps: bool
 ) -> dict[str, Any]:
@@ -146,14 +162,14 @@ def update_marketplace_json(
     validate_marketplace_interface(payload)
 
     existing_marketplace_name = payload.get("name")
+    if (
+        not isinstance(existing_marketplace_name, str)
+        or not existing_marketplace_name.strip()
+    ):
+        raise ValueError(
+            f"{marketplace_path} must contain a non-empty string 'name'."
+        )
     if marketplace_name is not None:
-        if (
-            not isinstance(existing_marketplace_name, str)
-            or not existing_marketplace_name.strip()
-        ):
-            raise ValueError(
-                f"{marketplace_path} must contain a non-empty string 'name'."
-            )
         if existing_marketplace_name != marketplace_name:
             raise ValueError(
                 f"{marketplace_path} already uses marketplace name "
@@ -293,6 +309,9 @@ def main() -> None:
         validate_marketplace_name(marketplace_name)
 
     plugin_root = Path(args.path).expanduser().resolve() / plugin_name
+    if args.with_marketplace:
+        marketplace_path = Path(args.marketplace_path).expanduser().resolve()
+        validate_marketplace_destination(marketplace_path, plugin_root)
     plugin_root.mkdir(parents=True, exist_ok=True)
 
     plugin_json_path = plugin_root / ".codex-plugin" / "plugin.json"
@@ -331,7 +350,6 @@ def main() -> None:
         )
 
     if args.with_marketplace:
-        marketplace_path = Path(args.marketplace_path).expanduser().resolve()
         update_marketplace_json(
             marketplace_path,
             marketplace_name,

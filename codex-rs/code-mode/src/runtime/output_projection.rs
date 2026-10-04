@@ -32,9 +32,9 @@ const PROJECTOR: &str = r#"(() => {
   }
   const escapes = (text) => stringify(text).length !== text.length + 2;
   const lineCount = (text) => text.split('\n').length;
-  // A whole command or file-read result prints its text raw after a one-line
-  // envelope that counts the lines following it; JSON escaping would otherwise
-  // turn every newline and quote of source text into an escape sequence.
+  // Registered results, including ones inside batches, keep their JSON shape
+  // in a one-line envelope. Counted text bodies follow in traversal order.
+  // Only tool-owned text slots qualify, never arbitrary user JSON strings.
   function rawText(projected) {
     if (projected === null || typeof projected !== 'object' || Array.isArray(projected)) {
       return undefined;
@@ -43,20 +43,29 @@ const PROJECTOR: &str = r#"(() => {
       const {output, ...envelope} = projected;
       if (!escapes(output)) return undefined;
       envelope.output_lines = lineCount(output);
-      return stringify(envelope) + '\n' + output;
+      return {envelope, texts: [output]};
     }
     if (Array.isArray(projected.results) && !('output' in projected)) {
       const texts = [];
-      const results = projected.results.map((result) => {
-        if (result === null || typeof result !== 'object' || typeof result.text !== 'string') {
-          return result;
+      const frame = (item) => {
+        if (item === null || typeof item !== 'object' || typeof item.text !== 'string') {
+          return item;
         }
-        const {text, ...rest} = result;
+        const {text, ...rest} = item;
         texts.push(text);
         return {...rest, text_lines: lineCount(text)};
+      };
+      const results = projected.results.map((result) => {
+        const framed = frame(result);
+        if (result?.selector?.kind === 'search' &&
+            Array.isArray(result.value?.hydrated_ranges)) {
+          return {...framed, value: {...result.value,
+            hydrated_ranges: result.value.hydrated_ranges.map(frame)}};
+        }
+        return framed;
       });
       if (!texts.some(escapes)) return undefined;
-      return stringify({...projected, results}) + '\n' + texts.join('\n');
+      return {envelope: {...projected, results}, texts};
     }
     return undefined;
   }
@@ -67,15 +76,16 @@ const PROJECTOR: &str = r#"(() => {
       return;
     }
     if (!active) return stringify(value);
-    const whole = value !== null && typeof value === 'object' ? get(value) : undefined;
-    if (whole && same(value, whole.original)) {
-      const raw = rawText(whole.projected);
-      if (raw !== undefined) return raw;
-    }
-    return stringify(value, (_key, item) => {
+    const texts = [];
+    const rendered = stringify(value, (_key, item) => {
       const entry = item !== null && typeof item === 'object' ? get(item) : undefined;
-      return entry && same(item, entry.original) ? entry.projected : item;
+      if (!entry || !same(item, entry.original)) return item;
+      const raw = rawText(entry.projected);
+      if (raw === undefined) return entry.projected;
+      texts.push(...raw.texts);
+      return raw.envelope;
     });
+    return texts.length ? rendered + '\n' + texts.join('\n') : rendered;
   };
 })()"#;
 
@@ -263,78 +273,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_command_result_prints_text_raw_after_counted_envelope() {
-        let raw = json!({"chunk_id":"transport", "output":"line \"one\"\nline two",
+    async fn whole_and_batched_text_results_print_raw_after_counted_envelopes() {
+        let source = "fn a() {\r\n    \"λ\\path\";\r\n}\r\n".repeat(128);
+        let lines = source.split('\n').count();
+        let command = json!({"chunk_id":"transport", "output":source,
             "exit_code":0, "execution_state":"exited", "process_exited":true,
             "output_complete":true});
-        let mut envelope = codex_code_mode_protocol::model_visible_tool_result(
+        let mut command_envelope = codex_code_mode_protocol::model_visible_tool_result(
             &ToolName::plain("exec_command"),
-            &raw,
+            &command,
         )
         .unwrap();
-        envelope.as_object_mut().unwrap().remove("output");
-        envelope["output_lines"] = json!(2);
-        let (event_tx, mut rx) = mpsc::unbounded_channel();
-        let request = ExecuteRequest {
-            state_path: None,
-            tool_call_id: "raw-projection".into(),
-            enabled_tools: vec![ToolDefinition {
-                name: "exec_command".into(),
-                tool_name: ToolName::plain("exec_command"),
-                kind: CodeModeToolKind::Function,
-                description: "".into(),
-                input_schema: None,
-                output_schema: None,
-                default_timeout_ms: None,
-            }].into(),
-            source: "const r = await tools.exec_command({}); text(r); r.extra = 1; text(r);"
-                .to_string(),
-            yield_time_ms: None,
-            max_output_tokens: None,
-            default_tool_timeout_ms: None,
-        };
-        let (tx, _termination) = spawn_runtime(
-            HashMap::new(),
-            request,
-            60_000,
-            event_tx,
-            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),
-            None,
-        )
-        .await
-        .unwrap();
-        let mut printed = Vec::new();
-        loop {
-            let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            match event {
-                RuntimeEvent::Started => {}
-                RuntimeEvent::ToolCall { id, .. } => tx
-                    .send(RuntimeCommand::ToolResponse {
-                        id,
-                        result: raw.clone(),
-                    })
-                    .unwrap(),
-                RuntimeEvent::ContentItem {
-                    item: FunctionCallOutputContentItem::InputText { text },
-                    ..
-                } => printed.push(text),
-                RuntimeEvent::Result { error_text, .. } => {
-                    assert_eq!(error_text, None);
-                    break;
+        command_envelope.as_object_mut().unwrap().remove("output");
+        command_envelope["output_lines"] = json!(lines);
+        // Recovered source keeps its CRLF bytes and quotes unescaped too.
+        let recovery = json!({"artifact_id":"retained", "complete":true,
+            "results":[{"status":"ok", "text":"fn a() {\r\n    \"x\"\r\n}"}]});
+        let recovery_envelope = json!({"artifact_id":"retained", "complete":true,
+            "results":[{"status":"ok", "text_lines":3}]});
+        let search = json!({"artifact_id":"search-evidence", "complete":false,
+            "results":[{"selector":{"kind":"search","query":"fn a"}, "status":"ok",
+                "continuation":{"kind":"search","query":"fn a","start_byte":source.len()},
+                "value":{"coverage_complete":false, "remaining_match_count":1,
+                    "hydrated_ranges":[{"canonical_range":{"start":0,"end":source.len()}, "text":source},
+                        {"canonical_range":{"start":0,"end":source.len()},"shared":true},
+                        {"canonical_range":{"start":source.len(),"end":source.len()+1},"data_base64":"/w=="}]}}]});
+        let mut search_envelope = search.clone();
+        let hydrated = &mut search_envelope["results"][0]["value"]["hydrated_ranges"][0];
+        hydrated.as_object_mut().unwrap().remove("text");
+        hydrated["text_lines"] = json!(lines);
+        for (fixture, name, raw, envelope, body) in [
+            (
+                "command",
+                "exec_command",
+                command,
+                command_envelope,
+                source.as_str(),
+            ),
+            (
+                "recovery",
+                "read_tool_output",
+                recovery,
+                recovery_envelope,
+                "fn a() {\r\n    \"x\"\r\n}",
+            ),
+            ("search", "read_tool_output", search, search_envelope, source.as_str()),
+        ] {
+            let (event_tx, mut rx) = mpsc::unbounded_channel();
+            let request = ExecuteRequest {
+                state_path: None,
+                tool_call_id: "raw-projection".into(),
+                enabled_tools: vec![ToolDefinition {
+                    name: name.into(),
+                    tool_name: ToolName::plain(name),
+                    kind: CodeModeToolKind::Function,
+                    description: "".into(),
+                    input_schema: None,
+                    output_schema: None,
+                    default_timeout_ms: None,
+                }]
+                .into(),
+                source: format!(
+                    "const r = await tools.{name}({{}}); text(r); text({{part:7, results:[r,r]}}); store('raw', r); r.extra = 1; text(r);"
+                ),
+                yield_time_ms: None,
+                max_output_tokens: None,
+                default_tool_timeout_ms: None,
+            };
+            let (tx, _termination) = spawn_runtime(
+                HashMap::new(),
+                request,
+                60_000,
+                event_tx,
+                Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),
+                None,
+            )
+            .await
+            .unwrap();
+            let mut printed = Vec::new();
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match event {
+                    RuntimeEvent::Started => {}
+                    RuntimeEvent::ToolCall { id, .. } => tx
+                        .send(RuntimeCommand::ToolResponse {
+                            id,
+                            result: raw.clone(),
+                        })
+                        .unwrap(),
+                    RuntimeEvent::ContentItem {
+                        item: FunctionCallOutputContentItem::InputText { text },
+                        ..
+                    } => printed.push(text),
+                    RuntimeEvent::Result { error_text, stored_value_writes, output_loss } => {
+                        assert_eq!(error_text, None);
+                        assert_eq!(output_loss, None);
+                        assert_eq!(*stored_value_writes["raw"].value, raw);
+                        break;
+                    }
+                    other => panic!("unexpected event {other:?}"),
                 }
-                other => panic!("unexpected event {other:?}"),
             }
+            assert_eq!(printed.len(), 3, "{name}");
+            let (header, printed_body) = printed[0].split_once('\n').unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(header).unwrap(),
+                envelope,
+                "{name}"
+            );
+            assert_eq!(printed_body, body, "{name}");
+            let (header, printed_body) = printed[1].split_once('\n').unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(header).unwrap(),
+                json!({"part":7, "results":[envelope.clone(), envelope]}),
+                "batch identity and result ordering must survive projection"
+            );
+            assert_eq!(printed_body, format!("{body}\n{body}"), "{name}");
+            let projected = codex_code_mode_protocol::model_visible_tool_result(&ToolName::plain(name), &raw).unwrap();
+            let old_batch = json!({"part":7,"results":[projected.clone(),projected]}).to_string();
+            if fixture != "recovery" {
+                assert!(printed[1].len() < old_batch.len());
+            }
+            println!("projection_audit {fixture} raw_bytes={} whole_bytes={} batch_before_bytes={} batch_after_bytes={}",
+                raw.to_string().len(), printed[0].len(), old_batch.len(), printed[1].len());
+            // A modified result is no longer the tool's own value: print it as JSON.
+            let mut changed = raw;
+            changed["extra"] = json!(1);
+            assert_eq!(
+                serde_json::from_str::<Value>(&printed[2]).unwrap(),
+                changed,
+                "{name}"
+            );
         }
-        assert_eq!(printed.len(), 2);
-        let (header, body) = printed[0].split_once('\n').unwrap();
-        assert_eq!(serde_json::from_str::<Value>(header).unwrap(), envelope);
-        assert_eq!(body, "line \"one\"\nline two");
-        // A modified result is no longer the tool's own value: print it as JSON.
-        let mut changed = raw;
-        changed["extra"] = json!(1);
-        assert_eq!(serde_json::from_str::<Value>(&printed[1]).unwrap(), changed);
     }
 }

@@ -1629,6 +1629,41 @@ fn developer_input_texts(items: &[ResponseItem]) -> Vec<&str> {
         .collect()
 }
 
+/// One changed fragment selects the full startup context, but history must
+/// gain only that change: sections it already holds unchanged are not repeated.
+fn assert_reinjection_appends_only_changed_sections(
+    previous: &[ResponseItem],
+    appended: &[ResponseItem],
+    full_reinjection: &[ResponseItem],
+    changed_text: &str,
+) {
+    let appended_texts = developer_input_texts(appended);
+    assert_eq!(
+        appended_texts
+            .iter()
+            .filter(|text| text.contains(changed_text))
+            .count(),
+        1,
+        "the changed fragment must be recorded exactly once: {appended_texts:?}"
+    );
+    let permissions = developer_input_texts(full_reinjection)
+        .into_iter()
+        .find(|text| text.starts_with("<permissions instructions>"))
+        .expect("full startup context includes permissions");
+    assert!(developer_input_texts(previous).contains(&permissions));
+    assert!(
+        !appended_texts.contains(&permissions),
+        "unchanged permissions must not be appended again"
+    );
+    let text_len = |items: &[ResponseItem]| {
+        developer_input_texts(items)
+            .iter()
+            .map(|text| text.len())
+            .sum::<usize>()
+    };
+    assert!(text_len(appended) < text_len(full_reinjection));
+}
+
 fn developer_message_texts(items: &[ResponseItem]) -> Vec<Vec<&str>> {
     items
         .iter()
@@ -13500,10 +13535,11 @@ async fn record_context_updates_reinjects_full_context_when_model_visible_fragme
         .unwrap();
 
     let history = session.clone_history().await;
-    assert_eq!(
-        strip_response_item_ids(&history.raw_items()[previous_history_len..]),
-        strip_response_item_ids(&expected_reinjection),
-        "changed model-visible context fragments should invalidate the accepted baseline"
+    assert_reinjection_appends_only_changed_sections(
+        &history.raw_items()[..previous_history_len],
+        &history.raw_items()[previous_history_len..],
+        &expected_reinjection,
+        "new model-visible instructions",
     );
     let projection = crate::stable_context::project_stable_context(
         history.raw_items().to_vec().into(),
@@ -13556,10 +13592,11 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
         .unwrap();
     commit_test_context_baseline(&session, "changed-multi-agent-usage-hint").await;
     let changed_history = session.clone_history().await;
-    assert_eq!(
-        strip_response_item_ids(&changed_history.raw_items()[previous_history_len..]),
-        strip_response_item_ids(&expected_changed_reinjection),
-        "changing the usage hint should reinject authoritative full context"
+    assert_reinjection_appends_only_changed_sections(
+        &changed_history.raw_items()[..previous_history_len],
+        &changed_history.raw_items()[previous_history_len..],
+        &expected_changed_reinjection,
+        "Changed root guidance.",
     );
     let changed_history_len = changed_history.raw_items().len();
     drop(changed_history);
@@ -13585,13 +13622,16 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
         .await
         .unwrap();
     let removed_history = session.clone_history().await;
-    assert_eq!(
-        strip_response_item_ids(&removed_history.raw_items()[changed_history_len..]),
-        strip_response_item_ids(&expected_removed_reinjection),
-        "removing the usage hint should reinject authoritative full context"
+    assert_reinjection_appends_only_changed_sections(
+        &removed_history.raw_items()[..changed_history_len],
+        &removed_history.raw_items()[changed_history_len..],
+        &expected_removed_reinjection,
+        "<multi_agent_usage_hint state=\"removed\" />",
     );
     assert!(
-        !developer_input_texts(&expected_removed_reinjection).contains(&"Changed root guidance."),
+        !developer_input_texts(&expected_removed_reinjection)
+            .iter()
+            .any(|text| text.contains("Changed root guidance.")),
         "authoritative reinjection after removal must omit the stale usage hint"
     );
     let projection = crate::stable_context::project_stable_context(
@@ -13599,7 +13639,9 @@ async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hi
         crate::stable_context::StableContextTarget::Sampling,
     );
     assert!(
-        !developer_input_texts(&projection.items).contains(&"Changed root guidance."),
+        !developer_input_texts(&projection.items)
+            .iter()
+            .any(|text| text.contains("Changed root guidance.")),
         "the final sampling prompt must not retain removed multi-agent guidance"
     );
 }

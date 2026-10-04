@@ -42,6 +42,7 @@
 use crate::fuzzy_match::fuzzy_match;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
@@ -571,7 +572,11 @@ impl BottomPaneView for MultiSelectPicker {
                 code: KeyCode::Char(' '),
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => self.toggle_selected(),
+            } => {
+                if key_event.kind == KeyEventKind::Press {
+                    self.toggle_selected();
+                }
+            }
             _ if self.keymap.accept.is_pressed(key_event) => self.confirm_selection(),
             _ if self.keymap.cancel.is_pressed(key_event) => self.close(),
             KeyEvent {
@@ -945,6 +950,24 @@ mod tests {
             section_break_after,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn held_space_toggles_only_once_and_does_not_start_search() {
+        let mut picker = test_picker(vec![item("model", true, false)]);
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(picker.items[0].enabled);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            picker.handle_key_event(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                kind,
+            ));
+            assert!(picker.items[0].enabled);
+            assert!(picker.search_query.is_empty());
+        }
+        picker.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(!picker.items[0].enabled);
     }
 
     #[test]

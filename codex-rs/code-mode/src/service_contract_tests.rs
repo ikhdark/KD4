@@ -357,25 +357,40 @@ async fn yields_again_after_the_previous_yield_was_observed() {
 
 #[tokio::test]
 async fn passive_command_wait_has_no_default_nested_deadline() {
-    let (delegate, mut events_rx) = BlockingDelegate::new();
-    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
-    let mut tool = blocking_tool();
-    tool.name = "write_stdin".into();
-    tool.tool_name = ToolName::plain("write_stdin");
-    tool.default_timeout_ms = Some(10);
-    let cell = service.execute(ExecuteRequest {
-        enabled_tools: vec![tool].into(),
-        source: "await tools.write_stdin({session_id:7, wait_for_output:true}); text('completed');".into(),
-        yield_time_ms: Some(60_000),
-        ..execute_request("")
-    }).await.unwrap();
-    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(events_rx.try_recv().is_err(), "passive wait must not time out");
-    delegate.tool_release.notify_one();
-    let response = cell.initial_response().await.unwrap();
-    assert!(matches!(response, RuntimeResponse::Result { error_text: None, .. }));
-    service.shutdown().await.unwrap();
+    for (arguments, options, bounded) in [
+        ("{session_id:7}", "", false),
+        ("{session_id:7, chars:''}", "", false),
+        ("{session_id:7, wait_for_output:true}", "", false),
+        ("{session_id:7, wait_for_output:false}", "", true),
+        ("{session_id:7, yield_time_ms:1}", "", true),
+        ("{session_id:7, chars:'input'}", "", true),
+        ("{session_id:7, terminate:true}", "", true),
+        ("{session_id:7}", ", {timeout_ms:10}", true),
+    ] {
+        let (delegate, mut events_rx) = BlockingDelegate::new();
+        let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+        let mut tool = blocking_tool();
+        tool.name = "write_stdin".into();
+        tool.tool_name = ToolName::plain("write_stdin");
+        tool.default_timeout_ms = Some(10);
+        let cell = service.execute(ExecuteRequest {
+            enabled_tools: vec![tool].into(),
+            source: format!("await tools.write_stdin({arguments}{options}); text('completed');"),
+            yield_time_ms: Some(60_000),
+            ..execute_request("")
+        }).await.unwrap();
+        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+        if !bounded {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(events_rx.try_recv().is_err(), "passive wait must not time out");
+            delegate.tool_release.notify_one();
+        }
+        let RuntimeResponse::Result { error_text, .. } = cell.initial_response().await.unwrap() else {
+            panic!("expected a terminal result");
+        };
+        assert_eq!(error_text.is_some(), bounded, "{arguments}{options}");
+        service.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

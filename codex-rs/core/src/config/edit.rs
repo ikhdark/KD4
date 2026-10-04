@@ -6,7 +6,6 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::version_for_toml;
-use codex_features::feature_for_key;
 use codex_file_system::acquire_atomic_write_lock;
 use codex_file_system::resolve_symlink_write_paths;
 use codex_file_system::write_atomically;
@@ -450,15 +449,21 @@ impl ConfigDocument {
                 return false;
             };
 
-            let existing_index = overrides.iter().enumerate().find_map(|(idx, table)| {
-                skill_config_selector_from_table(table)
-                    .filter(|value| value == &selector)
-                    .map(|_| idx)
-            });
+            let existing_indices: Vec<_> = overrides
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, table)| {
+                    skill_config_selector_from_table(table)
+                        .filter(|value| value == &selector)
+                        .map(|_| idx)
+                })
+                .collect();
 
             if enabled {
-                if let Some(index) = existing_index {
-                    overrides.remove(index);
+                if !existing_indices.is_empty() {
+                    for index in existing_indices.into_iter().rev() {
+                        overrides.remove(index);
+                    }
                     mutated = true;
                     if overrides.is_empty() {
                         skills_table.remove("config");
@@ -467,13 +472,12 @@ impl ConfigDocument {
                         }
                     }
                 }
-            } else if let Some(index) = existing_index {
-                for (idx, table) in overrides.iter_mut().enumerate() {
-                    if idx == index {
+            } else if !existing_indices.is_empty() {
+                for table in overrides.iter_mut() {
+                    if skill_config_selector_from_table(table).as_ref() == Some(&selector) {
                         write_skill_config_selector(table, &selector);
                         table["enabled"] = value(false);
                         mutated = true;
-                        break;
                     }
                 }
             } else {
@@ -802,21 +806,13 @@ impl ConfigEditsBuilder {
 
     /// Enable or disable a feature flag by key under the `[features]` table.
     ///
-    /// Disabling a default-false feature clears the key instead of
-    /// persisting `false`, so the config does not pin the feature once it
-    /// graduates to globally enabled.
+    /// Persist an explicit value even when it matches the default, so a
+    /// lower-precedence config layer cannot undo the requested toggle.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
-        let feature = feature_for_key(key);
-        let segments = vec!["features".to_string(), key.to_string()];
-        let is_default_false_feature = feature.is_some_and(|feature| !feature.default_enabled());
-        if enabled || !is_default_false_feature {
-            self.edits.push(ConfigEdit::SetPath {
-                segments,
-                value: value(enabled),
-            });
-        } else {
-            self.edits.push(ConfigEdit::ClearPath { segments });
-        }
+        self.edits.push(ConfigEdit::SetPath {
+            segments: vec!["features".to_string(), key.to_string()],
+            value: value(enabled),
+        });
         self
     }
 

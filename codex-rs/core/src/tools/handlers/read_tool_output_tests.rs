@@ -29,7 +29,7 @@ async fn explicit_nested_recovery_does_not_hide_a_model_handoff() {
     .into_iter()
     .enumerate()
     {
-        let result = ReadToolOutputHandler
+        let output = ReadToolOutputHandler
             .handle(ToolInvocation {
                 session: std::sync::Arc::clone(&session),
                 step_context: crate::session::step_context::StepContext::for_test(
@@ -45,9 +45,22 @@ async fn explicit_nested_recovery_does_not_hide_a_model_handoff() {
                 payload: payload.clone(),
             })
             .await
-            .expect("explicit recovery")
-            .code_mode_result(&payload);
+            .expect("explicit recovery");
+        let result = output.code_mode_result(&payload);
         assert_eq!(result["results"][0]["text"], "retained evidence\n");
+        assert_eq!(result["delivered_selection_complete"], true);
+        assert_eq!(result["retained_bytes"], result["canonical_bytes"]);
+        let ResponseInputItem::FunctionCallOutput { output: visible, .. } =
+            output.to_response_item("recovered", &payload) else { panic!("function output") };
+        let visible: Value = serde_json::from_str(&visible.body.to_text().unwrap()).unwrap();
+        assert!(visible.get("delivered_selection_complete").is_none());
+        assert!(visible.get("retained_bytes").is_none());
+        assert!(visible["results"][0].get("exact_bytes").is_none());
+        for field in ["artifact_id", "canonical_sha256", "canonical_bytes", "complete", "retained_artifact_complete"] {
+            assert_eq!(visible[field], result[field], "{field}");
+        }
+        assert_eq!(visible["results"][0]["text"], result["results"][0]["text"]);
+        assert_eq!(output.canonical_result(&payload).unwrap().value, Some(result));
 
         let mut pending = Some(crate::turn_timing::ContinuationCause::ToolResult);
         turn.turn_timing_state.begin_model_generation(
@@ -238,7 +251,7 @@ async fn byte_budget_delivers_an_exact_prefix_and_resumable_remainder() {
 }
 
 #[tokio::test]
-async fn recovery_uses_actual_cell_budget_with_a_minimum_page() {
+async fn recovery_data_is_independent_of_display_budget_and_keeps_byte_bounds() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let session = std::sync::Arc::new(session);
     let turn = std::sync::Arc::new(turn);
@@ -251,6 +264,7 @@ async fn recovery_uses_actual_cell_budget_with_a_minimum_page() {
         crate::tool_history::sha256(text.as_bytes())).await;
     let cell = codex_code_mode::CellId::new("bounded-recovery".into());
     session.services.code_mode_service.record_cell_parent_call_id(&cell, "outer");
+    let mut previous = None;
     for budget in [0, 512, 4_000, 10_000] {
         session.services.code_mode_service.record_output_budget(&cell, Some(budget));
         let payload = ToolPayload::Function { arguments: serde_json::json!({
@@ -268,7 +282,11 @@ async fn recovery_uses_actual_cell_budget_with_a_minimum_page() {
             payload: payload.clone(),
         }).await;
         let output = result.unwrap().code_mode_result(&payload);
-        assert!(codex_utils_string::approx_token_count(&output.to_string()) <= budget.max(896) - 384 + 128);
+        assert!(codex_utils_string::approx_token_count(&output.to_string()) <= CODE_MODE_RECOVERY_TOKEN_CEILING + 128);
+        if let Some(previous) = &previous {
+            assert_eq!(&output, previous, "display budget {budget} changed exact recovery");
+        }
+        previous = Some(output.clone());
         assert_eq!(output["complete"], false);
         let pages = output["results"].as_array().unwrap().iter()
             .filter(|page| page["text"].is_string()).collect::<Vec<_>>();
@@ -279,9 +297,7 @@ async fn recovery_uses_actual_cell_budget_with_a_minimum_page() {
             assert_eq!(page["text"].as_str().unwrap(), &text[start..end]);
         }
         assert!(output.get("continuation_stop").is_some());
-        if budget >= 4_000 {
-            assert!(!output["continuation_stop"]["page_selectors"].as_array().unwrap().is_empty());
-        }
+        assert!(!output["continuation_stop"]["page_selectors"].as_array().unwrap().is_empty());
         let history = serde_json::to_value(session.clone_history().await.tool_history_state()).unwrap();
         assert_eq!(history["recovered_call_ids"], serde_json::json!(["producer", "recover"]));
     }

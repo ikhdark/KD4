@@ -173,8 +173,12 @@ pub(crate) fn should_use_remote_compact_task(
     provider.supports_remote_compaction() && compact_prompt.is_none()
 }
 
-fn incremental_summarization_prompt(compact_prompt: Option<&str>) -> &str {
-    compact_prompt.unwrap_or(INCREMENTAL_SUMMARIZATION_PROMPT)
+fn incremental_summarization_prompt(compact_prompt: Option<&str>) -> Option<&'static str> {
+    // Both entrypoints already supply the custom prompt as the initial input.
+    // Only the default prompt needs additional incremental-summary guidance.
+    compact_prompt
+        .is_none()
+        .then_some(INCREMENTAL_SUMMARIZATION_PROMPT)
 }
 
 enum CompactionClientSession<'a, T> {
@@ -398,10 +402,13 @@ async fn run_compact_task_inner_impl(
     let previous_summary = latest_summary_message(history.raw_items()).map(str::to_string);
     let reuse_previous_summary = previous_summary.is_some()
         && can_reuse_previous_summary(history.raw_items(), omitted_user_text);
-    if previous_summary.is_some() && !reuse_previous_summary {
+    if previous_summary.is_some()
+        && !reuse_previous_summary
+        && let Some(prompt) =
+            incremental_summarization_prompt(turn_context.config.compact_prompt.as_deref())
+    {
         input.push(UserInput::Text {
-            text: incremental_summarization_prompt(turn_context.config.compact_prompt.as_deref())
-                .to_string(),
+            text: prompt.to_string(),
             text_elements: Vec::new(),
         });
     }

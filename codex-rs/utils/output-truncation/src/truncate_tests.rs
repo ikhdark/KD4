@@ -1147,6 +1147,78 @@ fn projection_line_markers_cover_exact_crlf_gaps() {
             assert!(!output.contains(&format!("source line {line:04}")));
         }
     }
-    let (start, end) = crate::first_omitted_line_range(&source, &output).unwrap();
-    assert!(start > 1 && end >= start);
+}
+
+/// Recovery receipts must name the whole first gap. Source code repeats braces
+/// and bodies on most lines; a selector that stops at the first line visible
+/// elsewhere sends the model to over-read and page again.
+#[test]
+fn recovery_selector_spans_the_exact_first_gap_despite_repeated_lines() {
+    let unique = (1..=3000)
+        .map(|line| format!("source line {line:04}\r\n"))
+        .collect::<String>();
+    let code = (1..=1000)
+        .map(|item| format!("fn item_{item:04}() {{\n    body();\n}}\n"))
+        .collect::<String>();
+    let limits = OutputLimitResolution {
+        requested_limit: None,
+        default_limit: 1000,
+        hard_limit: 1000,
+        applied_limit: 1000,
+    };
+    for source in [unique, code] {
+        // Projection boundaries number their gaps; the selector is the first one.
+        let marked = crate::truncate_text_with_line_markers(&source, 1000);
+        let (first, last) = marked
+            .lines()
+            .find_map(|line| line.strip_prefix("[omitted lines "))
+            .and_then(|marker| marker.split_once(" of "))
+            .and_then(|(span, _)| span.split_once('-'))
+            .map(|(start, end)| {
+                (
+                    start.parse::<usize>().unwrap(),
+                    end.parse::<usize>().unwrap(),
+                )
+            })
+            .expect("numbered gap marker");
+        assert_eq!(
+            crate::first_omitted_line_range(&source, &marked),
+            Some((first, last.min(first + 199)))
+        );
+
+        // Nested command results use a summary header and unnumbered seams.
+        let formatted = formatted_truncate_text_with_output_limit(&source, limits).text;
+        let body = formatted.split_once("\n\n").expect("summary header").1;
+        let (head, rest) = body
+            .split_once("\n[omitted before retained middle]\n")
+            .expect("first seam");
+        let middle = rest
+            .split_once("\n[omitted after retained middle]\n")
+            .expect("second seam")
+            .0;
+        assert!(source.starts_with(head));
+        let first = head.lines().count() + 1;
+        let resumed = source[..source.find(middle).expect("retained middle")]
+            .lines()
+            .count()
+            + 1;
+        assert!(
+            resumed - first > 1,
+            "the fixture must omit a multi-line run"
+        );
+        assert_eq!(
+            crate::first_omitted_line_range(&source, &formatted),
+            Some((first, (resumed - 1).min(first + 199)))
+        );
+    }
+
+    // Numbered shell-summary lines match their own source line.
+    let source = "alpha\nbeta\ngamma\ndelta\n";
+    assert_eq!(
+        crate::first_omitted_line_range(
+            source,
+            "Shell output summary:\n    1: alpha\n... [2 lines omitted]\n    4: delta\n"
+        ),
+        Some((2, 3))
+    );
 }

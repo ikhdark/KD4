@@ -60,8 +60,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
 
-const PREPARED_HISTORY_POLICY_VERSION: u16 = 6;
-const PREPARED_HISTORY_HASH_DOMAIN: &[u8] = b"codex.pending-turn.prepared-history.v6";
+const PREPARED_HISTORY_POLICY_VERSION: u16 = 7;
+const PREPARED_HISTORY_HASH_DOMAIN: &[u8] = b"codex.pending-turn.prepared-history.v7";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedHistoryPolicy {
@@ -741,9 +741,28 @@ impl ContextManager {
         if stable_context_target != StableContextTarget::Sampling {
             evict_resolved_reasoning(Arc::make_mut(&mut self.items));
             project_update_plan_history(Arc::make_mut(&mut self.items));
+        } else if let Some(boundary) = completed_turn_boundary(&self.items) {
+            // A final answer followed by a real user request closes the old
+            // reasoning chain. Keep steering/aborted turns and the active chain;
+            // this is a model projection, not a canonical-history deletion.
+            let mut index = 0;
+            Arc::make_mut(&mut self.items).retain(|item| {
+                let keep = index >= boundary || !matches!(item, ResponseItem::Reasoning { .. });
+                index += 1;
+                keep
+            });
         }
         self.normalize_history(input_modalities);
-        let normalized_items: Arc<[ResponseItem]> = Arc::from(Arc::unwrap_or_clone(self.items));
+        let mut normalized_items = Arc::unwrap_or_clone(self.items);
+        if stable_context_target == StableContextTarget::Sampling {
+            // Ingestion already filters new injections. Apply the same trusted,
+            // nonvolatile equality rule to resumed/replaced history as well.
+            // Do not hoist newer instructions or infer trust from their text.
+            normalized_items = crate::stable_context::filter_unchanged_stable_context_items(
+                &[], normalized_items,
+            );
+        }
+        let normalized_items: Arc<[ResponseItem]> = normalized_items.into();
         // Keep context updates at their original positions. Hoisting the latest
         // value into an earlier message invalidates the cached session prefix.
         let projection = project_stable_context(normalized_items, StableContextTarget::FailOpen);
@@ -2482,6 +2501,19 @@ fn evict_resolved_reasoning(items: &mut Vec<ResponseItem>) {
         index = index.saturating_add(1);
         retain
     });
+}
+
+/// End of the latest answered task before the current real user request.
+/// A user interruption alone is not evidence that the earlier work is finished.
+pub(crate) fn completed_turn_boundary(items: &[ResponseItem]) -> Option<usize> {
+    let user = items.iter().rposition(|item| {
+        matches!(item, ResponseItem::Message { role, .. } if role == "user")
+            && is_user_turn_boundary(item)
+    })?;
+    items[..user].iter().rposition(|item| matches!(item,
+        ResponseItem::Message { role, phase: Some(codex_protocol::models::MessagePhase::FinalAnswer), .. }
+            if role == "assistant"
+    )).map(|index| index + 1)
 }
 
 pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {

@@ -1568,7 +1568,7 @@ async fn record_sampling_notices(
         sess,
         turn,
         "exhaustive_scope_feasibility",
-        "Before committing to an exhaustive review or full-read request, use the known file count, byte volume, and tool throughput to assess whether the requested coverage is feasible. Do not silently substitute a sample for the requested scope. If it is infeasible without delegation, and delegation is not authorized, ask once whether to narrow the scope or set a time limit. Reuse a scope or limit the user already chose; do not ask repeatedly or spawn agents without authorization. Preserve a coverage ledger and report unfinished coverage explicitly.",
+        "Before committing to an exhaustive review or full-read request, use the known file count, byte volume, and tool throughput to assess whether the requested coverage is feasible. Do not silently substitute a sample for the requested scope. If it is infeasible without delegation, and delegation is not authorized, do not block on a question: choose the scope that best serves the requested deliverable, state it and its exclusions in commentary, and proceed. Ask once only when the request gives no basis for choosing a scope. Reuse a scope or limit the user already chose; do not ask repeatedly or spawn agents without authorization. Preserve a coverage ledger and report unfinished coverage explicitly.",
     ).await?;
     if mcp_unavailable {
         record_context_notice_if_changed(

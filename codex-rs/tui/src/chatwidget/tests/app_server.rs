@@ -745,6 +745,76 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
 }
 
 #[tokio::test]
+async fn surfaced_turn_results_render_live_and_replay_without_inventing_text() {
+    for from_replay in [false, true] {
+        for canonical_message in [Some("Owner-authored final response"), Some(""), None] {
+            let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+            chat.config.tui_notifications.notifications = Notifications::Enabled(true);
+            let earlier_message = AppServerThreadItem::AgentMessage {
+                id: "msg-1".to_string(),
+                text: "Earlier message".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
+            };
+            let mut turn = app_server_turn(
+                "turn-1",
+                AppServerTurnStatus::Completed,
+                /*duration_ms*/ None,
+                /*error*/ None,
+            );
+            turn.surfaced_result = Some(codex_app_server_protocol::SurfacedToolResult {
+                adapter: "owner".to_string(),
+                value: serde_json::json!({"not_assistant_prose": true}),
+                canonical_message: canonical_message.map(str::to_string),
+            });
+
+            if from_replay {
+                turn.items.push(earlier_message);
+                chat.replay_thread_turns(vec![turn], ReplayKind::ResumeInitialMessages);
+            } else {
+                handle_turn_started(&mut chat, "turn-1");
+                chat.handle_server_notification(
+                    ServerNotification::ItemCompleted(ItemCompletedNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        completed_at_ms: 0,
+                        item: earlier_message,
+                    }),
+                    /*replay_kind*/ None,
+                );
+                chat.handle_server_notification(
+                    ServerNotification::TurnCompleted(TurnCompletedNotification {
+                        surfaced_result: turn.surfaced_result.clone(),
+                        thread_id: "thread-1".to_string(),
+                        turn,
+                        timing: None,
+                    }),
+                    /*replay_kind*/ None,
+                );
+            }
+
+            let rendered = drain_insert_history(&mut rx)
+                .iter()
+                .map(|lines| lines_to_single_string(lines))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains("Earlier message"));
+            if let Some(message) = canonical_message.filter(|message| !message.is_empty()) {
+                assert_eq!(rendered.matches(message).count(), 1);
+                assert_eq!(chat.transcript.last_agent_markdown.as_deref(), Some(message));
+            }
+            assert!(!rendered.contains("not_assistant_prose"));
+            assert_matches!(
+                chat.pending_notification.as_ref(),
+                Some(Notification::AgentTurnComplete { response })
+                    if response == canonical_message.unwrap_or_default()
+            );
+            assert!(!chat.bottom_pane.is_task_running());
+            assert!(chat.bottom_pane.status_widget().is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn live_app_server_turn_started_sets_feedback_turn_id() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

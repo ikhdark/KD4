@@ -4,6 +4,8 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use codex_config::ConfigLayerStack;
 use codex_exec_server::ExecutorFileSystem;
@@ -32,6 +34,7 @@ use codex_config::SkillsConfig;
 const MAX_CACHED_SKILL_SNAPSHOTS: usize = 64;
 
 struct SnapshotCacheOptions<'a> {
+    generation: u64,
     force_reload: bool,
     cache_result: bool,
     cwd_cache_key: Option<&'a AbsolutePathBuf>,
@@ -79,6 +82,7 @@ pub struct SkillsService {
     codex_home: AbsolutePathBuf,
     restriction_product: Option<Product>,
     extra_roots: RwLock<Vec<AbsolutePathBuf>>,
+    cache_generation: AtomicU64,
     input_snapshot_cache: RwLock<HashMap<SkillsInputCacheKey, HostSkillsSnapshot>>,
     snapshot_cache: RwLock<HashMap<SkillsCacheKey, HostSkillsSnapshot>>,
 }
@@ -97,6 +101,7 @@ impl SkillsService {
             codex_home,
             restriction_product,
             extra_roots: RwLock::new(Vec::new()),
+            cache_generation: AtomicU64::new(0),
             input_snapshot_cache: RwLock::new(HashMap::new()),
             snapshot_cache: RwLock::new(HashMap::new()),
         };
@@ -138,7 +143,8 @@ impl SkillsService {
         input: &SkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
-        let input_cache_key = SkillsInputCacheKey::new(input, fs.as_ref());
+        let generation = self.cache_generation.load(Ordering::SeqCst);
+        let input_cache_key = SkillsInputCacheKey::new(input, fs.as_ref(), generation);
         if let Some(snapshot) = self.cached_input_snapshot(&input_cache_key) {
             return snapshot;
         }
@@ -150,6 +156,7 @@ impl SkillsService {
                 roots,
                 skill_config_rules,
                 SnapshotCacheOptions {
+                    generation,
                     force_reload: false,
                     cache_result: true,
                     cwd_cache_key: None,
@@ -185,6 +192,7 @@ impl SkillsService {
         force_reload: bool,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
+        let generation = self.cache_generation.load(Ordering::SeqCst);
         let cache_result = true;
         let mut roots = skill_roots(
             fs,
@@ -203,6 +211,7 @@ impl SkillsService {
             roots,
             skill_config_rules,
             SnapshotCacheOptions {
+                generation,
                 force_reload,
                 cache_result,
                 cwd_cache_key: Some(&input.cwd),
@@ -219,6 +228,7 @@ impl SkillsService {
         cache_options: SnapshotCacheOptions<'_>,
     ) -> HostSkillsSnapshot {
         let SnapshotCacheOptions {
+            generation,
             force_reload,
             cache_result,
             cwd_cache_key,
@@ -228,6 +238,7 @@ impl SkillsService {
             &skill_config_rules,
             input.plugin_skill_snapshots.as_ref(),
             cwd_cache_key,
+            generation,
         );
         if cache_result
             && !force_reload
@@ -271,6 +282,9 @@ impl SkillsService {
     }
 
     pub fn clear_cache(&self) {
+        // Loads already in flight may still publish, but their generation must
+        // never satisfy a lookup that starts after this invalidation.
+        self.cache_generation.fetch_add(1, Ordering::SeqCst);
         let mut input_cache = self
             .input_snapshot_cache
             .write()
@@ -368,6 +382,7 @@ impl Hash for FileSystemIdentity {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SkillsInputCacheKey {
+    generation: u64,
     config_layer_stack: ConfigLayerStackIdentity,
     cwd: AbsolutePathBuf,
     effective_skill_roots: Vec<PluginSkillRoot>,
@@ -377,8 +392,13 @@ struct SkillsInputCacheKey {
 }
 
 impl SkillsInputCacheKey {
-    fn new(input: &SkillsLoadInput, fs: Option<&Arc<dyn ExecutorFileSystem>>) -> Self {
+    fn new(
+        input: &SkillsLoadInput,
+        fs: Option<&Arc<dyn ExecutorFileSystem>>,
+        generation: u64,
+    ) -> Self {
         Self {
+            generation,
             config_layer_stack: ConfigLayerStackIdentity(Arc::clone(&input.config_layer_stack)),
             cwd: input.cwd.clone(),
             effective_skill_roots: input.effective_skill_roots.clone(),
@@ -394,6 +414,7 @@ impl SkillsInputCacheKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SkillsCacheKey {
+    generation: u64,
     cwd: Option<AbsolutePathBuf>,
     roots: Vec<SkillRootCacheKey>,
     skill_config_rules: SkillConfigRules,
@@ -437,8 +458,10 @@ fn skills_cache_key(
     skill_config_rules: &SkillConfigRules,
     plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
     cwd_cache_key: Option<&AbsolutePathBuf>,
+    generation: u64,
 ) -> SkillsCacheKey {
     SkillsCacheKey {
+        generation,
         cwd: cwd_cache_key.cloned(),
         roots: roots
             .iter()
@@ -490,3 +513,50 @@ fn finalize_skill_outcome(
 #[cfg(test)]
 #[path = "service_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod cache_invalidation_tests {
+    use super::*;
+    use codex_config::ConfigRequirementsToml;
+
+    #[test]
+    fn invalidation_isolates_late_publication_in_both_snapshot_caches() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::try_from(directory.path()).expect("absolute directory");
+        let service = SkillsService::new(cwd.clone(), false);
+        let input = SkillsLoadInput::new(
+            cwd,
+            Vec::new(),
+            ConfigLayerStack::new(
+                Vec::new(),
+                Default::default(),
+                ConfigRequirementsToml::default(),
+            )
+            .expect("config stack"),
+            false,
+        );
+        let rules = skill_config_rules_from_stack(&input.config_layer_stack);
+        let generation = service.cache_generation.load(Ordering::SeqCst);
+        let old_input_key = SkillsInputCacheKey::new(&input, None, generation);
+        let old_roots_key = skills_cache_key(&[], &rules, None, None, generation);
+        let snapshot = HostSkillsSnapshot::new(Arc::new(SkillLoadOutcome::default()));
+
+        service.clear_cache();
+        // Deterministically replay completion of a load that began before the
+        // clear. Neither public load path may reuse these late publications.
+        service.cache_input_snapshot(old_input_key, snapshot.clone());
+        service
+            .snapshot_cache
+            .write()
+            .expect("snapshot cache")
+            .insert(old_roots_key, snapshot.clone());
+
+        let generation = service.cache_generation.load(Ordering::SeqCst);
+        let input_key = SkillsInputCacheKey::new(&input, None, generation);
+        let roots_key = skills_cache_key(&[], &rules, None, None, generation);
+        assert!(service.cached_input_snapshot(&input_key).is_none());
+        assert!(service.cached_snapshot(&roots_key).is_none());
+        service.cache_input_snapshot(input_key.clone(), snapshot);
+        assert!(service.cached_input_snapshot(&input_key).is_some());
+    }
+}

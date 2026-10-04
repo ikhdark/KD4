@@ -161,10 +161,34 @@ def write_openai_yaml(skill_dir, skill_name, raw_overrides):
     if overrides is None:
         return None
 
-    display_name = overrides.get("display_name") or format_display_name(skill_name)
-    short_description = overrides.get(
-        "short_description"
-    ) or generate_short_description(display_name)
+    output_path = Path(skill_dir) / "agents" / "openai.yaml"
+    payload = None
+    existing_interface = {}
+    if output_path.exists():
+        import yaml
+
+        try:
+            payload = yaml.safe_load(output_path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            print(f"[ERROR] Cannot read existing agents/openai.yaml: {exc}")
+            return None
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("interface", {}), dict
+        ):
+            print("[ERROR] Existing agents/openai.yaml and interface must be mappings.")
+            return None
+        existing_interface = payload.get("interface", {})
+
+    display_name = (
+        overrides.get("display_name")
+        or existing_interface.get("display_name")
+        or format_display_name(skill_name)
+    )
+    short_description = (
+        overrides.get("short_description")
+        or existing_interface.get("short_description")
+        or generate_short_description(display_name)
+    )
 
     if not (25 <= len(short_description) <= 64):
         print(
@@ -186,9 +210,19 @@ def write_openai_yaml(skill_dir, skill_name, raw_overrides):
 
     agents_dir = Path(skill_dir) / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
-    output_path = agents_dir / "openai.yaml"
     # Codex reads skill metadata as UTF-8 regardless of the platform locale.
-    output_path.write_text("\n".join(interface_lines) + "\n", encoding="utf-8")
+    if payload is None:
+        contents = "\n".join(interface_lines) + "\n"
+    else:
+        # Regeneration updates UI fields, not invocation policy or dependencies.
+        payload["interface"] = {
+            **existing_interface,
+            **overrides,
+            "display_name": display_name,
+            "short_description": short_description,
+        }
+        contents = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+    output_path.write_text(contents, encoding="utf-8")
     print("[OK] Created agents/openai.yaml")
     return output_path
 

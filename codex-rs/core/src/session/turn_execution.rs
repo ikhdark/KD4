@@ -44,6 +44,12 @@ use crate::validation::classify_validation;
 const TURN_EFFICIENCY_TOOL_CALL_THRESHOLD: usize = 8;
 const TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL: u64 = 500;
 const LIGHTWEIGHT_HANDOFF_ADVISORY_GENERATIONS: u32 = 3;
+/// A handoff whose model-visible output filled this much of an exec cell's
+/// default budget could not have batched another comparable read, so it is
+/// output-bound rather than orchestration overhead. Four bytes approximate one
+/// token, as in the local input estimator.
+const OUTPUT_BOUND_HANDOFF_BYTES: usize =
+    codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 * 2 / 5;
 /// Advisory-only policy. Production keeps these defaults; replay fixtures can
 /// compare alternatives without changing completion, recovery or cancellation
 /// invariants. This does not select models or alter reasoning effort.
@@ -599,6 +605,7 @@ struct SamplingRequestSignalState {
     child_runtime_sample_count: usize,
     child_runtime_by_call: BTreeMap<String, u64>,
     call_ordinals: BTreeMap<String, u64>,
+    delivered_output_bytes: usize,
 }
 
 impl SamplingRequestSignalState {
@@ -1451,6 +1458,9 @@ impl SamplingRequestSignalCollector {
             }
         }
         state.saw_canonical_artifact_requirement |= canonical_artifact_required;
+        state.delivered_output_bytes = state
+            .delivered_output_bytes
+            .saturating_add(response_replay_text_size(response).unwrap_or(0));
         state.outcomes.push(outcome);
         if let Some(evidence_identity) = evidence_identity {
             state.evidence_items.insert(ordinal, evidence_identity);
@@ -1493,8 +1503,10 @@ impl SamplingRequestSignalCollector {
         let (ordinal, message) = state.explicit_completion.as_ref()?;
         // A model-authored delivery intent is an explicit final response, not a
         // guess that an arbitrary successful tool completed the user's task.
-        // Every registered sibling and nested call must have one terminal
-        // success. A count alone would let duplicate outcomes hide pending work.
+        // Every registered sibling and nested call must be accounted for. A
+        // yielded command is settled only by a later successful observation of
+        // that same process; its original running receipt remains evidence.
+        // A count alone would let duplicate outcomes hide pending work.
         let expected = state.registered_count.saturating_add(state.code_mode_nested_tool_count);
         let observed = state.outcomes.iter().map(|outcome| outcome.ordinal).collect::<BTreeSet<_>>();
         if state.conflicting_explicit_completions
@@ -1504,9 +1516,20 @@ impl SamplingRequestSignalCollector {
                 .outcomes
                 .iter()
                 .any(|outcome| {
-                    outcome.kind != SamplingToolOutcomeKind::Success
+                    let successful_terminal = outcome.kind == SamplingToolOutcomeKind::Success
+                        && outcome.background_process_id.is_none();
+                    let consumed_process = outcome.kind == SamplingToolOutcomeKind::Yielded
+                        && outcome.background_process_id.is_some_and(|process_id| {
+                            state.outcomes.iter().any(|later| {
+                                later.ordinal > outcome.ordinal
+                                    && later.observed_process_id == Some(process_id)
+                                    && later.kind == SamplingToolOutcomeKind::Success
+                                    && later.background_process_id.is_none()
+                                    && !later.canonical_artifact_required
+                            })
+                        });
+                    (!successful_terminal && !consumed_process)
                         || outcome.canonical_artifact_required
-                        || outcome.background_process_id.is_some()
                 })
             || state
                 .outcomes
@@ -3005,8 +3028,18 @@ impl TurnExecutionControl {
             }).map(|(environment, path)| format!("{environment}:{}", path.display()))
                 .collect::<Vec<_>>();
             if !uncovered.is_empty() {
+                // With nothing attributed at all, the likeliest cause is a
+                // repository runner the classifier was never told about.
+                let unrecognized = if self.validation_coverage_revision
+                    != Some(settled_mutation_revision)
+                    || self.validation_coverage.is_empty()
+                {
+                    " No recognized validation command passed after the last change; a repository-specific runner counts only when declared in `.codex/test-runners.json` committed at HEAD."
+                } else {
+                    ""
+                };
                 gaps.push(format!(
-                    "Changed paths without passing validation attribution: {}. Path attribution is not behavioral test coverage; inspection or intentionally omitted validation must be reported.",
+                    "Changed paths without passing validation attribution: {}.{unrecognized} Path attribution is not behavioral test coverage; inspection or intentionally omitted validation must be reported.",
                     uncovered.join(", ")
                 ));
             }
@@ -3140,11 +3173,13 @@ impl TurnExecutionControl {
         // Novel evidence still counts as progress. Fragmented execution is an
         // independent advisory, never authority to suppress a call or finish.
         // Require measured, completed, non-mutating work; do not confuse a
-        // large batch, validation, or process monitoring with serial overhead.
+        // large batch, a budget-filling read, validation, or process
+        // monitoring with serial overhead.
         let lightweight = (1..=2).contains(&tool_calls)
             && runtime_samples == tool_calls
             && child_runtime_ms
                 <= tool_calls as u64 * self.handoff_policy.negligible_runtime_ms_per_call
+            && state.delivered_output_bytes < OUTPUT_BOUND_HANDOFF_BYTES
             && state.wait_call_count == 0
             && state.process_monitor_ordinals.is_empty()
             && state.mutation_ordinals.is_empty()
@@ -4082,10 +4117,12 @@ mod tests {
         generation: usize,
         calls: usize,
         runtime_ms: Option<u64>,
+        output_bytes: usize,
     ) -> SamplingRequestSignalCollector {
         let collector = control.collector(baselines);
         for call in 0..calls {
             let id = format!("short-{generation}-{call}");
+            let output = format!("{id}{}", " ".repeat(output_bytes));
             let registration = collector.register_deterministic_tool_call(
                 &ToolName::plain("exec_command"),
                 &ToolPayload::Function {
@@ -4099,7 +4136,7 @@ mod tests {
                 Some(crate::tools::context::semantic_evidence_sampling_signal(json!(
                     crate::tools::context::semantic_evidence_for_command_output(id.as_bytes())
                 ))),
-                &successful_tool_response(&id, &id),
+                &successful_tool_response(&id, &output),
                 false,
             );
             if let Some(runtime) = runtime_ms {
@@ -4122,7 +4159,7 @@ mod tests {
                 let (baselines, settled) = unchanged_state(&control);
                 for generation in 1..=generations as usize {
                     let collector = lightweight_handoff_collector(
-                        &control, &baselines, generation, 1, Some(100),
+                        &control, &baselines, generation, 1, Some(100), 0,
                     );
                     assert_eq!(
                         control.observe_progress(&baselines, &collector, &settled),
@@ -4147,7 +4184,7 @@ mod tests {
                 assert!(control.batching_advisory(true).is_none());
                 let (baselines, settled) = unchanged_state(&control);
                 let slow = lightweight_handoff_collector(
-                    &control, &baselines, 99, 1, Some(negligible_runtime_ms_per_call + 1),
+                    &control, &baselines, 99, 1, Some(negligible_runtime_ms_per_call + 1), 0,
                 );
                 control.observe_progress(&baselines, &slow, &settled);
                 assert_eq!(control.lightweight_handoffs, 0);
@@ -4168,29 +4205,31 @@ mod tests {
 
     #[test]
     fn lightweight_handoff_window_resets_for_unmeasured_slow_batched_or_mutating_work() {
-        for (calls, runtime, mutation_revision) in [
-            (1, None, 0),
-            (1, Some(501), 0),
-            (3, Some(100), 0),
-            (1, Some(100), 1),
+        for (calls, runtime, mutation_revision, output_bytes) in [
+            (1, None, 0, 0),
+            (1, Some(501), 0, 0),
+            (3, Some(100), 0, 0),
+            (1, Some(100), 1, 0),
+            // A fast read that already filled the cell budget leaves nothing to batch.
+            (1, Some(100), 0, OUTPUT_BOUND_HANDOFF_BYTES),
         ] {
             let mut control = TurnExecutionControl::new();
             settle_plan(&mut control, plan(&[StepStatus::InProgress]));
             let baselines = control.baselines(0);
             for generation in 0..2 {
                 let collector = lightweight_handoff_collector(
-                    &control, &baselines, generation, 1, Some(100),
+                    &control, &baselines, generation, 1, Some(100), 0,
                 );
                 control.observe_progress(&baselines, &collector, &settled(0));
             }
             let boundary = lightweight_handoff_collector(
-                &control, &baselines, 2, calls, runtime,
+                &control, &baselines, 2, calls, runtime, output_bytes,
             );
             control.observe_progress(&baselines, &boundary, &settled(mutation_revision));
             assert!(control.batching_advisory(true).is_none());
             for generation in 3..6 {
                 let collector = lightweight_handoff_collector(
-                    &control, &baselines, generation, 1, Some(100),
+                    &control, &baselines, generation, 1, Some(100), 0,
                 );
                 control.observe_progress(&baselines, &collector, &settled(0));
                 assert_eq!(control.batching_advisory(true).is_some(), generation == 5);
@@ -6093,6 +6132,47 @@ mod tests {
         let baselines = control.baselines(0);
         assert_eq!(control.evaluate_convergence(&baselines, &collector, &settled).continuation,
             ContinuationDisposition::ModelRequired);
+    }
+
+    #[test]
+    fn explicit_delivery_requires_consumed_process_and_complete_evidence() {
+        for scenario in ["complete", "running", "failed", "unrelated", "missing",
+                         "duplicate", "truncated", "out-of-order"] {
+            let collector = SamplingRequestSignalCollector::default();
+            {
+                let mut state = collector.state.lock().unwrap();
+                state.registered_count = 1;
+                state.code_mode_nested_tool_count = 2;
+                state.explicit_completion = Some((0, "verified answer".into()));
+                let mut started = SamplingToolOutcome::plain(1, SamplingToolOutcomeKind::Yielded, None);
+                started.background_process_id = Some(7);
+                let mut observed = SamplingToolOutcome::plain(2, SamplingToolOutcomeKind::Success, None);
+                observed.observed_process_id = Some(7);
+                match scenario {
+                    "running" => {
+                        observed.kind = SamplingToolOutcomeKind::Yielded;
+                        observed.background_process_id = Some(7);
+                    }
+                    "failed" => observed.kind = SamplingToolOutcomeKind::Failure,
+                    "unrelated" => observed.observed_process_id = Some(8),
+                    "duplicate" => observed.ordinal = 1,
+                    "truncated" => observed.canonical_artifact_required = true,
+                    "out-of-order" => {
+                        started.ordinal = 2;
+                        observed.ordinal = 1;
+                    }
+                    _ => {}
+                }
+                state.outcomes = vec![
+                    SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None),
+                    started,
+                ];
+                if scenario != "missing" {
+                    state.outcomes.push(observed);
+                }
+            }
+            assert_eq!(collector.explicit_completion().is_some(), scenario == "complete", "{scenario}");
+        }
     }
 
     #[test]
@@ -8360,6 +8440,12 @@ mod tests {
                 assert!(gaps[0].contains(&changed[1].1.display().to_string()));
                 assert_eq!(
                     gaps[0].contains(&changed[0].1.display().to_string()),
+                    !matches!(scenario, "passed" | "background" | "after_edit"),
+                    "{nested} {scenario}: {gaps:?}",
+                );
+                // Only a turn with no attribution at all points at runner declaration.
+                assert_eq!(
+                    gaps[0].contains(".codex/test-runners.json"),
                     !matches!(scenario, "passed" | "background" | "after_edit"),
                     "{nested} {scenario}: {gaps:?}",
                 );

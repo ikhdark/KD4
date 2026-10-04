@@ -441,7 +441,7 @@ impl ModelInfo {
     pub fn auto_compact_token_limit(&self) -> Option<i64> {
         let context_limit = self
             .resolved_context_window()
-            .map(|context_window| (context_window * 9) / 10);
+            .map(|context_window| ((i128::from(context_window) * 9) / 10) as i64);
         let config_limit = self.auto_compact_token_limit;
         if let Some(context_limit) = context_limit {
             return Some(
@@ -1134,6 +1134,25 @@ mod tests {
 
         assert_eq!(model.resolved_context_window(), Some(400_000));
         assert_eq!(model.auto_compact_token_limit(), Some(360_000));
+    }
+
+    #[test]
+    fn auto_compact_token_limit_preserves_ratio_and_clamp_without_overflow() {
+        for (window, expected) in [(273_003, 245_702), (i64::MAX, 8_301_034_833_169_298_226)] {
+            for (context_window, max_context_window) in [(Some(window), None), (None, Some(window))]
+            {
+                let mut model = ModelInfo {
+                    context_window,
+                    max_context_window,
+                    ..test_model(/*spec*/ None)
+                };
+                assert_eq!(model.auto_compact_token_limit(), Some(expected));
+                model.auto_compact_token_limit = Some(i64::MAX);
+                assert_eq!(model.auto_compact_token_limit(), Some(expected));
+                model.auto_compact_token_limit = Some(1_000);
+                assert_eq!(model.auto_compact_token_limit(), Some(1_000));
+            }
+        }
     }
 
     #[test]

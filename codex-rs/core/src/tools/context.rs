@@ -35,6 +35,7 @@ use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::classify_diagnostic;
 use codex_utils_output_truncation::formatted_truncate_text;
+use codex_utils_output_truncation::formatted_truncate_text_with_line_markers;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_projected_output_limits;
 use serde::Serialize;
@@ -1235,8 +1236,14 @@ impl ToolOutput for ExecCommandToolOutput {
         );
         let output_reduced = model_output.reduced;
         let output = model_output.text;
+        // Marked coordinates are exact even for repeated text; only unmarked
+        // projections (summaries, outlined JSON) need text alignment.
         let recovery_selector = (raw_output_artifact_bytes == Some(self.raw_output.len() as u64))
-            .then(|| codex_utils_output_truncation::first_omitted_line_range(&raw_output, &output))
+            .then(|| {
+                model_output.first_omitted_lines.or_else(|| {
+                    codex_utils_output_truncation::first_omitted_line_range(&raw_output, &output)
+                })
+            })
             .flatten()
             .map(|(start, end)| serde_json::json!({"kind": "lines", "start": start, "end": end}));
 
@@ -2104,8 +2111,25 @@ impl ExecCommandToolOutput {
         };
         let limits = self.model_output_limits(raw_output, hard_limit_cap);
         let summarized = self.summarized_output(raw_output, limits.applied_limit);
-        let content = summarized.as_deref().unwrap_or(raw_output);
-        let truncated = formatted_truncate_text_with_output_limit(content, limits);
+        let artifact_has_more_bytes = self
+            .raw_output_artifact
+            .as_ref()
+            .and_then(RawOutputArtifact::retained_bytes)
+            .is_some_and(|bytes| bytes > self.raw_output.len() as u64);
+        let (truncated, first_omitted_lines) = match summarized.as_deref() {
+            // Line coordinates are recovery references only when the text is
+            // the retained source itself, not a summary or one chunk of a
+            // longer cumulative artifact.
+            None if !artifact_has_more_bytes => {
+                let marked = formatted_truncate_text_with_line_markers(raw_output, limits);
+                let first_omitted_lines = marked.first_omitted_line_range();
+                (marked.output, first_omitted_lines)
+            }
+            content => (
+                formatted_truncate_text_with_output_limit(content.unwrap_or(raw_output), limits),
+                None,
+            ),
+        };
         let was_truncated = truncated.was_truncated;
         let mut projected_text = truncated.text;
         if summarized.is_some()
@@ -2121,14 +2145,10 @@ impl ExecCommandToolOutput {
                 projected_text = candidate;
             }
         }
-        let artifact_has_more_bytes = self
-            .raw_output_artifact
-            .as_ref()
-            .and_then(RawOutputArtifact::retained_bytes)
-            .is_some_and(|bytes| bytes > self.raw_output.len() as u64);
         ProjectedModelOutput {
             reduced: summarized.is_some() || was_truncated || artifact_has_more_bytes,
             text: projected_text,
+            first_omitted_lines,
         }
     }
 
@@ -2239,6 +2259,8 @@ fn predetermined_validation_ranges(
 struct ProjectedModelOutput {
     text: String,
     reduced: bool,
+    /// Bounded first run the text's line markers report omitted from the raw output.
+    first_omitted_lines: Option<(usize, usize)>,
 }
 
 fn function_tool_response(

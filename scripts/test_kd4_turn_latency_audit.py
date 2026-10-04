@@ -468,8 +468,10 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
                 None, root, include_tokens=False, startup_log=source
             )
         bounded = kd4_turn_latency_audit.bounded_summary(full)["startupTiming"]
-        self.assertEqual(len(bounded["records"]), 10)
-        self.assertEqual(bounded["omittedRecords"], 3)
+        self.assertGreater(len(bounded["records"]), 0)
+        self.assertLessEqual(len(bounded["records"]), 10)
+        self.assertEqual(len(bounded["records"]) + bounded["omittedRecords"], len(events))
+        self.assertEqual(bounded["records"], full["startupTiming"]["records"][:len(bounded["records"])])
         self.assertEqual(bounded["profiles"], 13)
         self.assertEqual(bounded["validProfiles"], 12)
         self.assertEqual(bounded["excludedProfiles"], 1)
@@ -1578,7 +1580,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             )
             self.assertEqual(turn["tokens"]["totalTokens"], 17 * 115)
         self.assertLessEqual(
-            len(stdout.getvalue().rstrip("\n").encode("utf-8")), 32 * 1024
+            len(stdout.getvalue().rstrip("\n").encode("utf-8")), 16 * 1024
         )
         self.assertFalse(report["summaryBudget"]["limitExceeded"])
 
@@ -2133,6 +2135,28 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(loop["singleToolCallSamplingPasses"], 2)
         self.assertEqual(loop["samplingPassesWithTools"], 2)
 
+    def test_sequential_calls_without_sampling_telemetry_are_not_a_batch(self):
+        rows = [
+            _event({"type": "task_started", "turn_id": "a"}),
+            *self.paired_call("a", "00:00:01", "00:00:02"),
+            *self.paired_call("b", "00:00:03", "00:00:04"),
+            _event({"type": "task_complete", "turn_id": "a"}, "2026-08-17T00:00:05Z"),
+        ]
+        report = self.audit_rows(rows)
+        loop = report["executionLoop"]
+        self.assertEqual(loop["pairedToolCalls"], 2)
+        self.assertEqual(loop["toolCallsWithoutSamplingBoundary"], 2)
+        self.assertNotIn("batchedToolCalls", loop)
+        self.assertNotIn("samplingPassesWithTools", loop)
+        self.assertIn("calls without sampling boundary=2", kd4_turn_latency_audit.render_report(report))
+        self.assertEqual(kd4_turn_latency_audit.bounded_summary(report)["executionLoop"], loop)
+        # A later observed boundary must not retroactively classify the first call.
+        rows.insert(3, json.dumps({"type": "sampling_boundary", "payload": {}, "timestamp": "2026-08-17T00:00:02Z"}))
+        loop = self.audit_rows(rows)["executionLoop"]
+        self.assertEqual(loop["toolCallsWithoutSamplingBoundary"], 1)
+        self.assertEqual(loop["singleToolCallSamplingPasses"], 1)
+        self.assertNotIn("batchedToolCalls", loop)
+
     def test_waiting_input_tail_is_classified_without_blocking_completed_audit(
         self,
     ) -> None:
@@ -2396,7 +2420,18 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertTrue(report["auditDecision"]["readyToFinalize"])
         rendered = kd4_turn_latency_audit.render_report(report)
         self.assertIn("audit decision: finalize", rendered)
-        self.assertIn("Stop rollout inspection and answer from this report.", rendered)
+        instruction = report["auditDecision"]["instruction"]
+        self.assertIn("Timing attribution is ready to summarize.", instruction)
+        self.assertIn("does not establish completion of the user's request", instruction)
+        self.assertIn(
+            "Continue any obtainable required investigation, implementation, and validation.",
+            instruction,
+        )
+        self.assertIn(instruction, rendered)
+        self.assertEqual(
+            kd4_turn_latency_audit.bounded_summary(report)["auditDecision"]["instruction"],
+            instruction,
+        )
 
     def test_output_wall_time_fallback_is_low_confidence_and_unattributed(
         self,

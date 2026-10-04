@@ -167,6 +167,11 @@ pub(crate) enum KeymapEditIntent {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, strum_macros::IntoStaticStr)]
 pub(crate) enum AppEvent {
+    /// A local IDE pipe request finished off the UI thread. The widget owns its request token.
+    IdeContextCompleted {
+        id: uuid::Uuid,
+        result: Result<crate::ide_context::IdeContext, String>,
+    },
     /// Open the agent picker for switching active threads.
     OpenAgentPicker,
     /// Switch the active thread to the selected agent.

@@ -133,6 +133,14 @@ impl ChatWidget {
             _ => {}
         }
 
+        if self.chat_keymap.interrupt_turn.is_pressed(key_event)
+            && self.bottom_pane.no_modal_or_popup_active()
+            && !self.should_handle_vim_insert_escape(key_event)
+            && self.cancel_pending_ide_prompt()
+        {
+            return false;
+        }
+
         if key_event.kind == KeyEventKind::Press
             && self.chat_keymap.edit_queued_message.is_pressed(key_event)
             && self.has_queued_follow_up_messages()
@@ -413,6 +421,9 @@ impl ChatWidget {
     ///
     /// If cancellable work is active, Ctrl+C submits `Op::Interrupt`; otherwise it requests quit.
     fn on_ctrl_c(&mut self) {
+        if self.bottom_pane.no_modal_or_popup_active() && self.cancel_pending_ide_prompt() {
+            return;
+        }
         let modal_or_popup_active = !self.bottom_pane.no_modal_or_popup_active();
         let should_pause_active_goal = self
             .bottom_pane

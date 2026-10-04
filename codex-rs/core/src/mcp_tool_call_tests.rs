@@ -2404,25 +2404,45 @@ async fn codex_apps_auth_elicitation_reports_refresh_failure_after_acceptance() 
 }
 
 #[test]
-fn accepted_elicitation_content_converts_to_request_user_input_response() {
-    let response = request_user_input_response_from_elicitation_content(Some(serde_json::json!(
-        {
-            "approval": MCP_TOOL_APPROVAL_ACCEPT_AND_REMEMBER,
-        }
-    )));
-
-    assert_eq!(
-        response,
-        Some(RequestUserInputResponse {
-            answers: std::collections::HashMap::from([(
-                "approval".to_string(),
-                RequestUserInputAnswer {
-                    answers: vec![MCP_TOOL_APPROVAL_ACCEPT_AND_REMEMBER.to_string()],
-                },
-            )]),
-            interrupted: false,
-        })
-    );
+fn approval_answers_require_an_uninterrupted_response() {
+    for (answer, expected) in [
+        (MCP_TOOL_APPROVAL_ACCEPT, McpToolApprovalDecision::Accept),
+        (
+            MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION,
+            McpToolApprovalDecision::AcceptForSession,
+        ),
+        (
+            MCP_TOOL_APPROVAL_ACCEPT_AND_REMEMBER,
+            McpToolApprovalDecision::AcceptAndRemember,
+        ),
+    ] {
+        let response = request_user_input_response_from_elicitation_content(Some(serde_json::json!({
+            "approval": answer,
+        })));
+        assert_eq!(
+            response,
+            Some(RequestUserInputResponse {
+                answers: HashMap::from([(
+                    "approval".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec![answer.to_string()],
+                    },
+                )]),
+                interrupted: false,
+            })
+        );
+        assert_eq!(
+            parse_mcp_tool_approval_response(response.clone(), "approval"),
+            expected
+        );
+        let mut interrupted = response.expect("approval answer converts to a response");
+        interrupted.interrupted = true;
+        assert_eq!(
+            parse_mcp_tool_approval_response(Some(interrupted), "approval"),
+            McpToolApprovalDecision::Cancel,
+            "interrupted {answer:?} must not authorize execution or remembered approval"
+        );
+    }
 }
 
 #[test]

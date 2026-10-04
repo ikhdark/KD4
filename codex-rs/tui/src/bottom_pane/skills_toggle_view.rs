@@ -1,6 +1,7 @@
 use codex_utils_absolute_path::AbsolutePathBuf;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
@@ -273,8 +274,16 @@ impl BottomPaneView for SkillsToggleView {
                 code: KeyCode::Char(' '),
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => self.toggle_selected(),
-            _ if self.keymap.accept.is_pressed(key_event) => self.toggle_selected(),
+            } => {
+                if key_event.kind == KeyEventKind::Press {
+                    self.toggle_selected();
+                }
+            }
+            _ if self.keymap.accept.is_pressed(key_event) => {
+                if key_event.kind == KeyEventKind::Press {
+                    self.toggle_selected();
+                }
+            }
             _ if self.keymap.cancel.is_pressed(key_event) => {
                 self.on_ctrl_c();
             }
@@ -455,6 +464,46 @@ mod tests {
             })
             .collect();
         lines.join("\n")
+    }
+
+    #[test]
+    fn held_toggle_keys_emit_only_one_skill_write() {
+        for (code, modifiers) in [
+            (KeyCode::Char(' '), KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Char('t'), KeyModifiers::CONTROL),
+        ] {
+            let (tx, mut rx) = unbounded_channel();
+            let mut keymap = crate::keymap::RuntimeKeymap::defaults().list;
+            keymap.accept.push(key_hint::ctrl(KeyCode::Char('t')));
+            let mut view = SkillsToggleView::new(
+                vec![SkillsToggleItem {
+                    name: "Repo Scout".to_string(),
+                    skill_name: "repo_scout".to_string(),
+                    description: String::new(),
+                    enabled: true,
+                    path: test_path_buf("/tmp/skills/repo_scout.toml").abs(),
+                }],
+                AppEventSender::new(tx),
+                keymap,
+            );
+            view.handle_key_event(KeyEvent::new(code, modifiers));
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(AppEvent::SetSkillEnabled { enabled: false, .. })
+            ));
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                view.handle_key_event(KeyEvent::new_with_kind(code, modifiers, kind));
+                assert!(!view.items[0].enabled);
+                assert!(view.search_query.is_empty());
+                assert!(rx.try_recv().is_err());
+            }
+            view.handle_key_event(KeyEvent::new(code, modifiers));
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(AppEvent::SetSkillEnabled { enabled: true, .. })
+            ));
+        }
     }
 
     #[test]

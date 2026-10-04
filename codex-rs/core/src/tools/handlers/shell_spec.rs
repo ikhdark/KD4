@@ -201,6 +201,7 @@ pub(crate) fn create_foreign_shell_command_tool(
         unreachable!("exec_command has a function schema")
     };
     tool.name = "shell_command".to_string();
+    tool.description = tool.description.replace("`cmd`", "`command`");
     let mut properties = tool
         .parameters
         .properties
@@ -208,6 +209,11 @@ pub(crate) fn create_foreign_shell_command_tool(
         .expect("command properties");
     let command = properties.remove("cmd").expect("script command");
     properties.insert("command".to_string(), command);
+    for property in properties.values_mut() {
+        if let Some(description) = &mut property.description {
+            *description = description.replace("`cmd`", "`command`");
+        }
+    }
     tool.parameters = command_parameters_schema(properties, "command");
     ToolSpec::Function(tool)
 }
@@ -230,7 +236,7 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
         ),
         (
             "wait_for_output".to_string(),
-            JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
+            JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Defaults to true when chars is empty, yield_time_ms is omitted, and terminate is false; false preserves bounded polling. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
         ),
         (
             "session_id".to_string(),
@@ -251,7 +257,7 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
             "yield_time_ms".to_string(),
             bounded_integer(
                 format!(
-                    "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Empty polls default to {default_timeout_ms} ms and cap at {max_timeout_ms} ms; waits below 5000 ms are honored down to 250 ms only when new output is pending, otherwise a 5000 ms floor applies. A wait deadline does not terminate the process."
+                    "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Bounded empty polls default to {default_timeout_ms} ms and cap at {max_timeout_ms} ms; waits below 5000 ms are honored down to 250 ms only when new output is pending, otherwise a 5000 ms floor applies. Omitting this on an empty poll defaults to waiting for output or exit. A wait deadline does not terminate the process."
                 ),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 max_timeout_ms.max(crate::unified_exec::MAX_YIELD_TIME_MS),
@@ -303,7 +309,7 @@ pub(crate) fn create_shell_command_tool_for_policy(
         (
             "program".to_string(),
             JsonSchema::string(Some(
-                "Executable to launch directly, bypassing the shell. Use only when `cmd` cannot express the command.".to_string(),
+                "Executable to launch directly, bypassing the shell. Use only when `command` cannot express the command.".to_string(),
             )),
         ),
         (
@@ -316,7 +322,7 @@ pub(crate) fn create_shell_command_tool_for_policy(
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script that Codex encodes at runtime. Use only when `cmd` quoting cannot express the script."
+                "Plain PowerShell script that Codex encodes at runtime. Use only when `command` quoting cannot express the script."
                     .to_string(),
             )),
         ),
@@ -606,7 +612,7 @@ fn create_approval_parameters(
             (
                 "prefix_rule".to_string(),
                 JsonSchema::array(JsonSchema::string(/*description*/ None), Some(
-                    r#"Reusable approval prefix for `cmd`, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"]."#.to_string(),
+                    r#"Reusable approval prefix for the command, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"]."#.to_string(),
                 )),
             ),
         ]);
@@ -714,7 +720,7 @@ fn rg_search_admission_guidance() -> &'static str {
 - For filename inventories, apply path/glob filters before printing; do not dump the whole tree to filter a truncated display later. Reuse the complete matching set for multiple views. A stored `result.output` is still truncated when `output_reduced` is true; use the retained artifact for missing matches.
 - An `rg` exit code of 1 means no matches; 2 means an error, not evidence of absence. In a batch, inspect each search's status; a later successful command does not validate an earlier search. Preserve successful results and correct only the failed search.
 - Derive search roots from observed paths instead of guessing directories. Keep independent searches separate so a missing root does not skip unrelated work; record missing paths as coverage gaps.
-- Output above the tool's output budget is truncated. For a known source file, read a bounded range that fits the tool's advertised output contract."#
+- For a known source file, read whole useful regions. Omit `max_output_tokens` unless deliberately requesting a smaller display; the host enforces output caps. Output above the tool's output budget is truncated; recover only missing evidence from the retained artifact."#
 }
 
 #[cfg(test)]

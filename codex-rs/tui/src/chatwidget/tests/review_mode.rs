@@ -378,6 +378,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
         pending_steers,
         pending_steer_history_records: VecDeque::new(),
         pending_steer_compare_keys,
+        promoted_steers: VecDeque::new(),
         rejected_steers_queue,
         rejected_steer_history_records: VecDeque::new(),
         queued_user_messages,
@@ -819,6 +820,58 @@ async fn steer_that_started_a_new_turn_is_not_restored_when_the_old_turn_is_inte
     let rendered = drain_insert_history(&mut rx)
         .iter()
         .filter(|cell| lines_to_single_string(cell).contains("sent after the turn ended"))
+        .count();
+    assert_eq!(rendered, 1);
+    assert!(chat.input_queue.promoted_steers.is_empty());
+}
+
+#[tokio::test]
+async fn thread_input_snapshot_preserves_promoted_steers() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn-1");
+    let empty_snapshot = chat.capture_thread_input_state();
+
+    chat.bottom_pane.set_composer_text(
+        "sent after the turn ended".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    chat.input_queue.pending_steers.front_mut().unwrap().history_record =
+        UserMessageHistoryRecord::Override(UserMessageHistoryOverride {
+            text: "visible command".to_string(),
+            text_elements: Vec::new(),
+        });
+    chat.on_steer_started_turn(&items);
+    let snapshot = chat.capture_thread_input_state();
+
+    chat.restore_thread_input_state(None);
+    chat.restore_thread_input_state(snapshot.clone());
+    assert_eq!(chat.input_queue.promoted_steers.len(), 1);
+    assert!(chat.input_queue.pending_steers.is_empty());
+    assert_eq!(
+        chat.input_queue.preview().pending_steers,
+        vec!["visible command"]
+    );
+
+    // Restoring another thread must replace, not retain, this thread's promoted input.
+    chat.restore_thread_input_state(empty_snapshot);
+    assert!(chat.input_queue.promoted_steers.is_empty());
+    chat.restore_thread_input_state(snapshot);
+    handle_turn_interrupted(&mut chat, "turn-1");
+    assert_eq!(chat.bottom_pane.composer_text(), "");
+    assert_no_submit_op(&mut op_rx);
+
+    handle_turn_started(&mut chat, "turn-2");
+    complete_user_message(&mut chat, "user-2", "sent after the turn ended");
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .filter(|cell| lines_to_single_string(cell).contains("visible command"))
         .count();
     assert_eq!(rendered, 1);
     assert!(chat.input_queue.promoted_steers.is_empty());

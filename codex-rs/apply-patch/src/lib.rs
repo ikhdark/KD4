@@ -811,9 +811,11 @@ pub(crate) async fn preflight_hunks(
                         // Validate the complete candidate before any hunk is
                         // published. Existing JSONC and malformed documents can
                         // still be edited; only strict-JSON regressions fail.
-                        if hunk.path().extension().is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-                            && serde_json::from_str::<serde::de::IgnoredAny>(&original_contents).is_ok()
-                            && let Err(error) = serde_json::from_str::<serde::de::IgnoredAny>(&new_contents)
+                        if let Some(error) = invalid_json_candidate(
+                            hunk.path(),
+                            &original_contents,
+                            &new_contents,
+                        )
                         {
                             failures.push(ApplyPatchError::ComputeReplacements(format!(
                                 "{} was valid JSON before this patch; candidate is invalid: {error}. No files were changed.",
@@ -1008,6 +1010,22 @@ struct AppliedPatch {
     new_contents: String,
 }
 
+fn invalid_json_candidate(
+    path: &std::path::Path,
+    original_contents: &str,
+    new_contents: &str,
+) -> Option<serde_json::Error> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        && serde_json::from_str::<serde::de::IgnoredAny>(original_contents).is_ok()
+    {
+        serde_json::from_str::<serde::de::IgnoredAny>(new_contents).err()
+    } else {
+        None
+    }
+}
+
 /// Read the file at `path` and derive its contents after applying the chunks.
 async fn derive_new_contents_from_chunks(
     path: &PathUri,
@@ -1018,6 +1036,16 @@ async fn derive_new_contents_from_chunks(
 ) -> std::result::Result<AppliedPatch, ApplyPatchError> {
     let original_contents = read_update_source(path, fs, sandbox).await?;
     let new_contents = new_contents_from_chunks(path, &original_contents, chunks, hunk_ordinal)?;
+    if let Some(error) =
+        invalid_json_candidate(&path.to_path_buf(), &original_contents, &new_contents)
+    {
+        // Rebuilding against a newer snapshot must enforce the same guard as
+        // preflight. Earlier hunks may already be committed at this point.
+        return Err(ApplyPatchError::ComputeReplacements(format!(
+            "{} was valid JSON before this patch; candidate is invalid: {error}",
+            path.inferred_native_path_string(),
+        )));
+    }
     Ok(AppliedPatch {
         original_contents,
         new_contents,
@@ -1422,13 +1450,31 @@ fn bounded_patch_mismatch_excerpt(
         }
     }
     let best_score = candidate_scores.values().copied().max()?;
-    let mut best = candidate_scores
+    let best = candidate_scores
         .into_iter()
-        .filter_map(|(start, score)| (score == best_score).then_some(start));
-    let candidate_start = best.next()?;
-    if best.next().is_some() {
-        return None;
-    }
+        .filter_map(|(start, score)| (score == best_score).then_some(start))
+        .collect::<Vec<_>>();
+    let candidate_start = match best.as_slice() {
+        [only] => *only,
+        // Context leads with the line its author located, so when an insertion
+        // displaces the rest of a chunk, only the true site keeps that anchor.
+        // Identical candidates stay ambiguous.
+        tied => {
+            let (anchor_offset, anchor) = expected
+                .iter()
+                .enumerate()
+                .find(|(_, line)| !line.is_empty())?;
+            let mut anchored = tied
+                .iter()
+                .copied()
+                .filter(|start| original_lines.get(start + anchor_offset) == Some(anchor));
+            let start = anchored.next()?;
+            if anchored.next().is_some() {
+                return None;
+            }
+            start
+        }
+    };
     let mismatch = expected
         .iter()
         .enumerate()
@@ -2091,6 +2137,40 @@ mod tests {
     }
 
     #[test]
+    fn tied_mismatch_shows_the_candidate_that_keeps_the_leading_anchor() {
+        // An edit inserted a test between the chunk's anchor and its target, so
+        // the anchor site and the target site each match two of three lines.
+        let lines = [
+            "mod tests {",
+            "    static LOCK: Mutex<()> = Mutex::new(());",
+            "",
+            "    #[test]",
+            "    fn inserted() {}",
+            "",
+            "    fn target() {}",
+            "}",
+        ]
+        .map(String::from)
+        .to_vec();
+        let chunk = UpdateFileChunk {
+            change_context: None,
+            old_lines: vec![
+                "    static LOCK: Mutex<()> = Mutex::new(());".to_string(),
+                String::new(),
+                "    fn target() {}".to_string(),
+            ],
+            new_lines: vec![],
+            is_end_of_file: false,
+        };
+
+        let (start, end, excerpt) =
+            bounded_patch_mismatch_excerpt(&lines, &chunk).expect("anchored candidate");
+        assert!(start <= 2 && end >= 4, "{start}-{end}");
+        assert!(excerpt.contains("static LOCK"), "{excerpt}");
+        assert!(excerpt.contains("#[test]"), "{excerpt}");
+    }
+
+    #[test]
     fn mismatch_excerpt_preserves_blank_offsets_and_shows_late_discrepancy() {
         for mut lines in [
             vec!["anchor".to_string(), String::new(), "old".to_string()],
@@ -2468,6 +2548,57 @@ mod tests {
             .await.unwrap();
         assert_eq!(fs::read_to_string(&valid).unwrap(), "{\n  \"a\": 2\n}\n");
         assert_eq!(fs::read_to_string(&jsonc).unwrap(), "{\n  // comment\n  \"a\": 2\n}\n");
+    }
+
+    #[tokio::test]
+    async fn json_update_revalidates_after_concurrent_edit() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let source = dir.path().join("source.json");
+        let prefix = dir.path().join("prefix.txt");
+        let changed = "{\n\"key\":\n1\n}\n";
+        fs::write(&source, "[\n1\n]\n").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let failure = apply_patch_with_cancellation(
+            &wrap_patch(
+                "*** Add File: prefix.txt\n+committed\n*** Update File: source.json\n@@\n-1\n+2,3\n*** Add File: suffix.txt\n+not committed",
+            ),
+            &cwd,
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            None,
+            &|| {
+                // Preflight accepts [2,3], but the same replacement would
+                // invalidate the object written after the prefix commits.
+                if prefix.exists() {
+                    fs::write(&source, changed).unwrap();
+                }
+                false
+            },
+        )
+        .await
+        .expect_err("a refreshed JSON candidate must be validated before writing");
+        assert!(failure.to_string().contains("candidate is invalid"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), changed);
+        assert_eq!(fs::read_to_string(&prefix).unwrap(), "committed\n");
+        assert!(!dir.path().join("suffix.txt").exists());
+        assert!(stdout.is_empty());
+        assert!(failure.delta().is_exact());
+        assert_eq!(
+            failure.delta().changes(),
+            &[AppliedPatchChange {
+                path: prefix,
+                change: AppliedPatchFileChange::Add {
+                    content: "committed\n".into(),
+                    overwritten_content: None,
+                },
+            }]
+        );
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("do not retry the whole patch"), "{stderr}");
+        assert!(!stderr.contains("No files were changed"), "{stderr}");
     }
 
     #[tokio::test]

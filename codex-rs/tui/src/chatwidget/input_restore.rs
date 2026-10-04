@@ -98,6 +98,8 @@ impl ChatWidget {
     }
 
     pub(super) fn pop_latest_queued_composer_state(&mut self) -> Option<ComposerDraftSnapshot> {
+        self.ide_context.on_queue_tail_removed(self.input_queue.queued_user_messages.len());
+        self.update_task_running_state();
         self.input_queue.queued_user_message_history_records.resize(
             self.input_queue.queued_user_messages.len(),
             UserMessageHistoryRecord::UserMessageText,
@@ -265,6 +267,8 @@ impl ChatWidget {
     /// state stays aligned with the merged attachment list. Returns `None` when there is nothing to
     /// restore.
     fn drain_pending_messages_for_restore(&mut self) -> Option<ComposerDraftSnapshot> {
+        self.ide_context.invalidate_prompt();
+        self.update_task_running_state();
         if self.input_queue.pending_steers.is_empty() && !self.has_queued_follow_up_messages() {
             return None;
         }
@@ -358,6 +362,53 @@ impl ChatWidget {
         ));
     }
 
+    /// Cancel only the unsent IDE prompt, without disturbing steers already owned by the server.
+    pub(super) fn cancel_pending_ide_prompt(&mut self) -> bool {
+        if !self.ide_context.prompt_pending() {
+            return false;
+        }
+        self.ide_context.invalidate_prompt();
+        if let Some(queued) = self.input_queue.queued_user_messages.pop_front() {
+            let history = self
+                .input_queue
+                .queued_user_message_history_records
+                .pop_front()
+                .unwrap_or(UserMessageHistoryRecord::UserMessageText);
+            let composer = self.bottom_pane.composer_draft_snapshot();
+            self.restore_ide_prompt_to_composer(
+                user_message_for_restore(queued.into_user_message(), &history),
+                composer,
+            );
+        }
+        self.update_task_running_state();
+        self.refresh_pending_input_preview();
+        self.request_redraw();
+        true
+    }
+
+    pub(super) fn restore_ide_prompt_to_composer(
+        &mut self,
+        user_message: UserMessage,
+        composer: ComposerDraftSnapshot,
+    ) {
+        let mut messages = vec![user_message];
+        if composer.has_content() {
+            messages.push(UserMessage {
+                text: composer.text,
+                text_elements: composer.text_elements,
+                local_images: composer.local_images,
+                remote_image_urls: composer.remote_image_urls,
+                mention_bindings: composer.mention_bindings,
+            });
+        }
+        // The submitted payload has already expanded pastes. Only the newer draft still owns
+        // pending paste bodies; the existing merge helper rebases its image/text element ranges.
+        self.restore_composer_state(Self::composer_state_from_user_message(
+            merge_user_messages(messages),
+            composer.pending_pastes,
+        ));
+    }
+
     pub(super) fn restore_composer_state(&mut self, composer: ComposerDraftSnapshot) {
         let ComposerDraftSnapshot {
             text,
@@ -422,6 +473,7 @@ impl ChatWidget {
                 .iter()
                 .map(|pending| pending.compare_key.clone())
                 .collect(),
+            promoted_steers: self.input_queue.promoted_steers.clone(),
             rejected_steers_queue: self.input_queue.rejected_steers_queue.clone(),
             rejected_steer_history_records: self.input_queue.rejected_steer_history_records.clone(),
             queued_user_messages: self.input_queue.queued_user_messages.clone(),
@@ -440,6 +492,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn restore_thread_input_state(&mut self, input_state: Option<ThreadInputState>) {
+        self.ide_context.invalidate_requests();
         if let Some(input_state) = input_state {
             self.current_collaboration_mode = input_state.current_collaboration_mode;
             self.active_collaboration_mask = input_state.active_collaboration_mask;
@@ -451,6 +504,7 @@ impl ChatWidget {
             self.update_collaboration_mode_indicator();
             self.refresh_model_dependent_surfaces();
             self.restore_composer_state(input_state.composer.unwrap_or_default());
+            self.input_queue.promoted_steers = input_state.promoted_steers;
             let mut pending_steer_history_records = input_state.pending_steer_history_records;
             pending_steer_history_records.resize(
                 input_state.pending_steers.len(),

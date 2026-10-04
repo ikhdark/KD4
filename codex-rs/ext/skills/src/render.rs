@@ -195,6 +195,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_catalog_scopes_host_discovery_and_preserves_its_own_route() {
+        use codex_extension_api::ContextualUserFragment;
+
+        let catalog = SkillCatalog {
+            entries: vec![SkillCatalogEntry::new(
+                crate::catalog::SkillPackageId("skill://test/demo".to_string()),
+                crate::catalog::SkillAuthority::new(SkillSourceKind::Orchestrator, "codex_apps"),
+                "demo",
+                "description",
+                crate::catalog::SkillResourceId::new("skill://test/demo/SKILL.md"),
+            )],
+            ..Default::default()
+        };
+        let rendered = available_skills_fragment(&catalog).expect("catalog").render();
+
+        assert!(rendered.contains(
+            "For omitted or newly relevant host skills, search read_file(path=\"skill:catalog\")"
+        ));
+        assert!(rendered.contains("For other sources, use their provider-specific discovery routes."));
+        assert!(rendered.contains("(orchestrator resource: skill://test/demo/SKILL.md)"));
+        assert!(rendered.contains("skills.list({\"authority\":{\"kind\":\"orchestrator\"}})"));
+        assert!(rendered.contains("pass the returned authority, package, and main_resource as resource to skills.read"));
+    }
+
+    #[test]
     fn selected_instructions_share_a_rendered_budget_and_small_skills_are_complete() {
         use codex_extension_api::ContextualUserFragment;
         let entry = SkillCatalogEntry::new(

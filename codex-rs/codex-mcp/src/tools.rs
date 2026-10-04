@@ -290,9 +290,9 @@ fn rewrite_input_property_schema_as_local_file_path(schema: &mut JsonValue) {
     let is_array = object.get("type").and_then(JsonValue::as_str) == Some("array")
         || object.get("items").is_some();
     let guidance = if is_array {
-        "Absolute local paths to the files to upload."
+        "Paths to the files to upload, relative to the primary execution environment's working directory. Absolute paths and parent-directory (`..`) components are not allowed."
     } else {
-        "Absolute local path to the file to upload."
+        "Path to the file to upload, relative to the primary execution environment's working directory. Absolute paths and parent-directory (`..`) components are not allowed."
     };
     if description.is_empty() {
         description = guidance.to_string();

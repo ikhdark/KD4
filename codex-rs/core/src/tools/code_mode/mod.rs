@@ -728,7 +728,10 @@ pub(super) fn handle_runtime_response(
     );
     // A zero text budget must not erase the only handle for still-owned work.
     for state in &canonical_states {
-        if state["process_exited"] == false && !state["session_id"].is_null() {
+        if state["process_exited"] == false
+            && !state["session_id"].is_null()
+            && !shows_session_handle(&code_mode_text_content(&output.body), &state["session_id"])
+        {
             output.body.push(FunctionCallOutputContentItem::InputText {
                 text: format!("Running command session_id: {}", state["session_id"]),
             });
@@ -739,12 +742,22 @@ pub(super) fn handle_runtime_response(
             && let Some(artifact_id) = state["raw_output_artifact_id"].as_str()
             && !code_mode_text_content(&output.body).contains(artifact_id)
         {
+            let mut receipt = serde_json::json!({
+                "output_truncated": true,
+                "artifact_id": artifact_id,
+                "recovery_tool": "read_tool_output",
+            });
+            // The command owner already knows the omitted range. Preserve its
+            // executable recovery route, not just a locator that forces another
+            // discovery round trip or a reread of already delivered bytes.
+            if let Some(recovery) = state.get("recovery") {
+                receipt["recovery"] = recovery.clone();
+            }
+            if state["raw_output_artifact_retention_limit_hit"] == true {
+                receipt["raw_output_artifact_retention_limit_hit"] = JsonValue::Bool(true);
+            }
             output.body.push(FunctionCallOutputContentItem::InputText {
-                text: serde_json::json!({
-                    "output_truncated": true,
-                    "artifact_id": artifact_id,
-                    "recovery_tool": "read_tool_output",
-                }).to_string(),
+                text: receipt.to_string(),
             });
         }
     }
@@ -1246,6 +1259,21 @@ fn truncate_code_mode_failure(
         projected.push(FunctionCallOutputContentItem::InputText { text: error_text });
     }
     (projected, omitted)
+}
+
+/// Whether visible text already carries this live handle: in a printed result
+/// envelope or an earlier receipt. A longer ID sharing the prefix does not count.
+fn shows_session_handle(visible: &str, session_id: &JsonValue) -> bool {
+    [
+        format!("\"session_id\":{session_id}"),
+        format!("Running command session_id: {session_id}"),
+    ]
+    .iter()
+    .any(|handle| {
+        visible.match_indices(handle.as_str()).any(|(index, _)| {
+            !visible[index + handle.len()..].starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
 }
 
 fn code_mode_text_content(items: &[FunctionCallOutputContentItem]) -> String {

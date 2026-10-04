@@ -924,12 +924,12 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
     };
     let mixed = probe(|turn| configure(turn, false)).await;
     let nested_only = probe(|turn| configure(turn, true)).await;
-    mixed.assert_visible_contains(&["exec_command", "apply_patch"]);
-    nested_only.assert_visible_lacks(&["exec_command"]);
+    mixed.assert_visible_contains(&["exec_command", "apply_patch", "read_file"]);
+    nested_only.assert_visible_lacks(&["exec_command", "read_file"]);
     nested_only.assert_visible_lacks(&["apply_patch"]);
     assert_eq!(nested_only.exposure("apply_patch"), ToolExposure::Direct);
     for plan in [&mixed, &nested_only] {
-        plan.assert_registered_contains(&["exec_command", "apply_patch"]);
+        plan.assert_registered_contains(&["exec_command", "apply_patch", "read_file"]);
     }
 
     let ToolSpec::Freeform(mixed_exec) = mixed.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME)
@@ -941,7 +941,7 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
     else {
         panic!("expected nested-only code mode exec tool");
     };
-    for name in ["exec_command", "apply_patch"] {
+    for name in ["exec_command", "apply_patch", "read_file"] {
         let spec = mixed.visible_spec(name);
         let description = match spec {
             ToolSpec::Function(tool) => &tool.description,
@@ -956,6 +956,9 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         );
     }
     assert!(mixed_exec.description.contains("exec_command(args: unknown"));
+    assert!(mixed_exec.description.contains("read_file(args: unknown"));
+    assert!(!nested_exec.description.contains("read_file(args: unknown"));
+    assert!(nested_exec.description.contains("selectors?:"));
     assert!(!mixed_exec.description.contains("yield_time_ms"));
     assert!(nested_exec.description.contains("yield_time_ms"));
     let ToolSpec::Function(command) = mixed.visible_spec("exec_command") else {
@@ -985,7 +988,7 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         }
         assert!(!exec.description.contains("curr_time(args:"));
         assert!(!exec.description.contains("Return the current time in UTC."));
-        assert!(!exec.description.contains("read_file(args:"));
+        assert!(exec.description.contains("read_file(args:"));
         assert!(!exec.description.contains("read_tool_output(args:"));
     }
     assert!(mixed_exec.description.len() < nested_exec.description.len());
@@ -1725,6 +1728,14 @@ async fn code_mode_schema_stays_fixed_when_discovery_sources_change() {
     assert!(second.tool_search_sources.contains("docs"));
     assert!(second.tool_search_sources.contains("browser"));
     assert_ne!(first.tool_search_sources, second.tool_search_sources);
+    for plan in [&first, &second] {
+        plan.assert_registered_contains(&["tool_search"]);
+        let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+            panic!("expected exec contract");
+        };
+        assert!(!exec.description.contains("tool_search(args:"));
+        assert!(exec.description.contains("resolve_tool(\"tool_search\")"));
+    }
 }
 
 #[tokio::test]

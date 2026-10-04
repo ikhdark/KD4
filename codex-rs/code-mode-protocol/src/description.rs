@@ -340,6 +340,7 @@ mod tests {
         assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
         assert!(description.contains("callable with `.name`/`.description`"));
         assert!(description.contains("Search only if local discovery fails"));
+        assert!(description.contains("execute those arguments in the same cell"));
         assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
         assert!(description.contains(
             "When `tool_search` is advertised, use it to activate tools that are not yet listed."

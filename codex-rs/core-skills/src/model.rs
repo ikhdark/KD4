@@ -213,6 +213,7 @@ impl HostSkillsSnapshot {
         self.skills_by_catalog_id
             .get(catalog_id)
             .map(|&index| &self.outcome.skills[index])
+            .filter(|skill| self.outcome.is_skill_enabled(skill))
     }
 
     pub async fn read_skill_text_by_catalog_locator(&self, locator: &str) -> io::Result<String> {
@@ -348,7 +349,7 @@ mod catalog_id_tests {
     }
 
     #[test]
-    fn snapshot_resolves_catalog_locator_independent_of_input_order() {
+    fn snapshot_resolves_only_enabled_catalog_locators_independent_of_input_order() {
         let alpha = skill(
             "alpha",
             "/host/skills/alpha/SKILL.md",
@@ -362,15 +363,27 @@ mod catalog_id_tests {
             Some("plugin-b"),
         );
         let alpha_locator = format!("{SKILL_CATALOG_LOCATOR_PREFIX}{}", skill_catalog_id(&alpha));
-        for skills in [vec![alpha.clone(), beta.clone()], vec![beta, alpha.clone()]] {
-            let snapshot = HostSkillsSnapshot::new(Arc::new(SkillLoadOutcome {
-                skills,
-                ..Default::default()
-            }));
-            assert_eq!(
-                snapshot.resolve_catalog_locator(&alpha_locator),
-                Some(&alpha)
-            );
+        let beta_locator = format!("{SKILL_CATALOG_LOCATOR_PREFIX}{}", skill_catalog_id(&beta));
+        for skills in [
+            vec![alpha.clone(), beta.clone()],
+            vec![beta.clone(), alpha.clone()],
+        ] {
+            for disabled in [false, true] {
+                let snapshot = HostSkillsSnapshot::new(Arc::new(SkillLoadOutcome {
+                    skills: skills.clone(),
+                    disabled_paths: if disabled {
+                        HashSet::from([alpha.path_to_skills_md.clone()])
+                    } else {
+                        HashSet::new()
+                    },
+                    ..Default::default()
+                }));
+                assert_eq!(
+                    snapshot.resolve_catalog_locator(&alpha_locator),
+                    (!disabled).then_some(&alpha)
+                );
+                assert_eq!(snapshot.resolve_catalog_locator(&beta_locator), Some(&beta));
+            }
         }
     }
 

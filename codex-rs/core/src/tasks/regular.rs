@@ -9,6 +9,10 @@ use crate::session::turn::LogicalGenerationBudget;
 use crate::session::turn::run_turn;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
+use codex_protocol::ResponseItemId;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
 use tracing::Instrument;
@@ -78,6 +82,28 @@ impl SessionTask for RegularTask {
                 )
                 .await
                 {
+                    // Completion metadata is not a transcript item. Publish direct
+                    // answers through the normal persisted message lifecycle so
+                    // clients see them both live and when reopening the thread.
+                    if let Some(message) = turn_result
+                        .surfaced_result
+                        .as_ref()
+                        .and_then(|result| result.canonical_message.as_ref())
+                    {
+                        sess.record_response_item_and_emit_turn_item(
+                            &ctx,
+                            ResponseItem::Message {
+                                id: Some(ResponseItemId::new("msg")),
+                                role: "assistant".to_string(),
+                                content: vec![ContentItem::OutputText {
+                                    text: message.clone(),
+                                }],
+                                phase: Some(MessagePhase::FinalAnswer),
+                                internal_chat_message_metadata_passthrough: None,
+                            },
+                        )
+                        .await?;
+                    }
                     return Ok(turn_result);
                 }
                 next_input = Vec::new();

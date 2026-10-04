@@ -1529,28 +1529,31 @@ impl ToolHistoryState {
         }
     }
 
-    /// Sampling keeps observations as historical evidence and appends their
-    /// invalidations. Replacing an old output moves the provider cache boundary
-    /// back to that output on every edit. Compaction may still reduce history.
+    /// Active-task observations retain a stable prefix. After an answered task,
+    /// consumed recoverable results become historical receipts on the next user
+    /// request. Canonical history, unresolved failures and unread results remain.
     pub(crate) fn project_sampling_with_workspace_cache(
         &self,
         items: Arc<[ResponseItem]>,
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
         git_workspace: &GitWorkspaceCache,
     ) -> ToolHistoryProjection {
-        // Explicit checkpoints retire only their selected, recoverable results.
-        // All other sampling evidence retains its original representation.
+        // Explicit phase checkpoints can also retire current-task evidence.
         let retired = items
             .iter()
             .filter_map(phase_checkpoint_ids)
             .flatten()
             .collect::<BTreeSet<_>>();
+        let completed_boundary = crate::context_manager::completed_turn_boundary(&items);
         let mut checkpointed = ProjectedResponseItems::Shared(Arc::clone(&items));
         for (index, item) in items.iter().enumerate() {
             let Some((call_id, output)) = canonical_textual_output_identity(item) else {
                 continue;
             };
-            if !retired.contains(call_id) || non_text_output_token_cost(item) != 0 {
+            if (!retired.contains(call_id)
+                && !completed_boundary.is_some_and(|boundary| index < boundary))
+                || non_text_output_token_cost(item) != 0
+            {
                 continue;
             }
             let Some(candidate) = self.candidates.get(call_id) else {
@@ -1770,7 +1773,9 @@ impl ToolHistoryState {
             return None;
         }
         let tail = &prepared_items[anchored_len..];
-        if Self::has_phase_checkpoint(tail) {
+        if Self::has_phase_checkpoint(tail)
+            || tail.iter().any(crate::context_manager::is_user_turn_boundary)
+        {
             return None;
         }
         let extend = |base: &Arc<[ResponseItem]>| -> Arc<[ResponseItem]> {
@@ -6158,7 +6163,11 @@ fn powershell_path_operands(
     ];
     let mut paths = Vec::new();
     let mut expecting = None::<bool>;
-    let mut positional_skipped = false;
+    // Named parameters bind before positional arguments, even when they occur
+    // after the path. Only skip a positional pattern when none was named.
+    let mut positional_skipped = arguments
+        .iter()
+        .any(|argument| argument.eq_ignore_ascii_case("-pattern"));
     for argument in arguments {
         if let Some(is_path) = expecting.take() {
             if is_path {

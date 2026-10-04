@@ -87,6 +87,24 @@ mod tests {
     }
 
     #[test]
+    fn slice_truncation_preserves_original_line_coordinates() {
+        let source = (201..=1200)
+            .map(|line| format!("source line {line:04}\r\n"))
+            .collect::<String>();
+        let output = truncate_model_text_at_lines(&source, 100, 200, 1500);
+        assert!(model_token_count(&output) <= 100);
+        let (head, rest) = output.split_once("\n[omitted lines ").unwrap();
+        let (marker, tail) = rest.split_once("]\n").unwrap();
+        assert!(source.starts_with(head));
+        assert!(source.ends_with(tail));
+        let (span, total) = marker.split_once(" of ").unwrap();
+        assert_eq!(total.split(';').next(), Some("1500"));
+        let first = 201 + head.bytes().filter(|byte| *byte == b'\n').count();
+        let last = 200 + source[..source.len() - tail.len()].lines().count();
+        assert_eq!(span, format!("{first}-{last}"));
+    }
+
+    #[test]
     fn unicode_and_tiny_budgets_are_valid_and_bounded() {
         for text in ["🙂漢字".repeat(1000), "<|endoftext|>".repeat(1000)] {
             for limit in [0, 1, 10, 100, 1000] {

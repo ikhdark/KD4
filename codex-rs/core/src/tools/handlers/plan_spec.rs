@@ -120,7 +120,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                 "step_ids": { "type": "array", "items": { "type": "string" }, "description": "Stable step IDs in current plan order." },
                 "lineage": {
                     "type": "object",
-                    "description": "Persistent original requirements, independent of checklist wording; supersession records survive subsequent updates and resume.",
+                    "description": "Persistent original requirements, independent of checklist wording; supersession records survive subsequent updates and resume. Printed results omit entries restating their sole current step (same ID, text and status).",
                     "properties": {
                         "workflow": {
                             "type": "object",

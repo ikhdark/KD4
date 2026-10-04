@@ -486,7 +486,13 @@ fn tool_timeout_ms(
         .map(|state| {
             if state.enabled_tools.get(tool_index).is_some_and(|tool| {
                 tool.tool_name.namespace.is_none() && tool.tool_name.name == "write_stdin"
-            }) && input.is_some_and(|input| input["wait_for_output"] == true) {
+            }) && input.is_some_and(|input| {
+                input["wait_for_output"].as_bool().unwrap_or_else(|| {
+                    input["chars"].as_str().unwrap_or_default().is_empty()
+                        && input["yield_time_ms"].is_null()
+                        && input["terminate"] != true
+                })
+            }) {
                 return 0;
             }
             state

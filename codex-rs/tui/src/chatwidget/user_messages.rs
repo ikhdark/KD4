@@ -106,6 +106,7 @@ pub(crate) struct ThreadInputState {
     pub(super) pending_steers: VecDeque<UserMessage>,
     pub(super) pending_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) pending_steer_compare_keys: VecDeque<PendingSteerCompareKey>,
+    pub(super) promoted_steers: VecDeque<PendingSteer>,
     pub(super) rejected_steers_queue: VecDeque<UserMessage>,
     pub(super) rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
@@ -143,7 +144,7 @@ impl From<&str> for UserMessage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct PendingSteer {
     pub(super) user_message: UserMessage,
     pub(super) history_record: UserMessageHistoryRecord,

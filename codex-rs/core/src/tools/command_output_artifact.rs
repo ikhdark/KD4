@@ -4939,6 +4939,12 @@ fn successful_exact_selector_result(
             result.value = serde_json::from_slice(bytes).ok();
             if result.value.is_none() {
                 result.data_base64 = Some(BASE64_STANDARD.encode(bytes));
+            } else {
+                // Every direct child is already addressable from the complete
+                // value and parent pointer. Repeating a potentially unbounded
+                // address list can spill an otherwise fitting JSON selection.
+                // Directory-only and incomplete results still need their lists.
+                result.child_selectors.clear();
             }
         }
         ToolOutputSelector::Lines { .. } | ToolOutputSelector::Section { .. } => {
@@ -5352,6 +5358,33 @@ fn select_tool_output_snapshot(
             *selected = omitted;
         }
         response.complete = false;
+        // A later selector can exhaust the envelope after an earlier value has
+        // fitted. Keep the batch addressable instead of discarding every result
+        // and forcing a model/tool retry with fewer selectors. Compact from the
+        // tail so retained search hydration never references an omitted prefix.
+        if !response_fits_recovery_token_ceiling(&response, token_ceiling) {
+            for index in (0..response.results.len()).rev() {
+                let previous = &response.results[index];
+                if !matches!(previous.status,
+                    ToolOutputSelectorStatus::Ok
+                        | ToolOutputSelectorStatus::SelectorTooLarge
+                        | ToolOutputSelectorStatus::AggregateOmitted)
+                {
+                    continue;
+                }
+                let mut omitted = ToolOutputSelectorResult::state(
+                    previous.selector.clone(),
+                    ToolOutputSelectorStatus::AggregateOmitted,
+                );
+                omitted.exact_bytes = previous.exact_bytes;
+                omitted.canonical_range = previous.canonical_range;
+                omitted.continuation = Some(previous.selector.clone());
+                response.results[index] = omitted;
+                if response_fits_recovery_token_ceiling(&response, token_ceiling) {
+                    break;
+                }
+            }
+        }
         if !response_fits_recovery_token_ceiling(&response, token_ceiling) {
             return Err(ReadToolOutputError::InvalidRange(
                 "normalized selector manifest cannot fit a bounded typed-overflow response; use fewer selectors"

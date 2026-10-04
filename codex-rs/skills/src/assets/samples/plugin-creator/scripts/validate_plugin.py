@@ -154,7 +154,6 @@ def validate_manifest_shape(
             "logoDark",
             "screenshots",
             "defaultPrompt",
-            "default_prompt",
         },
         "interface",
         errors,
@@ -167,9 +166,21 @@ def validate_manifest_shape(
         "category",
     ):
         require_non_empty_string(interface, field, errors, prefix="interface")
-    if "defaultPrompt" not in interface and "default_prompt" not in interface:
+    prompts = interface.get("defaultPrompt")
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    if (
+        not isinstance(prompts, list)
+        or not 1 <= len(prompts) <= 3
+        or any(
+            not isinstance(prompt, str)
+            or not 1 <= len(" ".join(prompt.split())) <= 128
+            for prompt in prompts
+        )
+    ):
         errors.append(
-            "plugin.json field `interface.defaultPrompt` or `interface.default_prompt` is required"
+            "plugin.json field `interface.defaultPrompt` must be a non-empty string "
+            "or 1-3 non-empty strings, each at most 128 characters"
         )
     capabilities = interface.get("capabilities")
     if not isinstance(capabilities, list) or not all(

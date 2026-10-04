@@ -150,6 +150,9 @@ impl ChatWidget {
             );
             return (false, None);
         }
+        if self.defer_prompt_for_ide_context(&user_message, &history_record, shell_escape_policy) {
+            return (true, None);
+        }
         let UserMessage {
             text,
             local_images,

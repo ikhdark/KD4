@@ -462,7 +462,10 @@ async fn run_session_picker_with_loader(
 
     loop {
         tokio::select! {
-            Some(ev) = tui_events.next() => {
+            ev = tui_events.next() => {
+                // Input can close while the background loader is still alive.
+                // Do not wait for that loader before leaving the picker.
+                let Some(ev) = ev else { break };
                 if state.overlay.is_some() {
                     state.handle_overlay_event(alt.tui, ev)?;
                     continue;
@@ -2194,6 +2197,10 @@ fn picker_binding_label(
 }
 
 fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
+    let ctrl_c_label = match state.launch_context {
+        SessionPickerLaunchContext::Startup => "quit",
+        SessionPickerLaunchContext::ExistingSession => "exit",
+    };
     if state.is_transcript_loading() {
         let hints = [
             PickerFooterHint {
@@ -2204,8 +2211,8 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
             },
             PickerFooterHint {
                 key: "ctrl+c".into(),
-                wide_label: String::from("quit"),
-                compact_label: String::from("quit"),
+                wide_label: ctrl_c_label.to_string(),
+                compact_label: ctrl_c_label.to_string(),
                 priority: 1,
             },
         ];
@@ -2224,10 +2231,6 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
         }
     } else {
         ("clear search", "clear")
-    };
-    let ctrl_c_label = match state.launch_context {
-        SessionPickerLaunchContext::Startup => "quit",
-        SessionPickerLaunchContext::ExistingSession => "exit",
     };
     let density_label = match state.density {
         SessionListDensity::Comfortable => "dense view",
@@ -4300,6 +4303,13 @@ mod tests {
 
         assert!(rendered.contains("loading transcript"));
         assert!(rendered.contains("ctrl+c quit"));
+        assert!(!rendered.contains("enter"));
+
+        state.launch_context = SessionPickerLaunchContext::ExistingSession;
+        let rendered = footer_lines_text(&state, /*width*/ 80);
+        assert!(rendered.contains("loading transcript"));
+        assert!(rendered.contains("ctrl+c exit"));
+        assert!(!rendered.contains("quit"));
         assert!(!rendered.contains("enter"));
     }
 

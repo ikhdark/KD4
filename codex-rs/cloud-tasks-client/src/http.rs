@@ -875,7 +875,7 @@ mod api {
         if s.len() <= max {
             s.to_string()
         } else {
-            s[s.len() - max..].to_string()
+            s[s.ceil_char_boundary(s.len() - max)..].to_string()
         }
     }
 
@@ -898,7 +898,7 @@ mod api {
             .unwrap_or_else(|| "<unknown>".to_string());
         let head: String = patch.lines().take(20).collect::<Vec<&str>>().join("\n");
         let head_trunc = if head.len() > 800 {
-            format!("{}…", &head[..800])
+            format!("{}…", &head[..head.floor_char_boundary(800)])
         } else {
             head
         };

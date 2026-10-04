@@ -36,6 +36,13 @@ export type Usage = {
 export type TurnCompletedEvent = {
   type: "turn.completed";
   usage: Usage;
+  /** Authoritative tool result delivered without a final assistant message. */
+  surfaced_result?: {
+    adapter: string;
+    value: unknown;
+    /** Owner-authored text, when available; never synthesized from `value`. */
+    canonicalMessage?: string;
+  };
 };
 
 /** Indicates that a turn failed with an error. */

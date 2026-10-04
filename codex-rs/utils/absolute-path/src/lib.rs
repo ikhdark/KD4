@@ -95,6 +95,10 @@ impl AbsolutePathBuf {
     /// Construct an absolute path from `path`, resolving relative paths against
     /// the process current working directory.
     pub fn relative_to_current_dir<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        if path.as_ref().is_absolute() {
+            return Self::from_absolute_path(path);
+        }
+
         Ok(Self::resolve_path_against_base(
             path,
             std::env::current_dir()?,
@@ -646,6 +650,58 @@ mod tests {
             current_dir.join("file.txt").as_path()
         );
         Ok(())
+    }
+
+    #[test]
+    fn relative_to_current_dir_normalizes_absolute_path() -> std::io::Result<()> {
+        let path = test_path_buf("/tmp/codex/../codex-home/plugins/cache");
+        let resolved = AbsolutePathBuf::relative_to_current_dir(&path)?;
+        assert_eq!(resolved, AbsolutePathBuf::from_absolute_path(path)?);
+        assert_eq!(
+            resolved.as_path(),
+            test_path_buf("/tmp/codex-home/plugins/cache")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_paths_do_not_read_current_dir() {
+        let status = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+            .arg("tests::absolute_paths_with_removed_current_dir_child")
+            .arg("--exact")
+            .arg("--ignored")
+            .env("CODEX_ABSOLUTE_PATH_REMOVED_CWD_CHILD", "1")
+            .status()
+            .expect("run child test");
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn absolute_paths_with_removed_current_dir_child() {
+        if std::env::var_os("CODEX_ABSOLUTE_PATH_REMOVED_CWD_CHILD").is_none() {
+            return;
+        }
+
+        // Isolate the process-wide cwd change from the other tests.
+        let original_cwd = std::env::current_dir().expect("original cwd");
+        let dir = tempdir().expect("temporary cwd");
+        std::env::set_current_dir(dir.path()).expect("set cwd");
+        dir.close().expect("remove cwd");
+        assert!(std::env::current_dir().is_err());
+
+        let input = test_path_buf("/tmp/codex/../codex-home/plugins/cache");
+        let path = AbsolutePathBuf::from_absolute_path(&input)
+            .expect("absolute path should not require current dir");
+        let resolved = AbsolutePathBuf::relative_to_current_dir(input)
+            .expect("absolute path should not require current dir");
+        assert!(AbsolutePathBuf::relative_to_current_dir("relative.txt").is_err());
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        assert_eq!(path.as_path(), test_path_buf("/tmp/codex-home/plugins/cache"));
+        assert_eq!(resolved, path);
     }
 
     #[test]

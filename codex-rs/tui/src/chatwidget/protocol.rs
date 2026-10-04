@@ -229,8 +229,24 @@ impl ChatWidget {
         match notification.turn.status {
             TurnStatus::Completed => {
                 self.last_non_retry_error = None;
+                let last_agent_message = if let Some(result) = notification
+                    .surfaced_result
+                    .or(notification.turn.surfaced_result)
+                {
+                    // Direct delivery has no final assistant item. Finish any earlier
+                    // commentary first, and never substitute it for the owner's result.
+                    self.flush_answer_stream_with_separator();
+                    self.transcript.saw_copy_source_this_turn = false;
+                    result.canonical_message
+                } else {
+                    None
+                };
+                if let Some(message) = last_agent_message.as_deref() {
+                    let parsed = parse_assistant_markdown(message, self.config.cwd.as_path());
+                    self.finalize_completed_assistant_message(Some(&parsed.visible_markdown));
+                }
                 self.on_task_complete(
-                    /*last_agent_message*/ None,
+                    last_agent_message,
                     notification.turn.duration_ms,
                     replay_kind.is_some(),
                 )

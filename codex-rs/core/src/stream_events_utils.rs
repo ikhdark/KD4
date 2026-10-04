@@ -520,7 +520,7 @@ pub(crate) async fn handle_output_item_done(
             let completion = async move {
                 tool_runtime
                     .handle_model_tool_call_with_admission(
-                        call, cancellation_token, future_timing, Some(admission),
+                        call, cancellation_token, future_timing, Some((admission, read_only)),
                     )
                     .await
             };

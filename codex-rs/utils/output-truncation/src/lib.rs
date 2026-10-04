@@ -160,7 +160,7 @@ fn truncate_text_to_token_ceiling_cow(content: &str, max_tokens: usize) -> Cow<'
 }
 
 fn truncate_over_budget_text(content: &str, max_tokens: usize) -> String {
-    truncate_over_budget_text_with_markers(content, max_tokens, false)
+    truncate_over_budget_text_with_markers(content, max_tokens, false).0
 }
 
 /// Projection-boundary truncation. Line coordinates refer to the original text,
@@ -169,39 +169,136 @@ pub fn truncate_text_with_line_markers(content: &str, max_tokens: usize) -> Stri
     if !approx_token_count_exceeds(content, max_tokens) {
         return content.to_string();
     }
-    truncate_over_budget_text_with_markers(content, max_tokens, true)
+    truncate_over_budget_text_with_markers(content, max_tokens, true).0
 }
 
 pub fn omitted_line_marker(content: &str, start: usize, end: usize) -> String {
     omitted_line_marker_at_lines(content, start, end, 0, content.lines().count())
 }
 
-fn omitted_line_marker_at_lines(content: &str, start: usize, end: usize, offset: usize, total: usize) -> String {
-    let first = offset + content[..start].bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let last = first + content[start..end].bytes().filter(|byte| *byte == b'\n').count()
-        - usize::from(content[..end].ends_with('\n'));
-    let partial = (start > 0 && content.as_bytes()[start - 1] != b'\n')
-        || (end < content.len() && end > 0 && content.as_bytes()[end - 1] != b'\n');
+fn omitted_line_marker_at_lines(
+    content: &str,
+    start: usize,
+    end: usize,
+    offset: usize,
+    total: usize,
+) -> String {
+    let (first, last, partial) = omitted_line_span(content, start, end);
+    let first = first + offset;
+    let last = last + offset;
     format!("\n[omitted lines {first}-{last} of {total}{}]\n",
         if partial { "; boundary lines partially retained" } else { "" })
 }
 
-/// First bounded source-line run absent from the displayed projection. Summary
-/// line prefixes do not affect matching; repeated already-visible lines need
-/// no speculative recovery hint.
+/// 1-based inclusive lines touched by the omitted byte range, and whether a
+/// boundary line is partially retained.
+fn omitted_line_span(content: &str, start: usize, end: usize) -> (usize, usize, bool) {
+    let first = content[..start].bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let last = first + content[start..end].bytes().filter(|byte| *byte == b'\n').count()
+        - usize::from(content[..end].ends_with('\n'));
+    let partial = (start > 0 && content.as_bytes()[start - 1] != b'\n')
+        || (end < content.len() && end > 0 && content.as_bytes()[end - 1] != b'\n');
+    (first, last, partial)
+}
+
+const OMITTED_RANGE_MAX_LINES: usize = 200;
+/// Retained text resumes only where the source continues in order for this many
+/// lines, through the end of the source or projection, or up to a seam after at
+/// least this much text. A lone repeated line (a closing brace, a blank) or a
+/// duplicated construct that diverges mid-region cannot end an omitted run.
+const RESUME_CONFIRM_MAX_LINES: usize = 8;
+const RESUME_CONFIRM_TEXT_BYTES: usize = 24;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayedLine {
+    No,
+    /// Equal text, which may also occur elsewhere in the projection.
+    Text,
+    /// A shell-summary line carrying this exact source line number.
+    Numbered,
+}
+
+/// First bounded run of source lines missing from the displayed projection.
+/// Lines are aligned in source order: a line counts as displayed only where the
+/// projection continues it, so text repeated elsewhere in the projection does
+/// not end the run early. Projection headers and omission markers are skipped,
+/// and numbered summary lines (`{number:>5}: text`) match by line number.
 pub fn first_omitted_line_range(source: &str, projection: &str) -> Option<(usize, usize)> {
-    let mut start = None;
-    let mut end = 0;
-    for (index, line) in source.lines().enumerate() {
-        if !line.is_empty() && !projection.contains(line) {
-            let first = *start.get_or_insert(index + 1);
-            end = index + 1;
-            if end - first >= 199 { break; }
-        } else if start.is_some() {
-            break;
+    let source = source.lines().collect::<Vec<_>>();
+    let shown = projection.lines().collect::<Vec<_>>();
+    let displayed = |index: usize, row: usize| {
+        shown.get(row).map_or(DisplayedLine::No, |text| {
+            displayed_source_line(text, index + 1, source[index])
+        })
+    };
+    let displays = |index: usize, row: usize| displayed(index, row) != DisplayedLine::No;
+    // Omission markers and summary gaps begin with these; a blank row precedes
+    // a seam, and the end of the projection closes its last region.
+    let seam = |row: usize| {
+        shown.get(row).is_none_or(|text| {
+            text.is_empty()
+                || text.starts_with('[')
+                || text.starts_with("...")
+                || text.starts_with('…')
+        })
+    };
+    let resumes_at = |index: usize, row: usize| {
+        let mut text_bytes = 0;
+        for offset in 0..RESUME_CONFIRM_MAX_LINES {
+            let Some(line) = source.get(index + offset) else {
+                return offset > 0;
+            };
+            match displayed(index + offset, row + offset) {
+                DisplayedLine::No => {
+                    return text_bytes >= RESUME_CONFIRM_TEXT_BYTES && seam(row + offset);
+                }
+                DisplayedLine::Numbered => return true,
+                DisplayedLine::Text => text_bytes += line.trim().len(),
+            }
         }
+        true
+    };
+    let resume_row =
+        |index: usize, from: usize| (from..shown.len()).find(|&row| resumes_at(index, row));
+    let (mut index, mut row) = (0, 0);
+    let start = loop {
+        if index == source.len() {
+            return None;
+        }
+        if displays(index, row) {
+            (index, row) = (index + 1, row + 1);
+            continue;
+        }
+        match resume_row(index, row) {
+            Some(next) => row = next,
+            None => break index,
+        }
+    };
+    let limit = source.len().min(start + OMITTED_RANGE_MAX_LINES);
+    let end = (start + 1..limit)
+        .find(|&index| resume_row(index, row).is_some())
+        .unwrap_or(limit);
+    Some((start + 1, end))
+}
+
+fn displayed_source_line(text: &str, number: usize, line: &str) -> DisplayedLine {
+    if text == line {
+        return DisplayedLine::Text;
     }
-    start.map(|start| (start, end))
+    // Shell summaries render a selected, possibly abbreviated line as
+    // `{number:>5}: text`; only that exact numbering identifies the source line.
+    let Some(colon) = text.bytes().take(24).position(|byte| byte == b':') else {
+        return DisplayedLine::No;
+    };
+    let prefix = &text[..colon];
+    let numbered = text.as_bytes().get(colon + 1) == Some(&b' ')
+        && (prefix.len() == 5 || (prefix.len() > 5 && !prefix.starts_with(' ')))
+        && prefix.trim_start().parse::<usize>() == Ok(number);
+    if numbered {
+        DisplayedLine::Numbered
+    } else {
+        DisplayedLine::No
+    }
 }
 
 /// A line that alone needs more than this share of the budget crowds out every
@@ -304,23 +401,34 @@ fn json_outline(value: &serde_json::Value, depth: usize, out: &mut String) {
     }
 }
 
-fn truncate_over_budget_text_with_markers(content: &str, max_tokens: usize, line_markers: bool) -> String {
+/// Also returns the exact omitted line ranges when every cut is a line-marked
+/// seam; outlined JSON lines and tiny-budget fallbacks report none.
+fn truncate_over_budget_text_with_markers(
+    content: &str,
+    max_tokens: usize,
+    line_markers: bool,
+) -> (String, Vec<(usize, usize)>) {
     if let Some(outlined) = outline_oversized_json_lines(content, max_tokens) {
         if !approx_token_count_exceeds(&outlined, max_tokens) {
-            return outlined;
+            return (outlined, Vec::new());
         }
-        return truncate_over_budget_lines_with_markers(&outlined, max_tokens, line_markers);
+        let (text, _) = truncate_over_budget_lines_with_markers(&outlined, max_tokens, line_markers);
+        return (text, Vec::new());
     }
     truncate_over_budget_lines_with_markers(content, max_tokens, line_markers)
 }
 
-fn truncate_over_budget_lines_with_markers(content: &str, max_tokens: usize, line_markers: bool) -> String {
+fn truncate_over_budget_lines_with_markers(
+    content: &str,
+    max_tokens: usize,
+    line_markers: bool,
+) -> (String, Vec<(usize, usize)>) {
     const BEFORE_MIDDLE: &str = "\n[omitted before retained middle]\n";
     const AFTER_MIDDLE: &str = "\n[omitted after retained middle]\n";
     let marker_tokens = approx_token_count(BEFORE_MIDDLE) + approx_token_count(AFTER_MIDDLE);
     // Leave room for useful UTF-8 content in each retained region.
     if max_tokens <= marker_tokens + 4 {
-        return truncate_middle_to_token_ceiling(content, max_tokens);
+        return (truncate_middle_to_token_ceiling(content, max_tokens), Vec::new());
     }
 
     let mut retained_bytes =
@@ -340,8 +448,12 @@ fn truncate_over_budget_lines_with_markers(content: &str, max_tokens: usize, lin
             content.ceil_char_boundary(content.len() - tail), content.len());
         let middle_offset = middle_text.as_ptr() as usize - content.as_ptr() as usize;
         let tail_offset = tail_text.as_ptr() as usize - content.as_ptr() as usize;
-        let before = line_markers.then(|| omitted_line_marker(content, head_text.len(), middle_offset));
-        let after = line_markers.then(|| omitted_line_marker(content, middle_offset + middle_text.len(), tail_offset));
+        let gaps = [
+            (head_text.len(), middle_offset),
+            (middle_offset + middle_text.len(), tail_offset),
+        ];
+        let before = line_markers.then(|| omitted_line_marker(content, gaps[0].0, gaps[0].1));
+        let after = line_markers.then(|| omitted_line_marker(content, gaps[1].0, gaps[1].1));
         let _ = write!(
             candidate,
             "{}{}{}{}{}",
@@ -350,7 +462,16 @@ fn truncate_over_budget_lines_with_markers(content: &str, max_tokens: usize, lin
         );
         let actual_tokens = approx_token_count(&candidate);
         if actual_tokens <= max_tokens {
-            return candidate;
+            let omitted = if line_markers {
+                gaps.iter()
+                    .map(|&(start, end)| omitted_line_span(content, start, end))
+                    .filter(|(first, last, _)| first <= last)
+                    .map(|(first, last, _)| (first, last))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return (candidate, omitted);
         }
         // Scale by the observed token density; a token delta is not a byte delta.
         retained_bytes = retained_bytes
@@ -361,7 +482,7 @@ fn truncate_over_budget_lines_with_markers(content: &str, max_tokens: usize, lin
             // changes across UTF-8 boundaries or retained regions.
             .min(retained_bytes.saturating_sub(retained_bytes.div_ceil(8)));
         if retained_bytes < 3 {
-            return truncate_middle_to_token_ceiling(content, max_tokens);
+            return (truncate_middle_to_token_ceiling(content, max_tokens), Vec::new());
         }
     }
 }
@@ -439,19 +560,55 @@ pub fn formatted_truncate_text_with_output_limit(
     content: &str,
     limits: OutputLimitResolution,
 ) -> TruncatedTextOutput {
-    formatted_truncate_text_to_token_ceiling(content, limits.applied_limit)
+    formatted_truncate_text_to_token_ceiling(content, limits.applied_limit, false).0
+}
+
+/// A formatted truncation whose omission markers name source line ranges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineMarkedTruncation {
+    pub output: TruncatedTextOutput,
+    /// 1-based inclusive line runs of the source that the markers report
+    /// omitted, in order. Empty when no cut could be marked in line coordinates
+    /// (an outlined JSON line or a tiny budget); infer those from the text.
+    pub omitted_lines: Vec<(usize, usize)>,
+}
+
+impl LineMarkedTruncation {
+    /// The first marked run, bounded like [`first_omitted_line_range`].
+    pub fn first_omitted_line_range(&self) -> Option<(usize, usize)> {
+        self.omitted_lines
+            .first()
+            .map(|&(start, end)| (start, end.min(start + OMITTED_RANGE_MAX_LINES - 1)))
+    }
+}
+
+/// Formatted truncation whose omission markers name each omitted line range of
+/// `content`. Use it only when a retained artifact holds exactly `content`, so
+/// every gap is recoverable by exact line selector instead of a source reread.
+pub fn formatted_truncate_text_with_line_markers(
+    content: &str,
+    limits: OutputLimitResolution,
+) -> LineMarkedTruncation {
+    let (output, omitted_lines) =
+        formatted_truncate_text_to_token_ceiling(content, limits.applied_limit, true);
+    LineMarkedTruncation {
+        output,
+        omitted_lines,
+    }
 }
 
 fn formatted_truncate_text_to_token_ceiling(
     content: &str,
     max_tokens: usize,
-) -> TruncatedTextOutput {
+    line_markers: bool,
+) -> (TruncatedTextOutput, Vec<(usize, usize)>) {
     let original_tokens = approx_token_count(content);
     if original_tokens <= max_tokens {
-        return TruncatedTextOutput {
+        let output = TruncatedTextOutput {
             text: content.to_owned(),
             was_truncated: false,
         };
+        return (output, Vec::new());
     }
     let warning = format!(
         "Warning: truncated output (original token count: {original_tokens})\nTotal output lines: {}\n\n",
@@ -461,18 +618,21 @@ fn formatted_truncate_text_to_token_ceiling(
     // Keep at least half the budget for source evidence. At small budgets the
     // inline omission marker communicates truncation without consuming the
     // space needed to identify each retained text run.
-    let text = if max_tokens > warning_tokens.saturating_mul(2) {
-        format!(
-            "{warning}{}",
-            truncate_over_budget_text(content, max_tokens - warning_tokens)
-        )
+    let (text, omitted_lines) = if max_tokens > warning_tokens.saturating_mul(2) {
+        let (text, omitted_lines) = truncate_over_budget_text_with_markers(
+            content,
+            max_tokens - warning_tokens,
+            line_markers,
+        );
+        (format!("{warning}{text}"), omitted_lines)
     } else {
-        truncate_over_budget_text(content, max_tokens)
+        truncate_over_budget_text_with_markers(content, max_tokens, line_markers)
     };
-    TruncatedTextOutput {
+    let output = TruncatedTextOutput {
         text,
         was_truncated: true,
-    }
+    };
+    (output, omitted_lines)
 }
 
 /// Recognize validation output for diagnostic budgeting and summarization.
@@ -675,7 +835,7 @@ fn strip_prefix_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 
 pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String {
     if let TruncationPolicy::Tokens(max_tokens) = policy {
-        return formatted_truncate_text_to_token_ceiling(content, max_tokens).text;
+        return formatted_truncate_text_to_token_ceiling(content, max_tokens, false).0.text;
     }
     if content.len() <= policy.byte_budget() {
         return content.to_string();

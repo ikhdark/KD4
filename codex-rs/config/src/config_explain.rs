@@ -363,7 +363,7 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
     doc(
         "web_search",
         "Search and agents",
-        "Global web search mode: `disabled`, `cached`, or `live`.",
+        "Global web search mode: `disabled`, `cached`, `indexed`, or `live`.",
     ),
     doc(
         "agents",
