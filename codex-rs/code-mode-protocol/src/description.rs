@@ -346,7 +346,7 @@ mod tests {
             "When `tool_search` is advertised, use it to activate tools that are not yet listed."
         ));
         assert!(
-            description.len() < 8_500,
+            description.len() < 10_000,
             "compact exec prompt unexpectedly expanded to {} bytes",
             description.len()
         );
@@ -405,7 +405,7 @@ mod tests {
         assert!(description.contains("inspect every result"));
         assert!(
             description
-                .contains("Sequence dependent calls only after checking prerequisite results")
+                .contains("Check prerequisites before dependents")
         );
         assert!(description.contains("buffers output while awaited work continues"));
         assert!(description.contains("same awaited evaluation"));
@@ -429,7 +429,14 @@ mod tests {
             crate::MAX_NESTED_COMMAND_OUTPUT_TOKENS,
         )));
         assert!(!description.contains("the cell budget is separate"));
-        assert!(description.contains(r#"first-line `// @exec: {"max_output_tokens": 10000}`"#));
+        assert!(description.contains(&format!(
+            r#"first-line `// @exec: {{"max_output_tokens": {}}}`"#,
+            crate::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        )));
+        assert!(description.contains(&format!(
+            "(ceiling {})",
+            crate::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        )));
         assert!(description.contains("queues a model-visible message without yielding"));
         // Cells run in fresh isolates; only session storage carries values forward.
         assert!(description.contains("JS bindings reset per exec"));
@@ -443,7 +450,7 @@ mod tests {
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
-        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 8_500;
+        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 10_000;
         assert!(
             description.len() <= COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET,
             "the exec contract must stay within {COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET} bytes; got {}",
@@ -519,7 +526,7 @@ mod tests {
         ];
         for names in inventories {
             // Names, their backticks, and separators grow with the inventory.
-            // The 8,500-byte budget includes delivery, persistence, and DAG contracts.
+            // The 10,000-byte budget includes delivery, persistence, and DAG contracts.
             let list_bytes = names.iter().map(|name| name.len() + 2).sum::<usize>()
                 + names.len().saturating_sub(1) * 2;
             for code_mode_only in [false, true] {
@@ -527,7 +534,7 @@ mod tests {
                     let description =
                         build_exec_tool_description(code_mode_only, has_deferred_tools, &names);
                     assert!(
-                        description.len() < 8_500 + list_bytes,
+                        description.len() < 10_000 + list_bytes,
                         "assembled exec prompt exceeded its boilerplate budget: {} bytes, \
                          {list_bytes} bytes of names, code_mode_only={code_mode_only}, \
                          has_deferred_tools={has_deferred_tools}",

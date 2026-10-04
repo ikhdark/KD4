@@ -1345,7 +1345,13 @@ def _main() -> int:
                         flush=True,
                     )
                 extracted_cache_dir = artifacts_temp_root / "_extracted-codex-packages"
+                # Submit independent targets together to the existing bounded
+                # download/extraction pools, rather than serial singleton pools.
+                grouped_targets: dict[tuple[str, ...], set[str]] = {}
                 for components, targets in native_component_sets:
+                    grouped_targets.setdefault(components, set()).update(targets)
+                for components, selected_targets in grouped_targets.items():
+                    targets = tuple(t for t in BINARY_TARGETS if t in selected_targets)
                     vendor_temp_root = Path(
                         tempfile.mkdtemp(prefix="npm-native-", dir=runner_temp)
                     )
@@ -1369,9 +1375,9 @@ def _main() -> int:
                         max_download_workers=args.max_download_workers,
                         vendor_copy_mode=args.vendor_copy_mode,
                     )
-                    vendor_src_by_native_key[(components, targets)] = (
-                        vendor_temp_root / "vendor"
-                    )
+                    for key in native_component_sets:
+                        if key[0] == components:
+                            vendor_src_by_native_key[key] = vendor_temp_root / "vendor"
 
         staged_output_root = Path(
             tempfile.mkdtemp(prefix="npm-output-", dir=runner_temp)

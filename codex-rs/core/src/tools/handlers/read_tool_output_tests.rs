@@ -53,8 +53,12 @@ async fn explicit_nested_recovery_does_not_hide_a_model_handoff() {
         let ResponseInputItem::FunctionCallOutput { output: visible, .. } =
             output.to_response_item("recovered", &payload) else { panic!("function output") };
         let visible: Value = serde_json::from_str(&visible.body.to_text().unwrap()).unwrap();
-        assert!(visible.get("delivered_selection_complete").is_none());
-        assert!(visible.get("retained_bytes").is_none());
+        assert_eq!(visible["delivered_selection_complete"], result["delivered_selection_complete"]);
+        assert_eq!(visible["retained_bytes"], result["retained_bytes"]);
+        let schema = crate::tools::handlers::read_tool_output_spec::read_tool_output_output_schema(
+            crate::tools::handlers::read_tool_output_spec::tool_output_selector_schema(),
+        );
+        jsonschema::validator_for(&schema).unwrap().validate(&visible).unwrap();
         assert!(visible["results"][0].get("exact_bytes").is_none());
         for field in ["artifact_id", "canonical_sha256", "canonical_bytes", "complete", "retained_artifact_complete"] {
             assert_eq!(visible[field], result[field], "{field}");

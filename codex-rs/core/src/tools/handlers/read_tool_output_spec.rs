@@ -276,7 +276,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                                 "selector": {"$ref": "#/$defs/selector"},
                                 "canonical_range": {"$ref": "#/$defs/range"},
                                 "exact_bytes": {"type": "integer", "minimum": 0},
-                                "shared": {"type": "boolean", "enum": [true], "description": "The exact bytes were already hydrated at this identical canonical_range in an earlier result of this same response. Reuse that text; no further read is needed. This never refers to another response."},
+                                "shared": {"type": "boolean", "enum": [true], "description": "The exact bytes are contained in a text or data_base64 canonical_range in an earlier result of this same response. Slice that evidence by byte offset; no further read is needed. Overlapping contexts may be split into byte selectors. This never refers to another response or to a shared reference without bytes."},
                                 "text": {"type": "string"},
                                 "data_base64": {"type": "string"}
                             },

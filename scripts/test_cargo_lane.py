@@ -38,6 +38,73 @@ def ps_single_quote(value: str | Path) -> str:
 
 
 class CargoLaneTest(unittest.TestCase):
+    def test_busy_lane_waits_without_holding_coordination_then_reuses_target(self):
+        errors = self.temp_root / "waiting.stderr"
+        env = {
+            **os.environ,
+            "CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE": "1",
+            "CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0",
+            "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES": "0",
+            "CODEX_CARGO_LANE_ACTIVE_NAMES": "",
+        }
+        with contextlib.ExitStack() as reservation:
+            reservation.enter_context(rust_build_status.reserve_cargo_lane(
+                repo_root=self.temp_root, lane_root=self.lanes_root,
+                requested_lane="handoff", command=["cargo", "check"],
+            ))
+            with (
+                errors.open("w", encoding="utf-8") as stderr,
+                owned_process(
+                    [self.shell, "-NoProfile", "-File", str(SCRIPT),
+                     "-LanesRoot", str(self.lanes_root), "-Lane", "handoff",
+                     "-WarmWaitSeconds", "10"],
+                    env=env, stdout=subprocess.PIPE, stderr=stderr, text=True,
+                    creationflags=CREATE_NO_WINDOW,
+                ) as process,
+            ):
+                deadline = time.monotonic() + 5
+                while process.poll() is None and time.monotonic() < deadline:
+                    if "waiting up to" in errors.read_text(encoding="utf-8"):
+                        break
+                    time.sleep(0.025)
+                self.assertIn("waiting up to", errors.read_text(encoding="utf-8"))
+                with rust_build_status.cargo_lane_coordination_lock(
+                    self.lanes_root, timeout_seconds=1
+                ):
+                    pass
+                reservation.close()
+                stdout, _ = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, errors.read_text(encoding="utf-8"))
+        self.assertIn("LANE=handoff", stdout)
+        self.assertFalse((self.lanes_root / "handoff-2").exists())
+
+    def test_busy_lane_rejects_cold_overflow_by_default(self):
+        with rust_build_status.reserve_cargo_lane(
+            repo_root=self.temp_root, lane_root=self.lanes_root,
+            requested_lane="busy", command=["cargo", "check"]
+        ):
+            result = self.run_script("-Lane", "busy", "-WarmWaitSeconds", "0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no cold overflow was started", result.stderr)
+        self.assertFalse((self.lanes_root / "busy-2").exists())
+
+    def test_busy_lane_uses_an_idle_warm_sibling_without_overflow_opt_in(self):
+        with rust_build_status.reserve_cargo_lane(
+            repo_root=self.temp_root, lane_root=self.lanes_root,
+            requested_lane="busy", command=["cargo", "check"]
+        ):
+            for name in (".fingerprint", "deps", "build"):
+                (self.lanes_root / "busy-2" / "debug" / name).mkdir(parents=True, exist_ok=True)
+            result = self.run_script("-Lane", "busy", "-WarmWaitSeconds", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LANE=busy-2", result.stdout)
+
+    def test_warm_wait_rejects_invalid_deadlines(self):
+        for value in ("-1", "NaN", "Infinity", "invalid"):
+            result = self.run_script("-Lane", "deadline", "-WarmWaitSeconds", value)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("finite nonnegative", result.stderr)
+
     def test_script_wrapper_can_forward_the_existing_reservation_contract(self):
         wrapper = self.temp_root / "wrapper.ps1"
         wrapper.write_text(
@@ -555,6 +622,8 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
     def test_auto_lane_ranks_last_used_above_directory_mtime(self):
         for name, stamp_time, dir_time in (("warm-2", 10, 30), ("warm-3", 20, 1)):
             lane = self.make_lane(name)
+            for artifact in (".fingerprint", "deps", "build"):
+                (lane / "debug" / artifact).mkdir(parents=True, exist_ok=True)
             stamp = lane / ".lane-last-used"
             stamp.touch()
             os.utime(stamp, (stamp_time, stamp_time))
@@ -622,7 +691,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                     PROBE_READY=str(ready),
                     PROBE_RELEASE=str(release),
                 )
-                process = subprocess.Popen(
+                with owned_process(
                     [cargo, "check", "--offline", "--target-dir", str(lane), *flags],
                     cwd=crate,
                     env=env,
@@ -630,55 +699,52 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
                     stderr=subprocess.PIPE,
                     text=True,
                     creationflags=CREATE_NO_WINDOW,
-                )
-                try:
-                    deadline = time.monotonic() + 50
-                    while (
-                        not ready.exists()
-                        and process.poll() is None
-                        and time.monotonic() < deadline
-                    ):
-                        time.sleep(0.05)
-                    self.assertTrue(
-                        ready.exists(), "Cargo did not enter the build script"
-                    )
-                    self.assertTrue((lane / suffix / ".cargo-lock").is_file())
-                    self.assertTrue(rust_build_status.cargo_lock_is_busy(lane))
-                    with rust_build_status.reserve_cargo_lane(
-                        repo_root=self.temp_root,
-                        lane_root=self.lanes_root,
-                        requested_lane="real-cargo",
-                        command=["cargo", "check"],
-                        allow_cold_overflow=True,
-                        warm_wait_seconds=0,
-                    ) as (name, _):
-                        self.assertEqual(name, "real-cargo-2")
-                    result = self.run_fake_cargo(
-                        "-Lane", "real-cargo", "cargo", "check"
-                    )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn(self.lane_path("real-cargo-2"), result.stdout)
-                    from unittest import mock
-
-                    with mock.patch.dict(
-                        os.environ, {"CODEX_CARGO_LANES_ROOT": str(self.lanes_root)}
-                    ):
-                        removed = rust_build_status.prune_stale_lanes(
-                            repo_root=self.temp_root,
-                            processes=[],
-                            keep_warm_per_base=0,
-                            max_age_days=None,
-                        )
-                    self.assertNotIn(lane, removed)
-                    self.assertTrue(lane.exists())
-                finally:
-                    release.write_text("release", encoding="utf-8")
+                ) as process:
                     try:
+                        deadline = time.monotonic() + 50
+                        while (
+                            not ready.exists()
+                            and process.poll() is None
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.05)
+                        self.assertTrue(
+                            ready.exists(), "Cargo did not enter the build script"
+                        )
+                        self.assertTrue((lane / suffix / ".cargo-lock").is_file())
+                        self.assertTrue(rust_build_status.cargo_lock_is_busy(lane))
+                        with rust_build_status.reserve_cargo_lane(
+                            repo_root=self.temp_root,
+                            lane_root=self.lanes_root,
+                            requested_lane="real-cargo",
+                            command=["cargo", "check"],
+                            allow_cold_overflow=True,
+                            warm_wait_seconds=0,
+                        ) as (name, _):
+                            self.assertEqual(name, "real-cargo-2")
+                        result = self.run_fake_cargo(
+                            "-AllowColdOverflow", "-WarmWaitSeconds", "0",
+                            "-Lane", "real-cargo", "cargo", "check"
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn(self.lane_path("real-cargo-2"), result.stdout)
+                        from unittest import mock
+
+                        with mock.patch.dict(
+                            os.environ, {"CODEX_CARGO_LANES_ROOT": str(self.lanes_root)}
+                        ):
+                            removed = rust_build_status.prune_stale_lanes(
+                                repo_root=self.temp_root,
+                                processes=[],
+                                keep_warm_per_base=0,
+                                max_age_days=None,
+                            )
+                        self.assertNotIn(lane, removed)
+                        self.assertTrue(lane.exists())
+                    finally:
+                        release.write_text("release", encoding="utf-8")
                         stdout, stderr = process.communicate(timeout=20)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        stdout, stderr = process.communicate()
-                self.assertEqual(process.returncode, 0, stdout + stderr)
+                    self.assertEqual(process.returncode, 0, stdout + stderr)
                 self.assertFalse(rust_build_status.cargo_lock_is_busy(lane))
 
     def test_setup_failure_releases_reservation_in_surviving_host(self):
@@ -1273,6 +1339,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         lane = f"unit-explicit-busy-{os.getpid()}"
 
         result = self.run_fake_cargo(
+            "-AllowColdOverflow", "-WarmWaitSeconds", "0",
             "-Lane",
             lane,
             "cargo",
@@ -1298,7 +1365,10 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
             command=["cargo", "check"],
             lane_root=self.lanes_root,
         ):
-            result = self.run_fake_cargo("-Lane", lane, "cargo", "check")
+            result = self.run_fake_cargo(
+                "-AllowColdOverflow", "-WarmWaitSeconds", "0",
+                "-Lane", lane, "cargo", "check"
+            )
 
         self.assertEqual(
             result.returncode,
@@ -1842,6 +1912,8 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         warm_suffix = f"{package}-2"
         self.mark_lanes_root()
         (self.lanes_root / warm_suffix).mkdir(parents=True, exist_ok=True)
+        for artifact in (".fingerprint", "deps", "build"):
+            (self.lanes_root / warm_suffix / "debug" / artifact).mkdir(parents=True, exist_ok=True)
 
         result = self.run_fake_cargo(
             "-Lane",
@@ -1864,6 +1936,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         package = f"unit-core-mint-{os.getpid()}"
 
         result = self.run_fake_cargo(
+            "-AllowColdOverflow", "-WarmWaitSeconds", "0",
             "-Lane",
             "auto",
             "cargo",
@@ -1885,6 +1958,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         lock_process = self.hold_lane_lock(package)
         try:
             result = self.run_fake_cargo(
+                "-AllowColdOverflow", "-WarmWaitSeconds", "0",
                 "-Lane",
                 "auto",
                 "cargo",
@@ -1916,6 +1990,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         lock_path.chmod(stat.S_IREAD)
         try:
             result = self.run_fake_cargo(
+                "-AllowColdOverflow", "-WarmWaitSeconds", "0",
                 "-Lane",
                 "auto",
                 "cargo",
@@ -1934,6 +2009,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         lock_process = self.hold_lane_lock(package, lock_name=".lane-active.lock")
         try:
             result = self.run_fake_cargo(
+                "-AllowColdOverflow", "-WarmWaitSeconds", "0",
                 "-Lane",
                 "auto",
                 "cargo",

@@ -311,6 +311,124 @@ fn shared_search_hydration_rejects_missing_tiny_or_non_saving_evidence() {
     assert_eq!(expensive_reference, unchanged);
 }
 
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+#[expect(clippy::print_stdout, reason = "emit paired audit projection measurements")]
+async fn overlapping_search_hydration_reduces_input_with_identical_evidence() {
+    for newline in ["\n", "\r\n"] {
+        let text = (0..70).map(|line| format!(
+            "candidate_{line:02} {}{newline}", "λ exact source; ".repeat(12),
+        )).collect::<String>();
+        let temp = tempfile::tempdir().unwrap();
+        let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
+        let selectors = [20, 24, 28].map(|line| ToolOutputSelector::Search {
+            query: format!("candidate_{line:02}"), case_insensitive: false,
+            start_byte: 0, max_results: 1, context_lines: 10,
+        });
+        let result = select_tool_output_snapshot(
+            &metadata, &snapshot, selectors.to_vec(), 30_000,
+        ).unwrap();
+        let mut independent = result.clone();
+        independent.results = selectors.iter().map(|selector| search_logical_artifact(
+            &metadata, &snapshot, selector.clone(), 30_000, &[],
+        )).collect();
+        assert!(result.complete);
+        assert_eq!(result.delivered_evidence(), independent.delivered_evidence());
+        assert_eq!(result.canonical_sha256, independent.canonical_sha256);
+        assert_ne!(result.delivered_ranges(), vec![(0, text.len() as u64)]);
+        let mut prior = Vec::<(usize, usize, Vec<u8>)>::new();
+        for (selected, baseline) in result.results.iter().zip(&independent.results) {
+            assert_eq!(selected.child_selectors, baseline.child_selectors);
+            assert_eq!(selected.continuation, baseline.continuation);
+            let mut reconstructed = Vec::new();
+            for part in selected.value.as_ref().unwrap()["hydrated_ranges"].as_array().unwrap() {
+                let start = part["canonical_range"]["start"].as_u64().unwrap() as usize;
+                let end = part["canonical_range"]["end"].as_u64().unwrap() as usize;
+                let bytes = if part["shared"] == true {
+                    let (base, _, bytes) = prior.iter().find(|(left, right, _)|
+                        *left <= start && end <= *right).expect("same-response byte owner");
+                    bytes[start - base..end - base].to_vec()
+                } else {
+                    let bytes = part["text"].as_str().unwrap().as_bytes().to_vec();
+                    prior.push((start, end, bytes.clone()));
+                    bytes
+                };
+                assert_eq!(bytes, snapshot[start..end]);
+                reconstructed.extend(bytes);
+            }
+            let expected = baseline.value.as_ref().unwrap()["hydrated_ranges"][0]["text"].as_str().unwrap();
+            assert_eq!(reconstructed, expected.as_bytes());
+            let recovered = read_tool_output_selectors(
+                temp.path(), "thread", &metadata.artifact_id, selected.child_selectors.clone(),
+            ).await.unwrap();
+            assert_eq!(recovered.results[0].text.as_deref(), Some(expected));
+        }
+        let before = serde_json::to_string(&independent).unwrap();
+        let after = serde_json::to_string(&result).unwrap();
+        let before_tokens = codex_utils_output_truncation::model_token_count(&before);
+        let after_tokens = codex_utils_output_truncation::model_token_count(&after);
+        assert!(after.len() * 100 < before.len() * 70);
+        assert!(after_tokens * 100 < before_tokens * 70);
+        println!("audit_overlap newline={newline:?} before_bytes={} after_bytes={} before_estimated_tokens={before_tokens} after_estimated_tokens={after_tokens}", before.len(), after.len());
+        let schema = crate::tools::handlers::read_tool_output_spec::read_tool_output_output_schema(
+            crate::tools::handlers::read_tool_output_spec::tool_output_selector_schema(),
+        );
+        jsonschema::validator_for(&schema).unwrap().validate(&serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(read_complete_canonical_snapshot(
+            temp.path(), "thread", &metadata.artifact_id, text.len(),
+        ).await.unwrap(), snapshot);
+        // A later response must contain its own bytes, not dangling references.
+        let later = read_tool_output_selectors(
+            temp.path(), "thread", &metadata.artifact_id, vec![selectors[1].clone()],
+        ).await.unwrap();
+        assert_eq!(later.results[0].value, independent.results[1].value);
+    }
+}
+
+#[test]
+fn overlapping_search_hydration_preserves_binary_edges_and_rejects_non_evidence() {
+    let snapshot = (0..1200).map(|index| (index * 73 % 256) as u8).collect::<Vec<_>>();
+    let hydrated = serde_json::json!({
+        "selector": {"kind":"bytes", "start":0, "end":1200},
+        "canonical_range": {"start":0, "end":1200}, "exact_bytes":1200,
+        "data_base64": BASE64_STANDARD.encode(&snapshot),
+    });
+    let mut previous = ToolOutputSelectorResult::state(
+        ToolOutputSelector::Search { query:"candidate".into(), case_insensitive:false,
+            start_byte:0, max_results:1, context_lines:0 }, ToolOutputSelectorStatus::Ok,
+    );
+    previous.value = Some(serde_json::json!({"hydrated_ranges":[{
+        "canonical_range":{"start":200,"end":1000},
+        "data_base64":BASE64_STANDARD.encode(&snapshot[200..1000]),
+    }]}));
+    let parts = share_overlapping_search_hydration(hydrated.clone(), &snapshot, &[previous.clone()]);
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[1]["shared"], true);
+    for (part, range) in [(&parts[0], 0..200), (&parts[2], 1000..1200)] {
+        assert_eq!(BASE64_STANDARD.decode(part["data_base64"].as_str().unwrap()).unwrap(), snapshot[range]);
+    }
+    // Repetitive base64 can cost fewer tokens than the split metadata. Keep it
+    // inline in that case, even though sharing would remove many source bytes.
+    let repetitive = vec![0xff; 1200];
+    let mut cheap = hydrated.clone();
+    cheap["data_base64"] = Value::String(BASE64_STANDARD.encode(&repetitive));
+    let mut cheap_previous = previous.clone();
+    cheap_previous.value.as_mut().unwrap()["hydrated_ranges"][0]["data_base64"] = Value::String(BASE64_STANDARD.encode(&repetitive[200..1000]));
+    assert_eq!(share_overlapping_search_hydration(cheap.clone(), &repetitive, &[cheap_previous]), vec![cheap]);
+    for status in [ToolOutputSelectorStatus::AggregateOmitted, ToolOutputSelectorStatus::SelectorTooLarge,
+        ToolOutputSelectorStatus::Invalid, ToolOutputSelectorStatus::NotFound] {
+        let mut unavailable = previous.clone();
+        unavailable.status = status;
+        assert_eq!(share_overlapping_search_hydration(hydrated.clone(), &snapshot, &[unavailable]), vec![hydrated.clone()]);
+    }
+    let mut tiny = previous.clone();
+    tiny.value.as_mut().unwrap()["hydrated_ranges"][0]["canonical_range"] = serde_json::json!({"start":200,"end":400});
+    assert_eq!(share_overlapping_search_hydration(hydrated.clone(), &snapshot, &[tiny]), vec![hydrated.clone()]);
+    previous.value.as_mut().unwrap()["hydrated_ranges"][0].as_object_mut().unwrap().remove("data_base64");
+    previous.value.as_mut().unwrap()["hydrated_ranges"][0]["shared"] = Value::Bool(true);
+    assert_eq!(share_overlapping_search_hydration(hydrated.clone(), &snapshot, &[previous]), vec![hydrated]);
+}
+
 /// Adjacent selectors that each fit were normalized into one range that could
 /// only come back as `selector_too_large`, turning a working multi-selector
 /// read into a failure the model had to retry.

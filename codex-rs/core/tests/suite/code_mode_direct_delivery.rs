@@ -12,6 +12,11 @@ use codex_protocol::protocol::RolloutItem;
 #[cfg_attr(windows, test_case::test_case("leaf-glob"))]
 #[test_case::test_case("lookup")]
 #[test_case::test_case("batch")]
+#[test_case::test_case("read-helper")]
+#[test_case::test_case("full-recovery-helper")]
+#[test_case::test_case("validation-helper")]
+#[test_case::test_case("retained-batch")]
+#[test_case::test_case("bounded-inventory")]
 #[test_case::test_case("multi-range")]
 #[test_case::test_case("search-inspect")]
 #[test_case::test_case("full-file")]
@@ -21,6 +26,7 @@ use codex_protocol::protocol::RolloutItem;
 #[test_case::test_case("poll")]
 #[test_case::test_case("retained")]
 #[test_case::test_case("validation_overlap")]
+#[test_case::test_case("validation-progress")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scenario: &str) -> Result<()> {
     require_network!();
@@ -38,12 +44,24 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         fs::write(test.cwd.path().join("first.txt"), "Verified answer: α → β.\n")?;
         fs::write(test.cwd.path().join("second.txt"), "Preserve this exact text.\n")?;
         fs::write(test.cwd.path().join("ranges.txt"), "Verified answer: α → β.\nnot requested\nPreserve this exact text.\n")?;
+        let mut inventory = (0..128).map(|index| serde_json::json!({
+            "path":format!("unrelated/{index}.txt"), "selected":false,
+        })).collect::<Vec<_>>();
+        inventory.extend([
+            serde_json::json!({"path":"first.txt","selected":true}),
+            serde_json::json!({"path":"second.txt","selected":true}),
+        ]);
+        fs::write(test.cwd.path().join("inventory.json"), serde_json::to_vec(&inventory)?)?;
         let bulk = serde_json::json!({"answer":answer,"padding":"filler ".repeat(if scenario == "large-recovery" { 10_000 } else { 900 })}).to_string();
         fs::write(test.cwd.path().join("bulk.json"), &bulk)?;
         // Larger than a model display page, but comfortably within the exact
         // script payload limit. A short computed answer must not force paging.
         let large = serde_json::json!({"answer":answer,"padding":"λ 日本語\r\n".repeat(10_000)}).to_string();
         fs::write(test.cwd.path().join("large.json"), &large)?;
+        if scenario == "full-recovery-helper" {
+            let large = serde_json::json!({"answer":answer,"padding":"λ 日本語\r\n".repeat(100_000)}).to_string();
+            fs::write(test.cwd.path().join("recovery.json"), large)?;
+        }
         let read_answer = "const r = await tools.read_file({path:'answer.txt'}); if (!r.file_complete) throw new Error('incomplete source'); text(r.results[0].text);";
         let (prepare, compute) = match scenario {
             "delivery" => (None, read_answer.to_string()),
@@ -65,13 +83,30 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                 Some("text(resolve_tool('read_file').description);".to_string()),
                 "const read = resolve_tool('read_file'); if (!read.description.includes('UTF-8')) throw Error('missing contract'); const r = await read({path:'answer.txt'}); if (!r.file_complete) throw Error('incomplete source'); text(r.results[0].text);".to_string(),
             ),
-            "batch" => (
+            "batch" | "read-helper" => (
                 Some("const r = await tools.read_file({path:'first.txt'}); if (!r.file_complete) throw Error('incomplete first file'); store('first', r.results[0].text); text('first file read');".to_string()),
-                if candidate {
+                if candidate && scenario == "read-helper" {
+                    "const rows = await read_files(['first.txt','second.txt','first.txt']); store('reads',rows); if (rows.some(r => r.status !== 'fulfilled' || !r.value.file_complete) || rows[0].value !== rows[2].value) throw Error('incomplete/different batch'); text(rows[0].value.initial.results[0].text + rows[1].value.initial.results[0].text);".to_string()
+                } else if candidate {
                     "const results = await Promise.allSettled(['first.txt','second.txt'].map(path => tools.read_file({path}))); for (const r of results) if (r.status !== 'fulfilled' || !r.value.file_complete) throw Error('incomplete batch'); text(results.map(r => r.value.results[0].text).join(''));".to_string()
                 } else {
                     "const r = await tools.read_file({path:'second.txt'}); if (!r.file_complete) throw Error('incomplete second file'); text(load('first') + r.results[0].text);".to_string()
                 },
+            ),
+            "retained-batch" => (
+                Some(format!(r#"const batch = await Promise.allSettled(['first.txt','second.txt'].map(path => tools.read_file({{path}})));
+                    store('batch', {});
+                    for (const r of batch) if (r.status !== 'fulfilled' || !r.value.complete || !r.value.file_complete) throw Error('incomplete batch');"#,
+                    if candidate { "batch" } else { "[batch[0]]" })),
+                if candidate {
+                    "const retained = load('batch'); if (retained.length !== 2) throw Error('lost unprinted sibling'); text(retained.map(r => r.value.results[0].text).join(''));".to_string()
+                } else {
+                    "const second = await tools.read_file({path:'second.txt'}); if (!second.complete || !second.file_complete) throw Error('missing second file'); text(load('batch')[0].value.results[0].text + second.results[0].text);".to_string()
+                },
+            ),
+            "bounded-inventory" => (
+                Some("const inventory = await tools.read_file({path:'inventory.json'}); if (!inventory.complete || !inventory.file_complete) throw Error('incomplete inventory'); const rows = JSON.parse(inventory.results[0].text); if (rows.length !== 130) throw Error('lost inventory rows'); store('inventory', rows);".to_string()),
+                "const selected = load('inventory').filter(row => row.selected); if (selected.length !== 2) throw Error('wrong scope'); const results = await Promise.allSettled(selected.map(row => tools.read_file({path:row.path}))); for (const r of results) if (r.status !== 'fulfilled' || !r.value.file_complete) throw Error('missing selected source'); text(results.map(r => r.value.results[0].text).join(''));".to_string(),
             ),
             "full-file" => (
                 Some("const r = await tools.read_file({path:'large.json', selectors:[{kind:'bytes',start:0,end:1}]}); if (!r.complete || r.file_complete) throw Error('expected exact partial source'); store('largeHead', r);".to_string()),
@@ -79,6 +114,14 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                     "const r = await tools.read_file({path:'large.json'}); if (!r.complete || !r.file_complete) throw Error('full source required'); const v = JSON.parse(r.results[0].text); if (v.padding !== 'λ 日本語\\r\\n'.repeat(10000)) throw Error('source corruption'); text(v.answer);".to_string()
                 } else {
                     format!("const r = await tools.read_file({{path:'large.json',selectors:[{{kind:'bytes',start:1,end:{}}}]}}); const head = load('largeHead'); if (!r.complete || !head.source_sha256 || r.source_sha256 !== head.source_sha256) throw Error('incomplete or changed source'); const v = JSON.parse(head.results[0].text + r.results[0].text); if (v.padding !== 'λ 日本語\\r\\n'.repeat(10000)) throw Error('source corruption'); text(v.answer);", large.len())
+                },
+            ),
+            "full-recovery-helper" => (
+                Some("const head = await tools.read_file({path:'recovery.json'}); if (!head.complete || head.file_complete) throw Error('expected partial source'); store('head',head);".to_string()),
+                if candidate {
+                    "const rows = await read_files(['recovery.json'], {full:true}); store('reads',rows); if (rows[0].status !== 'fulfilled' || !rows[0].value.file_complete) throw Error(JSON.stringify(rows)); const e = rows[0].value; const value = JSON.parse([e.initial,...e.pages].flatMap(p => p.results).map(p => p.text).join('')); if(value.padding !== 'λ 日本語\\r\\n'.repeat(100000)) throw Error('source corruption'); text(value.answer);".to_string()
+                } else {
+                    "const head=load('head'); let parts=[head.results[0].text], offset=head.continuation.start; while(offset<head.canonical_bytes) {const end=head.canonical_bytes; const r=await tools.read_tool_output({artifact_id:head.artifact_id,selectors:[{kind:'bytes',start:offset,end}],max_bytes:1048576}); if(r.canonical_sha256!==head.source_sha256 || r.canonical_bytes!==head.canonical_bytes) throw Error('snapshot changed'); const before=offset; for(const p of r.results){if(p.status==='selector_too_large' && p.complete===false && p.text===undefined && Array.isArray(p.child_selectors)) continue; if(p.status!=='ok'||p.complete!==true||p.canonical_range.start!==offset||p.canonical_range.end>end||p.canonical_range.end<=offset||typeof p.text!=='string') throw Error('missing source'); parts.push(p.text); offset=p.canonical_range.end;} if(offset<=before) throw Error('no progress'); if(offset<end && (r.continuation_stop?.reason!=='budget' || r.continuation_stop.resumable!==true || r.continuation_stop.selector?.start!==offset || r.continuation_stop.selector.end!==end)) throw Error('unproven continuation'); if(offset===end && !r.complete) throw Error('incomplete source');} const value=JSON.parse(parts.join('')); if(value.padding!=='λ 日本語\\r\\n'.repeat(100000)) throw Error('source corruption'); text(value.answer);".to_string()
                 },
             ),
             "multi-range" => (
@@ -144,18 +187,31 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                     "const r = await tools.read_file({path:'answer.txt',force_fresh:true}); if (!r.file_complete || r.source_sha256 !== load('evidence').source_sha256) throw Error('source changed'); text(r.results[0].text);".to_string()
                 },
             ),
-            "validation_overlap" => {
+            "validation_overlap" | "validation-progress" | "validation-helper" => {
                 let python = which::which("python").or_else(|_| which::which("python3"))?;
+                let script = if scenario == "validation-progress" {
+                    "import sys,time; sys.stdout.buffer.write(sys.argv[1].encode('utf-8')); sys.stdout.buffer.flush(); time.sleep(3)"
+                } else {
+                    "import sys,time; time.sleep(3); sys.stdout.write(sys.argv[1])"
+                };
                 let command = serde_json::json!({
                     "program":python,
-                    "args":["-X", "utf8", "-c", "import sys,time; time.sleep(3); sys.stdout.write(sys.argv[1])", answer],
+                    "args":["-X", "utf8", "-c", script, answer],
                     "yield_time_ms":250,
                 });
                 // The wait models read-only report work, not inference. No
                 // mutation, resource conflict, or second validation is hidden.
                 let review = "const source = await tools.read_file({path:'answer.txt'}); if (!source.file_complete) throw Error('incomplete review'); store('review', source.results[0].text); await new Promise(resolve => setTimeout(resolve, 1000));";
                 let launch = format!("let r = await tools.exec_command({command});");
-                let drain = "let output = r.output; while (r.session_id && !r.process_exited) { r = await tools.write_stdin({session_id:r.session_id,wait_for_output:true}); output += r.output; } if (!r.process_exited || r.exit_code !== 0 || output !== load('review')) throw Error('validation or review mismatch'); text(output);";
+                let drain = if scenario == "validation-progress" && candidate {
+                    "const completed = await await_command(r); const terminal = completed.terminal; if (!terminal.streams_complete || terminal.stdout !== load('review') || !completed.observations.some(p => !p.process_exited && p.output.includes(load('review')))) throw Error('incomplete terminal/progress evidence: '+JSON.stringify({terminal,observations:completed.observations,review:load('review')})); text(terminal.stdout);"
+                } else if scenario == "validation-progress" {
+                    "const observations = [r]; while (r.session_id && !r.process_exited) { r = await tools.write_stdin({session_id:r.session_id,wait_for_output:true}); observations.push(r); } if (!r.process_exited || r.exit_code !== 0 || !r.streams_complete || r.stdout !== load('review') || !observations.some(p => !p.process_exited && p.output.includes(load('review')))) throw Error('incomplete terminal/progress evidence: '+JSON.stringify({terminal:r,observations,review:load('review')})); text(r.stdout);"
+                } else if candidate && scenario == "validation-helper" {
+                    "const completed = await await_command(r); const output = completed.observations.map(p => p.output).join(''); if (completed.observations.some(p => p.output_reduced) || output !== load('review')) throw Error('validation or review mismatch'); text(output);"
+                } else {
+                    "let output = r.output; while (r.session_id && !r.process_exited) { r = await tools.write_stdin({session_id:r.session_id,wait_for_output:true}); output += r.output; } if (!r.process_exited || r.exit_code !== 0 || output !== load('review')) throw Error('validation or review mismatch'); text(output);"
+                };
                 (
                     Some(review.to_string()),
                     if candidate {
@@ -185,6 +241,8 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         if !candidate && let Some(prepare) = &prepare {
             let extra = if scenario == "poll" {
                 "const bounded = await tools.write_stdin({session_id:load('process'),wait_for_output:false}); if (bounded.process_exited) throw Error('fixture must cross a bounded poll'); text('still waiting');"
+            } else if scenario == "bounded-inventory" {
+                "text(load('inventory'));"
             } else {
                 "text('prepared');"
             };
@@ -201,7 +259,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         };
         // Discovery and independent reads already have same-cell APIs. Recovery
         // and polling also need their owners not to manufacture a model boundary.
-        let inline_prepare = if candidate && matches!(scenario, "recovery" | "large-recovery" | "poll" | "retained") {
+        let inline_prepare = if candidate && matches!(scenario, "recovery" | "large-recovery" | "poll" | "retained" | "retained-batch" | "bounded-inventory") {
             prepare.as_deref().unwrap_or_default()
         } else {
             ""
@@ -324,12 +382,14 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                 "compute-answer",
             )
             .expect("computed answer");
-            if scenario == "large-recovery" {
+            if matches!(scenario, "large-recovery" | "full-recovery-helper") {
                 // The display-sized baseline attaches recovery controls to the
                 // computed answer. The final model removes those receipts; the
                 // candidate must deliver the exact persisted answer directly.
-                assert!(output.starts_with(answer), "missing exact computed answer");
-                assert!(output[answer.len()..].contains("continuation_stop"));
+                assert!(output.starts_with(answer), "missing exact computed answer: {output}");
+                if scenario == "large-recovery" {
+                    assert!(output[answer.len()..].contains("continuation_stop"));
+                }
             } else {
                 assert_eq!(output, answer);
             }
@@ -351,7 +411,20 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         if matches!(scenario, "retained" | "full-file" | "multi-range" | "search-inspect") {
             assert_eq!(reads, if candidate { 1 } else { 2 }, "no repeat read without drift");
         }
+        if scenario == "retained-batch" {
+            assert_eq!(reads, if candidate { 2 } else { 3 }, "unprinted siblings must survive the phase boundary");
+        }
+        if scenario == "bounded-inventory" {
+            assert_eq!(reads, 3, "same complete inventory and selected-source coverage");
+        }
         let calls = timing_json["toolCalls"].as_array().expect("tool timing");
+        if scenario == "read-helper" {
+            assert_eq!(reads, 2, "duplicate paths share one observation");
+        }
+        if scenario == "full-recovery-helper" {
+            assert_eq!(reads, 1, "recovery never reopens the mutable source");
+            assert!(calls.iter().any(|call| call["toolName"] == "read_tool_output"));
+        }
         if scenario == "leaf-glob" {
             let commands = calls.iter().filter(|call| call["toolName"] == "exec_command").count();
             assert_eq!(commands, if candidate { 1 } else { 2 }, "no discovery-only command or retry");
@@ -371,6 +444,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             "wall_ms":started_at.elapsed().as_millis(),
             "model_requests":model_requests, "native_reads":reads,
             "outer_tool_calls":outer_calls,
+            "projected_tool_output_bytes":timing_json["counters"]["toolOutputModelByteCount"],
             "exact_answer_and_persistence_verified":true,
             "provider":"scripted",
         }));

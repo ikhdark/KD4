@@ -290,7 +290,14 @@ pub(super) fn json_to_v8<'s>(
     value: &JsonValue,
 ) -> Option<v8::Local<'s, v8::Value>> {
     let json = serde_json::to_string(value).ok()?;
-    let json = v8::String::new(scope, &json)?;
+    serialized_json_to_v8(scope, &json)
+}
+
+pub(super) fn serialized_json_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    json: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let json = v8::String::new(scope, json)?;
     v8::json::parse(scope, json)
 }
 

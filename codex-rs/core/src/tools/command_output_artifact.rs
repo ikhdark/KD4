@@ -4623,6 +4623,82 @@ fn share_search_hydration(
     }
 }
 
+/// Share only bytes actually present in earlier results of this response. Split
+/// overlapping contexts rather than dropping the new evidence at either edge.
+/// Exact child selectors remain unchanged for independent snapshot recovery.
+fn share_overlapping_search_hydration(
+    hydrated: Value,
+    snapshot: &[u8],
+    previous_results: &[ToolOutputSelectorResult],
+) -> Vec<Value> {
+    let Some(start) = hydrated["canonical_range"]["start"].as_u64() else {
+        return vec![hydrated];
+    };
+    let Some(end) = hydrated["canonical_range"]["end"].as_u64() else {
+        return vec![hydrated];
+    };
+    if hydrated["shared"] == true || end.saturating_sub(start) < 256 {
+        return vec![hydrated];
+    }
+    let mut overlaps = previous_results.iter()
+        .filter(|result| result.status == ToolOutputSelectorStatus::Ok)
+        .filter_map(|result| result.value.as_ref())
+        .filter_map(|value| value["hydrated_ranges"].as_array())
+        .flatten()
+        .filter(|value| value["text"].is_string() || value["data_base64"].is_string())
+        .filter_map(|value| {
+            let left = start.max(value["canonical_range"]["start"].as_u64()?);
+            let right = end.min(value["canonical_range"]["end"].as_u64()?);
+            (right.saturating_sub(left) >= 256).then_some((left, right))
+        }).collect::<Vec<_>>();
+    overlaps.sort_unstable();
+    if overlaps.is_empty() {
+        return vec![hydrated];
+    }
+    let mut parts = Vec::new();
+    let mut cursor = start;
+    for (left, right) in overlaps {
+        if right <= cursor {
+            continue;
+        }
+        if left > cursor {
+            parts.push((cursor, left, false));
+        }
+        parts.push((left.max(cursor), right, true));
+        cursor = right;
+    }
+    if cursor < end {
+        parts.push((cursor, end, false));
+    }
+    let compact = parts.into_iter().map(|(start, end, shared)| {
+        let mut part = serde_json::json!({
+            "selector": {"kind": "bytes", "start": start, "end": end},
+            "canonical_range": {"start": start, "end": end},
+            "exact_bytes": end - start,
+        });
+        if shared {
+            part["shared"] = Value::Bool(true);
+        } else {
+            let exact = snapshot.get(usize::try_from(start).ok()?..usize::try_from(end).ok()?)?;
+            if let Ok(text) = std::str::from_utf8(exact) {
+                part["text"] = Value::String(text.to_string());
+            } else {
+                part["data_base64"] = Value::String(BASE64_STANDARD.encode(exact));
+            }
+        }
+        Some(part)
+    }).collect::<Option<Vec<_>>>();
+    let original = vec![hydrated];
+    if let Some(compact) = compact
+        && codex_utils_output_truncation::model_token_count(&serde_json::json!(compact).to_string())
+            < codex_utils_output_truncation::model_token_count(&serde_json::json!(original).to_string())
+    {
+        compact
+    } else {
+        original
+    }
+}
+
 fn search_logical_artifact(
     metadata: &LogicalArtifactMetadata,
     snapshot: &[u8],
@@ -4755,6 +4831,7 @@ fn search_logical_artifact(
                 }
                 Some(hydrated)
             })
+            .flat_map(|hydrated| share_overlapping_search_hydration(hydrated, snapshot, previous_results))
             .collect::<Vec<_>>();
         let mut result =
             ToolOutputSelectorResult::state(selector.clone(), ToolOutputSelectorStatus::Ok);

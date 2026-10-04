@@ -20,12 +20,16 @@ pub const OWNER_HELD_DECISION_YIELD_TIME_MS: u64 = u64::MAX - 1;
 /// Default coherent evidence-packet budget when no per-call limit is requested.
 pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
 /// Maximum coherent evidence-packet budget accepted from an explicit request.
-/// The core also caps this at the active model's hard output limit.
-pub const MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
+/// Above the default so one round trip can carry known-bulk evidence instead
+/// of paging it across model turns; a configured `tool_output_token_limit`
+/// still lowers the effective ceiling.
+pub const MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 40_000;
 /// Output budget of a nested command result returned to a script. Printing
 /// the result JSON-escapes its output and adds lifecycle fields, so the budget
-/// stays below the cell cap; otherwise the cell cuts the result a second time.
-pub const MAX_NESTED_COMMAND_OUTPUT_TOKENS: usize = MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 / 5;
+/// stays below the default cell budget; otherwise a cell without a raised
+/// explicit budget cuts the result a second time.
+pub const MAX_NESTED_COMMAND_OUTPUT_TOKENS: usize =
+    DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 / 5;
 /// Hard deadline applied to a single nested tool call when the host supplies no
 /// per-cell default. A host-supplied default must still leave room for the
 /// longest wait its own tools can be asked to perform.

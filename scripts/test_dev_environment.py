@@ -445,6 +445,31 @@ class GitDoctorTest(unittest.TestCase):
 
 
 class VscodeRuntimeProofTest(unittest.TestCase):
+    def test_version_probes_overlap_but_keep_deterministic_order(self) -> None:
+        import threading
+        from contextvars import ContextVar
+
+        paths = [str(Path(f"probe-{i}.exe").resolve()) for i in range(4)]
+        barrier = threading.Barrier(4)
+        operation = ContextVar("probe_operation")
+        operation.set("caller-operation")
+
+        def version(path, *, enabled):
+            self.assertTrue(enabled)
+            self.assertEqual(operation.get(), "caller-operation")
+            barrier.wait(timeout=5)
+            return path
+
+        with (
+            mock.patch.object(vscode_runtime_proof.shutil, "which", return_value=paths[0]),
+            mock.patch.object(vscode_runtime_proof, "desktop_target", return_value=paths[1]),
+            mock.patch.object(vscode_runtime_proof, "extension_candidates", return_value=paths[2:] + [paths[0]]),
+            mock.patch.object(vscode_runtime_proof, "run_version", side_effect=version) as run,
+        ):
+            probes = vscode_runtime_proof.build_probes(True)
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual([p.version for p in probes], paths + [paths[0]])
+
     def test_default_target_matches_publisher_bin_directory(self) -> None:
         with mock.patch.dict(
             os.environ, {"CODEX_LOCAL_PUBLISH_DIR": "", "CODEX_CLI_PATH": ""}

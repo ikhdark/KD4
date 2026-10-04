@@ -12,6 +12,8 @@ import collections
 import contextlib
 import difflib
 import hashlib
+import heapq
+import itertools
 import json
 import re
 import tempfile
@@ -248,6 +250,44 @@ def tool_call_trace(records):
     }
 
 
+def repeated_input_overlap(previous, current):
+    """Conditional bounds, not a tokenizer-aligned attribution of cache hits.
+
+    An unchanged non-history manifest and a completely reused history prefix
+    support using the previous provider input length as an append-only proxy.
+    Missing telemetry, compaction, or changed instructions must fail closed.
+    """
+    if previous is None:
+        return None
+    before = previous.get("local_prompt_categories", {})
+    after = current.get("local_prompt_categories", {})
+    old_hashes = before.get("promptSectionSha256", {})
+    new_hashes = after.get("promptSectionSha256", {})
+    if not old_hashes or old_hashes.keys() != new_hashes.keys():
+        return None
+    if any(old_hashes[k] != new_hashes[k] for k in old_hashes if k != "history"):
+        return None
+    prefix = after.get("historyItemsPrevious")
+    if (type(prefix) is not int or prefix <= 0
+            or after.get("historyPrefixItemsReused") != prefix
+            or after.get("historyFirstDivergentIndex") != prefix):
+        return None
+    repeated = previous.get("provider_usage", {}).get("inputTokens")
+    usage = current.get("provider_usage", {})
+    total, cached = usage.get("inputTokens"), usage.get("cachedInputTokens")
+    if (not all(type(n) is int for n in (repeated, total, cached))
+            or not 0 <= repeated <= total or not 0 <= cached <= total):
+        return None
+    return {
+        "basis": "conditional_append_only_previous_provider_input",
+        "repeated_input_proxy": repeated,
+        "cached_overlap_min": max(0, repeated + cached - total),
+        "cached_overlap_max": min(repeated, cached),
+        "uncached_overlap_min": max(0, repeated - cached),
+        "uncached_overlap_max": min(repeated, total - cached),
+    }
+
+
 def execution_context_audit(records):
     """Keep provider usage separate from local prompt estimates and disk records."""
     turns = []
@@ -257,6 +297,12 @@ def execution_context_audit(records):
     boundaries = {}
     outputs = []
     previous_outputs = []
+    identical_outputs = {}
+    block_index = collections.defaultdict(set)
+    # Bound the optional fuzzy text analysis, not record/usage coverage. Exact
+    # identities bypass SequenceMatcher; omissions remain explicit lower bounds.
+    pair_budget = 10000
+    match_work_budget = 2000000
     current_turn = None
     started = set()
     last_reported_usage = None
@@ -279,17 +325,40 @@ def execution_context_audit(records):
             "custom_tool_call_output",
         }:
             body = text_body(payload.get("output", ""))
-            lines = body.splitlines(keepends=True)
+            lines = tuple(body.splitlines(keepends=True))
+            byte_prefix = [0]
+            for output_line in lines:
+                byte_prefix.append(byte_prefix[-1] + len(output_line.encode("utf-8")))
+            blocks = {tuple(lines[i:i + 4]) for i in range(max(0, len(lines) - 3))}
+            candidates = set()
+            for block in blocks:
+                candidates.update(block_index.get(block, ()))
             covered = set()
             matches = []
-            for prior_line, prior_lines in previous_outputs:
-                for match in difflib.SequenceMatcher(
-                    None, prior_lines, lines, autojunk=False
-                ).get_matching_blocks():
-                    size = sum(
-                        len(s.encode("utf-8"))
-                        for s in lines[match.b : match.b + match.size]
-                    )
+            candidate_pairs = sum(len(previous_outputs[i][1]) for i in candidates)
+            selected_pairs = min(pair_budget, candidate_pairs)
+            skipped = candidate_pairs - selected_pairs
+            # Index distinct bodies, not every replay. A thousand identical
+            # outputs have one posting, while bounded evidence keeps record IDs.
+            prior_records = heapq.merge(*(previous_outputs[i][1] for i in candidates))
+            for prior_line, prior_index in itertools.islice(prior_records, selected_pairs):
+                prior_lines = previous_outputs[prior_index][0]
+                pair_budget -= 1
+                if prior_lines == lines:
+                    matching = [difflib.Match(0, 0, len(lines))]
+                else:
+                    # The nested occurrence visits dominate repetitive inputs;
+                    # n*m is a conservative input-size work estimate.
+                    work = len(prior_lines) * len(lines)
+                    if work > match_work_budget:
+                        skipped += 1
+                        continue
+                    match_work_budget -= work
+                    matching = difflib.SequenceMatcher(
+                        None, prior_lines, lines, autojunk=False
+                    ).get_matching_blocks()
+                for match in matching:
+                    size = byte_prefix[match.b + match.size] - byte_prefix[match.b]
                     if match.size >= 4 and size >= 160:
                         covered.update(range(match.b, match.b + match.size))
                         matches.append(
@@ -310,9 +379,21 @@ def execution_context_audit(records):
                         len(lines[i].encode("utf-8")) for i in covered
                     ),
                     "matching_blocks": matches,
+                    "matching_blocks_coverage": {
+                        "candidate_pairs": candidate_pairs,
+                        "omitted_pairs": skipped,
+                        "complete": skipped == 0,
+                    },
                 }
             )
-            previous_outputs.append((line, lines))
+            prior_index = identical_outputs.get(lines)
+            if prior_index is None:
+                prior_index = len(previous_outputs)
+                identical_outputs[lines] = prior_index
+                previous_outputs.append((lines, []))
+                for block in blocks:
+                    block_index[block].add(prior_index)
+            previous_outputs[prior_index][1].append((line, prior_index))
     for timing in execution_timings(records):
         requests = timing["modelRequests"]
         for field in ("modelRequests", "toolCalls"):
@@ -349,6 +430,9 @@ def execution_context_audit(records):
                     "added_tool_result_records": [o["record"] for o in added_outputs],
                     "added_tool_result_bytes": sum(o["bytes"] for o in added_outputs),
                 }
+            )
+            rounds[-1]["repeated_input_overlap"] = repeated_input_overlap(
+                rounds[-2] if len(rounds) > 1 else None, rounds[-1]
             )
             previous = input_tokens
             if boundary is not None:
@@ -450,10 +534,12 @@ def execution_context_audit(records):
         "limitations": [
             "Provider input includes cached input; visible output and reasoning are disjoint here.",
             "Repeated uncached context cannot be identified from aggregate cache usage or prompt section hashes.",
+            "Per-round repeated_input_overlap is conditional on append-only tokenization of the reused history and unchanged non-history sections; bounds are not exact repeated-cache attribution. Missing evidence is null, not zero.",
             "Local prompt categories are tokenizer estimates, not additive provider billing attribution; history includes tool results.",
             "Input growth is net change, not an exact decomposition of newly added context.",
             "Raw replay estimates assume output survives subsequent requests in its turn; they are exposure proxies, not measured savings.",
             "Matching text blocks are byte-equal evidence, not proof they are semantically unnecessary or current.",
+            "Repeated-block matching is budgeted; matching_blocks_coverage reports skipped candidate pairs. Repeated bytes are a lower bound when coverage is incomplete. Four-line indexing excludes only pairs that cannot meet the minimum block length.",
             "Terminal arrays take precedence; otherwise incremental checkpoints are merged by request/call identity, never summed as independent requests.",
             "Unfinished executions report observed usage only; requests without usage and uncheckpointed tail work are not assumed free or complete.",
             "Usage reconciliation compares request totals with the last cumulative token event; differences can reflect inherited usage or different capture horizons, not necessarily double counting.",
@@ -823,6 +909,10 @@ def compact_report(report, path, digest, byte_length, limit=5, source_checks=Non
         totals["repeated_block_bytes"] += sum(
             row["repeated_block_bytes"] for row in context.get("tool_outputs", [])
         )
+        totals["repeated_block_omitted_pairs"] += sum(
+            row.get("matching_blocks_coverage", {}).get("omitted_pairs", 0)
+            for row in context.get("tool_outputs", [])
+        )
         coverage.append({
             "pointer": prefix,
             "records": session["records"],
@@ -893,6 +983,7 @@ def compact_report(report, path, digest, byte_length, limit=5, source_checks=Non
             "Reconciliation status unavailable includes older ledgers. Different totals can reflect inherited usage or differing capture horizons; inspect each session's execution_context.",
             "truncated_results is a legacy alias of truncation_marker_results: lexical matches including quoted source, not runtime truncations. Follow-ups are candidates, not causal or dispatch measurements.",
             "Unavailable references may be quoted or cross-session IDs, not lost artifacts.",
+            "repeated_block_bytes is a lower bound when repeated_block_omitted_pairs is nonzero; record and token coverage are unaffected by the text-matching budget.",
             "Pointers address the hashed report snapshot; counts cover all records, displayed lists are bounded. Full limitations: /limitations.",
         ],
     }

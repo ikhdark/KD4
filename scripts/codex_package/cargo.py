@@ -49,6 +49,7 @@ class SourceBuildOutputs:
 
 
 _build_leases = ContextVar("package_build_leases", default=frozenset())
+_leased_targets = ContextVar("package_lease_targets", default=None)
 
 
 @contextmanager
@@ -74,9 +75,14 @@ def package_build_lease(spec, profile, *, inputs=None):
         "package build target",
     ):
         token = _build_leases.set(held | {target})
+        targets_token = _leased_targets.set({
+            **(_leased_targets.get() or {}),
+            (spec.target, profile, str(package_target_base(spec, profile).resolve())): target,
+        })
         try:
             yield target
         finally:
+            _leased_targets.reset(targets_token)
             _build_leases.reset(token)
 
 
@@ -124,7 +130,18 @@ def build_source_binaries(
         codex_windows_sandbox_setup_bin=codex_windows_sandbox_setup_bin,
     )
 
-    target_dir = cargo_package_target_dir(spec, profile)
+    requested_binaries = source_binaries_for_target(
+        spec,
+        variant,
+        build_entrypoint=entrypoint_bin is None,
+        build_code_mode_host=code_mode_host_bin is None,
+        build_codex_command_runner=codex_command_runner_bin is None,
+        build_codex_windows_sandbox_setup=codex_windows_sandbox_setup_bin is None,
+    )
+    target_dir = (
+        cargo_package_target_dir(spec, profile)
+        if requested_binaries else package_target_base(spec, profile)
+    )
     output_dir = cargo_profile_output_dir(spec, profile, target_dir=target_dir)
     outputs = SourceBuildOutputs(
         entrypoint_bin=resolve_output_path(
@@ -146,14 +163,6 @@ def build_source_binaries(
     )
     validate_distinct_output_paths(outputs)
 
-    requested_binaries = source_binaries_for_target(
-        spec,
-        variant,
-        build_entrypoint=entrypoint_bin is None,
-        build_code_mode_host=code_mode_host_bin is None,
-        build_codex_command_runner=codex_command_runner_bin is None,
-        build_codex_windows_sandbox_setup=codex_windows_sandbox_setup_bin is None,
-    )
     build_env = (
         cargo_build_env(
             spec, profile, target_dir=target_dir, release_version=release_version
@@ -438,8 +447,15 @@ def package_target_base(spec: TargetSpec, profile: str) -> Path:
 
 def cargo_package_target_dir(spec: TargetSpec, profile: str) -> Path:
     base = package_target_base(spec, profile)
+    held = (_leased_targets.get() or {}).get((spec.target, profile, str(base.resolve())))
+    if held is not None:
+        return held
     env = cargo_build_env(spec, profile, target_dir=base)
     identity = effective_tool_contents(spec, env)
+    return _target_for_tools(base, identity)
+
+
+def _target_for_tools(base, identity):
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
     return base / f"toolchain-{key}"
 
@@ -1010,15 +1026,23 @@ def build_recipe_fingerprint(
     build_env: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Capture toolchain and environment inputs that can change Cargo output."""
-    target_dir = cargo_package_target_dir(spec, profile)
+    base = package_target_base(spec, profile)
+    held = (_leased_targets.get() or {}).get((spec.target, profile, str(base.resolve())))
     effective_env = (
         build_env
         if build_env is not None
         else cargo_build_env(
-            spec, profile, target_dir=target_dir, release_version=release_version
+            spec, profile, target_dir=held or base, release_version=release_version
         )
     )
+    # Each proof boundary still observes executable contents freshly. Target
+    # derivation reuses this observation rather than hashing the tools again.
     tools = effective_tool_contents(spec, effective_env)
+    target_dir = held or _target_for_tools(base, tools)
+    if build_env is None:
+        effective_env = cargo_build_env(
+            spec, profile, target_dir=target_dir, release_version=release_version
+        )
     rustc = tools.get("rustc", {}).get("path", effective_env.get("RUSTC", "rustc"))
     # Build scripts and env!/option_env! can consume arbitrary variables.
     # Conservatively hash the full supplied environment, including absent vs

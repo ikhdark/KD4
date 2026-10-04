@@ -11,6 +11,27 @@
 
 version = 1
 
+[gates.harness-fork91-recovery]
+description = "Fork91-specific recovery regressions. Pair with harness-recovery-audit, harness-prevention-context and capability-command-preflight for shared coverage."
+
+[[gates.harness-fork91-recovery.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "tools::handlers::command_preflight::command_preflight_tests::fork91_multi_root_glob_repair_preserves_flags_and_other_roots",
+  "tools::context::tests::fork91_empty_terminal_drain_preserves_chunk_and_cumulative_stream_contracts",
+  "tools::context::tests::fork91_cumulative_recovery_has_bounded_selector_without_fake_coordinates",
+  "tools::context::tests::fork91_no_match_requires_exact_error_free_terminal_streams",
+  "tools::context::tests::exec_code_mode_exposes_artifact_id_not_path",
+  "tools::context::tests::exec_code_mode_preserves_empty_output_and_explicit_lifecycle",
+  "tools::context::tests::code_mode_command_result_fits_its_cell_when_printed",
+  "tools::context::tests::exec_output_discloses_lossy_decoding_without_changing_canonical_bytes",
+  "tools::context::tests::exec_command_projection_reports_reduction_from_per_call_limit",
+  "tools::code_mode::response_tests::fork91_live_fallback_preserves_capabilities_without_inventing_them",
+  "tools::code_mode::response_tests::fork91_no_match_receipt_is_not_a_failure_but_errors_are",
+  "tools::code_mode::response_tests::completion_audit_retained_intent_requires_authoritative_terminal_commands",
+]
+
 [gates.harness-recovery-audit]
 description = "Command receipts preserve recovery, diagnostics and drain handles without false silent-read recovery."
 

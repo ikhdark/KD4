@@ -84,7 +84,9 @@ pub(super) fn resolve_tool_response(
             let value = json_to_v8(&mut tc, &result)
                 .ok_or_else(|| "failed to serialize tool response".to_string())?;
             if let Some(projected) = codex_code_mode_protocol::model_visible_tool_result(&tool_name, &result) {
-                super::output_projection::register(&mut tc, value, &result, &projected)?;
+                let source_fragments = tool_name.namespace.is_none()
+                    && matches!(tool_name.name.as_str(), "read_file" | "read_tool_output");
+                super::output_projection::register(&mut tc, value, &result, &projected, source_fragments)?;
             }
             resolver.resolve(&tc, value);
         }

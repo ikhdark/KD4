@@ -88,7 +88,8 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         {
             projected.remove("canonical_sha256");
         }
-        if object.get("complete").is_some_and(Value::is_boolean)
+        if tool.name == "read_file"
+            && object.get("complete").is_some_and(Value::is_boolean)
             && object.get("delivered_selection_complete") == object.get("complete")
         {
             projected.remove("delivered_selection_complete");
@@ -96,15 +97,12 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         if object.get("artifact_id") == Some(&Value::Null) {
             projected.remove("artifact_id");
         }
-        if object.get("retained_artifact_complete") == Some(&Value::Bool(true))
-            && object.get("canonical_bytes").is_some_and(Value::is_u64)
-            && object.get("retained_bytes") == object.get("canonical_bytes")
-        {
-            projected.remove("retained_bytes");
-        }
+        // Keep required retention and search fields even when reconstructible:
+        // direct tool responses must still satisfy their advertised schema.
         if let Some(results) = projected.get_mut("results").and_then(Value::as_array_mut) {
             for result in results {
                 let Some(result) = result.as_object_mut() else { continue };
+                project_search_metadata(result);
                 if let (Some(start), Some(end), Some(bytes)) = (
                     result.get("canonical_range").and_then(|range| range["start"].as_u64()),
                     result.get("canonical_range").and_then(|range| range["end"].as_u64()),
@@ -143,6 +141,28 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         projected.insert("content".to_string(), Value::Array(retained));
     }
     (raw_text || projected != *object).then_some(Value::Object(projected))
+}
+
+/// Search coordinates and hydrated evidence remain inline. Only omit aliases
+/// derivable from that same result, never a recovery path for missing context.
+fn project_search_metadata(result: &mut serde_json::Map<String, Value>) {
+    if result.get("status").and_then(Value::as_str) != Some("ok")
+        || result.get("selector").and_then(|selector| selector["kind"].as_str()) != Some("search")
+    {
+        return;
+    }
+    let redundant_children = result.get("child_selectors").and_then(Value::as_array)
+        .zip(result.get("value").and_then(|value| value["hydrated_ranges"].as_array()))
+        .is_some_and(|(children, ranges)| !children.is_empty()
+            && children.len() == ranges.len()
+            && children.iter().zip(ranges).all(|(child, range)| {
+                range.get("selector") == Some(child)
+                    && (range.get("text").is_some_and(Value::is_string)
+                        || range.get("data_base64").is_some_and(Value::is_string))
+            }));
+    if redundant_children {
+        result.remove("child_selectors");
+    }
 }
 
 /// Keep the committed delta, retry receipt and diagnostics. Only a byte-exact
@@ -222,6 +242,60 @@ fn plan_without_restated_lineage(raw: &Value) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn search_projection_is_reconstructible_and_preserves_recovery() {
+        let child = json!({"kind":"lines", "start":1, "end":2});
+        let raw = json!({"artifact_id":"snapshot", "canonical_sha256":"revision",
+            "complete":false, "results":[{"status":"ok", "complete":false,
+                "selector":{"kind":"search", "query":"λ", "start_byte":0},
+                "continuation":{"kind":"search", "query":"λ", "start_byte":6},
+                "child_selectors":[child], "value":{"query":"λ", "start_byte":0,
+                    "coverage_complete":true, "total_matches":2, "matches_returned":1,
+                    "remaining_match_count":1,
+                    "matches":[{"line":1,"end_line":1,"start_byte":0,"end_byte":2}],
+                    "hydrated_ranges":[{"selector":child,"canonical_range":{"start":0,"end":6},
+                        "exact_bytes":6,"text":"λ\r\nhi"}]}}]});
+        for name in ["read_file", "read_tool_output"] {
+            let tool = ToolName::plain(name);
+            let compact = model_visible_tool_result(&tool, &raw).unwrap();
+            assert!(compact.to_string().len() < raw.to_string().len());
+            assert!(compact["results"][0].get("child_selectors").is_none());
+            let mut restored = compact.clone();
+            let selected = &mut restored["results"][0];
+            assert_eq!(selected["value"], raw["results"][0]["value"], "required search metadata stays inline");
+            selected["child_selectors"] = json!(selected["value"]["hydrated_ranges"].as_array().unwrap()
+                .iter().map(|range| range["selector"].clone()).collect::<Vec<_>>());
+            assert_eq!(restored, raw, "all omitted fields must be exactly recoverable");
+            println!("projection_audit search_metadata before_bytes={} after_bytes={}",
+                raw.to_string().len(), compact.to_string().len());
+
+            // Coordinates without context must retain the lazy retrieval list.
+            let mut missing = raw.clone();
+            missing["results"][0]["value"]["hydrated_ranges"] = json!([]);
+            let projected = model_visible_tool_result(&tool, &missing).unwrap_or_else(|| missing.clone());
+            assert_eq!(projected["results"][0]["child_selectors"], json!([child]));
+            assert_eq!(projected["results"][0]["continuation"], raw["results"][0]["continuation"]);
+
+            // Shared ranges need their reference; nonmatching metadata diagnoses
+            // producer inconsistencies instead of silently normalizing them.
+            let mut distinct = raw.clone();
+            let selected = &mut distinct["results"][0];
+            selected["value"]["query"] = json!("other");
+            selected["value"]["start_byte"] = json!(9);
+            selected["value"]["matches_returned"] = json!(7);
+            let range = &mut selected["value"]["hydrated_ranges"][0];
+            range.as_object_mut().unwrap().remove("text");
+            range["shared"] = json!(true);
+            range["exact_bytes"] = json!(99);
+            assert_eq!(model_visible_tool_result(&tool, &distinct), None);
+            for status in ["invalid", "aggregate_omitted", "selector_too_large"] {
+                let mut rejected = raw.clone();
+                rejected["results"][0]["status"] = json!(status);
+                assert_eq!(model_visible_tool_result(&tool, &rejected), Some(rejected));
+            }
+        }
+    }
 
     #[test]
     fn patch_projection_removes_only_reconstructible_success_text() {
@@ -358,15 +432,16 @@ mod tests {
                 "canonical_range":{"start":2,"end":8}, "text":"λ\r\nhi",
                 "subdivision_plan":{"chunk_count":2}, "message":"drained 2 pages"}]});
         let mut expected = raw.clone();
-        for field in ["retained_bytes", "delivered_selection_complete"] {
-            expected.as_object_mut().unwrap().remove(field);
-        }
         for field in ["exact_bytes", "subdivision_plan"] {
             expected["results"][0].as_object_mut().unwrap().remove(field);
         }
         println!("projection_audit recovery_metadata before_bytes={} after_bytes={}", raw.to_string().len(), expected.to_string().len());
         for tool in ["read_file", "read_tool_output"] {
-            assert_eq!(model_visible_tool_result(&ToolName::plain(tool), &raw), Some(expected.clone()));
+            let mut projected = expected.clone();
+            if tool == "read_file" {
+                projected.as_object_mut().unwrap().remove("delivered_selection_complete");
+            }
+            assert_eq!(model_visible_tool_result(&ToolName::plain(tool), &raw), Some(projected));
             let mut incomplete = raw.clone();
             incomplete["retained_artifact_complete"] = json!(false);
             incomplete["retained_bytes"] = json!(6);

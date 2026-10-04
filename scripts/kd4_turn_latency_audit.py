@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import contextlib
 import datetime as dt
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -925,27 +927,53 @@ def _checkout_overlaps(
         if paths and isinstance(start, (int, float)) and isinstance(end, (int, float)):
             checkout = str(record.get("cwd") or "").replace("\\", "/").casefold()
             turns.append((checkout, record["file"], record["turn_id"], start, end, paths))
+    # Sweep each checkout's live intervals. Preserve original input ordering
+    # for pair orientation and ties, while retaining only the requested top K.
     pairs = []
-    for index, first in enumerate(turns):
-        for second in turns[index + 1 :]:
-            if first[0] != second[0] or first[1] == second[1]:
+    pair_count = 0
+    active = {}
+    endings = []
+    checkout = None
+    for index, current in sorted(
+        enumerate(turns), key=lambda item: (item[1][0], item[1][3], item[0])
+    ):
+        if current[0] != checkout:
+            active.clear()
+            endings.clear()
+            checkout = current[0]
+        while endings and endings[0][0] <= current[3]:
+            _, expired = heapq.heappop(endings)
+            active.pop(expired, None)
+        for prior_index, prior in active.items():
+            if prior[1] == current[1]:
                 continue
+            first_index, second_index = sorted((prior_index, index))
+            first, second = turns[first_index], turns[second_index]
             overlap_ms = min(first[4], second[4]) - max(first[3], second[3])
             if overlap_ms > 0:
-                pairs.append(
-                    {
-                        "checkout": first[0],
-                        "sessions": [Path(first[1]).name, Path(second[1]).name],
-                        "turns": [first[2], second[2]],
-                        "overlapSeconds": round(overlap_ms / 1000, 1),
-                        "sharedPaths": sorted(first[5] & second[5])[:10],
-                    }
-                )
-    pairs.sort(key=lambda pair: (-len(pair["sharedPaths"]), -pair["overlapSeconds"]))
+                pair_count += 1
+                pair = {
+                    "checkout": first[0],
+                    "sessions": [Path(first[1]).name, Path(second[1]).name],
+                    "turns": [first[2], second[2]],
+                    "overlapSeconds": round(overlap_ms / 1000, 1),
+                    "sharedPaths": sorted(first[5] & second[5])[:10],
+                }
+                if limit > 0:
+                    key = (
+                        -len(pair["sharedPaths"]), -pair["overlapSeconds"],
+                        first_index, second_index,
+                    )
+                    bisect.insort(pairs, (key, pair))
+                    if len(pairs) > limit:
+                        pairs.pop()
+        if current[4] > current[3]:
+            active[index] = current
+            heapq.heappush(endings, (current[4], index))
     return {
-        "pairs": len(pairs),
-        "overlaps": pairs[:limit],
-        "omittedPairs": max(0, len(pairs) - limit),
+        "pairs": pair_count,
+        "overlaps": [pair for _, pair in pairs],
+        "omittedPairs": pair_count - len(pairs),
     }
 
 
@@ -1658,6 +1686,7 @@ def analyze_session_path(
     _captured=None,
     _files=None,
     _hydrate=None,
+    _decoded=None,
 ) -> dict[str, Any]:
     if cache_dir is not None:
         try:
@@ -1728,14 +1757,11 @@ def analyze_session_path(
         byte_count += snapshot.byte_length
         cwd = ""
         build = None
-        with (contextlib.nullcontext(snapshot.stream) if _captured is not None else contextlib.closing(snapshot.stream)), snapshot.open_lines() as handle:
-            for line_number, line in enumerate(handle, 1):
+        decoded = _decoded.get(file) if _decoded is not None else None
+        with (contextlib.nullcontext(snapshot.stream) if _captured is not None else contextlib.closing(snapshot.stream)), (contextlib.nullcontext(decoded) if decoded is not None else contextlib.closing(snapshot.decoded_lines())) as handle:
+            for line_number, item, error, _wire_bytes in handle:
                 line_count += 1
-                try:
-                    item = json.loads(line)
-                    if not isinstance(item, dict):
-                        raise TypeError("rollout record must be an object")
-                except (ValueError, TypeError) as error:
+                if error is not None:
                     action_records.append(None)
                     parse_error_count += 1
                     if len(parse_errors) < 100:
@@ -1743,7 +1769,7 @@ def analyze_session_path(
                             {
                                 "file": str(file),
                                 "line": line_number,
-                                "error": str(error),
+                                "error": error,
                             }
                         )
                     continue

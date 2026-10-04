@@ -54,6 +54,8 @@ function Parse-CargoLaneArguments {
     $parsedLanesRoot = $null
     $parsedIsolateCargoHome = $false
     $parsedFetch = $false
+    $allowColdOverflow = $false
+    $warmWaitSeconds = 30.0
     $maintenanceOnly = $false
     $commandStart = $RawArgs.Count
 
@@ -98,6 +100,20 @@ function Parse-CargoLaneArguments {
             $parsedFetch = $true
             continue
         }
+        if ($arg -eq "-AllowColdOverflow") {
+            $allowColdOverflow = $true
+            continue
+        }
+        if ($arg -eq "-WarmWaitSeconds") {
+            $i++
+            if ($i -ge $RawArgs.Count -or -not [double]::TryParse(
+                [string]$RawArgs[$i], [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$warmWaitSeconds
+            ) -or $warmWaitSeconds -lt 0 -or [double]::IsInfinity($warmWaitSeconds) -or [double]::IsNaN($warmWaitSeconds)) {
+                throw "-WarmWaitSeconds requires a finite nonnegative number."
+            }
+            continue
+        }
         if ($arg -eq "-MaintenanceOnly") {
             $maintenanceOnly = $true
             continue
@@ -126,6 +142,8 @@ function Parse-CargoLaneArguments {
         LanesRoot = $parsedLanesRoot
         IsolateCargoHome = $parsedIsolateCargoHome
         Fetch = $parsedFetch
+        AllowColdOverflow = $allowColdOverflow
+        WarmWaitSeconds = $warmWaitSeconds
         MaintenanceOnly = $maintenanceOnly
         Command = @($RawArgs | Select-Object -Skip $commandStart)
     }
@@ -712,11 +730,25 @@ function Get-CargoLaneLastUsed {
     return $newest
 }
 
-function Acquire-CargoLaneReservation {
+function Test-CargoLaneWarm {
+    param([string]$Target)
+    if (-not (Test-Path -LiteralPath $Target -PathType Container)) { return $false }
+    foreach ($profile in @(Get-ChildItem -LiteralPath $Target -Directory -ErrorAction Stop)) {
+        if (($profile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+        if ((Test-Path -LiteralPath (Join-Path $profile.FullName ".fingerprint") -PathType Container) -and
+            (Test-Path -LiteralPath (Join-Path $profile.FullName "deps") -PathType Container) -and
+            ((Test-Path -LiteralPath (Join-Path $profile.FullName "build") -PathType Container) -or
+             (Test-Path -LiteralPath (Join-Path $profile.FullName "incremental") -PathType Container))) { return $true }
+    }
+    return $false
+}
+
+function Try-AcquireCargoLaneReservation {
     param(
         [string]$LaneRoot,
         [string]$BaseLane,
         [switch]$PreferWarm,
+        [switch]$AllowColdOverflow,
         [string[]]$ActiveNames = @()
     )
 
@@ -752,15 +784,23 @@ function Acquire-CargoLaneReservation {
         }
 
         $candidates = @()
-        if ($PreferWarm) {
-            $candidates += @(Get-ChildItem -LiteralPath $LaneRoot -Directory -ErrorAction Stop |
+        $candidates += @(Get-ChildItem -LiteralPath $LaneRoot -Directory -ErrorAction Stop |
                 Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and ($_.Name -eq $BaseLane -or $_.Name -match "^$([regex]::Escape($BaseLane))-\d+$") } |
                 Sort-Object -Property @{ Expression = { Get-CargoLaneLastUsed -Lane $_ }; Descending = $true }, Name |
                 ForEach-Object { $_.Name })
-        }
         $candidates += @($BaseLane) + @(2..65 | ForEach-Object { "$BaseLane-$_" })
+        $warm = @{}
+        foreach ($candidate in @($candidates | Select-Object -Unique)) {
+            $target = Join-Path $LaneRoot $candidate
+            $warm[$candidate] = -not (Test-CargoLanesRootReparsePoint -LanesRoot $target) -and (Test-CargoLaneWarm -Target $target)
+        }
+        $unique = @($candidates | Select-Object -Unique)
+        $coldOrder = @($BaseLane) + @(2..65 | ForEach-Object { "$BaseLane-$_" })
+        $candidates = @($unique | Where-Object { $warm[$_] }) + @($coldOrder | Where-Object { -not $warm[$_] })
+        $busy = $false
         foreach ($candidate in @($candidates | Select-Object -Unique)) {
             if ($active.Contains($candidate)) {
+                $busy = $true
                 continue
             }
             $target = Join-Path $LaneRoot $candidate
@@ -768,11 +808,12 @@ function Acquire-CargoLaneReservation {
             # rust_build_status.py quarantines a lane whose owned process tree
             # was not confirmed stopped; never hand that lane to new work.
             if (Test-Path -LiteralPath (Join-Path $target ".lane-cleanup-unconfirmed")) { continue }
+            if ($busy -and -not $warm[$candidate] -and -not $AllowColdOverflow) { return $null }
             New-Item -ItemType Directory -Force -Path $target | Out-Null
             if (Test-CargoLanesRootReparsePoint -LanesRoot $target) { continue }
             # The earlier process/lock snapshot can be stale while waiting for
             # coordination. Recheck Cargo's profile locks before reservation.
-            if (Test-CargoLockBusy -TargetDir $target) { continue }
+            if (Test-CargoLockBusy -TargetDir $target) { $busy = $true; continue }
             $lockPath = Join-Path $target ".lane-active.lock"
             $stream = $null
             try {
@@ -797,6 +838,7 @@ function Acquire-CargoLaneReservation {
                 if (-not (Test-IsCargoLaneLockContention -Exception $_.Exception)) {
                     throw
                 }
+                $busy = $true
             }
             catch {
                 if ($null -ne $stream) {
@@ -812,6 +854,33 @@ function Acquire-CargoLaneReservation {
         if ($null -ne $coordinationStream) {
             $coordinationStream.Dispose()
         }
+    }
+}
+
+function Acquire-CargoLaneReservation {
+    param(
+        [string]$LaneRoot,
+        [string]$BaseLane,
+        [switch]$PreferWarm,
+        [string[]]$ActiveNames = @(),
+        [switch]$AllowColdOverflow,
+        [double]$WarmWaitSeconds = 30
+    )
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $announced = $false
+    while ($true) {
+        $expired = $watch.Elapsed.TotalSeconds -ge $WarmWaitSeconds
+        $reservation = Try-AcquireCargoLaneReservation -LaneRoot $LaneRoot -BaseLane $BaseLane -PreferWarm:$PreferWarm -ActiveNames $ActiveNames -AllowColdOverflow:($AllowColdOverflow -and $expired)
+        if ($null -ne $reservation) { return $reservation }
+        if ($expired) {
+            throw "Cargo lane '$BaseLane' is busy; no cold overflow was started. Wait for its owner, increase -WarmWaitSeconds, or explicitly use -AllowColdOverflow."
+        }
+        if (-not $announced) {
+            [Console]::Error.WriteLine("waiting up to ${WarmWaitSeconds}s for a reusable Cargo lane for '$BaseLane'")
+            $announced = $true
+        }
+        # Try-Acquire releases coordination before sleeping: owners can finish.
+        Start-Sleep -Milliseconds ([Math]::Max(1, [Math]::Min(250, ($WarmWaitSeconds - $watch.Elapsed.TotalSeconds) * 1000)))
     }
 }
 
@@ -999,7 +1068,7 @@ $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
 $didPushLocation = $false
 # OS observations may become idle while waiting for coordination. Reservation
 # rechecks their locks; only explicit administrative exclusions stay excluded.
-$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $excludedLaneNames -PreferWarm:($requestedLane -ceq "auto")
+$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $excludedLaneNames -PreferWarm:($requestedLane -ceq "auto") -AllowColdOverflow:$parsedArgs.AllowColdOverflow -WarmWaitSeconds $parsedArgs.WarmWaitSeconds
 try {
     $resolvedLane = $reservation.Lane
     $targetDir = $reservation.TargetDir

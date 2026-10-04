@@ -1049,12 +1049,12 @@ impl ToolOutput for ExecCommandToolOutput {
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
         if self.error.is_some()
-            || (self.process_exited && self.exit_code != Some(0) && !self.search_no_match)
+            || (self.process_exited && self.exit_code != Some(0) && !self.search_no_match_is_success())
         {
             ToolOutputOutcome::Failure
         } else if self.process_id.is_some() {
             ToolOutputOutcome::Yielded
-        } else if self.exit_code == Some(0) || self.search_no_match {
+        } else if self.exit_code == Some(0) || self.search_no_match_is_success() {
             ToolOutputOutcome::Success
         } else {
             ToolOutputOutcome::Failure
@@ -1189,6 +1189,8 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             session_capabilities: Option<ExecSessionCapabilities>,
             process_exited: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            search_no_match: Option<bool>,
             output_complete: bool,
             output_reduced: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -1225,6 +1227,9 @@ impl ToolOutput for ExecCommandToolOutput {
                 }
                 None => (None, None, None),
             };
+        // Output is this poll's chunk, including an empty terminal drain.
+        // Cumulative exact streams are exposed separately as stdout/stderr;
+        // replaying them here would duplicate bytes for polling consumers.
         let raw_output = String::from_utf8_lossy(&self.raw_output);
         // A script shows this result to the model only by printing it into
         // its cell. Bound it to fit there, so the command's own projection,
@@ -1245,7 +1250,16 @@ impl ToolOutput for ExecCommandToolOutput {
                 })
             })
             .flatten()
-            .map(|(start, end)| serde_json::json!({"kind": "lines", "start": start, "end": end}));
+            .map(|(start, end)| serde_json::json!({"kind": "lines", "start": start, "end": end}))
+            .or_else(|| {
+                // Cumulative artifacts have no chunk-relative line mapping.
+                // Supply a bounded, executable prefix selector rather than
+                // inventing omitted coordinates or requiring discovery first.
+                (output_reduced && raw_output_artifact_id.is_some())
+                    .then_some(raw_output_artifact_bytes).flatten()
+                    .filter(|bytes| *bytes > 0)
+                    .map(|bytes| serde_json::json!({"kind": "bytes", "start": 0, "end": bytes.min(4096)}))
+            });
 
         // Exact programmatic access does not inherit the display-token budget.
         // Never offer a truncated or lossy string as JSON. Larger/binary streams
@@ -1284,6 +1298,7 @@ impl ToolOutput for ExecCommandToolOutput {
             session_id: self.process_id,
             session_capabilities: self.session_capabilities,
             process_exited: self.process_exited,
+            search_no_match: self.search_no_match_is_success().then_some(true),
             output_complete: self.process_exited && self.process_id.is_none() && !output_reduced,
             output_reduced,
             original_token_count: self.original_token_count,
@@ -1902,6 +1917,17 @@ pub(crate) fn attach_command_validation(
 }
 
 impl ExecCommandToolOutput {
+    fn search_no_match_is_success(&self) -> bool {
+        // PowerShell can map native rg errors to exit 1 too. Classification of
+        // the command alone cannot turn its stderr (or lost streams) into a
+        // successful empty search. Use the process-owned cumulative evidence.
+        self.search_no_match && self.exit_code == Some(1) && self.error.is_none()
+            && self.process_exited && self.process_id.is_none()
+            && self.process_output.as_ref().is_some_and(|snapshot| {
+                snapshot.streams_are_exact && snapshot.stderr.is_empty()
+            })
+    }
+
     fn execution_state(&self) -> &'static str {
         if self.process_exited {
             "exited"
@@ -2078,7 +2104,43 @@ impl ExecCommandToolOutput {
     }
 
     fn summarized_output(&self, raw_output: &str, token_limit: usize) -> Option<String> {
-        if codex_utils_string::approx_token_count(raw_output) <= token_limit {
+        // A maximum output budget is not a target for successful validation.
+        // Compact only terminal validation with recoverable raw bytes; the
+        // authoritative streams and execution-evidence parser stay unchanged.
+        let compact_validation = self.process_id.is_none()
+            && self.process_exited
+            && self.exit_code == Some(0)
+            && self.validation.as_ref().is_some_and(|validation| validation.is_validation())
+            && self.raw_output_artifact.as_ref().is_some_and(|artifact| {
+                artifact.model_projection().0.is_some()
+                    && artifact.retained_bytes().is_some_and(|bytes| bytes >= raw_output.len() as u64)
+            });
+        if compact_validation && raw_output.len() > 2_048
+            && let Some(mut receipt) = runner_execution_receipt(
+                raw_output.as_bytes(),
+                self.validation.as_ref().and_then(|validation| validation.receipt_runner.as_deref()),
+            )
+            && receipt["completed_tests"].to_string().len() > 2_048
+        {
+            let groups = receipt["completed_tests"].as_object()?.len();
+            receipt["kind"] = serde_json::json!("codex_test_execution_summary_v1");
+            receipt["completed_tests"] = serde_json::json!({
+                "groups": groups,
+                "tests": receipt["executed_tests"],
+                "detail": "exact test names retained in raw output; this display is not an execution receipt",
+            });
+            let compact = receipt.to_string();
+            return Some(raw_output.lines().map(|line| {
+                if serde_json::from_str::<JsonValue>(line).ok()
+                    .is_some_and(|value| value["kind"] == "codex_test_execution_v1")
+                {
+                    compact.as_str()
+                } else {
+                    line
+                }
+            }).collect::<Vec<_>>().join("\n"));
+        }
+        if !compact_validation && codex_utils_string::approx_token_count(raw_output) <= token_limit {
             return None;
         }
         match (self.process_id, self.exit_code) {
@@ -2101,6 +2163,7 @@ impl ExecCommandToolOutput {
         raw_output: &str,
         hard_limit_cap: Option<usize>,
     ) -> ProjectedModelOutput {
+        let source_bytes = raw_output.len() as u64;
         // Normalize only the model projection; canonical artifacts retain exact bytes.
         let normalized;
         let raw_output = if raw_output.contains("\r\n") {
@@ -2115,7 +2178,7 @@ impl ExecCommandToolOutput {
             .raw_output_artifact
             .as_ref()
             .and_then(RawOutputArtifact::retained_bytes)
-            .is_some_and(|bytes| bytes > self.raw_output.len() as u64);
+            .is_some_and(|bytes| bytes > source_bytes);
         let (truncated, first_omitted_lines) = match summarized.as_deref() {
             // Line coordinates are recovery references only when the text is
             // the retained source itself, not a summary or one chunk of a

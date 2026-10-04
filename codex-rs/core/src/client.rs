@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -2082,6 +2083,8 @@ pub struct ModelClientSession {
     /// This is a contract between the client and server: we receive it at turn start,
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
+    /// The exception is a stream throughput collapse, which replaces the token together
+    /// with the websocket so the next full request can be routed afresh.
     turn_state: Arc<OnceLock<String>>,
 }
 
@@ -2182,11 +2185,95 @@ fn websocket_connection_expiring(connected_at: Option<Instant>, now: Instant) ->
     })
 }
 
+/// A turn stays on the backend selected by its sticky turn-state token, so a turn
+/// whose output rate collapses keeps streaming slowly until it ends. Responses
+/// below this size say too little about the stream rate to be judged.
+const STREAM_THROUGHPUT_MIN_OUTPUT_TOKENS: i64 = 150;
+const STREAM_THROUGHPUT_WINDOW: usize = 9;
+const STREAM_THROUGHPUT_MIN_BASELINE_SAMPLES: usize = 5;
+const STREAM_THROUGHPUT_COLLAPSE_RATIO: f64 = 0.5;
+const STREAM_THROUGHPUT_COLLAPSE_STREAK: u8 = 2;
+/// Responses to observe on a replacement connection before replacing it again.
+/// A provider-wide slowdown fills the window meanwhile and becomes the baseline.
+const STREAM_THROUGHPUT_ROTATION_COOLDOWN: u8 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StreamThroughputCollapse {
+    observed_tokens_per_second: f64,
+    baseline_tokens_per_second: f64,
+}
+
+/// Output rates of completed websocket responses, judged against their recent median.
+#[derive(Debug, Default)]
+struct WebsocketStreamThroughput {
+    recent_tokens_per_second: VecDeque<f64>,
+    collapsed_streak: u8,
+    latest_collapse: Option<StreamThroughputCollapse>,
+    responses_since_rotation: Option<u8>,
+}
+
+impl WebsocketStreamThroughput {
+    fn record(&mut self, output_tokens: i64, elapsed: Duration) {
+        if output_tokens < STREAM_THROUGHPUT_MIN_OUTPUT_TOKENS || elapsed.is_zero() {
+            return;
+        }
+        let tokens_per_second = output_tokens as f64 / elapsed.as_secs_f64();
+        self.latest_collapse = self
+            .baseline_tokens_per_second()
+            .filter(|baseline| tokens_per_second < baseline * STREAM_THROUGHPUT_COLLAPSE_RATIO)
+            .map(|baseline_tokens_per_second| StreamThroughputCollapse {
+                observed_tokens_per_second: tokens_per_second,
+                baseline_tokens_per_second,
+            });
+        self.collapsed_streak = if self.latest_collapse.is_some() {
+            self.collapsed_streak.saturating_add(1)
+        } else {
+            0
+        };
+        if self.recent_tokens_per_second.len() == STREAM_THROUGHPUT_WINDOW {
+            self.recent_tokens_per_second.pop_front();
+        }
+        self.recent_tokens_per_second.push_back(tokens_per_second);
+        if let Some(responses) = self.responses_since_rotation.as_mut() {
+            *responses = responses.saturating_add(1);
+        }
+    }
+
+    fn baseline_tokens_per_second(&self) -> Option<f64> {
+        if self.recent_tokens_per_second.len() < STREAM_THROUGHPUT_MIN_BASELINE_SAMPLES {
+            return None;
+        }
+        let mut sorted = self
+            .recent_tokens_per_second
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        sorted.sort_by(f64::total_cmp);
+        Some(sorted[sorted.len() / 2])
+    }
+
+    /// Returns the collapse that warrants replacing the connection, at most once per cooldown.
+    fn take_collapse(&mut self) -> Option<StreamThroughputCollapse> {
+        if self.collapsed_streak < STREAM_THROUGHPUT_COLLAPSE_STREAK
+            || self
+                .responses_since_rotation
+                .is_some_and(|responses| responses < STREAM_THROUGHPUT_ROTATION_COOLDOWN)
+        {
+            return None;
+        }
+        self.collapsed_streak = 0;
+        self.responses_since_rotation = Some(0);
+        self.latest_collapse.take()
+    }
+}
+
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     /// When `connection` was established; drives rotation before the server's age limit.
     connected_at: Option<Instant>,
+    /// Shared with each response stream, which reports its rate on completion.
+    stream_throughput: Arc<StdMutex<WebsocketStreamThroughput>>,
     setup_fingerprint: Option<WebsocketSetupFingerprint>,
     last_request: Option<ResponsesApiRequest>,
     last_request_history: Option<WebsocketHistoryBaseline>,
@@ -3199,6 +3286,28 @@ impl ModelClientSession {
             .set_connection_reused(/*connection_reused*/ false);
     }
 
+    /// Replaces a websocket whose responses stopped streaming at this client's
+    /// established rate. The sticky turn-state token is dropped with it: replaying
+    /// the token would route the full request back to the backend that collapsed.
+    fn replace_websocket_after_throughput_collapse(&mut self) {
+        let collapse = self
+            .websocket_session
+            .stream_throughput
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_collapse();
+        let Some(collapse) = collapse else {
+            return;
+        };
+        warn!(
+            observed_tokens_per_second = collapse.observed_tokens_per_second,
+            baseline_tokens_per_second = collapse.baseline_tokens_per_second,
+            "replacing websocket and sticky turn routing after stream throughput collapse"
+        );
+        self.reset_websocket_session();
+        self.turn_state = Arc::new(OnceLock::new());
+    }
+
     /// Invalidates request-prefix reuse without discarding a healthy transport.
     ///
     /// Callers use this for compaction, truncation, rollback, reinjection,
@@ -4125,6 +4234,7 @@ impl ModelClientSession {
                         inference_trace_attempt,
                         Arc::clone(&self.client.state.provider),
                         attempt,
+                        /*stream_throughput*/ None,
                     );
                     return Ok(stream);
                 }
@@ -4208,6 +4318,8 @@ impl ModelClientSession {
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
+        // Before the request captures the turn-state token it would replay.
+        self.replace_websocket_after_throughput_collapse();
         loop {
             // `generate=false` warmup is transport setup rather than a sampling attempt.
             let attempt_clock = (!warmup).then(ModelAttemptClock::new);
@@ -4748,6 +4860,7 @@ impl ModelClientSession {
                 inference_trace_attempt,
                 Arc::clone(&self.client.state.provider),
                 attempt,
+                Some(Arc::clone(&self.websocket_session.stream_throughput)),
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             self.websocket_session.last_response = None;
@@ -5211,6 +5324,7 @@ fn map_response_stream(
     inference_trace_attempt: AsyncInferenceTraceAttempt,
     provider: SharedModelProvider,
     attempt: Option<ModelAttemptState>,
+    stream_throughput: Option<Arc<StdMutex<WebsocketStreamThroughput>>>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
@@ -5220,6 +5334,20 @@ fn map_response_stream(
         rx_event,
         upstream_request_id: None,
     };
+    let dispatched_at = Instant::now();
+    let api_stream = api_stream.inspect(move |event| {
+        if let Some(stream_throughput) = stream_throughput.as_ref()
+            && let Ok(ResponseEvent::Completed {
+                token_usage: Some(token_usage),
+                ..
+            }) = event
+        {
+            stream_throughput
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(token_usage.output_tokens, dispatched_at.elapsed());
+        }
+    });
     map_response_events(
         upstream_request_id,
         api_stream,

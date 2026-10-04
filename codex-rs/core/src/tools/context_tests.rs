@@ -1856,6 +1856,78 @@ async fn artifact_backed_exec_output(
 }
 
 #[tokio::test]
+async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_proof() {
+    let tests = (0..160).map(|index| format!("module::日本語::test_{index:04}")).collect::<Vec<_>>();
+    let receipt = json!({
+        "kind": "codex_test_execution_v1", "runner": "rust_test_runner",
+        "runner_input_fingerprint": "a".repeat(64), "selected_targets": ["core_lib"],
+        "completed_tests": {"codex-core": tests}, "executed_tests": 160,
+        "skipped_tests": null, "exit_code": 0,
+    });
+    let raw = format!("warning: retain this diagnostic\n{receipt}\nRust phase build/test: wall=1.234s; exit=0\n");
+    let (mut output, artifact_id, artifact_path, _root) =
+        artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
+    output.hook_command = Some("cargo test --lib".into());
+    output.validation = Some(crate::validation::CommandValidation {
+        declared: None,
+        classification: crate::validation::classify_validation_script("cargo test --lib"),
+        receipt_runner: Some("rust_test_runner".into()),
+    });
+    output.process_output = Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+        aggregated_output: raw.as_bytes().to_vec(), stdout: raw.as_bytes().to_vec(), stderr: Vec::new(),
+        aggregated_output_is_exact: true, streams_are_exact: true,
+    }));
+    assert!(codex_utils_string::approx_token_count(&raw) < 10_000);
+    let result = output.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
+    let display = result["output"].as_str().unwrap();
+    assert!(display.len() * 5 < raw.len(), "{display}");
+    assert!(display.contains("codex_test_execution_summary_v1"));
+    assert!(display.contains("\"executed_tests\":160"));
+    assert!(display.contains("warning: retain this diagnostic"));
+    assert!(display.contains("wall=1.234s; exit=0"));
+    assert_eq!(result["stdout"], raw);
+    assert_eq!(result["streams_complete"], true);
+    assert_eq!(result["output_reduced"], true);
+    assert_eq!(result["raw_output_artifact_id"], artifact_id.to_string());
+    assert_eq!(std::fs::read(artifact_path).unwrap(), raw.as_bytes());
+    assert!(output.response_text().contains("codex_test_execution_summary_v1"));
+    let mut signal = json!({});
+    attach_command_validation(&mut signal, &output.raw_output, output.validation.as_ref(), Some(0), true);
+    assert_eq!(signal["runner_execution_receipt"], receipt);
+    assert!(runner_execution_receipt(display.as_bytes(), Some("rust_test_runner")).is_none());
+
+    output.validation.as_mut().unwrap().receipt_runner = None;
+    assert!(output.summarized_output(&raw, 10_000).is_none(), "untrusted output is not a receipt");
+    output.validation.as_mut().unwrap().receipt_runner = Some("rust_test_runner".into());
+    output.process_id = Some(7);
+    assert!(output.summarized_output(&raw, 10_000).is_none(), "live output must not be summarized as success");
+    output.process_id = None;
+    output.exit_code = Some(1);
+    assert!(output.summarized_output(&raw, 10_000).is_none(), "failures retain existing diagnostics");
+    output.exit_code = Some(0);
+    output.raw_output_artifact = None;
+    assert!(output.summarized_output(&raw, 10_000).is_none(), "never discard unrecoverable evidence");
+}
+
+#[tokio::test]
+async fn exec_passing_validation_is_compact_even_when_it_fits_the_output_budget() {
+    let raw = format!("{}test result: ok. 160 passed; 0 failed; 2 ignored\n",
+        (0..160).map(|index| format!("test case_{index:04} ... ok\n")).collect::<String>());
+    let (mut output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
+    output.hook_command = Some("cargo test --lib".into());
+    output.validation = Some(crate::validation::CommandValidation {
+        declared: None,
+        classification: crate::validation::classify_validation_script("cargo test --lib"),
+        receipt_runner: None,
+    });
+    let summary = output.summarized_output(&raw, 10_000).expect("compact passing validation");
+    assert!(summary.len() < raw.len());
+    assert!(summary.contains("160 passed; 0 failed; 2 ignored"));
+    output.validation = None;
+    assert!(output.summarized_output(&raw, 10_000).is_none(), "ordinary output stays exact below budget");
+}
+
+#[tokio::test]
 async fn exec_model_output_exposes_artifact_id_not_path() {
     let (output, artifact_id, artifact_path, _retained_root) =
         artifact_backed_exec_output(b"complete output requiring reduction\n", Some(2)).await;
@@ -1925,6 +1997,66 @@ async fn exec_code_mode_preserves_empty_output_and_explicit_lifecycle() {
     assert_eq!(running["output"], "");
     assert_eq!(running["execution_state"], "running");
     assert_eq!(running["output_complete"], false);
+}
+
+#[tokio::test]
+async fn fork91_empty_terminal_drain_preserves_chunk_and_cumulative_stream_contracts() {
+    let raw = b"validation completed: 5 passed\r\n";
+    let (mut output, _, _, _root) = artifact_backed_exec_output(raw, Some(1000)).await;
+    output.raw_output.clear();
+    let payload = ToolPayload::Function { arguments: "{}".into() };
+    for (exact, live, expected) in [(true, false, true), (false, false, false), (true, true, false)] {
+        output.process_output = Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+            aggregated_output: raw.to_vec(), stdout: raw.to_vec(), stderr: Vec::new(),
+            aggregated_output_is_exact: exact, streams_are_exact: exact,
+        }));
+        output.process_id = live.then_some(7);
+        output.process_exited = !live;
+        output.exit_code = (!live).then_some(0);
+        let result = output.code_mode_result(&payload);
+        assert_eq!(result["output"], "", "terminal polls must not replay earlier chunks");
+        assert_eq!(format!("{}{}", String::from_utf8_lossy(raw), result["output"].as_str().unwrap()), String::from_utf8_lossy(raw));
+        assert_eq!(result["streams_complete"], expected);
+        assert_eq!(result["stdout"].as_str(), expected.then_some("validation completed: 5 passed\r\n"));
+        assert_eq!(result["output_complete"], false, "the chunk alone is not cumulative coverage");
+        assert!(output.raw_output.is_empty(), "canonical chunk is unchanged");
+    }
+}
+
+#[tokio::test]
+async fn fork91_cumulative_recovery_has_bounded_selector_without_fake_coordinates() {
+    let raw = "retained progress\n".repeat(1000);
+    let (mut output, id, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(1000)).await;
+    output.raw_output = b"last chunk\n".to_vec();
+    let payload = ToolPayload::Function { arguments: "{}".into() };
+    let result = output.code_mode_result(&payload);
+    assert_eq!(result["raw_output_artifact_id"], id.to_string());
+    assert_eq!(result["recovery_selector"], json!({"kind":"bytes", "start":0, "end":4096}));
+    output.raw_output_artifact = None;
+    assert!(output.code_mode_result(&payload).get("recovery_selector").is_none());
+    output.raw_output = raw.into_bytes();
+    output.max_output_tokens = Some(10_000);
+    assert!(output.code_mode_result(&payload).get("recovery_selector").is_none());
+}
+
+#[tokio::test]
+async fn fork91_no_match_requires_exact_error_free_terminal_streams() {
+    let (mut output, _, _, _root) = artifact_backed_exec_output(b"", Some(1000)).await;
+    output.exit_code = Some(1);
+    output.search_no_match = true;
+    let payload = ToolPayload::Function { arguments: "{}".into() };
+    for (stderr, exact, expected) in [("", true, true), ("rg: missing path (os error 123)", true, false), ("", false, false)] {
+        output.process_output = Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+            aggregated_output: stderr.as_bytes().to_vec(), stdout: Vec::new(), stderr: stderr.as_bytes().to_vec(),
+            aggregated_output_is_exact: exact, streams_are_exact: exact,
+        }));
+        assert_eq!(output.success_for_logging(), expected);
+        assert_eq!(output.code_mode_result(&payload)["search_no_match"].as_bool().unwrap_or(false), expected);
+    }
+    output.process_output = None;
+    assert!(!output.success_for_logging(), "unknown streams are not a no-match proof");
+    output.exit_code = Some(0);
+    assert!(output.success_for_logging(), "ordinary successes are unchanged");
 }
 
 #[tokio::test]

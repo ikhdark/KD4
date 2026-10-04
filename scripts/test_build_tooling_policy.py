@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import venv
+from functools import partial
 from pathlib import Path
 from unittest import mock
 
@@ -19,10 +20,13 @@ from scripts.build_tooling_test_support import load_format_module
 from scripts.build_tooling_test_support import load_toml
 from scripts.build_tooling_test_support import powershell
 from scripts.build_tooling_test_support import ps_single_quote
+from scripts.process_owner import run_owned
+
+run_test_command = partial(run_owned, timeout=60)
 
 
 def repository_owned_paths() -> list[Path]:
-    result = subprocess.run(
+    result = run_test_command(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
         cwd=REPO_ROOT,
         capture_output=True,
@@ -36,6 +40,14 @@ def repository_owned_paths() -> list[Path]:
 
 
 class BuildToolingPolicyTest(unittest.TestCase):
+    def test_fixture_commands_have_finite_tree_owned_deadlines(self):
+        from scripts import test_build_tooling_policy as owner
+
+        self.assertEqual(owner.run_test_command.keywords["timeout"], 60)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            owner.run_test_command([sys.executable, "-c", "import time; time.sleep(30)"],
+                                   capture_output=True, timeout=0.1)
+
     def test_dead_code_preserves_target_config_and_rejects_unused_code(self):
         shell = powershell()
         if shell is None or shutil.which("cargo") is None:
@@ -475,7 +487,7 @@ function Get-Command($Name) {
                 env["CARGO_ENCODED_RUSTFLAGS"] = encoded_flags
             if os_name is not None:
                 env["OS"] = os_name
-            result = subprocess.run(
+            result = run_owned(
                 [
                     shell,
                     "-NoProfile",
@@ -492,6 +504,7 @@ function Get-Command($Name) {
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=60,
             )
             output = (
                 output_path.read_text(encoding="utf-8") if output_path.exists() else ""
@@ -767,7 +780,7 @@ function Get-Command($Name) {
                 f"try {{ Write-InstallMetadata -ReleaseDir {ps_single_quote(Path(temp_dir))} -ResolvedVersion '1' -Target 't' -Layout 'Package' }} catch {{ }}; "
                 f"if (@(Get-ChildItem -LiteralPath {ps_single_quote(Path(temp_dir))} -Filter 'codex-install.env.*').Count -ne 0) {{ exit 9 }}"
             )
-            completed = subprocess.run(
+            completed = run_test_command(
                 [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
                 text=True,
                 capture_output=True,
@@ -789,7 +802,7 @@ function Get-Command($Name) {
             "$conflict=Get-ConflictingInstall -VisibleBinDir 'C:\\KD4\\bin'; "
             "if ($null -eq $conflict -or $null -ne $conflict.Manager -or $conflict.Path -cne 'C:\\Tools\\codex.exe') { exit 9 }"
         )
-        completed = subprocess.run(
+        completed = run_test_command(
             [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
             text=True,
             capture_output=True,
@@ -830,7 +843,7 @@ function Get-Command($Name) {
             "if ($actual -cne 'https://api.github.com/repos/ikhdark/KD4/releases/latest') "
             "{ exit 9 }"
         )
-        completed = subprocess.run(
+        completed = run_test_command(
             [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
             text=True,
             capture_output=True,
@@ -872,7 +885,7 @@ function Get-Command($Name) {
                     f"try {{ & $probe -ReleaseRepository {ps_single_quote(repository)} }} "
                     "catch { [Console]::Error.WriteLine($_.Exception.Message); exit 7 }"
                 )
-                completed = subprocess.run(
+                completed = run_test_command(
                     [ps, "-NoProfile", "-NonInteractive", "-Command", command],
                     text=True,
                     capture_output=True,
@@ -916,7 +929,7 @@ function Get-Command($Name) {
                     f"Maybe-HandleConflictingInstall -Conflict ([pscustomobject]@{{Manager='{manager}'}}); "
                     "@{warnings=@($warnings.ToArray()); arguments=$script:calledArgs; completed=$true} | ConvertTo-Json -Compress"
                 )
-                completed = subprocess.run(
+                completed = run_test_command(
                     [ps, "-NoProfile", "-NonInteractive", "-Command", command],
                     text=True,
                     capture_output=True,
@@ -1031,7 +1044,7 @@ function Get-Command($Name) {
                     "-ExpectedTarget 'x86_64-pc-windows-msvc'; "
                     f"if ($actual -ne ${str(expected).lower()}) {{ exit 9 }}"
                 )
-                return subprocess.run(
+                return run_test_command(
                     [
                         ps,
                         "-NoProfile",
@@ -1121,7 +1134,7 @@ function Get-Command($Name) {
             "$actual=Remove-PathEntry -PathValue 'C:\\Tools;C:\\KD4\\bin\\;C:\\Other' -Entry 'c:\\kd4\\BIN'; "
             "if ($actual -cne 'C:\\Tools;C:\\Other') { Write-Error $actual; exit 9 }"
         )
-        completed = subprocess.run(
+        completed = run_test_command(
             [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
             text=True,
             capture_output=True,
@@ -1154,7 +1167,7 @@ function Get-Command($Name) {
                 "Invoke-Expression $fn.Extent.Text; $InstallMetadataFile='codex-install.env'; "
                 f"Remove-OldCompletedReleases -ReleasesDir {ps_single_quote(releases)} -ActiveReleaseDir {ps_single_quote(active)} -RetainPrevious 2"
             )
-            completed = subprocess.run(
+            completed = run_test_command(
                 [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
                 text=True,
                 capture_output=True,
@@ -1198,7 +1211,7 @@ function Get-Command($Name) {
             env["CODEX_PERMISSION_PROFILE"] = ":danger-full-access"
             env["CODEX_SQLITE_HOME"] = str(Path(temp) / "desktop-sqlite")
 
-            result = subprocess.run(
+            result = run_test_command(
                 [sys.executable, "codex-rs/scripts/nextest_windows_stack.py"],
                 cwd=REPO_ROOT,
                 env=env,
@@ -1236,7 +1249,7 @@ function Get-Command($Name) {
                     env["RUST_MIN_STACK"] = inherited
                 env["CODEX_HOME"] = "inherited-desktop-home"
                 env["NEXTEST_ENV"] = str(Path(temp) / "worker env.txt")
-                result = subprocess.run(
+                result = run_test_command(
                     [sys.executable, "codex-rs/scripts/nextest_windows_stack.py"],
                     cwd=REPO_ROOT,
                     env=env,
@@ -1251,7 +1264,7 @@ function Get-Command($Name) {
                     name, value = line.split("=", 1)
                     worker[name] = value
                 # Fixtures set their child overrides after nextest's isolation boundary.
-                consumer = subprocess.run(
+                consumer = run_test_command(
                     [
                         sys.executable,
                         "-c",
@@ -1288,7 +1301,7 @@ function Get-Command($Name) {
                     env["NEXTEST_ENV"] = str(path)
                     env["RUST_MIN_STACK"] = stack
                     expected = "RUST_MIN_STACK must be"
-                result = subprocess.run(
+                result = run_test_command(
                     [sys.executable, "codex-rs/scripts/nextest_windows_stack.py"],
                     cwd=REPO_ROOT,
                     env=env,
@@ -1491,7 +1504,7 @@ function Get-Command($Name) {
         if node is None:
             self.skipTest("node is not available")
 
-        result = subprocess.run(
+        result = run_test_command(
             [node, "--check", str(REPO_ROOT / "codex-cli" / "bin" / "codex.js")],
             cwd=REPO_ROOT,
             capture_output=True,
@@ -1592,7 +1605,7 @@ function Get-Command($Name) {
                 f"Path({str(marker)!r}).write_text('ok', encoding='utf-8')\n",
                 encoding="utf-8",
             )
-            result = subprocess.run(
+            result = run_test_command(
                 [node, str(launcher), str(script)],
                 cwd=REPO_ROOT,
                 env={**os.environ, "PYTHON": sys.executable},
@@ -1660,7 +1673,7 @@ function Get-Command($Name) {
             with self.subTest(target=target):
                 # Match tracked paths before touching disk, never traversing
                 # dependency or build trees. Git glob pathspecs preserve **.
-                matches = subprocess.run(
+                matches = run_test_command(
                     ["git", "ls-files", "-z", "--", f":(glob){target}"],
                     cwd=REPO_ROOT,
                     capture_output=True,
@@ -1680,7 +1693,7 @@ function Get-Command($Name) {
         self.assertNotIn("test:scripts:target", package["scripts"])
 
     def test_hooks_schema_check_selects_the_fixture_comparison(self) -> None:
-        result = subprocess.run(
+        result = run_test_command(
             ["just", "--dry-run", "hooks-schema-check"],
             cwd=REPO_ROOT,
             capture_output=True,
@@ -1696,7 +1709,7 @@ function Get-Command($Name) {
 
     @unittest.skipUnless(sys.platform == "win32", "Windows protobuf wrapper")
     def test_protos_check_runs_both_freshness_checks(self) -> None:
-        result = subprocess.run(
+        result = run_test_command(
             ["just", "--dry-run", "protos-check"],
             cwd=REPO_ROOT,
             capture_output=True,
@@ -1750,7 +1763,7 @@ function Get-Command($Name) {
             with self.subTest(path=obsolete_path):
                 self.assertFalse((REPO_ROOT / obsolete_path).exists())
 
-        result = subprocess.run(
+        result = run_test_command(
             [
                 "just",
                 "--dry-run",
@@ -1769,7 +1782,7 @@ function Get-Command($Name) {
         rendered = result.stdout + result.stderr
         self.assertIn('--owner "policy-test" -- --experimental', rendered)
 
-        result = subprocess.run(
+        result = run_test_command(
             ["just", "--dry-run", "cargo-lane", "main", "cargo", "--version"],
             cwd=REPO_ROOT,
             capture_output=True,
@@ -2239,7 +2252,7 @@ function Get-Command($Name) {
         self.assertIn(
             '[no-cd]\n[script("python")]\ncheck-kd4-features *args:', justfile
         )
-        feature_recipe = subprocess.run(
+        feature_recipe = run_test_command(
             ["just", "--show", "check-kd4-features"],
             cwd=REPO_ROOT,
             text=True,
@@ -2254,7 +2267,7 @@ function Get-Command($Name) {
         self.assertIn("sys.argv = [script, *forwarded]", feature_recipe.stdout)
 
     def test_direct_python_recipe_preserves_argv_and_exit_code(self) -> None:
-        help_result = subprocess.run(
+        help_result = run_test_command(
             ["just", "check-kd4-features", "--help"],
             cwd=REPO_ROOT,
             text=True,
@@ -2270,7 +2283,7 @@ function Get-Command($Name) {
         # Pin the child's stderr encoding: on a legacy code page Python falls
         # back to backslashreplace and reports the argument as an escape
         # sequence, which says nothing about whether argv survived.
-        rejected = subprocess.run(
+        rejected = run_test_command(
             ["just", "check-kd4-features", unicode_argument],
             cwd=REPO_ROOT,
             text=True,

@@ -29,7 +29,7 @@ pub struct ParsedExecSource<'a> {
 pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
     if input.trim().is_empty() {
         return Err(
-            "exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {\"max_output_tokens\": 10000}`.".to_string(),
+            "exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {\"max_output_tokens\": 40000}`.".to_string(),
         );
     }
 

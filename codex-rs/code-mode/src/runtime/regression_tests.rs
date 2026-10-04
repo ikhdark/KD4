@@ -71,6 +71,49 @@ async fn dependency_graph_scheduling_contracts() {
 }
 
 #[tokio::test]
+async fn mechanical_orchestration_preserves_evidence_and_stops_for_decisions() {
+    let (_tx, _termination, mut rx) = start(include_str!("orchestration_tests.js")).await;
+    assert_eq!(text(next(&mut rx).await), "orchestration scenarios passed");
+    let RuntimeEvent::Result { error_text, output_loss, .. } = next(&mut rx).await else {
+        panic!("orchestration result");
+    };
+    assert_eq!(error_text, None);
+    assert_eq!(output_loss, None);
+    closed(&mut rx).await;
+}
+
+#[test]
+fn stored_serialization_is_shared_and_replaced_with_its_value() {
+    let key = "quote\"日本語";
+    let value = json!({"text": "λ\r\n", "nested": [true, null, 42]});
+    let stored = StoredValue::new(key, value.clone());
+    assert_eq!(stored.bytes, stored_value_entry_bytes(key, &value));
+    let snapshot = stored.clone();
+    assert!(Arc::ptr_eq(stored.serialized.as_ref().unwrap(), snapshot.serialized.as_ref().unwrap()));
+    assert_eq!(serde_json::from_str::<JsonValue>(stored.serialized.as_deref().unwrap()).unwrap(), value);
+    let changed = StoredValue::new(key, json!({"text":"changed"}));
+    assert_ne!(changed.serialized, stored.serialized);
+    assert_eq!(snapshot.value.as_ref(), &value);
+}
+
+#[tokio::test]
+async fn stored_loads_are_independent_and_replacement_invalidates_serialization() {
+    let (_tx, _termination, mut rx) = start(r#"
+        store("result", {nested: {value: "original"}});
+        const first = load("result");
+        first.nested.value = "local mutation";
+        text(load("result").nested.value);
+        store("result", {nested: {value: "replacement"}});
+        text(load("result").nested.value);
+    "#).await;
+    assert_eq!(text(next(&mut rx).await), "original");
+    assert_eq!(text(next(&mut rx).await), "replacement");
+    let RuntimeEvent::Result { error_text, .. } = next(&mut rx).await else { panic!("result"); };
+    assert_eq!(error_text, None);
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
 async fn dependency_graph_cancellation_stops_pending_and_dependent_dispatch() {
     let (tx, termination, mut rx) = start(r#"
         await run_graph([

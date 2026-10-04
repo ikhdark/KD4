@@ -24,6 +24,62 @@ def publish_source_text() -> str:
 
 
 class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
+    def test_conditional_noop_restart_does_not_scan_sessions(self):
+        from scripts.process_owner import run_owned
+
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        source = publish_source_text()
+        start = source.index("if (-not $DryRun -and ($binaryChanged")
+        block = source[start:source.index("\nif ($DryRun) {", start)]
+        command = """
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$DryRun = $false
+$binaryChanged = $false
+$RestartDesktop = $false
+$RestartDesktopIfNeeded = $true
+$ConfigureDesktopLocalCli = $false
+$LocalCodexHome = 'fixture'
+$Force = $false
+$targetPath = 'fixture'
+$turnHostProcess = $null
+function Assert-NoCodexRunningTurns { throw 'unnecessary session scan' }
+function Test-DesktopRuntimeProof { return $true }
+function Write-ProofLine { param($Name, $Value); Write-Output "$Name : $Value" }
+""" + block + "\nif ($RestartDesktop) { throw 'unnecessary restart' }"
+        result = run_owned([shell, "-NoProfile", "-Command", command],
+                           capture_output=True, text=True, timeout=15, env=clean_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("skipped: current runtime", result.stdout)
+
+    def test_shared_fixture_defaults_to_temp_home_and_preserves_overrides(self):
+        import os
+        from types import SimpleNamespace
+        from unittest import mock
+        from scripts import publish_local_codex_test_support as support
+
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = support.PublishLocalCodexTestBase()
+            fixture.repo_temp = SimpleNamespace(name=temp)
+            fixture.repo_root = Path(temp) / "repo"
+            fixture.shell = "fixture-shell"
+            with (
+                mock.patch.object(support.subprocess, "run") as run,
+                mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "unrelated-live-turn"}),
+            ):
+                fixture.run_script()
+                args = run.call_args.args[0]
+                self.assertNotIn("CODEX_THREAD_ID", run.call_args.kwargs["env"])
+                self.assertEqual(args[args.index("-LocalCodexHome") + 1],
+                                 str(Path(temp) / "local-home"))
+                fixture.run_script("-LocalCodexHome", "explicit-home")
+                self.assertEqual(run.call_args.args[0].count("-LocalCodexHome"), 1)
+                env = dict(os.environ, USERPROFILE=str(Path(temp) / "user"))
+                fixture.run_script(env=env)
+                self.assertNotIn("-LocalCodexHome", run.call_args.args[0])
+
     def test_activation_guard_checks_other_chats_and_requires_force(self) -> None:
         shell = powershell()
         if shell is None:

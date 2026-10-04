@@ -4122,8 +4122,10 @@ if ($null -ne $turnHostProcess) {
     }
 }
 
-if (-not $DryRun -and ($binaryChanged -or $RestartDesktop -or $RestartDesktopIfNeeded)) {
+if (-not $DryRun -and ($binaryChanged -or $RestartDesktop -or $ConfigureDesktopLocalCli)) {
     # Run before closing target processes, replacing binaries, or changing routing.
+    # A conditional restart is checked freshly inside Restart-CodexDesktop only
+    # if runtime proof below determines that a restart is actually necessary.
     Assert-NoCodexRunningTurns -LocalCodexHome $LocalCodexHome -Force:$Force
 }
 

@@ -1331,6 +1331,55 @@ async fn terminated_packet_keeps_nested_results_and_omission_notice_after_printe
 }
 
 #[tokio::test]
+async fn explicit_exec_budget_above_the_default_is_honored_to_the_ceiling() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let exec = super::ExecContext {
+        session: Arc::new(session),
+        turn: Arc::new(turn),
+    };
+    // Middle marker: middle truncation keeps head and tail, so only an intact
+    // packet retains it.
+    let body = format!(
+        "{} MIDDLE_EVIDENCE_MARKER {}",
+        "head evidence line\n".repeat(2_500),
+        "tail evidence line\n".repeat(2_500),
+    );
+    let body_tokens = codex_utils_string::approx_token_count(&body);
+    assert!(body_tokens > codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
+    assert!(body_tokens < codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
+    for (requested, retained) in [
+        (Some(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL), true),
+        (None, false),
+    ] {
+        let cell = CellId::new(format!("bulk-evidence-{}", requested.is_some()));
+        let service = &exec.session.services.code_mode_service;
+        service.record_cell_parent_call_id(&cell, "outer-exec");
+        let output = super::handle_runtime_response(
+            &exec,
+            RuntimeResponse::Result {
+                output_loss: None,
+                cell_id: cell.clone(),
+                content_items: vec![RuntimeContentItem::InputText { text: body.clone() }],
+                error_text: None,
+            },
+            requested,
+            Instant::now(),
+        )
+        .unwrap();
+        let visible = output.into_text();
+        assert_eq!(
+            visible.contains("MIDDLE_EVIDENCE_MARKER"),
+            retained,
+            "requested={requested:?}"
+        );
+        exec.session
+            .services
+            .code_mode_service
+            .finish_cell_dispatch(&cell);
+    }
+}
+
+#[tokio::test]
 async fn packet_composition_budgets_required_diagnostics_and_preserves_canonical_failure() {
     use crate::tools::context::RequiredToolTerminalCause;
     use crate::tools::context::ToolPayload;
@@ -1713,6 +1762,42 @@ async fn recovery_audit_exited_but_undrained_process_keeps_handle() {
 }
 
 #[tokio::test]
+async fn fork91_live_fallback_preserves_capabilities_without_inventing_them() {
+    let capabilities = serde_json::json!({"stdin":false,"interrupt":false,"polling":true,"cancellation":true});
+    for caps in [capabilities.clone(), serde_json::Value::Null] {
+        let raw = serde_json::json!({
+            "process_exited":false, "exit_code":null, "execution_state":"running",
+            "session_id":12, "session_capabilities":caps, "output_complete":false,
+        });
+        let output = command_receipt_fixture(serde_json::json!({}), raw.clone(), "progress", None).await;
+        let visible = super::code_mode_text_content(&output.body);
+        assert!(visible.contains("Running command session_id: 12"));
+        assert_eq!(visible.contains("session_capabilities"), caps.is_object());
+        if caps.is_object() {
+            let receipt = visible.lines().find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).unwrap();
+            assert_eq!(receipt["session_capabilities"], caps);
+            assert_eq!(receipt["continuation"]["arguments"]["session_id"], 12);
+        }
+        let output = command_receipt_fixture(serde_json::json!({}), raw.clone(), &raw.to_string(), None).await;
+        assert!(!super::code_mode_text_content(&output.body).contains("Running command session_id"));
+    }
+}
+
+#[tokio::test]
+async fn fork91_no_match_receipt_is_not_a_failure_but_errors_are() {
+    for (exit, no_match, error, failed) in [
+        (0, false, None, false), (1, true, None, false), (1, false, None, true),
+        (2, true, None, true), (1, true, Some("stderr error"), true),
+    ] {
+        let output = command_receipt_fixture(serde_json::json!({}), serde_json::json!({
+            "process_exited":true, "exit_code":exit, "execution_state":"exited",
+            "search_no_match":no_match, "error":error,
+        }), "search complete", None).await;
+        assert_eq!(super::code_mode_text_content(&output.body).contains("nested_command_failure"), failed);
+    }
+}
+
+#[tokio::test]
 async fn recovery_audit_failure_keeps_bounded_diagnostic_without_changing_success() {
     for error in [None, Some("launch denied: ".to_string() + &"x".repeat(4_000))] {
         let output = command_receipt_fixture(serde_json::json!({}), serde_json::json!({
@@ -1769,7 +1854,8 @@ async fn recovery_audit_bare_locator_does_not_hide_exact_selector() {
 #[tokio::test]
 async fn completion_audit_retained_intent_requires_authoritative_terminal_commands() {
     for scenario in ["complete", "empty-yield", "partial-yield", "input-changed",
-                     "schema-changed", "running", "unknown", "failed", "missing-exit", "deferred"] {
+                     "schema-changed", "running", "unknown", "failed", "missing-exit", "deferred",
+                     "no-match", "no-match-error", "invalid-no-match"] {
         let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         let service = &session.services.code_mode_service;
         let cell = CellId::new(format!("completion-{scenario}"));
@@ -1783,6 +1869,11 @@ async fn completion_audit_retained_intent_requires_authoritative_terminal_comman
             "running" => { command["execution_state"] = "running".into(); command["process_exited"] = false.into(); }
             "unknown" => command["execution_state"] = "unknown".into(),
             "failed" => command["exit_code"] = 1.into(),
+            "no-match" | "no-match-error" | "invalid-no-match" => {
+                command["exit_code"] = if scenario == "invalid-no-match" { 2 } else { 1 }.into();
+                command["search_no_match"] = true.into();
+                if scenario == "no-match-error" { command["error"] = "error".into(); }
+            }
             "missing-exit" => { command.as_object_mut().unwrap().remove("exit_code"); }
             "deferred" => command["pending_deferred_completions"] = serde_json::json!(["required-job"]),
             "input-changed" => { activity.send_replace(crate::session::InputQueueActivity::Steer); }
@@ -1806,7 +1897,7 @@ async fn completion_audit_retained_intent_requires_authoritative_terminal_comman
             error_text: None, output_loss: None,
         };
         assert_eq!(service.delivery_for_response(&cell, &turn, &response).as_deref(),
-            matches!(scenario, "complete" | "empty-yield").then_some("verified result"), "{scenario}");
+            matches!(scenario, "complete" | "empty-yield" | "no-match").then_some("verified result"), "{scenario}");
         assert!(service.delivery_for_response(&cell, &turn, &response).is_none(), "intent is consumed once");
         service.finish_cell_dispatch(&cell);
     }

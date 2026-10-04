@@ -122,16 +122,52 @@ pub(crate) fn reselect_read_file_output(
     if selectors.is_empty() || selectors.len() > READ_TOOL_OUTPUT_MAX_SELECTORS {
         return None;
     }
-    // Search results can contain shared references to other selections. Never
-    // return those references after removing their hydration owners.
-    if selectors.iter().any(|selector| !matches!(selector["kind"].as_str(), Some("bytes" | "lines"))) {
-        return None;
-    }
     let retained = output["results"].as_array()?;
-    let mut selected = Vec::new();
-    for selector in selectors {
-        selected.push(retained.iter().find_map(|result| retained_read_selection(result, selector))?);
-    }
+    let selected = if previous["selectors"].is_null()
+        && output["file_complete"] == true
+        && selectors.iter().any(|selector| matches!(selector["kind"].as_str(), Some("lines" | "search")))
+    {
+        // Default reads use a byte selector. Reuse that whole authenticated
+        // source through the owning selector engine instead of requiring another
+        // filesystem read for lines/search. Search hydration stays self-contained.
+        let source = retained.first()?;
+        let text = source["text"].as_str()?;
+        if retained.len() != 1 || source["status"] != "ok" || source["complete"] != true
+            || source["canonical_range"]["start"] != 0
+            || source["canonical_range"]["end"] != output["canonical_bytes"]
+            || output["canonical_bytes"].as_u64()? != text.len() as u64
+        { return None; }
+        let canonical = CanonicalToolResult::text(text.to_owned());
+        if output["canonical_sha256"].as_str()? != canonical.sha256 { return None; }
+        let selectors: Vec<ToolOutputSelector> = serde_json::from_value(json!(selectors)).ok()?;
+        if selectors.iter().any(|selector| !matches!(selector,
+            ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Lines { .. } | ToolOutputSelector::Search { .. }
+        )) { return None; }
+        let (selection, continuation) = select_file_snapshot_for_script(&canonical, Some(selectors.clone())).ok()?;
+        if !selection.complete || continuation.is_some() { return None; }
+        let selected = serde_json::to_value(selection.results).ok()?;
+        // The replay ledger is shared by direct and script consumers. Direct
+        // selection can reorder/merge mixed ranges and has a smaller budget.
+        // Until the ledger carries that consumer policy, reuse only projections
+        // with identical complete results in both modes, never change the API
+        // shape merely to save an I/O operation.
+        let (direct, _) = select_file_snapshot_with_ceiling(
+            &canonical, Some(selectors), RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000),
+        ).ok()?;
+        if !direct.complete || serde_json::to_value(direct.results).ok()? != selected { return None; }
+        selected
+    } else {
+        // Partial search results can reference other hydration owners. Do not
+        // reuse them after removing those owners or infer undelivered source.
+        if selectors.iter().any(|selector| !matches!(selector["kind"].as_str(), Some("bytes" | "lines"))) {
+            return None;
+        }
+        let mut selected = Vec::new();
+        for selector in selectors {
+            selected.push(retained.iter().find_map(|result| retained_read_selection(result, selector))?);
+        }
+        json!(selected)
+    };
     output["results"] = json!(selected);
     output["complete"] = json!(true);
     output["delivered_selection_complete"] = json!(true);
@@ -874,7 +910,8 @@ mod tests {
         std::fs::write(&path, "first λ\nsecond 日本語\n").unwrap();
         let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function tool"); };
         let validator = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
-        for selectors in [json!(null), json!([{"kind":"lines","start":1,"end":1}])] {
+        for selectors in [json!(null), json!([{"kind":"lines","start":1,"end":1}]),
+            json!([{"kind":"search","query":"first","context_lines":0}])] {
             let call = invocation(&path, selectors.clone(), false).await;
             let payload = call.payload.clone();
             let output = ReadFileHandler.handle(call).await.unwrap();
@@ -883,13 +920,29 @@ mod tests {
             let codex_protocol::models::FunctionCallOutputBody::Text(text) = response.body else { panic!("text output"); };
             let compact: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert!(validator.is_valid(&raw));
-            assert!(validator.is_valid(&compact));
+            validator.validate(&compact).unwrap();
             assert_eq!(raw["source_sha256"], raw["canonical_sha256"]);
             assert_eq!(raw["complete"], raw["delivered_selection_complete"]);
             assert!(compact.get("canonical_sha256").is_none());
             assert!(compact.get("delivered_selection_complete").is_none());
             assert_eq!(compact["source_sha256"], raw["source_sha256"]);
-            assert_eq!(compact["results"], raw["results"]);
+            // Display omits exact_bytes when the canonical range proves it.
+            // Reconstruct that alias and compare every field, not just text;
+            // scripts must still receive the unchanged raw result contract.
+            let mut reconstructed = compact["results"].clone();
+            for selected in reconstructed.as_array_mut().unwrap() {
+                if selected["selector"]["kind"] == "search" {
+                    assert_eq!(selected["value"], raw["results"][0]["value"]);
+                    selected["child_selectors"] = json!(selected["value"]["hydrated_ranges"].as_array().unwrap()
+                        .iter().map(|range| range["selector"].clone()).collect::<Vec<_>>());
+                    continue;
+                }
+                assert!(selected.get("exact_bytes").is_none());
+                let start = selected["canonical_range"]["start"].as_u64().unwrap();
+                let end = selected["canonical_range"]["end"].as_u64().unwrap();
+                selected["exact_bytes"] = json!(end.checked_sub(start).unwrap());
+            }
+            assert_eq!(reconstructed, raw["results"]);
             if selectors.is_null() {
                 assert!(compact.get("artifact_id").is_none());
                 assert_eq!(compact["file_complete"], true);
@@ -1607,6 +1660,36 @@ mod tests {
             .unwrap()
             .validate(&result)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_search_context_preserves_file_coverage_in_both_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlap.txt");
+        let text = (0..7).map(|line| format!("candidate_{line} {}\r\n", "λ evidence; ".repeat(30))).collect::<String>();
+        std::fs::write(&path, &text).unwrap();
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function tool expected") };
+        let validator = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+        for script in [false, true] {
+            for (context_lines, expected_complete) in [(1, false), (3, true)] {
+                let mut call = invocation(&path, json!([
+                    {"kind":"search", "query":"candidate_2", "context_lines":context_lines},
+                    {"kind":"search", "query":"candidate_4", "context_lines":context_lines}
+                ]), false).await;
+                if script {
+                    call.source = ToolCallSource::CodeMode {
+                        cell_id:"audit-overlap".into(), parent_call_id:None,
+                        runtime_tool_call_id:"audit-overlap-read".into(),
+                        nested_deadline:None, cancellation_cause:None,
+                    };
+                }
+                let result = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+                assert_eq!(result["complete"], true);
+                assert_eq!(result["file_complete"], expected_complete);
+                assert!(result["results"][1]["value"]["hydrated_ranges"].as_array().unwrap().iter().any(|range| range["shared"] == true));
+                validator.validate(&result).unwrap();
+            }
+        }
     }
 
     /// Builds a turn whose skills snapshot holds one real skill loaded from

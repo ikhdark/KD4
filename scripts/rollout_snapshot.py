@@ -174,6 +174,24 @@ class RolloutSnapshot:
         with self.open_lines() as handle:
             return handle.read().decode("utf-8").splitlines()
 
+    def decoded_lines(self) -> Iterator[tuple[int, Any, str | None, int]]:
+        """Decode this captured stream once, preserving line/error coverage.
+
+        Consumers may retain these operation-local values, not treat them as
+        current disk evidence. A new snapshot must decode its own bytes. The
+        final field is expanded line bytes, for bounded compressed-input reuse.
+        """
+        with self.open_lines() as lines:
+            for number, line in enumerate(lines, 1):
+                try:
+                    item = json.loads(line)
+                    if not isinstance(item, dict):
+                        raise TypeError("rollout record must be an object")
+                except (ValueError, TypeError) as error:
+                    yield number, None, str(error), len(line)
+                else:
+                    yield number, item, None, len(line)
+
     def metadata(self) -> dict[str, str | int]:
         return {
             "path": str(self.path),

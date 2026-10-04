@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "engine": "v26.9.0",
+  "runs": 5,
+  "wallMs": [
+    5.7305999999999955,
+    2.7431999999999945,
+    2.8585999999999956,
+    4.728200000000001,
+    3.3796999999999997
+  ],
+  "medianMs": 3.3796999999999997,
+  "sources": [
+    {
+      "path": "dependency_graph.js",
+      "bytes": 8324,
+      "sha256": "b0aaefbff085decf6fc3f66ab6338af0a2b81e9dfe07027c5bf662c7faeda79f"
+    },
+    {
+      "path": "orchestration.js",
+      "bytes": 8909,
+      "sha256": "6ea37b4bcefb3cf681ccf752002026fd0e5ef7ad50929bec0f996485d914a083"
+    },
+    {
+      "path": "orchestration_tests.js",
+      "bytes": 9062,
+      "sha256": "6844e0a293c82b6d1a1d265a29109c1c5eb15c8f3e9fbe42788bd2fbba70f3b8"
+    }
+  ],
+  "passed": true,
+  "coverage": [
+    "bounded concurrency",
+    "batch deduplication",
+    "settled partial failure",
+    "immutable UTF-8/CRLF recovery",
+    "gaps/hash drift/no-progress stops",
+    "passive command drainage",
+    "all output packets retained",
+    "failure/input/handle stops"
+  ],
+  "limitations": [
+    "Scripted tool responses, not real provider inference or native tool dispatch.",
+    "No claim about live model request selection, tokens, cost, or turn wall-clock speedup.",
+    "Native core direct-delivery tests separately assert actual mock-provider request counts and answer persistence."
+  ]
+}

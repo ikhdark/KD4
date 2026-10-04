@@ -121,10 +121,12 @@ Object.defineProperty(globalThis, "run_graph", {
       for (const key of claims.write) writers.delete(key);
     }
     async function execute(id, node) {
+      let value, produced = false;
       try {
         const dependencies = Object.create(null);
         for (const dep of node.deps) dependencies[dep] = results[dep].value;
-        const value = await node.run(Object.freeze(dependencies));
+        value = await node.run(Object.freeze(dependencies));
+        produced = true;
         // Promise resolution is not tool success. The caller must explicitly
         // establish the node's behavioral postcondition (including exit codes).
         if (await node.accept(value) !== true) {
@@ -133,7 +135,10 @@ Object.defineProperty(globalThis, "run_graph", {
           results[id] = { status: "fulfilled", value };
         }
       } catch (reason) {
-        results[id] = { status: "rejected", reason };
+        // Acceptance can fail after a successful, expensive effect. Keep its
+        // evidence/live handle so recovery never needs to repeat that effect.
+        results[id] = produced ? { status: "rejected", value, reason }
+          : { status: "rejected", reason };
       }
     }
     while (pending.size || running.size) {

@@ -390,7 +390,9 @@ impl CodeModeService {
                 // owner must settle execution and deferred work affirmatively.
                 state.get("execution_state").and_then(JsonValue::as_str) != Some("exited")
                     || state.get("process_exited").and_then(JsonValue::as_bool) != Some(true)
-                    || state.get("exit_code").and_then(JsonValue::as_i64) != Some(0)
+                    || !(state.get("exit_code").and_then(JsonValue::as_i64) == Some(0)
+                        || (state["search_no_match"] == true && state["exit_code"] == 1))
+                    || state.get("error").is_some_and(|error| !error.is_null())
                     || state.get("pending_deferred_completions")
                         .is_some_and(|pending| !pending.as_array().is_some_and(Vec::is_empty))
             })
@@ -710,7 +712,8 @@ pub(super) fn handle_runtime_response(
     for state in &canonical_states {
         // A script printing only result.output must not hide a crashed or
         // unstarted command behind later successful output.
-        if state["exit_code"].as_i64().is_some_and(|code| code != 0)
+        if (state["exit_code"].as_i64().is_some_and(|code| code != 0)
+            && !(state["search_no_match"] == true && state["exit_code"] == 1))
             || state["execution_state"] == "unknown"
             || state.get("error").is_some_and(|error| !error.is_null())
         {
@@ -748,6 +751,15 @@ pub(super) fn handle_runtime_response(
             output.body.push(FunctionCallOutputContentItem::InputText {
                 text: format!("Running command session_id: {}", state["session_id"]),
             });
+            if state["session_capabilities"].is_object() {
+                output.body.push(FunctionCallOutputContentItem::InputText {
+                    text: serde_json::json!({
+                        "session_id": state["session_id"],
+                        "session_capabilities": state["session_capabilities"],
+                        "continuation": state["continuation"],
+                    }).to_string(),
+                });
+            }
         }
         // Printing only result.output must not discard the recovery route for
         // bytes omitted by the nested command, even if the outer packet fits.
@@ -2015,6 +2027,7 @@ fn nested_command_state(
         "execution_state",
         "session_capabilities",
         "process_exited",
+        "search_no_match",
         "pending_deferred_completions",
         "output_complete",
         "output_reduced",

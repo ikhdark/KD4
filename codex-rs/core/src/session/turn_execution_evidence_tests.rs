@@ -506,8 +506,10 @@ async fn evidence_reuse_native_replay_tracks_paths_inputs_turns_and_freshness() 
     assert!(!restored_guard.is_fresh(2, &cache, None));
 }
 
+#[test_case::test_case(false; "explicit_ranges")]
+#[test_case::test_case(true; "complete_default_read")]
 #[tokio::test]
-async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_guards() {
+async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_guards(default_read: bool) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("source.txt");
     std::fs::write(&path, "first\nsecond\n").unwrap();
@@ -515,7 +517,8 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
         {"kind":"lines","start":1,"end":1},
         {"kind":"lines","start":2,"end":2},
     ]);
-    let invocation = invocation("read_file", json!({"path":path,"selectors":selectors})).await;
+    let arguments = if default_read { json!({"path":path}) } else { json!({"path":path,"selectors":selectors}) };
+    let invocation = invocation("read_file", arguments).await;
     let result = ReadFileHandler.handle(invocation.clone()).await.unwrap();
     let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
     let observations = cache.begin_source_path_change_observations(root.path(), &[(path.clone(), false)])
@@ -573,6 +576,14 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
         json!({"path":path.with_file_name("other.txt"),"offset":2,"limit":1}),
         json!({"path":path,"selectors":[{"kind":"search","query":"second"}]}),
     ] {
+        if default_read && (args.get("offset") == Some(&json!(1)) || args.get("selectors").is_some()) {
+            // A full source can prove EOF-clamped lines and complete searches.
+            assert!(collector.register_deterministic_tool_call(
+                &ToolName::plain("read_file"),
+                &ToolPayload::Function { arguments: args.to_string() }, "full-source",
+            ).replayed_success.is_some(), "{args}");
+            continue;
+        }
         assert!(collector.register_deterministic_tool_call(
             &ToolName::plain("read_file"),
             &ToolPayload::Function { arguments: args.to_string() }, "miss",
@@ -581,6 +592,55 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
     std::fs::write(&path, "first\nCHANGED\n").unwrap();
     cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
     assert!(!guard.is_fresh(1, &cache, None));
+}
+
+#[tokio::test]
+async fn default_read_reselection_matches_fresh_selector_engine_without_io() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.txt");
+    std::fs::write(&path, "λ\r\n日本語 second\r\nSECOND\nlast").unwrap();
+    let original = invocation("read_file", json!({"path":path})).await;
+    let raw = ReadFileHandler.handle(original.clone()).await.unwrap().code_mode_result(&original.payload);
+    let ToolPayload::Function { arguments: previous } = &original.payload else { unreachable!() };
+    let mut cases = Vec::new();
+    for selectors in [
+        json!([{"kind":"lines","start":2,"end":3}]),
+        json!([{"kind":"lines","start":1,"end":99}]),
+        json!([{"kind":"search","query":"second","case_insensitive":true,"context_lines":1}]),
+        json!([{"kind":"search","query":"absent"}]),
+        json!([{"kind":"lines","start":1,"end":2},{"kind":"search","query":"second","context_lines":2}]),
+    ] {
+        let current = invocation("read_file", json!({"path":path,"selectors":selectors})).await;
+        let fresh = ReadFileHandler.handle(current.clone()).await.unwrap().code_mode_result(&current.payload);
+        let mut script_call = current.clone();
+        script_call.source = ToolCallSource::CodeMode {
+            cell_id: "reselect-script".into(), parent_call_id: None,
+            runtime_tool_call_id: "reselect-script-read".into(),
+            nested_deadline: None, cancellation_cause: None,
+        };
+        let script = ReadFileHandler.handle(script_call.clone()).await.unwrap().code_mode_result(&script_call.payload);
+        let ToolPayload::Function { arguments } = current.payload else { unreachable!() };
+        cases.push((arguments, fresh, script));
+    }
+    // Pure projection must not reread, even if the source is unavailable now.
+    // Production freshness/authorization remains covered by the collector test.
+    std::fs::remove_file(&path).unwrap();
+    for (arguments, fresh, script) in cases {
+        let replay = crate::tools::handlers::reselect_read_file_output(previous, &arguments, raw.clone());
+        if fresh["results"] != script["results"] {
+            assert!(replay.is_none(), "consumer-specific ordering/hydration must not be replayed: {arguments}");
+            continue;
+        }
+        let replay = replay.unwrap();
+        for key in ["results", "complete", "file_complete", "source_sha256", "canonical_bytes"] {
+            assert_eq!(replay[key], fresh[key], "{key}: {arguments}");
+        }
+        for key in ["file_complete", "canonical_sha256"] {
+            let mut invalid = raw.clone();
+            invalid[key] = json!(false);
+            assert!(crate::tools::handlers::reselect_read_file_output(previous, &arguments, invalid).is_none());
+        }
+    }
 }
 
 #[test]

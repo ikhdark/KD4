@@ -1,6 +1,5 @@
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS;
-use std::sync::Arc;
 
 use super::EXIT_SENTINEL;
 use super::MAX_OUTSTANDING_CALLBACKS_PER_CELL;
@@ -12,7 +11,6 @@ use super::StoredValue;
 use super::stored_value_entry_bytes;
 use super::stored_value_limit_message;
 use super::timers;
-use super::value::json_to_v8;
 use super::value::normalize_output_image;
 use super::value::serialize_output_text;
 use super::value::throw_type_error;
@@ -364,12 +362,13 @@ pub(super) fn load_callback(
     let value = scope
         .get_slot::<RuntimeState>()
         .and_then(|state| state.stored_values.get(&key))
-        .map(|stored| Arc::clone(&stored.value));
+        .cloned();
     let Some(value) = value else {
         retval.set(v8::undefined(scope).into());
         return;
     };
-    let Some(value) = json_to_v8(scope, &value) else {
+    let Some(value) = value.serialized.as_deref()
+        .and_then(|json| super::value::serialized_json_to_v8(scope, json)) else {
         throw_type_error(scope, "failed to load stored value");
         return;
     };

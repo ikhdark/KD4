@@ -25,6 +25,31 @@ from codex_package.targets import TARGET_SPECS
 
 
 class SourceBinariesForTargetTest(unittest.TestCase):
+    def test_nested_lease_reuses_target_but_proof_boundaries_reobserve_tools(self):
+        with self.package_fixture() as fixture:
+            spec, variant, kwargs, _, _, _ = fixture
+            with mock.patch.object(cargo_module, "effective_tool_contents",
+                                   return_value={"rustc": {"sha256": "fixture"}}) as tools:
+                with cargo_module.package_build_lease(spec, "release") as target:
+                    with cargo_module.package_build_lease(spec, "release") as nested:
+                        self.assertEqual(target, nested)
+                        self.assertEqual(cargo_package_target_dir(spec, "release"), target)
+                        self.assertEqual(tools.call_count, 1)
+                    build_source_binaries(spec, variant, **kwargs)
+                    # One target observation, plus independent before/after proofs.
+                    self.assertEqual(tools.call_count, 3)
+
+    def test_all_explicit_outputs_do_not_hash_default_cargo_tools(self):
+        with self.package_fixture() as fixture:
+            spec, variant, kwargs, _, _, _ = fixture
+            explicit = {
+                name: touch_file(cargo_module.CODEX_RS_ROOT / "prebuilt" / f"{name}.exe")
+                for name in cargo_module.SourceBuildOutputs.__dataclass_fields__
+            }
+            with mock.patch.object(cargo_module, "effective_tool_contents",
+                                   side_effect=AssertionError("unneeded tool hashing")):
+                self.assertEqual(vars(build_source_binaries(spec, variant, **(kwargs | explicit))), explicit)
+
     @contextmanager
     def package_fixture(self):
         spec = TARGET_SPECS["x86_64-pc-windows-msvc"]

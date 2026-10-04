@@ -500,24 +500,34 @@ def has_shared_target_rust_jobs(processes: Sequence[RustProcess] | None = None) 
     return bool(shared_target_rust_processes(processes))
 
 
-def cargo_lock_is_busy(target_dir: Path) -> bool:
+def cargo_lock_is_busy(target_dir: Path, *, profile: str | None = None) -> bool:
+    if _binary_file_lock_is_busy(target_dir / ".rust-test-runner.lock"):
+        return True
+    return _cargo_profile_locks_are_busy(target_dir, profile=profile)
+
+
+def _cargo_profile_locks_are_busy(target_dir: Path, *, profile: str | None) -> bool:
     # Cargo locks each profile directory, optionally below a target triple.
     # Inspect only those two levels; never follow junctions into other trees.
+    # Admission can ignore unrelated Cargo profiles; lane reservation/pruning
+    # must keep the default whole-target probe. Runner leases remain exclusive
+    # for the whole invocation, including helper staging and test execution.
     try:
-        if _binary_file_lock_is_busy(target_dir / ".rust-test-runner.lock"):
-            return True
         for child in target_dir.iterdir():
             if not child.is_dir():
                 continue
             if is_indirect_directory(child):
                 return True
-            if _cargo_lock_file_is_busy(child / ".cargo-lock"):
+            if (profile is None or child.name == profile) and _cargo_lock_file_is_busy(
+                child / ".cargo-lock"
+            ):
                 return True
-            for profile in child.iterdir():
-                if profile.is_dir():
-                    if is_indirect_directory(profile):
+            profiles = child.iterdir() if profile is None else (child / profile,)
+            for candidate in profiles:
+                if candidate.is_dir():
+                    if is_indirect_directory(candidate):
                         return True
-                    if _cargo_lock_file_is_busy(profile / ".cargo-lock"):
+                    if _cargo_lock_file_is_busy(candidate / ".cargo-lock"):
                         return True
     except OSError:
         # A disappearing child does not prove the remaining profiles are idle.
@@ -745,6 +755,7 @@ def _binary_file_lock_is_busy(path: Path) -> bool:
 @contextmanager
 def reserve_rust_test_target(
     target_dir: Path, *, timeout_seconds: float = 1800.0,
+    cargo_profile: str | None = None,
 ) -> Iterator[dict[str, object]]:
     """Coordinate whole runner invocations, not cached results.
 
@@ -754,10 +765,16 @@ def reserve_rust_test_target(
     raw Cargo locks too, without claiming to prevent uncooperative future starts.
     CODEX_CARGO_LANE_TARGET_DIR is the wrappers' inherited reservation contract,
     not an authorization boundary; it exempts only that exact parent lane, never
-    another runner or Cargo process using the target.
+    another runner or Cargo process using the selected build profile. An unknown
+    profile keeps the conservative whole-target Cargo probe.
     """
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("admission timeout must be a finite positive number")
+    if cargo_profile is not None and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None:
+        raise ValueError("Cargo profile must be a profile name, not a filesystem path")
+    profile_dir = {"dev": "debug", "test": "debug", "bench": "release"}.get(
+        cargo_profile, cargo_profile
+    )
     target_dir = target_dir.resolve()
     inherited_target = os.environ.get("CODEX_CARGO_LANE_TARGET_DIR")
     parent_reserved = bool(
@@ -785,8 +802,21 @@ def reserve_rust_test_target(
                 lane_busy = not parent_reserved and _binary_file_lock_is_busy(
                     target_dir / ".lane-active.lock"
                 )
-                if not lane_busy and not cargo_lock_is_busy(target_dir):
-                    handle = _try_acquire_binary_file_lock(target_dir / ".rust-test-runner.lock")
+                if not lane_busy:
+                    # Acquire once rather than opening, probing and releasing
+                    # this same lease before reacquiring it. Raw Cargo probes
+                    # are nonblocking; never retain our lease while waiting.
+                    candidate = _try_acquire_binary_file_lock(target_dir / ".rust-test-runner.lock")
+                    if candidate is not None:
+                        try:
+                            if not _cargo_profile_locks_are_busy(target_dir, profile=profile_dir):
+                                handle = candidate
+                        finally:
+                            if handle is None:
+                                try:
+                                    _release_binary_file_lock(candidate)
+                                finally:
+                                    candidate.close()
             if handle is None:
                 if not announced:
                     print(f"Rust admission: waiting for target {target_dir}", file=sys.stderr)
@@ -799,6 +829,7 @@ def reserve_rust_test_target(
                 "scope": "cooperating_rust_test_runner_invocations",
                 "inherited_lane_reservation": parent_reserved,
                 "observed_external_locks": ["lane_reservation", "cargo_profile"],
+                "cargo_profile_directory": profile_dir,
             }
         except BaseException as error:
             if isinstance(error, CleanupFailed) or getattr(error, "outcome", None) == "cleanup_failed":
@@ -1623,6 +1654,12 @@ def _direct_reserved_lane_command(
     if recipe == "_core-test-reserved" and len(arguments) >= 2:
         profile, target, *forwarded = arguments
         runner_arguments = ["run-target", "--profile", profile, target, *forwarded]
+    elif recipe == "_core-test-small-reserved" and arguments:
+        profile = "fast"
+        runner_arguments = [
+            "--cargo-profile", "dev-small", "run-target", "--profile", profile,
+            *arguments,
+        ]
     elif recipe == "_core-gate-reserved" and arguments:
         profile = "fast"
         runner_arguments = ["run-gate", "--profile", profile, *arguments]

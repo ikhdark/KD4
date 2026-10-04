@@ -104,6 +104,9 @@ pub(crate) enum RuntimeEvent {
 #[derive(Clone, Debug)]
 pub(crate) struct StoredValue {
     pub(crate) value: Arc<JsonValue>,
+    /// Immutable wire representation shared by loads and cell snapshots. Each
+    /// load still parses a fresh JS value, so callers cannot mutate the store.
+    serialized: Option<Arc<str>>,
     /// Serialized bytes of the key and value, charged to the session limit.
     pub(crate) bytes: usize,
     /// Keys read by the producing cell. None means the bounded read set
@@ -113,9 +116,16 @@ pub(crate) struct StoredValue {
 
 impl StoredValue {
     pub(crate) fn new(key: &str, value: JsonValue) -> Self {
+        let serialized = serde_json::to_string(&value).ok().map(Arc::<str>::from);
+        let bytes = serialized.as_ref().and_then(|json| {
+            stored_value_entry_bytes(key, &JsonValue::Null)
+                .checked_sub(4)
+                .and_then(|key_bytes| key_bytes.checked_add(json.len()))
+        }).unwrap_or(usize::MAX);
         Self {
-            bytes: stored_value_entry_bytes(key, &value),
+            bytes,
             value: Arc::new(value),
+            serialized,
             read_dependencies: Some(Arc::new(HashSet::new())),
         }
     }

@@ -35,7 +35,12 @@ const PROJECTOR: &str = r#"(() => {
   // Registered results, including ones inside batches, keep their JSON shape
   // in a one-line envelope. Counted text bodies follow in traversal order.
   // Only tool-owned text slots qualify, never arbitrary user JSON strings.
-  function rawText(projected) {
+  function rawText(projected, fragment) {
+    if (fragment) {
+      const raw = rawText({results: fragment === 'rows' ? projected : [projected]});
+      if (!raw) return undefined;
+      return {envelope: fragment === 'rows' ? raw.envelope.results : raw.envelope.results[0], texts: raw.texts};
+    }
     if (projected === null || typeof projected !== 'object' || Array.isArray(projected)) {
       return undefined;
     }
@@ -69,9 +74,25 @@ const PROJECTOR: &str = r#"(() => {
     }
     return undefined;
   }
-  return function(value, original, projected) {
-    if (arguments.length === 3) {
+  return function(value, original, projected, sourceFragments) {
+    if (arguments.length === 4) {
       set(value, {original, projected});
+      // Selected native source rows should not need the entire envelope just
+      // to avoid JSON-escaping their text. Keep identity and mutation guards;
+      // arbitrary JSON, cloned values and storage remain untouched.
+      if (sourceFragments && Array.isArray(value.results) && Array.isArray(projected.results)) {
+        const rows = (values, originals, displays) => {
+          set(values, {original: originals, projected: displays, fragment: 'rows', root: value, rootOriginal: original});
+          values.forEach((row, i) => {
+            if (row === null || typeof row !== 'object' || !displays[i]) return;
+            set(row, {original: originals[i], projected: displays[i], fragment: 'row', root: value, rootOriginal: original});
+            if (row.selector?.kind === 'search' && Array.isArray(row.value?.hydrated_ranges)) {
+              rows(row.value.hydrated_ranges, originals[i].value.hydrated_ranges, displays[i].value.hydrated_ranges);
+            }
+          });
+        };
+        rows(value.results, original.results, projected.results);
+      }
       active = true;
       return;
     }
@@ -79,8 +100,9 @@ const PROJECTOR: &str = r#"(() => {
     const texts = [];
     const rendered = stringify(value, (_key, item) => {
       const entry = item !== null && typeof item === 'object' ? get(item) : undefined;
-      if (!entry || !same(item, entry.original)) return item;
-      const raw = rawText(entry.projected);
+      if (!entry || !same(item, entry.original) ||
+          (entry.root && !same(entry.root, entry.rootOriginal))) return item;
+      const raw = rawText(entry.projected, entry.fragment);
       if (raw === undefined) return entry.projected;
       texts.push(...raw.texts);
       return raw.envelope;
@@ -115,6 +137,7 @@ pub(super) fn register(
     value: v8::Local<'_, v8::Value>,
     raw: &Value,
     projected: &Value,
+    source_fragments: bool,
 ) -> Result<(), String> {
     let original = json_to_v8(scope, raw)
         .ok_or_else(|| "failed to serialize projection source".to_string())?;
@@ -126,8 +149,9 @@ pub(super) fn register(
         .map(|function| v8::Local::new(scope, function))
         .ok_or_else(|| "output projector unavailable".to_string())?;
     let receiver = v8::undefined(scope).into();
+    let source_fragments = v8::Boolean::new(scope, source_fragments).into();
     function
-        .call(scope, receiver, &[value, original, projected])
+        .call(scope, receiver, &[value, original, projected, source_fragments])
         .ok_or_else(|| "failed to register output projection".to_string())?;
     Ok(())
 }
@@ -171,6 +195,18 @@ mod tests {
                 json!({"success":true,"changes_exact":true,
                     "text":"Success. Updated the following files:\nM λ\n",
                     "changes":[{"kind":"update","path":"λ","move_path":null}]}),
+            ),
+            (
+                "read_file",
+                json!({"artifact_id":"search-snapshot", "source_sha256":"revision", "complete":false,
+                    "results":[{"status":"ok", "selector":{"kind":"search","query":"λ","start_byte":0},
+                        "continuation":{"kind":"search","query":"λ","start_byte":2},
+                        "child_selectors":[{"kind":"lines","start":1,"end":1}],
+                        "value":{"query":"λ","start_byte":0,"matches_returned":1,
+                            "total_matches":2,"remaining_match_count":1,"coverage_complete":true,
+                            "matches":[{"line":1,"end_line":1,"start_byte":0,"end_byte":2}],
+                            "hydrated_ranges":[{"selector":{"kind":"lines","start":1,"end":1},
+                                "canonical_range":{"start":0,"end":2},"exact_bytes":2,"text":"λ"}]}}]}),
             ),
         ] {
             let projected =
@@ -342,7 +378,7 @@ mod tests {
                 }]
                 .into(),
                 source: format!(
-                    "const r = await tools.{name}({{}}); text(r); text({{part:7, results:[r,r]}}); store('raw', r); r.extra = 1; text(r);"
+                    "const r = await tools.{name}({{}}); text(r); text({{part:7, results:[r,r]}}); store('raw', r); if(r.results){{text(r.results); text(r.results[0]); if(r.results[0].value?.hydrated_ranges) text(r.results[0].value.hydrated_ranges); text(JSON.parse(JSON.stringify(r.results)));}} r.extra = 1; text(r); if(r.results) text(r.results);"
                 ),
                 yield_time_ms: None,
                 max_output_tokens: None,
@@ -385,7 +421,7 @@ mod tests {
                     other => panic!("unexpected event {other:?}"),
                 }
             }
-            assert_eq!(printed.len(), 3, "{name}");
+            assert_eq!(printed.len(), if fixture == "command" { 3 } else if fixture == "search" { 8 } else { 7 }, "{name}");
             let (header, printed_body) = printed[0].split_once('\n').unwrap();
             assert_eq!(
                 serde_json::from_str::<Value>(header).unwrap(),
@@ -396,7 +432,7 @@ mod tests {
             let (header, printed_body) = printed[1].split_once('\n').unwrap();
             assert_eq!(
                 serde_json::from_str::<Value>(header).unwrap(),
-                json!({"part":7, "results":[envelope.clone(), envelope]}),
+                json!({"part":7, "results":[envelope.clone(), envelope.clone()]}),
                 "batch identity and result ordering must survive projection"
             );
             assert_eq!(printed_body, format!("{body}\n{body}"), "{name}");
@@ -407,11 +443,30 @@ mod tests {
             }
             println!("projection_audit {fixture} raw_bytes={} whole_bytes={} batch_before_bytes={} batch_after_bytes={}",
                 raw.to_string().len(), printed[0].len(), old_batch.len(), printed[1].len());
+            if fixture != "command" {
+                let mut selected = vec![envelope["results"].clone(), envelope["results"][0].clone()];
+                if fixture == "search" {
+                    selected.push(envelope["results"][0]["value"]["hydrated_ranges"].clone());
+                }
+                for (index, expected) in selected.iter().enumerate() {
+                    let (header, text) = printed[index + 2].split_once('\n').unwrap();
+                    assert_eq!(serde_json::from_str::<Value>(header).unwrap(), *expected);
+                    assert_eq!(text, body, "selected fields must preserve exact text and coverage");
+                }
+                assert_eq!(serde_json::from_str::<Value>(&printed[2 + selected.len()]).unwrap(), raw["results"]);
+                assert_eq!(serde_json::from_str::<Value>(printed.last().unwrap()).unwrap(), raw["results"],
+                    "a changed parent must disable child projection too");
+                if fixture == "search" {
+                    assert!(printed[2].len() < raw["results"].to_string().len());
+                }
+                println!("projection_audit selected_{fixture} before_bytes={} after_bytes={}",
+                    raw["results"].to_string().len(), printed[2].len());
+            }
             // A modified result is no longer the tool's own value: print it as JSON.
             let mut changed = raw;
             changed["extra"] = json!(1);
             assert_eq!(
-                serde_json::from_str::<Value>(&printed[2]).unwrap(),
+                serde_json::from_str::<Value>(&printed[printed.len() - if fixture == "command" { 1 } else { 2 }]).unwrap(),
                 changed,
                 "{name}"
             );

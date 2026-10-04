@@ -32,6 +32,39 @@ class RolloutAuditCacheTest(unittest.TestCase):
             self.source, self.root, cache_dir=self.cache, **kwargs
         )
 
+    def test_capture_and_analysis_share_one_decode_with_error_coverage(self):
+        lines = [b'{"type":"session_meta","payload":{"cwd":"one"}}\n',
+                 b'invalid\n', b'[]\n', b'\xff\n']
+        self.source.write_bytes(b"".join(lines))
+        decode = json.loads
+        counts = {line: 0 for line in lines}
+
+        def counted(value, *args, **kwargs):
+            if isinstance(value, bytes) and value in counts:
+                counts[value] += 1
+            return decode(value, *args, **kwargs)
+
+        with mock.patch.object(cache.json, "loads", side_effect=counted):
+            first = self.run_audit()
+        self.assertEqual(list(counts.values()), [1, 1, 1, 1])
+        self.assertEqual(first["coverage"]["lines"], 4)
+        self.assertEqual(first["coverage"]["parseErrorCount"], 3)
+        direct = audit.analyze_session_path(self.source, self.root)
+        self.assertEqual(first["coverage"], direct["coverage"])
+        self.source.write_bytes(lines[0])
+        changed = self.run_audit()
+        self.assertEqual(changed["coverage"]["lines"], 1)
+        self.assertEqual(changed["coverage"]["parseErrorCount"], 0)
+        self.assertEqual(changed["analysisCache"]["status"], "miss")
+
+    def test_decode_retention_limits_fall_back_without_losing_records(self):
+        self.source.write_bytes(b'{}\n{}\n')
+        for limit in ("MAX_DECODED_WIRE_BYTES", "MAX_DECODED_RECORDS"):
+            with self.subTest(limit=limit), mock.patch.object(cache, limit, 1):
+                report = self.run_audit(refresh=True)
+            self.assertEqual(report["coverage"]["lines"], 2)
+            self.assertEqual(report["coverage"]["parseErrorCount"], 0)
+
     def test_reuse_preserves_report_identity_and_skips_analysis(self):
         first = self.run_audit()
         path = Path(first["analysisCache"]["report"])
@@ -260,6 +293,24 @@ class RolloutAuditCacheTest(unittest.TestCase):
         self.source.unlink()
         self.assertEqual(self.run_audit()["analysisCache"]["status"], "miss")
         self.assertEqual(self.run_audit()["analysisCache"]["status"], "hit")
+
+    def test_compressed_decode_retention_is_bounded_by_expanded_bytes(self):
+        try:
+            from compression import zstd
+        except ImportError:
+            from backports import zstd
+        compressed = self.source.with_name(self.source.name + ".zst")
+        compressed.write_bytes(zstd.compress(b'{}\n' * 1000))
+        self.assertLess(compressed.stat().st_size, 100)
+
+        def analyze(*args, **kwargs):
+            self.assertEqual(kwargs["_decoded"], {})
+            return audit.analyze_session_path(*args, **kwargs)
+
+        with mock.patch.object(cache, "MAX_DECODED_WIRE_BYTES", 100):
+            report = cache.analyze_cached(analyze, compressed, self.root, cache_dir=self.cache)
+        self.assertEqual(report["coverage"]["lines"], 1000)
+        self.assertEqual(report["coverage"]["parseErrorCount"], 0)
 
     def test_live_append_during_analysis_belongs_to_next_snapshot(self):
         original = audit._population_report

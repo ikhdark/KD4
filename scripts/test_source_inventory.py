@@ -1011,6 +1011,42 @@ class SourceInventoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             inventory.instruction_paths(self.root, ["../outside"])
 
+    def test_json_structure_is_computed_once_per_source_and_invalidated_by_edits(self):
+        path = self.file("catalog.json", '{"text":"before"}')
+        query = {"categories": [
+            {"name": name, "paths": ["catalog.json"], "json_summary": True,
+             "verification": "path"} for name in ("first", "second", "third")
+        ]}
+        decode = json.loads
+        parsed_sources = []
+
+        def counted(value, *args, **kwargs):
+            if isinstance(value, bytes):
+                parsed_sources.append(value)
+            return decode(value, *args, **kwargs)
+
+        with mock.patch.object(inventory.json, "loads", side_effect=counted):
+            _, first = inventory.inventory(self.root, query)
+            self.assertEqual(parsed_sources, [b'{"text":"before"}'])
+            unchanged, _ = inventory.inventory(self.root, query, first)
+            self.assertEqual(unchanged["reused_records"], 3)
+            self.assertEqual(len(parsed_sources), 1)
+            stat = path.stat()
+            path.write_text('{"text":"edited"}', encoding="utf-8")
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            _, changed = inventory.inventory(self.root, query, first)
+            self.assertEqual(parsed_sources[-1], b'{"text":"edited"}')
+            self.assertEqual(len(parsed_sources), 2)
+            self.assertNotEqual(first["files"]["catalog.json"]["sha256"],
+                                changed["files"]["catalog.json"]["sha256"])
+            path.write_text("invalid", encoding="utf-8")
+            invalid, _ = inventory.inventory(self.root, query, changed)
+            self.assertEqual(parsed_sources[-1], b"invalid")
+            self.assertEqual(len(parsed_sources), 3)
+            self.assertEqual(len(invalid["unresolved"]), 3)
+            self.assertTrue(all(row["unresolved"] == "invalid JSON requires separate inspection"
+                                for row in invalid["unresolved"]))
+
     def test_json_structure_and_remaining_page_do_not_print_prompt_bodies_or_rescan(self):
         body = "SECRET PROMPT BODY" * 10000
         self.file("catalog.json", json.dumps({"models": [{"slug": "model", "base_instructions": body}]}))
@@ -1310,6 +1346,24 @@ class SourceInventoryTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             inventory.main(["--state", str(legacy), "--render-only", "--report", str(report)])
         self.assertFalse(report.exists())
+
+    def test_consumer_evidence_reuses_digest_and_lines_within_one_scan(self):
+        self.file("src/loader.rs", "consumer\n" * 100)
+        data = (self.root / "src/loader.rs").read_bytes()
+        reference = {"path": "src/loader.rs", "sha256": hashlib.sha256(data).hexdigest(),
+                     "line": 1, "text": "consumer"}
+        cache = {}
+        with mock.patch.object(inventory, "digest", wraps=inventory.digest) as hashed:
+            for _ in range(50):
+                self.assertIsNone(inventory.consumer_evidence(self.root, [reference], cache))
+            self.assertEqual(hashed.call_count, 1)
+        self.assertEqual(cache["src/loader.rs"][0], len(data))
+        self.assertIsNotNone(inventory.consumer_evidence(
+            self.root, [dict(reference, sha256="stale")], cache))
+        self.assertIsNotNone(inventory.consumer_evidence(
+            self.root, [dict(reference, text="invented")], cache))
+        self.file("src/loader.rs", "changed\n")
+        self.assertIsNotNone(inventory.consumer_evidence(self.root, [reference], {}))
 
 
 if __name__ == "__main__":

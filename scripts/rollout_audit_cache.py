@@ -23,6 +23,8 @@ except ImportError:
 
 MAX_CAPTURE_BYTES = 64 * 1024 * 1024
 MAX_REPORT_BYTES = 64 * 1024 * 1024
+MAX_DECODED_WIRE_BYTES = 8 * 1024 * 1024
+MAX_DECODED_RECORDS = 100_000
 
 
 def _bytes(value):
@@ -114,6 +116,8 @@ def analyze_cached(
     )
     root = Path(cache_dir).resolve()
     captured, payloads, payload_ids = {}, {}, []
+    decoded = {}
+    decoded_wire_bytes = decoded_records = 0
     with contextlib.ExitStack() as stack:
         captured_bytes = 0
         for file in dict.fromkeys([*files, *([startup_log] if startup_log else [])]):
@@ -125,12 +129,21 @@ def analyze_cached(
                 break
             if file not in files:
                 continue
-            with snapshot.open_lines() as lines:
-                for line in lines:
-                    try:
-                        item = json.loads(line)
-                    except (ValueError, UnicodeError):
-                        continue  # The analyzer retains its existing parse-error coverage.
+            retained_lines = [] if decoded_wire_bytes <= MAX_DECODED_WIRE_BYTES else None
+            # The miss path consumes these exact parsed values rather than
+            # decoding/decompressing the captured JSONL again. Keep errors too.
+            with contextlib.closing(snapshot.decoded_lines()) as lines:
+                for number, item, error, wire_bytes in lines:
+                    if retained_lines is not None:
+                        decoded_records += 1
+                        decoded_wire_bytes += wire_bytes
+                        if (decoded_records <= MAX_DECODED_RECORDS
+                                and decoded_wire_bytes <= MAX_DECODED_WIRE_BYTES):
+                            retained_lines.append((number, item, error, wire_bytes))
+                        else:
+                            retained_lines = None
+                    if error is not None:
+                        continue
                     if (
                         not isinstance(item, dict)
                         or item.get("type") != "rollout_payload_artifact"
@@ -162,6 +175,8 @@ def analyze_cached(
                         raise ValueError("rollout payload size mismatch")
                     if captured_bytes > MAX_CAPTURE_BYTES:
                         break
+            if retained_lines is not None:
+                decoded[file] = retained_lines
             if captured_bytes > MAX_CAPTURE_BYTES:
                 break
         if captured_bytes > MAX_CAPTURE_BYTES:
@@ -223,6 +238,7 @@ def analyze_cached(
             _captured=captured,
             _files=files,
             _hydrate=hydrate,
+            _decoded=decoded,
         )
         report["inputProvenance"] = {"sha256": identity, "inputs": provenance}
         # Existing command-output lineage consumes this declaration as evidence

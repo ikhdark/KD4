@@ -2478,6 +2478,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_base_instructions_narrow_audits_without_replacing_coverage() {
+        let instructions = BaseInstructions::default();
+        for required in [
+            "narrowing determines inspection order, not required coverage or stopping criteria",
+            "establish the requested scope and coverage obligations before prioritizing candidates",
+            "do not silently turn it into targeted diagnosis",
+            "even when the user did not explicitly request full reads",
+            "narrow candidates with scoped references",
+            "Batch independent deterministic discovery",
+            "inspect complete relevant functions/types",
+            "expand when evidence or unresolved edges require it",
+            "also examine remaining in-scope surfaces independently of candidate hits",
+            "Do not treat fixed search context as an enclosing function",
+            "no search matches as a stopping condition",
+            "Prefer exact selectors only when they preserve required coverage",
+            "honor explicit full-read requests",
+            "Reuse existing revision-bound inventories and coverage ledgers",
+            "reconcile all coverage obligations",
+            "report unexamined areas and unresolved edges explicitly",
+            "incomplete coverage is a partial audit, not a clean result",
+            "Measure input reduction alongside preserved coverage and defect detection",
+            "projection tests establish preservation of selected evidence, not unchanged defect detection",
+        ] {
+            assert!(instructions.text.contains(required), "missing: {required}");
+        }
+    }
+
     // A tiny valid PNG (1x1) so image conversion tests don't depend on cross-crate
     // file paths or external fixture layouts.
     const TINY_PNG_BYTES: &[u8] = &[

@@ -355,7 +355,7 @@ def consumer_evidence(root, references, cache):
             else:
                 try:
                     remaining = MAX_SCAN_BYTES - sum(
-                        len(v) for v in cache.values() if v
+                        v[0] for v in cache.values() if v
                     )
                     limit = min(MAX_FILE_BYTES, remaining)
                     if full_path.stat().st_size > limit:
@@ -365,15 +365,21 @@ def consumer_evidence(root, references, cache):
                             data = source.read(limit + 1)
                         if len(data) > limit:
                             data = None
-                    cache[path] = data
+                    if data is None:
+                        cache[path] = None
+                    else:
+                        try:
+                            lines = data.decode("utf-8").splitlines()
+                        except UnicodeDecodeError:
+                            lines = None
+                        cache[path] = (len(data), digest(data), lines)
                 except OSError:
                     cache[path] = None
-        data = cache[path]
-        if data is None or digest(data) != reference.get("sha256"):
+        observation = cache[path]
+        if observation is None or observation[1] != reference.get("sha256"):
             return "consumer evidence is unavailable or stale"
-        try:
-            lines = data.decode("utf-8").splitlines()
-        except UnicodeDecodeError:
+        lines = observation[2]
+        if lines is None:
             return "consumer evidence is not UTF-8"
         line = reference.get("line")
         text = reference.get("text")
@@ -388,12 +394,47 @@ def consumer_evidence(root, references, cache):
     return None
 
 
+def windows_change_time(path):
+    """NTFS change time, unlike Windows st_ctime, tracks restored-mtime edits."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_longlong) for name in (
+            "creation", "access", "write", "change"
+        )] + [("attributes", wintypes.DWORD)]
+
+    kernel = ctypes.windll.kernel32
+    create = kernel.CreateFileW
+    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.restype = wintypes.HANDLE
+    info = kernel.GetFileInformationByHandleEx
+    info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    info.restype = wintypes.BOOL
+    close = kernel.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    # Read attributes, share with editors, and inspect (not follow) reparse points.
+    handle = create(str(path), 0x80, 7, None, 3, 0x02200000, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError()
+    try:
+        value = BasicInfo()
+        if not info(handle, 0, ctypes.byref(value), ctypes.sizeof(value)):
+            raise ctypes.WinError()
+        return value.change
+    finally:
+        close(handle)
+
+
 def source_revision(path):
     """Cheap race/continuation guard; content hashes remain the evidence identity."""
     try:
         stat = path.lstat()
         return [stat.st_dev, stat.st_ino, stat.st_mode, stat.st_size,
-                stat.st_mtime_ns, stat.st_ctime_ns]
+                stat.st_mtime_ns,
+                windows_change_time(path) if sys.platform == "win32" else stat.st_ctime_ns]
     except FileNotFoundError:
         return None
 
@@ -606,6 +647,10 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
                 error = str(exc)
         entries = {}
         text = None
+        # All categories observe these same captured bytes. Parse and summarize
+        # once per file, including failures; later scans use the revision guard.
+        structure = None
+        structure_error = None
         for name in sorted(selected):
             rule, pattern = categories[name]
             rule_hash = rule_hashes[name]
@@ -643,10 +688,15 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
                         except UnicodeDecodeError:
                             reason = "non-UTF-8 source requires separate inspection"
                     if matched and rule.get("json_summary"):
-                        try:
-                            evidence["structure"] = json_shape(json.loads(data))
-                        except (ValueError, UnicodeDecodeError):
-                            reason = "invalid JSON requires separate inspection"
+                        if structure is None and structure_error is None:
+                            try:
+                                structure = json_shape(json.loads(data))
+                            except (ValueError, UnicodeDecodeError):
+                                structure_error = "invalid JSON requires separate inspection"
+                        if structure_error is not None:
+                            reason = structure_error
+                        else:
+                            evidence["structure"] = structure
                 if not matched and reason is None:
                     reason = "category rule did not match"
             elif reason is None:

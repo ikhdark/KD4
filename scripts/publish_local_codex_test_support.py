@@ -93,7 +93,7 @@ def clean_env() -> dict[str, str]:
     # assertions machine-state-dependent unless they are stripped.
     env = os.environ.copy()
     # Publish builds refuse these, so an ambient value must not decide a test.
-    for name in (*PUBLISH_ENV_VARS, "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
+    for name in (*PUBLISH_ENV_VARS, "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CODEX_THREAD_ID"):
         env.pop(name, None)
     return env
 
@@ -623,6 +623,17 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         observe_commands: dict[str, Path] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         publish_args = list(self.publish_args(args))
+        # Ordinary fixtures must never inspect the developer's session history.
+        # Explicit homes and a fixture USERPROFILE still exercise routing defaults.
+        effective_env = clean_env() if env is None else env
+        if (
+            "-LocalCodexHome" not in publish_args
+            and not effective_env.get("CODEX_LOCAL_CODEX_HOME")
+            and effective_env.get("USERPROFILE") == os.environ.get("USERPROFILE")
+        ):
+            publish_args.extend(
+                ["-LocalCodexHome", str(Path(self.repo_temp.name) / "local-home")]
+            )
         # Only prebuilt (-SkipBuild) runs may name binaries; builds publish the
         # Cargo outputs, so fixtures reach them through write_fake_cargo.
         if "-SkipBuild" in publish_args:
@@ -693,7 +704,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
-            env=clean_env() if env is None else env,
+            env=effective_env,
             timeout=RUN_TIMEOUT_SECONDS,
         )
 

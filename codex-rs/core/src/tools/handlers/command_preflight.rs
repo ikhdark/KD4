@@ -3,6 +3,7 @@ use std::path::Component;
 use std::path::Path;
 
 use super::command_search::rg_search_path_operands;
+use super::command_search::rg_search_path_indices;
 use crate::shell::ShellType;
 use crate::tools::handlers::command_shape::CommandInvocation;
 
@@ -371,12 +372,18 @@ fn repair_rg_leaf_glob(
     {
         return None;
     }
-    let operands = rg_search_path_operands(&[argv.clone()])?;
-    // A glob filter over several roots can silently narrow unrelated operands.
-    // Expand actual file names instead, and require one terminal path operand.
-    let [operand] = operands.as_slice() else { return None };
-    if argv.last() != Some(operand) || !operand.contains('*') {
-        return None;
+    let indices = rg_search_path_indices(&argv)?;
+    // Expand one leaf glob in place, not a global --glob that would narrow
+    // other roots. The shared argument parser keeps patterns/flag values out.
+    let globs = indices.iter().copied().filter(|&index| argv[index].contains('*')).collect::<Vec<_>>();
+    let [operand_index] = globs.as_slice() else { return None };
+    let operand = &argv[*operand_index];
+    let root = cwd.canonicalize().ok()?;
+    for &index in &indices {
+        if index == *operand_index { continue; }
+        // Preserve uncertainty rather than guessing another missing operand.
+        let path = cwd.join(&argv[index]).canonicalize().ok()?;
+        if !path.starts_with(&root) { return None; }
     }
     let path = Path::new(operand);
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -387,7 +394,6 @@ fn repair_rg_leaf_glob(
         return None;
     }
     let pattern = glob::Pattern::new(leaf).ok()?;
-    let root = cwd.canonicalize().ok()?;
     let directory = cwd.join(parent).canonicalize().ok()?;
     if !directory.starts_with(&root) {
         return None;
@@ -408,12 +414,13 @@ fn repair_rg_leaf_glob(
     }
     if matches.is_empty() { return None; }
     matches.sort();
-    let mut repaired_argv = argv[..argv.len() - 1].to_vec();
+    let mut repaired_argv = argv[..*operand_index].to_vec();
     // Prevent a matched '-name' from becoming an option, including a helper.
-    if !repaired_argv.iter().any(|arg| arg == "--") {
+    if *operand_index == argv.len() - 1 && !repaired_argv.iter().any(|arg| arg == "--") {
         repaired_argv.push("--".to_string());
     }
     repaired_argv.extend(matches);
+    repaired_argv.extend_from_slice(&argv[*operand_index + 1..]);
     if !codex_shell_command::is_safe_command::is_known_safe_direct_argv(&repaired_argv) {
         return None;
     }

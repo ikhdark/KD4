@@ -7,6 +7,8 @@ import argparse
 import json
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
@@ -85,46 +87,33 @@ def extension_candidates(limit: int = 8) -> list[str]:
 
 
 def build_probes(run_codex: bool, *, path_only: bool = False) -> list[BinaryProbe]:
-    versions: dict[Path, str | None] = {}
-
-    def version(path: str | None) -> str | None:
-        if not run_codex or not path:
-            return None
-        key = Path(path).resolve()
-        if key not in versions:
-            versions[key] = run_version(path, enabled=True)
-        return versions[key]
-
     path_codex = shutil.which("codex")
-    probes = [
-        BinaryProbe(
-            "path-codex",
-            path_codex,
-            bool(path_codex),
-            version(path_codex),
-        ),
+    candidates = [("path-codex", path_codex, bool(path_codex))]
+    if not path_only:
+        target = desktop_target()
+        candidates.append(
+            ("desktop-local-target", target, bool(target and Path(target).exists()))
+        )
+        candidates.extend(
+            ("vscode-extension-candidate", candidate, Path(candidate).exists())
+            for candidate in extension_candidates()
+        )
+    # Capture and deduplicate before scheduling; workers never mutate the cache.
+    paths = {
+        Path(path).resolve(): path for _, path, _ in candidates if path
+    } if run_codex else {}
+    versions = {}
+    if paths:
+        with ThreadPoolExecutor(max_workers=min(4, len(paths))) as executor:
+            futures = {
+                key: executor.submit(copy_context().run, run_version, path, enabled=True)
+                for key, path in paths.items()
+            }
+            versions = {key: future.result() for key, future in futures.items()}
+    return [
+        BinaryProbe(label, path, exists, versions.get(Path(path).resolve()) if path else None)
+        for label, path, exists in candidates
     ]
-    if path_only:
-        return probes
-    target = desktop_target()
-    probes.append(
-        BinaryProbe(
-            "desktop-local-target",
-            target,
-            bool(target and Path(target).exists()),
-            version(target),
-        )
-    )
-    for candidate in extension_candidates():
-        probes.append(
-            BinaryProbe(
-                "vscode-extension-candidate",
-                candidate,
-                Path(candidate).exists(),
-                version(candidate),
-            )
-        )
-    return probes
 
 
 def print_probes(probes: Sequence[BinaryProbe]) -> None:

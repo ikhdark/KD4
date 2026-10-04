@@ -321,6 +321,90 @@ class RunnerTestCase(unittest.TestCase):
 
 
 class WallClockRunnerTest(RunnerTestCase):
+    def discovered_build_runner(self):
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers_by_test_prefix"] = {"mod::tests::": []}
+        fake = FakeExecutor(artifacts={"codex": self.helper_executable("codex")})
+        runner, _ = self.runner(manifest=Manifest.from_data(data), executor=fake)
+        commands = []
+        builds = []
+
+        def execute(args, **kwargs):
+            commands.append(list(args))
+            if "--binaries-metadata" in args:
+                path = Path(args[args.index("--binaries-metadata") + 1])
+                builds.append(json.loads(path.read_text()))
+                # The fixture simulates the binary Nextest selects from metadata.
+                result = fake([*args[:3], "-p", "codex-core", "--lib", *args[5:]], **kwargs)
+            else:
+                result = fake(args, **kwargs)
+            if args[:3] == ["cargo", "nextest", "list"]:
+                root = json.loads(result.stdout)
+                suite = next(iter(root["rust-suites"].values()))
+                suite.update({
+                    "binary-id": "codex-core", "binary-name": "codex_core",
+                    "package-id": "path+file:///codex-core#0.0.0", "kind": "lib",
+                    "binary-path": str(self.target_dir / "debug" / "core.exe"),
+                    "build-platform": "target",
+                })
+                root["rust-suites"] = {"codex-core": suite}
+                root["rust-build-meta"] = {
+                    "target-directory": str(self.target_dir),
+                    "non-test-binaries": {"codex-core": ["core-helper"]},
+                    "build-script-out-dirs": {"codex-core": "out"},
+                }
+                result.stdout = json.dumps(root)
+            return result
+
+        runner.executor = execute
+        return runner, fake, commands, builds
+
+    def test_discovery_build_is_reused_only_within_current_run(self):
+        runner, fake, commands, builds = self.discovered_build_runner()
+        # Keep a real helper between discovery and execution, the source of
+        # feature/fingerprint churn in the production path.
+        fake.default_listing = {"other::alpha": False}
+        runner.platform = "linux"
+        filters = ["-E", "test(alpha)", "--run-ignored", "all"]
+        for _ in range(2):
+            receipt = runner.run_target("core_lib", filters, no_fail_fast=True)
+            self.assertEqual(receipt, {"codex-core": ["other::alpha"]})
+        self.assertEqual([cmd[:3] for cmd in commands], [
+            ["cargo", "nextest", "list"],
+            ["cargo", "build", "--message-format=json-render-diagnostics"],
+            ["cargo", "nextest", "run"],
+        ] * 2)
+        for command in (commands[2], commands[5]):
+            self.assertIn("--binaries-metadata", command)
+            self.assertNotIn("--target-dir", command)
+            self.assertNotIn("-p", command)
+            self.assertIn("--no-tests=fail", command)
+            self.assertIn("--no-fail-fast", command)
+            self.assertEqual(command[-len(filters):], filters)
+        self.assertNotEqual(commands[2][4], commands[5][4])
+        self.assertEqual(set(builds[0]["rust-binaries"]), {"codex-core"})
+        self.assertNotIn("testcases", builds[0]["rust-binaries"]["codex-core"])
+        self.assertEqual(builds[0]["rust-build-meta"]["non-test-binaries"],
+                         {"codex-core": ["core-helper"]})
+        self.assertEqual(builds[0]["rust-build-meta"]["build-script-out-dirs"],
+                         {"codex-core": "out"})
+
+    def test_discovered_build_retention_failure_falls_back_to_cargo(self):
+        runner, _, commands, builds = self.discovered_build_runner()
+        with mock.patch.object(runner, "_retain_text", return_value=None):
+            runner.run_target("core_lib", ["alpha"])
+        self.assertEqual(builds, [])
+        self.assertIn("--target-dir", commands[-1])
+        self.assertNotIn("--binaries-metadata", commands[-1])
+
+    def test_discovered_build_failure_is_not_recompiled_or_retried(self):
+        runner, fake, commands, _ = self.discovered_build_runner()
+        fake.failing_runs.add("--lib")
+        with self.assertRaises(RunnerError):
+            runner.run_target("core_lib", ["alpha"])
+        self.assertEqual(len(commands), 2)
+        self.assertIn("--binaries-metadata", commands[-1])
+
     def test_focused_benchmark_skips_discovery_and_helper_builds(self):
         scenario = kd4_perf_snapshot.scenario_catalog()["focused-core-test"]
         runner, executor = self.runner(
@@ -1565,6 +1649,76 @@ class HelperUnionTest(RunnerTestCase):
 
 
 class TargetDirectoryPropagationTest(RunnerTestCase):
+    def test_explicit_relative_target_uses_the_invocation_directory(self) -> None:
+        cargo_cwd = self.temp_dir / "codex-rs"
+        expected = cargo_cwd / "target" / "lanes" / "demo"
+        for caller, value in [
+            (self.temp_dir, "codex-rs/target/lanes/demo"),
+            (cargo_cwd, "target/lanes/demo"),
+            (self.temp_dir / "other", "../codex-rs/target/lanes/demo"),
+        ]:
+            with (
+                self.subTest(caller=caller, value=value),
+                mock.patch.object(Path, "cwd", return_value=caller),
+            ):
+                actual = rust_test_runner._resolve_target_dir(
+                    value, self.metadata(), cwd=cargo_cwd
+                )
+                self.assertEqual(actual.resolve(), expected)
+
+    def test_target_environment_precedence_and_cargo_relative_paths_are_preserved(self) -> None:
+        cargo_cwd = self.temp_dir / "codex-rs"
+        for configured, expected in [
+            ({}, self.metadata().target_directory),
+            ({"CARGO_TARGET_DIR": "target/cargo"}, cargo_cwd / "target/cargo"),
+            ({"CODEX_CARGO_LANE_TARGET_DIR": "target/lane"}, cargo_cwd / "target/lane"),
+            ({"CODEX_CARGO_LANE_TARGET_DIR": "target/lane", "CARGO_TARGET_DIR": "target/cargo"}, cargo_cwd / "target/lane"),
+            ({"CARGO_TARGET_DIR": str(self.target_dir)}, self.target_dir),
+            ({"CODEX_CARGO_LANE_TARGET_DIR": str(self.target_dir)}, self.target_dir),
+        ]:
+            with (
+                self.subTest(configured=configured),
+                mock.patch.dict(os.environ, configured, clear=True),
+                mock.patch.object(Path, "cwd", return_value=self.temp_dir / "caller"),
+            ):
+                self.assertEqual(
+                    rust_test_runner._resolve_target_dir(None, self.metadata(), cwd=cargo_cwd),
+                    expected,
+                )
+                # Explicit absolute paths win over either environment variable.
+                self.assertEqual(
+                    rust_test_runner._resolve_target_dir(str(self.target_dir), self.metadata(), cwd=cargo_cwd),
+                    self.target_dir,
+                )
+
+    def test_cli_target_reaches_admission_and_all_commands_without_rerooting(self) -> None:
+        relative = "codex-rs/target/lanes/demo"
+        expected = (self.temp_dir / relative).resolve()
+        for arguments in [
+            ["--target-dir", relative, "run-target", "core_all"],
+            ["run-target", "--target-dir", relative, "core_all"],
+            [f"--target-dir={relative}", "run-target", "core_all"],
+        ]:
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch.object(Path, "cwd", return_value=self.temp_dir),
+                mock.patch.object(rust_test_runner, "load_metadata", return_value=self.metadata()),
+                mock.patch.object(Manifest, "load", return_value=self.manifest()),
+                mock.patch.object(rust_test_runner, "_dispatch_with_admission", return_value=0) as dispatch,
+                mock.patch.dict(os.environ, {
+                    "CODEX_CARGO_LANE_TARGET_DIR": str(self.temp_dir / "unused-lane"),
+                    "CARGO_TARGET_DIR": str(self.temp_dir / "unused-cargo"),
+                }),
+            ):
+                self.assertEqual(rust_test_runner.main(arguments), 0)
+                runner = dispatch.call_args.args[1]
+                self.assertEqual(runner.target_dir, expected)
+                plan = runner.plan("core_all")
+                for command in [plan["run"], *plan["builds"]]:
+                    self.assertEqual(command[command.index("--target-dir") + 1], str(expected))
+                self.assertEqual(runner.base_env["CODEX_RUST_TEST_LOG_DIR"], str(expected / "test-runner-logs"))
+                self.assertFalse((self.temp_dir / "codex-rs/codex-rs").exists())
+
     def test_every_cargo_command_targets_the_active_lane(self) -> None:
         runner, _ = self.runner()
         plan = runner.plan("core_all")
@@ -1897,6 +2051,7 @@ class RunTargetTest(RunnerTestCase):
                 # The CLI now admits a real target before invoking the mocked
                 # runner; never pass MagicMock filesystem paths to the lease.
                 runner.return_value.target_dir = self.target_dir
+                runner.return_value.cargo_profile = None
                 runner.return_value.manifest = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
                 runner.return_value.run_target.return_value = {"codex-core": ["tests::alpha"]}
                 self.assertEqual(
@@ -2700,6 +2855,30 @@ class RunGateTest(RunnerTestCase):
         )
         for command in executor.commands(["cargo", "nextest", "run"]):
             self.assertEqual(command[command.index("--status-level") + 1], "pass")
+
+    def test_test_failure_reports_diagnostics_once_and_keeps_independent_gate_proof(self):
+        executor = self.gate_executor(self.matching_listings())
+        original = executor.__call__
+        runner, _ = self.runner(executor=executor)
+
+        def execute(args, **kwargs):
+            result = original(args, **kwargs)
+            if args[:3] == ["cargo", "nextest", "run"] and "--lib" in args:
+                result.returncode = 100
+                result.stdout = "FAIL [ 0.001s] codex-core mod::tests::alpha"
+                result.stderr = "unique assertion diagnostic: expected 2, got 1"
+            return result
+
+        runner.executor = execute
+        with self.assertRaises(RunnerError) as failed:
+            runner.run_gates(["demo-gate"], quiet=True)
+        detail = str(failed.exception)
+        self.assertEqual(detail.count("unique assertion diagnostic: expected 2, got 1"), 1)
+        self.assertEqual(detail.count("FAIL [ 0.001s] codex-core mod::tests::alpha"), 1)
+        self.assertIn("missing(1)", detail)
+        self.assertIn("passed exactly once", detail)
+        self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 2)
+        self.assertEqual(failed.exception.completed_gates, {})
 
     def test_failed_gate_targets_finish_the_batch_and_report_every_failure(
         self,

@@ -596,6 +596,11 @@ pub(crate) fn rg_search_path_operands(commands: &[Vec<String>]) -> Option<Vec<St
     saw_search.then_some(operands)
 }
 
+pub(crate) fn rg_search_path_indices(argv: &[String]) -> Option<Vec<usize>> {
+    let roles = RgArgumentRoles::parse(argv);
+    roles.searches.then_some(roles.path_indices)
+}
+
 const MAX_MISSING_PATH_NOTES: usize = 3;
 const MAX_PATH_SUGGESTIONS: usize = 3;
 const MAX_SUGGESTION_DEPTH: usize = 3;

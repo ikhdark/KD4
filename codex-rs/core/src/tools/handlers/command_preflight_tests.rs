@@ -86,6 +86,42 @@ async fn powershell_leaf_glob_repair_preserves_shell_and_exact_output() {
 
 #[cfg(windows)]
 #[tokio::test]
+async fn fork91_multi_root_glob_repair_preserves_flags_and_other_roots() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fixture.path().join("src")).unwrap();
+    std::fs::create_dir(fixture.path().join("scripts")).unwrap();
+    std::fs::write(fixture.path().join("src/libtest_a.rs"), "needle\n").unwrap();
+    std::fs::write(fixture.path().join("scripts/other.rs"), "needle\n").unwrap();
+    let shell = codex_shell_command::powershell::try_find_pwsh_executable_blocking().unwrap();
+    for pattern in ["needle", "absent"] {
+        let script = format!("rg -n '{pattern}' scripts src/libtest* --glob '*.rs' --sort path");
+        let invocation = CommandInvocation::PowerShellScript(script.clone());
+        let command = strings(&[shell.as_path().to_str().unwrap(), "-NoProfile", "-Command", &script]);
+        let outcome = preflight_invocation_for_kd4_runtime(
+            true, false, &invocation, &command, Some(ShellType::PowerShell), Some(fixture.path()),
+        ).await.unwrap();
+        assert!(outcome.repaired(), "{outcome:?}");
+        let CommandInvocation::PowerShellScript(repaired) = outcome.invocation else { panic!("shell lost"); };
+        let run = |script: &str| std::process::Command::new(shell.as_path())
+            .args(["-NoProfile", "-Command", script]).current_dir(fixture.path()).output().unwrap();
+        let actual = run(&repaired);
+        let explicit = Path::new("src").join("libtest_a.rs");
+        let expected = run(&format!("rg -n '{pattern}' scripts '{}' --glob '*.rs' --sort path", explicit.display()));
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stdout, expected.stdout);
+        assert_eq!(actual.stderr, expected.stderr);
+    }
+    for args in [
+        strings(&["needle", "missing", "src/libtest*", "--glob", "*.rs"]),
+        strings(&["needle", "scripts/*", "src/libtest*"]),
+        strings(&["--pre", "helper.exe", "needle", "scripts", "src/libtest*"]),
+    ] {
+        assert!(repair_rg_leaf_glob(&CommandInvocation::Argv { program: "rg".into(), args }, fixture.path()).is_none());
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn powershell_leaf_glob_repair_refuses_ambiguous_or_effectful_scripts() {
     let fixture = tempfile::tempdir().unwrap();
     std::fs::create_dir(fixture.path().join("src")).unwrap();

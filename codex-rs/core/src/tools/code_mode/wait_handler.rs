@@ -116,14 +116,21 @@ impl CodeModeWaitHandler {
                 let exec = ExecContext { session, turn };
                 let started_at = Instant::now();
                 let cell_id = codex_code_mode::CellId::new(args.cell_id);
+                // An explicit request re-budgets the cell; a plain wait keeps
+                // the budget the cell was started with (e.g. a raised exec
+                // pragma) instead of resetting it to the default.
                 exec.session.services.code_mode_service.record_output_budget(
                     &cell_id,
-                    Some(args.max_tokens
-                        .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+                    args.max_tokens.map(|max_tokens| max_tokens
                         .min(exec.turn.config.tool_output_token_limit
                             .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL))
                         .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)),
                 );
+                let effective_max_tokens = exec
+                    .session
+                    .services
+                    .code_mode_service
+                    .output_budget(cell_id.as_str());
                 let (wait_response, drained_observations) = if args.terminate {
                     exec.session
                         .services
@@ -265,7 +272,7 @@ impl CodeModeWaitHandler {
                 let mut output = handle_runtime_response(
                     &exec,
                     response,
-                    args.max_tokens,
+                    effective_max_tokens,
                     started_at,
                 )
                 .map_err(FunctionCallError::RespondToModel)?;

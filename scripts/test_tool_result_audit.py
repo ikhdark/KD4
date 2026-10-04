@@ -6,10 +6,90 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.tool_result_audit import audit, execution_context_audit, source_read_paths, tool_call_trace
+from scripts.tool_result_audit import audit, execution_context_audit, repeated_input_overlap, source_read_paths, tool_call_trace
 
 
 class ToolResultAuditTest(unittest.TestCase):
+    @staticmethod
+    def output_records(bodies):
+        return [(i, {"type": "response_item", "payload": {
+            "type": "function_call_output", "output": body}}, len(body))
+            for i, body in enumerate(bodies, 1)]
+
+    def test_matching_index_skips_disjoint_and_fast_paths_identical_outputs(self):
+        from unittest import mock
+        source = ("long repetitive output " * 4 + "\n") * 1600
+        records = self.output_records(
+            [f"unique {i}\n" * 20 for i in range(100)] + [source, source])
+        with mock.patch("scripts.tool_result_audit.difflib.SequenceMatcher",
+                        side_effect=AssertionError("unnecessary quadratic comparison")):
+            outputs = execution_context_audit(records)["tool_outputs"]
+        self.assertEqual(outputs[-1]["repeated_block_bytes"], len(source.encode()))
+        self.assertTrue(all(o["matching_blocks_coverage"]["complete"] for o in outputs))
+
+    def test_expensive_matching_is_reported_as_incomplete_not_exact_zero(self):
+        source = ("repetitive output " * 4 + "\n") * 1600
+        report = execution_context_audit(self.output_records([source, source + "tail\n"]))
+        output = report["tool_outputs"][-1]
+        self.assertEqual(output["matching_blocks_coverage"],
+                         {"candidate_pairs": 1, "omitted_pairs": 1, "complete": False})
+
+    def test_repeated_output_evidence_stops_at_the_pair_budget(self):
+        body = ("repeated " * 8 + "\n") * 4
+        outputs = execution_context_audit(self.output_records([body] * 300))["tool_outputs"]
+        self.assertEqual(sum(len(o["matching_blocks"]) for o in outputs), 10000)
+        coverage = outputs[-1]["matching_blocks_coverage"]
+        self.assertEqual(coverage, {"candidate_pairs": 299, "omitted_pairs": 299,
+                                    "complete": False})
+
+    def test_indexed_matching_preserves_small_sequence_matcher_results(self):
+        import difflib
+        import random
+        randomizer = random.Random(7)
+        bodies = ["".join(randomizer.choice(["a", "b", "c"]) * 45 + "\n"
+                          for _ in range(20)) for _ in range(20)]
+        outputs = execution_context_audit(self.output_records(bodies))["tool_outputs"]
+        for index, output in enumerate(outputs):
+            current = bodies[index].splitlines(keepends=True)
+            expected = []
+            for prior in range(index):
+                for match in difflib.SequenceMatcher(
+                    None, bodies[prior].splitlines(keepends=True), current,
+                    autojunk=False
+                ).get_matching_blocks():
+                    size = sum(len(s.encode()) for s in current[match.b:match.b + match.size])
+                    if match.size >= 4 and size >= 160:
+                        expected.append({"prior_record": prior + 1, "start_line": match.b + 1,
+                                         "lines": match.size, "bytes": size})
+            self.assertEqual(output["matching_blocks"], expected)
+
+    def test_repeated_input_bounds_require_unchanged_append_only_context(self):
+        previous = {"provider_usage": {"inputTokens": 100}, "local_prompt_categories": {
+            "promptSectionSha256": {"history": "old", "tool_schemas": "stable"}}}
+        current = {"provider_usage": {"inputTokens": 150, "cachedInputTokens": 90},
+                   "local_prompt_categories": {
+                       "promptSectionSha256": {"history": "new", "tool_schemas": "stable"},
+                       "historyItemsPrevious": 7, "historyPrefixItemsReused": 7,
+                       "historyFirstDivergentIndex": 7}}
+        result = repeated_input_overlap(previous, current)
+        self.assertEqual(result["repeated_input_proxy"], 100)
+        self.assertEqual((result["cached_overlap_min"], result["cached_overlap_max"]), (40, 90))
+        self.assertEqual((result["uncached_overlap_min"], result["uncached_overlap_max"]), (10, 60))
+        self.assertIsNone(repeated_input_overlap(None, current))
+        self.assertIsNone(repeated_input_overlap({}, current))
+        for key, value in [("historyPrefixItemsReused", 6), ("historyItemsPrevious", 0),
+                           ("historyFirstDivergentIndex", 3),
+                           ("promptSectionSha256", {"history": "new", "tool_schemas": "changed"}),
+                           ("promptSectionSha256", {})]:
+            changed = {**current, "local_prompt_categories": {**current["local_prompt_categories"], key: value}}
+            self.assertIsNone(repeated_input_overlap(previous, changed), key)
+        for usage in [{}, {"inputTokens": 90, "cachedInputTokens": 80},
+                      {"inputTokens": 150, "cachedInputTokens": 151}]:
+            self.assertIsNone(repeated_input_overlap(previous, {**current, "provider_usage": usage}))
+        uncached = repeated_input_overlap(previous, {**current, "provider_usage": {
+            "inputTokens": 150, "cachedInputTokens": 0}})
+        self.assertEqual((uncached["uncached_overlap_min"], uncached["uncached_overlap_max"]), (100, 100))
+
     def test_trace_counts_dispatches_not_mentions_or_checkpoint_mirrors(self):
         timings = [{"callId": "outer", "toolName": "exec", "source": "direct"},
                    {"callId": "child", "toolName": "read_file", "source": "code_mode",

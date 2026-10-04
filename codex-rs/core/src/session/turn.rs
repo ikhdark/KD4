@@ -863,7 +863,12 @@ pub(crate) async fn run_turn(
                     .and_then(|decision| authoritative_wait_terminal_surface(
                         decision,
                         turn_context.final_output_json_schema.as_ref(),
-                        turn_context.config.tool_output_token_limit.unwrap_or(10_000).min(10_000),
+                        // Same ceiling chain as the exec cell budget: a message
+                        // that survived cell projection must not bounce to a
+                        // model re-emission turn here.
+                        turn_context.config.tool_output_token_limit
+                            .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+                            .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
                     ));
                 if authoritative_wait_terminal_surface.is_none()
                     && convergence_decision.as_ref().is_some_and(|decision| {

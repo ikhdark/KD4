@@ -1655,10 +1655,10 @@ class BuildToolingStorageTest(unittest.TestCase):
                 target,
             )
 
-    def test_cargo_config_enables_incremental_cache_by_default(self) -> None:
+    def test_cargo_config_preserves_profile_incremental_defaults(self) -> None:
         config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
 
-        self.assertTrue(config["build"]["incremental"])
+        self.assertNotIn("incremental", config["build"])
 
     def test_missing_lane_mtime_is_safe_during_concurrent_gc(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

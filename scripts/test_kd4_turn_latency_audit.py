@@ -199,6 +199,42 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
 
 
 class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    def test_checkout_sweep_matches_pairwise_ranking_and_skips_disjoint_history(self):
+        import random
+
+        rng = random.Random(9)
+        records, edited = [], {}
+        for index in range(100):
+            start = rng.randrange(10000)
+            record = {"file": f"session-{index % 11}.jsonl", "turn_id": str(index),
+                      "cwd": "C:/repo" if index % 3 else "C:/other",
+                      "timing": {"startedAtUnixMs": start,
+                                 "completedAtUnixMs": start + rng.randrange(3000)}}
+            records.append(record)
+            edited[(record["file"], record["turn_id"])] = {f"file-{index % 4}", "common"}
+        expected = []
+        for index, first in enumerate(records):
+            for second in records[index + 1:]:
+                if first["cwd"] != second["cwd"] or first["file"] == second["file"]:
+                    continue
+                overlap = min(first["timing"]["completedAtUnixMs"], second["timing"]["completedAtUnixMs"]) - max(first["timing"]["startedAtUnixMs"], second["timing"]["startedAtUnixMs"])
+                if overlap > 0:
+                    expected.append({"checkout": first["cwd"].casefold(),
+                                     "sessions": [first["file"], second["file"]],
+                                     "turns": [first["turn_id"], second["turn_id"]],
+                                     "overlapSeconds": round(overlap / 1000, 1),
+                                     "sharedPaths": sorted(edited[(first["file"], first["turn_id"])] & edited[(second["file"], second["turn_id"])])})
+        expected.sort(key=lambda pair: (-len(pair["sharedPaths"]), -pair["overlapSeconds"]))
+        actual = kd4_turn_latency_audit._checkout_overlaps(records, edited, limit=7)
+        self.assertEqual(actual, {"pairs": len(expected), "overlaps": expected[:7],
+                                  "omittedPairs": len(expected) - 7})
+        for index, record in enumerate(records):
+            record["timing"] = {"startedAtUnixMs": index * 1000,
+                                "completedAtUnixMs": index * 1000 + 500}
+        with mock.patch.object(kd4_turn_latency_audit, "min", wraps=min, create=True) as compare:
+            self.assertEqual(kd4_turn_latency_audit._checkout_overlaps(records, edited)["pairs"], 0)
+        compare.assert_not_called()
+
     def test_turn_tokens_ignore_session_cumulative_and_suppression_is_not_savings(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "rollout.jsonl"

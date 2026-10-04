@@ -15,11 +15,13 @@ use super::REQUEST_SCHEMA_CACHE_CAPACITY;
 use super::RequestSchemaCacheKey;
 use super::RequestSchemaCacheValue;
 use super::RequestSchemaSerializationCache;
+use super::StreamThroughputCollapse;
 use super::UnauthorizedRecoveryExecution;
 use super::WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION;
 use super::WebsocketCachePublicationPermit;
 use super::WebsocketHistoryBaseline;
 use super::WebsocketSession;
+use super::WebsocketStreamThroughput;
 use super::WebsocketTransportCache;
 use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -81,6 +83,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::ExecutionStatus;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
@@ -138,6 +141,143 @@ fn websocket_rotates_before_the_server_connection_age_limit() {
         Some(connected_at),
         minutes(61)
     ));
+}
+
+fn record_response_rate(throughput: &mut WebsocketStreamThroughput, tokens_per_second: i64) {
+    throughput.record(tokens_per_second * 100, Duration::from_secs(100));
+}
+
+#[test]
+fn websocket_throughput_collapse_needs_a_baseline_and_consecutive_slow_responses() {
+    let mut throughput = WebsocketStreamThroughput::default();
+    for _ in 0..4 {
+        record_response_rate(&mut throughput, 10);
+    }
+    assert_eq!(throughput.take_collapse(), None, "no baseline yet");
+
+    let mut throughput = WebsocketStreamThroughput::default();
+    for _ in 0..5 {
+        record_response_rate(&mut throughput, 40);
+    }
+    record_response_rate(&mut throughput, 10);
+    assert_eq!(throughput.take_collapse(), None, "one slow response");
+    record_response_rate(&mut throughput, 40);
+    record_response_rate(&mut throughput, 10);
+    assert_eq!(
+        throughput.take_collapse(),
+        None,
+        "recovery resets the streak"
+    );
+    // Too small to say anything about the stream rate.
+    throughput.record(100, Duration::from_secs(60));
+    assert_eq!(throughput.take_collapse(), None);
+
+    record_response_rate(&mut throughput, 12);
+    assert_eq!(
+        throughput.take_collapse(),
+        Some(StreamThroughputCollapse {
+            observed_tokens_per_second: 12.0,
+            baseline_tokens_per_second: 40.0,
+        })
+    );
+    assert_eq!(throughput.take_collapse(), None, "reported once");
+}
+
+#[test]
+fn websocket_throughput_slowdown_that_survives_replacement_becomes_the_baseline() {
+    let mut throughput = WebsocketStreamThroughput::default();
+    for _ in 0..9 {
+        record_response_rate(&mut throughput, 40);
+    }
+    record_response_rate(&mut throughput, 10);
+    record_response_rate(&mut throughput, 10);
+    assert!(throughput.take_collapse().is_some());
+
+    for _ in 0..20 {
+        record_response_rate(&mut throughput, 10);
+        assert_eq!(throughput.take_collapse(), None);
+    }
+
+    // A later collapse relative to the new baseline is still caught.
+    record_response_rate(&mut throughput, 3);
+    record_response_rate(&mut throughput, 3);
+    assert!(throughput.take_collapse().is_some());
+}
+
+#[test]
+fn throughput_collapse_replaces_websocket_history_and_sticky_turn_state() {
+    let client = websocket_test_model_client();
+    let mut session = client.new_session();
+    session
+        .turn_state
+        .set("sticky".to_string())
+        .expect("turn state unset");
+    session.websocket_session.last_response = Some(LastResponse {
+        response_id: "response".to_string(),
+        items_added: Vec::new(),
+    });
+
+    session.replace_websocket_after_throughput_collapse();
+    assert_eq!(session.turn_state.get().map(String::as_str), Some("sticky"));
+    assert!(session.websocket_session.last_response.is_some());
+
+    {
+        let mut throughput = session
+            .websocket_session
+            .stream_throughput
+            .lock()
+            .expect("throughput lock");
+        for _ in 0..5 {
+            record_response_rate(&mut throughput, 40);
+        }
+        record_response_rate(&mut throughput, 10);
+        record_response_rate(&mut throughput, 10);
+    }
+    session.replace_websocket_after_throughput_collapse();
+    assert_eq!(session.turn_state.get(), None);
+    assert!(session.websocket_session.last_response.is_none());
+}
+
+#[tokio::test]
+async fn completed_websocket_response_reports_its_stream_throughput() {
+    let (tx_event, rx_event) = tokio::sync::mpsc::channel(1);
+    let throughput = Arc::new(Mutex::new(WebsocketStreamThroughput::default()));
+    let (mut stream, _) = super::map_response_stream(
+        codex_api::ResponseStream {
+            rx_event,
+            upstream_request_id: None,
+        },
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled().into(),
+        test_model_provider(),
+        None,
+        Some(Arc::clone(&throughput)),
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tx_event
+        .send(Ok(ResponseEvent::Completed {
+            response_id: "response".to_string(),
+            token_usage: Some(TokenUsage {
+                output_tokens: 300,
+                ..Default::default()
+            }),
+            end_turn: None,
+        }))
+        .await
+        .expect("mapper is listening");
+
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ResponseEvent::Completed { .. }))
+    ));
+    assert_eq!(
+        throughput
+            .lock()
+            .expect("throughput lock")
+            .recent_tokens_per_second
+            .len(),
+        1
+    );
 }
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {

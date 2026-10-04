@@ -1765,6 +1765,31 @@ def relative_files(root: Path) -> set[str]:
 
 
 class StageCacheWorkflowRegressionTests(unittest.TestCase):
+    def test_platform_targets_share_one_bounded_install_operation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = types.SimpleNamespace(
+                vendor_src=None, output_dir=Path(temp) / "out",
+                workflow_url="https://github.com/owner/repo/actions/runs/123",
+                workflow_name=None, github_repo="owner/repo", packages=["codex"],
+                release_version="1.2.3", cache_dir=Path(temp) / "cache",
+                max_download_workers=2, vendor_copy_mode="auto",
+                keep_staging_dirs=False, max_stage_workers=1)
+            with (
+                mock.patch.object(stage, "parse_args", return_value=args),
+                mock.patch.object(stage, "resolve_workflow_url", return_value=(args.workflow_url, "fixture")),
+                mock.patch.object(stage, "ensure_source_matches_workflow"),
+                mock.patch.object(stage, "install_native_components") as install,
+                mock.patch.object(stage, "stage_packages", return_value=[]) as packages,
+                mock.patch.object(stage, "commit_staged_packages", return_value=[]),
+            ):
+                self.assertEqual(stage._main(), 0)
+            install.assert_called_once()
+            self.assertEqual(set(install.call_args.args[3]), set(stage.BINARY_TARGETS))
+            self.assertEqual(install.call_args.kwargs["max_download_workers"], 2)
+            mapping = packages.call_args.args[4]
+            self.assertEqual(len(mapping), 2)
+            self.assertEqual(len(set(mapping.values())), 1)
+
     def test_persistent_cache_can_be_reused_without_hiding_other_dirty_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"

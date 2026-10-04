@@ -86,6 +86,11 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     v8::Script::compile(scope, graph_source, None)
         .and_then(|script| script.run(scope))
         .ok_or_else(|| "failed to install dependency graph helper".to_string())?;
+    let orchestration = v8::String::new(scope, include_str!("orchestration.js"))
+        .ok_or_else(|| "failed to allocate orchestration helpers".to_string())?;
+    v8::Script::compile(scope, orchestration, None)
+        .and_then(|script| script.run(scope))
+        .ok_or_else(|| "failed to install orchestration helpers".to_string())?;
     Ok(())
 }
 
