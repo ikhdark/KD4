@@ -127,15 +127,10 @@ pub(crate) fn reselect_read_file_output(
     if selectors.iter().any(|selector| !matches!(selector["kind"].as_str(), Some("bytes" | "lines"))) {
         return None;
     }
-    let mut remaining = output["results"].as_array()?.clone();
+    let retained = output["results"].as_array()?;
     let mut selected = Vec::new();
     for selector in selectors {
-        let index = remaining.iter().position(|result| {
-            result["selector"] == *selector && result["status"] == "ok"
-                && result["complete"] == true
-                && (result["text"].is_string() || result["data_base64"].is_string())
-        })?;
-        selected.push(remaining.remove(index));
+        selected.push(retained.iter().find_map(|result| retained_read_selection(result, selector))?);
     }
     output["results"] = json!(selected);
     output["complete"] = json!(true);
@@ -150,6 +145,50 @@ pub(crate) fn reselect_read_file_output(
         fields.remove(key);
     }
     Some(output)
+}
+
+fn retained_read_selection(result: &serde_json::Value, selector: &serde_json::Value) -> Option<serde_json::Value> {
+    if result["status"] != "ok" || result["complete"] != true {
+        return None;
+    }
+    if result["selector"] == *selector
+        && (result["text"].is_string() || result["data_base64"].is_string())
+    {
+        return Some(result.clone());
+    }
+    // The owning selector engine merges adjacent ranges. A narrower request
+    // can still be projected from its exact text, never from line counts alone.
+    let text = result["text"].as_str()?;
+    let base = result["canonical_range"]["start"].as_u64()?;
+    let limit = result["canonical_range"]["end"].as_u64()?;
+    if limit.checked_sub(base)? != text.len() as u64
+        || result["selector"]["kind"] != selector["kind"]
+    { return None; }
+    let start = selector["start"].as_u64()?;
+    let end = selector["end"].as_u64()?;
+    let (start, end) = match selector["kind"].as_str()? {
+        "bytes" => (
+            usize::try_from(start.checked_sub(base)?).ok()?,
+            usize::try_from(end.checked_sub(base)?).ok()?,
+        ),
+        "lines" => {
+            let first = result["selector"]["start"].as_u64()?;
+            let start = usize::try_from(start.checked_sub(first)?).ok()?;
+            let end = usize::try_from(end.checked_sub(first)?.checked_add(1)?).ok()?;
+            let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+            lines.get(start..end)?;
+            (lines[..start].iter().map(|line| line.len()).sum(),
+             lines[..end].iter().map(|line| line.len()).sum())
+        }
+        _ => return None,
+    };
+    let text = text.get(start..end)?;
+    let mut selected = result.clone();
+    selected["selector"] = selector.clone();
+    selected["canonical_range"] = json!({"start":base + start as u64, "end":base + end as u64});
+    selected["exact_bytes"] = json!(text.len());
+    selected["text"] = json!(text);
+    Some(selected)
 }
 
 impl ToolExecutor<ToolInvocation> for ReadFileHandler {

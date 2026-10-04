@@ -543,6 +543,13 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
     let requested = ToolPayload::Function {
         arguments: json!({"path":path,"offset":2,"limit":1}).to_string(),
     };
+    let ToolPayload::Function { arguments: original_args } = &invocation.payload else { unreachable!() };
+    let ToolPayload::Function { arguments: requested_args } = &requested else { unreachable!() };
+    let raw = result.code_mode_result(&invocation.payload);
+    assert!(crate::tools::handlers::reselect_read_file_output(original_args, requested_args, raw.clone()).is_some(), "raw selector projection: {raw}");
+    assert!(collector.register_deterministic_tool_call(
+        &ToolName::plain("read_file"), &invocation.payload, "original-again",
+    ).replayed_success.is_some(), "original read must remain a candidate");
     let guard = collector.register_deterministic_tool_call(
         &ToolName::plain("read_file"), &requested, "subset",
     ).replayed_success.expect("a delivered selector survives a stage boundary");
@@ -560,7 +567,7 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
     assert_eq!(value["file_complete"], false);
     assert!(value.get("criterion_evidence").is_none());
     for args in [
-        json!({"path":path,"offset":1,"limit":2}), // new range, not delivered as one selector
+        json!({"path":path,"offset":1,"limit":3}), // extends past the delivered text
         json!({"path":path,"offset":2,"limit":1,"force_fresh":true}),
         json!({"path":path,"offset":2,"limit":1,"environment_id":"other"}),
         json!({"path":path.with_file_name("other.txt"),"offset":2,"limit":1}),
@@ -591,6 +598,27 @@ fn native_selector_reuse_rejects_incomplete_and_shared_only_results() {
             &previous, &requested, json!({"results":[result]}),
         ).is_none());
     }
+}
+
+#[test]
+fn native_selector_reuse_slices_utf8_crlf_without_inventing_bytes() {
+    let text = "λ\r\n日本語\r\n";
+    let output = json!({
+        "artifact_id":null,"canonical_sha256":"source","canonical_bytes":text.len(),
+        "retained_bytes":0,"complete":true,"results":[{
+            "selector":{"kind":"bytes","start":0,"end":text.len()},
+            "status":"ok","complete":true,"text":text,
+            "canonical_range":{"start":0,"end":text.len()}
+        }]
+    });
+    let original = json!({"path":"file"}).to_string();
+    let requested = json!({"path":"file","selectors":[{"kind":"bytes","start":4,"end":13}]}).to_string();
+    let result = crate::tools::handlers::reselect_read_file_output(&original, &requested, output.clone()).unwrap();
+    assert_eq!(result["results"][0]["text"], "日本語");
+    assert_eq!(result["results"][0]["exact_bytes"], 9);
+    assert_eq!(result["file_complete"], false);
+    let split_codepoint = json!({"path":"file","selectors":[{"kind":"bytes","start":1,"end":2}]}).to_string();
+    assert!(crate::tools::handlers::reselect_read_file_output(&original, &split_codepoint, output).is_none());
 }
 
 #[test]
