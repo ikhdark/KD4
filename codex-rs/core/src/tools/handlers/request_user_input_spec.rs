@@ -42,9 +42,12 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
         ),
         (
             "header".to_string(),
-            JsonSchema::string(Some(
-                "Short header label shown in the UI (12 or fewer chars).".to_string(),
-            )),
+            JsonSchema {
+                max_length: Some(12),
+                ..JsonSchema::string(Some(
+                    "Short header label shown in the UI (12 or fewer chars).".to_string(),
+                ))
+            },
         ),
         (
             "question".to_string(),

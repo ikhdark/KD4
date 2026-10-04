@@ -70,7 +70,7 @@ impl RequestUserInputHandler {
             return Err(FunctionCallError::RespondToModel(message));
         }
 
-        let args: RequestUserInputArgs = parse_arguments(&arguments)?;
+        let args = parse_user_input_with_header_fallback(&arguments)?;
         let args =
             normalize_request_user_input_args(args).map_err(FunctionCallError::RespondToModel)?;
         let response = session
@@ -90,6 +90,46 @@ impl RequestUserInputHandler {
 
         Ok(boxed_tool_output(JsonToolOutput::new(content)))
     }
+}
+
+/// A display label must not buy a model round to regenerate the whole question.
+/// Keep the public protocol strict; repair only this tool's presentation field,
+/// preserving its complete text in the question before validating again.
+fn parse_user_input_with_header_fallback(
+    arguments: &str,
+) -> Result<RequestUserInputArgs, FunctionCallError> {
+    let original_error = match parse_arguments::<RequestUserInputArgs>(arguments) {
+        Ok(args) => return Ok(args),
+        Err(error) => error,
+    };
+    let mut value: serde_json::Value = parse_arguments(arguments)?;
+    let Some(questions) = value.get_mut("questions").and_then(serde_json::Value::as_array_mut) else {
+        return Err(original_error);
+    };
+    let mut repaired = false;
+    for question in questions {
+        let (Some(header), Some(prompt)) = (
+            question.get("header").and_then(serde_json::Value::as_str),
+            question.get("question").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        if header.chars().nth(12).is_none() {
+            continue;
+        }
+        let short = format!("{}…", header.chars().take(11).collect::<String>());
+        let full_prompt = format!("{header}\n\n{prompt}");
+        question["header"] = short.into();
+        question["question"] = full_prompt.into();
+        repaired = true;
+    }
+    if !repaired {
+        return Err(original_error);
+    }
+    // Never relax IDs, choice counts, unknown fields, or approval semantics.
+    serde_json::from_value(value).map_err(|error| {
+        FunctionCallError::RespondToModel(format!("failed to parse function arguments: {error}"))
+    })
 }
 
 impl CoreToolRuntime for RequestUserInputHandler {

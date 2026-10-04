@@ -386,8 +386,13 @@ impl CodeModeService {
             || metrics.delivery_blocked
             || metrics.first_required_terminal.is_some()
             || metrics.command_states.iter().any(|state| {
-                state.get("execution_state").and_then(JsonValue::as_str) == Some("running")
-                    || state.get("process_exited").and_then(JsonValue::as_bool) == Some(false)
+                // Absence of a running flag is not terminal proof. The command
+                // owner must settle execution and deferred work affirmatively.
+                state.get("execution_state").and_then(JsonValue::as_str) != Some("exited")
+                    || state.get("process_exited").and_then(JsonValue::as_bool) != Some(true)
+                    || state.get("exit_code").and_then(JsonValue::as_i64) != Some(0)
+                    || state.get("pending_deferred_completions")
+                        .is_some_and(|pending| !pending.as_array().is_some_and(Vec::is_empty))
             })
         {
             return None;
@@ -699,6 +704,9 @@ pub(super) fn handle_runtime_response(
     // Host lifecycle state stays in the canonical record. Only live handles
     // need a separate inline receipt when the script did not print them.
     let canonical_states = packet.command_states;
+    let completed_cleanly = matches!(&response, RuntimeResponse::Result {
+        error_text: None, output_loss: None, ..
+    });
     for state in &canonical_states {
         // A script printing only result.output must not hide a crashed or
         // unstarted command behind later successful output.
@@ -712,6 +720,9 @@ pub(super) fn handle_runtime_response(
                     "exit_code": state["exit_code"],
                     "execution_state": state["execution_state"],
                     "process_exited": state["process_exited"],
+                    "error": state.get("error").and_then(JsonValue::as_str).map(|error| {
+                        codex_utils_string::truncate_middle_chars(error, 1_024)
+                    }),
                 }}).to_string(),
             });
         }
@@ -728,8 +739,10 @@ pub(super) fn handle_runtime_response(
     );
     // A zero text budget must not erase the only handle for still-owned work.
     for state in &canonical_states {
-        if state["process_exited"] == false
-            && !state["session_id"].is_null()
+        // A terminal process may still own an undrained pipe. Its handle is
+        // actionable until the command owner removes it, even after exit.
+        if state["session_id"].as_u64().is_some()
+            && (state["process_exited"] != true || state["output_complete"] == false)
             && !shows_session_handle(&code_mode_text_content(&output.body), &state["session_id"])
         {
             output.body.push(FunctionCallOutputContentItem::InputText {
@@ -739,14 +752,26 @@ pub(super) fn handle_runtime_response(
         // Printing only result.output must not discard the recovery route for
         // bytes omitted by the nested command, even if the outer packet fits.
         if state["output_reduced"] == true
-            && let Some(artifact_id) = state["raw_output_artifact_id"].as_str()
-            && !code_mode_text_content(&output.body).contains(artifact_id)
+            && !(completed_cleanly && state["display_suppressed"] == true)
         {
             let mut receipt = serde_json::json!({
                 "output_truncated": true,
-                "artifact_id": artifact_id,
-                "recovery_tool": "read_tool_output",
             });
+            if let Some(artifact_id) = state["raw_output_artifact_id"].as_str() {
+                if shows_command_recovery(&code_mode_text_content(&output.body), state) {
+                    continue;
+                }
+                receipt["artifact_id"] = artifact_id.into();
+                receipt["recovery_tool"] = "read_tool_output".into();
+            } else {
+                // Do not offer a nonexistent locator or silently imply that
+                // omitted bytes can be recovered by another tool call.
+                receipt["recovery_available"] = false.into();
+            }
+            if let Some(error) = state["raw_output_artifact_error"].as_str() {
+                receipt["raw_output_artifact_error"] =
+                    codex_utils_string::truncate_middle_chars(error, 256).into();
+            }
             // The command owner already knows the omitted range. Preserve its
             // executable recovery route, not just a locator that forces another
             // discovery round trip or a reread of already delivered bytes.
@@ -1276,6 +1301,38 @@ fn shows_session_handle(visible: &str, session_id: &JsonValue) -> bool {
     })
 }
 
+fn shows_command_recovery(visible: &str, state: &JsonValue) -> bool {
+    // A locator mentioned in source text is not an executable recovery route.
+    // Batched whole results may nest the envelope. Traverse JSON containers,
+    // never strings (which can contain quoted source or historical output).
+    visible.lines().filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
+        .any(|value| {
+            let mut pending = vec![&value];
+            while let Some(value) = pending.pop() {
+                let found = if let Some(recovery) = state.get("recovery") {
+                    value.get("recovery") == Some(recovery)
+                        || (value.get("raw_output_artifact_id") == state.get("raw_output_artifact_id")
+                            && value.get("recovery_selector").is_some()
+                            && value.get("recovery_selector")
+                                == recovery.pointer("/arguments/selectors/0"))
+                } else {
+                    state["raw_output_artifact_id"].is_string()
+                        && (value.get("artifact_id") == state.get("raw_output_artifact_id")
+                            || value.get("raw_output_artifact_id") == state.get("raw_output_artifact_id"))
+                };
+                if found {
+                    return true;
+                }
+                match value {
+                    JsonValue::Object(fields) => pending.extend(fields.values()),
+                    JsonValue::Array(items) => pending.extend(items),
+                    _ => {}
+                }
+            }
+            false
+        })
+}
+
 fn code_mode_text_content(items: &[FunctionCallOutputContentItem]) -> String {
     items
         .iter()
@@ -1723,16 +1780,6 @@ fn model_visible_nested_result(tool: &ToolName, value: JsonValue) -> JsonValue {
         // removal. That must not trigger a second, lossy lifecycle projection.
         return value;
     }
-    if tool.name == "apply_patch" {
-        return JsonValue::String(if value["success"] == true {
-            "Success. Updated the files.".to_string()
-        } else {
-            crate::tools::context::failed_patch_text(
-                value["text"].as_str().unwrap_or("Patch failed"),
-                value.get("retry").filter(|retry| !retry.is_null()),
-            )
-        });
-    }
     value
 }
 
@@ -1968,6 +2015,7 @@ fn nested_command_state(
         "execution_state",
         "session_capabilities",
         "process_exited",
+        "pending_deferred_completions",
         "output_complete",
         "output_reduced",
         "raw_output_artifact_id",
@@ -1980,13 +2028,25 @@ fn nested_command_state(
             state[key] = value.clone();
         }
     }
-    if tool_name.name == "write_stdin"
-        && let ToolPayload::Function { arguments } = payload
+    if let ToolPayload::Function { arguments } = payload
         && let Ok(arguments) = serde_json::from_str::<JsonValue>(arguments)
     {
-        state["polled_session_id"] = arguments["session_id"].clone();
+        if tool_name.name == "write_stdin" {
+            state["polled_session_id"] = arguments["session_id"].clone();
+        }
+        // Explicitly silent successful reads still expose exact streams to JS.
+        // This is display intent, not a claim that the script consumed them.
+        if arguments["max_output_tokens"] == 0
+            && result["streams_complete"] == true
+            && result["exit_code"] == 0
+            && result["process_exited"] == true
+            && result["session_id"].is_null()
+            && result["error"].is_null()
+        {
+            state["display_suppressed"] = true.into();
+        }
     }
-    if let Some(session_id) = result.get("session_id") {
+    if let Some(session_id) = result.get("session_id").filter(|id| id.as_u64().is_some()) {
         state["continuation"] = serde_json::json!({
             "tool": "write_stdin", "arguments": {"session_id": session_id, "chars": ""}
         });
@@ -3108,6 +3168,17 @@ mod tests {
     }
 
     #[test]
+    fn nested_patch_projection_keeps_partial_effects_and_retry() {
+        let raw = serde_json::json!({"success":false,"changes_exact":false,
+            "text":"failed after first file", "environment_id":"remote",
+            "changes":[{"kind":"update","path":"first"}],
+            "retry":{"patch_id":"retained","hunks":[2]}});
+        assert_eq!(super::model_visible_nested_result(&ToolName::plain("apply_patch"), raw.clone()), raw);
+        let custom = serde_json::json!({"success":true,"text":"custom diagnostic"});
+        assert_eq!(super::model_visible_nested_result(&ToolName::plain("apply_patch"), custom.clone()), custom);
+    }
+
+    #[test]
     fn nested_execution_projection_preserves_lifecycle_and_recovery() {
         let raw = serde_json::json!({"exit_code": 7, "output": "assertion failed: left 3 right 7",
             "wall_time_seconds": 1.5, "process_exited": true, "chunk_id": "chunk",
@@ -3140,6 +3211,35 @@ mod tests {
             serde_json::json!({"exit_code": 2, "output": "src/run*: os error 123",
                 "repair": "Command preflight advisory (rg_literal_glob_path): ..."})
         );
+    }
+
+    #[test]
+    fn batched_recovery_envelopes_do_not_need_duplicate_receipts() {
+        let selector = serde_json::json!({"kind":"lines","start":10,"end":20});
+        let state = serde_json::json!({"raw_output_artifact_id":"retained", "recovery":{
+            "tool":"read_tool_output", "arguments":{"artifact_id":"retained", "selectors":[selector]}
+        }});
+        let envelope = serde_json::json!({"raw_output_artifact_id":"retained", "recovery_selector":selector});
+        for value in [
+            envelope.clone(),
+            serde_json::json!({"batch":[{"status":"fulfilled", "value":envelope}]}),
+            serde_json::json!([{"recovery":state["recovery"]}]),
+        ] {
+            assert!(super::shows_command_recovery(&value.to_string(), &state));
+        }
+        for value in [
+            serde_json::json!({"source":envelope.to_string()}),
+            serde_json::json!({"artifact_id":"retained"}),
+            serde_json::json!({"raw_output_artifact_id":"other", "recovery_selector":selector}),
+            serde_json::json!({"raw_output_artifact_id":"retained", "recovery_selector":{"kind":"lines","start":1,"end":9}}),
+            serde_json::json!({"recovery":null}),
+        ] {
+            assert!(!super::shows_command_recovery(&value.to_string(), &state));
+        }
+        assert!(!super::shows_command_recovery("{\"batch\":[", &state));
+        assert!(!super::shows_command_recovery("{}", &serde_json::json!({})));
+        let legacy = serde_json::json!({"raw_output_artifact_id":"retained"});
+        assert!(super::shows_command_recovery("{\"batch\":[{\"artifact_id\":\"retained\"}]}", &legacy));
     }
 
     #[test]

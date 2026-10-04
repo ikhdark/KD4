@@ -115,6 +115,17 @@ pub fn create_update_plan_tool() -> ToolSpec {
         output_schema: Some(json!({
             "type": "object",
             "properties": {
+                "obligations": {
+                    "type": "object",
+                    "description": "Derived original-requirement status: continue unresolved work only. When unresolved is empty, reconcile existing evidence and publish the final result; do not recheck satisfied requirements without changed inputs or uncertainty. Checklist status is not evidence or authority to stop.",
+                    "properties": {
+                        "completed": { "type": "integer", "minimum": 0 },
+                        "superseded": { "type": "integer", "minimum": 0 },
+                        "unresolved": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["completed", "superseded", "unresolved"],
+                    "additionalProperties": false
+                },
                 "completion_authority": { "const": "checklist_only", "description": "Model-declared checklist state, not a deliverable publication receipt or host confirmation that the task is complete. A final result must still be published." },
                 "revision": { "type": "string", "description": "Content revision for optimistic concurrency; preserved across resume." },
                 "step_ids": { "type": "array", "items": { "type": "string" }, "description": "Stable step IDs in current plan order." },
@@ -177,7 +188,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     "description": "True when this update left the stored plan unchanged; this does not assess progress on the underlying work."
                 }
             },
-            "required": ["current_plan", "message", "effect", "no_progress", "revision", "step_ids", "completion_authority"],
+            "required": ["current_plan", "message", "effect", "no_progress", "revision", "step_ids", "completion_authority", "obligations"],
             "additionalProperties": false
         }).into()),
     })

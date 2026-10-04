@@ -2066,7 +2066,7 @@ impl ToolCallRuntime {
                 })
                 && guard.matches_authorization(
                     crate::tools::registry::authorized_tool_invocation_sha256(
-                        &self.step_context.turn, &call.payload, None,
+                        &self.step_context.turn, guard.authorization_payload(&call.payload), None,
                     ).as_deref(),
                 )
                 // Typed tasks may need a new attempt-owned inspection receipt;
@@ -2302,6 +2302,8 @@ impl ToolCallRuntime {
                     // slot is write-once, preserving the registry measurement for
                     // ordinary results while closing the abort path's attribution.
                     let projection_started = Instant::now();
+                    let native_read_output = (semantic_tool_name.name.as_str() == "read_file")
+                        .then(|| response.result.code_mode_result(&response.payload));
                     let response = response.into_response();
                     evidence_timing.record_output_projection(projection_started.elapsed());
                     let (workspace_revision_before, evidence_classification) =
@@ -2379,6 +2381,9 @@ impl ToolCallRuntime {
                                 &self.step_context.turn, &owner_payload, None,
                             ),
                         );
+                        if let Some(output) = native_read_output {
+                            collector.record_read_replay_output(ordinal, output);
+                        }
                     }
                     let workspace_evidence_deferred = dispatch_state.handler_started() && self.register_workspace_evidence_for_response(
                         &response,

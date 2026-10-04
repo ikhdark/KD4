@@ -1644,3 +1644,170 @@ async fn live_session_receipt_is_added_only_when_its_handle_is_not_visible() {
         service.finish_cell_dispatch(&cell);
     }
 }
+
+async fn command_receipt_fixture(
+    arguments: serde_json::Value,
+    raw: serde_json::Value,
+    printed: &str,
+    error_text: Option<String>,
+) -> FunctionToolOutput {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let exec = super::ExecContext { session: Arc::new(session), turn: Arc::new(turn) };
+    let service = &exec.session.services.code_mode_service;
+    let cell = CellId::new("recovery-audit".to_string());
+    service.record_cell_parent_call_id(&cell, "outer-recovery-audit");
+    let ordinal = service.begin_packet_call(&cell).unwrap();
+    let mut result = nested_result_evidence("output");
+    result.command_state = super::nested_command_state(
+        &codex_tools::ToolName::plain("exec_command"), "command",
+        &ToolPayload::Function { arguments: arguments.to_string() }, &raw,
+    );
+    service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
+    let output = super::handle_runtime_response(
+        &exec,
+        RuntimeResponse::Result {
+            cell_id: cell.clone(),
+            content_items: vec![RuntimeContentItem::InputText { text: printed.into() }],
+            error_text,
+            output_loss: None,
+        },
+        None,
+        Instant::now(),
+    ).unwrap();
+    service.finish_cell_dispatch(&cell);
+    output
+}
+
+#[tokio::test]
+async fn recovery_audit_silent_exact_success_does_not_request_recovery() {
+    let raw = serde_json::json!({
+        "process_exited": true, "exit_code": 0, "execution_state": "exited",
+        "streams_complete": true, "output_reduced": true,
+        "raw_output_artifact_id": "retained",
+        "recovery_selector": {"kind": "lines", "start": 1, "end": 20},
+    });
+    for (arguments, exact, error, expected) in [
+        (serde_json::json!({"max_output_tokens": 0}), true, None, false),
+        (serde_json::json!({"max_output_tokens": 0}), false, None, true),
+        (serde_json::json!({}), true, None, true),
+        (serde_json::json!({"max_output_tokens": 0}), true, Some("script failed".into()), true),
+    ] {
+        let mut raw = raw.clone();
+        raw["streams_complete"] = exact.into();
+        let output = command_receipt_fixture(arguments, raw, "summary", error).await;
+        assert_eq!(super::code_mode_text_content(&output.body).contains("output_truncated"), expected);
+        assert_eq!(output.essential_inline["nested_commands"][0]["raw_output_artifact_id"], "retained");
+    }
+}
+
+#[tokio::test]
+async fn recovery_audit_exited_but_undrained_process_keeps_handle() {
+    for (session_id, expected) in [(serde_json::json!(12), true), (serde_json::Value::Null, false)] {
+        let output = command_receipt_fixture(serde_json::json!({}), serde_json::json!({
+            "process_exited": true, "exit_code": 0, "execution_state": "exited",
+            "session_id": session_id, "output_complete": false,
+        }), "last output", None).await;
+        assert_eq!(super::code_mode_text_content(&output.body).contains("Running command session_id: 12"), expected);
+        assert_eq!(output.essential_inline["nested_commands"][0].get("continuation").is_some(), expected);
+    }
+}
+
+#[tokio::test]
+async fn recovery_audit_failure_keeps_bounded_diagnostic_without_changing_success() {
+    for error in [None, Some("launch denied: ".to_string() + &"x".repeat(4_000))] {
+        let output = command_receipt_fixture(serde_json::json!({}), serde_json::json!({
+            "process_exited": error.is_none(), "exit_code": if error.is_none() { Some(0) } else { None },
+            "execution_state": if error.is_none() { "exited" } else { "unknown" }, "error": error,
+        }), "", None).await;
+        let visible = super::code_mode_text_content(&output.body);
+        assert_eq!(visible.contains("launch denied"), error.is_some());
+        assert_eq!(visible.contains("nested_command_failure"), error.is_some());
+        assert!(visible.len() < 2_000, "diagnostics must stay bounded");
+        if let Some(error) = error {
+            assert_eq!(output.essential_inline["nested_commands"][0]["error"], error);
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_audit_missing_artifact_is_explicit_and_not_retryable() {
+    for reduced in [false, true] {
+        let output = command_receipt_fixture(serde_json::json!({}), serde_json::json!({
+            "process_exited": true, "exit_code": 0, "execution_state": "exited",
+            "output_reduced": reduced, "raw_output_artifact_error": "disk full",
+        }), "partial output", None).await;
+        let visible = super::code_mode_text_content(&output.body);
+        assert_eq!(visible.contains("\"recovery_available\":false"), reduced);
+        assert_eq!(visible.contains("disk full"), reduced);
+        assert!(!visible.contains("recovery_tool"));
+    }
+}
+
+#[tokio::test]
+async fn recovery_audit_bare_locator_does_not_hide_exact_selector() {
+    let raw = serde_json::json!({
+        "process_exited": true, "exit_code": 0, "execution_state": "exited",
+        "output_reduced": true, "raw_output_artifact_id": "retained",
+        "recovery_selector": {"kind": "lines", "start": 12, "end": 24},
+    });
+    for (printed, appended) in [
+        ("retained".to_string(), true),
+        (raw.to_string(), false),
+        (serde_json::json!({"results":[{"status":"fulfilled", "value":raw}]}).to_string(), false),
+        (serde_json::json!({"source":raw.to_string()}).to_string(), true),
+    ] {
+        let output = command_receipt_fixture(serde_json::json!({}), raw.clone(), &printed, None).await;
+        let visible = super::code_mode_text_content(&output.body);
+        assert_eq!(visible.contains("\"recovery\":"), appended);
+        assert!(visible.contains("\"start\":12"));
+        assert_eq!(output.essential_inline["nested_commands"][0]["recovery"]["arguments"]["selectors"],
+            serde_json::json!([raw["recovery_selector"]]));
+        assert!(super::code_mode_text_content(output.canonical_body.as_ref().unwrap())
+            .contains("retained"));
+    }
+}
+#[tokio::test]
+async fn completion_audit_retained_intent_requires_authoritative_terminal_commands() {
+    for scenario in ["complete", "empty-yield", "partial-yield", "input-changed",
+                     "schema-changed", "running", "unknown", "failed", "missing-exit", "deferred"] {
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        let service = &session.services.code_mode_service;
+        let cell = CellId::new(format!("completion-{scenario}"));
+        service.record_cell_parent_call_id(&cell, "parent");
+        let (activity, receiver) = tokio::sync::watch::channel(crate::session::InputQueueActivity::Mailbox);
+        service.record_delivery_intent(&cell, &turn, receiver);
+        let mut command = serde_json::json!({
+            "execution_state":"exited", "process_exited":true, "exit_code":0
+        });
+        match scenario {
+            "running" => { command["execution_state"] = "running".into(); command["process_exited"] = false.into(); }
+            "unknown" => command["execution_state"] = "unknown".into(),
+            "failed" => command["exit_code"] = 1.into(),
+            "missing-exit" => { command.as_object_mut().unwrap().remove("exit_code"); }
+            "deferred" => command["pending_deferred_completions"] = serde_json::json!(["required-job"]),
+            "input-changed" => { activity.send_replace(crate::session::InputQueueActivity::Steer); }
+            "schema-changed" => turn.final_output_json_schema = Some(serde_json::json!({"type":"string"})),
+            _ => {}
+        }
+        service.packet_admission.lock().unwrap().cells.get_mut(cell.as_str()).unwrap()
+            .command_states.push(command);
+        if matches!(scenario, "empty-yield" | "partial-yield") {
+            let yielded = RuntimeResponse::ExplicitYield {
+                cell_id: cell.clone(), content_items: if scenario == "partial-yield" {
+                    vec![RuntimeContentItem::InputText { text: "partial".into() }]
+                } else { Vec::new() },
+            };
+            assert!(service.delivery_for_response(&cell, &turn, &yielded).is_none());
+            service.finish_packet(cell.as_str(), true);
+        }
+        let response = RuntimeResponse::Result {
+            cell_id: cell.clone(),
+            content_items: vec![RuntimeContentItem::InputText { text: "verified result".into() }],
+            error_text: None, output_loss: None,
+        };
+        assert_eq!(service.delivery_for_response(&cell, &turn, &response).as_deref(),
+            matches!(scenario, "complete" | "empty-yield").then_some("verified result"), "{scenario}");
+        assert!(service.delivery_for_response(&cell, &turn, &response).is_none(), "intent is consumed once");
+        service.finish_cell_dispatch(&cell);
+    }
+}

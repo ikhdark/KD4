@@ -132,7 +132,8 @@ fn unchanged_plan_output_remains_compact() {
     assert_eq!(response["step_ids"], serde_json::json!([]));
     assert_eq!(response["revision"], crate::plan_store::plan_revision(Some(&output.current_plan)));
     assert_eq!(response["completion_authority"], "checklist_only");
-    assert_eq!(response.as_object().expect("object response").len(), 7);
+    assert_eq!(response["obligations"], serde_json::json!({"completed":0,"superseded":0,"unresolved":[]}));
+    assert_eq!(response.as_object().expect("object response").len(), 8);
     assert_eq!(output.code_mode_result(&payload), response);
 }
 

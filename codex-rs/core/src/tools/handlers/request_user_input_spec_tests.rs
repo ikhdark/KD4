@@ -20,6 +20,22 @@ fn default_available_modes() -> Vec<ModeKind> {
 }
 
 #[test]
+fn header_length_is_machine_readable_without_changing_question_text() {
+    let ToolSpec::Function(tool) = create_request_user_input_tool("Ask".into()) else {
+        panic!("function tool expected");
+    };
+    let schema = serde_json::to_value(tool.parameters).unwrap();
+    let header = &schema["properties"]["questions"]["items"]["properties"]["header"];
+    assert_eq!(header["maxLength"], 12);
+    let validator = jsonschema::validator_for(header).unwrap();
+    for text in ["Scope", "123456789012", "日本語日本語日本語日本語"] {
+        assert!(validator.is_valid(&json!(text)), "{text}");
+    }
+    assert!(!validator.is_valid(&json!("Harness scope")));
+    assert!(schema["properties"]["questions"]["items"]["properties"]["question"].get("maxLength").is_none());
+}
+
+#[test]
 fn request_user_input_tool_includes_questions_schema() {
     let ToolSpec::Function(mut actual) =
         create_request_user_input_tool("Ask the user to choose.".to_string())
@@ -54,10 +70,13 @@ fn request_user_input_tool_includes_questions_schema() {
                             BTreeMap::from([
                                 (
                                     "header".to_string(),
-                                    JsonSchema::string(Some(
-                                        "Short header label shown in the UI (12 or fewer chars)."
-                                            .to_string(),
-                                    )),
+                                    JsonSchema {
+                                        max_length: Some(12),
+                                        ..JsonSchema::string(Some(
+                                            "Short header label shown in the UI (12 or fewer chars)."
+                                                .to_string(),
+                                        ))
+                                    },
                                 ),
                                 (
                                     "id".to_string(),

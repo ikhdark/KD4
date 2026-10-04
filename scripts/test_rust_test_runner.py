@@ -1199,6 +1199,37 @@ class NamedSelectionTest(RunnerTestCase):
 
 
 class GatesForTest(RunnerTestCase):
+    def test_module_inventory_is_reused_only_inside_one_query(self) -> None:
+        root = self.temp_dir / "src"
+        root.mkdir()
+        lib = root / "lib.rs"
+        lib.write_text('#[path = "one.rs"] mod first;\n', encoding="utf-8")
+        one, two = root / "one.rs", root / "two.rs"
+        one.write_text("", encoding="utf-8")
+        two.write_text("", encoding="utf-8")
+        read_text, glob = Path.read_text, Path.glob
+        reads, scans = [], []
+        def read(path, *args, **kwargs):
+            reads.append(path)
+            return read_text(path, *args, **kwargs)
+        def scan(path, pattern):
+            scans.append(path)
+            return glob(path, pattern)
+        with mock.patch.object(Path, "read_text", read), mock.patch.object(Path, "glob", scan):
+            declarations = {}
+            self.assertEqual(rust_test_runner._rust_module(lib, one, declarations=declarations), "first")
+            self.assertEqual(rust_test_runner._rust_module(lib, two, declarations=declarations), "two")
+        self.assertEqual(scans, [root])
+        self.assertCountEqual(reads, [lib, one, two])
+        lib.write_text('#[path = "one.rs"] mod changed;\n', encoding="utf-8")
+        self.assertEqual(rust_test_runner._rust_module(lib, one), "changed")
+        lib.write_text("", encoding="utf-8")
+        wrapper = root / "wrapper.rs"
+        wrapper.write_text('#[path = "one.rs"] mod added;\n', encoding="utf-8")
+        self.assertEqual(rust_test_runner._rust_module(lib, one), "wrapper::added")
+        wrapper.unlink()
+        self.assertEqual(rust_test_runner._rust_module(lib, one), "one")
+
     def test_gates_follow_module_ownership_and_path_declarations(self) -> None:
         crate = self.temp_dir / "core"
         files = {
@@ -1863,6 +1894,10 @@ class RunTargetTest(RunnerTestCase):
                 mock.patch.object(rust_test_runner, "load_metadata"),
                 mock.patch.object(rust_test_runner, "RustTestRunner") as runner,
             ):
+                # The CLI now admits a real target before invoking the mocked
+                # runner; never pass MagicMock filesystem paths to the lease.
+                runner.return_value.target_dir = self.target_dir
+                runner.return_value.manifest = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
                 runner.return_value.run_target.return_value = {"codex-core": ["tests::alpha"]}
                 self.assertEqual(
                     rust_test_runner.main(["run-target", "core_lib", *arguments]), 0
@@ -3185,6 +3220,37 @@ class RepositoryManifestTest(unittest.TestCase):
                     key = (step.target, test)
                     self.assertNotIn(key, owners, f"duplicate gate test {key}")
                     owners[key] = gate.name
+
+    def test_prevention_and_capability_gates_preserve_combined_coverage(self):
+        preflight = "tools::handlers::command_preflight::command_preflight_tests::"
+        headers = "tools::handlers::request_user_input::tests::"
+        capability = {
+            preflight + "never_repairs_mutating_command_flag_typos",
+            preflight + "leaf_glob_repair_is_bounded_and_preserves_exact_scope",
+            preflight + "kd4_runtime_off_preserves_command_without_repair",
+        }
+        prevention = {
+            preflight + "powershell_leaf_glob_repair_preserves_shell_and_exact_output",
+            preflight + "powershell_leaf_glob_repair_refuses_ambiguous_or_effectful_scripts",
+            preflight + "leaf_glob_runtime_repair_avoids_retry_and_respects_bypasses",
+            preflight + "missing_rg_paths_are_advisory_and_use_the_execution_workdir",
+            preflight + "source_paging_advice_preserves_invocation_and_runtime_bypasses",
+            preflight + "source_paging_advice_excludes_transformations_and_unpaged_reads",
+            preflight + "source_paging_advice_keeps_unicode_output_errors_and_exit_status",
+            headers + "header_fallback_preserves_full_question_and_strict_validation",
+            headers + "overlong_header_reaches_user_without_a_repair_round",
+        }
+        for name, expected in [
+            ("capability-command-preflight", capability),
+            ("harness-prevention-context", prevention),
+        ]:
+            with self.subTest(gate=name):
+                steps = self.manifest.gates[name].steps
+                self.assertEqual(len(steps), 1)
+                self.assertEqual(steps[0].target, "core_lib")
+                self.assertEqual(steps[0].helpers, ())
+                self.assertIsNone(steps[0].filterset)
+                self.assertEqual(set(steps[0].tests), expected)
 
     def test_manifest_parses_strictly(self) -> None:
         self.assertEqual(self.manifest.version, rust_test_runner.SCHEMA_VERSION)

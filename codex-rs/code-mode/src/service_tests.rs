@@ -394,6 +394,33 @@ text(JSON.stringify({ names: ALL_TOOL_NAMES, resolved: resolve_tool("sample_tool
 }
 
 #[tokio::test]
+async fn tool_callables_reuse_cell_catalog_but_not_changed_capabilities() {
+    let service = InProcessCodeModeSession::new();
+    for description in ["first schema", "changed schema"] {
+        let response = execute(&service, ExecuteRequest {
+            enabled_tools: vec![ToolDefinition {
+                description: description.into(),
+                ..exec_command_definition()
+            }].into(),
+            source: r#"
+const resolved = resolve_tool("exec_command");
+if (resolved !== tools.exec_command || resolved !== exec || resolved !== shell)
+    throw new Error("callable was reconstructed");
+tools.exec_command = null;
+if (resolve_tool("exec_command") !== resolved) throw new Error("resolver trusted mutable tools");
+text(resolved.description);
+"#.into(),
+            ..execute_request("")
+        }).await;
+        assert_eq!(result_text(&response), description);
+    }
+    let response = execute(&service, execute_request(
+        "text(resolve_tool('exec_command') === undefined)"
+    )).await;
+    assert_eq!(result_text(&response), "true");
+}
+
+#[tokio::test]
 async fn discovered_tools_are_callable_and_namespace_aliases_keep_exact_dispatch() {
     let service = InProcessCodeModeSession::with_delegate(Arc::new(EchoDelegate));
     let response = execute(

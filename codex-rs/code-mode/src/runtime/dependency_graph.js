@@ -1,7 +1,7 @@
 // Cell-local dependency execution. Tool dispatch, permissions, cancellation and
 // resource admission remain owned by the normal nested-tool runtime.
 Object.defineProperty(globalThis, "run_graph", {
-  value: async function run_graph(nodes, { concurrency = 4 } = {}) {
+  value: async function run_graph(nodes, { concurrency = 4, targets } = {}) {
     if (!Array.isArray(nodes) || nodes.length === 0 || nodes.length > 256) {
       throw new TypeError("run_graph requires 1–256 nodes");
     }
@@ -30,7 +30,30 @@ Object.defineProperty(globalThis, "run_graph", {
           typeof name !== "string" || !ALL_TOOL_NAMES.includes(name))) {
         throw new TypeError(`required tool capability is unavailable for ${node.id}`);
       }
-      graph.set(node.id, { deps, run: node.run, accept: node.accept, step_id: node.step_id });
+      const estimated_ms = node.estimated_ms ?? 0;
+      if (!Number.isFinite(estimated_ms) || estimated_ms < 0 || estimated_ms > 86_400_000) {
+        throw new TypeError(`invalid estimated_ms for ${node.id}`);
+      }
+      const resources = node.resources ?? {};
+      if (typeof resources !== "object" || Array.isArray(resources) ||
+          Object.keys(resources).some(key => key !== "read" && key !== "write")) {
+        throw new TypeError(`invalid resources for ${node.id}`);
+      }
+      const claims = {};
+      for (const mode of ["read", "write"]) {
+        const keys = resources[mode] ?? [];
+        if (!Array.isArray(keys) || keys.length > 128 || keys.some(key =>
+            typeof key !== "string" || !key.trim() || key.length > 256) ||
+            new Set(keys).size !== keys.length) {
+          throw new TypeError(`invalid ${mode} resources for ${node.id}`);
+        }
+        claims[mode] = [...keys];
+      }
+      if (claims.read.some(key => claims.write.includes(key))) {
+        throw new TypeError(`duplicate read/write resource for ${node.id}`);
+      }
+      graph.set(node.id, { deps, run: node.run, accept: node.accept,
+        step_id: node.step_id, estimated_ms, claims, ordinal: graph.size });
     }
     for (const [id, node] of graph) {
       if (node.deps.some(dep => dep === id || !graph.has(dep))) {
@@ -49,9 +72,54 @@ Object.defineProperty(globalThis, "run_graph", {
     }
     for (const id of graph.keys()) visit(id);
 
+    // Selection is explicit and happens before effects, never by abandoning
+    // already-started work. Validate even disconnected definitions above.
+    if (targets !== undefined && (!Array.isArray(targets) || !targets.length ||
+        targets.some(id => typeof id !== "string" || !graph.has(id)) ||
+        new Set(targets).size !== targets.length)) {
+      throw new TypeError("run_graph targets require distinct known node IDs");
+    }
+    const selected = new Set();
+    function select(id) {
+      if (selected.has(id)) return;
+      selected.add(id);
+      for (const dep of graph.get(id).deps) select(dep);
+    }
+    for (const id of targets ?? graph.keys()) select(id);
+    // Longest remaining dependency path first; zero estimates retain the
+    // original input-order policy. Estimates affect admission, never results.
+    const ranks = new Map();
+    for (const id of [...visited].reverse()) {
+      if (!selected.has(id)) continue;
+      const node = graph.get(id);
+      const rank = (ranks.get(id) ?? 0) + node.estimated_ms;
+      ranks.set(id, rank);
+      for (const dep of node.deps) ranks.set(dep, Math.max(ranks.get(dep) ?? 0, rank));
+    }
+    const admissionOrder = [...graph.keys()].filter(id => selected.has(id)).sort((a, b) =>
+      ranks.get(b) - ranks.get(a) || graph.get(a).ordinal - graph.get(b).ordinal);
     const results = Object.create(null);
-    const pending = new Set(graph.keys());
+    const pending = new Set(admissionOrder);
     const running = new Map();
+    // All claims are acquired together on this JS thread. No partial leases,
+    // lock-order cycles, or cross-cell authority. Normal tool gates still apply.
+    const readers = new Map();
+    const writers = new Set();
+    function available({ claims }) {
+      return claims.read.every(key => !writers.has(key)) &&
+        claims.write.every(key => !writers.has(key) && !readers.has(key));
+    }
+    function acquire({ claims }) {
+      for (const key of claims.read) readers.set(key, (readers.get(key) ?? 0) + 1);
+      for (const key of claims.write) writers.add(key);
+    }
+    function release({ claims }) {
+      for (const key of claims.read) {
+        if (readers.get(key) === 1) readers.delete(key);
+        else readers.set(key, readers.get(key) - 1);
+      }
+      for (const key of claims.write) writers.delete(key);
+    }
     async function execute(id, node) {
       try {
         const dependencies = Object.create(null);
@@ -75,11 +143,12 @@ Object.defineProperty(globalThis, "run_graph", {
         if (node.deps.some(dep => results[dep].status !== "fulfilled")) {
           results[id] = { status: "skipped", reason: "dependency failed" };
           pending.delete(id);
-        } else if (running.size < concurrency) {
+        } else if (running.size < concurrency && available(node)) {
           pending.delete(id);
+          acquire(node);
           // Defer callbacks until the task is registered, even when run throws.
           const task = Promise.resolve().then(() => execute(id, node))
-            .finally(() => running.delete(id));
+            .finally(() => { release(node); running.delete(id); });
           running.set(id, task);
         }
       }
@@ -87,6 +156,7 @@ Object.defineProperty(globalThis, "run_graph", {
     }
     const ordered = Object.create(null);
     for (const [id, node] of graph) {
+      if (!selected.has(id)) continue;
       ordered[id] = results[id];
       if (node.step_id !== undefined) ordered[id].step_id = node.step_id;
     }

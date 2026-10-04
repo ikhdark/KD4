@@ -10,6 +10,7 @@ use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_RESULTS;
 
 pub(crate) const READ_TOOL_OUTPUT_TOOL_NAME: &str = "read_tool_output";
 pub(crate) const READ_TOOL_OUTPUT_MAX_BYTES: usize = 16_384;
+pub(crate) const READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const READ_TOOL_OUTPUT_MAX_SELECTORS: usize = 64;
 pub(crate) const READ_TOOL_OUTPUT_MAX_LEGACY_RANGES: usize = READ_TOOL_OUTPUT_MAX_SELECTORS;
 
@@ -142,7 +143,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: format!("Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Returns as much exact content as fits plus continuation metadata; structured selections use JSON pointers. Recovery also has a {} token envelope ceiling ({} in code mode), independent of max_bytes. In code mode, the cell's display budget bounds printed output, not exact data returned to JavaScript. complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.",
+        description: format!("Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Returns as much exact content as fits plus continuation metadata; structured selections use JSON pointers. Default recovery has a {} token envelope ceiling ({} in code mode). Scripts explicitly requesting max_bytes above the default instead use a bounded 1 MiB serialized payload, independent of the cell display budget. Print only needed evidence; complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.",
             crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING,
             codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS.saturating_sub(1_000)),
         strict: false,
@@ -152,7 +153,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                 ("artifact_id".to_string(), artifact_id),
                 ("selectors".to_string(), selectors),
                 ("max_bytes".to_string(), bounded_integer(1, u64::MAX,
-                    format!("Maximum delivered source bytes, default and cap {READ_TOOL_OUTPUT_MAX_BYTES}; response metadata is additional. The advertised token ceiling can produce a smaller page with continuation."))),
+                    format!("Maximum delivered source bytes, default {READ_TOOL_OUTPUT_MAX_BYTES}. Direct calls are capped at that default. Code-mode scripts may explicitly request up to {READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES} bytes under a separate 1 MiB serialized payload cap; print only the needed evidence. Metadata/escaping can produce a smaller page with continuation."))),
             ]),
             Some(vec!["artifact_id".to_string(), "selectors".to_string()]),
             Some(false.into()),

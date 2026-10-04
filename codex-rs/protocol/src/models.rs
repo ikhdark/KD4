@@ -2439,6 +2439,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_base_instructions_shorten_the_critical_path_without_dropping_proof() {
+        let instructions = BaseInstructions::default();
+        for required in [
+            "batch independent reads using native file/snapshot tools",
+            "without reducing requested read coverage",
+            "A new turn alone does not invalidate evidence",
+            "recheck affected dependencies rather than rereading the entire prior scope",
+            "resolve the recovery contract, fetch, check completeness",
+            "with coverage, failures, and continuation controls",
+            "Full-read requests still require full coverage",
+            "start the known expensive validation before independent read-only diff review",
+            "cannot mutate validation inputs, contend for its resources",
+            "prepare the conditional final report in that cell",
+            "Unexpected results or unresolved semantic questions still require interpretation",
+            "a passing check alone never proves task completion",
+        ] {
+            assert!(instructions.text.contains(required), "missing: {required}");
+        }
+    }
+
+    #[test]
+    fn default_base_instructions_coordinate_sessions_without_inventing_authority() {
+        let instructions = BaseInstructions::default();
+        for required in [
+            "concurrent sessions are known to share a checkout",
+            "coordinate overlapping edit ownership through available thread/task tools",
+            "do not infer ownership from dirty files or start agents without authorization",
+            "Without a coordination channel, continue disjoint work",
+            "reconcile the affected current source immediately before patching",
+            "an execution lock is not a reservation of an earlier read",
+            "refresh only affected evidence and validation inputs",
+            "do not replay an obsolete whole-file replacement",
+            "launch a duplicate validation while its original run is still live",
+        ] {
+            assert!(instructions.text.contains(required), "missing: {required}");
+        }
+    }
+
     // A tiny valid PNG (1x1) so image conversion tests don't depend on cross-crate
     // file paths or external fixture layouts.
     const TINY_PNG_BYTES: &[u8] = &[

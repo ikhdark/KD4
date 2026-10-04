@@ -5474,20 +5474,27 @@ pub(crate) fn select_file_snapshot_for_script(
         results: Vec::new(),
     };
     let mut continuation = None;
+    // The envelope and previously selected fragments do not change while
+    // admitting the next selector. Size each fragment once instead of
+    // serializing the growing prefix (up to 64 times).
+    let envelope_bytes = serde_json::to_vec(&response).map(|bytes| bytes.len()).unwrap_or(MAX_SCRIPT_BYTES);
+    let mut result_bytes = 0usize;
     for selector in selectors {
         let mut selected = select_logical_artifact(
             &metadata, &canonical.bytes, selector.clone(), usize::MAX, usize::MAX,
             &response.results,
         );
         loop {
-            response.results.push(selected.clone());
             // Reserve enough room for all remaining selectors' overflow metadata.
-            let fits = serde_json::to_vec(&response)
-                .is_ok_and(|bytes| bytes.len() <= MAX_SCRIPT_BYTES - 128 * 1024);
+            let selected_bytes = serde_json::to_vec(&selected).map(|bytes| bytes.len()).unwrap_or(MAX_SCRIPT_BYTES);
+            let next_bytes = result_bytes.saturating_add(selected_bytes)
+                .saturating_add(usize::from(!response.results.is_empty()));
+            let fits = envelope_bytes.saturating_add(next_bytes) <= MAX_SCRIPT_BYTES - 128 * 1024;
             if fits {
+                result_bytes = next_bytes;
+                response.results.push(selected);
                 break;
             }
-            response.results.pop();
             if default_read && let Some(range) = selected.canonical_range && range.end > 1 {
                 let mut end = range.end as usize / 2;
                 while end > 0 && std::str::from_utf8(&canonical.bytes[..end]).is_err() {
@@ -5505,6 +5512,9 @@ pub(crate) fn select_file_snapshot_for_script(
             omitted.canonical_range = selected.canonical_range;
             omitted.continuation = Some(selector.clone());
             omitted.message = Some("Selection exceeds the 1 MiB script payload cap; request smaller ranges.".into());
+            result_bytes = result_bytes
+                .saturating_add(serde_json::to_vec(&omitted).map(|bytes| bytes.len()).unwrap_or(MAX_SCRIPT_BYTES))
+                .saturating_add(usize::from(!response.results.is_empty()));
             response.results.push(omitted);
             break;
         }

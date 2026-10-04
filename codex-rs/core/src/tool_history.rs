@@ -330,6 +330,9 @@ impl ToolHistoryCandidate {
         Some(serde_json::json!({
             "version": 1,
             "kind": "tool_history_artifact_pin",
+            "call_id": self.call_id,
+            "tool_identity": self.tool_identity,
+            "semantic_class": self.semantic_class,
             "successful": self.successful,
             "digest": truncate_text_to_token_ceiling(&self.bounded_model_output, RECEIPT_DIGEST_TARGET_TOKENS),
             "artifact_id": self.artifact_id,
@@ -899,6 +902,29 @@ impl ToolHistoryMutation {
 
 pub(crate) fn phase_checkpoint_ids(item: &ResponseItem) -> Option<Vec<String>> {
     Some(phase_checkpoint_payload(item)?["receipts"].as_object()?.keys().cloned().collect())
+}
+
+/// Once an observation is stale, a later explanation of the same invalidation
+/// does not make it stale again. Preserve every other field, especially current
+/// nested results: a newly invalidated nested result still requires a notice.
+fn same_workspace_invalidation(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    if a == b {
+        return true;
+    }
+    if a["call_id"].as_str().is_none()
+        || a["stale_workspace_evidence"] != true
+        || b["stale_workspace_evidence"] != true
+        || a["valid_for_current_workspace"] != false
+        || b["valid_for_current_workspace"] != false
+    {
+        return false;
+    }
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
+        return false;
+    };
+    a.iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "reason" | "reason_code"))
+        .eq(b.iter().filter(|(key, _)| !matches!(key.as_str(), "reason" | "reason_code")))
 }
 
 fn phase_checkpoint_payload(item: &ResponseItem) -> Option<serde_json::Value> {
@@ -1695,7 +1721,9 @@ impl ToolHistoryState {
                     }
                 }
             }
-            if !previous_notices.contains(&notice) && !notices.contains(&notice) {
+            if !previous_notices.iter().chain(&notices).any(|previous| {
+                same_workspace_invalidation(previous, &notice)
+            }) {
                 notices.push(notice);
             }
         }

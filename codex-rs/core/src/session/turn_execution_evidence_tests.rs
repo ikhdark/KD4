@@ -426,6 +426,24 @@ async fn evidence_reuse_native_replay_tracks_paths_inputs_turns_and_freshness() 
     assert!(next_turn.collector(&next_turn.baselines(0)).register_deterministic_tool_call(
         &ToolName::plain("read_file"), &payload, "next-turn",
     ).replayed_success.is_some());
+    // Equivalent legacy/default syntax must not turn a review-to-implementation
+    // transition into another filesystem read. Never conflate environments,
+    // selections, invalid calls, or an explicit freshness request.
+    let collector = next_turn.collector(&next_turn.baselines(0));
+    for (arguments, reusable) in [
+        (json!({"file_path":source}), true),
+        (json!({"path":source,"selectors":null,"environment_id":null,"force_fresh":false}), true),
+        (json!({"path":source,"environment_id":"other"}), false),
+        (json!({"path":source,"offset":1,"limit":1}), false),
+        (json!({"path":source,"force_fresh":true}), false),
+        (json!({"path":source,"file_path":source}), false),
+        (json!({"path":source,"unknown":true}), false),
+    ] {
+        let payload = ToolPayload::Function { arguments: arguments.to_string() };
+        assert_eq!(collector.register_deterministic_tool_call(
+            &ToolName::plain("read_file"), &payload, "alias-follow-up",
+        ).replayed_success.is_some(), reusable, "{arguments}");
+    }
     // Exact canonical outputs and their persisted provenance can seed a new
     // turn owner; compaction prose must never become a replayable file result.
     use codex_protocol::models::ResponseItem;
@@ -486,6 +504,93 @@ async fn evidence_reuse_native_replay_tracks_paths_inputs_turns_and_freshness() 
     cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
     assert!(!guard.is_fresh(2, &cache, None), "a relevant edit invalidates the original proof");
     assert!(!restored_guard.is_fresh(2, &cache, None));
+}
+
+#[tokio::test]
+async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_guards() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.txt");
+    std::fs::write(&path, "first\nsecond\n").unwrap();
+    let selectors = json!([
+        {"kind":"lines","start":1,"end":1},
+        {"kind":"lines","start":2,"end":2},
+    ]);
+    let invocation = invocation("read_file", json!({"path":path,"selectors":selectors})).await;
+    let result = ReadFileHandler.handle(invocation.clone()).await.unwrap();
+    let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let observations = cache.begin_source_path_change_observations(root.path(), &[(path.clone(), false)])
+        .await.unwrap();
+    let shared = Arc::new(SessionPathReplays::default());
+    let mut control = TurnExecutionControl::new().with_session_path_replays(Arc::clone(&shared));
+    let baseline = control.baselines(0);
+    let collector = control.collector(&baseline);
+    let registration = collector.register_deterministic_tool_call(
+        &ToolName::plain("read_file"), &invocation.payload, "original",
+    );
+    collector.record_replay_dependencies(registration.ordinal, 0, observations, None);
+    let authority = crate::tools::registry::authorized_tool_invocation_sha256(
+        &invocation.step_context.turn, &invocation.payload, None,
+    );
+    collector.record_replay_authorization(registration.ordinal, authority.clone());
+    collector.record_read_replay_output(registration.ordinal, result.code_mode_result(&invocation.payload));
+    collector.record_response_result(
+        registration.ordinal, result.outcome_context(), result.sampling_request_signal(),
+        &result.to_response_item("original", &invocation.payload), false,
+    );
+    control.settle(&baseline, &collector, &settled());
+    let next = TurnExecutionControl::new().with_session_path_replays(shared);
+    let collector = next.collector(&next.baselines(0));
+    let requested = ToolPayload::Function {
+        arguments: json!({"path":path,"offset":2,"limit":1}).to_string(),
+    };
+    let guard = collector.register_deterministic_tool_call(
+        &ToolName::plain("read_file"), &requested, "subset",
+    ).replayed_success.expect("a delivered selector survives a stage boundary");
+    assert!(guard.is_fresh(0, &cache, None));
+    assert!(guard.matches_authorization(crate::tools::registry::authorized_tool_invocation_sha256(
+        &invocation.step_context.turn, guard.authorization_payload(&requested), None,
+    ).as_deref()));
+    assert!(!guard.matches_authorization(Some("changed-permissions")));
+    assert!(!guard.matches_authorization(None));
+    let replay = guard.response_for_call("subset").unwrap();
+    let value: Value = serde_json::from_str(&response_output_text(&replay).unwrap()).unwrap();
+    assert_eq!(value["results"].as_array().unwrap().len(), 1);
+    assert_eq!(value["results"][0]["text"], "second\n");
+    assert_eq!(value["complete"], true);
+    assert_eq!(value["file_complete"], false);
+    assert!(value.get("criterion_evidence").is_none());
+    for args in [
+        json!({"path":path,"offset":1,"limit":2}), // new range, not delivered as one selector
+        json!({"path":path,"offset":2,"limit":1,"force_fresh":true}),
+        json!({"path":path,"offset":2,"limit":1,"environment_id":"other"}),
+        json!({"path":path.with_file_name("other.txt"),"offset":2,"limit":1}),
+        json!({"path":path,"selectors":[{"kind":"search","query":"second"}]}),
+    ] {
+        assert!(collector.register_deterministic_tool_call(
+            &ToolName::plain("read_file"),
+            &ToolPayload::Function { arguments: args.to_string() }, "miss",
+        ).replayed_success.is_none(), "{args}");
+    }
+    std::fs::write(&path, "first\nCHANGED\n").unwrap();
+    cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
+    assert!(!guard.is_fresh(1, &cache, None));
+}
+
+#[test]
+fn native_selector_reuse_rejects_incomplete_and_shared_only_results() {
+    let previous = json!({"path":"file","selectors":[
+        {"kind":"lines","start":1,"end":1}, {"kind":"lines","start":2,"end":2}
+    ]}).to_string();
+    let requested = json!({"path":"file","offset":2,"limit":1}).to_string();
+    for result in [
+        json!({"selector":{"kind":"lines","start":2,"end":2},"status":"ok","complete":false,"text":"partial"}),
+        json!({"selector":{"kind":"lines","start":2,"end":2},"status":"ok","complete":true,"value":{"shared":true}}),
+        json!({"selector":{"kind":"lines","start":2,"end":2},"status":"aggregate_omitted","complete":false}),
+    ] {
+        assert!(crate::tools::handlers::reselect_read_file_output(
+            &previous, &requested, json!({"results":[result]}),
+        ).is_none());
+    }
 }
 
 #[test]

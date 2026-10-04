@@ -7,6 +7,9 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
     if tool.namespace.is_none() && tool.name == "update_plan" {
         return plan_without_restated_lineage(raw);
     }
+    if tool.namespace.is_none() && tool.name == "apply_patch" {
+        return patch_without_repeated_summary(raw);
+    }
     let local_text_tool = tool.namespace.is_none()
         && matches!(
             tool.name.as_str(),
@@ -142,6 +145,45 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
     (raw_text || projected != *object).then_some(Value::Object(projected))
 }
 
+/// Keep the committed delta, retry receipt and diagnostics. Only a byte-exact
+/// rendering of an authoritative delta is redundant; custom success messages
+/// and partial/failing patches are not interchangeable with generic success.
+fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
+    let object = raw.as_object()?;
+    let mut projected = object.clone();
+    if raw["success"] == true && raw["changes_exact"] == true {
+        let summary = raw["changes"].as_array().and_then(|changes| {
+            let mut summary = String::from("Success. Updated the following files:\n");
+            for change in changes {
+                let prefix = match change["kind"].as_str()? {
+                    "add" => "A",
+                    "delete" => "D",
+                    "update" => "M",
+                    _ => return None,
+                };
+                summary.push_str(prefix);
+                summary.push(' ');
+                summary.push_str(change["path"].as_str()?);
+                if let Some(destination) = change.get("move_path").filter(|v| !v.is_null()) {
+                    if prefix != "M" {
+                        return None;
+                    }
+                    summary.push_str(" -> ");
+                    summary.push_str(destination.as_str()?);
+                }
+                summary.push('\n');
+            }
+            Some(summary)
+        });
+        if summary.as_deref().is_some_and(|summary| raw["text"].as_str() == Some(summary)) {
+            projected.remove("text");
+        }
+    }
+    // Register even when nothing can be removed: fallback display must not
+    // replace a partial delta or custom diagnostic with a generic success.
+    Some(Value::Object(projected))
+}
+
 /// A requirement owned solely by the current step with its ID, text and status
 /// restates `current_plan`. Renamed, merged, split, superseded and retired
 /// requirements, identities and workflow links stay in view.
@@ -180,6 +222,34 @@ fn plan_without_restated_lineage(raw: &Value) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn patch_projection_removes_only_reconstructible_success_text() {
+        let raw = json!({"success":true,"changes_exact":true,"environment_id":"remote",
+            "text":"Success. Updated the following files:\nA new\nD old\nM λ -> moved\n",
+            "changes":[{"kind":"add","path":"new","move_path":null},
+                {"kind":"delete","path":"old","move_path":null},
+                {"kind":"update","path":"λ","move_path":"moved"}]});
+        let tool = ToolName::plain("apply_patch");
+        let compact = model_visible_tool_result(&tool, &raw).unwrap();
+        let mut expected = raw.clone();
+        expected.as_object_mut().unwrap().remove("text");
+        assert_eq!(compact, expected);
+        println!("projection_audit patch_receipt before_bytes={} after_bytes={}",
+            raw.to_string().len(), compact.to_string().len());
+        for (field, value) in [
+            ("success", json!(false)), ("changes_exact", json!(false)),
+            ("text", json!("Success with a warning: partial receipt")),
+            ("text", json!("Success. Updated the following files:\r\nA new\r\n")),
+            ("changes", json!([{ "kind":"unknown", "path":"new" }])),
+        ] {
+            let mut exceptional = raw.clone();
+            exceptional[field] = value;
+            exceptional["retry"] = json!({"patch_id":"retained", "hunks":[2]});
+            assert_eq!(model_visible_tool_result(&tool, &exceptional), Some(exceptional));
+        }
+        assert_eq!(model_visible_tool_result(&ToolName::plain("other"), &raw), None);
+    }
 
     #[test]
     fn command_projection_keeps_lifecycle_and_recovery_not_transport_defaults() {

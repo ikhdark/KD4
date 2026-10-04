@@ -380,6 +380,7 @@ function Test-CargoLockBusy {
         return $false
     }
     try {
+        if (Test-ExclusiveLaneFileBusy -TargetDir $TargetDir -LockFileName ".rust-test-runner.lock") { return $true }
         foreach ($child in Get-ChildItem -LiteralPath $TargetDir -Directory -Force -ErrorAction Stop) {
             if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
             if (Test-ExclusiveLaneFileBusy -TargetDir $child.FullName -LockFileName ".cargo-lock") { return $true }

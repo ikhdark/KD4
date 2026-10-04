@@ -730,9 +730,12 @@ fn build_code_mode_executors(
                     // resolve_tool retain the complete callable contract.
                     definition.input_schema = None;
                 }
-                // Recovery payloads are inspected in JavaScript. Keep their full
-                // result schemas available through resolve_tool, not every prompt.
-                if matches!(definition.name.as_str(), "read_file" | "read_tool_output") {
+                // Detailed result contracts are available through resolve_tool.
+                // Eager descriptions retain lifecycle/recovery semantics; do not
+                // replay the large transport union on every model generation.
+                if matches!(definition.name.as_str(),
+                    "read_file" | "read_tool_output" | "exec_command" | "write_stdin"
+                ) {
                     definition.output_schema = None;
                 }
                 eager_nested_tool_definitions.push(definition);

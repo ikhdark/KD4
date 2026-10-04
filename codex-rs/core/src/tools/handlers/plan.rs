@@ -41,6 +41,7 @@ const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 impl PlanToolOutput {
     fn response_result(&self) -> JsonValue {
         serde_json::json!(PlanToolResponse {
+            obligations: self.lineage.obligation_summary(&self.current_plan),
             completion_authority: crate::plan_store::checklist_completion_authority(),
             lineage: self.lineage.clone(),
             revision: crate::plan_store::plan_revision_with_lineage(Some(&self.current_plan), &self.lineage),

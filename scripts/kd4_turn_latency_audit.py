@@ -1613,11 +1613,11 @@ def _behavior_metrics(
     }
 
 
-def _startup_log_report(source: Path) -> dict[str, Any]:
-    snapshot = read_rollout_snapshot(source)
+def _startup_log_report(source: Path, captured=None) -> dict[str, Any]:
+    snapshot = captured if captured is not None else read_rollout_snapshot(source)
     records = []
     parse_errors = 0
-    with contextlib.closing(snapshot.stream):
+    with contextlib.nullcontext(snapshot.stream) if captured is not None else contextlib.closing(snapshot.stream):
         lines = snapshot.data.splitlines()
     for line in lines:
         if not line.strip():
@@ -1653,9 +1653,24 @@ def analyze_session_path(
     runner_evidence: dict[str, Any] | None = None,
     startup_log: Path | None = None,
     diagnostic_evidence: dict[str, Any] | None = None,
+    cache_dir: Path | None = None,
+    refresh: bool = False,
+    _captured=None,
+    _files=None,
+    _hydrate=None,
 ) -> dict[str, Any]:
+    if cache_dir is not None:
+        try:
+            from scripts.rollout_audit_cache import analyze_cached
+        except ImportError:
+            from rollout_audit_cache import analyze_cached
+        return analyze_cached(
+            analyze_session_path, source, repo_root, cache_dir=cache_dir, refresh=refresh,
+            include_tokens=include_tokens, runner_evidence=runner_evidence,
+            startup_log=startup_log, diagnostic_evidence=diagnostic_evidence,
+        )
     source = existing_rollout_path(source) if source else None
-    files = (
+    files = _files if _files is not None else (
         ([source] if source.is_file() else discover_rollouts(source)) if source else []
     )
     started_turns: set[str] = set()
@@ -1706,14 +1721,14 @@ def analyze_session_path(
         sampling_boundary_observed = False
         calls_since_sampling_boundary = 0
         last_tool_output_ns: int | None = None
-        snapshot = read_rollout_snapshot(file)
+        snapshot = _captured[file] if _captured is not None else read_rollout_snapshot(file)
         action_records = []
         first_action_records.append((snapshot.metadata(), action_records))
         snapshots.append(snapshot.metadata())
         byte_count += snapshot.byte_length
         cwd = ""
         build = None
-        with contextlib.closing(snapshot.stream), snapshot.open_lines() as handle:
+        with (contextlib.nullcontext(snapshot.stream) if _captured is not None else contextlib.closing(snapshot.stream)), snapshot.open_lines() as handle:
             for line_number, line in enumerate(handle, 1):
                 line_count += 1
                 try:
@@ -1732,7 +1747,7 @@ def analyze_session_path(
                             }
                         )
                     continue
-                item = hydrate_rollout_record(item, snapshot.path)
+                item = (_hydrate or hydrate_rollout_record)(item, snapshot.path)
                 if runner_evidence is None:
                     native_events.append(
                         {
@@ -2235,7 +2250,9 @@ def analyze_session_path(
     report["outputChannels"] = _output_channels(output_channel_bytes, valid)
     report["checkoutOverlaps"] = _checkout_overlaps(valid, edited_paths)
     if startup_log is not None:
-        report["startupTiming"] = _startup_log_report(startup_log)
+        report["startupTiming"] = _startup_log_report(
+            startup_log, _captured[startup_log] if _captured is not None else None
+        )
     return report
 
 
@@ -2995,6 +3012,10 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         return value
 
     result["tokenAnalysisEnabled"] = report.get("tokenAnalysisEnabled", True)
+    if "analysisCache" in report:
+        result["analysisCache"] = report["analysisCache"]
+    if "evidence_lineage" in report:
+        result["evidence_lineage"] = report["evidence_lineage"]
     runner = report.get("runnerDiagnostics", {})
     result["runnerDiagnostics"] = {
         key: runner.get(key)
@@ -3238,7 +3259,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="on",
         help="Disable token computation for scripted execution",
     )
+    parser.add_argument(
+        "--cache-dir", type=Path,
+        help="Reuse content-addressed audit reports here after authenticating current inputs; explicitly share this directory across related stages. Reports retain their original observedAt and may contain sensitive session data.",
+    )
+    parser.add_argument(
+        "--refresh", action="store_true",
+        help="Recompute instead of reusing a report in --cache-dir",
+    )
     args = parser.parse_args(argv)
+    if args.refresh and args.cache_dir is None:
+        parser.error("--refresh requires --cache-dir")
     if (
         args.source is None
         and args.runner_evidence is None
@@ -3272,6 +3303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             include_tokens=args.tokens == "on",
             runner_evidence=evidence,
             startup_log=args.startup_log,
+            cache_dir=args.cache_dir,
+            refresh=args.refresh,
             diagnostic_evidence=(
                 json.loads(args.diagnostic_evidence.read_text(encoding="utf-8-sig"))
                 if args.diagnostic_evidence

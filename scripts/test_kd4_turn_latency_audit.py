@@ -1644,10 +1644,17 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}),
                 contextlib.redirect_stdout(stdout),
+                mock.patch.object(
+                    kd4_turn_latency_audit, "bounded_summary",
+                    wraps=kd4_turn_latency_audit.bounded_summary,
+                ) as projection,
             ):
                 exit_code = kd4_turn_latency_audit.main(
                     [session_id, "--repo-root", str(root), "--summary-json"]
                 )
+            # Test detailed evidence against the captured producer result, not
+            # display rows that the summary's byte budget may legitimately omit.
+            full_report = projection.call_args.args[0]
 
         output = stdout.getvalue()
         report = json.loads(output)
@@ -1708,7 +1715,7 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(
             report["populations"]["repository_root"], {"turns": 1, "sameAs": "all"}
         )
-        self.assertEqual(report["schemaVersion"], 21)
+        self.assertEqual(report["schemaVersion"], 22)
         breakdown = report["latencyBreakdown"]
         orchestration_breakdown = breakdown["orchestration"]
         self.assertEqual(orchestration_breakdown["exclusiveTotalNs"], 100_000_000)
@@ -1747,12 +1754,13 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(report["perTurn"][0]["samplingPassTarget"], 8)
         self.assertEqual(report["perTurn"][0]["startedAt"], "2026-08-17T00:00:00+00:00")
         self.assertEqual(report["perTurn"][0]["boundarySource"], "timing")
-        intervals = report["perTurn"][0]["tokenIntervals"]
+        intervals = full_report["perTurn"][0]["tokenIntervals"]
         self.assertEqual(len(intervals), 2)
         self.assertEqual(intervals[0]["emittedToolCallIds"], ["relay-1"])
         self.assertEqual(intervals[1]["precedingToolCallIds"], ["relay-1"])
         self.assertEqual(intervals[1]["tokens"]["inputTokens"], 110)
-        summary = kd4_turn_latency_audit.bounded_summary(report)
+        summary = kd4_turn_latency_audit.bounded_summary(full_report)
+        self.assertEqual(summary["schemaVersion"], 22)
         self.assertEqual(
             summary["latencyBreakdown"]["orchestration"]["exclusiveTotalNs"],
             100_000_000,
@@ -1761,7 +1769,13 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             summary["latencyBreakdown"]["modelInference"]["generationPurposes"],
             model_breakdown["generationPurposes"],
         )
-        self.assertEqual(len(summary["perTurn"][0]["tokenIntervals"]), 2)
+        for displayed in (report, summary):
+            turn = displayed["perTurn"][0]
+            self.assertEqual(
+                len(turn["tokenIntervals"]) + turn["omittedTokenIntervals"], 2,
+            )
+            self.assertFalse(displayed["summaryBudget"]["limitExceeded"])
+        self.assertEqual(len(full_report["perTurn"][0]["tokenIntervals"]), 2)
         self.assertEqual(report["firstUsefulActionAnalysis"]["canonicalTurnCount"], 1)
         self.assertIn("firstUsefulActionAnalysis", summary)
         self.assertEqual(

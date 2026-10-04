@@ -59,6 +59,48 @@ fn text(event: RuntimeEvent) -> String {
 }
 
 #[tokio::test]
+async fn dependency_graph_scheduling_contracts() {
+    let (_tx, _termination, mut rx) = start(include_str!("dependency_graph_tests.js")).await;
+    assert_eq!(text(next(&mut rx).await), "dependency graph scenarios passed");
+    let RuntimeEvent::Result { error_text, output_loss, .. } = next(&mut rx).await else {
+        panic!("graph result");
+    };
+    assert_eq!(error_text, None);
+    assert_eq!(output_loss, None);
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn dependency_graph_cancellation_stops_pending_and_dependent_dispatch() {
+    let (tx, termination, mut rx) = start(r#"
+        await run_graph([
+          {id: "a", resources: {write: ["repo"]}, run: () => tools.sample_tool({id: "a"}), accept: () => true},
+          {id: "b", run: () => tools.sample_tool({id: "b"}), accept: () => true},
+          {id: "pending", resources: {write: ["repo"]}, run: () => tools.sample_tool({id: "pending"}), accept: () => true},
+          {id: "dependent", deps: ["a"], run: () => tools.sample_tool({id: "dependent"}), accept: () => true},
+        ], {concurrency: 2});
+        text("must not complete");
+    "#).await;
+    let mut started = Vec::new();
+    for _ in 0..2 {
+        let RuntimeEvent::ToolCall { input, .. } = next(&mut rx).await else {
+            panic!("expected admitted graph tool");
+        };
+        started.push(input.unwrap()["id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(started, ["a", "b"]);
+    // Synchronize with the idle event loop, then use the real owner cancellation
+    // path. No graph-specific cancellation token can bypass nested cleanup.
+    inspect(&tx).await;
+    assert!(termination.terminate_execution());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = rx.recv().await {
+            assert!(matches!(event, RuntimeEvent::Result { .. }));
+        }
+    }).await.expect("cancelled graph runtime must close");
+}
+
+#[tokio::test]
 async fn pending_checks_do_not_collect_writes_and_response_heap_does_not_accumulate() {
     let (tx, _termination, mut rx) = start(r#"
         store("payload", "x".repeat(1_000_000));

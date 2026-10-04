@@ -11,6 +11,40 @@
 
 version = 1
 
+[gates.harness-recovery-audit]
+description = "Command receipts preserve recovery, diagnostics and drain handles without false silent-read recovery."
+
+[[gates.harness-recovery-audit.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "tools::code_mode::response_tests::recovery_audit_silent_exact_success_does_not_request_recovery",
+  "tools::code_mode::response_tests::recovery_audit_exited_but_undrained_process_keeps_handle",
+  "tools::code_mode::response_tests::recovery_audit_failure_keeps_bounded_diagnostic_without_changing_success",
+  "tools::code_mode::response_tests::recovery_audit_missing_artifact_is_explicit_and_not_retryable",
+  "tools::code_mode::response_tests::recovery_audit_bare_locator_does_not_hide_exact_selector",
+  "tools::code_mode::response_tests::live_session_receipt_is_added_only_when_its_handle_is_not_visible",
+  "tools::code_mode::response_tests::command_receipts_share_the_script_budget_and_keep_latest_canonical_states",
+]
+
+[gates.harness-prevention-context]
+description = "Windows context-audit regressions: literal search repair, bounded source advice, known paths and question headers. Pair with capability-command-preflight for shared safety/off-state coverage."
+
+[[gates.harness-prevention-context.steps]]
+target = "core_lib"
+helpers = []
+tests = [
+  "tools::handlers::command_preflight::command_preflight_tests::powershell_leaf_glob_repair_preserves_shell_and_exact_output",
+  "tools::handlers::command_preflight::command_preflight_tests::powershell_leaf_glob_repair_refuses_ambiguous_or_effectful_scripts",
+  "tools::handlers::command_preflight::command_preflight_tests::leaf_glob_runtime_repair_avoids_retry_and_respects_bypasses",
+  "tools::handlers::command_preflight::command_preflight_tests::missing_rg_paths_are_advisory_and_use_the_execution_workdir",
+  "tools::handlers::command_preflight::command_preflight_tests::source_paging_advice_preserves_invocation_and_runtime_bypasses",
+  "tools::handlers::command_preflight::command_preflight_tests::source_paging_advice_excludes_transformations_and_unpaged_reads",
+  "tools::handlers::command_preflight::command_preflight_tests::source_paging_advice_keeps_unicode_output_errors_and_exit_status",
+  "tools::handlers::request_user_input::tests::header_fallback_preserves_full_question_and_strict_validation",
+  "tools::handlers::request_user_input::tests::overlong_header_reaches_user_without_a_repair_round",
+]
+
 [gates.token-budget-lifecycle]
 description = "Real new_context handler, sampling handoff, and nonblocking startup prewarm."
 
@@ -313,6 +347,31 @@ helpers = []
 package = "codex-rollout"
 lib = true
 helpers = []
+
+[targets.code_mode_lib]
+package = "codex-code-mode"
+lib = true
+helpers = []
+
+[targets.code_mode_protocol_lib]
+package = "codex-code-mode-protocol"
+lib = true
+helpers = []
+
+[gates.dependency-graph-scheduling]
+description = "Bounded dependency/resource scheduling, deterministic evidence, prompt contracts, and owner cancellation."
+
+[[gates.dependency-graph-scheduling.steps]]
+target = "code_mode_lib"
+tests = [
+  "runtime::tests::dependency_graph_preflights_and_settles_without_running_failed_dependents",
+  "runtime::regression_tests::dependency_graph_scheduling_contracts",
+  "runtime::regression_tests::dependency_graph_cancellation_stops_pending_and_dependent_dispatch",
+]
+
+[[gates.dependency-graph-scheduling.steps]]
+target = "code_mode_protocol_lib"
+filter = "test(description::exec_prompt::tests::)"
 
 [targets.tui_lib]
 package = "codex-tui"
@@ -696,6 +755,7 @@ helpers = []
 # The off-state test proves the declared features.kd4_runtime switch controls preflight.
 tests = [
   "tools::handlers::command_preflight::command_preflight_tests::never_repairs_mutating_command_flag_typos",
+  "tools::handlers::command_preflight::command_preflight_tests::leaf_glob_repair_is_bounded_and_preserves_exact_scope",
   "tools::handlers::command_preflight::command_preflight_tests::kd4_runtime_off_preserves_command_without_repair",
 ]
 
@@ -771,7 +831,15 @@ tests = [
 target = "core_code_mode_mcp"
 helpers = ["codex-code-mode-host"]
 tests = [
-  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request",
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request::_batch_expects",
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request::_delivery_expects",
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request::_full_file_expects",
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request::_graph_expects",
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request::_lookup_expects",
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request::_poll_expects",
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request::_recovery_expects",
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request::_retained_expects",
+  "suite::code_mode::direct_delivery::explicit_delivery_preserves_answer_and_removes_final_model_request::_validation_overlap_expects",
   "suite::code_mode::direct_delivery::explicit_delivery_accepts_schema_valid_json_and_supported_media",
   "suite::code_mode::direct_delivery::delivery_cannot_hide_failure_yield_overflow_or_sibling_work",
 ]
@@ -963,3 +1031,15 @@ filter = "all()"
 [[gates.extension-contracts.steps]]
 target = "image_generation_contracts"
 filter = "all()"
+[gates.completion-path-evidence]
+description = "Evidence-backed direct completion, explicit obligation state, retained results, and safe command/wait termination. Scripted provider request counts, not live-model latency claims."
+
+[[gates.completion-path-evidence.steps]]
+target = "core_lib"
+helpers = []
+filter = "test(plan_store::tests::) | test(tools::handlers::plan::tests::) | test(context::world_state::task_state::tests::) | test(completion_audit_) | test(explicit_delivery_requires_consumed_process_and_complete_evidence) | test(native_receipt_requires_settled_success_and_no_unfinished_plan)"
+
+[[gates.completion-path-evidence.steps]]
+target = "core_code_mode_mcp"
+helpers = ["codex-code-mode-host"]
+filter = "test(suite::code_mode::direct_delivery::)"

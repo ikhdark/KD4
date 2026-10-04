@@ -22,6 +22,96 @@ from scripts import restore_rollout_artifact
 
 
 class RolloutSnapshotTest(unittest.TestCase):
+    def test_snapshot_context_closes_once_without_reopening_live_source(self):
+        data = '{"type":"event_msg","payload":{"text":"日本語"}}\n'.encode()
+        with tempfile.TemporaryDirectory() as temp:
+            for compressed in (False, True):
+                with self.subTest(compressed=compressed):
+                    source = Path(temp) / ("rollout.jsonl.zst" if compressed else "rollout.jsonl")
+                    captured = zstd.compress(data) if compressed else data
+                    source.write_bytes(captured)
+                    with mock.patch.object(
+                        rollout_snapshot, "read_rollout_snapshot",
+                        wraps=rollout_snapshot.read_rollout_snapshot,
+                    ) as read:
+                        with rollout_snapshot.read_rollout_snapshot(source) as snapshot:
+                            source.write_bytes(b"changed after capture")
+                            for _ in range(2):
+                                with snapshot.open_lines() as lines:
+                                    self.assertEqual(lines.read(), data)
+                            self.assertEqual(snapshot.data, captured)
+                            identity = snapshot.metadata()
+                            self.assertFalse(snapshot.stream.closed)
+                        read.assert_called_once_with(source)
+                    self.assertTrue(snapshot.stream.closed)
+                    snapshot.close()
+                    self.assertEqual(snapshot.metadata(), identity)
+                    with self.assertRaisesRegex(ValueError, "already closed"):
+                        with snapshot:
+                            self.fail("closed snapshot must not be reopened")
+
+    def test_snapshot_context_propagates_errors_and_supports_explicit_closing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "rollout.jsonl"
+            source.write_bytes(b'{}\n')
+            for exception in (ValueError("audit failed"), KeyboardInterrupt()):
+                with self.subTest(exception=type(exception).__name__):
+                    with self.assertRaises(type(exception)) as caught:
+                        with rollout_snapshot.read_rollout_snapshot(source) as snapshot:
+                            raise exception
+                    self.assertIs(caught.exception, exception)
+                    self.assertTrue(snapshot.stream.closed)
+            with contextlib.closing(rollout_snapshot.read_rollout_snapshot(source)) as snapshot:
+                self.assertEqual(snapshot.data, b'{}\n')
+            self.assertTrue(snapshot.stream.closed)
+
+    def test_snapshot_context_owns_stream_on_success_and_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            path.write_bytes(b'{"type":"event_msg","payload":{}}\n')
+            snapshot = rollout_snapshot.read_rollout_snapshot(path)
+            with snapshot as current:
+                self.assertIs(current, snapshot)
+                self.assertEqual(current.data, path.read_bytes())
+                self.assertFalse(current.stream.closed)
+            self.assertTrue(snapshot.stream.closed)
+            with self.assertRaisesRegex(ValueError, "already closed"):
+                with snapshot:
+                    self.fail("closed snapshots cannot be reused")
+            snapshot = rollout_snapshot.read_rollout_snapshot(path)
+            with self.assertRaisesRegex(RuntimeError, "consumer failed"):
+                with snapshot:
+                    raise RuntimeError("consumer failed")
+            self.assertTrue(snapshot.stream.closed)
+
+    def test_export_reuses_authenticated_bytes_but_rechecks_changed_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "sessions" / "rollout.jsonl"
+            source.parent.mkdir()
+            data = b'{"type":"event_msg","payload":{"type":"example"}}'
+            digest = hashlib.sha256(data).hexdigest()
+            directory = rollout_snapshot.rollout_payload_root(source)
+            directory.mkdir()
+            blob = directory / f"{digest}.json"
+            blob.write_bytes(data)
+            reference = {"type": "rollout_payload_artifact", "payload": {
+                "sha256": digest, "bytes": len(data), "item_type": "event_msg"}}
+            source.write_text(json.dumps(reference) + "\n", encoding="utf-8")
+            snapshot = rollout_snapshot.read_rollout_snapshot(source)
+            with contextlib.closing(snapshot.stream), mock.patch.object(
+                rollout_snapshot, "load_rollout_payload",
+                wraps=rollout_snapshot.load_rollout_payload,
+            ) as load:
+                destination = Path(temp) / "export" / "snapshot.jsonl"
+                rollout_snapshot.copy_rollout_payloads(snapshot, destination)
+                self.assertEqual(load.call_count, 1)
+                self.assertEqual(
+                    (rollout_snapshot.rollout_payload_root(destination) / blob.name).read_bytes(), data
+                )
+                blob.write_bytes(data.replace(b"example", b"changed"))
+                with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                    rollout_snapshot.copy_rollout_payloads(snapshot, destination)
+
     def test_artifact_export_restores_deleted_unicode_without_overwriting_work(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "sessions" / "rollout.jsonl"

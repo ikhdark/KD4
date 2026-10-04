@@ -9,10 +9,18 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 
 #[test_case::test_case("delivery")]
+#[cfg_attr(windows, test_case::test_case("leaf-glob"))]
 #[test_case::test_case("lookup")]
 #[test_case::test_case("batch")]
+#[test_case::test_case("multi-range")]
+#[test_case::test_case("search-inspect")]
+#[test_case::test_case("full-file")]
+#[test_case::test_case("graph")]
 #[test_case::test_case("recovery")]
+#[test_case::test_case("large-recovery")]
 #[test_case::test_case("poll")]
+#[test_case::test_case("retained")]
+#[test_case::test_case("validation_overlap")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scenario: &str) -> Result<()> {
     require_network!();
@@ -29,11 +37,30 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         fs::write(test.cwd.path().join("answer.txt"), answer)?;
         fs::write(test.cwd.path().join("first.txt"), "Verified answer: α → β.\n")?;
         fs::write(test.cwd.path().join("second.txt"), "Preserve this exact text.\n")?;
-        let bulk = serde_json::json!({"answer":answer,"padding":"filler ".repeat(900)}).to_string();
+        fs::write(test.cwd.path().join("ranges.txt"), "Verified answer: α → β.\nnot requested\nPreserve this exact text.\n")?;
+        let bulk = serde_json::json!({"answer":answer,"padding":"filler ".repeat(if scenario == "large-recovery" { 10_000 } else { 900 })}).to_string();
         fs::write(test.cwd.path().join("bulk.json"), &bulk)?;
+        // Larger than a model display page, but comfortably within the exact
+        // script payload limit. A short computed answer must not force paging.
+        let large = serde_json::json!({"answer":answer,"padding":"λ 日本語\r\n".repeat(10_000)}).to_string();
+        fs::write(test.cwd.path().join("large.json"), &large)?;
         let read_answer = "const r = await tools.read_file({path:'answer.txt'}); if (!r.file_complete) throw new Error('incomplete source'); text(r.results[0].text);";
         let (prepare, compute) = match scenario {
             "delivery" => (None, read_answer.to_string()),
+            "leaf-glob" => {
+                let rg = which::which("rg")?;
+                let discover = serde_json::json!({
+                    "program":rg, "args":["--files", "--glob", "answer*.txt", "."],
+                });
+                let search = serde_json::json!({
+                    "program":rg,
+                    "args":["--no-heading", "--color", "never", ".", if candidate { "answer*.txt" } else { "answer.txt" }],
+                });
+                (
+                    Some(format!("const found = await tools.exec_command({discover}); if (!found.process_exited || found.exit_code !== 0) throw Error('discovery failed'); text(found.output);")),
+                    format!("const result = await tools.exec_command({search}); if (!result.process_exited || result.exit_code !== 0 || result.output_reduced) throw Error('search incomplete'); text(result.output);"),
+                )
+            },
             "lookup" => (
                 Some("text(resolve_tool('read_file').description);".to_string()),
                 "const read = resolve_tool('read_file'); if (!read.description.includes('UTF-8')) throw Error('missing contract'); const r = await read({path:'answer.txt'}); if (!r.file_complete) throw Error('incomplete source'); text(r.results[0].text);".to_string(),
@@ -46,10 +73,98 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                     "const r = await tools.read_file({path:'second.txt'}); if (!r.file_complete) throw Error('incomplete second file'); text(load('first') + r.results[0].text);".to_string()
                 },
             ),
+            "full-file" => (
+                Some("const r = await tools.read_file({path:'large.json', selectors:[{kind:'bytes',start:0,end:1}]}); if (!r.complete || r.file_complete) throw Error('expected exact partial source'); store('largeHead', r);".to_string()),
+                if candidate {
+                    "const r = await tools.read_file({path:'large.json'}); if (!r.complete || !r.file_complete) throw Error('full source required'); const v = JSON.parse(r.results[0].text); if (v.padding !== 'λ 日本語\\r\\n'.repeat(10000)) throw Error('source corruption'); text(v.answer);".to_string()
+                } else {
+                    format!("const r = await tools.read_file({{path:'large.json',selectors:[{{kind:'bytes',start:1,end:{}}}]}}); const head = load('largeHead'); if (!r.complete || !head.source_sha256 || r.source_sha256 !== head.source_sha256) throw Error('incomplete or changed source'); const v = JSON.parse(head.results[0].text + r.results[0].text); if (v.padding !== 'λ 日本語\\r\\n'.repeat(10000)) throw Error('source corruption'); text(v.answer);", large.len())
+                },
+            ),
+            "multi-range" => (
+                Some("const r = await tools.read_file({path:'ranges.txt',selectors:[{kind:'lines',start:1,end:1}]}); if (!r.complete) throw Error('incomplete first range'); store('firstRange', r);".to_string()),
+                if candidate {
+                    "const r = await tools.read_file({path:'ranges.txt',selectors:[{kind:'lines',start:1,end:1},{kind:'lines',start:3,end:3}]}); if (!r.complete || r.file_complete || r.results.length !== 2) throw Error('wrong range coverage'); text(r.results.map(x => x.text).join(''));".to_string()
+                } else {
+                    "const r = await tools.read_file({path:'ranges.txt',selectors:[{kind:'lines',start:3,end:3}]}); const first = load('firstRange'); if (!r.complete || r.source_sha256 !== first.source_sha256) throw Error('changed range source'); text(first.results[0].text + r.results[0].text);".to_string()
+                },
+            ),
+            "search-inspect" => (
+                Some("const r = await tools.read_file({path:'answer.txt',selectors:[{kind:'search',query:'Verified',context_lines:1}]}); if (!r.complete || !r.file_complete) throw Error('incomplete search evidence'); store('search', r);".to_string()),
+                if candidate {
+                    "const r = await tools.read_file({path:'answer.txt',selectors:[{kind:'search',query:'Verified',context_lines:1}]}); if (!r.complete || !r.file_complete) throw Error('incomplete search evidence'); text(r.results[0].value.hydrated_ranges.map(x => x.text).join(''));".to_string()
+                } else {
+                    "const search = load('search'); const r = await tools.read_file({path:'answer.txt',selectors:search.results[0].value.hydrated_ranges.map(x => x.selector)}); if (!r.complete || !r.file_complete || r.source_sha256 !== search.source_sha256) throw Error('changed inspection source'); text(r.results.map(x => x.text).join(''));".to_string()
+                },
+            ),
+            "graph" => (
+                Some("const r = await tools.read_file({path:'first.txt'}); if (!r.file_complete) throw Error('incomplete prerequisite'); store('first', r.results[0].text);".to_string()),
+                if candidate {
+                    r#"const results = await run_graph([
+                        {id:'first', requires:['read_file'], run:() => tools.read_file({path:'first.txt'}), accept:r => r.complete && r.file_complete},
+                        {id:'second', requires:['read_file'], run:() => tools.read_file({path:'second.txt'}), accept:r => r.complete && r.file_complete},
+                        {id:'answer', deps:['first','second'], run:r => r.first.results[0].text + r.second.results[0].text, accept:r => r.length > 0}
+                    ], {concurrency:2}); text(results.answer.value);"#.to_string()
+                } else {
+                    "const r = await tools.read_file({path:'second.txt'}); if (!r.file_complete) throw Error('incomplete prerequisite'); text(load('first') + r.results[0].text);".to_string()
+                },
+            ),
             "recovery" => (
                 Some("const head = await tools.read_file({path:'bulk.json', selectors:[{kind:'bytes',start:0,end:1}]}); store('artifact', head.artifact_id);".to_string()),
                 format!("const r = await tools.read_tool_output({{artifact_id:load('artifact'),selectors:[{{kind:'bytes',start:0,end:{}}}]}}); if (!r.complete) throw Error('recovery required another handoff'); text(JSON.parse(r.results[0].text).answer);", bulk.len()),
             ),
+            "large-recovery" => (
+                Some("{ const head = await tools.read_file({path:'bulk.json',selectors:[{kind:'bytes',start:0,end:1}]}); if (!head.complete) throw Error('missing head'); store('artifactHead',head); }".to_string()),
+                format!(r#"const head = load('artifactHead'); let offset = 1; let parts = [head.results[0].text];
+                    let selectors = [{{kind:'bytes',start:1,end:{}}}]; let calls = 0;
+                    while (selectors) {{
+                        const r = await tools.read_tool_output({{artifact_id:head.artifact_id, selectors, max_bytes:{}}}); calls++;
+                        if (r.canonical_sha256 !== head.source_sha256) throw Error('snapshot identity changed');
+                        const before = offset;
+                        for (const p of r.results) if (p.status === 'ok' && p.text !== undefined) {{
+                            if (p.canonical_range.start !== offset) throw Error('noncontiguous recovery');
+                            parts.push(p.text); offset = p.canonical_range.end;
+                        }}
+                        if (offset <= before) throw Error('recovery made no progress');
+                        if (r.complete) selectors = null;
+                        else {{
+                            if (r.continuation_stop?.reason !== 'budget' || !r.continuation_stop.resumable) throw Error('unrecoverable');
+                            selectors = [r.continuation_stop.selector];
+                        }}
+                    }}
+                    if (offset !== {} || ({} && calls !== 1)) throw Error('incomplete or redundant recovery');
+                    const value = JSON.parse(parts.join('')); if (value.padding !== 'filler '.repeat(10000)) throw Error('corrupt payload'); text(value.answer);"#,
+                    bulk.len(), if candidate { 1024 * 1024 } else { 16_384 }, bulk.len(), candidate),
+            ),
+            "retained" => (
+                Some("const r = await tools.read_file({path:'answer.txt'}); if (!r.file_complete) throw Error('incomplete source'); store('evidence', r);".to_string()),
+                if candidate {
+                    "const retained = load('evidence'); if (!retained.file_complete || !retained.source_sha256) throw Error('missing retained evidence'); text(retained.results[0].text);".to_string()
+                } else {
+                    "const r = await tools.read_file({path:'answer.txt',force_fresh:true}); if (!r.file_complete || r.source_sha256 !== load('evidence').source_sha256) throw Error('source changed'); text(r.results[0].text);".to_string()
+                },
+            ),
+            "validation_overlap" => {
+                let python = which::which("python").or_else(|_| which::which("python3"))?;
+                let command = serde_json::json!({
+                    "program":python,
+                    "args":["-X", "utf8", "-c", "import sys,time; time.sleep(3); sys.stdout.write(sys.argv[1])", answer],
+                    "yield_time_ms":250,
+                });
+                // The wait models read-only report work, not inference. No
+                // mutation, resource conflict, or second validation is hidden.
+                let review = "const source = await tools.read_file({path:'answer.txt'}); if (!source.file_complete) throw Error('incomplete review'); store('review', source.results[0].text); await new Promise(resolve => setTimeout(resolve, 1000));";
+                let launch = format!("let r = await tools.exec_command({command});");
+                let drain = "let output = r.output; while (r.session_id && !r.process_exited) { r = await tools.write_stdin({session_id:r.session_id,wait_for_output:true}); output += r.output; } if (!r.process_exited || r.exit_code !== 0 || output !== load('review')) throw Error('validation or review mismatch'); text(output);";
+                (
+                    Some(review.to_string()),
+                    if candidate {
+                        format!("{launch}\n{review}\n{drain}")
+                    } else {
+                        format!("{launch}\n{drain}")
+                    },
+                )
+            }
             "poll" => {
                 let python = which::which("python").or_else(|_| which::which("python3"))?;
                 let command = serde_json::json!({
@@ -86,7 +201,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         };
         // Discovery and independent reads already have same-cell APIs. Recovery
         // and polling also need their owners not to manufacture a model boundary.
-        let inline_prepare = if candidate && matches!(scenario, "recovery" | "poll") {
+        let inline_prepare = if candidate && matches!(scenario, "recovery" | "large-recovery" | "poll" | "retained") {
             prepare.as_deref().unwrap_or_default()
         } else {
             ""
@@ -113,6 +228,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         .await;
         let (sandbox_policy, permission_profile) =
             turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
+        let started_at = std::time::Instant::now();
         test.codex
             .submit(Op::UserInput {
                 items: vec![UserInput::Text {
@@ -208,7 +324,15 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                 "compute-answer",
             )
             .expect("computed answer");
-            assert_eq!(output, answer);
+            if scenario == "large-recovery" {
+                // The display-sized baseline attaches recovery controls to the
+                // computed answer. The final model removes those receipts; the
+                // candidate must deliver the exact persisted answer directly.
+                assert!(output.starts_with(answer), "missing exact computed answer");
+                assert!(output[answer.len()..].contains("continuation_stop"));
+            } else {
+                assert_eq!(output, answer);
+            }
         }
         let model_requests = server
             .received_requests()
@@ -221,6 +345,35 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         let timing = completed.timing.as_ref().expect("turn timing");
         assert_eq!(timing.counters.logical_generation_count as usize, model_requests);
         assert_eq!(timing.counters.model_request_count as usize, model_requests);
+        let timing_json = serde_json::to_value(timing)?;
+        let reads = timing_json["toolCalls"].as_array().expect("tool timing").iter()
+            .filter(|call| call["toolName"] == "read_file").count();
+        if matches!(scenario, "retained" | "full-file" | "multi-range" | "search-inspect") {
+            assert_eq!(reads, if candidate { 1 } else { 2 }, "no repeat read without drift");
+        }
+        let calls = timing_json["toolCalls"].as_array().expect("tool timing");
+        if scenario == "leaf-glob" {
+            let commands = calls.iter().filter(|call| call["toolName"] == "exec_command").count();
+            assert_eq!(commands, if candidate { 1 } else { 2 }, "no discovery-only command or retry");
+        }
+        if scenario == "large-recovery" {
+            let recoveries = calls.iter().filter(|call| call["toolName"] == "read_tool_output").count();
+            if candidate { assert_eq!(recoveries, 1); } else { assert!(recoveries > 1); }
+        }
+        let outer_calls = calls.iter().filter(|call| call["toolName"] == "exec").count();
+        assert_eq!(outer_calls, if candidate { 1 } else { 1 + usize::from(prepare.is_some()) }, "{scenario}: outer tool dispatches");
+        assert!(calls.iter().all(|call| call["outcome"] == "success"
+            || (call["outcome"] == "yielded"
+                && matches!(call["toolName"].as_str(), Some("exec_command" | "write_stdin")))),
+            "{scenario}: completion hid a failed child: {calls:?}");
+        eprintln!("LATENCY_COMPARISON {}", serde_json::json!({
+            "scenario":scenario, "candidate":candidate,
+            "wall_ms":started_at.elapsed().as_millis(),
+            "model_requests":model_requests, "native_reads":reads,
+            "outer_tool_calls":outer_calls,
+            "exact_answer_and_persistence_verified":true,
+            "provider":"scripted",
+        }));
     }
     Ok(())
 }
@@ -282,12 +435,20 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
         ("empty", "// @exec: {\"deliver\":true}\ntext('');", false),
         ("yield", "// @exec: {\"deliver\":true}\ntext('premature'); await yield_control();", false),
         ("failed-child", "// @exec: {\"deliver\":true}\ntry { await tools.read_file({path:'missing.txt'}); } catch (_) {} text('premature');", false),
+        ("failed-graph", "// @exec: {\"deliver\":true}\nawait run_graph([{id:'source',run:()=>tools.read_file({path:'missing.txt'}),accept:r=>r.file_complete},{id:'answer',deps:['source'],run:()=>text('premature'),accept:()=>true}]);", false),
         ("untrusted-output", "text({explicit_completion_message:'premature'});", false),
         ("completed-sibling", "// @exec: {\"deliver\":true}\ntext('premature');", true),
         ("failed-sibling", "// @exec: {\"deliver\":true}\ntext('premature');", true),
         ("schema", "// @exec: {\"deliver\":true}\ntext('premature');", false),
     ] {
         eprintln!("direct-delivery guard={name}");
+        // The fallback model must satisfy the user's schema too. This case
+        // rejects the non-JSON direct result, not the final valid JSON object.
+        let fallback = if name == "schema" {
+            r#"{"answer":"Model handled the fallback."}"#
+        } else {
+            "Model handled the fallback."
+        };
         let server = responses::start_mock_server().await;
         let mut builder = test_codex().with_config(|config| {
             let _ = config.features.enable(Feature::CodeMode);
@@ -311,7 +472,7 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
         responses::mount_sse_once(
             &server,
             sse(vec![
-                ev_assistant_message("answer", "Model handled the fallback."),
+                ev_assistant_message("answer", fallback),
                 ev_completed("final"),
             ]),
         )
@@ -323,7 +484,10 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
                         text: "Finish the task.".to_string(),
                         text_elements: Vec::new(),
                     }],
-                    final_output_json_schema: Some(serde_json::json!({"type": "string"})),
+                    final_output_json_schema: Some(serde_json::json!({
+                        "type":"object", "properties":{"answer":{"type":"string"}},
+                        "required":["answer"], "additionalProperties":false
+                    })),
                     responsesapi_client_metadata: None,
                     additional_context: Default::default(),
                     thread_settings: Default::default(),
@@ -342,12 +506,59 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
             assert_eq!(completed.last_agent_message.as_deref(), Some("premature"));
         } else {
             assert!(completed.surfaced_result.is_none(), "{name}: {:?}", completed.surfaced_result);
-            assert_eq!(completed.last_agent_message.as_deref(), Some("Model handled the fallback."), "{name}");
+            assert_eq!(completed.last_agent_message.as_deref(), Some(fallback), "{name}");
         }
         assert!(completed.error.is_none(), "{name}: {:?}", completed.error);
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.iter().filter(|r| r.url.path().contains("responses")).count(),
             if name == "completed-sibling" { 1 } else { 2 }, "{name}");
     }
+    Ok(())
+}
+/// Closing the last checklist obligation is bookkeeping, not another inference
+/// boundary. Evidence and plan closure may share the final execution cell.
+#[test_case::test_case(false; "unfinished_obligation_continues")]
+#[test_case::test_case(true; "evidence_and_plan_close_deliver_immediately")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_audit_plan_closure_uses_existing_evidence(close_plan: bool) -> Result<()> {
+    require_network!();
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::CodeMode);
+        let _ = config.features.enable(Feature::Kd4Runtime);
+    });
+    let test = builder.build(&server).await?;
+    fs::write(test.cwd.path().join("evidence.txt"), "verified result")?;
+    let close = if close_plan {
+        "const closed = await tools.update_plan({set:p.step_ids.map(step_id=>({step_id,status:'completed'}))}); if(closed.obligations.unresolved.length || closed.obligations.completed !== 2) throw Error('unresolved obligations');"
+    } else { "" };
+    let code = format!(r#"// @exec: {{"deliver":true}}
+const p = await tools.update_plan({{plan:[{{step:'Inspect source',status:'in_progress'}},{{step:'Verify result',status:'pending'}}]}});
+const source = await tools.read_file({{path:'evidence.txt'}});
+if (!source.file_complete || !source.complete || !source.source_sha256) throw Error('incomplete evidence');
+store('completionEvidence', source); store('completionPlan', p);
+{close}
+text(source.results[0].text);"#);
+    responses::mount_sse_once(&server, sse(vec![
+        ev_response_created("compute"), ev_custom_tool_call("compute", "exec", &code),
+        ev_completed("compute"),
+    ])).await;
+    responses::mount_sse_once(&server, sse(vec![
+        ev_response_created("fallback"),
+        ev_custom_tool_call("finish-required-work", "exec", r#"// @exec: {"deliver":true}
+const source = load('completionEvidence');
+if (!source.file_complete || source.results[0].text !== 'verified result') throw Error('verification failed');
+const p = load('completionPlan');
+const closed = await tools.update_plan({set:p.step_ids.map(step_id=>({step_id,status:'completed'}))});
+if (closed.obligations.unresolved.length) throw Error('work remains');
+text('Required work completed.');"#), ev_completed("fallback"),
+    ])).await;
+    let completed = test.submit_turn_and_capture_completion("Inspect and verify the source.").await?;
+    assert!(completed.surfaced_result.is_some());
+    assert_eq!(completed.last_agent_message.as_deref(),
+        Some(if close_plan { "verified result" } else { "Required work completed." }));
+    assert_eq!(server.received_requests().await.unwrap().iter()
+        .filter(|request| request.url.path().contains("responses")).count(),
+        if close_plan { 1 } else { 2 });
     Ok(())
 }

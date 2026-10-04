@@ -12,7 +12,8 @@ $ProgressPreference = 'SilentlyContinue'
 #     "powershell_version": "7.5.2",
 #     "resolved_application": "C:\\Program Files\\Git\\cmd\\git.exe" | null }
 # or:
-#   { "id": <same>, "status": "parse_failed" | "parse_errors" | "unsupported" }
+#   { "id": <same>, "status": "parse_failed" | "parse_errors" | "unsupported",
+#     "syntax_error": "bounded parser diagnostics, only for parse_errors" }
 #
 # "unsupported" is intentional: it means the script parsed successfully, but the AST
 # included constructs that we conservatively refuse to lower into argv-like command words.
@@ -43,7 +44,20 @@ function Invoke-ParseRequest {
     }
 
     if ($errors.Count -gt 0) {
-        return @{ id = $RequestId; status = 'parse_errors' }
+        # Return diagnostics from this parse, not a second parser process or an
+        # execution attempt. Bound both count and text; never echo the source.
+        $diagnostics = @(foreach ($error in ($errors | Select-Object -First 3)) {
+            $message = ([string]$error.Message).Replace("`r", ' ').Replace("`n", ' ')
+            if ($message.Length -gt 240) {
+                $message = $message.Substring(0, 240) + '…'
+            }
+            'line {0}, column {1} ({2}): {3}' -f $error.Extent.StartLineNumber,
+                $error.Extent.StartColumnNumber, $error.ErrorId, $message
+        })
+        if ($errors.Count -gt 3) {
+            $diagnostics += '{0} further parser errors omitted.' -f ($errors.Count - 3)
+        }
+        return @{ id = $RequestId; status = 'parse_errors'; syntax_error = ($diagnostics -join "`n") }
     }
 
     # Top-level AST regions and collections outside the end-block statement list

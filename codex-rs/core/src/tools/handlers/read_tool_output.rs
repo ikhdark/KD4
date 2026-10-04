@@ -19,6 +19,7 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_BYTES;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_LEGACY_RANGES;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_SELECTORS;
+use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME;
 use crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool;
 use crate::tools::registry::CoreToolRuntime;
@@ -1007,9 +1008,15 @@ async fn handle_read_tool_output(
         ));
     };
     let args = parse_read_tool_output_args(arguments)?;
-    let max_bytes = resolved_max_bytes(args.max_bytes)?;
     let selectors = resolved_selectors(&args)?;
     let code_mode_recovery = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
+    let max_bytes = if code_mode_recovery
+        && args.max_bytes.is_some_and(|bytes| bytes > READ_TOOL_OUTPUT_MAX_BYTES)
+    {
+        args.max_bytes.unwrap_or_default().min(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES)
+    } else {
+        resolved_max_bytes(args.max_bytes)?
+    };
     let mut action_bounds_digest = Sha256::new();
     serde_json::to_writer(&mut action_bounds_digest, &selectors).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery selectors: {err}"))
@@ -1017,9 +1024,13 @@ async fn handle_read_tool_output(
     let action_bounds_hash = format!("{:x}", action_bounds_digest.finalize());
     // JavaScript consumes exact data before choosing what to print. Coupling
     // this selection to its display budget makes a small summary require extra
-    // recovery calls. Keep the existing byte/envelope caps and bound only the
-    // printed projection by the cell budget, as read_file already does.
-    let token_ceiling = if code_mode_recovery {
+    // recovery calls. Larger exact script selections are explicit opt-ins;
+    // direct reads and the default retain their existing display-sized caps.
+    let token_ceiling = if code_mode_recovery && max_bytes > READ_TOOL_OUTPUT_MAX_BYTES {
+        // Approximate token costs use UTF-8 bytes / 4. Leave ample space for
+        // escaping, continuation metadata and the retry-avoidance margin.
+        (READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES - 128 * 1024) / 4
+    } else if code_mode_recovery {
         CODE_MODE_RECOVERY_TOKEN_CEILING
     } else {
         RECOVERY_AGGREGATE_TOKEN_CEILING
@@ -1176,13 +1187,20 @@ async fn drain_recovery_snapshot_with_byte_limit(
         ).await?;
         let delivered_bytes: u64 = result.output.delivered_ranges().iter()
             .map(|(start, end)| end - start).sum();
-        if delivered_bytes <= max_bytes as u64 || cancellation_token.is_cancelled() {
+        let envelope_bytes = recovery_envelope(&result.output, result.continuation_stop.as_ref())
+            .and_then(|value| serde_json::to_vec(&value))
+            .map_err(|error| ReadToolOutputError::Io(error.to_string()))?.len();
+        if delivered_bytes <= max_bytes as u64
+            && envelope_bytes <= READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES
+        {
             return Ok(result);
         }
         // Refit against the same authenticated snapshot, never rerun or reread
         // the producer. Preserve the selector engine's exact ranges/continuation.
-        let smaller = token_ceiling.saturating_mul(max_bytes)
-            / usize::try_from(delivered_bytes).unwrap_or(usize::MAX);
+        let smaller = (token_ceiling.saturating_mul(max_bytes)
+            / usize::try_from(delivered_bytes).unwrap_or(usize::MAX).max(1))
+            .min(token_ceiling.saturating_mul(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES)
+                / envelope_bytes.max(1));
         if smaller >= token_ceiling || smaller < 256 {
             return Err(ReadToolOutputError::InvalidRange(
                 "max_bytes is too small for an exact recovery page; increase it or request a smaller selector".to_string(),

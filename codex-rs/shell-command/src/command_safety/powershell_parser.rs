@@ -188,13 +188,22 @@ pub(super) fn parse_with_powershell_ast(executable: &str, script: &str) -> Power
 /// Only a positive syntax-error report is a rejection. An unavailable parser
 /// or an unsupported (but possibly valid) AST remains the target shell's job.
 pub fn powershell_command_has_syntax_error(command: &[String]) -> bool {
+    powershell_command_syntax_error(command).is_some()
+}
+
+/// Bounded diagnostics from the same cached parse used for admission. `None`
+/// means no positive syntax-error report, not proof that execution is safe.
+pub fn powershell_command_syntax_error(command: &[String]) -> Option<String> {
     let Some((executable, args)) = command.split_first() else {
-        return false;
+        return None;
     };
     let PowershellInvocation::InlineCommand { script, .. } = parse_powershell_invocation(args) else {
-        return false;
+        return None;
     };
-    matches!(parse_with_powershell_ast(executable, script), PowershellParseOutcome::SyntaxError)
+    match parse_with_powershell_ast(executable, script) {
+        PowershellParseOutcome::SyntaxError(diagnostic) => Some(diagnostic),
+        _ => None,
+    }
 }
 
 fn parse_with_powershell_ast_request(
@@ -265,7 +274,7 @@ pub(crate) fn try_parse_powershell_ast_commands(
 ) -> Option<Vec<Vec<String>>> {
     match parse_with_powershell_ast(executable, script) {
         PowershellParseOutcome::Analysis(analysis) => Some(analysis.commands),
-        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError => None,
+        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError(_) => None,
     }
 }
 
@@ -289,7 +298,7 @@ pub(crate) fn try_parse_powershell_ast_analysis(
 ) -> Option<PowershellParseAnalysis> {
     match parse_with_powershell_ast(executable, script) {
         PowershellParseOutcome::Analysis(analysis) => Some(analysis),
-        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError => None,
+        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError(_) => None,
     }
 }
 
@@ -300,7 +309,7 @@ pub(crate) fn try_parse_powershell_ast_analysis_with_resolution(
 ) -> Option<PowershellParseAnalysis> {
     match parse_with_powershell_ast_request(executable, script, Some(resolution)) {
         PowershellParseOutcome::Analysis(analysis) => Some(analysis),
-        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError => None,
+        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError(_) => None,
     }
 }
 
@@ -318,7 +327,7 @@ pub(crate) fn is_trusted_powershell_host(executable: &str) -> bool {
 pub(super) enum PowershellParseOutcome {
     Analysis(PowershellParseAnalysis),
     Unsupported,
-    SyntaxError,
+    SyntaxError(String),
     Failed,
 }
 
@@ -525,7 +534,7 @@ impl PowershellParserProcess {
                             || matches!(
                                 outcome,
                                 PowershellParseOutcome::Unsupported
-                                    | PowershellParseOutcome::SyntaxError
+                                    | PowershellParseOutcome::SyntaxError(_)
                                     | PowershellParseOutcome::Analysis(PowershellParseAnalysis {
                                         direct_argv: None,
                                         ..
@@ -848,6 +857,7 @@ struct PowershellParserResponse {
     native_argument_mode: Option<String>,
     powershell_version: Option<String>,
     resolved_application: Option<String>,
+    syntax_error: Option<String>,
 }
 
 impl PowershellParserResponse {
@@ -885,7 +895,7 @@ impl PowershellParserResponse {
                 })
                 .unwrap_or(PowershellParseOutcome::Unsupported),
             "unsupported" => PowershellParseOutcome::Unsupported,
-            "parse_errors" => PowershellParseOutcome::SyntaxError,
+            "parse_errors" => PowershellParseOutcome::SyntaxError(self.syntax_error.unwrap_or_default()),
             _ => PowershellParseOutcome::Failed,
         }
     }
@@ -923,6 +933,7 @@ mod tests {
             native_argument_mode: Some(mode.to_string()),
             powershell_version: Some(version.to_string()),
             resolved_application: None,
+            syntax_error: None,
         }
         .into_outcome()
     }
@@ -1113,11 +1124,18 @@ mod tests {
             );
         }
         assert_eq!(parser.next_request_id, 1);
+        let mut first_diagnostic = None;
         for _ in 0..2 {
-            assert_eq!(
-                parser.parse("Get-Content '").unwrap(),
-                PowershellParseOutcome::SyntaxError
-            );
+            let PowershellParseOutcome::SyntaxError(diagnostic) =
+                parser.parse("Get-Content '").unwrap() else {
+                    panic!("expected positive syntax error");
+                };
+            assert!(diagnostic.contains("line 1, column"), "{diagnostic}");
+            assert!(diagnostic.contains("TerminatorExpectedAtEndOfString"), "{diagnostic}");
+            if let Some(first) = &first_diagnostic {
+                assert_eq!(&diagnostic, first, "cached diagnostics must be unchanged");
+            }
+            first_diagnostic = Some(diagnostic);
         }
         assert_eq!(parser.next_request_id, 2, "syntax errors must be cached");
         for _ in 0..2 {
@@ -1127,6 +1145,24 @@ mod tests {
             parser.next_request_id, 4,
             "parse_failed responses must not be cached"
         );
+    }
+
+    #[test]
+    fn parser_syntax_diagnostics_are_bounded_and_legacy_errors_still_reject() {
+        let legacy = deserialize_response(r#"{"id":1,"status":"parse_errors"}"#).unwrap();
+        assert_eq!(legacy.into_outcome(), PowershellParseOutcome::SyntaxError(String::new()));
+        let Some(powershell) = try_find_powershell_executable_blocking() else { return };
+        let mut parser = PowershellParserProcess::spawn(powershell.as_path().to_str().unwrap()).unwrap();
+        let source = "foreach ($d in ) {}\n".repeat(20);
+        let PowershellParseOutcome::SyntaxError(diagnostic) = parser.parse(&source).unwrap() else {
+            panic!("invalid foreach expression must be rejected");
+        };
+        assert!(diagnostic.contains("line 1, column"), "{diagnostic}");
+        assert!(diagnostic.contains("further parser errors omitted"), "{diagnostic}");
+        assert!(diagnostic.len() < 2000, "bounded recovery packet");
+        assert_eq!(diagnostic.lines().count(), 4);
+        // A rejected parse must not contaminate the next request or execute it.
+        assert!(matches!(parser.parse("Get-Content 'source.txt'").unwrap(), PowershellParseOutcome::Analysis(_)));
     }
 
     #[test]

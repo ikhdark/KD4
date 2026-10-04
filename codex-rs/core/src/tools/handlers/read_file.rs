@@ -91,13 +91,74 @@ pub(crate) fn validate_read_file_arguments(arguments: &str) -> Result<(), String
     parse_arguments::<ReadFileArgs>(arguments).map(|_| ()).map_err(|error| error.to_string())
 }
 
+/// Use the handler's parser for replay identity, not a second interpretation of
+/// legacy aliases/defaults. Path spelling and selector order remain exact;
+/// filesystem identity and authorization still belong to the replay guard.
+pub(crate) fn canonical_read_file_arguments(arguments: &str) -> Option<serde_json::Value> {
+    let args = parse_arguments::<ReadFileArgs>(arguments).ok()?;
+    Some(json!({
+        "path": args.path,
+        "environment_id": args.environment_id,
+        "selectors": args.selectors,
+    }))
+}
+
+/// Reuse only fully delivered, self-contained selections from the same request
+/// scope. This is a projection, not freshness proof: dispatch must still verify
+/// the original authorization, environment and source observations.
+pub(crate) fn reselect_read_file_output(
+    previous: &str,
+    requested: &str,
+    mut output: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let previous = canonical_read_file_arguments(previous)?;
+    let requested = canonical_read_file_arguments(requested)?;
+    if previous["path"] != requested["path"]
+        || previous["environment_id"] != requested["environment_id"]
+    {
+        return None;
+    }
+    let selectors = requested["selectors"].as_array()?;
+    if selectors.is_empty() || selectors.len() > READ_TOOL_OUTPUT_MAX_SELECTORS {
+        return None;
+    }
+    // Search results can contain shared references to other selections. Never
+    // return those references after removing their hydration owners.
+    if selectors.iter().any(|selector| !matches!(selector["kind"].as_str(), Some("bytes" | "lines"))) {
+        return None;
+    }
+    let mut remaining = output["results"].as_array()?.clone();
+    let mut selected = Vec::new();
+    for selector in selectors {
+        let index = remaining.iter().position(|result| {
+            result["selector"] == *selector && result["status"] == "ok"
+                && result["complete"] == true
+                && (result["text"].is_string() || result["data_base64"].is_string())
+        })?;
+        selected.push(remaining.remove(index));
+    }
+    output["results"] = json!(selected);
+    output["complete"] = json!(true);
+    output["delivered_selection_complete"] = json!(true);
+    // Complete inline reads use null instead of a retained artifact identity.
+    let mut typed = output.clone();
+    if typed["artifact_id"].is_null() { typed["artifact_id"] = json!(""); }
+    let typed = serde_json::from_value::<ReadToolOutputResult>(typed).ok()?;
+    output["file_complete"] = json!(file_selection_complete(&typed));
+    let fields = output.as_object_mut()?;
+    for key in ["continuation", "page_selectors", "criterion_evidence", "inspection_proof_error"] {
+        fields.remove(key);
+    }
+    Some(output)
+}
+
 impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("read_file")
     }
 
     fn spec(&self) -> ToolSpec {
-        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Explicit selectors are exact; oversized selections return child_selectors for the retained snapshot.".to_string()));
+        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Batch known ranges of this file here rather than calling once per range. Search results include matching text in results[].value.hydrated_ranges: consume that text before requesting another inspection. Explicit selectors are exact; oversized selections return child_selectors for the retained snapshot.".to_string()));
         selectors.min_items = Some(1);
         selectors.max_items = Some(READ_TOOL_OUTPUT_MAX_SELECTORS as u64);
         let mut output = read_tool_output_output_schema(file_selector_schema());

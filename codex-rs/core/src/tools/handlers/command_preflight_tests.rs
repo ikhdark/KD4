@@ -6,6 +6,253 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(ToString::to_string).collect()
 }
 
+#[test]
+fn leaf_glob_repair_is_bounded_and_preserves_exact_scope() {
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    for name in ["b.rs", "a.rs", "unrelated.txt", "-option.rs"] {
+        std::fs::write(src.join(name), "needle").unwrap();
+    }
+    let invocation = CommandInvocation::Argv {
+        program: "rg".into(), args: strings(&["-n", "needle", "src/*.rs"]),
+    };
+    let repaired = repair_rg_leaf_glob(&invocation, fixture.path()).unwrap();
+    let mut expected = strings(&["rg", "-n", "needle", "--"]);
+    expected.extend(["-option.rs", "a.rs", "b.rs"].map(|name| Path::new("src").join(name).to_str().unwrap().to_string()));
+    assert_eq!(repaired.invocation.to_direct_argv().unwrap(), expected);
+    assert!(repaired.repaired());
+    assert_eq!(repaired.validation_invocations, vec![repaired.invocation.clone()]);
+    assert!(repair_rg_leaf_glob(&repaired.invocation, fixture.path()).is_none());
+
+    for args in [
+        strings(&["needle", "src/*.missing"]),
+        strings(&["needle", "src/*.rs", "other"]),
+        strings(&["needle", "src/**/*.rs"]),
+        strings(&["needle", "src/*.[rt]s"]),
+        strings(&["needle", "../*.rs"]),
+        strings(&["--pre", "helper.exe", "needle", "src/*.rs"]),
+        strings(&["--ignorecase", "needle", "src/*.rs"]),
+    ] {
+        assert!(repair_rg_leaf_glob(&CommandInvocation::Argv {
+            program: "rg".into(), args: args.clone(),
+        }, fixture.path()).is_none(), "{args:?}");
+    }
+    assert!(repair_rg_leaf_glob(&CommandInvocation::Script("rg needle src/*.rs; echo done".into()), fixture.path()).is_none());
+    std::fs::create_dir(src.join("directory.rs")).unwrap();
+    assert!(repair_rg_leaf_glob(&invocation, fixture.path()).is_none(), "must not introduce directory traversal");
+    std::fs::remove_dir(src.join("directory.rs")).unwrap();
+    for i in 0..256 {
+        std::fs::write(src.join(format!("file{i}.rs")), "needle").unwrap();
+    }
+    assert!(repair_rg_leaf_glob(&invocation, fixture.path()).is_none(), "bounded expansion must fail closed");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_leaf_glob_repair_preserves_shell_and_exact_output() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fixture.path().join("src")).unwrap();
+    std::fs::write(fixture.path().join("src/a'b.rs"), "λ needle\n").unwrap();
+    std::fs::write(fixture.path().join("src/other.txt"), "needle\n").unwrap();
+    let shell = codex_shell_command::powershell::try_find_pwsh_executable_blocking().unwrap();
+    for pattern in ["needle", "absent"] {
+        let script = format!("rg -n {pattern} src/*.rs");
+        let invocation = CommandInvocation::PowerShellScript(script.clone());
+        let command = strings(&[shell.as_path().to_str().unwrap(), "-NoProfile", "-Command", &script]);
+        let outcome = preflight_invocation_for_kd4_runtime(
+            true, false, &invocation, &command, Some(ShellType::PowerShell), Some(fixture.path()),
+        ).await.unwrap();
+        let CommandInvocation::PowerShellScript(repaired) = &outcome.invocation else { panic!("shell must be preserved"); };
+        assert!(outcome.repaired(), "{outcome:?}");
+        assert!(outcome.advisory.is_none());
+        assert!(repaired.contains("a''b.rs"));
+        let run = |script: &str| std::process::Command::new(shell.as_path())
+            .args(["-NoProfile", "-Command", script]).current_dir(fixture.path()).output().unwrap();
+        let actual = run(repaired);
+        let expected = run(&format!("rg -n {pattern} 'src/a''b.rs'"));
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stdout, expected.stdout);
+        assert_eq!(actual.stderr, expected.stderr);
+        for (enabled, direct, cwd) in [(false, false, Some(fixture.path())), (true, true, Some(fixture.path())), (true, false, None)] {
+            let unchanged = preflight_invocation_for_kd4_runtime(
+                enabled, direct, &invocation, &command, Some(ShellType::PowerShell), cwd,
+            ).await.unwrap();
+            assert_eq!(unchanged.invocation, invocation);
+            assert!(!unchanged.repaired());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_leaf_glob_repair_refuses_ambiguous_or_effectful_scripts() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fixture.path().join("src")).unwrap();
+    std::fs::write(fixture.path().join("src/a.rs"), "needle\n").unwrap();
+    let shell = codex_shell_command::powershell::try_find_pwsh_executable_blocking().unwrap();
+    for script in [
+        "rg needle src/*.rs | Select-Object -First 1",
+        "Get-Content src/a.rs; rg needle src/*.rs",
+        "Set-Content src/a.rs changed; rg needle src/*.rs",
+        "rg needle src/*.rs > output.txt",
+        "rg $pattern src/*.rs",
+        "rg --pre helper.exe needle src/*.rs",
+        "rg needle src/*.missing",
+        "rg needle src/*.rs src/other.txt",
+    ] {
+        let invocation = CommandInvocation::PowerShellScript(script.into());
+        let command = strings(&[shell.as_path().to_str().unwrap(), "-NoProfile", "-Command", script]);
+        assert!(repair_powershell_rg_leaf_glob(&invocation, &command, fixture.path()).is_none(), "{script}");
+        let outcome = preflight_invocation_for_kd4_runtime(
+            true, false, &invocation, &command, Some(ShellType::PowerShell), Some(fixture.path()),
+        ).await.unwrap();
+        assert_eq!(outcome.invocation, invocation);
+        assert!(!outcome.repaired());
+    }
+    assert_eq!(std::fs::read_to_string(fixture.path().join("src/a.rs")).unwrap(), "needle\n");
+    assert!(!fixture.path().join("output.txt").exists());
+    let script = "rg needle src/*.rs";
+    let invocation = CommandInvocation::PowerShellScript(script.into());
+    let command = strings(&[shell.as_path().to_str().unwrap(), "-Command", script]);
+    assert!(repair_powershell_rg_leaf_glob(&invocation, &command, fixture.path()).is_none());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn leaf_glob_runtime_repair_avoids_retry_and_respects_bypasses() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fixture.path().join("src")).unwrap();
+    std::fs::write(fixture.path().join("src/answer.rs"), "needle\n").unwrap();
+    std::fs::write(fixture.path().join("src/other.txt"), "needle\n").unwrap();
+    let invocation = CommandInvocation::Argv {
+        program: "rg".into(), args: strings(&["-n", "needle", "src/*.rs"]),
+    };
+    let command = invocation.to_direct_argv().unwrap();
+    let repaired = preflight_invocation_for_kd4_runtime(
+        true, false, &invocation, &command, None, Some(fixture.path()),
+    ).await.unwrap();
+    assert!(repaired.repaired());
+    let argv = repaired.invocation.to_direct_argv().unwrap();
+    let run = |args: &[String]| std::process::Command::new(&args[0])
+        .args(&args[1..]).current_dir(fixture.path()).output().unwrap();
+    let actual = run(&argv);
+    let expected = run(&strings(&["rg", "-n", "needle", "src/answer.rs"]));
+    assert!(actual.status.success(), "{actual:?}");
+    assert_eq!(actual.stdout, expected.stdout);
+    assert_eq!(actual.stderr, expected.stderr);
+    for (enabled, direct) in [(false, false), (true, true)] {
+        let outcome = preflight_invocation_for_kd4_runtime(
+            enabled, direct, &invocation, &command, None, Some(fixture.path()),
+        ).await.unwrap();
+        assert_eq!(outcome.invocation, invocation);
+        assert!(!outcome.repaired());
+    }
+    assert!(preflight_invocation_for_kd4_runtime(
+        true, false, &invocation, &command, None, None,
+    ).await.is_err(), "remote requests must not inspect the host filesystem");
+}
+
+#[tokio::test]
+async fn source_paging_advice_preserves_invocation_and_runtime_bypasses() {
+    let fixture = tempfile::tempdir().unwrap();
+    for script in [
+        "Get-Content -LiteralPath source.rs | Select-Object -Skip 2 -First 3",
+        "Get-Content source.rs -TotalCount 5; Get-Content other.rs -Head 3",
+    ] {
+        let invocation = CommandInvocation::PowerShellScript(script.into());
+        let command = strings(&["pwsh", "-NoProfile", "-Command", script]);
+        let original = preflight_invocation_for_runtime(
+            false, &invocation, &command, Some(ShellType::PowerShell),
+        ).await.unwrap();
+        for (enabled, direct, cwd, expected) in [
+            (true, false, Some(fixture.path()), true),
+            (false, false, Some(fixture.path()), false),
+            (true, true, Some(fixture.path()), false),
+            (true, false, None, false),
+        ] {
+            let outcome = preflight_invocation_for_kd4_runtime(
+                enabled, direct, &invocation, &command, Some(ShellType::PowerShell), cwd,
+            ).await.unwrap();
+            assert_eq!(outcome.invocation, invocation);
+            assert!(!outcome.repaired());
+            assert_eq!(outcome.advisory.is_some(), expected, "{script}");
+            if expected {
+                assert_eq!(outcome.validation_invocations, original.validation_invocations);
+                let notice = outcome.model_notice().unwrap();
+                assert!(notice.contains("runs unchanged"));
+                assert!(notice.contains("-Skip N starts at line N+1"));
+                assert!(notice.contains("Do not reread already delivered evidence"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn source_paging_advice_excludes_transformations_and_unpaged_reads() {
+    for script in [
+        "Get-Content source.rs",
+        "Get-Content source.rs; Get-Content other.rs",
+        "Get-Content source.rs -Wait | Select-Object -First 3",
+        "Get-Content source.rs -Encoding Unicode | Select-Object -First 3",
+        "Get-Content source.rs -AsByteStream | Select-Object -First 3",
+        "Get-Content source.rs | Select-Object -Property Length",
+        "Get-Content source.rs | Select-Object -First 3; Set-Content dest.txt changed",
+        "Write-Output 'Get-Content source.rs | Select-Object -First 3'",
+    ] {
+        let invocation = CommandInvocation::PowerShellScript(script.into());
+        let command = strings(&["pwsh", "-NoProfile", "-Command", script]);
+        let outcome = preflight_invocation_for_runtime(
+            false, &invocation, &command, Some(ShellType::PowerShell),
+        ).await.unwrap();
+        assert_eq!(source_paging_advisory(&outcome.validation_invocations,
+            Some(ShellType::PowerShell)), None, "{script}");
+    }
+    let stages = [CommandInvocation::Argv {
+        program: "Get-Content".into(), args: strings(&["source.rs", "-Head", "3"]),
+    }];
+    assert_eq!(source_paging_advisory(&stages, Some(ShellType::Bash)), None);
+    assert_eq!(source_paging_advisory(&stages, None), None);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn source_paging_advice_keeps_unicode_output_errors_and_exit_status() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("source.rs"), "zero\nλ 日本語\nlast\n").unwrap();
+    for (script, expected) in [
+        ("Get-Content -LiteralPath source.rs | Select-Object -Skip 1 -First 1", Some("λ 日本語")),
+        ("Get-Content -LiteralPath missing.rs -TotalCount 1", None),
+    ] {
+        let invocation = CommandInvocation::PowerShellScript(script.into());
+        let command = strings(&["pwsh", "-NoProfile", "-Command", script]);
+        let outcome = preflight_invocation_for_kd4_runtime(
+            true, false, &invocation, &command, Some(ShellType::PowerShell), Some(fixture.path()),
+        ).await.unwrap();
+        assert_eq!(outcome.invocation, invocation);
+        assert!(outcome.advisory.is_some());
+        // A directly spawned PowerShell inherits nextest's console code page,
+        // unlike the runtime shell bootstrap. Make the fixture's stdout UTF-8
+        // so the Unicode assertion does not depend on the host's console.
+        let script = format!(
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); {script}"
+        );
+        let output = std::process::Command::new(&command[0])
+            .args(["-NoProfile", "-Command", &script])
+            .current_dir(fixture.path()).output().unwrap();
+        match expected {
+            Some(text) => {
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), text);
+            }
+            None => {
+                assert!(!output.status.success());
+                assert!(!output.stderr.is_empty());
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn missing_rg_paths_are_advisory_and_use_the_execution_workdir() {
     let fixture = tempfile::tempdir().unwrap();
@@ -1602,6 +1849,8 @@ fn preflight_requires_explicit_powershell_for_cmdlets_and_rejects_invalid_source
         Some(ShellType::PowerShell),
     ).unwrap_err();
     assert!(error.contains("invalid script syntax"));
+    assert!(error.contains("line 1, column"), "{error}");
+    assert!(error.contains("TerminatorExpectedAtEndOfString"), "{error}");
 }
 
 #[tokio::test(flavor = "current_thread")]

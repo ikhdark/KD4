@@ -111,6 +111,8 @@ pub(crate) use unified_exec::ExecCommandHandlerOptions;
 pub use unified_exec::WriteStdinHandler;
 pub(crate) use unified_exec::validate_exec_command_arguments;
 pub(crate) use read_file::validate_read_file_arguments;
+pub(crate) use read_file::canonical_read_file_arguments;
+pub(crate) use read_file::reselect_read_file_output;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 
@@ -136,6 +138,13 @@ impl ParsedFunctionArguments {
     }
 
     fn from_raw(arguments: &str) -> Self {
+        // Admission, dispatch and typed handlers can enter nested parse scopes.
+        // Reuse only an exact input match; a hook rewrite must parse anew.
+        if let Ok(Some(parsed)) = PARSED_FUNCTION_ARGUMENTS.try_with(|parsed| {
+            (parsed.raw.as_ref() == arguments).then(|| parsed.clone())
+        }) {
+            return parsed;
+        }
         Self {
             raw: Arc::from(arguments),
             value: serde_json::from_str(arguments)
@@ -713,6 +722,27 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn nested_argument_scopes_reuse_exact_input_but_not_rewrites() {
+        for raw in [r#"{"path":"unchanged"}"#, "invalid json"] {
+            let original = super::ParsedFunctionArguments::from_raw(raw);
+            super::with_parsed_function_arguments(Some(original.clone()), async {
+                let reused = super::ParsedFunctionArguments::from_raw(raw);
+                assert!(std::sync::Arc::ptr_eq(&original.raw, &reused.raw));
+                match (&original.value, &reused.value) {
+                    (Ok(a), Ok(b)) => assert!(std::sync::Arc::ptr_eq(a, b)),
+                    (Err(a), Err(b)) => assert!(std::sync::Arc::ptr_eq(a, b)),
+                    _ => panic!("reuse changed parse outcome"),
+                }
+                let changed = super::ParsedFunctionArguments::from_raw(r#"{"path":"changed"}"#);
+                assert!(!std::sync::Arc::ptr_eq(&original.raw, &changed.raw));
+                assert_eq!(changed.value().unwrap()["path"], "changed");
+            }).await;
+            let independent = super::ParsedFunctionArguments::from_raw(raw);
+            assert!(!std::sync::Arc::ptr_eq(&original.raw, &independent.raw));
+        }
     }
 
     use super::EffectiveAdditionalPermissions;

@@ -440,7 +440,8 @@ _LIB_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
 
 
 def _rust_module_owners(
-    metadata: MetadataIndex, raw: str, cwd: Path
+    metadata: MetadataIndex, raw: str, cwd: Path,
+    declarations: dict | None = None,
 ) -> tuple[str, list[tuple[str, str | None, str]]] | None:
     """The package and (selector kind, selector value, module) owning a Rust file."""
     if not raw.endswith(".rs"):
@@ -475,7 +476,7 @@ def _rust_module_owners(
         # A file that is a target root belongs only to that target.
         roots = [(selector, src) for selector, src in targets if src == path]
         modules = [
-            (kind, value, _rust_module(src, path))
+            (kind, value, _rust_module(src, path, declarations=declarations))
             for (kind, value), src in roots
             or [(selector, src) for selector, src in targets if path.is_relative_to(src.parent)]
         ]
@@ -483,21 +484,32 @@ def _rust_module_owners(
     return None
 
 
-def _rust_module(crate_root: Path, path: Path, depth: int = 0) -> str:
+def _rust_module(
+    crate_root: Path, path: Path, depth: int = 0, *, declarations: dict | None = None
+) -> str:
     """Module path of `path` below `crate_root`, honoring sibling `#[path]`."""
     if path == crate_root:
         return ""
+    if declarations is None:
+        declarations = {}
     if depth < 8:
-        for sibling in sorted(path.parent.glob("*.rs")):
+        if path.parent not in declarations:
+            siblings = []
+            for sibling in sorted(path.parent.glob("*.rs")):
+                try:
+                    text = sibling.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                siblings.append((sibling, _PATH_MODULE.findall(text)))
+            declarations[path.parent] = siblings
+        for sibling, modules in declarations[path.parent]:
             if sibling == path:
                 continue
-            try:
-                text = sibling.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            for declared, module in _PATH_MODULE.findall(text):
+            for declared, module in modules:
                 if declared == path.name:
-                    parent = _rust_module(crate_root, sibling.resolve(), depth + 1)
+                    parent = _rust_module(
+                        crate_root, sibling.resolve(), depth + 1, declarations=declarations
+                    )
                     return f"{parent}::{module}" if parent else module
     parts = list(path.relative_to(crate_root.parent).with_suffix("").parts)
     if parts[-1:] == ["mod"]:
@@ -539,6 +551,63 @@ def _stdout_text(result: subprocess.CompletedProcess[str]) -> str:
     # JSON inventory/metadata is control data, not an unbounded diagnostic log.
     path = getattr(result, "stdout_path", None)
     return path.read_text(encoding="utf-8", errors="replace") if path else result.stdout
+
+
+def _failure_diagnostic_excerpt(
+    result: subprocess.CompletedProcess[str], stream: str, tail: str,
+) -> str:
+    """Display selected diagnostics, never replace retained bytes or test proof.
+
+    A nextest failure may precede thousands of passes; a linker command may be
+    one enormous line. Tail-only receipts make the caller read the log again to
+    learn the cause. Keep a bounded, explicitly partial excerpt plus the tail.
+    The existing line iterator bounds memory and skips oversized records.
+    """
+    path = getattr(result, f"{stream}_path", None)
+    if path is None:
+        return tail
+    heading = "Selected failure diagnostics (partial; full log below):\n"
+    separator = "\n... remaining log omitted; tail follows ...\n"
+    tail = tail[-MAX_FAILURE_STREAM_CHARS:]
+    tail_size = min(len(tail), MAX_FAILURE_STREAM_CHARS // 4)
+    budget = MAX_FAILURE_STREAM_CHARS - len(heading) - len(separator) - tail_size
+    selected: list[str] = []
+    context = 0
+    try:
+        # Complete short logs should not be summarized or scanned again.
+        if path.stat().st_size <= len(tail.encode("utf-8")):
+            return tail
+        for raw in _output_lines(result, stream):
+            line = re.sub(r"\x1b\[[0-9;]*m", "", raw).rstrip("\r\n")
+            diagnostic = bool(re.search(
+                r"^\s*(?:error(?:\[E\d+\])?:|(?:lld-link|rust-lld): error:|"
+                r"(?:=\s*)?note: (?:lld-link|rust-lld): error:)|"
+                r"\bpanicked at\b", line,
+            ))
+            status = bool(re.match(
+                r"\s*(?:FAIL|LEAK-FAIL|TIMEOUT|EXECFAIL|ABORT)\s+\[", line,
+            ))
+            if not (diagnostic or status or context):
+                continue
+            if diagnostic:
+                context = 4
+            elif context:
+                context -= 1
+            # Bound long assertion values separately so they cannot displace
+            # every later failure. This is an excerpt, not exact source data.
+            if len(line) > 512:
+                line = line[:384] + " ... [line shortened] ... " + line[-96:]
+            line += "\n"
+            if len(line) > budget:
+                break
+            selected.append(line)
+            budget -= len(line)
+    except OSError:
+        # Diagnostic selection must not mask the command's original failure.
+        return tail
+    if not selected:
+        return tail
+    return heading + "".join(selected) + separator + (tail[-tail_size:] if tail_size else "")
 
 
 def _nextest_results(
@@ -977,8 +1046,14 @@ class RustTestRunner:
         selected: dict[str, list[str]] = {}
         unmapped: list[str] = []
         not_evaluated: set[str] = set()
+        # Capture each sibling declaration once for this ownership query, not
+        # once per input/target/recursive parent. Never carry it into another
+        # query or validation run: additions, removals and edits must be seen.
+        declarations: dict = {}
         for raw in dict.fromkeys(paths):
-            owners = _rust_module_owners(self.metadata, raw, cwd or Path.cwd())
+            owners = _rust_module_owners(
+                self.metadata, raw, cwd or Path.cwd(), declarations
+            )
             if not owners:
                 unmapped.append(raw)
                 continue
@@ -1827,7 +1902,7 @@ class RustTestRunner:
         include_stdout: bool = True,
     ) -> str:
         streams = [
-            (name, output)
+            (name, _failure_diagnostic_excerpt(result, name, output))
             for name, output in (
                 ("stdout", result.stdout if include_stdout else None),
                 ("stderr", result.stderr),
@@ -2213,6 +2288,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--target-dir")
     parser.add_argument(
+        "--admission-timeout-seconds", type=float, default=1800.0,
+        help="Maximum wait for another runner using the exact target directory (default 1800s). Place before the subcommand.",
+    )
+    parser.add_argument(
         "--cargo-profile",
         help="Cargo build profile for both tests and their helpers (for example dev-small).",
     )
@@ -2321,6 +2400,8 @@ def _split_runner_owned_options(
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if not math.isfinite(args.admission_timeout_seconds) or args.admission_timeout_seconds <= 0:
+            raise RunnerError("admission timeout must be a finite positive number")
         if args.command in {"_guard-generic", "guard-args"}:
             # This runs on every generic recipe invocation: never read the
             # manifest or shell out to Cargo here.
@@ -2382,15 +2463,57 @@ def main(argv: Sequence[str] | None = None) -> int:
             no_fail_fast=no_fail_fast,
             command_timeout_seconds=getattr(args, "command_timeout_seconds", None),
         )
+        return _dispatch_with_admission(
+            args, runner, metadata, execution_fingerprint, filter_args, allow_all
+        )
+    except RunnerError as exc:
+        print(f"rust_test_runner: {exc}", file=sys.stderr)
+        return 2
+
+
+def _dispatch_with_admission(
+    args: argparse.Namespace, runner: RustTestRunner, metadata: MetadataIndex,
+    execution_fingerprint: str | None, filter_args: Sequence[str], allow_all: bool,
+) -> int:
+    # Keep imports off the generic guard and planning path. This uses the same
+    # lease primitive as the existing lane owner, not a result-sharing service.
+    with ExitStack() as cleanup:
+        admission = None
+        if args.command in {"run-target", "run-gate", "check-gates"}:
+            try:
+                if __package__:
+                    from .rust_build_status import reserve_rust_test_target
+                else:
+                    from rust_build_status import reserve_rust_test_target
+
+                admission = cleanup.enter_context(reserve_rust_test_target(
+                    runner.target_dir, timeout_seconds=args.admission_timeout_seconds,
+                ))
+            except KeyboardInterrupt as exc:
+                raise RunnerError("Rust admission cancelled before dispatch", outcome="cancelled") from exc
+            except TimeoutError as exc:
+                raise RunnerError(str(exc), outcome="timed_out") from exc
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RunnerError(f"Rust admission failed: {exc}") from exc
+            print(f"Rust admission: wait={admission['wait_seconds']:.3f}s; target={runner.target_dir}", file=sys.stderr)
+            # Manifest definitions loaded before waiting must not silently select
+            # obsolete tests. Fail closed rather than auto-retrying changed work.
+            current = Manifest.load(args.manifest)
+            if current != runner.manifest:
+                raise RunnerError("Rust test manifest changed while waiting for admission; rerun with current inputs")
+            if execution_fingerprint is not None:
+                inputs = Path(__file__).read_bytes() + Path(args.manifest).read_bytes()
+                if hashlib.sha256(inputs).hexdigest() != execution_fingerprint:
+                    raise RunnerError("Rust runner inputs changed while waiting for admission; rerun with current inputs")
         dependencies = (
             execution_dependency_manifest(metadata, Path(args.manifest))
             if args.command in {"run-target", "run-gate"}
             else None
         )
         if args.command == "check-manifest":
-            metadata.validate_manifest(manifest)
+            metadata.validate_manifest(runner.manifest)
             print(
-                f"validated Rust test manifest version {manifest.version}: {args.manifest}"
+                f"validated Rust test manifest version {runner.manifest.version}: {args.manifest}"
             )
         elif args.command == "check-gates":
             runner.check_gates(args.names)
@@ -2403,18 +2526,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             emit_execution_receipt(
                 execution_fingerprint, receipts, [args.name], skipped=None,
                 dependency_manifest=dependencies,
+                admission=admission,
             )
         elif args.command == "run-gate":
             receipts = runner.run_gates(args.names)
             emit_execution_receipt(
                 execution_fingerprint, receipts, args.names, skipped=0,
                 dependency_manifest=dependencies,
+                admission=admission,
             )
         else:  # pragma: no cover - argparse enforces the command set.
             raise RunnerError(f"unsupported command {args.command!r}")
-    except RunnerError as exc:
-        print(f"rust_test_runner: {exc}", file=sys.stderr)
-        return 2
     return 0
 
 
@@ -2432,6 +2554,9 @@ def execution_dependency_manifest(
         Path(__file__).resolve(), manifest.resolve(),
         Path(__file__).with_name("process_owner.py").resolve(),
         Path(__file__).with_name("rust_tool_env.py").resolve(),
+        Path(__file__).with_name("rust_build_status.py").resolve(),
+        Path(__file__).with_name("rust_build_status_support.py").resolve(),
+        Path(__file__).with_name("tool_versions.py").resolve(),
         CODEX_RS_ROOT / "Cargo.toml", CODEX_RS_ROOT / "Cargo.lock",
     }
     for package in metadata.packages.values():
@@ -2492,6 +2617,7 @@ def emit_execution_receipt(
     *,
     skipped: int | None,
     dependency_manifest: dict[str, Any] | None = None,
+    admission: dict[str, object] | None = None,
 ) -> None:
     """Publish the runner's completed-test ledger, not a parsed success slogan.
 
@@ -2510,6 +2636,8 @@ def emit_execution_receipt(
     }
     if dependency_manifest is not None:
         receipt["dependency_manifest"] = dependency_manifest
+    if admission is not None:
+        receipt["admission"] = admission
     print(json.dumps(receipt, sort_keys=True))
 
 

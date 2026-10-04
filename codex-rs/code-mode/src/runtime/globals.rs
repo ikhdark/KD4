@@ -329,6 +329,14 @@ fn tool_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     tool_index: usize,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
+    // One callable/metadata pair per immutable catalog entry in this cell.
+    // Keep it in host state, not the user-mutable `tools` object. A new cell
+    // owns a new cache, so changed capabilities cannot reuse old functions.
+    let cached = scope.get_slot::<RuntimeState>()
+        .and_then(|state| state.tool_functions.get(&tool_index).cloned());
+    if let Some(cached) = cached {
+        return Ok(v8::Local::new(scope, cached));
+    }
     let enabled_tools = scope
         .get_slot::<RuntimeState>()
         .map(|state| Arc::clone(&state.enabled_tools))
@@ -359,6 +367,10 @@ fn tool_function<'s>(
         .get_function(scope)
         .ok_or_else(|| "failed to create tool metadata serializer".to_string())?;
     set_global(scope, function.into(), "toJSON", to_json.into())?;
+    let retained = v8::Global::new(scope, function);
+    scope.get_slot_mut::<RuntimeState>()
+        .ok_or_else(|| "missing runtime state".to_string())?
+        .tool_functions.insert(tool_index, retained);
     Ok(function)
 }
 

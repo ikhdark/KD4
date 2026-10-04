@@ -33,6 +33,12 @@ fn create_apply_patch_freeform_tool_matches_expected_spec() {
         "incremental",
         "only remaining changes",
         "FREEFORM",
+        "large replacements already fully read",
+        "ordinary contextual hunks suit small edits",
+        "whole-file source_sha256, never an excerpt hash",
+        "read current source and reconcile before retrying",
+        "Deterministic transformations may still construct patches in JavaScript",
+        "read/transform/apply chain in one cell after checking prerequisites",
     ] {
         assert!(tool.description.contains(rule), "missing rule: {rule}");
     }

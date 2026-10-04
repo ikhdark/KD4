@@ -67,7 +67,35 @@ pub(crate) struct PlanRequirement {
     pub(crate) superseded_reason: Option<String>,
 }
 
+/// Derived checklist state, never a validation or publication receipt. Keeping
+/// the unresolved IDs separate avoids reconstructing obligations from prose.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PlanObligationSummary {
+    pub(crate) completed: usize,
+    pub(crate) superseded: usize,
+    pub(crate) unresolved: Vec<String>,
+}
+
 impl PlanLineage {
+    pub(crate) fn obligation_summary(&self, plan: &UpdatePlanArgs) -> PlanObligationSummary {
+        // Old histories carry only the checklist. Reconstruct from that source,
+        // not a possibly stale serialized summary.
+        if self.is_empty() && !plan.plan.is_empty() {
+            return Self::from_plan(Some(plan)).obligation_summary(plan);
+        }
+        let mut summary = PlanObligationSummary::default();
+        for (id, requirement) in &self.requirements {
+            if requirement.superseded_reason.is_some() {
+                summary.superseded += 1;
+            } else if requirement.status == StepStatus::Completed {
+                summary.completed += 1;
+            } else {
+                summary.unresolved.push(id.clone());
+            }
+        }
+        summary
+    }
+
     pub(crate) fn step_id(&self, text: &str) -> String {
         let key = plan_step_id(text);
         self.step_identities.get(&key).cloned().unwrap_or(key)
@@ -190,6 +218,30 @@ impl PlanLineage {
         }
         lineage
     }
+
+    /// Reconcile historical metadata with the owning checklist, retaining
+    /// original obligations even when they are no longer mapped to a step.
+    /// A partial lineage must not make a pending checklist appear resolved.
+    fn reconcile_restored(mut self, plan: Option<&UpdatePlanArgs>) -> Self {
+        let Some(plan) = plan else {
+            return self;
+        };
+        for ids in self.step_requirements.values_mut() {
+            ids.retain(|id| self.requirements.get(id)
+                .is_some_and(|requirement| requirement.superseded_reason.is_none()));
+        }
+        self.revise(
+            Some(plan),
+            &plan.plan.iter().map(|step| PlanStepArg {
+                step: step.step.clone(),
+                status: step.status,
+                continues: Vec::new(),
+            }).collect::<Vec<_>>(),
+            &[],
+        );
+        self.update_statuses(plan);
+        self
+    }
 }
 
 #[derive(Debug, Default)]
@@ -247,6 +299,8 @@ pub(crate) struct SupersededStep {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PlanToolResponse {
     pub(crate) current_plan: UpdatePlanArgs,
+    #[serde(default)]
+    pub(crate) obligations: PlanObligationSummary,
     #[serde(default = "checklist_completion_authority")]
     pub(crate) completion_authority: String,
     #[serde(default, skip_serializing_if = "PlanLineage::is_empty")]
@@ -378,11 +432,7 @@ impl PlanStore {
         let mut current = self.current.lock().await;
         *current = restored
             .map(|response| {
-                let lineage = if response.lineage.is_empty() {
-                    PlanLineage::from_plan(Some(&response.current_plan))
-                } else {
-                    response.lineage
-                };
+                let lineage = response.lineage.reconcile_restored(Some(&response.current_plan));
                 PlanState { plan: Some(response.current_plan), lineage }
             })
             .unwrap_or_default();
@@ -401,9 +451,7 @@ impl PlanStore {
     ) {
         let mut current = self.current.lock().await;
         *current = PlanState {
-            lineage: lineage
-                .filter(|lineage| !lineage.is_empty())
-                .unwrap_or_else(|| PlanLineage::from_plan(plan.as_ref())),
+            lineage: lineage.unwrap_or_default().reconcile_restored(plan.as_ref()),
             plan,
         };
     }
@@ -767,6 +815,114 @@ mod tests {
         ).await.unwrap();
         assert_eq!(result.current.plan[0].status, StepStatus::Pending);
         assert_eq!(result.current.plan[1].status, StepStatus::Completed);
+    }
+
+    #[test]
+    fn completion_summary_separates_resolved_unresolved_and_superseded_requirements() {
+        let current = plan("required check", StepStatus::Pending);
+        let mut lineage = PlanLineage::from_plan(Some(&current));
+        lineage.requirements.insert("completed".into(), PlanRequirement {
+            text: "verified implementation".into(), status: StepStatus::Completed,
+            superseded_reason: None,
+        });
+        lineage.requirements.insert("retired".into(), PlanRequirement {
+            text: "user removed scope".into(), status: StepStatus::Pending,
+            superseded_reason: Some("explicit correction".into()),
+        });
+        let summary = lineage.obligation_summary(&current);
+        assert_eq!(summary.completed, 1);
+        assert_eq!(summary.superseded, 1);
+        assert_eq!(summary.unresolved, vec![plan_step_id("required check")]);
+        assert_eq!(PlanLineage::default().obligation_summary(&current).unresolved,
+            summary.unresolved, "legacy checklist is not an empty obligation set");
+        lineage.update_statuses(&plan("required check", StepStatus::Completed));
+        let summary = lineage.obligation_summary(&current);
+        assert_eq!(summary.completed, 2);
+        assert!(summary.unresolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_summary_is_recompiled_after_restore_not_trusted_as_evidence() {
+        let current = plan("still required", StepStatus::Pending);
+        let response = serde_json::json!({
+            "current_plan": current,
+            "obligations": {"completed": 999, "superseded": 0, "unresolved": []}
+        });
+        let parsed: PlanToolResponse = serde_json::from_value(response).unwrap();
+        let store = PlanStore::default();
+        store.restore_with_lineage(Some(parsed.current_plan), Some(parsed.lineage)).await;
+        let (restored, lineage) = store.snapshot_with_lineage().await.unwrap();
+        let summary = lineage.obligation_summary(&restored);
+        assert_eq!(summary.completed, 0);
+        assert_eq!(summary.unresolved, vec![plan_step_id("still required")]);
+    }
+
+    #[tokio::test]
+    async fn completion_audit_restores_partial_lineage_without_losing_obligations() {
+        for mode in ["missing-step", "unknown-reference", "retired-reference", "stale-status"] {
+            for history_replay in [false, true] {
+                let current = plan("verify current work", StepStatus::Pending);
+                let id = plan_step_id("verify current work");
+                let mut lineage = PlanLineage::from_plan(Some(&plan("earlier work", StepStatus::Completed)));
+                let earlier_id = plan_step_id("earlier work");
+                lineage.requirements.insert("unmapped-open".into(), PlanRequirement {
+                    text: "original unresolved obligation".into(),
+                    status: StepStatus::InProgress,
+                    superseded_reason: None,
+                });
+                match mode {
+                    "unknown-reference" => { lineage.step_requirements.insert(id.clone(), vec!["absent".into()]); }
+                    "retired-reference" => {
+                        lineage.requirements.get_mut(&earlier_id).unwrap().superseded_reason = Some("user removed scope".into());
+                        lineage.step_requirements.insert(id.clone(), vec![earlier_id.clone()]);
+                    }
+                    "stale-status" => {
+                        lineage.requirements.insert(id.clone(), PlanRequirement {
+                            text: "verify current work".into(), status: StepStatus::Completed,
+                            superseded_reason: None,
+                        });
+                        lineage.step_requirements.insert(id.clone(), vec![id.clone()]);
+                    }
+                    _ => {}
+                }
+                let store = PlanStore::default();
+                if history_replay {
+                    let history = vec![
+                        ResponseItem::FunctionCall {
+                            id: None, name: "update_plan".into(), namespace: None,
+                            arguments: "{}".into(), call_id: "restore".into(),
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                        ResponseItem::FunctionCallOutput {
+                            id: None, call_id: "restore".into(),
+                            output: FunctionCallOutputPayload::from_text(serde_json::json!({
+                                "current_plan": current, "lineage": lineage,
+                                "obligations": {"completed": 999, "superseded": 0, "unresolved": []}
+                            }).to_string()),
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                    ];
+                    assert!(store.restore_from_history(&history).await);
+                } else {
+                    store.restore_with_lineage(Some(current.clone()), Some(lineage)).await;
+                }
+                let (restored, repaired) = store.snapshot_with_lineage().await.unwrap();
+                assert_eq!(restored, current);
+                assert_eq!(store.active_requirement_count().await, 2, "{mode}");
+                assert_eq!(repaired.obligation_summary(&restored).unresolved.len(), 2);
+                assert_eq!(repaired.requirements["unmapped-open"].status, StepStatus::InProgress);
+                let revision = plan_revision_with_lineage(Some(&restored), &repaired);
+                store.restore_with_lineage(Some(restored.clone()), Some(repaired)).await;
+                let (_, again) = store.snapshot_with_lineage().await.unwrap();
+                assert_eq!(plan_revision_with_lineage(Some(&restored), &again), revision, "restore is idempotent");
+                let closed = store.update_tool(PlanToolArgs {
+                    set: Some(vec![PlanStatusUpdate { index: None, step_id: Some(id), status: StepStatus::Completed }]),
+                    ..Default::default()
+                }).await.unwrap();
+                assert_eq!(closed.lineage.obligation_summary(&closed.current).unresolved, vec!["unmapped-open"]);
+                assert_eq!(store.active_requirement_count().await, 1);
+            }
+        }
     }
 
     #[tokio::test]

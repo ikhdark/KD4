@@ -54,6 +54,9 @@ fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
         assert!(description.contains("Derive search roots from observed paths"));
         assert!(description.contains("record missing paths as coverage gaps"));
         assert!(description.contains("For a known source file, read whole useful regions."));
+        assert!(description.contains("Prefer native `read_file` with batched selectors"));
+        assert!(description.contains("Keep shell reads for required encoding, streaming, or transformations"));
+        assert!(description.contains("do not repeat delivered reads just to switch tools"));
         assert!(description.contains(
             "Omit `max_output_tokens` unless deliberately requesting a smaller display;"
         ));

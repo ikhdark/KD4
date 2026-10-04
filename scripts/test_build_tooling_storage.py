@@ -1561,8 +1561,15 @@ class BuildToolingStorageTest(unittest.TestCase):
                         )
                         self.assertEqual(env["NEXTEST_PROFILE"], profile)
                         self.assertEqual(env["RUST_MIN_STACK"], "8388608")
-                        self.assertNotIn("CODEX_CARGO_LANE_TARGET_DIR", env)
+                        self.assertEqual(env["CODEX_CARGO_LANE_TARGET_DIR"], str(target))
                         self.assertNotIn("CARGO_TARGET_DIR", env)
+                        # The parent still owns the lane. The runner inherits
+                        # that reservation without reacquiring it or deadlocking.
+                        with mock.patch.dict(os.environ, env, clear=True):
+                            with rust_build_status.reserve_rust_test_target(
+                                target, timeout_seconds=.1,
+                            ) as admission:
+                                self.assertTrue(admission["inherited_lane_reservation"])
                         return subprocess.CompletedProcess(command, 7)
 
                     run.side_effect = child

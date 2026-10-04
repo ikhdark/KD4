@@ -58,7 +58,14 @@ def hydrate_rollout_record(record: Any, path: Path) -> Any:
     reference = record.get("payload")
     if not isinstance(reference, dict) or type(reference.get("bytes")) is not int:
         raise ValueError("invalid rollout payload reference")
-    item = json.loads(load_rollout_payload(path, reference.get("sha256"), reference["bytes"]))
+    data = load_rollout_payload(path, reference.get("sha256"), reference["bytes"])
+    return _hydrate_verified_payload(record, data)
+
+
+def _hydrate_verified_payload(record: dict[str, Any], data: bytes) -> dict[str, Any]:
+    """Decode bytes already authenticated by load_rollout_payload in this operation."""
+    reference = record["payload"]
+    item = json.loads(data)
     if (not isinstance(item, dict) or item.get("type") == _PAYLOAD_KIND
             or item.get("type") != reference.get("item_type")):
         raise ValueError("rollout payload type mismatch")
@@ -80,13 +87,15 @@ def copy_rollout_payloads(snapshot: RolloutSnapshot, output: Path) -> None:
                 continue  # Preserve raw snapshots, including an incomplete tail.
             if not isinstance(record, dict) or record.get("type") != _PAYLOAD_KIND:
                 continue
-            hydrate_rollout_record(record, snapshot.path)
             reference = record["payload"]
+            if not isinstance(reference, dict) or type(reference.get("bytes")) is not int:
+                raise ValueError("invalid rollout payload reference")
+            data = load_rollout_payload(snapshot.path, reference.get("sha256"), reference["bytes"])
+            _hydrate_verified_payload(record, data)
             digest = reference["sha256"]
             if digest in seen:
                 continue
             seen.add(digest)
-            data = load_rollout_payload(snapshot.path, digest, reference["bytes"])
             directory = rollout_payload_root(output)
             directory.mkdir(parents=True, exist_ok=True)
             destination = directory / f"{digest}.json"
@@ -107,10 +116,28 @@ def copy_rollout_payloads(snapshot: RolloutSnapshot, output: Path) -> None:
 
 @dataclass(frozen=True)
 class RolloutSnapshot:
+    """Owned immutable bytes; use as a context manager or explicitly close it.
+
+    Reading lines does not transfer ownership. Copying only ``data`` does not
+    export referenced payloads; use the CLI's ``--output`` for a portable copy.
+    """
+
     path: Path
     stream: BinaryIO
     sha256: str
     byte_length: int
+
+    def close(self) -> None:
+        """Release the captured stream; repeated calls are harmless."""
+        self.stream.close()
+
+    def __enter__(self) -> RolloutSnapshot:
+        if self.stream.closed:
+            raise ValueError("rollout snapshot is already closed")
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
 
     @property
     def data(self) -> bytes:
@@ -217,6 +244,12 @@ def discover_rollouts(root: Path, pattern: str = "*.jsonl") -> list[Path]:
 
 
 def read_rollout_snapshot(path: Path) -> RolloutSnapshot:
+    """Capture once; use `with read_rollout_snapshot(path) as snapshot` to close it.
+
+    `open_lines()` borrows the snapshot; exiting it does not close an uncompressed
+    snapshot. Existing callers may still explicitly close `snapshot.stream`.
+    For decoded records plus wire lengths, prefer `read_rollout_records(path)`.
+    """
     candidate = existing_rollout_path(path)
     for attempt in range(2):
         try:
@@ -271,7 +304,7 @@ def read_rollout_records(path: Path) -> list[tuple[dict[str, Any], int]]:
     """
     snapshot = read_rollout_snapshot(path)
     records = []
-    with contextlib.closing(snapshot.stream), snapshot.open_lines() as lines:
+    with snapshot, snapshot.open_lines() as lines:
         for number, line in enumerate(lines, 1):
             try:
                 record = json.loads(line.decode("utf-8"))
@@ -305,15 +338,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        help="Optional path where the captured bytes are written",
+        help="Write a portable snapshot with checksum-verified referenced payloads",
     )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    snapshot = read_rollout_snapshot(args.path)
-    with contextlib.closing(snapshot.stream):
+    with read_rollout_snapshot(args.path) as snapshot:
         metadata = snapshot.metadata()
         if args.output is not None:
             output = args.output.resolve()

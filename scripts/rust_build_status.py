@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from dataclasses import field
 import errno
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -503,6 +504,8 @@ def cargo_lock_is_busy(target_dir: Path) -> bool:
     # Cargo locks each profile directory, optionally below a target triple.
     # Inspect only those two levels; never follow junctions into other trees.
     try:
+        if _binary_file_lock_is_busy(target_dir / ".rust-test-runner.lock"):
+            return True
         for child in target_dir.iterdir():
             if not child.is_dir():
                 continue
@@ -535,11 +538,17 @@ def _cargo_lock_file_is_busy(lock_path: Path) -> bool:
     handle: TextIO | None = None
     try:
         handle = lock_path.open("r+")
-        import msvcrt
-
         try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             return False
         except OSError:
             return True
@@ -667,9 +676,14 @@ def cargo_lane_coordination_lock(
 
 def _release_binary_file_lock(handle: BinaryIO) -> None:
     handle.seek(0)
-    import msvcrt
+    if os.name == "nt":
+        import msvcrt
 
-    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _try_acquire_binary_file_lock(path: Path) -> BinaryIO | None:
@@ -686,10 +700,15 @@ def _try_acquire_binary_file_lock(path: Path) -> BinaryIO | None:
             handle.write(b"\0")
             handle.flush()
         handle.seek(0)
-        import msvcrt
-
         try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             if _is_file_lock_contention(exc):
                 return None
@@ -699,6 +718,101 @@ def _try_acquire_binary_file_lock(path: Path) -> BinaryIO | None:
     finally:
         if not acquired:
             handle.close()
+
+
+def _binary_file_lock_is_busy(path: Path) -> bool:
+    """An existing, uninspectable lease is busy; a missing lease is not."""
+    try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        handle = _try_acquire_binary_file_lock(path)
+        if handle is None:
+            return True
+        try:
+            _release_binary_file_lock(handle)
+        finally:
+            handle.close()
+        return False
+    except OSError:
+        return True
+
+
+@contextmanager
+def reserve_rust_test_target(
+    target_dir: Path, *, timeout_seconds: float = 1800.0,
+) -> Iterator[dict[str, object]]:
+    """Coordinate whole runner invocations, not cached results.
+
+    A separate lease avoids re-acquiring a parent run-lane reservation. Managed
+    lanes use the existing short creation/prune lock; never hold it while waiting
+    or executing. Different exact targets remain independent. Observe existing
+    raw Cargo locks too, without claiming to prevent uncooperative future starts.
+    CODEX_CARGO_LANE_TARGET_DIR is the wrappers' inherited reservation contract,
+    not an authorization boundary; it exempts only that exact parent lane, never
+    another runner or Cargo process using the target.
+    """
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("admission timeout must be a finite positive number")
+    target_dir = target_dir.resolve()
+    inherited_target = os.environ.get("CODEX_CARGO_LANE_TARGET_DIR")
+    parent_reserved = bool(
+        inherited_target and Path(inherited_target).resolve() == target_dir
+    )
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    handle = None
+    announced = False
+    try:
+        while handle is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for Rust test target {target_dir}")
+            managed = (target_dir.parent / CARGO_LANES_ROOT_MARKER).is_file()
+            coordination = (
+                cargo_lane_coordination_lock(
+                    target_dir.parent, timeout_seconds=min(30.0, remaining)
+                ) if managed and os.name == "nt" else nullcontext()
+            )
+            with coordination:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                if (target_dir / ".lane-cleanup-unconfirmed").exists():
+                    raise RuntimeError(f"Rust test target is quarantined: {target_dir}")
+                lane_busy = not parent_reserved and _binary_file_lock_is_busy(
+                    target_dir / ".lane-active.lock"
+                )
+                if not lane_busy and not cargo_lock_is_busy(target_dir):
+                    handle = _try_acquire_binary_file_lock(target_dir / ".rust-test-runner.lock")
+            if handle is None:
+                if not announced:
+                    print(f"Rust admission: waiting for target {target_dir}", file=sys.stderr)
+                    announced = True
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        try:
+            yield {
+                "target_dir": str(target_dir),
+                "wait_seconds": time.monotonic() - started,
+                "scope": "cooperating_rust_test_runner_invocations",
+                "inherited_lane_reservation": parent_reserved,
+                "observed_external_locks": ["lane_reservation", "cargo_profile"],
+            }
+        except BaseException as error:
+            if isinstance(error, CleanupFailed) or getattr(error, "outcome", None) == "cleanup_failed":
+                (target_dir / ".lane-cleanup-unconfirmed").write_text(
+                    "Runner process cleanup was not confirmed; inspect descendants before removing this quarantine.\n",
+                    encoding="utf-8",
+                )
+            raise
+    finally:
+        if handle is not None:
+            try:
+                _release_binary_file_lock(handle)
+            finally:
+                handle.close()
 
 
 def _safe_lane_name(value: str) -> str:
@@ -1515,6 +1629,9 @@ def _direct_reserved_lane_command(
     if runner_arguments is not None:
         child_env["RUST_MIN_STACK"] = RUST_MIN_STACK_BYTES
         child_env["NEXTEST_PROFILE"] = profile
+        # The direct Python shortcut must preserve the same parent reservation
+        # contract as the PowerShell/just wrapper, or admission waits on itself.
+        child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
         return [
             sys.executable,
             str(repo_root / "scripts" / "rust_test_runner.py"),

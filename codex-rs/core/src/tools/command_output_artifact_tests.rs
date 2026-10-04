@@ -2,6 +2,47 @@ use super::*;
 use codex_utils_string::approx_token_count;
 use std::time::Duration;
 
+#[test]
+fn script_selector_sizing_reuses_prefix_without_changing_admission() {
+    // Reference the old full-envelope measurement, including escaping, overflow
+    // metadata and repeated selections. Different source bytes must recompute it.
+    for text in ["a".repeat(20_000), "\"\\\n".repeat(20_000)] {
+        let canonical = CanonicalToolResult::text(text);
+        let selectors = (0..64).map(|index| ToolOutputSelector::Bytes {
+            start: index,
+            end: canonical.exact_bytes,
+        }).collect::<Vec<_>>();
+        let metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string());
+        let (mut expected, _) = select_file_snapshot_for_script(&canonical, Some(Vec::new())).unwrap();
+        for selector in &selectors {
+            let selected = select_logical_artifact(
+                &metadata, &canonical.bytes, selector.clone(), usize::MAX, usize::MAX,
+                &expected.results,
+            );
+            expected.results.push(selected.clone());
+            if serde_json::to_vec(&expected).unwrap().len() > 1024 * 1024 - 128 * 1024 {
+                expected.results.pop();
+                let mut omitted = ToolOutputSelectorResult::state(
+                    selector.clone(), ToolOutputSelectorStatus::AggregateOmitted,
+                );
+                omitted.exact_bytes = selected.exact_bytes;
+                omitted.canonical_range = selected.canonical_range;
+                omitted.continuation = Some(selector.clone());
+                omitted.message = Some("Selection exceeds the 1 MiB script payload cap; request smaller ranges.".into());
+                expected.results.push(omitted);
+            }
+        }
+        expected.complete = expected.results.iter().all(|result|
+            result.status == ToolOutputSelectorStatus::Ok && result.complete);
+        let (actual, continuation) = select_file_snapshot_for_script(&canonical, Some(selectors)).unwrap();
+        assert_eq!(actual, expected);
+        assert!(continuation.is_none());
+        assert!(actual.results.iter().any(|result| result.status == ToolOutputSelectorStatus::AggregateOmitted));
+        assert!(serde_json::to_vec(&actual).unwrap().len() <= 1024 * 1024);
+        assert_eq!(actual.canonical_sha256, canonical.sha256);
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 #[expect(clippy::print_stdout, reason = "emit deterministic audit fixture measurements")]

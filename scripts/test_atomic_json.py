@@ -17,6 +17,36 @@ def windows_error(code: int) -> OSError:
 
 
 class AtomicJsonTest(unittest.TestCase):
+    def test_exclusive_stream_never_clobbers_and_cleans_failed_writes(self):
+        class InterruptedSource(io.BytesIO):
+            def read(self, size=-1):
+                if self.tell():
+                    raise OSError("producer interrupted")
+                return super().read(2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report"
+            with self.assertRaisesRegex(OSError, "producer interrupted"):
+                atomic_json.write_stream_atomic(output, InterruptedSource(b"partial"), exclusive=True)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            atomic_json.write_stream_atomic(output, io.BytesIO(b"complete"), exclusive=True)
+            with self.assertRaises(FileExistsError):
+                atomic_json.write_stream_atomic(output, io.BytesIO(b"replacement"), exclusive=True)
+            self.assertEqual(output.read_bytes(), b"complete")
+            self.assertEqual(list(Path(directory).iterdir()), [output])
+
+    def test_exclusive_publication_preserves_concurrent_winner(self):
+        link = os.link
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report"
+            def race(source, destination):
+                destination.write_bytes(b"winner")
+                link(source, destination)
+            with mock.patch.object(atomic_json.os, "link", side_effect=race), self.assertRaises(FileExistsError):
+                atomic_json.write_stream_atomic(output, io.BytesIO(b"loser"), exclusive=True)
+            self.assertEqual(output.read_bytes(), b"winner")
+            self.assertEqual(list(Path(directory).iterdir()), [output])
+
     def test_stream_output_uses_bounded_reads_and_keeps_source_open(self):
         payload = b"captured bytes\n" * 100_000
 

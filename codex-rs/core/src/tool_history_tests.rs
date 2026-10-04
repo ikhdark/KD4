@@ -255,6 +255,9 @@ async fn long_session_prompt_pressure_comparison() {
             .find(|(call_id, _)| *call_id == id).unwrap();
         let pin: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(pin["kind"], "tool_history_artifact_pin");
+        assert_eq!(pin["call_id"], id);
+        assert!(pin["tool_identity"].is_string());
+        assert!(pin["semantic_class"].is_string());
         assert_eq!(pin["bytes"], source.len());
         assert_eq!(pin["sha256"], sha256(source.as_bytes()));
         assert_eq!(read_exact_tool_output_artifact(
@@ -832,6 +835,34 @@ fn sampling_freshness_batches_results_and_only_appends_new_invalidations() {
         .project_continuation_with_workspace_cache(&anchor, canonical, Some(&changed), &cache)
         .unwrap();
     assert_eq!(repeated.items, projected.items);
+}
+
+#[test]
+fn invalidation_reason_changes_do_not_repeat_the_same_evidence_but_nested_changes_do() {
+    let previous = serde_json::json!({
+        "call_id": "read", "observed_revision": {"worktree_identity": "captured"},
+        "stale_workspace_evidence": true, "valid_for_current_workspace": false,
+        "reason": "repository changed", "reason_code": "workspace_identity_changed",
+        "current_nested_results": [{"call_id": "still-current"}],
+    });
+    let mut next = previous.clone();
+    next["reason"] = "source dependency changed".into();
+    next["reason_code"] = "source_dependencies_invalidated".into();
+    assert!(same_workspace_invalidation(&previous, &next));
+    assert!(same_workspace_invalidation(&next, &previous));
+    next["current_nested_results"] = serde_json::json!([]);
+    assert!(!same_workspace_invalidation(&previous, &next));
+    next = previous.clone();
+    next["observed_revision"]["worktree_identity"] = "new observation".into();
+    assert!(!same_workspace_invalidation(&previous, &next));
+    next = previous.clone();
+    next["call_id"] = "other".into();
+    assert!(!same_workspace_invalidation(&previous, &next));
+    next = previous.clone();
+    next["valid_for_current_workspace"] = true.into();
+    assert!(!same_workspace_invalidation(&previous, &next));
+    assert!(!same_workspace_invalidation(&serde_json::json!({"reason":"one"}),
+                                       &serde_json::json!({"reason":"two"})));
 }
 
 #[test]

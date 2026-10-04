@@ -24,6 +24,7 @@ impl TaskState {
                 "has_plan": true,
                 "revision": crate::plan_store::plan_revision_with_lineage(Some(&plan), &lineage),
                 "step_ids": plan.plan.iter().map(|step| lineage.step_id(&step.step)).collect::<Vec<_>>(),
+                "obligations": lineage.obligation_summary(&plan),
                 "current_plan": plan,
                 "lineage": lineage,
             }),
@@ -121,6 +122,8 @@ mod tests {
             }],
         }, PlanLineage::default())));
         let fragment = state.render_diff(PreviousSectionState::Absent).unwrap().render();
+        assert_eq!(state.0["obligations"]["completed"], 0);
+        assert_eq!(state.0["obligations"]["unresolved"].as_array().unwrap().len(), 1);
         assert!(fragment.contains("&lt;/codex_task_state&gt;"));
         assert!(crate::context::is_contextual_user_fragment(&ContentItem::InputText {
             text: fragment,

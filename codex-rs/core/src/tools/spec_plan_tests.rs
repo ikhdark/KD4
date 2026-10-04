@@ -959,8 +959,8 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
     assert!(mixed_exec.description.contains("read_file(args: unknown"));
     assert!(!nested_exec.description.contains("read_file(args: unknown"));
     assert!(nested_exec.description.contains("selectors?:"));
-    assert!(!mixed_exec.description.contains("yield_time_ms"));
-    assert!(nested_exec.description.contains("yield_time_ms"));
+    assert!(!mixed_exec.description.contains("yield_time_ms?:"));
+    assert!(nested_exec.description.contains("yield_time_ms?:"));
     let ToolSpec::Function(command) = mixed.visible_spec("exec_command") else {
         panic!("expected direct command schema");
     };
@@ -978,7 +978,6 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         for contract_field in [
             "max_output_tokens",
             "session_id",
-            "wall_time_seconds",
             "timeout_ms",
         ] {
             assert!(
@@ -990,6 +989,21 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         assert!(!exec.description.contains("Return the current time in UTC."));
         assert!(exec.description.contains("read_file(args:"));
         assert!(!exec.description.contains("read_tool_output(args:"));
+        assert!(!exec.description.contains("wall_time_seconds?:"));
+        assert!(!exec.description.contains("raw_output_artifact_bytes?:"));
+        assert!(exec.description.contains("retains the full contract when required"));
+    }
+    for name in ["exec_command", "write_stdin"] {
+        let definition = codex_tools::code_mode_tool_definition_for_spec(mixed.visible_spec(name)).unwrap();
+        assert!(definition.output_schema.is_some(), "{name}: discovery must retain the result schema");
+        let full = codex_code_mode::augment_tool_definition(definition.clone()).description;
+        assert!(full.contains("raw_output_artifact_bytes"));
+        let mut projected = definition.clone();
+        projected.output_schema = None;
+        let projected = codex_code_mode::augment_tool_definition(projected).description;
+        let count = |text: &str| codex_utils_output_truncation::model_token_count(text);
+        assert!(count(&projected) < count(&full));
+        eprintln!("context-audit {name} full_contract_tokens={} eager_contract_tokens={}", count(&full), count(&projected));
     }
     assert!(mixed_exec.description.len() < nested_exec.description.len());
     let clock = ToolName::namespaced("clock", "curr_time").to_string();

@@ -420,6 +420,8 @@ pub(crate) struct SuccessfulReplayGuard {
 #[derive(Clone, Debug)]
 struct SuccessfulReplayEvidence {
     authorization_identity: Option<String>,
+    read_payload: Option<ToolPayload>,
+    read_output: Option<Value>,
     path_scoped: bool,
     mutation_revision: u64,
     workspace_revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
@@ -427,6 +429,12 @@ struct SuccessfulReplayEvidence {
 }
 
 impl SuccessfulReplayGuard {
+    pub(crate) fn authorization_payload<'a>(&'a self, requested: &'a ToolPayload) -> &'a ToolPayload {
+        // The candidate has already proved equal native read scope. Recheck the
+        // original invocation under today's permissions, not a broadened key.
+        self.evidence.read_payload.as_ref().unwrap_or(requested)
+    }
+
     pub(crate) fn matches_authorization(&self, identity: Option<&str>) -> bool {
         identity.is_some() && self.evidence.authorization_identity.as_deref() == identity
     }
@@ -575,6 +583,7 @@ struct SamplingRequestSignalState {
     evidence_items: BTreeMap<u64, String>,
     successful_replay_responses: BTreeMap<u64, ResponseInputItem>,
     successful_replay_evidence: BTreeMap<u64, SuccessfulReplayEvidence>,
+    read_payloads: BTreeMap<u64, ToolPayload>,
     path_scoped_ordinals: BTreeSet<u64>,
     replayed_ordinals: BTreeSet<u64>,
     validation_ordinals: BTreeSet<u64>,
@@ -877,16 +886,26 @@ impl SamplingRequestSignalCollector {
                             .successful_replay_gates
                             .iter()
                             .rev()
-                            .find(|gate| {
+                            .find_map(|gate| {
                                 // Path-scoped evidence is re-proven fresh by the
                                 // dispatcher, so turn-local revisions do not gate it.
-                                (gate.state_revision == self.request_state_revision
-                                    || gate.evidence.path_scoped)
-                                    && gate.action_identity == action.identity
-                            })
-                            .map(|gate| SuccessfulReplayGuard {
-                                response: gate.response.clone(),
-                                evidence: gate.evidence.clone(),
+                                if gate.state_revision != self.request_state_revision
+                                    && !gate.evidence.path_scoped { return None; }
+                                let response = if gate.action_identity == action.identity {
+                                    gate.response.clone()
+                                } else if tool_name_matches(tool_name, "read_file") {
+                                    let ToolPayload::Function { arguments: previous } = gate.evidence.read_payload.as_ref()? else { return None; };
+                                    let ToolPayload::Function { arguments: requested } = payload else { return None; };
+                                    let output = gate.evidence.read_output.as_ref()?.clone();
+                                    let output = crate::tools::handlers::reselect_read_file_output(previous, requested, output)?;
+                                    let text = serde_json::to_string(&output).ok()?;
+                                    if text.len() > SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT { return None; }
+                                    ResponseInputItem::FunctionCallOutput {
+                                        call_id: current_call_id.to_owned(),
+                                        output: codex_protocol::models::FunctionCallOutputPayload::from_text(text),
+                                    }
+                                } else { return None; };
+                                Some(SuccessfulReplayGuard { response, evidence: gate.evidence.clone() })
                             })
                     });
                 (blocked_wait_guard, suppressed_failure, replayed_success)
@@ -899,6 +918,12 @@ impl SamplingRequestSignalCollector {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.registered_count = state.registered_count.saturating_add(1);
         state.call_ordinals.insert(current_call_id.to_string(), ordinal);
+        if tool_name_matches(tool_name, "read_file") && structured_action.is_some() {
+            while state.read_payloads.len() >= SUCCESSFUL_REPLAY_GATE_LIMIT {
+                state.read_payloads.pop_first();
+            }
+            state.read_payloads.insert(ordinal, payload.clone());
+        }
         if tool_name_matches(tool_name, "read_file") || tool_name_matches(tool_name, "list_files") {
             state.path_scoped_ordinals.insert(ordinal);
         }
@@ -1377,16 +1402,33 @@ impl SamplingRequestSignalCollector {
             state.successful_replay_evidence.pop_first();
         }
         let path_scoped = state.path_scoped_ordinals.contains(&ordinal);
+        let read_payload = state.read_payloads.get(&ordinal).cloned();
         state.successful_replay_evidence.insert(
             ordinal,
             SuccessfulReplayEvidence {
                 authorization_identity: None,
+                read_payload,
+                read_output: None,
                 path_scoped,
                 mutation_revision,
                 workspace_revision,
                 source_paths,
             },
         );
+    }
+
+    /// Model projections can replace text with line counts. Only the native
+    /// owner's exact, bounded result may seed selector-level reuse.
+    pub(crate) fn record_read_replay_output(&self, ordinal: u64, output: Value) {
+        if !serde_json::to_vec(&output).is_ok_and(|bytes| bytes.len() <= SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(evidence) = state.successful_replay_evidence.get_mut(&ordinal)
+            && evidence.read_payload.is_some()
+        {
+            evidence.read_output = Some(output);
+        }
     }
 
     pub(crate) fn record_response_result(
@@ -2170,7 +2212,8 @@ struct CanonicalToolAction {
 
 fn canonical_tool_action(payload: &ToolPayload) -> CanonicalToolAction {
     match payload {
-        ToolPayload::Function { arguments } => match serde_json::from_str::<Value>(arguments) {
+        ToolPayload::Function { arguments } => match crate::tools::handlers::parsed_function_argument_value(arguments)
+            .unwrap_or_else(|| serde_json::from_str::<Value>(arguments).map_err(|err| err.to_string())) {
             Ok(arguments) => {
                 let value = canonicalize_json(&arguments);
                 let identity_payload = serde_json::to_string(&value).ok();
@@ -2261,10 +2304,19 @@ fn structured_action_identity_from_canonical(
         return None;
     }
     let class = source_invocation_class_from_canonical(tool_name, payload, canonical);
+    let normalized_read = if tool_name_matches(tool_name, "read_file") {
+        Some(crate::tools::handlers::canonical_read_file_arguments(
+            canonical.identity_payload.as_deref()?,
+        )?)
+    } else {
+        None
+    };
+    let normalized_payload = normalized_read.as_ref().map(serde_json::to_string).transpose().ok()?;
     let action =
-        serde_json::to_string(&(tool_name, canonical.identity_payload.as_deref()?)).ok()?;
+        serde_json::to_string(&(tool_name, normalized_payload.as_deref()
+            .or(canonical.identity_payload.as_deref())?)).ok()?;
     let identity = format!("{:x}", Sha256::digest(action.as_bytes()));
-    let mut evidence_arguments = canonical.value.clone();
+    let mut evidence_arguments = normalized_read.unwrap_or_else(|| canonical.value.clone());
     if ["exec_command", "shell_command", "write_stdin"].iter()
         .any(|name| tool_name_matches(tool_name, name))
         && let Some(arguments) = evidence_arguments.as_object_mut()
@@ -2909,6 +2961,10 @@ impl SessionPathReplays {
                 response,
                 evidence: SuccessfulReplayEvidence {
                     authorization_identity: Some(authorization_identity),
+                    read_payload: (name.as_str() == "read_file").then_some(payload),
+                    // Durable history may be a lossy model projection. It can
+                    // restore exact-call replay, never remint missing raw bytes.
+                    read_output: None,
                     path_scoped: true,
                     mutation_revision: 0,
                     workspace_revision,
@@ -3045,6 +3101,14 @@ impl TurnExecutionControl {
             }
         }
         gaps
+    }
+
+    fn completion_repair_directive(&self, mutation_revision: u64) -> Option<String> {
+        let gaps = self.completion_gaps(mutation_revision);
+        (!gaps.is_empty()).then(|| format!(
+            "Completion preflight: {} Continue the required repair using existing evidence where valid. Keep tools available; do not present the candidate as a verified final result or repeat unchanged checks. Report any genuine blocker or intentionally omitted validation explicitly.",
+            gaps.join(" ")
+        ))
     }
 
     pub(crate) fn batching_advisory(&self, is_continuation: bool) -> Option<String> {
@@ -3438,6 +3502,12 @@ impl TurnExecutionControl {
         if self.input_revision == baselines.input_revision
             && let Some(result) = collector.explicit_completion()
         {
+            // Do not enter the finalization/stop-hook repair cycle for a gap
+            // already known to this owner. Tell the next ordinary continuation
+            // exactly what remains; absence of gaps is not semantic proof.
+            if let Some(directive) = self.completion_repair_directive(settled.mutation_revision) {
+                return SamplingConvergenceDecision { directive: Some(directive), ..Default::default() };
+            }
             return SamplingConvergenceDecision {
                 continuation: ContinuationDisposition::SurfaceExistingResult,
                 authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(result)),
@@ -3640,11 +3710,15 @@ impl TurnExecutionControl {
                 return SamplingConvergenceDecision::default();
             }
             if observation.disposition == AuthoritativeWaitDisposition::Terminal
+                && let Some(directive) = self.completion_repair_directive(settled.mutation_revision)
+            {
+                // This also protects terminal receipts without a message: they
+                // must not force a tool-free answer while required work remains.
+                return SamplingConvergenceDecision { directive: Some(directive), ..Default::default() };
+            }
+            if observation.disposition == AuthoritativeWaitDisposition::Terminal
                 && observation.result.surfaceable_message.is_some()
             {
-                if self.plan.as_ref().is_some_and(plan_is_unfinished) {
-                    return SamplingConvergenceDecision::default();
-                }
                 // The owner has already supplied the exact assistant text for
                 // this terminal state. Surface it directly instead of making
                 // the model restate an authoritative completion.
@@ -6172,6 +6246,86 @@ mod tests {
                 }
             }
             assert_eq!(collector.explicit_completion().is_some(), scenario == "complete", "{scenario}");
+        }
+    }
+
+    #[test]
+    fn completion_audit_direct_result_requires_closed_plan_and_unchanged_input() {
+        for (status, new_input, expected) in [
+            (StepStatus::Pending, false, false),
+            (StepStatus::InProgress, false, false),
+            (StepStatus::Completed, false, true),
+            (StepStatus::Completed, true, false),
+        ] {
+            let mut control = TurnExecutionControl::new();
+            settle_plan(&mut control, plan(&[status]));
+            let (baselines, settled) = unchanged_state(&control);
+            let collector = SamplingRequestSignalCollector::default();
+            {
+                let mut state = collector.state.lock().unwrap();
+                state.registered_count = 1;
+                state.explicit_completion = Some((0, "verified answer".into()));
+                state.outcomes.push(SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None));
+            }
+            if new_input { control.input_revision += 1; }
+            let decision = control.evaluate_convergence(&baselines, &collector, &settled);
+            assert_eq!(decision.continuation == ContinuationDisposition::SurfaceExistingResult,
+                expected, "{status:?}, new_input={new_input}");
+            if !expected {
+                assert_eq!(decision.continuation, ContinuationDisposition::ModelRequired);
+            }
+        }
+    }
+
+    #[test]
+    fn completion_audit_preflights_stale_validation_before_publishing_owner_result() {
+        for mode in ["explicit", "native-text", "native-receipt"] {
+            let mut control = TurnExecutionControl::new();
+            let before = control.baselines(0);
+            let validation = recorded_validation_collector(&control, &before, ToolOutputOutcome::Success);
+            control.settle(&before, &validation, &settled(0));
+            // Validation exists, but a later settled change invalidates it.
+            let baselines = control.baselines(1);
+            let receipt = if mode == "explicit" {
+                let collector = control.collector(&baselines);
+                {
+                    let mut state = collector.state.lock().unwrap();
+                    state.registered_count = 1;
+                    state.explicit_completion = Some((0, "verified answer".into()));
+                    state.outcomes.push(SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None));
+                }
+                collector
+            } else {
+                let message = (mode == "native-text").then_some("verified answer");
+                let collector = authoritative_wait_collector(&control, &baselines, "native", false, message);
+                {
+                    let mut state = collector.state.lock().unwrap();
+                    state.authoritative_wait_observations[0].result.adapter = "agent_job_report".into();
+                    state.outcomes.push(SamplingToolOutcome::plain(0, SamplingToolOutcomeKind::Success, None));
+                }
+                collector
+            };
+            let stale = control.evaluate_convergence(&baselines, &receipt, &settled(1));
+            assert!(stale.directive.as_deref().unwrap().contains("workspace changed after the last passing validation"));
+            assert_eq!(stale.continuation,
+                ContinuationDisposition::ModelRequired, "stale evidence cannot publish: {mode}");
+            let failed = recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Failure);
+            control.settle(&baselines, &failed, &settled(1));
+            assert_eq!(control.evaluate_convergence(&baselines, &receipt, &settled(1)).continuation,
+                ContinuationDisposition::ModelRequired, "failed validation does not close the gap");
+            let passed = recorded_validation_collector(&control, &baselines, ToolOutputOutcome::Success);
+            control.settle(&baselines, &passed, &settled(1));
+            let expected = if mode == "native-receipt" {
+                ContinuationDisposition::TerminalCompletionRequired
+            } else {
+                ContinuationDisposition::SurfaceExistingResult
+            };
+            assert_eq!(control.evaluate_convergence(&baselines, &receipt, &settled(1)).continuation,
+                expected, "fresh evidence surfaces or synthesizes from the existing receipt");
+            settle_plan(&mut control, plan(&[StepStatus::Pending]));
+            let pending = control.baselines(1);
+            assert_eq!(control.evaluate_convergence(&pending, &receipt, &settled(1)).continuation,
+                ContinuationDisposition::ModelRequired, "unfinished plans retain tools: {mode}");
         }
     }
 

@@ -1750,6 +1750,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revision_bound_replacements_reduce_payload_without_changing_bytes_or_freshness() {
+        let mut measurements = Vec::new();
+        for count in [64, 256, 1024] {
+            for newline in ["\n", "\r\n"] {
+                for trailing_newline in [false, true] {
+                    let dir = tempdir().unwrap();
+                    let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+                    let removed = (0..count)
+                        .map(|index| format!("    old_{index}(\"λ 日本語\");"))
+                        .collect::<Vec<_>>();
+                    let replacement = (0..count)
+                        .map(|index| format!("    new_{index}(\"β 日本語\");"))
+                        .collect::<Vec<_>>();
+                    let source = format!(
+                        "prefix{newline}{}{newline}suffix{}",
+                        removed.join(newline),
+                        if trailing_newline { newline } else { "" },
+                    );
+                    let expected = format!(
+                        "prefix{newline}{}{newline}suffix{}",
+                        replacement.join(newline),
+                        if trailing_newline { newline } else { "" },
+                    );
+                    let hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+                    let added = replacement
+                        .iter()
+                        .map(|line| format!("+{line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let ordinary = wrap_patch(&format!(
+                        "*** Update File: contextual.rs\n@@\n prefix\n{}{added}\n suffix",
+                        removed
+                            .iter()
+                            .map(|line| format!("-{line}\n"))
+                            .collect::<String>(),
+                    ));
+                    let compact = wrap_patch(&format!(
+                        "*** Update File: ranged.rs\n@@ codex-range 2:{} sha256:{hash}\n{added}",
+                        count + 1,
+                    ));
+                    for (name, patch) in [("contextual.rs", &ordinary), ("ranged.rs", &compact)] {
+                        fs::write(dir.path().join(name), &source).unwrap();
+                        apply_patch(
+                            patch,
+                            &cwd,
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                            LOCAL_FS.as_ref(),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(fs::read(dir.path().join(name)).unwrap(), expected.as_bytes());
+                    }
+                    // Even an edit outside the selected range invalidates the
+                    // whole-file identity. Never silently accept a stale view.
+                    let drifted = source.replace("suffix", "user change outside selection");
+                    let path = dir.path().join("ranged.rs");
+                    fs::write(&path, &drifted).unwrap();
+                    let error = apply_patch(
+                        &compact,
+                        &cwd,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        LOCAL_FS.as_ref(),
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(error.delta().is_empty());
+                    assert_eq!(fs::read(path).unwrap(), drifted.as_bytes());
+                    assert!(compact.len() < ordinary.len());
+                    measurements.push(serde_json::json!({
+                        "lines_replaced": count, "crlf": newline == "\r\n",
+                        "trailing_newline": trailing_newline,
+                        "contextual_patch_bytes": ordinary.len(), "range_patch_bytes": compact.len(),
+                    }));
+                }
+            }
+        }
+        eprintln!("range_patch_comparison {}", serde_json::json!(measurements));
+    }
+
+    #[tokio::test]
     async fn blank_source_lines_and_eof_are_literal_preconditions() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sample.txt");

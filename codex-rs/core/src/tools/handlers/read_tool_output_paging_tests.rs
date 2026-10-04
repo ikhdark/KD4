@@ -1,6 +1,38 @@
 use super::*;
 
 #[tokio::test]
+async fn script_recovery_payload_cap_preserves_exact_prefix_and_remainder() {
+    let home = tempfile::tempdir().unwrap();
+    // Escaping must count toward the serialized cap, not only source bytes.
+    let text = "\"\\\tλ\r\n".repeat(180_000);
+    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        home.path(), "script-cap", &CanonicalToolResult::text(&text),
+    ).await;
+    let snapshot = load_tool_output_snapshot(home.path(), "script-cap", &artifact.artifact_id().unwrap()).await.unwrap();
+    let result = drain_recovery_snapshot_with_byte_limit(
+        &snapshot, vec![ToolOutputSelector::Bytes { start: 0, end: text.len() as u64 }],
+        READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES / 4, READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES,
+        &CancellationToken::new(),
+    ).await.unwrap();
+    let envelope = recovery_envelope(&result.output, result.continuation_stop.as_ref()).unwrap();
+    assert!(serde_json::to_vec(&envelope).unwrap().len() <= READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES);
+    assert!(!result.output.complete);
+    let mut end = 0;
+    for page in &result.output.results {
+        if let Some(value) = &page.text {
+            let range = page.canonical_range.unwrap();
+            assert_eq!(range.start, end);
+            assert_eq!(value, &text[range.start as usize..range.end as usize]);
+            end = range.end;
+        }
+    }
+    assert!(end > READ_TOOL_OUTPUT_MAX_BYTES as u64);
+    let stop = result.continuation_stop.unwrap();
+    assert!(stop.resumable);
+    assert_eq!(stop.selector, Some(ToolOutputSelector::Bytes { start: end, end: text.len() as u64 }));
+}
+
+#[tokio::test]
 async fn nearly_complete_recovery_uses_margin_before_reserving_page_hints() {
     let home = tempfile::tempdir().unwrap();
     let text = "source evidence\n".repeat(1_500);

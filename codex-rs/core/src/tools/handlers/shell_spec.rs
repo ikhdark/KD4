@@ -720,7 +720,7 @@ fn rg_search_admission_guidance() -> &'static str {
 - For filename inventories, apply path/glob filters before printing; do not dump the whole tree to filter a truncated display later. Reuse the complete matching set for multiple views. A stored `result.output` is still truncated when `output_reduced` is true; use the retained artifact for missing matches.
 - An `rg` exit code of 1 means no matches; 2 means an error, not evidence of absence. In a batch, inspect each search's status; a later successful command does not validate an earlier search. Preserve successful results and correct only the failed search.
 - Derive search roots from observed paths instead of guessing directories. Keep independent searches separate so a missing root does not skip unrelated work; record missing paths as coverage gaps.
-- For a known source file, read whole useful regions. Omit `max_output_tokens` unless deliberately requesting a smaller display; the host enforces output caps. Output above the tool's output budget is truncated; recover only missing evidence from the retained artifact."#
+- For a known source file, read whole useful regions. Prefer native `read_file` with batched selectors over `Get-Content | Select-Object` paging when available. Keep shell reads for required encoding, streaming, or transformations; do not repeat delivered reads just to switch tools. Omit `max_output_tokens` unless deliberately requesting a smaller display; the host enforces output caps. Output above the tool's output budget is truncated; recover only missing evidence from the retained artifact."#
 }
 
 #[cfg(test)]

@@ -82,17 +82,63 @@ async fn multi_agent_v2_request_user_input_rejects_subagent_threads() {
     );
 }
 
+#[test]
+fn header_fallback_preserves_full_question_and_strict_validation() {
+    for header in ["Harness scope".to_string(), "🦀".repeat(13)] {
+        let raw = json!({"questions":[{
+            "id":"scope", "header":header, "question":"Which harness?",
+            "isSecret":true,
+            "options":[{"label":"Fork","description":"Local fork"},
+                       {"label":"Runner","description":"Task runner"}]
+        }], "autoResolutionMs":60000});
+        assert!(serde_json::from_value::<RequestUserInputArgs>(raw.clone()).is_err());
+        let args = parse_user_input_with_header_fallback(&raw.to_string()).unwrap();
+        assert_eq!(args.questions[0].header.chars().count(), 12);
+        assert_eq!(args.questions[0].question, format!("{header}\n\nWhich harness?"));
+        assert_eq!(args.questions[0].id, "scope");
+        assert!(args.questions[0].is_secret);
+        assert_eq!(args.auto_resolution_ms, Some(60000));
+        let normalized = serde_json::to_value(&args).unwrap();
+        assert_eq!(normalized["questions"][0]["options"], raw["questions"][0]["options"]);
+        assert_eq!(parse_user_input_with_header_fallback(&normalized.to_string()).unwrap(), args);
+        for bad in [
+            json!({"questions":[raw["questions"][0].clone(),raw["questions"][0].clone()]}),
+            { let mut bad = raw.clone(); bad["questions"][0]["options"] = json!([]); bad },
+            { let mut bad = raw.clone(); bad["questions"][0]["id"] = json!(""); bad },
+            { let mut bad = raw.clone(); bad["questions"][0]["queston"] = json!("typo"); bad },
+        ] {
+            assert!(parse_user_input_with_header_fallback(&bad.to_string()).is_err());
+        }
+    }
+    let raw = json!({"questions":[{"id":"q","header":"🦀".repeat(12),"question":"Q"}]});
+    assert_eq!(parse_user_input_with_header_fallback(&raw.to_string()).unwrap(),
+        serde_json::from_value::<RequestUserInputArgs>(raw).unwrap());
+}
+
 async fn registered_input_request(
     session: Arc<Session>,
     turn: Arc<crate::session::turn_context::TurnContext>,
     call_id: &str,
+) -> Result<crate::tools::registry::AnyToolResult, FunctionCallError> {
+    registered_input_request_with_header(session, turn, call_id, "Hdr").await
+}
+
+async fn registered_input_request_with_header(
+    session: Arc<Session>,
+    turn: Arc<crate::session::turn_context::TurnContext>,
+    call_id: &str,
+    header: &str,
 ) -> Result<crate::tools::registry::AnyToolResult, FunctionCallError> {
     use crate::tools::context::ToolCallSource;
     use crate::tools::context::ToolDispatchState;
     use crate::tools::router::ToolCall;
     use crate::tools::router::ToolRouter;
     use crate::tools::router::ToolRouterParams;
-    let invocation = request_invocation(Arc::clone(&session), Arc::clone(&turn));
+    let mut invocation = request_invocation(Arc::clone(&session), Arc::clone(&turn));
+    let ToolPayload::Function { arguments } = &mut invocation.payload else { unreachable!() };
+    let mut value: serde_json::Value = serde_json::from_str(arguments).unwrap();
+    value["questions"][0]["header"] = json!(header);
+    *arguments = value.to_string();
     let step = StepContext::for_test(turn);
     let router = ToolRouter::from_context(
         step.as_ref(),
@@ -207,6 +253,43 @@ async fn registered_user_input_drop_retires_sender_before_and_after_event_delive
             );
         }
     }
+}
+
+#[tokio::test]
+async fn overlong_header_reaches_user_without_a_repair_round() {
+    use crate::state::ActiveTurn;
+    use crate::state::TurnTerminalCoordinator;
+    use codex_protocol::protocol::EventMsg;
+    use std::time::Duration;
+
+    let (session, turn, _events_tx, events) =
+        crate::session::tests::make_session_and_context_with_event_capacity(64).await;
+    *session.active_turn.lock().await = Some(ActiveTurn {
+        terminal: Some(TurnTerminalCoordinator::new(turn.sub_id.clone())),
+        ..Default::default()
+    });
+    let mut request = Box::pin(registered_input_request_with_header(
+        Arc::clone(&session), Arc::clone(&turn), "call-header", "Harness scope",
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            tokio::select! {
+                result = &mut request => panic!("must await user rather than regenerate: {:?}", result.err()),
+                event = events.recv() => {
+                    if let EventMsg::RequestUserInput(event) = event.unwrap().msg {
+                        assert_eq!(event.questions[0].header, "Harness sco…");
+                        assert_eq!(event.questions[0].question, "Harness scope\n\nPick one");
+                        assert_eq!(event.questions[0].id, "pick_one");
+                        assert_eq!(event.questions[0].options.as_ref().unwrap().len(), 3);
+                        break;
+                    }
+                }
+            }
+        }
+    }).await.expect("one invocation delivers the repaired presentation");
+    drop(request);
+    session.terminal_tasks.close();
+    tokio::time::timeout(Duration::from_secs(3), session.terminal_tasks.wait()).await.unwrap();
 }
 
 #[tokio::test]

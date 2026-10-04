@@ -166,6 +166,12 @@ mod tests {
                 json!({"structuredContent":{"x":1},"isError":true,"_meta":{"id":7},
                 "content":[{"type":"text","text":"{\"x\":1}"},{"type":"text","text":"caption"}]}),
             ),
+            (
+                "apply_patch",
+                json!({"success":true,"changes_exact":true,
+                    "text":"Success. Updated the following files:\nM λ\n",
+                    "changes":[{"kind":"update","path":"λ","move_path":null}]}),
+            ),
         ] {
             let projected =
                 codex_code_mode_protocol::model_visible_tool_result(&ToolName::plain(name), &raw)
@@ -189,7 +195,7 @@ mod tests {
                     store('raw', r);
                     text(r); text({{wrapped:[r]}}); console.log(r);
                     text(JSON.parse(JSON.stringify(r)));
-                    const child = r.results ? r.results[0] : r.structuredContent;
+                    const child = r.results ? r.results[0] : r.changes ? r.changes[0] : r.structuredContent;
                     Object.defineProperty(child, 'toJSON', {{value: () => 'CUSTOM', configurable:true}});
                     text(r);
                     delete child.toJSON;
@@ -249,6 +255,8 @@ mod tests {
             let mut transformed = raw.clone();
             if transformed.get("results").is_some() {
                 transformed["results"][0] = json!("CUSTOM");
+            } else if transformed.get("changes").is_some() {
+                transformed["changes"][0] = json!("CUSTOM");
             } else {
                 transformed["structuredContent"] = json!("CUSTOM");
             }

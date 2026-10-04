@@ -26,8 +26,14 @@ def write_bytes_atomic(path: Path, payload: bytes, *, immutable: bool = False) -
     )
 
 
-def write_stream_atomic(path: Path, source: BinaryIO) -> None:
-    _write_atomic(path, lambda temporary: shutil.copyfileobj(source, temporary))
+def write_stream_atomic(
+    path: Path, source: BinaryIO, *, exclusive: bool = False
+) -> None:
+    """Publish a complete stream, optionally refusing any existing destination."""
+    _write_atomic(
+        path, lambda temporary: shutil.copyfileobj(source, temporary),
+        exclusive=exclusive,
+    )
 
 
 def _replace_with_retry(source: Path, destination: Path) -> None:
@@ -51,6 +57,7 @@ def _write_atomic(
     write_payload: Callable[[BinaryIO], object],
     *,
     immutable_payload: bytes | None = None,
+    exclusive: bool = False,
 ) -> None:
     # Replace the directory entry, never truncate a symlink/hardlink's referent.
     path = path.absolute()
@@ -68,7 +75,11 @@ def _write_atomic(
             write_payload(temporary)
             temporary.flush()
             os.fsync(temporary.fileno())
-        if immutable_payload is not None:
+        if exclusive:
+            # Atomic no-clobber publication: an interrupted producer never
+            # leaves a partial report at its advertised destination.
+            os.link(temporary_path, path)
+        elif immutable_payload is not None:
             try:
                 os.link(temporary_path, path)
             except FileExistsError:
