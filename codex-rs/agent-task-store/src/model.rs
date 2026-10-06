@@ -25,12 +25,7 @@ pub const MAX_WAKE_EVENTS_PER_ROOT: usize = 256;
 pub const MAX_WAKE_EVENTS_PER_READ: usize = 50;
 pub const DEFAULT_BINDING_LIMIT: usize = 100;
 pub const MAX_BINDING_LIMIT: usize = 256;
-pub const DEFAULT_MUTATION_EVIDENCE_LIMIT: usize = 20;
-pub const MAX_MUTATION_EVIDENCE_LIMIT: usize = 100;
 pub const MAX_VALIDATION_CALLS_PER_TASK: usize = 100;
-pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
-pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
-pub const MAX_MUTATION_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_WORKSPACE_LEASE_SECONDS: i64 = 120;
 pub const MAX_VALIDATION_LEASE_SECONDS: i64 = 120;
 pub const NONPRODUCTIVE_RECOVERY_POLICY_VERSION: u32 = 1;
@@ -629,56 +624,9 @@ pub struct WorkspaceManifestEntry {
     pub existed: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceRevision {
-    pub repository_id: String,
-    pub workspace_id: String,
-    pub epoch: u64,
-    pub manifest_hash: String,
-    pub files: Vec<WorkspaceManifestEntry>,
-    #[serde(default)]
-    pub capture_mode: WorkspaceCaptureMode,
-    #[serde(default)]
-    pub complete: bool,
-    #[serde(default)]
-    pub discovery_errors: Vec<String>,
-    #[serde(default)]
-    pub ignored_path_count: u64,
-    #[serde(default)]
-    pub excluded_path_count: u64,
-}
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceCaptureMode {
-    #[default]
-    ExplicitPaths,
-    GitOverlay,
-    FilesystemFallback,
-}
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceActorRegistration {
-    pub root_session_id: String,
-    pub actor_id: String,
-    pub kind: WorkspaceActorKind,
-    pub assignment_id: Option<AssignmentId>,
-    pub attempt_id: Option<AttemptId>,
-    #[serde(default)]
-    pub strategy: WorkspaceStrategy,
-}
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceEvent {
-    pub workspace_id: String,
-    pub epoch: u64,
-    pub actor_id: Option<String>,
-    pub actor_kind: WorkspaceActorKind,
-    pub attribution_confidence: AttributionConfidence,
-    pub paths: Vec<String>,
-    pub contracts: Vec<String>,
-    pub created_at: DateTime<Utc>,
-}
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceTaskStatus {
@@ -714,16 +662,6 @@ pub struct IsolationHandoff {
     pub integrated_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct QuiescenceStatus {
-    pub quiescent: bool,
-    pub active_assignment_ids: Vec<AssignmentId>,
-    pub running_validation_call_ids: Vec<String>,
-    pub pending_gate_assignment_ids: Vec<AssignmentId>,
-    pub active_claim_assignment_ids: Vec<AssignmentId>,
-    #[serde(default)]
-    pub warnings: Vec<String>,
-}
 
 impl TaskActor {
     pub(crate) fn require_root(self) -> StoreResult<()> {
@@ -828,7 +766,7 @@ impl ValidationCall {
 }
 
 /// Host-only preparation for a complete local source read. It is not proof
-/// until the producer finishes and the store confirms an unchanged epoch.
+/// until the producer finishes. It does not verify workspace freshness.
 pub struct SourceInspectionStart {
     pub(crate) attempt_id: AttemptId,
     pub(crate) path: String,
@@ -914,7 +852,7 @@ pub enum CriterionEvidenceKind {
     /// A successful recorded execution; does not imply a test or runtime boundary passed.
     ValidationExecution,
     /// The native file reader delivered a complete, hash-bound source snapshot
-    /// at an unchanged repository epoch. Does not establish semantic correctness.
+    /// without establishing semantic correctness or current workspace freshness.
     SourceInspection,
 }
 
@@ -1051,20 +989,6 @@ pub struct AgentGate {
     pub sealed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WriteClaim {
-    pub assignment_id: AssignmentId,
-    pub attempt_id: AttemptId,
-    pub scopes: Vec<RepoScope>,
-    #[serde(default)]
-    pub contract_claims: Vec<String>,
-    #[serde(default)]
-    pub workspace_id: String,
-    pub supersedes: Vec<AssignmentId>,
-    pub active: bool,
-    pub created_at: DateTime<Utc>,
-    pub released_at: Option<DateTime<Utc>>,
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1094,34 +1018,8 @@ pub struct MutationEvidence {
     pub end_epoch: Option<u64>,
 }
 
-/// A bounded mutation-evidence page whose completeness is explicit.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct MutationEvidencePage {
-    pub evidence: Vec<MutationEvidence>,
-    pub total_count: usize,
-    pub truncated: bool,
-    pub next_cursor: Option<usize>,
-}
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MutationSnapshotVersion {
-    PreWrite,
-    Final,
-}
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct MutationSnapshotChunk {
-    pub assignment_id: AssignmentId,
-    pub attempt_id: AttemptId,
-    pub path: String,
-    pub version: MutationSnapshotVersion,
-    pub existed: bool,
-    pub offset: u64,
-    pub total_bytes: u64,
-    pub bytes: Vec<u8>,
-    pub next_offset: Option<u64>,
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTaskBindingDraft {
@@ -1287,18 +1185,14 @@ impl AgentTask {
             let status = match (result.status, evidence) {
                 (CriterionStatus::NotRun, _) => "not run",
                 (CriterionStatus::Failed, _) => "reported failed",
-                (CriterionStatus::Passed, Some(reference))
-                    if reference.evidence_epoch == self.workspace_status.epoch =>
+                (CriterionStatus::Passed, Some(reference)) =>
                 {
                     match reference.kind {
                         CriterionEvidenceKind::ValidationExecution =>
-                            "supported by a successful validation execution (test coverage not established)",
+                            "supported by a successful validation execution (test coverage not established; freshness unverified)",
                         CriterionEvidenceKind::SourceInspection =>
-                            "supported by a complete source inspection (semantic correctness not established)",
+                            "supported by a complete source inspection (semantic correctness not established; freshness unverified)",
                     }
-                }
-                (CriterionStatus::Passed, Some(_)) => {
-                    "prior validation recorded; freshness unverified"
                 }
                 (CriterionStatus::Passed, None) => "reported complete; behavior unverified",
             };
@@ -1319,21 +1213,6 @@ impl AgentTask {
         }
         if receipt.criterion_results.is_empty() {
             summary.push_str("No criterion evidence recorded; behavior unverified.\n");
-        }
-        match self.isolation_handoff.as_ref().map(|handoff| handoff.state) {
-            Some(IsolationHandoffState::Ready) => {
-                summary.push_str("Integration: patch ready, not integrated.\n")
-            }
-            Some(IsolationHandoffState::Claimed) => {
-                summary.push_str("Integration: claimed, not integrated.\n")
-            }
-            Some(IsolationHandoffState::Integrated) => {
-                summary.push_str("Integration: recorded as integrated.\n")
-            }
-            None if self.assignment.workspace_strategy == WorkspaceStrategy::Isolated => {
-                summary.push_str("Integration: unverified.\n")
-            }
-            None => summary.push_str("Workspace: shared.\n"),
         }
         let _ = write!(
             summary,

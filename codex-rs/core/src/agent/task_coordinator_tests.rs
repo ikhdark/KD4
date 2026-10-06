@@ -5,6 +5,7 @@ use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::CapabilityProfile;
 use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
+use codex_agent_task_store::WorkspaceStrategy;
 use codex_protocol::ThreadId;
 use tempfile::TempDir;
 

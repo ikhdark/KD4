@@ -18,7 +18,6 @@ use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::with_cached_approval;
 use codex_agent_task_store::AttemptState;
-use codex_agent_task_store::AttributionConfidence;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchAction;
 use codex_exec_server::FileSystemSandboxContext;
@@ -67,13 +66,12 @@ pub struct ApplyPatchRequest {
 #[derive(Default)]
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
-    typed_mutations_started: bool,
-    mutation_finalization_attempted: bool,
+    workspace_tracking_started: bool,
+    workspace_tracking_finished: bool,
     mutation_repo_root: Option<PathBuf>,
     mutation_repo_paths: Vec<String>,
     workspace_operation_permit: Option<crate::scoped_workspace_gate::WorkspaceLease>,
     mutation_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    mutation_evidence_failures: usize,
 }
 
 #[derive(Debug)]
@@ -104,25 +102,19 @@ impl ApplyPatchRuntime {
         &self.committed_delta
     }
 
-    pub async fn finish_pending_mutation_evidence(&mut self, ctx: &ToolCtx) {
-        if self.mutation_repo_root.is_some() && !self.mutation_finalization_attempted {
-            self.finish_mutation_evidence(ctx, true).await;
+    pub async fn finish_pending_workspace_tracking(&mut self, ctx: &ToolCtx) {
+        if self.mutation_repo_root.is_some() && !self.workspace_tracking_finished {
+            self.finish_workspace_tracking(ctx, true).await;
         }
     }
 
-    pub(crate) fn mutation_evidence_warning(&self) -> Option<String> {
-        (self.mutation_evidence_failures > 0).then(|| format!(
-            "Warning: apply_patch could not finalize mutation evidence for {} path(s). Filesystem changes remain committed, but the durable mutation ledger may be incomplete; do not repeat the patch to repair it.",
-            self.mutation_evidence_failures,
-        ))
-    }
 
-    async fn begin_mutation_evidence(
+    async fn begin_workspace_tracking(
         &mut self,
         req: &ApplyPatchRequest,
         ctx: &ToolCtx,
     ) -> Result<(), ToolError> {
-        if self.typed_mutations_started {
+        if self.workspace_tracking_started {
             return Ok(());
         }
 
@@ -152,10 +144,10 @@ impl ApplyPatchRuntime {
             Err(error) => {
                 if binding.is_some() {
                     return Err(ToolError::Rejected(format!(
-                        "apply_patch: typed mutation evidence requires a host-native workspace: {error}"
+                        "apply_patch: typed patch tracking requires a host-native workspace: {error}"
                     )));
                 }
-                self.typed_mutations_started = true;
+                self.workspace_tracking_started = true;
                 return Ok(());
             }
         };
@@ -180,51 +172,22 @@ impl ApplyPatchRuntime {
                 .await;
         }
 
-        if let Some(binding) = binding.as_ref() {
-            let store = coordinator.store().ok_or_else(|| {
-                ToolError::Rejected(
-                    "apply_patch: typed mutation evidence store is unavailable".to_string(),
-                )
-            })?;
-            for path in &repo_paths {
-                store
-                    .begin_mutation(
-                        binding.attempt_id,
-                        &repo_root,
-                        path.clone(),
-                        AttributionConfidence::Definitive,
-                    )
-                    .await
-                    .map_err(|error| {
-                        ToolError::Rejected(format!(
-                            "apply_patch: mutation evidence could not be recorded for `{path}`: {error}"
-                        ))
-                    })?;
-                // Each successful begin is already durable. Retain it before
-                // attempting the next path, which can independently fail.
-                self.mutation_repo_root = Some(repo_root.clone());
-                if !self.mutation_repo_paths.contains(path) {
-                    self.mutation_repo_paths.push(path.clone());
-                }
-            }
-        }
-
         self.mutation_repo_root = Some(repo_root);
         self.mutation_repo_paths = repo_paths;
-        self.typed_mutations_started = true;
+        self.workspace_tracking_started = true;
         Ok(())
     }
 
-    async fn finish_mutation_evidence(&mut self, ctx: &ToolCtx, finalize_typed_mutations: bool) {
-        self.typed_mutations_started = false;
-        let (repo_root, repo_paths) = if finalize_typed_mutations {
+    async fn finish_workspace_tracking(&mut self, ctx: &ToolCtx, finish_tracking: bool) {
+        self.workspace_tracking_started = false;
+        let (repo_root, repo_paths) = if finish_tracking {
             (
                 self.mutation_repo_root.take(),
                 std::mem::take(&mut self.mutation_repo_paths),
             )
         } else {
             // A denied attempt can await retry approval. Retain the pending
-            // evidence for cancellation there, while still rechecking admission
+            // invalidation for cancellation there, while still rechecking admission
             // on a later runtime attempt.
             (
                 self.mutation_repo_root.clone(),
@@ -246,32 +209,8 @@ impl ApplyPatchRuntime {
             }
         }
 
-        if finalize_typed_mutations {
-            self.mutation_finalization_attempted = true;
-        }
-        if finalize_typed_mutations && let Some(repo_root) = repo_root.as_ref() {
-            let coordinator = ctx.session.services.agent_control.task_coordinator();
-            let binding = coordinator.binding_for_source(&ctx.turn.session_source);
-            if let (Some(binding), Some(store)) = (binding.as_ref(), coordinator.store()) {
-                for path in repo_paths {
-                    if let Err(error) = store
-                        .finalize_mutation(binding.attempt_id, repo_root, path.clone())
-                        .await
-                    {
-                        self.mutation_evidence_failures += 1;
-                        ctx.session.services.session_telemetry.counter(
-                            "codex.apply_patch.evidence_finalization_failed",
-                            1,
-                            &[],
-                        );
-                        tracing::warn!(
-                            %error,
-                            path,
-                            "apply_patch mutation evidence finalization was unavailable; the write remains committed"
-                        );
-                    }
-                }
-            }
+        if finish_tracking {
+            self.workspace_tracking_finished = true;
         }
     }
 
@@ -331,7 +270,7 @@ fn native_mutation_repo_paths(
             Ok(path) => path,
             Err(error) if require_complete => {
                 return Err(ToolError::Rejected(format!(
-                    "apply_patch: mutation evidence cannot represent `{path}` on this host: {error}"
+                    "apply_patch: patch tracking cannot represent `{path}` on this host: {error}"
                 )));
             }
             Err(_) => {
@@ -343,7 +282,7 @@ fn native_mutation_repo_paths(
             Ok(path) => paths.push(path),
             Err(error) if require_complete => {
                 return Err(ToolError::Rejected(format!(
-                    "apply_patch: mutation path `{path}` is outside the evidence workspace: {error}"
+                    "apply_patch: mutation path `{path}` is outside the patch workspace: {error}"
                 )));
             }
             Err(_) => complete = false,
@@ -489,7 +428,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 self.workspace_operation_permit = Some(tokio::select! {
                     biased;
                     _ = req.cancellation_token.cancelled() => {
-                        self.finish_mutation_evidence(ctx, true).await;
+                        self.finish_workspace_tracking(ctx, true).await;
                         return Err(ToolError::Codex(CodexErr::TurnAborted));
                     }
                     permit = crate::workspace_operation_gate::acquire_patch_operation_with_timeout(
@@ -498,8 +437,8 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                     ) => permit.map_err(|error| ToolError::Denied(error.to_string()))?,
                 });
             }
-            if let Err(error) = self.begin_mutation_evidence(req, ctx).await {
-                self.finish_mutation_evidence(ctx, true).await;
+            if let Err(error) = self.begin_workspace_tracking(req, ctx).await {
+                self.finish_workspace_tracking(ctx, true).await;
                 return Err(error);
             }
             let started_at = Instant::now();
@@ -560,7 +499,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                     }),
                 ],
             );
-            self.finish_mutation_evidence(ctx, !sandbox_denied).await;
+            self.finish_workspace_tracking(ctx, !sandbox_denied).await;
             if sandbox_denied {
                 // Keep the verified file state serialized across retry approval too.
                 return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {

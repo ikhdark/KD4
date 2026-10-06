@@ -258,7 +258,6 @@ class ScriptReportRegressions(unittest.TestCase):
             "scripts/app_server_schema_runtime_check.py": "Report26ValidationRegressions.test_compatibility_keeps_fixed_baseline_across_unrelated_commit",
             "scripts/generated_output_lock.py": "Report26ValidationRegressions.test_lock_waits_for_release_and_distinguishes_timeout_from_io_error",
             "scripts/stage_npm_packages.py": "ScriptReportRegressions.test_npm_cancellation_restores_all_outputs_and_clears_journal",
-            "scripts/check_kd4_features.py": "ScriptReportRegressions.test_feature_lane_is_lazy_and_held_across_both_phases",
             "scripts/rust_test_runner.py": "ScriptReportRegressions.test_nextest_progress_counter_and_binary_identity",
         }
         prefix = "scripts.test_report_script_regressions"
@@ -677,38 +676,6 @@ class ScriptReportRegressions(unittest.TestCase):
                     else:
                         with self.assertRaises(RunnerError):
                             runner.run_gates(["identity"], quiet=True)
-
-    def test_feature_lane_is_lazy_and_held_across_both_phases(self):
-        from scripts import check_kd4_features as feature
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            entered, released = [], []
-
-            @contextlib.contextmanager
-            def reserve(**kwargs):
-                entered.append(kwargs)
-                try:
-                    yield "core-tests", root / "lane"
-                finally:
-                    released.append(True)
-
-            with (
-                mock.patch.object(
-                    feature.rust_build_status, "reserve_cargo_lane", reserve
-                ),
-                mock.patch.dict(os.environ, {}, clear=True),
-            ):
-                with feature.validation_session():
-                    self.assertEqual(entered, [])
-                    with feature.validation_lane(root) as first:
-                        self.assertEqual(first, root / "lane")
-                    self.assertEqual(released, [])
-                    with feature.validation_lane(root) as second:
-                        self.assertEqual(first, second)
-                    self.assertEqual(len(entered), 1)
-                self.assertEqual(released, [True])
-                self.assertIsNone(feature._validation_lane.get())
 
     def test_staged_bytes_must_match_inputs_observed_before_copy(self):
         from scripts.codex_package import layout

@@ -294,23 +294,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             }
             None => None,
         };
-        let mutation = crate::tools::events::command_mutation_for_exec(
-            &req.command_for_approval,
-            Some(req.cwd.as_path()),
-        )
-        .await
-        .map_err(ToolError::Codex)?;
-        crate::tools::events::begin_exec_mutation_evidence(
-            crate::tools::events::ToolEventCtx::new(
-                ctx.session.as_ref(),
-                ctx.turn.as_ref(),
-                &ctx.call_id,
-                None,
-            ),
-            Some(&req.cwd),
-            &mutation,
-        )
-        .await;
         let session_shell = ctx.session.user_shell();
         let shell = req
             .turn_environment

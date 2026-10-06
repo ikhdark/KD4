@@ -92,20 +92,6 @@ fmt-check *args:
     runpy.run_path(script, run_name="__main__")
 
 [no-cd]
-[script("python")]
-check-kd4-features *args:
-    import runpy
-    import sys
-    script = r"{{ justfile_directory() }}/scripts/check_kd4_features.py"
-    forwarded = sys.argv[1:]
-    sys.argv = [script, *forwarded]
-    runpy.run_path(script, run_name="__main__")
-
-[no-cd]
-kd4-sync-audit *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/kd4_sync_audit.py" {args}
-
-[no-cd]
 kd4-perf-snapshot *args:
     @{{ python }} "{{ justfile_directory() }}/scripts/kd4_perf_snapshot.py" {args}
 

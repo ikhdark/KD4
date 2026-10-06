@@ -1,13 +1,10 @@
 use crate::FunctionCallError;
-use crate::agent::task_capabilities::normalize_absolute_repo_path;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::tool_dispatch_trace::active_tool_dispatch_timing;
-use codex_agent_task_store::AttemptState;
-use codex_agent_task_store::AttributionConfidence;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -829,115 +826,7 @@ pub(crate) async fn begin_uncertain_command_baseline(
         .await;
 }
 
-pub(crate) async fn begin_exec_mutation_evidence(
-    ctx: ToolEventCtx<'_>,
-    native_cwd: Option<&AbsolutePathBuf>,
-    mutation: &crate::turn_diff_tracker::CommandMutation,
-) {
-    if ctx
-        .session
-        .services
-        .command_execution
-        .has_typed_mutation_baseline(ctx.call_id)
-        .await
-    {
-        return;
-    }
-    let Some(cwd) = native_cwd else {
-        return;
-    };
-    let Some(paths) = mutation.paths() else {
-        return;
-    };
-    let coordinator = ctx.session.services.agent_control.task_coordinator();
-    let Some(binding) = coordinator.binding_for_source(&ctx.turn.session_source) else {
-        return;
-    };
-    let Some(store) = coordinator.store() else {
-        return;
-    };
-    let Ok(authorization) = coordinator
-        .get_agent_task_authorization(binding.assignment_id)
-        .await
-    else {
-        tracing::warn!(
-            attempt_id = %binding.attempt_id,
-            "command mutation evidence could not verify the typed assignment"
-        );
-        return;
-    };
-    if authorization.current_attempt.attempt_id != binding.attempt_id
-        || authorization.current_attempt.state != AttemptState::Active
-    {
-        tracing::warn!(
-            attempt_id = %binding.attempt_id,
-            "command mutation evidence skipped an inactive typed assignment"
-        );
-        return;
-    }
 
-    let repo_root = ctx.session.services.git_workspace.resolve_workspace_root(cwd.as_path())
-        .await.ok().flatten().unwrap_or_else(|| cwd.as_path().to_path_buf());
-    let repo_paths = paths
-        .iter()
-        .filter_map(|path| normalize_absolute_repo_path(&repo_root, path).ok())
-        .collect::<Vec<_>>();
-    if repo_paths.is_empty() {
-        return;
-    }
-    match store.begin_mutations(
-        binding.attempt_id, &repo_root, repo_paths.clone(), AttributionConfidence::Definitive,
-    ).await {
-        Err(error) => tracing::warn!(
-            %error, "command mutation evidence was unavailable; continuing with the command"
-        ),
-        Ok(_) => {
-        ctx.session
-            .services
-            .command_execution
-            .record_typed_mutation_baseline(
-                ctx.call_id,
-                &ctx.turn.sub_id,
-                crate::tools::command_execution::TypedMutationBaseline {
-                    attempt_id: binding.attempt_id,
-                    repo_root,
-                    paths: repo_paths,
-                },
-            )
-            .await;
-        }
-    }
-}
-
-async fn finish_exec_mutation_evidence(ctx: ToolEventCtx<'_>) {
-    let baseline = ctx
-        .session
-        .services
-        .command_execution
-        .take_typed_mutation_baseline(ctx.call_id)
-        .await;
-    let Some(baseline) = baseline else {
-        return;
-    };
-    let Some(store) = ctx
-        .session
-        .services
-        .agent_control
-        .task_coordinator()
-        .store()
-    else {
-        return;
-    };
-        if let Err(error) = store
-            .finalize_mutations(baseline.attempt_id, &baseline.repo_root, baseline.paths)
-            .await
-        {
-            tracing::warn!(
-                %error,
-                "command mutation evidence finalization was unavailable; the command outcome remains terminal"
-            );
-        }
-}
 
 async fn emit_exec_end(
     ctx: ToolEventCtx<'_>,
@@ -988,7 +877,6 @@ async fn emit_exec_end(
             }
         };
     }
-    finish_exec_mutation_evidence(ctx).await;
     let possible_mutation = mutation.may_have_mutated();
     let mutation_paths = mutation.paths();
     let generation_batch = if possible_mutation
@@ -2002,77 +1890,6 @@ mod tests {
         assert_eq!(item.aggregated_output.as_deref(), Some(raw_output.as_str()));
     }
 
-    #[tokio::test]
-    async fn post_begin_declined_command_finalizes_typed_mutation_evidence() {
-        let temp = tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        initialize_git_repository(&repo);
-        tokio::fs::write(repo.join("protected.txt"), "unchanged")
-            .await
-            .expect("mutation fixture");
-        let (mut session, mut turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        set_turn_environments(
-            &mut turn,
-            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, repo.as_path())],
-        );
-        let (attempt_id, store) =
-            enable_typed_task_for_repo(&mut session, &mut turn, &repo, &["protected.txt"]).await;
-        let assignment_id = session
-            .services
-            .agent_control
-            .task_coordinator()
-            .binding_for_source(&turn.session_source)
-            .expect("typed task binding")
-            .assignment_id;
-        let capsule_dir = repo
-            .join(".typed-task-home")
-            .join("agent-task-coordination")
-            .join("task_capsules");
-        std::fs::create_dir_all(&capsule_dir).expect("create capsule directory");
-        std::fs::write(
-            capsule_dir.join(format!("{assignment_id}.json")),
-            "{not-json",
-        )
-        .expect("write corrupt task capsule");
-        let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute cwd");
-        let command = vec!["rm".to_string(), "protected.txt".to_string()];
-        let mutation = crate::turn_diff_tracker::command_mutation(&command, Some(&repo));
-        let call_id = "post-begin-declined-mutation";
-
-        begin_exec_mutation_evidence(
-            ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, None),
-            Some(&cwd),
-            &mutation,
-        )
-        .await;
-        ToolEmitter::shell(
-            command,
-            cwd,
-            ExecCommandSource::Agent,
-            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-        )
-        .finish(
-            ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, None),
-            Err(ToolError::Denied("declined after begin".to_string())),
-            None,
-        )
-        .await
-        .expect_err("declined command is returned to the model");
-
-        let evidence = store
-            .list_mutation_evidence(
-                attempt_id,
-                Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
-            )
-            .await
-            .expect("mutation evidence remains queryable");
-        assert_eq!(evidence.len(), 1);
-        assert_eq!(evidence[0].path, "protected.txt");
-        assert_eq!(evidence[0].pre_write_hash, evidence[0].final_hash);
-        assert!(evidence[0].finalized_at.is_some());
-        assert!(evidence[0].end_epoch.is_some());
-    }
 
     #[tokio::test]
     async fn patch_after_capture_overlaps_relay_and_flush_joins_it() {
@@ -2261,7 +2078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_and_unified_exec_finalize_typed_mutation_evidence() {
+    async fn shell_and_unified_exec_do_not_capture_task_snapshots() {
         let temp = tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         initialize_git_repository(&repo);
@@ -2277,7 +2094,7 @@ mod tests {
             &mut turn,
             &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, repo.as_path())],
         );
-        let (attempt_id, store) = enable_typed_task_for_repo(
+        let (_attempt_id, store) = enable_typed_task_for_repo(
             &mut session,
             &mut turn,
             &repo,
@@ -2292,16 +2109,6 @@ mod tests {
             ExecCommandSource::Agent,
             codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
         );
-        let shell_mutation = crate::turn_diff_tracker::command_mutation(
-            &["touch".to_string(), "shell.txt".to_string()],
-            Some(&repo),
-        );
-        begin_exec_mutation_evidence(
-            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "shell-mutation", None),
-            Some(&cwd),
-            &shell_mutation,
-        )
-        .await;
         shell
             .begin(ToolEventCtx::new(
                 session.as_ref(),
@@ -2324,14 +2131,6 @@ mod tests {
             .expect("shell mutation completes");
 
         let unified_command = vec!["touch".to_string(), "unified.txt".to_string()];
-        let unified_mutation =
-            crate::turn_diff_tracker::command_mutation(&unified_command, Some(&repo));
-        begin_exec_mutation_evidence(
-            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "unified-mutation", None),
-            Some(&cwd),
-            &unified_mutation,
-        )
-        .await;
         ToolEmitter::unified_exec(
             &unified_command,
             PathUri::from_abs_path(&cwd),
@@ -2365,26 +2164,10 @@ mod tests {
         .await
         .expect("unified mutation completes");
 
-        let evidence = store
-            .list_mutation_evidence(
-                attempt_id,
-                Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
-            )
-            .await
-            .expect("mutation evidence remains queryable");
-        assert_eq!(
-            evidence
-                .iter()
-                .map(|item| item.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["shell.txt", "unified.txt"]
-        );
-        assert!(evidence.iter().all(|item| item.final_hash.is_some()));
-        assert!(
-            evidence
-                .iter()
-                .all(|item| item.pre_write_hash != item.final_hash)
-        );
+        assert_eq!(tokio::fs::read_to_string(repo.join("shell.txt")).await.unwrap(), "after shell");
+        assert_eq!(tokio::fs::read_to_string(repo.join("unified.txt")).await.unwrap(), "after unified");
+        assert!(!repo.join(".typed-task-home/agent-task-coordination/snapshots").exists());
+        store.close().await;
     }
 
     #[tokio::test]

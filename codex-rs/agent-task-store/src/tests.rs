@@ -12,72 +12,6 @@ use uuid::Uuid;
 
 static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-#[tokio::test]
-async fn command_mutation_batches_are_atomic_and_deduplicate_paths() {
-    let fixture = Fixture::new().await;
-    let repo = fixture.repo.path();
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(repo, worker_draft("batch-evidence", "src"))
-        .await
-        .unwrap();
-    let paths = vec!["a.txt".to_string(), "b.txt".to_string()];
-    for path in &paths {
-        std::fs::write(repo.join(path), "before").unwrap();
-    }
-    let events = fixture
-        .store
-        .begin_mutations(
-            attempt.attempt_id,
-            repo,
-            vec![paths[0].clone(), paths[1].clone(), paths[0].clone()],
-            AttributionConfidence::Definitive,
-        )
-        .await
-        .unwrap();
-    assert_eq!(events.len(), 2);
-    // Failure on the second path must roll back finalization of the first.
-    assert!(
-        fixture
-            .store
-            .finalize_mutations(
-                attempt.attempt_id,
-                repo,
-                vec![paths[0].clone(), "missing.txt".into()],
-            )
-            .await
-            .is_err()
-    );
-    for path in &paths {
-        std::fs::write(repo.join(path), "after").unwrap();
-    }
-    let evidence = fixture
-        .store
-        .finalize_mutations(attempt.attempt_id, repo, paths.clone())
-        .await
-        .unwrap();
-    assert_eq!(evidence.len(), 2);
-    // Failure after adding a new path must not leave a partial baseline.
-    assert!(
-        fixture
-            .store
-            .begin_mutations(
-                attempt.attempt_id,
-                repo,
-                vec!["0-new.txt".into(), paths[0].clone()],
-                AttributionConfidence::Definitive,
-            )
-            .await
-            .is_err()
-    );
-    let retained = fixture
-        .store
-        .list_mutation_evidence(attempt.attempt_id, None)
-        .await
-        .unwrap();
-    assert_eq!(retained.len(), 2);
-    assert!(retained.iter().all(|entry| paths.contains(&entry.path)));
-}
 
 fn task_store_migrator_through(version: i64) -> sqlx::migrate::Migrator {
     sqlx::migrate::Migrator {
@@ -100,8 +34,6 @@ fn task_store_migrator_through(version: i64) -> sqlx::migrate::Migrator {
 use super::*;
 use crate::local::TestSnapshotCapturePause;
 use crate::local::with_test_snapshot_capture_pause;
-use crate::workspace::TestWorkspaceCapturePause;
-use crate::workspace::with_test_workspace_capture_pause;
 
 #[test]
 fn editing_and_tool_calls_are_meaningful_progress() {
@@ -131,160 +63,8 @@ fn embedded_migration_checksums_match_persisted_line_endings() {
     }
 }
 
-#[tokio::test]
-async fn audit_mutation_recovery_f060_page_reports_completeness_and_rejects_zero() {
-    let fixture = Fixture::new().await;
-    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src creates");
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft("audit-page", "src"))
-        .await
-        .expect("assignment creates");
-    for path in ["src/a.rs", "src/b.rs"] {
-        std::fs::write(fixture.repo.path().join(path), "before").expect("file writes");
-        fixture
-            .store
-            .begin_mutation(
-                attempt.attempt_id,
-                fixture.repo.path(),
-                path.to_string(),
-                AttributionConfidence::Definitive,
-            )
-            .await
-            .expect("mutation begins");
-    }
-    let page = fixture
-        .store
-        .list_mutation_evidence_page(attempt.attempt_id, Some(1), None)
-        .await
-        .expect("page reads");
-    assert_eq!(page.evidence.len(), 1);
-    assert_eq!(page.total_count, 2);
-    assert!(page.truncated);
-    assert_eq!(page.next_cursor, Some(1));
-    let second = fixture
-        .store
-        .list_mutation_evidence_page(attempt.attempt_id, Some(1), page.next_cursor)
-        .await
-        .expect("next page reads");
-    assert_eq!(second.total_count, 2);
-    assert!(!second.truncated);
-    assert_eq!(second.next_cursor, None);
-    assert_eq!(page.evidence[0].path, "src/b.rs");
-    assert_eq!(second.evidence.len(), 1);
-    assert_eq!(second.evidence[0].path, "src/a.rs");
-    assert_eq!(second.evidence[0].mutation_event_ids.len(), 1);
-    let empty = fixture
-        .store
-        .list_mutation_evidence_page(attempt.attempt_id, Some(1), Some(999))
-        .await
-        .expect("past-end page reads");
-    assert_eq!(empty.total_count, 2);
-    assert!(empty.evidence.is_empty());
-    assert_eq!(empty.next_cursor, None);
-    assert!(matches!(
-        fixture
-            .store
-            .list_mutation_evidence(attempt.attempt_id, Some(0))
-            .await,
-        Err(StoreError::InvalidMutationEvidenceLimit(0))
-    ));
-}
 
-#[tokio::test]
-async fn audit_mutation_recovery_f061_finalize_pending_is_atomic() {
-    let fixture = Fixture::new().await;
-    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src creates");
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            worker_draft("audit-finalize-all", "src"),
-        )
-        .await
-        .expect("assignment creates");
-    for path in ["src/a.rs", "src/b.rs"] {
-        std::fs::write(fixture.repo.path().join(path), "before").expect("file writes");
-        fixture
-            .store
-            .begin_mutation(
-                attempt.attempt_id,
-                fixture.repo.path(),
-                path.into(),
-                AttributionConfidence::Definitive,
-            )
-            .await
-            .expect("mutation begins");
-    }
-    std::fs::remove_file(fixture.repo.path().join("src/b.rs")).expect("file removes");
-    std::fs::create_dir(fixture.repo.path().join("src/b.rs")).expect("directory replaces file");
-    assert!(
-        fixture
-            .store
-            .finalize_pending_mutations(attempt.attempt_id)
-            .await
-            .is_err()
-    );
-    let evidence = fixture
-        .store
-        .list_mutation_evidence(attempt.attempt_id, None)
-        .await
-        .expect("evidence reads");
-    assert!(evidence.iter().all(|item| item.finalized_at.is_none()));
-}
 
-#[tokio::test]
-async fn audit_mutation_recovery_f062_prewrite_capture_holds_coordination_lock() {
-    let fixture = Fixture::new().await;
-    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src creates");
-    std::fs::write(fixture.repo.path().join("src/a.rs"), "before").expect("file writes");
-    let (assignment, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft("audit-pre", "src"))
-        .await
-        .expect("assignment creates");
-    let pause = Arc::new(TestSnapshotCapturePause::new());
-    let task_pause = Arc::clone(&pause);
-    let store = fixture.store.clone();
-    let repo = fixture.repo.path().to_path_buf();
-    let task = tokio::spawn(async move {
-        with_test_snapshot_capture_pause(
-            task_pause,
-            store.begin_mutation(
-                attempt.attempt_id,
-                &repo,
-                "src/a.rs".into(),
-                AttributionConfidence::Definitive,
-            ),
-        )
-        .await
-    });
-    let permit = pause.started.acquire().await.expect("capture pauses");
-    permit.forget();
-    let task_read = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        fixture
-            .store
-            .get_agent_task(assignment.assignment_id, Some(0)),
-    )
-    .await
-    .expect("an unrelated task read must not wait for snapshot capture")
-    .expect("task read succeeds");
-    assert_eq!(task_read.assignment.assignment_id, assignment.assignment_id);
-    let pool = coordination_pool(&fixture).await;
-    let mut connection = pool.acquire().await.expect("connection opens");
-    let writer = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection),
-    )
-    .await;
-    assert!(
-        !matches!(writer, Ok(Ok(_))),
-        "writer must remain excluded during prewrite capture"
-    );
-    pause.release.add_permits(1);
-    task.await.expect("task joins").expect("mutation begins");
-}
 
 #[tokio::test]
 async fn agent_task_authorization_does_not_hydrate_task_capsules() {
@@ -324,67 +104,6 @@ async fn agent_task_authorization_does_not_hydrate_task_capsules() {
     assert_eq!(authorization.current_attempt, attempt);
 }
 
-#[tokio::test]
-async fn audit_mutation_recovery_f063_final_snapshot_matches_commit_evidence() {
-    let fixture = Fixture::new().await;
-    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src creates");
-    std::fs::write(fixture.repo.path().join("src/a.rs"), "before").expect("file writes");
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft("audit-final", "src"))
-        .await
-        .expect("assignment creates");
-    fixture
-        .store
-        .begin_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "src/a.rs".into(),
-            AttributionConfidence::Definitive,
-        )
-        .await
-        .expect("mutation begins");
-    std::fs::write(fixture.repo.path().join("src/a.rs"), "committed").expect("file mutates");
-    let pause = Arc::new(TestSnapshotCapturePause::new());
-    let task_pause = Arc::clone(&pause);
-    let store = fixture.store.clone();
-    let repo = fixture.repo.path().to_path_buf();
-    let task = tokio::spawn(async move {
-        with_test_snapshot_capture_pause(
-            task_pause,
-            store.finalize_mutation(attempt.attempt_id, &repo, "src/a.rs".into()),
-        )
-        .await
-    });
-    let permit = pause.started.acquire().await.expect("capture pauses");
-    permit.forget();
-    let pool = coordination_pool(&fixture).await;
-    let mut connection = pool.acquire().await.expect("connection opens");
-    let writer = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection),
-    )
-    .await;
-    assert!(
-        !matches!(writer, Ok(Ok(_))),
-        "writer must remain excluded until final evidence commits"
-    );
-    pause.release.add_permits(1);
-    let evidence = task.await.expect("task joins").expect("mutation finalizes");
-    let snapshot = fixture
-        .store
-        .read_mutation_snapshot(
-            attempt.attempt_id,
-            "src/a.rs".into(),
-            MutationSnapshotVersion::Final,
-            0,
-            None,
-        )
-        .await
-        .expect("snapshot reads");
-    assert_eq!(snapshot.bytes, b"committed");
-    assert!(evidence.end_epoch.is_some());
-}
 
 #[tokio::test]
 async fn audit_mutation_recovery_f064_summary_records_configured_policy() {
@@ -471,14 +190,6 @@ async fn audit_mutation_recovery_f065_validation_leases_are_server_bounded() {
     );
 }
 
-#[tokio::test]
-async fn audit_mutation_recovery_f067_epoch_overflow_is_rejected() {
-    let fixture = Fixture::new().await;
-    assert!(matches!(
-        fixture.store.read_workspace_events(fixture.repo.path(), u64::MAX).await,
-        Err(StoreError::CorruptData(message)) if message.contains("SQLite integer range")
-    ));
-}
 
 fn audit_capsule(assignment: &Assignment, attempt: &Attempt) -> TaskCapsuleV1 {
     TaskCapsuleV1 {
@@ -618,32 +329,6 @@ async fn audit_capsule_cancelled_publication_serializes_competing_attach_and_rec
     recovered.close().await;
 }
 
-#[tokio::test]
-async fn audit_workspace_root_capture_records_deleted_descendants() {
-    let fixture = Fixture::new().await;
-    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("source directory");
-    let path = fixture.repo.path().join("src/deleted.rs");
-    std::fs::write(&path, "before").expect("source writes");
-    let before = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![".".into()])
-        .await
-        .expect("baseline");
-    std::fs::remove_file(path).expect("source deletes");
-    let after = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![".".into()])
-        .await
-        .expect("deletion capture");
-    assert_eq!(after.epoch, before.epoch + 1);
-    let deleted = after
-        .files
-        .iter()
-        .find(|entry| entry.path == "src/deleted.rs")
-        .expect("deleted descendant remains represented");
-    assert!(!deleted.existed);
-    assert_eq!(deleted.content_hash, None);
-}
 
 #[tokio::test]
 async fn wake_wait_ends_when_store_closes() {
@@ -749,226 +434,10 @@ async fn audit_validation_receipt_failed_and_cancelled_do_not_refresh_progress()
     }
 }
 
-#[tokio::test]
-async fn audit_workspace_actor_reset_clears_binding_and_lease() {
-    let fixture = Fixture::new().await;
-    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("scope directory");
-    let (assignment, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft("reset-root", "src"))
-        .await
-        .expect("assignment creates");
-    let registration = WorkspaceActorRegistration {
-        root_session_id: "reset-root".to_string(),
-        actor_id: "reset-actor".to_string(),
-        kind: WorkspaceActorKind::Typed,
-        assignment_id: Some(assignment.assignment_id),
-        attempt_id: Some(attempt.attempt_id),
-        strategy: WorkspaceStrategy::Shared,
-    };
-    fixture
-        .store
-        .register_workspace_actor(fixture.repo.path(), registration)
-        .await
-        .expect("bound actor registers");
-    let pool = coordination_pool(&fixture).await;
-    sqlx::query(
-        "UPDATE workspace_actors SET state = 'active', lease_expires_at = ? WHERE actor_id = ?",
-    )
-    .bind(serde_json::to_string(&(Utc::now() + Duration::hours(1))).expect("lease serializes"))
-    .bind("reset-actor")
-    .execute(&pool)
-    .await
-    .expect("actor simulates active lease");
 
-    fixture
-        .store
-        .register_workspace_actor(
-            fixture.repo.path(),
-            WorkspaceActorRegistration {
-                root_session_id: "reset-root".to_string(),
-                actor_id: "reset-actor".to_string(),
-                kind: WorkspaceActorKind::Typed,
-                assignment_id: None,
-                attempt_id: None,
-                strategy: WorkspaceStrategy::Shared,
-            },
-        )
-        .await
-        .expect("actor resets");
-    let row = sqlx::query_as::<_, (Option<String>, Option<String>, String, Option<String>)>(
-        "SELECT assignment_id, attempt_id, state, lease_expires_at FROM workspace_actors WHERE actor_id = ?",
-    )
-    .bind("reset-actor")
-    .fetch_one(&pool)
-    .await
-    .expect("reset actor reads");
-    assert_eq!(row, (None, None, "idle".to_string(), None));
-}
 
-#[tokio::test]
-async fn audit_workspace_capture_publish_order_matches_scan_order() {
-    let fixture = Fixture::new().await;
-    let path = fixture.repo.path().join("ordered.txt");
-    std::fs::write(&path, "old").expect("initial file");
-    fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["ordered.txt".to_string()])
-        .await
-        .expect("baseline captures");
 
-    let pause = Arc::new(TestWorkspaceCapturePause::new());
-    let first_store = fixture.store.clone();
-    let first_root = fixture.repo.path().to_path_buf();
-    let first_pause = Arc::clone(&pause);
-    let first = tokio::spawn(async move {
-        with_test_workspace_capture_pause(first_pause, async move {
-            first_store
-                .capture_workspace_revision(&first_root, vec!["ordered.txt".to_string()])
-                .await
-        })
-        .await
-    });
-    let started = tokio::time::timeout(std::time::Duration::from_secs(1), pause.started.acquire())
-        .await
-        .expect("first scan reaches pause")
-        .expect("pause remains open");
-    started.forget();
-    std::fs::write(&path, "new").expect("file changes between captures");
-    let second_store = fixture.store.clone();
-    let second_root = fixture.repo.path().to_path_buf();
-    let second = tokio::spawn(async move {
-        second_store
-            .capture_workspace_revision(&second_root, vec!["ordered.txt".to_string()])
-            .await
-    });
-    pause.release.add_permits(1);
-    let first = first
-        .await
-        .expect("first task joins")
-        .expect("first capture");
-    let second = second
-        .await
-        .expect("second task joins")
-        .expect("second capture");
-    assert!(second.epoch > first.epoch);
-    assert_ne!(second.manifest_hash, first.manifest_hash);
-}
 
-#[tokio::test]
-async fn audit_workspace_git_capture_includes_tracked_generated_named_paths() {
-    let fixture = Fixture::new().await;
-    run_git(fixture.repo.path(), &["init", "--quiet"]);
-    std::fs::create_dir_all(fixture.repo.path().join("build")).expect("build directory");
-    std::fs::write(fixture.repo.path().join("build/source.rs"), "old").expect("tracked file");
-    run_git(fixture.repo.path(), &["add", "build/source.rs"]);
-    run_git(
-        fixture.repo.path(),
-        &[
-            "-c",
-            "user.name=KD4 Audit",
-            "-c",
-            "user.email=kd4-audit@example.invalid",
-            "commit",
-            "--quiet",
-            "-m",
-            "fixture",
-        ],
-    );
-    std::fs::write(fixture.repo.path().join("build/source.rs"), "new").expect("tracked change");
-    let revision = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
-        .await
-        .expect("Git overlay captures");
-    assert_eq!(revision.capture_mode, WorkspaceCaptureMode::GitOverlay);
-    assert!(revision.complete);
-    assert!(revision.discovery_errors.is_empty());
-    assert!(
-        revision
-            .files
-            .iter()
-            .any(|entry| entry.path == "build/source.rs")
-    );
-}
-
-#[tokio::test]
-async fn unborn_repository_capture_includes_index_and_excludes_ignored_files() {
-    let fixture = Fixture::new().await;
-    std::fs::write(fixture.repo.path().join("input.txt"), "input").expect("fallback input");
-    run_git(fixture.repo.path(), &["init", "--quiet"]);
-    std::fs::write(fixture.repo.path().join(".gitignore"), "target/\n").unwrap();
-    std::fs::create_dir(fixture.repo.path().join("target")).unwrap();
-    std::fs::write(fixture.repo.path().join("target/artifact"), "ignored").unwrap();
-    run_git(fixture.repo.path(), &["add", "input.txt"]);
-    let revision = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
-        .await
-        .expect("unborn repository captures");
-    assert_eq!(revision.capture_mode, WorkspaceCaptureMode::GitOverlay);
-    assert!(revision.complete);
-    assert!(revision.discovery_errors.is_empty());
-    assert!(crate::local::require_complete_workspace_capture(&revision).is_ok());
-    assert!(revision.files.iter().any(|entry| entry.path == "input.txt"));
-    assert!(
-        !revision
-            .files
-            .iter()
-            .any(|entry| entry.path.starts_with("target/"))
-    );
-    assert!(
-        revision
-            .files
-            .iter()
-            .any(|entry| entry.path == REPOSITORY_WIDE_PATH && !entry.existed)
-    );
-}
-
-#[tokio::test]
-async fn validation_changed_during_execution_cannot_be_current_proof() {
-    let fixture = Fixture::new().await;
-    initialize_validation_repository(fixture.repo.path());
-    let command = "focused validation";
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            validation_worker_draft("during-validation", "src/lib.rs", command),
-        )
-        .await
-        .unwrap();
-    // An edit before launch must be part of the recorded input revision.
-    std::fs::write(fixture.repo.path().join("src/lib.rs"), "before launch\n").unwrap();
-    let call =
-        start_focused_validation(&fixture.store, attempt.attempt_id, "during-call", command).await;
-    let revision = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
-        .await
-        .unwrap();
-    assert_eq!(call.evidence.start_epoch, revision.epoch);
-    std::fs::write(
-        fixture.repo.path().join("src/lib.rs"),
-        "after inputs consumed\n",
-    )
-    .unwrap();
-    let terminal = finish_focused_validation(&fixture.store, call).await;
-    assert_ne!(
-        terminal.evidence.end_epoch,
-        Some(terminal.evidence.start_epoch)
-    );
-    assert!(matches!(
-        fixture
-            .store
-            .submit_agent_receipt(
-                attempt.attempt_id,
-                completed_receipt(vec![terminal.call_id])
-            )
-            .await,
-        Err(StoreError::ValidationCallStatusInvalid { .. })
-    ));
-}
 
 #[tokio::test]
 async fn late_validation_settles_after_abandonment_without_creating_proof() {
@@ -1008,223 +477,13 @@ async fn late_validation_settles_after_abandonment_without_creating_proof() {
     assert_eq!(running, 0);
 }
 
-#[tokio::test]
-async fn successful_process_settles_when_terminal_evidence_capture_fails() {
-    let fixture = Fixture::new().await;
-    initialize_validation_repository(fixture.repo.path());
-    let command = "focused validation";
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            validation_worker_draft("capture-failed", "src", command),
-        )
-        .await
-        .unwrap();
-    let call = start_focused_validation(
-        &fixture.store,
-        attempt.attempt_id,
-        "capture-failed-call",
-        command,
-    )
-    .await;
-    std::fs::write(fixture.repo.path().join(".git/HEAD"), "invalid head\n").unwrap();
-    let terminal = finish_focused_validation(&fixture.store, call).await;
-    assert_eq!(terminal.status, ValidationCallStatus::Succeeded);
-    assert_eq!(terminal.evidence.end_epoch, None);
-    assert!(
-        terminal
-            .evidence
-            .output_summary
-            .unwrap()
-            .contains("evidence is unavailable")
-    );
-}
 
-#[tokio::test]
-async fn failed_capture_rolls_back_before_settling_validation() {
-    let fixture = Fixture::new().await;
-    initialize_validation_repository(fixture.repo.path());
-    let command = "focused validation";
-    let (assignment, attempt) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            validation_worker_draft("capture-rollback", "src", command),
-        )
-        .await
-        .unwrap();
-    let call =
-        start_focused_validation(&fixture.store, attempt.attempt_id, "rollback-call", command)
-            .await;
-    let pool = coordination_pool(&fixture).await;
-    let before: i64 =
-        sqlx::query_scalar("SELECT epoch FROM workspace_repositories WHERE workspace_id = ?")
-            .bind(&assignment.workspace_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    // Reject publication after capture has obtained the writer. Without the
-    // savepoint, reconciliation could leak a partial epoch into the outer commit.
-    sqlx::query("CREATE TRIGGER reject_capture BEFORE UPDATE OF epoch ON workspace_repositories WHEN NEW.epoch <> OLD.epoch BEGIN SELECT RAISE(FAIL, 'injected capture publication failure'); END")
-        .execute(&pool).await.unwrap();
-    std::fs::write(
-        fixture.repo.path().join("src/lib.rs"),
-        "changed before completion\n",
-    )
-    .unwrap();
-    let terminal = finish_focused_validation(&fixture.store, call).await;
-    assert_eq!(terminal.status, ValidationCallStatus::Succeeded);
-    assert_eq!(terminal.evidence.end_epoch, None);
-    assert!(
-        terminal
-            .evidence
-            .output_summary
-            .unwrap()
-            .contains("injected capture publication failure")
-    );
-    let after: i64 =
-        sqlx::query_scalar("SELECT epoch FROM workspace_repositories WHERE workspace_id = ?")
-            .bind(&assignment.workspace_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(after, before);
-    let leaked_events: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM workspace_events WHERE workspace_id = ? AND epoch > ?",
-    )
-    .bind(&assignment.workspace_id)
-    .bind(before)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        leaked_events, 0,
-        "failed publication must roll back its event too"
-    );
-}
 
-fn create_audit_symlink(target: &std::path::Path, link: &std::path::Path) {
-    std::os::windows::fs::symlink_file(target, link).expect("file symlink creates");
-}
 
-fn create_audit_directory_junction(target: &std::path::Path, link: &std::path::Path) {
-    let output = Command::new("cmd")
-        .args(["/d", "/c", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .expect("junction command starts");
-    assert!(
-        output.status.success(),
-        "junction creates: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
-#[tokio::test]
-async fn audit_workspace_symlink_target_identity_affects_manifest() {
-    let fixture = Fixture::new().await;
-    std::fs::write(fixture.repo.path().join("left.txt"), "same").expect("left target");
-    std::fs::write(fixture.repo.path().join("right.txt"), "same").expect("right target");
-    let link = fixture.repo.path().join("link.txt");
-    create_audit_symlink(std::path::Path::new("left.txt"), &link);
-    let left = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["link.txt".to_string()])
-        .await
-        .expect("left link captures");
-    std::fs::remove_file(&link).expect("left link removes");
-    create_audit_symlink(std::path::Path::new("right.txt"), &link);
-    let right = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["link.txt".to_string()])
-        .await
-        .expect("right link captures");
-    assert_eq!(left.files[0].path, "link.txt");
-    assert_eq!(right.files[0].path, "link.txt");
-    assert_ne!(left.files[0].content_hash, right.files[0].content_hash);
-    assert_ne!(left.files, right.files);
-    assert_ne!(left.manifest_hash, right.manifest_hash);
-}
 
-#[tokio::test]
-async fn audit_workspace_broken_symlink_differs_from_absent_path() {
-    let fixture = Fixture::new().await;
-    let link = fixture.repo.path().join("link.txt");
-    create_audit_symlink(std::path::Path::new("missing.txt"), &link);
-    let broken = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["link.txt".to_string()])
-        .await
-        .expect("broken link captures");
-    std::fs::remove_file(&link).expect("broken link removes");
-    let absent = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["link.txt".to_string()])
-        .await
-        .expect("absent path captures");
-    assert!(broken.files[0].existed);
-    assert!(!absent.files[0].existed);
-    assert_ne!(broken.manifest_hash, absent.manifest_hash);
-}
 
-#[tokio::test]
-async fn audit_workspace_directory_junction_is_snapshotted_without_traversing_its_target() {
-    let fixture = Fixture::new().await;
-    let outside = TempDir::new().expect("outside tempdir");
-    std::fs::write(outside.path().join("outside.txt"), "outside").expect("outside file");
-    create_audit_directory_junction(outside.path(), &fixture.repo.path().join("linked"));
 
-    let revision = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["linked".to_string()])
-        .await
-        .expect("directory junction captures");
-
-    assert_eq!(revision.files.len(), 1);
-    assert_eq!(revision.files[0].path, "linked");
-    assert!(revision.files[0].existed);
-    assert!(
-        revision
-            .files
-            .iter()
-            .all(|entry| entry.path != "linked/outside.txt")
-    );
-}
-
-#[tokio::test]
-async fn audit_workspace_case_only_rename_replaces_the_stored_display_path() {
-    let fixture = Fixture::new().await;
-    let upper = fixture.repo.path().join("CaseOnly.txt");
-    let intermediate = fixture.repo.path().join("case-rename.tmp");
-    let lower = fixture.repo.path().join("caseonly.txt");
-    std::fs::write(&upper, "same bytes").expect("initial file");
-    let baseline = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["CaseOnly.txt".to_string()])
-        .await
-        .expect("baseline captures");
-
-    std::fs::rename(&upper, &intermediate).expect("first rename");
-    std::fs::rename(&intermediate, &lower).expect("case-only rename");
-    let renamed = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["caseonly.txt".to_string()])
-        .await
-        .expect("renamed path captures");
-
-    assert!(renamed.epoch > baseline.epoch);
-    assert_eq!(renamed.files[0].path, "caseonly.txt");
-    let pool = coordination_pool(&fixture).await;
-    let stored_paths =
-        sqlx::query_scalar::<_, String>("SELECT path FROM workspace_paths WHERE workspace_id = ?")
-            .bind(&renamed.workspace_id)
-            .fetch_all(&pool)
-            .await
-            .expect("stored workspace paths read");
-    assert_eq!(stored_paths, vec!["caseonly.txt".to_string()]);
-}
 
 #[tokio::test]
 async fn audit_task_view_terminal_actor_with_future_expiry_is_released() {
@@ -1642,97 +901,7 @@ async fn coordination_pool(fixture: &Fixture) -> sqlx::SqlitePool {
         .expect("coordination database opens")
 }
 
-async fn assert_writer_blocked_while_snapshot_capture_is_paused(
-    pause: &TestSnapshotCapturePause,
-    blocker_pool: &sqlx::SqlitePool,
-) {
-    let permit = tokio::time::timeout(std::time::Duration::from_secs(1), pause.started.acquire())
-        .await
-        .expect("snapshot capture reaches the test pause")
-        .expect("snapshot pause remains open");
-    permit.forget();
 
-    let mut blocker = blocker_pool
-        .acquire()
-        .await
-        .expect("independent coordination connection opens");
-    let writer_result = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *blocker),
-    )
-    .await;
-    let writer_acquired = matches!(&writer_result, Ok(Ok(_)));
-    if writer_acquired {
-        sqlx::query("ROLLBACK")
-            .execute(&mut *blocker)
-            .await
-            .expect("independent writer lock is released");
-    }
-    pause.release.add_permits(1);
-    match writer_result {
-        Err(_) => {} // The writer stayed blocked until the timeout.
-        Ok(Err(sqlx::Error::Database(error))) => assert!(
-            matches!(
-                error.code().as_deref(),
-                Some("5" | "6" | "261" | "262" | "517")
-            ),
-            "expected SQLite contention, got {error}",
-        ),
-        other => panic!("snapshot capture must retain the writer lock: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn workspace_actor_registration_waits_for_transient_writer_contention() {
-    let fixture = Fixture::new().await;
-    assert_eq!(
-        fixture
-            .store
-            .configured_busy_timeout_millis()
-            .await
-            .expect("busy timeout reads"),
-        30_000,
-    );
-    let blocker_pool = coordination_pool(&fixture).await;
-    let mut blocker = blocker_pool
-        .acquire()
-        .await
-        .expect("coordination connection opens");
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *blocker)
-        .await
-        .expect("writer lock is acquired");
-
-    let registration = fixture.store.register_workspace_actor(
-        fixture.repo.path(),
-        WorkspaceActorRegistration {
-            root_session_id: "contended-root".to_string(),
-            actor_id: "contended-reader".to_string(),
-            kind: WorkspaceActorKind::Root,
-            assignment_id: None,
-            attempt_id: None,
-            strategy: WorkspaceStrategy::Shared,
-        },
-    );
-    tokio::pin!(registration);
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), &mut registration)
-            .await
-            .is_err(),
-        "actor registration should wait while another connection owns the writer lock"
-    );
-
-    sqlx::query("ROLLBACK")
-        .execute(&mut *blocker)
-        .await
-        .expect("writer lock is released");
-    tokio::time::timeout(std::time::Duration::from_secs(1), registration)
-        .await
-        .expect("registration resumes promptly after the writer lock is released")
-        .expect("registration survives transient writer contention");
-    drop(blocker);
-    blocker_pool.close().await;
-}
 
 async fn wait_out_transient_writer_contention<T>(
     blocker_pool: &sqlx::SqlitePool,
@@ -1765,7 +934,7 @@ async fn wait_out_transient_writer_contention<T>(
 }
 
 #[tokio::test]
-async fn lease_heartbeats_and_quiescence_wait_for_transient_writer_contention() {
+async fn lease_heartbeats_wait_for_transient_writer_contention() {
     let fixture = Fixture::new().await;
     let root_session_id = "contended-lease-root";
     let command = "cargo test -p contended lease";
@@ -1815,16 +984,6 @@ async fn lease_heartbeats_and_quiescence_wait_for_transient_writer_contention() 
         .await,
         "the running validation lease renews after contention"
     );
-    let quiescence = wait_out_transient_writer_contention(
-        &blocker_pool,
-        fixture.store.check_quiescence(root_session_id.to_string()),
-    )
-    .await;
-    assert_eq!(
-        quiescence.active_assignment_ids,
-        vec![assignment.assignment_id]
-    );
-    assert_eq!(quiescence.running_validation_call_ids, vec![call.call_id]);
     blocker_pool.close().await;
 }
 
@@ -2155,14 +1314,6 @@ async fn migration_removes_workspace_mutation_blocking_schema() {
     let store = LocalAgentTaskStore::initialize(&state)
         .await
         .expect("production initializer upgrades predecessor database");
-    let events = store
-        .read_workspace_events(repo.path(), 0)
-        .await
-        .expect("retained workspace events read through production API");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].paths, vec!["src/lib.rs".to_string()]);
-    assert_eq!(events[0].contracts, vec!["stable-contract".to_string()]);
-
     let fixture = Fixture {
         _codex_home: codex_home,
         repo,
@@ -2170,6 +1321,13 @@ async fn migration_removes_workspace_mutation_blocking_schema() {
         store,
     };
     let pool = coordination_pool(&fixture).await;
+    let event = sqlx::query_as::<_, (String, String)>(
+        "SELECT paths_json, contracts_json FROM workspace_events",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical workspace event is preserved");
+    assert_eq!(event, (r#"["src/lib.rs"]"#.to_string(), r#"["stable-contract"]"#.to_string()));
     let remaining = sqlx::query_as::<_, (String, String)>(
         "SELECT type, name
          FROM sqlite_master
@@ -2757,29 +1915,7 @@ async fn controlled_write(
     contents: &str,
 ) {
     bind_test_agent(store, assignment_id, attempt_id, root_session_id).await;
-    store
-        .capture_workspace_revision(repo_root, vec![path.to_string()])
-        .await
-        .expect("pre-write workspace revision captures");
-    store
-        .begin_mutation(
-            attempt_id,
-            repo_root,
-            path.to_string(),
-            AttributionConfidence::Definitive,
-        )
-        .await
-        .expect("typed mutation evidence starts");
     std::fs::write(repo_root.join(path), contents).expect("controlled file write");
-    store
-        .capture_workspace_revision(repo_root, vec![path.to_string()])
-        .await
-        .expect("post-write workspace revision captures");
-    let evidence = store
-        .finalize_mutation(attempt_id, repo_root, path.to_string())
-        .await
-        .expect("typed mutation evidence finalizes");
-    assert_eq!(evidence.assignment_id, assignment_id);
 }
 
 async fn bind_test_agent(
@@ -2902,7 +2038,7 @@ fn reviewer_and_verifier_invariants_are_enforced() {
 }
 
 #[tokio::test]
-async fn selective_admission_keeps_overlapping_claims_as_metadata() {
+async fn selective_admission_uses_assignment_metadata_without_persisting_claims() {
     let fixture = Fixture::new().await;
     let root_session_id = "selective-overlap-root";
     let mut first_draft = selective_worker_draft(
@@ -2955,7 +2091,7 @@ async fn selective_admission_keeps_overlapping_claims_as_metadata() {
             .fetch_one(&pool)
             .await
             .expect("active write claim count reads"),
-        4
+        0
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -2964,7 +2100,7 @@ async fn selective_admission_keeps_overlapping_claims_as_metadata() {
         .fetch_one(&pool)
         .await
         .expect("active contract claim count reads"),
-        3
+        0
     );
     pool.close().await;
 
@@ -3527,7 +2663,7 @@ async fn criterion_execution_reference_is_validated_persisted_and_projected() {
 }
 
 #[tokio::test]
-async fn source_inspection_receipts_bind_kind_and_pre_read_epoch() {
+async fn source_inspection_receipts_bind_kind_without_workspace_tracking() {
     use sha2::Digest;
     let fixture = Fixture::new().await;
     initialize_validation_repository(fixture.repo.path());
@@ -3557,7 +2693,7 @@ async fn source_inspection_receipts_bind_kind_and_pre_read_epoch() {
     fixture.store.submit_agent_receipt(attempt.attempt_id, draft).await.unwrap();
     let task = fixture.store.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
     assert!(task.completion_evidence_summary().contains(
-        "supported by a complete source inspection (semantic correctness not established)"
+        "supported by a complete source inspection (semantic correctness not established; freshness unverified)"
     ));
     let stale_fixture = Fixture::new().await;
     initialize_validation_repository(stale_fixture.repo.path());
@@ -3572,14 +2708,14 @@ async fn source_inspection_receipts_bind_kind_and_pre_read_epoch() {
     std::fs::write(&stale_path, "pub fn changed() {}\n").unwrap();
     let bytes = std::fs::read(&stale_path).unwrap();
     let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
-    assert!(matches!(
-        stale_fixture.store.record_source_inspection(stale, "stale-read".into(), hash, bytes.len() as u64).await,
-        Err(StoreError::EvidenceSuperseded { .. })
-    ));
+    let reference = stale_fixture.store.record_source_inspection(
+        stale, "stale-read".into(), hash, bytes.len() as u64,
+    ).await.expect("source inspection no longer scans workspace changes");
+    assert_eq!(reference.kind, CriterionEvidenceKind::SourceInspection);
 }
 
 #[tokio::test]
-async fn completed_receipt_rejects_workspace_change_after_validation() {
+async fn completed_receipt_retains_validation_without_workspace_tracking() {
     let fixture = Fixture::new().await;
     initialize_validation_repository(fixture.repo.path());
     let command = "cargo test -p freshness focused-proof";
@@ -3608,36 +2744,35 @@ async fn completed_receipt_rejects_workspace_change_after_validation() {
         "pub fn changed_after_validation() {}\n",
     )
     .expect("source changes after validation");
-    let error = fixture
-        .store
-        .submit_agent_receipt(
-            attempt.attempt_id,
-            completed_receipt(vec!["fresh-receipt-call".to_string()]),
-        )
-        .await
-        .expect_err("stale validation cannot seal a completed receipt");
-    assert!(matches!(
-        error,
-        StoreError::EvidenceSuperseded { call_ids }
-            if call_ids == vec!["fresh-receipt-call".to_string()]
-    ));
-
-    let task = fixture
-        .store
-        .get_agent_task(assignment.assignment_id, Some(0))
-        .await
-        .expect("unsealed task reloads");
-    assert!(task.receipt.is_none());
-    assert_eq!(task.current_attempt.state, AttemptState::Active);
+    let mut draft = completed_receipt(vec!["fresh-receipt-call".to_string()]);
+    draft.criterion_results[0].evidence_ref = Some(CriterionEvidenceRef {
+        kind: CriterionEvidenceKind::ValidationExecution,
+        call_id: "fresh-receipt-call".to_string(),
+        workspace_id: assignment.workspace_id.clone(),
+        evidence_epoch: 0,
+    });
+    fixture.store.submit_agent_receipt(attempt.attempt_id, draft).await
+        .expect("workspace changes no longer trigger automatic freshness rejection");
+    let task = fixture.store.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
+    assert!(task.receipt.is_some());
+    assert!(task.completion_evidence_summary().contains("freshness unverified"));
+    assert!(!fixture.state.codex_home().join("agent-task-coordination").join("snapshots").exists());
     let pool = coordination_pool(&fixture).await;
-    let active_claims = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM write_claims WHERE assignment_id = ? AND active = 1",
-    )
-    .bind(assignment.assignment_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("active claim count reads");
-    assert_eq!(active_claims, 1);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM write_claims)
+              + (SELECT COUNT(*) FROM contract_claims)
+              + (SELECT COUNT(*) FROM workspace_paths)
+              + (SELECT COUNT(*) FROM workspace_events)
+              + (SELECT COUNT(*) FROM mutation_files)
+              + (SELECT COUNT(*) FROM isolated_handoffs)",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 0, "workspace tracking tables must not receive new records");
+    pool.close().await;
+    fixture.store.close().await;
+    let restarted = LocalAgentTaskStore::initialize(&fixture.state).await.unwrap();
+    let reloaded = restarted.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
+    assert_eq!(reloaded.receipt, task.receipt);
+    restarted.close().await;
 }
 
 #[tokio::test]
@@ -3773,9 +2908,7 @@ async fn host_legacy_outcome_persists_final_response_without_fabricating_evidenc
     assert_eq!(receipt.criterion_results[0].evidence, None);
     assert_eq!(receipt.criterion_results[0].evidence_ref, None);
     assert!(receipt.validation_call_ids.is_empty());
-    assert_eq!(receipt.declared_changes.len(), 1);
-    assert_eq!(receipt.declared_changes[0].path, "result.txt");
-    assert!(receipt.declared_changes[0].summary.contains("unverified"));
+    assert!(receipt.declared_changes.is_empty());
     let task = fixture
         .store
         .get_agent_task(assignment.assignment_id, Some(0))
@@ -3838,56 +2971,6 @@ async fn host_legacy_outcome_cannot_bypass_explicit_typed_receipt() {
     ));
 }
 
-#[tokio::test]
-async fn host_legacy_outcome_retains_unfinalized_mutation_risk() {
-    let fixture = Fixture::new().await;
-    let mut draft = worker_draft("plain-pending-root", ".");
-    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
-        parent_assignment_id: None,
-    };
-    draft.workspace_strategy = WorkspaceStrategy::Shared;
-    let (assignment, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), draft)
-        .await
-        .expect("plain-message assignment creates");
-    bind_test_agent(
-        &fixture.store,
-        assignment.assignment_id,
-        attempt.attempt_id,
-        "plain-pending-root",
-    )
-    .await;
-    fixture
-        .store
-        .begin_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "pending.txt".to_string(),
-            AttributionConfidence::Definitive,
-        )
-        .await
-        .expect("mutation begins");
-    std::fs::write(fixture.repo.path().join("pending.txt"), "pending").unwrap();
-    // Completion can still be delivered if mutation finalization was unavailable,
-    // but the host must not turn pending records into finalized change evidence.
-    let receipt = fixture
-        .store
-        .record_legacy_agent_outcome(
-            attempt.attempt_id,
-            AgentStatusClaim::Completed,
-            "Final response".to_string(),
-        )
-        .await
-        .expect("host result persists with incomplete attribution");
-    assert_eq!(receipt.status, AgentStatusClaim::Completed);
-    assert!(receipt.declared_changes.is_empty());
-    assert!(receipt.validation_call_ids.is_empty());
-    assert_eq!(
-        receipt.risks,
-        vec!["1 recorded mutations were not finalized; change attribution is incomplete"]
-    );
-}
 
 #[tokio::test]
 async fn host_legacy_outcome_waits_for_running_validation() {
@@ -4016,39 +3099,6 @@ async fn host_legacy_followup_renews_each_completed_turn_and_its_binding() {
         assert!(active.receipt.is_none());
         assert!(active.validation_calls.is_empty());
     }
-    // This agent already has a stable path and thread binding. A follow-up must
-    // attribute new writes to the renewed attempt without rebinding its identity.
-    fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["followup.txt".to_string()])
-        .await
-        .unwrap();
-    fixture
-        .store
-        .begin_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "followup.txt".to_string(),
-            AttributionConfidence::Definitive,
-        )
-        .await
-        .unwrap();
-    std::fs::write(fixture.repo.path().join("followup.txt"), "latest turn").unwrap();
-    fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["followup.txt".to_string()])
-        .await
-        .unwrap();
-    let mutation = fixture
-        .store
-        .finalize_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "followup.txt".to_string(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(mutation.attempt_id, attempt.attempt_id);
     let receipt = fixture
         .store
         .record_legacy_agent_outcome(
@@ -4058,7 +3108,7 @@ async fn host_legacy_followup_renews_each_completed_turn_and_its_binding() {
         )
         .await
         .unwrap();
-    assert_eq!(receipt.declared_changes[0].path, "followup.txt");
+    assert!(receipt.declared_changes.is_empty());
     assert!(receipt.validation_call_ids.is_empty());
     for old_attempt in prior_attempts {
         assert!(matches!(
@@ -4168,13 +3218,9 @@ async fn receipt_sealing_waits_for_all_attempt_owned_running_validations() {
         .submit_agent_receipt(attempt.attempt_id, receipt)
         .await
         .expect("receipt seals after the watcher finishes");
-    let quiescence = fixture
-        .store
-        .check_quiescence("receipt-seal-root".to_string())
-        .await
-        .expect("terminal quiescence reads");
-    assert!(quiescence.quiescent);
-    assert!(quiescence.running_validation_call_ids.is_empty());
+    let task = fixture.store.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
+    assert!(task.receipt.is_some());
+    assert!(task.validation_calls.iter().all(|call| call.status != ValidationCallStatus::Running));
 }
 
 #[tokio::test]
@@ -4727,25 +3773,25 @@ async fn correction_attempt_is_immutable_and_bounded_to_one() {
     assert!(matches!(
         fixture
             .store
-            .begin_mutation(
+            .append_observation(
                 attempt.attempt_id,
-                fixture.repo.path(),
-                "src/repaired.rs".to_string(),
-                AttributionConfidence::Definitive,
+                ObservationKind::Reading,
+                "correction progress".to_string(),
+                None,
             )
             .await,
         Err(StoreError::AttemptNotActive(_))
     ));
     fixture
         .store
-        .begin_mutation(
+        .append_observation(
             correction.attempt_id,
-            fixture.repo.path(),
-            "src/repaired.rs".to_string(),
-            AttributionConfidence::Definitive,
+            ObservationKind::Reading,
+            "correction progress".to_string(),
+            None,
         )
         .await
-        .expect("correction mutation evidence starts");
+        .expect("correction progress records");
     assert!(matches!(
         fixture
             .store
@@ -4756,7 +3802,7 @@ async fn correction_attempt_is_immutable_and_bounded_to_one() {
 }
 
 #[tokio::test]
-async fn risk_review_progresses_to_independent_verification_without_releasing_claim() {
+async fn risk_review_progresses_to_independent_verification() {
     let fixture = Fixture::new().await;
     let (worker, worker_attempt) = fixture
         .store
@@ -4788,18 +3834,6 @@ async fn risk_review_progresses_to_independent_verification_without_releasing_cl
             .iter()
             .any(|gate| { gate.kind == GateKind::Review && gate.status == GateStatus::Pending })
     );
-    let gated_quiescence = fixture
-        .store
-        .check_quiescence("risk-root".to_string())
-        .await
-        .expect("risk-gated quiescence reads");
-    assert!(
-        gated_quiescence
-            .active_claim_assignment_ids
-            .contains(&worker.assignment_id),
-        "the pending review keeps claim metadata active"
-    );
-
     let (_, reviewer_attempt) = fixture
         .store
         .create_assignment(
@@ -4849,17 +3883,9 @@ async fn risk_review_progresses_to_independent_verification_without_releasing_cl
         )
         .await
         .expect("verification verdict");
-    let pool = coordination_pool(&fixture).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT active FROM write_claims WHERE assignment_id = ?",)
-            .bind(worker.assignment_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .expect("reviewed claim metadata reads"),
-        0,
-        "claim metadata releases only after verification passes"
-    );
-    pool.close().await;
+    let task = fixture.store.get_agent_task(worker.assignment_id, Some(0)).await.unwrap();
+    assert!(task.gates.iter().all(|gate| gate.status == GateStatus::Passed));
+    assert_eq!(task.workspace_status.lease_state, Some(LeaseState::Released));
 }
 
 #[tokio::test]
@@ -5012,187 +4038,8 @@ async fn progress_heartbeat_defers_nonproductive_recovery_but_liveness_does_not(
     ));
 }
 
-#[tokio::test]
-async fn orphaned_owner_claims_release_after_the_liveness_window() {
-    let expired_fixture = Fixture::new().await;
-    let (expired_assignment, expired_attempt) = expired_fixture
-        .store
-        .create_assignment(
-            expired_fixture.repo.path(),
-            worker_draft("expired-owner-root", "src"),
-        )
-        .await
-        .expect("expired-owner assignment");
-    let comparison_now =
-        expire_workspace_actor_leases(&expired_fixture, &[expired_attempt.attempt_id]).await;
-    crate::local::with_test_comparison_now(
-        comparison_now,
-        expired_fixture
-            .store
-            .check_quiescence("expired-owner-root".to_string()),
-    )
-    .await
-    .expect("quiescence scavenges the expired owner");
-    let expired_task = expired_fixture
-        .store
-        .get_agent_task(expired_assignment.assignment_id, Some(10))
-        .await
-        .expect("expired owner task reads");
-    assert_eq!(expired_task.current_attempt.state, AttemptState::NeedsMain);
-    assert!(expired_task.observations.iter().any(|observation| {
-        observation.kind == ObservationKind::NeedsMain
-            && observation.summary.contains("owner lease expired")
-    }));
 
-    let missing_fixture = Fixture::new().await;
-    let (missing_assignment, missing_attempt) = missing_fixture
-        .store
-        .create_assignment(
-            missing_fixture.repo.path(),
-            worker_draft("missing-owner-root", "src"),
-        )
-        .await
-        .expect("missing-owner assignment");
-    remove_workspace_actor(&missing_fixture, missing_attempt.attempt_id).await;
-    missing_fixture
-        .store
-        .check_quiescence("missing-owner-root".to_string())
-        .await
-        .expect("quiescence scavenges a claim without an owner record");
-    assert_eq!(
-        missing_fixture
-            .store
-            .get_agent_task(missing_assignment.assignment_id, Some(0))
-            .await
-            .expect("missing owner task reads")
-            .current_attempt
-            .state,
-        AttemptState::NeedsMain
-    );
-}
 
-#[tokio::test]
-async fn claimless_typed_actor_is_recovered_after_its_liveness_window() {
-    let fixture = Fixture::new().await;
-    let (assignment, attempt) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            explorer_draft("claimless-owner-root", "src", "inspect the bounded source"),
-        )
-        .await
-        .expect("claimless explorer assignment");
-    let pool = coordination_pool(&fixture).await;
-    let active_claim_count = sqlx::query_scalar::<_, i64>(
-        "SELECT
-             (SELECT COUNT(*) FROM write_claims WHERE assignment_id = ? AND active = 1)
-           + (SELECT COUNT(*) FROM contract_claims WHERE assignment_id = ? AND active = 1)",
-    )
-    .bind(assignment.assignment_id.to_string())
-    .bind(assignment.assignment_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("claim metadata reads");
-    assert_eq!(active_claim_count, 0, "explorer is intentionally claimless");
-    pool.close().await;
-
-    let comparison_now = expire_workspace_actor_leases(&fixture, &[attempt.attempt_id]).await;
-    let quiescence = crate::local::with_test_comparison_now(
-        comparison_now,
-        fixture
-            .store
-            .check_quiescence("claimless-owner-root".to_string()),
-    )
-    .await
-    .expect("quiescence recovers the expired claimless actor");
-    assert!(quiescence.quiescent);
-    assert!(quiescence.active_assignment_ids.is_empty());
-
-    let task = fixture
-        .store
-        .get_agent_task(assignment.assignment_id, Some(10))
-        .await
-        .expect("recovered explorer task reads");
-    assert_eq!(task.current_attempt.state, AttemptState::NeedsMain);
-    assert!(task.observations.iter().any(|observation| {
-        observation.kind == ObservationKind::NeedsMain
-            && observation.summary.contains("workspace actor recovered")
-    }));
-}
-
-#[tokio::test]
-async fn live_reviewer_preserves_a_gated_claim_after_the_worker_lease_expires() {
-    let fixture = Fixture::new().await;
-    let (worker, worker_attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft("review-root", "src"))
-        .await
-        .expect("worker assignment");
-    fixture
-        .store
-        .submit_agent_receipt_with_review(
-            worker_attempt.attempt_id,
-            completed_receipt(Vec::new()),
-            "cold review required".to_string(),
-        )
-        .await
-        .expect("review-gated receipt");
-    let (_, reviewer_attempt) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            relation_draft("review-root", AgentRole::Reviewer, worker.assignment_id),
-        )
-        .await
-        .expect("reviewer assignment");
-
-    let worker_comparison_now =
-        expire_workspace_actor_leases(&fixture, &[worker_attempt.attempt_id]).await;
-    let live_relation = crate::local::with_test_comparison_now(
-        worker_comparison_now,
-        fixture.store.check_quiescence("review-root".to_string()),
-    )
-    .await
-    .expect("live related reviewer is considered");
-    assert!(
-        live_relation
-            .active_claim_assignment_ids
-            .contains(&worker.assignment_id)
-    );
-
-    let reviewer_comparison_now =
-        expire_workspace_actor_leases(&fixture, &[reviewer_attempt.attempt_id]).await;
-    let released = crate::local::with_test_comparison_now(
-        reviewer_comparison_now,
-        fixture.store.check_quiescence("review-root".to_string()),
-    )
-    .await
-    .expect("stale related actors are scavenged");
-    assert!(
-        !released
-            .active_claim_assignment_ids
-            .contains(&worker.assignment_id)
-    );
-    fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            worker_draft("competing-root", "src/file.rs"),
-        )
-        .await
-        .expect("claim releases after both the owner and related reviewer become stale");
-    let task = fixture
-        .store
-        .get_agent_task(worker.assignment_id, Some(10))
-        .await
-        .expect("orphaned gated task reads");
-    assert_eq!(task.current_attempt.state, AttemptState::NeedsMain);
-    assert!(
-        task.gates
-            .iter()
-            .any(|gate| gate.kind == GateKind::Review && gate.status == GateStatus::Pending)
-    );
-}
 
 #[tokio::test]
 async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
@@ -5817,805 +4664,29 @@ async fn integrator_admission_does_not_depend_on_claim_overlap_or_supersession()
         .create_assignment(fixture.repo.path(), integrator)
         .await
         .expect("targeted integrator is admitted after the dependency gate passes");
-    let pool = coordination_pool(&fixture).await;
-    let targeted = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT active, superseded_by FROM write_claims WHERE assignment_id = ?",
-    )
-    .bind(worker.assignment_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("targeted claim reads");
-    assert_eq!(targeted, (0, None));
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT active FROM write_claims WHERE assignment_id = ?",)
-            .bind(untargeted.assignment_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .expect("untargeted claim reads"),
-        1
-    );
-    pool.close().await;
-}
-
-#[tokio::test]
-async fn write_claims_and_mutations_are_bound_to_exact_repositories() {
-    let fixture = Fixture::new().await;
-    let other_repo = TempDir::new().expect("second repository tempdir");
-    let (_, first_attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft("root", "shared"))
-        .await
-        .expect("first repository claim");
-    fixture
-        .store
-        .create_assignment(other_repo.path(), worker_draft("root", "shared"))
-        .await
-        .expect("same relative scope in another repository does not conflict");
-    assert!(matches!(
-        fixture
-            .store
-            .begin_mutation(
-                first_attempt.attempt_id,
-                other_repo.path(),
-                "shared/file.rs".to_string(),
-                AttributionConfidence::Definitive,
-            )
-            .await,
-        Err(StoreError::RepositoryMismatch(_))
-    ));
-}
-
-#[tokio::test]
-async fn mutation_evidence_and_receipts_are_not_gated_by_claim_metadata() {
-    let fixture = Fixture::new().await;
-    std::fs::write(fixture.repo.path().join("outside.txt"), "before\n")
-        .expect("outside-scope fixture");
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            worker_draft("evidence-without-claim-root", "src/claimed.rs"),
-        )
-        .await
-        .expect("claimed assignment is admitted");
-
-    fixture
-        .store
-        .begin_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "outside.txt".to_string(),
-            AttributionConfidence::Definitive,
-        )
-        .await
-        .expect("evidence outside claim metadata starts");
-    std::fs::write(fixture.repo.path().join("outside.txt"), "after\n")
-        .expect("outside-scope mutation");
-    fixture
-        .store
-        .finalize_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "outside.txt".to_string(),
-        )
-        .await
-        .expect("evidence outside claim metadata finalizes");
-    let receipt = fixture
-        .store
-        .submit_agent_receipt(
-            attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["outside.txt"]),
-        )
-        .await
-        .expect("receipt outside claim metadata seals");
-    assert_eq!(receipt.status, AgentStatusClaim::Completed);
-}
-
-#[tokio::test]
-async fn mutation_evidence_keeps_private_prewrite_snapshot() {
-    let fixture = Fixture::new().await;
-    tokio::fs::create_dir_all(fixture.repo.path().join("src"))
-        .await
-        .expect("source directory");
-    tokio::fs::write(fixture.repo.path().join("src/file.rs"), b"before")
-        .await
-        .expect("prewrite file");
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft("root", "src"))
-        .await
-        .expect("worker assignment");
-    let attempt_id = attempt.attempt_id;
-    let blocker_pool = coordination_pool(&fixture).await;
-    let begin_pause = Arc::new(TestSnapshotCapturePause::new());
-    let begin_store = fixture.store.clone();
-    let begin_repo = fixture.repo.path().to_path_buf();
-    let begin_pause_scope = Arc::clone(&begin_pause);
-    let begin = tokio::spawn(async move {
-        with_test_snapshot_capture_pause(begin_pause_scope, async move {
-            begin_store
-                .begin_mutation(
-                    attempt_id,
-                    &begin_repo,
-                    "src/file.rs".to_string(),
-                    AttributionConfidence::Definitive,
-                )
-                .await
-        })
-        .await
-    });
-    assert_writer_blocked_while_snapshot_capture_is_paused(&begin_pause, &blocker_pool).await;
-    let event_id = begin
-        .await
-        .expect("begin mutation task joins")
-        .expect("mutation begins");
-    tokio::fs::write(fixture.repo.path().join("src/file.rs"), b"after")
-        .await
-        .expect("mutated file");
-    let finalize_pause = Arc::new(TestSnapshotCapturePause::new());
-    let finalize_store = fixture.store.clone();
-    let finalize_repo = fixture.repo.path().to_path_buf();
-    let finalize_pause_scope = Arc::clone(&finalize_pause);
-    let finalize = tokio::spawn(async move {
-        with_test_snapshot_capture_pause(finalize_pause_scope, async move {
-            finalize_store
-                .finalize_mutation(attempt_id, &finalize_repo, "src/file.rs".to_string())
-                .await
-        })
-        .await
-    });
-    assert_writer_blocked_while_snapshot_capture_is_paused(&finalize_pause, &blocker_pool).await;
-    let evidence = finalize
-        .await
-        .expect("finalize mutation task joins")
-        .expect("mutation finalizes");
-    assert_eq!(evidence.mutation_event_ids, vec![event_id]);
-    assert_ne!(evidence.pre_write_hash, evidence.final_hash);
-    assert!(evidence.snapshot_retained);
-    tokio::fs::write(
-        fixture.repo.path().join("src/file.rs"),
-        b"later live contents",
-    )
-    .await
-    .expect("live file changes after evidence finalization");
-    let pre_first = fixture
-        .store
-        .read_mutation_snapshot(
-            attempt.attempt_id,
-            "src/file.rs".to_string(),
-            MutationSnapshotVersion::PreWrite,
-            0,
-            Some(2),
-        )
-        .await
-        .expect("first prewrite snapshot chunk");
-    assert_eq!(pre_first.bytes, b"be");
-    assert_eq!(pre_first.total_bytes, 6);
-    let pre_rest = fixture
-        .store
-        .read_mutation_snapshot(
-            attempt.attempt_id,
-            "src/file.rs".to_string(),
-            MutationSnapshotVersion::PreWrite,
-            pre_first.next_offset.expect("prewrite continuation"),
-            Some(16),
-        )
-        .await
-        .expect("remaining prewrite snapshot chunk");
-    assert_eq!(pre_rest.bytes, b"fore");
-    assert_eq!(pre_rest.next_offset, None);
-    let final_snapshot = fixture
-        .store
-        .read_mutation_snapshot(
-            attempt.attempt_id,
-            "src/file.rs".to_string(),
-            MutationSnapshotVersion::Final,
-            0,
-            None,
-        )
-        .await
-        .expect("final snapshot remains stable");
-    assert_eq!(final_snapshot.bytes, b"after");
-    assert_eq!(
-        fixture
-            .store
-            .list_mutation_evidence(attempt.attempt_id, Some(1))
-            .await
-            .expect("bounded evidence list"),
-        vec![evidence.clone()]
-    );
-    assert!(matches!(
-        fixture
-            .store
-            .finalize_mutation(
-                attempt.attempt_id,
-                fixture.repo.path(),
-                "src/file.rs".to_string(),
-            )
-            .await,
-        Err(StoreError::MutationAlreadyFinalized { .. })
-    ));
-}
-
-#[tokio::test]
-async fn mutation_evidence_records_workspace_epochs() {
-    let fixture = Fixture::new().await;
-    tokio::fs::create_dir_all(fixture.repo.path().join("src"))
-        .await
-        .expect("source directory");
-    tokio::fs::write(fixture.repo.path().join("src/file.rs"), b"before")
-        .await
-        .expect("prewrite file");
-    let (_, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft("epoch-root", "src"))
-        .await
-        .expect("worker assignment");
-    let start_revision = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["src/file.rs".to_string()])
-        .await
-        .expect("start revision captures");
-    fixture
-        .store
-        .begin_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "src/file.rs".to_string(),
-            AttributionConfidence::Definitive,
-        )
-        .await
-        .expect("mutation begins");
-    tokio::fs::write(fixture.repo.path().join("src/file.rs"), b"after")
-        .await
-        .expect("mutated file");
-    let end_revision = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec!["src/file.rs".to_string()])
-        .await
-        .expect("end revision captures");
-    let evidence = fixture
-        .store
-        .finalize_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "src/file.rs".to_string(),
-        )
-        .await
-        .expect("mutation finalizes");
-    assert_eq!(evidence.start_epoch, start_revision.epoch);
-    assert_eq!(evidence.end_epoch, Some(end_revision.epoch));
-    assert!(end_revision.epoch > start_revision.epoch);
-
-    fixture.store.close().await;
-    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
-        .await
-        .expect("task store restarts");
-    let persisted = restarted
-        .list_mutation_evidence(attempt.attempt_id, None)
-        .await
-        .expect("persisted mutation evidence reads");
-    assert_eq!(persisted, vec![evidence]);
-}
-
-async fn finalized_snapshot_assignment(
-    fixture: &Fixture,
-    root_session_id: &str,
-) -> (Assignment, Attempt) {
-    tokio::fs::create_dir_all(fixture.repo.path().join("src"))
-        .await
-        .expect("source directory");
-    tokio::fs::write(fixture.repo.path().join("src/file.rs"), b"before")
-        .await
-        .expect("prewrite file");
-    let (assignment, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), worker_draft(root_session_id, "src"))
-        .await
-        .expect("worker assignment");
-    fixture
-        .store
-        .begin_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "src/file.rs".to_string(),
-            AttributionConfidence::Definitive,
-        )
-        .await
-        .expect("mutation begins");
-    tokio::fs::write(fixture.repo.path().join("src/file.rs"), b"after")
-        .await
-        .expect("mutated file");
-    fixture
-        .store
-        .finalize_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "src/file.rs".to_string(),
-        )
-        .await
-        .expect("mutation finalizes");
-    (assignment, attempt)
-}
-
-async fn snapshot_is_retained(store: &LocalAgentTaskStore, attempt_id: AttemptId) -> bool {
-    store
-        .list_mutation_evidence(attempt_id, None)
-        .await
-        .expect("mutation evidence reads")
-        .into_iter()
-        .next()
-        .expect("mutation evidence exists")
-        .snapshot_retained
-}
-
-#[tokio::test]
-async fn final_receipt_collects_snapshots() {
-    let fixture = Fixture::new().await;
-    let (_, attempt) = finalized_snapshot_assignment(&fixture, "gc-receipt-root").await;
-
-    assert!(snapshot_is_retained(&fixture.store, attempt.attempt_id).await);
-    fixture
-        .store
-        .submit_agent_receipt(
-            attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["src/file.rs"]),
-        )
-        .await
-        .expect("final receipt seals and collects snapshots");
-
-    assert!(!snapshot_is_retained(&fixture.store, attempt.attempt_id).await);
-    assert!(matches!(
-        fixture
-            .store
-            .read_mutation_snapshot(
-                attempt.attempt_id,
-                "src/file.rs".to_string(),
-                MutationSnapshotVersion::PreWrite,
-                0,
-                None,
-            )
-            .await,
-        Err(StoreError::SnapshotUnavailable { .. })
-    ));
-}
-
-#[tokio::test]
-async fn abandonment_collects_snapshots() {
-    let fixture = Fixture::new().await;
-    let (assignment, attempt) = finalized_snapshot_assignment(&fixture, "gc-abandon-root").await;
-
-    fixture
-        .store
-        .abandon_agent_task(
-            TaskActor::Root,
-            assignment.assignment_id,
-            "root abandons the task".to_string(),
-        )
-        .await
-        .expect("abandonment seals the task and collects snapshots");
-
-    assert!(!snapshot_is_retained(&fixture.store, attempt.attempt_id).await);
-}
-
-#[tokio::test]
-async fn pending_gate_retains_snapshots_until_sealed_or_waived() {
-    let fixture = Fixture::new().await;
-    let (assignment, attempt) = finalized_snapshot_assignment(&fixture, "gc-gate-root").await;
-    fixture
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            assignment.assignment_id,
-            GateKind::Verification,
-            GateStatus::Pending,
-            "verification pending".to_string(),
-        )
-        .await
-        .expect("pending verification gate");
-    fixture
-        .store
-        .submit_agent_receipt(
-            attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["src/file.rs"]),
-        )
-        .await
-        .expect("receipt seals while gate remains pending");
-    assert!(snapshot_is_retained(&fixture.store, attempt.attempt_id).await);
-
-    fixture
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            assignment.assignment_id,
-            GateKind::Verification,
-            GateStatus::Passed,
-            "verification passed".to_string(),
-        )
-        .await
-        .expect("last gate seals");
-    assert!(!snapshot_is_retained(&fixture.store, attempt.attempt_id).await);
-
-    let waived_fixture = Fixture::new().await;
-    let (waived_assignment, waived_attempt) =
-        finalized_snapshot_assignment(&waived_fixture, "gc-waiver-root").await;
-    waived_fixture
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            waived_assignment.assignment_id,
-            GateKind::Verification,
-            GateStatus::Pending,
-            "verification pending".to_string(),
-        )
-        .await
-        .expect("pending verification gate");
-    waived_fixture
-        .store
-        .submit_agent_receipt(
-            waived_attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["src/file.rs"]),
-        )
-        .await
-        .expect("receipt seals while gate remains pending");
-    waived_fixture
-        .store
-        .waive_agent_gate(
-            TaskActor::Root,
-            waived_assignment.assignment_id,
-            GateKind::Verification,
-            "root accepts verification risk".to_string(),
-        )
-        .await
-        .expect("last gate is waived");
-    assert!(!snapshot_is_retained(&waived_fixture.store, waived_attempt.attempt_id).await);
-}
-
-#[tokio::test]
-async fn risk_review_creates_verification_gate_before_snapshot_collection() {
-    let fixture = Fixture::new().await;
-    let (assignment, attempt) = finalized_snapshot_assignment(&fixture, "gc-review-root").await;
-    fixture
-        .store
-        .submit_agent_receipt_with_review(
-            attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["src/file.rs"]),
-            "cold review required: focused validation unavailable".to_string(),
-        )
-        .await
-        .expect("review-gated receipt seals");
-    fixture
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            assignment.assignment_id,
-            GateKind::Review,
-            GateStatus::Passed,
-            "review passed".to_string(),
-        )
-        .await
-        .expect("review passes and creates verification gate");
-    assert!(snapshot_is_retained(&fixture.store, attempt.attempt_id).await);
-
-    fixture
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            assignment.assignment_id,
-            GateKind::Verification,
-            GateStatus::Passed,
-            "verification passed".to_string(),
-        )
-        .await
-        .expect("verification passes");
-    assert!(!snapshot_is_retained(&fixture.store, attempt.attempt_id).await);
-}
-
-#[tokio::test]
-async fn correction_attempt_retains_snapshots_until_every_attempt_and_gate_is_sealed() {
-    let fixture = Fixture::new().await;
-    let (assignment, initial_attempt) =
-        finalized_snapshot_assignment(&fixture, "gc-correction-root").await;
-    fixture
-        .store
-        .submit_agent_receipt_with_review(
-            initial_attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["src/file.rs"]),
-            "cold review required: correction review".to_string(),
-        )
-        .await
-        .expect("initial receipt seals behind review");
-    fixture
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            assignment.assignment_id,
-            GateKind::Review,
-            GateStatus::ChangesRequested,
-            "one correction is required".to_string(),
-        )
-        .await
-        .expect("review requests correction");
-    assert!(snapshot_is_retained(&fixture.store, initial_attempt.attempt_id).await);
-
-    let correction = fixture
-        .store
-        .amend_agent_task(
-            TaskActor::Root,
-            assignment.assignment_id,
-            AttemptAmendment {
-                reason: "address the review finding".to_string(),
-                objective: None,
-                acceptance_criteria: None,
-                stop_condition: None,
-            },
-        )
-        .await
-        .expect("correction attempt starts");
-    assert!(snapshot_is_retained(&fixture.store, initial_attempt.attempt_id).await);
-    fixture
-        .store
-        .submit_agent_receipt(correction.attempt_id, completed_receipt(Vec::new()))
-        .await
-        .expect("correction receipt seals");
-    assert!(snapshot_is_retained(&fixture.store, initial_attempt.attempt_id).await);
-    fixture
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            assignment.assignment_id,
-            GateKind::Review,
-            GateStatus::ChangesRequested,
-            "the bounded correction remains unresolved".to_string(),
-        )
-        .await
-        .expect("the final correction verdict seals without reopening work");
-    assert!(!snapshot_is_retained(&fixture.store, initial_attempt.attempt_id).await);
-}
-
-#[tokio::test]
-async fn startup_reuses_live_eligibility_and_never_collects_for_terminal_status_alone() {
-    let eligible = Fixture::new().await;
-    let (eligible_assignment, eligible_attempt) =
-        finalized_snapshot_assignment(&eligible, "gc-startup-eligible").await;
-    eligible
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            eligible_assignment.assignment_id,
-            GateKind::Verification,
-            GateStatus::Pending,
-            "verification pending".to_string(),
-        )
-        .await
-        .expect("pending gate");
-    eligible
-        .store
-        .submit_agent_receipt(
-            eligible_attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["src/file.rs"]),
-        )
-        .await
-        .expect("receipt seals with retained snapshots");
-    eligible.store.close().await;
-    let pool = coordination_pool(&eligible).await;
-    let now = Utc::now();
-    let mut gate: AgentGate = serde_json::from_str(
-        &sqlx::query_scalar::<_, String>(
-            "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
-        )
-        .bind(eligible_assignment.assignment_id.to_string())
-        .bind(serde_json::to_string(&GateKind::Verification).expect("gate kind serializes"))
-        .fetch_one(&pool)
-        .await
-        .expect("pending gate reads"),
-    )
-    .expect("pending gate decodes");
-    gate.status = GateStatus::Passed;
-    gate.updated_at = now;
-    gate.sealed_at = Some(now);
-    sqlx::query(
-        "UPDATE gates SET status = ?, body_json = ?, updated_at = ?, sealed_at = ?
-         WHERE assignment_id = ? AND kind = ?",
-    )
-    .bind(serde_json::to_string(&gate.status).expect("gate status serializes"))
-    .bind(serde_json::to_string(&gate).expect("gate serializes"))
-    .bind(serde_json::to_string(&now).expect("time serializes"))
-    .bind(serde_json::to_string(&now).expect("time serializes"))
-    .bind(eligible_assignment.assignment_id.to_string())
-    .bind(serde_json::to_string(&GateKind::Verification).expect("gate kind serializes"))
-    .execute(&pool)
-    .await
-    .expect("legacy retained assignment becomes eligible");
-    pool.close().await;
-    let restarted = LocalAgentTaskStore::initialize(&eligible.state)
-        .await
-        .expect("eligible store restarts");
-    assert!(!snapshot_is_retained(&restarted, eligible_attempt.attempt_id).await);
-
-    let incomplete = Fixture::new().await;
-    let (_, incomplete_attempt) =
-        finalized_snapshot_assignment(&incomplete, "gc-startup-incomplete").await;
-    incomplete.store.close().await;
-    let pool = coordination_pool(&incomplete).await;
-    let sealed_at = Utc::now();
-    sqlx::query("UPDATE attempts SET state = ?, sealed_at = ? WHERE attempt_id = ?")
-        .bind(serde_json::to_string(&AttemptState::Abandoned).expect("state serializes"))
-        .bind(serde_json::to_string(&sealed_at).expect("time serializes"))
-        .bind(incomplete_attempt.attempt_id.to_string())
-        .execute(&pool)
-        .await
-        .expect("attempt is made terminal without a receipt");
-    pool.close().await;
-    let restarted = LocalAgentTaskStore::initialize(&incomplete.state)
-        .await
-        .expect("incomplete store restarts");
-    assert!(snapshot_is_retained(&restarted, incomplete_attempt.attempt_id).await);
-
-    let pending = Fixture::new().await;
-    let (pending_assignment, pending_attempt) =
-        finalized_snapshot_assignment(&pending, "gc-startup-pending").await;
-    pending
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            pending_assignment.assignment_id,
-            GateKind::Verification,
-            GateStatus::Pending,
-            "verification remains pending".to_string(),
-        )
-        .await
-        .expect("pending gate");
-    pending
-        .store
-        .submit_agent_receipt(
-            pending_attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["src/file.rs"]),
-        )
-        .await
-        .expect("receipt seals behind pending gate");
-    pending.store.close().await;
-    let restarted = LocalAgentTaskStore::initialize(&pending.state)
-        .await
-        .expect("pending-gate store restarts");
-    assert!(snapshot_is_retained(&restarted, pending_attempt.attempt_id).await);
-
-    let correction = Fixture::new().await;
-    let (correction_assignment, correction_initial_attempt) =
-        finalized_snapshot_assignment(&correction, "gc-startup-correction").await;
-    correction
-        .store
-        .submit_agent_receipt_with_review(
-            correction_initial_attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["src/file.rs"]),
-            "cold review required: startup correction".to_string(),
-        )
-        .await
-        .expect("review-gated receipt seals");
-    correction
-        .store
-        .set_agent_gate(
-            TaskActor::Root,
-            correction_assignment.assignment_id,
-            GateKind::Review,
-            GateStatus::ChangesRequested,
-            "correction required".to_string(),
-        )
-        .await
-        .expect("review requests correction");
-    correction.store.close().await;
-    let restarted = LocalAgentTaskStore::initialize(&correction.state)
-        .await
-        .expect("changes-requested store restarts");
-    assert!(
-        snapshot_is_retained(&restarted, correction_initial_attempt.attempt_id).await,
-        "the original changes-requested attempt can still reopen work"
-    );
-    restarted
-        .amend_agent_task(
-            TaskActor::Root,
-            correction_assignment.assignment_id,
-            AttemptAmendment {
-                reason: "complete the correction".to_string(),
-                objective: None,
-                acceptance_criteria: None,
-                stop_condition: None,
-            },
-        )
-        .await
-        .expect("active correction attempt starts");
-    restarted.close().await;
-    let restarted = LocalAgentTaskStore::initialize(&correction.state)
-        .await
-        .expect("correction store restarts");
-    assert!(
-        snapshot_is_retained(&restarted, correction_initial_attempt.attempt_id).await,
-        "an active correction attempt with no receipt remains ineligible"
-    );
-}
-
-#[tokio::test]
-async fn failed_snapshot_deletion_is_queued_and_retried_without_failing_receipt() {
-    let fixture = Fixture::new().await;
-    let (_, attempt) = finalized_snapshot_assignment(&fixture, "gc-retry-root").await;
-    let pool = coordination_pool(&fixture).await;
-    let snapshot_name = sqlx::query_scalar::<_, String>(
-        "SELECT snapshot_name FROM mutation_files WHERE attempt_id = ? AND path = ?",
-    )
-    .bind(attempt.attempt_id.to_string())
-    .bind("src/file.rs")
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot name reads");
-    pool.close().await;
-    let snapshot_path = fixture
-        .state
-        .codex_home()
-        .join("agent-task-coordination")
-        .join(snapshot_name);
-    tokio::fs::remove_file(&snapshot_path)
-        .await
-        .expect("snapshot file is replaced for failure injection");
-    tokio::fs::create_dir(&snapshot_path)
-        .await
-        .expect("directory forces remove_file failure");
-
-    let later_name = "snapshots/zz-later.bin";
-    let later_path = fixture
-        .state
-        .codex_home()
-        .join("agent-task-coordination")
-        .join(later_name);
-    std::fs::write(&later_path, "collect me").expect("later snapshot");
-    let pool = coordination_pool(&fixture).await;
-    sqlx::query("INSERT INTO snapshot_gc_queue (snapshot_name, queued_at) VALUES (?, ?)")
-        .bind(later_name)
-        .bind(serde_json::to_string(&Utc::now()).expect("timestamp"))
-        .execute(&pool)
-        .await
-        .expect("later deletion queues");
-    pool.close().await;
-    fixture
-        .store
-        .submit_agent_receipt(
-            attempt.attempt_id,
-            completed_receipt_with_changes(Vec::new(), &["src/file.rs"]),
-        )
-        .await
-        .expect("receipt remains successful when deletion fails");
-    assert!(!snapshot_is_retained(&fixture.store, attempt.attempt_id).await);
-    assert!(
-        !later_path.exists(),
-        "one failed deletion must not starve later entries"
-    );
-    let pool = coordination_pool(&fixture).await;
-    assert!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM snapshot_gc_queue")
-            .fetch_one(&pool)
-            .await
-            .expect("queued deletion count reads")
-            > 0
-    );
-    pool.close().await;
-
-    tokio::fs::remove_dir(&snapshot_path)
-        .await
-        .expect("failure injection is removed");
-    fixture.store.close().await;
-    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
-        .await
-        .expect("queued deletion retries at startup");
+    let unrelated = fixture.store.get_agent_task(untargeted.assignment_id, Some(0)).await.unwrap();
+    assert_eq!(unrelated.current_attempt.state, AttemptState::Active);
     let pool = coordination_pool(&fixture).await;
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM snapshot_gc_queue")
-            .fetch_one(&pool)
-            .await
-            .expect("queue drains after retry"),
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM write_claims")
+            .fetch_one(&pool).await.unwrap(),
         0
     );
     pool.close().await;
-    restarted.close().await;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #[test]
 fn assignments_without_additive_identity_or_capsule_fields_still_deserialize() {
@@ -6978,219 +5049,8 @@ fn risk_gate_uses_canonical_concurrent_drift_reason() {
     assert_eq!(decision.reasons, vec![CONCURRENT_DRIFT_REASON.to_string()]);
 }
 
-#[tokio::test]
-async fn repository_wide_capture_detects_an_external_revert_missing_from_git_overlay() {
-    let fixture = Fixture::new().await;
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .arg("-C")
-            .arg(fixture.repo.path())
-            .args(args)
-            .output()
-            .expect("git command launches")
-    };
-    assert!(git(&["init", "-q"]).status.success());
-    assert!(
-        git(&["config", "user.email", "coordination@example.invalid"])
-            .status
-            .success()
-    );
-    assert!(
-        git(&["config", "user.name", "Coordination Test"])
-            .status
-            .success()
-    );
-    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
-    std::fs::write(fixture.repo.path().join("src/lib.rs"), "base\n").expect("base source");
-    assert!(git(&["add", "src/lib.rs"]).status.success());
-    assert!(git(&["commit", "-qm", "base"]).status.success());
 
-    std::fs::write(fixture.repo.path().join("src/lib.rs"), "modified\n")
-        .expect("external modification");
-    let modified = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
-        .await
-        .expect("modified overlay is captured");
-    assert_eq!(
-        modified
-            .files
-            .iter()
-            .map(|entry| entry.path.as_str())
-            .collect::<Vec<_>>(),
-        vec![REPOSITORY_WIDE_PATH, "src/lib.rs"]
-    );
-    assert_eq!(
-        modified
-            .files
-            .iter()
-            .find(|entry| entry.path == "src/lib.rs"),
-        Some(&WorkspaceManifestEntry {
-            path: "src/lib.rs".to_string(),
-            content_hash: Some(
-                "4487e24377581c1a43c957c7700c8b49920de7b8500c05590cee74996ef73f42".to_string()
-            ),
-            existed: true,
-        })
-    );
 
-    std::fs::write(fixture.repo.path().join("src/lib.rs"), "base\n").expect("external revert");
-    let reverted = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
-        .await
-        .expect("reverted overlay is reconciled");
-    assert!(reverted.epoch > modified.epoch);
-    assert_eq!(
-        reverted
-            .files
-            .iter()
-            .map(|entry| entry.path.as_str())
-            .collect::<Vec<_>>(),
-        vec![REPOSITORY_WIDE_PATH, "src/lib.rs"]
-    );
-    assert_eq!(
-        reverted
-            .files
-            .iter()
-            .find(|entry| entry.path == "src/lib.rs"),
-        Some(&WorkspaceManifestEntry {
-            path: "src/lib.rs".to_string(),
-            content_hash: Some(
-                "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac".to_string()
-            ),
-            existed: true,
-        })
-    );
-    let events = fixture
-        .store
-        .read_workspace_events(fixture.repo.path(), modified.epoch)
-        .await
-        .expect("revert drift event reads");
-    assert!(events.iter().any(|event| {
-        event.actor_kind == WorkspaceActorKind::External
-            && event.attribution_confidence == AttributionConfidence::DetectionOnly
-            && event.paths == vec!["src/lib.rs".to_string()]
-    }));
-    let stable = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
-        .await
-        .expect("unchanged reverted file remains stable");
-    assert_eq!(stable.epoch, reverted.epoch);
-    assert_eq!(stable.manifest_hash, reverted.manifest_hash);
-    assert!(
-        fixture
-            .store
-            .read_workspace_events(fixture.repo.path(), reverted.epoch)
-            .await
-            .expect("events after stable capture read")
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn repository_wide_capture_detects_clean_head_change() {
-    let fixture = Fixture::new().await;
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .arg("-C")
-            .arg(fixture.repo.path())
-            .args(args)
-            .output()
-            .expect("git command launches")
-    };
-    assert!(git(&["init", "-q"]).status.success());
-    assert!(
-        git(&["config", "user.email", "coordination@example.invalid"])
-            .status
-            .success()
-    );
-    assert!(
-        git(&["config", "user.name", "Coordination Test"])
-            .status
-            .success()
-    );
-    std::fs::write(fixture.repo.path().join("tracked.txt"), "first\n").expect("first revision");
-    assert!(git(&["add", "tracked.txt"]).status.success());
-    assert!(git(&["commit", "-qm", "first"]).status.success());
-
-    let first = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
-        .await
-        .expect("first head is captured");
-    std::fs::write(fixture.repo.path().join("tracked.txt"), "second\n").expect("second revision");
-    assert!(git(&["add", "tracked.txt"]).status.success());
-    assert!(git(&["commit", "-qm", "second"]).status.success());
-
-    let second = fixture
-        .store
-        .capture_workspace_revision(fixture.repo.path(), vec![REPOSITORY_WIDE_PATH.to_string()])
-        .await
-        .expect("second head is captured");
-    assert!(second.epoch > first.epoch);
-    assert_ne!(first.manifest_hash, second.manifest_hash);
-    let events = fixture
-        .store
-        .read_workspace_events(fixture.repo.path(), first.epoch)
-        .await
-        .expect("head drift event reads");
-    assert!(events.iter().any(|event| {
-        event.actor_kind == WorkspaceActorKind::External
-            && event.attribution_confidence == AttributionConfidence::DetectionOnly
-            && event.paths == vec![REPOSITORY_WIDE_PATH.to_string()]
-    }));
-}
-
-#[tokio::test]
-async fn unrelated_work_in_the_same_repository_warns_without_blocking_quiescence() {
-    let fixture = Fixture::new().await;
-    let (completed_assignment, _) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            worker_draft("completed-root", "completed"),
-        )
-        .await
-        .expect("completed-root assignment");
-    fixture
-        .store
-        .abandon_agent_task(
-            TaskActor::Root,
-            completed_assignment.assignment_id,
-            "root approved terminal cleanup".to_string(),
-        )
-        .await
-        .expect("completed-root assignment becomes terminal");
-    let (unrelated_assignment, _) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            worker_draft("unrelated-root", "unrelated"),
-        )
-        .await
-        .expect("unrelated assignment");
-
-    let status = fixture
-        .store
-        .check_quiescence("completed-root".to_string())
-        .await
-        .expect("completed root quiescence");
-
-    assert!(
-        status.quiescent,
-        "unrelated task roots must not block completion"
-    );
-    assert!(
-        status.warnings.iter().any(|warning| {
-            warning.contains("unrelated-root")
-                && warning.contains(&unrelated_assignment.assignment_id.to_string())
-        }),
-        "active work in the same repository lineage is surfaced as a warning: {:?}",
-        status.warnings
-    );
-}
 
 #[tokio::test]
 async fn bounded_validation_operation_suspends_only_until_its_hard_deadline() {
@@ -7285,52 +5145,9 @@ async fn bounded_validation_operation_suspends_only_until_its_hard_deadline() {
     );
 }
 
-#[tokio::test]
-async fn quiescence_reports_claim_metadata_without_waiting_on_it() {
-    let fixture = Fixture::new().await;
-    let (assignment, _) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            worker_draft("metadata-quiescence-root", "src/lib.rs"),
-        )
-        .await
-        .expect("metadata assignment is admitted");
-    fixture
-        .store
-        .abandon_agent_task(
-            TaskActor::Root,
-            assignment.assignment_id,
-            "terminal fixture".to_string(),
-        )
-        .await
-        .expect("assignment becomes terminal");
-
-    let pool = coordination_pool(&fixture).await;
-    sqlx::query(
-        "UPDATE write_claims
-         SET active = 1, released_at = NULL
-         WHERE assignment_id = ?",
-    )
-    .bind(assignment.assignment_id.to_string())
-    .execute(&pool)
-    .await
-    .expect("active claim metadata is restored");
-    pool.close().await;
-    let status = fixture
-        .store
-        .inspect_quiescence("metadata-quiescence-root".to_string())
-        .await
-        .expect("quiescence inspection reads");
-    assert!(status.quiescent);
-    assert_eq!(
-        status.active_claim_assignment_ids,
-        vec![assignment.assignment_id]
-    );
-}
 
 #[tokio::test]
-async fn nudge_leases_quiescence_and_restart_are_durable() {
+async fn nudge_leases_and_task_restart_are_durable() {
     let fixture = Fixture::new().await;
     std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
     std::fs::write(fixture.repo.path().join("src/lib.rs"), "before\n").expect("lib fixture");
@@ -7392,17 +5209,6 @@ async fn nudge_leases_quiescence_and_restart_are_durable() {
     )
     .await;
     assert!(call.evidence.lease_expires_at.is_none());
-    let quiescence = fixture
-        .store
-        .check_quiescence("restart-root".to_string())
-        .await
-        .expect("active quiescence reads");
-    assert!(!quiescence.quiescent);
-    assert_eq!(
-        quiescence.active_assignment_ids,
-        vec![assignment.assignment_id]
-    );
-
     fixture.store.close().await;
     std::fs::write(
         fixture.repo.path().join("src/lib.rs"),
@@ -7412,21 +5218,6 @@ async fn nudge_leases_quiescence_and_restart_are_durable() {
     let restarted = LocalAgentTaskStore::initialize(&fixture.state)
         .await
         .expect("store reconstructs");
-    let revision = restarted
-        .capture_workspace_revision(fixture.repo.path(), vec!["src/lib.rs".to_string()])
-        .await
-        .expect("restart detects drift");
-    assert!(revision.epoch > call.evidence.start_epoch);
-    let restarted_quiescence = restarted
-        .check_quiescence("restart-root".to_string())
-        .await
-        .expect("restarted quiescence reads");
-    assert!(
-        restarted_quiescence
-            .active_claim_assignment_ids
-            .contains(&assignment.assignment_id),
-        "claim metadata reconstructs across restart"
-    );
     let wakes = restarted
         .read_wake_events("restart-root".to_string(), Some(cursor))
         .await
@@ -7442,36 +5233,14 @@ async fn nudge_leases_quiescence_and_restart_are_durable() {
         .await
         .expect("restarted task reads");
     assert_eq!(task.workspace_status.lease_state, Some(LeaseState::Active));
-    let stale_error = restarted
+    restarted
         .submit_agent_receipt(
             attempt.attempt_id,
             completed_receipt(vec!["restart-validation".to_string()]),
         )
         .await
-        .expect_err("workspace drift supersedes the independently recorded validation");
-    assert!(matches!(
-        stale_error,
-        StoreError::EvidenceSuperseded { call_ids }
-            if call_ids == vec!["restart-validation".to_string()]
-    ));
-    let stale_quiescence = restarted
-        .check_quiescence("restart-root".to_string())
-        .await
-        .expect("stale quiescence reads");
-    assert!(
-        !stale_quiescence.quiescent,
-        "the active assignment must remain visible after stale validation is rejected"
-    );
-    assert_eq!(
-        stale_quiescence.active_assignment_ids,
-        vec![assignment.assignment_id]
-    );
-    assert!(stale_quiescence.running_validation_call_ids.is_empty());
-    assert!(stale_quiescence.pending_gate_assignment_ids.is_empty());
-    assert_eq!(
-        stale_quiescence.active_claim_assignment_ids,
-        vec![assignment.assignment_id]
-    );
+        .expect("validation history remains usable without workspace freshness tracking");
+    restarted.close().await;
 }
 
 #[tokio::test]
@@ -7781,294 +5550,10 @@ async fn legacy_repository_bindings_upgrade_to_lineage_ids_on_restart() {
         .expect("upgraded task reads");
     assert_eq!(task.assignment.repository_id, lineage_id);
     assert_eq!(task.assignment.workspace_id, assignment.workspace_id);
-    restarted
-        .begin_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "src/lib.rs".to_string(),
-            AttributionConfidence::Definitive,
-        )
-        .await
-        .expect("upgraded assignment may record mutation evidence in its bound workspace");
-    std::fs::write(fixture.repo.path().join("src/lib.rs"), "after\n").expect("upgraded mutation");
-    restarted
-        .finalize_mutation(
-            attempt.attempt_id,
-            fixture.repo.path(),
-            "src/lib.rs".to_string(),
-        )
-        .await
-        .expect("upgraded mutation finalizes");
+    assert_eq!(task.current_attempt.attempt_id, attempt.attempt_id);
+    restarted.close().await;
 }
 
-#[tokio::test]
-async fn isolated_overlap_integrates_only_through_versioned_handoff() {
-    let fixture = Fixture::new().await;
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .arg("-C")
-            .arg(fixture.repo.path())
-            .args(args)
-            .output()
-            .expect("git command launches")
-    };
-    assert!(git(&["init", "-q"]).status.success());
-    assert!(
-        git(&["config", "user.email", "coordination@example.invalid"])
-            .status
-            .success()
-    );
-    assert!(
-        git(&["config", "user.name", "Coordination Test"])
-            .status
-            .success()
-    );
-    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
-    std::fs::write(fixture.repo.path().join("src/lib.rs"), "base\n").expect("base source");
-    assert!(git(&["add", "src/lib.rs"]).status.success());
-    assert!(git(&["commit", "-qm", "base"]).status.success());
-    let isolated_path = fixture
-        .repo
-        .path()
-        .parent()
-        .expect("repo parent")
-        .join(format!("isolated-{}", Uuid::now_v7()));
-    let worktree = Command::new("git")
-        .arg("-C")
-        .arg(fixture.repo.path())
-        .args(["worktree", "add", "--detach"])
-        .arg(&isolated_path)
-        .arg("HEAD")
-        .output()
-        .expect("worktree add launches");
-    assert!(
-        worktree.status.success(),
-        "{}",
-        String::from_utf8_lossy(&worktree.stderr)
-    );
-
-    let (shared, shared_attempt) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            worker_draft("isolation-root", "src/lib.rs"),
-        )
-        .await
-        .expect("shared implementation claims the path");
-    let isolated_command = "cargo test -p owner isolated";
-    let mut isolated_draft =
-        validation_worker_draft("isolation-root", "src/lib.rs", isolated_command);
-    isolated_draft.workspace_strategy = WorkspaceStrategy::Isolated;
-    let (isolated, isolated_attempt) = fixture
-        .store
-        .create_assignment(&isolated_path, isolated_draft)
-        .await
-        .expect("intentional overlap uses a separate workspace");
-    assert_eq!(shared.repository_id, isolated.repository_id);
-    assert_ne!(shared.workspace_id, isolated.workspace_id);
-    controlled_write(
-        &fixture.store,
-        &isolated_path,
-        "isolation-root",
-        isolated.assignment_id,
-        isolated_attempt.attempt_id,
-        "src/lib.rs",
-        "isolated implementation\n",
-    )
-    .await;
-    finish_focused_validation(
-        &fixture.store,
-        start_focused_validation(
-            &fixture.store,
-            isolated_attempt.attempt_id,
-            "isolated-validation",
-            isolated_command,
-        )
-        .await,
-    )
-    .await;
-    fixture
-        .store
-        .submit_agent_receipt(
-            isolated_attempt.attempt_id,
-            completed_receipt_with_changes(
-                vec!["isolated-validation".to_string()],
-                &["src/lib.rs"],
-            ),
-        )
-        .await
-        .expect("isolated receipt publishes handoff");
-    let ready_task = fixture
-        .store
-        .get_agent_task(isolated.assignment_id, Some(0))
-        .await
-        .expect("isolated handoff reads");
-    assert!(
-        ready_task
-            .completion_evidence_summary()
-            .contains("patch ready, not integrated")
-    );
-    let ready = ready_task
-        .isolation_handoff
-        .expect("isolated handoff exists");
-    assert_eq!(ready.state, IsolationHandoffState::Ready);
-    let isolated_canonical = std::fs::canonicalize(&isolated_path)
-        .expect("isolated path canonicalizes")
-        .to_string_lossy()
-        .into_owned();
-    assert_eq!(
-        ready.source_repository_root.as_deref(),
-        Some(isolated_canonical.as_str()),
-        "the integrator handoff exposes the durable source workspace for inspection"
-    );
-
-    let mut shared_receipt = completed_receipt(Vec::new());
-    shared_receipt.status = AgentStatusClaim::NeedsMain;
-    shared_receipt.summary = "shared implementation yielded to integrator".to_string();
-    shared_receipt.criterion_results[0].status = CriterionStatus::NotRun;
-    fixture
-        .store
-        .submit_agent_receipt(shared_attempt.attempt_id, shared_receipt)
-        .await
-        .expect("shared claim releases");
-
-    let integrator_command = "cargo test -p owner integrated";
-    let integrator_draft = AssignmentDraft {
-        root_session_id: "isolation-root".to_string(),
-        admission_origin: AssignmentAdmissionOrigin::Typed,
-        role: AgentRole::Integrator,
-        capability_profile: CapabilityProfile::IntegratorSourceWrite,
-        objective: "integrate the versioned isolated result".to_string(),
-        acceptance_criteria: vec![criterion()],
-        read_scope: Vec::new(),
-        write_scope: vec![RepoScope {
-            path: "src/lib.rs".to_string(),
-            recursive: true,
-        }],
-        stop_condition: "stop after versioned integration".to_string(),
-        dependencies: vec![isolated.assignment_id],
-        risk_hints: Vec::new(),
-        required_evidence: vec![integrator_command.to_string()],
-        prohibited_changes: Vec::new(),
-        contract_claims: Vec::new(),
-        workspace_strategy: WorkspaceStrategy::Shared,
-        relation: Some(AssignmentRelation {
-            kind: RelationKind::Integration,
-            target_assignment_ids: vec![isolated.assignment_id],
-        }),
-        architecture_contract_ref: None,
-    };
-    let (integrator, _integrator_attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), integrator_draft.clone())
-        .await
-        .expect("integrator claims ready handoff");
-    let claimed_task = fixture
-        .store
-        .get_agent_task(isolated.assignment_id, Some(0))
-        .await
-        .expect("claimed handoff reads");
-    assert!(
-        claimed_task
-            .completion_evidence_summary()
-            .contains("claimed, not integrated")
-    );
-    let claimed = claimed_task
-        .isolation_handoff
-        .expect("claimed handoff exists");
-    assert_eq!(claimed.state, IsolationHandoffState::Claimed);
-    assert_eq!(
-        claimed.integrator_assignment_id,
-        Some(integrator.assignment_id)
-    );
-    fixture
-        .store
-        .abandon_agent_task(
-            TaskActor::Root,
-            integrator.assignment_id,
-            "integrator stopped before applying the handoff".to_string(),
-        )
-        .await
-        .expect("abandoned integrator releases its handoff claim");
-    let released = fixture
-        .store
-        .get_agent_task(isolated.assignment_id, Some(0))
-        .await
-        .expect("released handoff reads")
-        .isolation_handoff
-        .expect("released handoff exists");
-    assert_eq!(released.state, IsolationHandoffState::Ready);
-    assert_eq!(released.integrator_assignment_id, None);
-
-    let (replacement_integrator, replacement_integrator_attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), integrator_draft)
-        .await
-        .expect("replacement integrator reclaims released handoff");
-    controlled_write(
-        &fixture.store,
-        fixture.repo.path(),
-        "isolation-root",
-        replacement_integrator.assignment_id,
-        replacement_integrator_attempt.attempt_id,
-        "src/lib.rs",
-        "isolated implementation\n",
-    )
-    .await;
-    finish_focused_validation(
-        &fixture.store,
-        start_focused_validation(
-            &fixture.store,
-            replacement_integrator_attempt.attempt_id,
-            "integrator-validation",
-            integrator_command,
-        )
-        .await,
-    )
-    .await;
-    fixture
-        .store
-        .submit_agent_receipt(
-            replacement_integrator_attempt.attempt_id,
-            completed_receipt_with_changes(
-                vec!["integrator-validation".to_string()],
-                &["src/lib.rs"],
-            ),
-        )
-        .await
-        .expect("integrator seals versioned handoff");
-    let integrated_task = fixture
-        .store
-        .get_agent_task(isolated.assignment_id, Some(0))
-        .await
-        .expect("integrated handoff reads");
-    assert!(
-        integrated_task
-            .completion_evidence_summary()
-            .contains("recorded as integrated")
-    );
-    assert_eq!(
-        integrated_task
-            .isolation_handoff
-            .expect("integrated handoff exists")
-            .state,
-        IsolationHandoffState::Integrated
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.repo.path().join("src/lib.rs"))
-            .expect("integrated file reads"),
-        "isolated implementation\n"
-    );
-
-    let cleanup = Command::new("git")
-        .arg("-C")
-        .arg(fixture.repo.path())
-        .args(["worktree", "remove", "--force"])
-        .arg(&isolated_path)
-        .output()
-        .expect("worktree cleanup launches");
-    assert!(cleanup.status.success());
-}
 
 #[tokio::test]
 async fn malformed_git_lineage_metadata_rejects_assignment_without_persisting_fallback_identity() {

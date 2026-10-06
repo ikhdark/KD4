@@ -725,7 +725,7 @@ tests = [
   "suite::review::review_op_emits_lifecycle_and_review_output",
 ]
 
-# Capability gates are the runtime proofs named by `kd4_features.toml`.
+# Capability gates provide focused runtime contract tests.
 
 [gates.generation-ceiling-proof]
 description = "No-progress ceiling and productive repair renewal through the sampling loop."
@@ -925,31 +925,6 @@ description = "Cached and diversified discovery of deferred core and extension t
 target = "core_lib"
 helpers = []
 tests = ["tools::spec_plan::tests::tool_search_cache_rebuilds_when_deferred_sources_change"]
-
-[gates.capability-config-explain]
-description = "Human-readable configuration reference exposed through codex config explain."
-
-[[gates.capability-config-explain.steps]]
-target = "cli_bin"
-tests = ["tests::config_explain_parses_optional_filter"]
-
-# Parsing alone is syntax; the rendered, filtered reference is the behavior.
-[[gates.capability-config-explain.steps]]
-target = "config_lib"
-tests = ["config_explain::tests::filters_config_reference_by_option_name"]
-
-[gates.capability-shared-worktree-reliability]
-description = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
-
-[[gates.capability-shared-worktree-reliability.steps]]
-target = "agent_task_store_lib"
-tests = ["tests::completed_receipt_rejects_workspace_change_after_validation"]
-
-# Core shell and unified-exec events must record mutation evidence in the store.
-[[gates.capability-shared-worktree-reliability.steps]]
-target = "core_lib"
-helpers = []
-tests = ["tools::events::tests::shell_and_unified_exec_finalize_typed_mutation_evidence"]
 
 # Recipe gates are invoked by the matching root justfile recipes.
 

@@ -342,9 +342,6 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/cargo-lane-trash-cleanup.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-lane.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-workspace-analyzer.ps1": ("scripts.test_build_tooling_policy",),
-    "scripts/check_kd4_features.py": (
-        f"{REPORT_REGRESSIONS}.test_feature_lane_is_lazy_and_held_across_both_phases",
-    ),
     "scripts/common-rust-env.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/codex_package/rg": (
         "scripts.codex_package.test_dotslash",

@@ -1,4 +1,3 @@
-use codex_agent_task_store::AttemptId;
 use codex_protocol::protocol::ToolExecutionId;
 use serde::Deserialize;
 use serde::Serialize;
@@ -443,23 +442,11 @@ struct CommandRepositoryState {
     observed_workspace_identity_hash: Option<(u64, String)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
     uncertain_command_baselines: HashMap<String, UncertainCommandBaseline>,
-    typed_mutation_baselines: HashMap<String, PendingTypedMutationBaseline>,
 }
 
 struct UncertainCommandBaseline {
     turn_id: String,
     workspace_identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-}
-
-pub(crate) struct TypedMutationBaseline {
-    pub(crate) attempt_id: AttemptId,
-    pub(crate) repo_root: PathBuf,
-    pub(crate) paths: Vec<String>,
-}
-
-struct PendingTypedMutationBaseline {
-    turn_id: String,
-    baseline: TypedMutationBaseline,
 }
 
 #[derive(Default)]
@@ -646,47 +633,8 @@ impl CommandExecutionLedger {
             .map(|baseline| baseline.workspace_identity)
     }
 
-    pub(crate) async fn record_typed_mutation_baseline(
-        &self,
-        call_id: &str,
-        turn_id: &str,
-        baseline: TypedMutationBaseline,
-    ) {
-        self.state
-            .lock()
-            .await
-            .repository
-            .typed_mutation_baselines
-            .insert(
-                call_id.to_string(),
-                PendingTypedMutationBaseline {
-                    turn_id: turn_id.to_string(),
-                    baseline,
-                },
-            );
-    }
 
-    pub(crate) async fn has_typed_mutation_baseline(&self, call_id: &str) -> bool {
-        self.state
-            .lock()
-            .await
-            .repository
-            .typed_mutation_baselines
-            .contains_key(call_id)
-    }
 
-    pub(crate) async fn take_typed_mutation_baseline(
-        &self,
-        call_id: &str,
-    ) -> Option<TypedMutationBaseline> {
-        self.state
-            .lock()
-            .await
-            .repository
-            .typed_mutation_baselines
-            .remove(call_id)
-            .map(|pending| pending.baseline)
-    }
 
     /// Reuse a snapshot captured under the dispatch workspace lease. The ledger
     /// belongs to its original local cwd; another workspace must not seed it.
@@ -1103,12 +1051,6 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn finish_turn_before_terminal(&self, turn_id: &str) {
         self.forget_turn_repository_revision(turn_id).await;
-        self.state
-            .lock()
-            .await
-            .repository
-            .typed_mutation_baselines
-            .retain(|_, pending| pending.turn_id != turn_id);
     }
 
     pub(crate) async fn persist_cache_after_terminal(&self) {
@@ -3422,8 +3364,6 @@ mod tests {
     #[tokio::test]
     async fn terminal_turn_cleanup_forgets_its_observed_repository_revision() {
         let ledger = CommandExecutionLedger::default();
-        let finished_attempt = AttemptId::new();
-        let active_attempt = AttemptId::new();
 
         ledger.observe_repository_revision("finished-turn", 1).await;
         ledger.observe_repository_revision("active-turn", 2).await;
@@ -3432,28 +3372,6 @@ mod tests {
             .await;
         ledger
             .record_uncertain_command_baseline("active-call", "active-turn", None)
-            .await;
-        ledger
-            .record_typed_mutation_baseline(
-                "finished-mutation",
-                "finished-turn",
-                TypedMutationBaseline {
-                    attempt_id: finished_attempt,
-                    repo_root: PathBuf::from("finished-repo"),
-                    paths: vec!["finished.txt".to_string()],
-                },
-            )
-            .await;
-        ledger
-            .record_typed_mutation_baseline(
-                "active-mutation",
-                "active-turn",
-                TypedMutationBaseline {
-                    attempt_id: active_attempt,
-                    repo_root: PathBuf::from("active-repo"),
-                    paths: vec!["active.txt".to_string()],
-                },
-            )
             .await;
         ledger.finish_turn("finished-turn").await;
 
@@ -3482,46 +3400,8 @@ mod tests {
                 .uncertain_command_baselines
                 .contains_key("active-call")
         );
-        assert!(
-            !state
-                .repository
-                .typed_mutation_baselines
-                .contains_key("finished-mutation")
-        );
-        assert!(
-            state
-                .repository
-                .typed_mutation_baselines
-                .contains_key("active-mutation")
-        );
     }
 
-    #[tokio::test]
-    async fn typed_mutation_baseline_survives_emitter_reconstruction_until_consumed() {
-        let ledger = CommandExecutionLedger::default();
-        let attempt_id = AttemptId::new();
-        ledger
-            .record_typed_mutation_baseline(
-                "call",
-                "turn",
-                TypedMutationBaseline {
-                    attempt_id,
-                    repo_root: PathBuf::from("repo"),
-                    paths: vec!["src/lib.rs".to_string()],
-                },
-            )
-            .await;
-
-        let baseline = ledger
-            .take_typed_mutation_baseline("call")
-            .await
-            .expect("completion emitter should recover the launch baseline");
-
-        assert_eq!(baseline.attempt_id, attempt_id);
-        assert_eq!(baseline.repo_root, PathBuf::from("repo"));
-        assert_eq!(baseline.paths, vec!["src/lib.rs"]);
-        assert!(ledger.take_typed_mutation_baseline("call").await.is_none());
-    }
 
     #[tokio::test]
     async fn handler_finalization_before_exit_watcher_records_one_failure() {

@@ -190,25 +190,6 @@ def scenario_catalog(
             5,
             "repository",
         ),
-        "feature-check": Scenario(
-            "feature-check",
-            (sys.executable, "scripts/check_kd4_features.py", "--json"),
-            repo_root,
-            5,
-            "validation",
-        ),
-        "feature-check-static": Scenario(
-            "feature-check-static",
-            (
-                sys.executable,
-                "scripts/check_kd4_features.py",
-                "--static-only",
-                "--json",
-            ),
-            repo_root,
-            5,
-            "static-validation",
-        ),
         "installed-codex-version": Scenario(
             "installed-codex-version",
             (str(installed_codex), "--version"),
@@ -262,11 +243,10 @@ def scenario_catalog(
 
 
 PROFILE_SCENARIOS = {
-    "quick": ("python-startup", "git-status", "feature-check-static"),
+    "quick": ("python-startup", "git-status"),
     "phase0": (
         "python-startup",
         "git-status",
-        "feature-check",
         "installed-codex-version",
         "focused-core-test",
         "local-cli-build",

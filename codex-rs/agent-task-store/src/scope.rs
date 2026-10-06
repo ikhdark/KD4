@@ -167,10 +167,6 @@ impl RepoScope {
             || other.recursive && is_descendant(&other.path, &self.path)
     }
 
-    pub(crate) fn covers_scope(&self, other: &Self) -> bool {
-        paths_equal(&self.path, &other.path) && (self.recursive || !other.recursive)
-            || self.recursive && is_descendant(&self.path, &other.path)
-    }
 }
 
 pub fn normalize_repo_scopes(
@@ -205,30 +201,6 @@ pub fn normalize_repo_path(repo_root: &Path, path: &str) -> StoreResult<String> 
     canonical_relative_identity(&canonical_root, &normalized)
 }
 
-/// Observation identifies the final directory entry, including an escaping or broken link.
-/// Its parent still must resolve inside the repository; authorization uses the target-aware API.
-pub(crate) fn normalize_observed_path(canonical_root: &Path, path: &str) -> StoreResult<String> {
-    let normalized = normalize_lexically(path)?;
-    if normalized == "." {
-        return Ok(normalized);
-    }
-    let relative = Path::new(&normalized);
-    let parent = relative
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let parent = match parent {
-        Some(parent) => canonical_relative_identity(canonical_root, &parent.to_string_lossy())?,
-        None => ".".to_string(),
-    };
-    let name = relative
-        .file_name()
-        .ok_or_else(|| StoreError::InvalidScope(normalized.clone()))?;
-    Ok(if parent == "." {
-        name.to_string_lossy().into_owned()
-    } else {
-        relative_path_identity(&Path::new(&parent).join(name))
-    })
-}
 
 fn normalize_lexically(path: &str) -> StoreResult<String> {
     if path.trim().is_empty() {
@@ -347,36 +319,13 @@ fn comparison_key(path: &str) -> String {
     }
 }
 
-pub(crate) fn path_comparison_key(path: &str) -> String {
-    comparison_key(path)
-}
 
 pub(crate) fn filesystem_paths_equal(left: &str, right: &str) -> bool {
     paths_equal(left, right)
 }
 
-pub(crate) fn relative_path_identity(path: &Path) -> String {
-    if let Some(path) = path.to_str()
-        && !path.starts_with(ENCODED_PATH_PREFIX)
-    {
-        return path.replace(std::path::MAIN_SEPARATOR, "/");
-    }
-    format!(
-        "{ENCODED_PATH_PREFIX}{}",
-        hex_encode(&native_os_bytes(path.as_os_str()))
-    )
-}
 
-pub(crate) fn absolute_repo_path(repo_root: &Path, relative: &str) -> PathBuf {
-    if let Some(encoded) = relative.strip_prefix(ENCODED_PATH_PREFIX)
-        && let Some(path) = native_os_string_from_hex(encoded)
-    {
-        return repo_root.join(PathBuf::from(path));
-    }
-    repo_root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
-}
 
-const ENCODED_PATH_PREFIX: &str = ":native-path:";
 
 fn filesystem_identity_bytes(path: &Path) -> Vec<u8> {
     let bytes = native_os_bytes(path.as_os_str());
@@ -399,44 +348,8 @@ fn native_os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
         .collect::<Vec<_>>()
 }
 
-fn native_os_string_from_hex(value: &str) -> Option<std::ffi::OsString> {
-    use std::os::windows::ffi::OsStringExt;
-    let bytes = hex_decode(value)?;
-    if !bytes.len().is_multiple_of(2) {
-        return None;
-    }
-    Some(std::ffi::OsString::from_wide(
-        &bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>(),
-    ))
-}
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0xf) as usize] as char);
-    }
-    encoded
-}
 
-fn hex_decode(value: &str) -> Option<Vec<u8>> {
-    if !value.len().is_multiple_of(2) {
-        return None;
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = (pair[0] as char).to_digit(16)?;
-            let low = (pair[1] as char).to_digit(16)?;
-            Some(((high << 4) | low) as u8)
-        })
-        .collect()
-}
 
 #[cfg(test)]
 mod audit_tests {
@@ -462,7 +375,7 @@ mod audit_tests {
 
     #[test]
     #[cfg(windows)]
-    fn audit_workspace_native_path_encoding_is_lossless() {
+    fn repository_native_identity_is_lossless() {
         let (left, right) = {
             use std::os::windows::ffi::OsStringExt;
             (
@@ -471,11 +384,8 @@ mod audit_tests {
             )
         };
 
-        let left_identity = relative_path_identity(&left);
-        let right_identity = relative_path_identity(&right);
+        let left_identity = filesystem_identity_bytes(&left);
+        let right_identity = filesystem_identity_bytes(&right);
         assert_ne!(left_identity, right_identity);
-        let root = Path::new("root");
-        assert_eq!(absolute_repo_path(root, &left_identity), root.join(left));
-        assert_eq!(absolute_repo_path(root, &right_identity), root.join(right));
     }
 }

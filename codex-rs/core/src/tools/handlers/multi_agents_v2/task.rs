@@ -15,26 +15,19 @@ use codex_agent_task_store::ArchitectureContractV1;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::Attempt;
 use codex_agent_task_store::AttemptAmendment;
-use codex_agent_task_store::AttributionConfidence;
 use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::DEFAULT_OBSERVATION_LIMIT;
 use codex_agent_task_store::DeclaredChange;
 use codex_agent_task_store::GateKind;
 use codex_agent_task_store::GateStatus;
-use codex_agent_task_store::LocalAgentTaskStore;
-use codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT;
 use codex_agent_task_store::MAX_OBSERVATION_LIMIT;
-use codex_agent_task_store::MAX_SNAPSHOT_CHUNK_BYTES;
-use codex_agent_task_store::MutationEvidence;
-use codex_agent_task_store::MutationSnapshotVersion;
 use codex_agent_task_store::ReceiptDraft;
 use codex_agent_task_store::RelationKind;
 use codex_agent_task_store::RepoScope;
 use codex_agent_task_store::RiskDomain;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::TaskActor;
-use codex_agent_task_store::TaskCapsuleV1;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_git_utils::get_git_repo_root;
@@ -45,32 +38,10 @@ use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 use serde_json::json;
-use similar::ChangeTag;
-use similar::TextDiff;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-async fn list_all_mutation_evidence(
-    store: &LocalAgentTaskStore,
-    attempt_id: codex_agent_task_store::AttemptId,
-) -> Result<Vec<MutationEvidence>, StoreError> {
-    let mut evidence = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = store
-            .list_mutation_evidence_page(attempt_id, Some(MAX_MUTATION_EVIDENCE_LIMIT), cursor)
-            .await?;
-        evidence.extend(page.evidence);
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => {
-                evidence.reverse();
-                return Ok(evidence);
-            }
-        }
-    }
-}
 
 const GET_AGENT_TASK_TOOL: &str = "get_agent_task";
 const SUBMIT_AGENT_RECEIPT_TOOL: &str = "submit_agent_receipt";
@@ -78,8 +49,6 @@ const SET_AGENT_GATE_TOOL: &str = "set_agent_gate";
 const AMEND_AGENT_TASK_TOOL: &str = "amend_agent_task";
 const WAIVE_AGENT_GATE_TOOL: &str = "waive_agent_gate";
 const ABANDON_AGENT_TASK_TOOL: &str = "abandon_agent_task";
-const MAX_COLD_REVIEW_DIFF_BYTES: usize = 256 * 1024;
-const MAX_COLD_REVIEW_FILE_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct GetAgentTaskHandler;
 pub(crate) struct SubmitAgentReceiptHandler;
@@ -254,37 +223,12 @@ async fn handle_submit_agent_receipt(
             "{SUBMIT_AGENT_RECEIPT_TOOL}: the typed task store is unavailable"
         ))
     })?;
-    let workspace_root = get_git_repo_root(turn.config.cwd.as_path())
-        .unwrap_or_else(|| turn.config.cwd.to_path_buf());
-    let _workspace_operation_permit =
-        crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root).await;
     let draft = args.into_receipt_draft(&task)?;
-    if let Err(error) = store.finalize_pending_mutations(binding.attempt_id).await {
-        if draft.status == AgentStatusClaim::Completed {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "{SUBMIT_AGENT_RECEIPT_TOOL}: evidence_unavailable: mutation finalization failed: {error}. Retry evidence collection; do not repeat edits or passing validation."
-            )));
-        }
-        tracing::warn!(
-            %error,
-            attempt_id = %binding.attempt_id,
-            "typed mutation evidence finalization was unavailable; continuing receipt submission"
-        );
-    }
-    // Risk derivation and cold-review evidence must cover the complete attempt, including writes
-    // that another runtime path finalized before receipt submission.
     let review_reason = if draft.status == AgentStatusClaim::Completed {
-        let observed_writes = list_all_mutation_evidence(store.as_ref(), binding.attempt_id)
-            .await
-            .map_err(|error| FunctionCallError::RespondToModel(format!(
-                "{SUBMIT_AGENT_RECEIPT_TOOL}: evidence_unavailable: mutation evidence could not be read: {error}. Retry evidence collection; do not repeat edits or passing validation."
-            )))?;
         derive_review_reason(
-            store.as_ref(),
             turn.config.cwd.as_path(),
             &task,
             &draft,
-            &observed_writes,
         )
         .await?
     } else {
@@ -313,40 +257,16 @@ struct ParsedRiskHints {
     domains: Vec<RiskDomain>,
 }
 
-struct SnapshotContent {
-    existed: bool,
-    bytes: Option<Vec<u8>>,
-    total_bytes: u64,
-}
-
-#[derive(Default)]
-struct AttemptDiffSummary {
-    text: String,
-    changed_paths: Vec<String>,
-    non_generated_changed_files: u32,
-    non_generated_changed_lines: u32,
-}
-
 async fn derive_review_reason(
-    store: &LocalAgentTaskStore,
     cwd: &Path,
     task: &AgentTask,
     draft: &ReceiptDraft,
-    observed_writes: &[MutationEvidence],
 ) -> Result<Option<String>, FunctionCallError> {
     if draft.status != AgentStatusClaim::Completed {
         return Ok(None);
     }
 
     let cwd = cwd.to_path_buf();
-    let diff = build_attempt_diff(
-        store,
-        task.current_attempt.attempt_id,
-        observed_writes,
-        false,
-    )
-    .await
-    .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     let risk_hints = parse_risk_hints(&task.assignment.risk_hints);
     let successful_validation_ids = task
         .validation_calls
@@ -359,14 +279,13 @@ async fn derive_review_reason(
             .validation_call_ids
             .iter()
             .all(|call_id| successful_validation_ids.contains(call_id.as_str()));
-    let touched_contracts = if diff.changed_paths.is_empty() {
+    let changed_paths = draft.declared_changes.iter().map(|change| change.path.clone()).collect::<Vec<_>>();
+    let has_declared_changes = !changed_paths.is_empty();
+    let touched_contracts = if !has_declared_changes {
         Vec::new()
     } else {
         risk_hints.contracts.clone()
     };
-    let drift = observed_writes
-        .iter()
-        .any(|evidence| evidence.attribution_confidence == AttributionConfidence::DetectionOnly);
     let assignment = task.assignment.clone();
     let derived = tokio::task::spawn_blocking(move || {
         let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
@@ -374,19 +293,17 @@ async fn derive_review_reason(
             &assignment,
             &repo_root,
             RiskPolicyInput {
-                changed_paths: &diff.changed_paths,
+                changed_paths: &changed_paths,
                 configured_high_risk_paths: &risk_hints.high_risk_paths,
                 touched_contracts: &touched_contracts,
                 configured_high_risk_contracts: &risk_hints.contracts,
                 cross_owner_scope: false,
                 named_domains: &risk_hints.domains,
-                non_generated_changed_files: diff.non_generated_changed_files,
-                non_generated_changed_lines: diff.non_generated_changed_lines,
+                non_generated_changed_files: changed_paths.len().try_into().unwrap_or(u32::MAX),
+                non_generated_changed_lines: 0, // No automatic diff or snapshot collection.
                 focused_validation_succeeded,
-                // Claim overlap is advisory metadata, not an ownership conflict. Detection-only
-                // attribution remains the persisted signal that concurrent drift may exist.
                 ownership_conflict: false,
-                drift,
+                drift: false,
             },
         )
     })
@@ -408,10 +325,12 @@ async fn derive_review_reason(
     if task.assignment.role == AgentRole::Explorer
         && task.assignment.write_scope.is_empty()
         && task.assignment.risk_hints.is_empty()
-        && observed_writes.is_empty()
         && draft.declared_changes.is_empty()
     {
         return Ok(None);
+    }
+    if has_declared_changes {
+        return Ok(Some("cold review required: declared changes have no automatic change snapshots; inspect the changes independently".to_string()));
     }
     Ok(derived.decision.review_required.then(|| {
         format!(
@@ -463,18 +382,6 @@ async fn build_evaluation_context(
         .get_agent_task(target_assignment_id, Some(0))
         .await
         .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
-    let observed_writes =
-        list_all_mutation_evidence(store.as_ref(), target.current_attempt.attempt_id)
-            .await
-            .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
-    let diff = build_attempt_diff(
-        store.as_ref(),
-        target.current_attempt.attempt_id,
-        &observed_writes,
-        true,
-    )
-    .await
-    .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
     let agents_md_observation = session
         .services
         .agents_md_manager
@@ -513,8 +420,8 @@ async fn build_evaluation_context(
                 assignment: target.assignment,
                 attempt_id: target.current_attempt.attempt_id,
                 applicable_instructions,
-                attempt_specific_diff: diff.text,
-                observed_writes,
+                attempt_specific_diff: "Automatic change snapshots are disabled. Inspect the declared changes independently; task receipts do not establish current workspace freshness.".to_string(),
+                observed_writes: Vec::new(),
                 relevant_contracts,
                 nearest_tests,
             },
@@ -587,259 +494,6 @@ fn risk_domain_from_hint(hint: &str) -> Option<RiskDomain> {
         "security" => Some(RiskDomain::Security),
         "installation" => Some(RiskDomain::Installation),
         _ => None,
-    }
-}
-
-async fn build_attempt_diff(
-    store: &LocalAgentTaskStore,
-    attempt_id: codex_agent_task_store::AttemptId,
-    observed_writes: &[MutationEvidence],
-    include_text: bool,
-) -> Result<AttemptDiffSummary, StoreError> {
-    let mut summary = AttemptDiffSummary::default();
-    let mut truncated = false;
-    for evidence in observed_writes {
-        let final_existed = evidence.final_write_existed.unwrap_or(false);
-        if evidence.pre_write_hash == evidence.final_hash
-            && evidence.pre_write_existed == final_existed
-        {
-            continue;
-        }
-        summary.changed_paths.push(evidence.path.clone());
-        let (section, changed_lines, generated) = if evidence.snapshot_retained {
-            let before = read_snapshot(
-                store,
-                attempt_id,
-                &evidence.path,
-                MutationSnapshotVersion::PreWrite,
-            )
-            .await?;
-            let after = read_snapshot(
-                store,
-                attempt_id,
-                &evidence.path,
-                MutationSnapshotVersion::Final,
-            )
-            .await?;
-            let path = evidence.path.clone();
-            let remaining = if include_text {
-                MAX_COLD_REVIEW_DIFF_BYTES.saturating_sub(summary.text.len())
-            } else {
-                0
-            };
-            tokio::task::spawn_blocking(move || {
-                render_snapshot_diff_bounded(&path, &before, &after, remaining)
-            })
-            .await
-            .map_err(|error| StoreError::CorruptData(format!("diff worker failed: {error}")))?
-        } else {
-            (
-                format!(
-                    "diff --git a/{0} b/{0}\n[private mutation snapshot unavailable]\n",
-                    evidence.path
-                ),
-                401,
-                false,
-            )
-        };
-        if !generated {
-            summary.non_generated_changed_files =
-                summary.non_generated_changed_files.saturating_add(1);
-            summary.non_generated_changed_lines = summary
-                .non_generated_changed_lines
-                .saturating_add(changed_lines);
-        }
-        if include_text {
-            push_bounded_diff(&mut summary.text, &section, &mut truncated);
-        }
-    }
-    if truncated {
-        const NOTICE: &str = "\n[attempt-specific diff truncated; write hashes remain available]\n";
-        let keep = MAX_COLD_REVIEW_DIFF_BYTES.saturating_sub(NOTICE.len());
-        let keep = summary.text.floor_char_boundary(keep);
-        summary.text.truncate(keep);
-        summary.text.push_str(NOTICE);
-    }
-    Ok(summary)
-}
-
-async fn read_snapshot(
-    store: &LocalAgentTaskStore,
-    attempt_id: codex_agent_task_store::AttemptId,
-    path: &str,
-    version: MutationSnapshotVersion,
-) -> Result<SnapshotContent, StoreError> {
-    let first = store
-        .read_mutation_snapshot(
-            attempt_id,
-            path.to_string(),
-            version,
-            0,
-            Some(MAX_SNAPSHOT_CHUNK_BYTES),
-        )
-        .await?;
-    if first.total_bytes > MAX_COLD_REVIEW_FILE_BYTES as u64 {
-        return Ok(SnapshotContent {
-            existed: first.existed,
-            bytes: None,
-            total_bytes: first.total_bytes,
-        });
-    }
-    let mut bytes = first.bytes;
-    let existed = first.existed;
-    let total_bytes = first.total_bytes;
-    let mut next_offset = first.next_offset;
-    while let Some(offset) = next_offset {
-        let chunk = store
-            .read_mutation_snapshot(
-                attempt_id,
-                path.to_string(),
-                version,
-                offset,
-                Some(MAX_SNAPSHOT_CHUNK_BYTES),
-            )
-            .await?;
-        if chunk.existed != existed || chunk.total_bytes != total_bytes {
-            return Err(StoreError::CorruptData(format!(
-                "snapshot metadata changed while reading {path}"
-            )));
-        }
-        bytes.extend_from_slice(&chunk.bytes);
-        next_offset = chunk.next_offset;
-    }
-    Ok(SnapshotContent {
-        existed,
-        bytes: Some(bytes),
-        total_bytes,
-    })
-}
-
-#[cfg(test)]
-fn render_snapshot_diff(
-    path: &str,
-    before: &SnapshotContent,
-    after: &SnapshotContent,
-) -> (String, u32, bool) {
-    render_snapshot_diff_bounded(path, before, after, MAX_COLD_REVIEW_DIFF_BYTES)
-}
-
-fn render_snapshot_diff_bounded(
-    path: &str,
-    before: &SnapshotContent,
-    after: &SnapshotContent,
-    max_bytes: usize,
-) -> (String, u32, bool) {
-    let (Some(before_bytes), Some(after_bytes)) = (&before.bytes, &after.bytes) else {
-        return (
-            format!(
-                "diff --git a/{0} b/{0}\n[snapshot exceeds cold-review limit: before={1} bytes, after={2} bytes]\n",
-                path, before.total_bytes, after.total_bytes
-            ),
-            401,
-            false,
-        );
-    };
-    let generated = confirmed_generated(before, before_bytes, after, after_bytes);
-    let (Ok(before_text), Ok(after_text)) = (
-        std::str::from_utf8(before_bytes),
-        std::str::from_utf8(after_bytes),
-    ) else {
-        return (
-            format!("diff --git a/{path} b/{path}\nBinary files differ\n"),
-            401,
-            generated,
-        );
-    };
-    let text_diff = TextDiff::from_lines(before_text, after_text);
-    let changed_lines = text_diff
-        .iter_all_changes()
-        .filter(|change| change.tag() != ChangeTag::Equal)
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX);
-    if max_bytes == 0 {
-        return (String::new(), changed_lines, generated);
-    }
-    let old_header = if before.existed {
-        format!("a/{path}")
-    } else {
-        "/dev/null".to_string()
-    };
-    let new_header = if after.existed {
-        format!("b/{path}")
-    } else {
-        "/dev/null".to_string()
-    };
-    let mut section = format!("diff --git a/{path} b/{path}\n");
-    struct BoundedDiff<'a> {
-        text: &'a mut String,
-        limit: usize,
-    }
-    impl std::fmt::Write for BoundedDiff<'_> {
-        fn write_str(&mut self, value: &str) -> std::fmt::Result {
-            let remaining = self.limit.saturating_sub(self.text.len());
-            let end = value.floor_char_boundary(remaining.min(value.len()));
-            self.text.push_str(&value[..end]);
-            if end < value.len() {
-                Err(std::fmt::Error)
-            } else {
-                Ok(())
-            }
-        }
-    }
-    let mut writer = BoundedDiff {
-        text: &mut section,
-        limit: max_bytes,
-    };
-    let truncated = std::fmt::write(
-        &mut writer,
-        format_args!(
-            "{}",
-            text_diff
-                .unified_diff()
-                .context_radius(3)
-                .header(&old_header, &new_header)
-        ),
-    )
-    .is_err();
-    if truncated {
-        section.push_str("\n[diff presentation truncated]\n");
-    }
-    if !section.ends_with('\n') {
-        section.push('\n');
-    }
-    (section, changed_lines, generated)
-}
-
-fn confirmed_generated(
-    before: &SnapshotContent,
-    before_bytes: &[u8],
-    after: &SnapshotContent,
-    after_bytes: &[u8],
-) -> bool {
-    (!before.existed || generated_marker(before_bytes))
-        && (!after.existed || generated_marker(after_bytes))
-}
-
-fn generated_marker(contents: &[u8]) -> bool {
-    let prefix = &contents[..contents.len().min(4096)];
-    let lowercase = String::from_utf8_lossy(prefix).to_ascii_lowercase();
-    lowercase.contains("@generated")
-        || lowercase.contains("code generated") && lowercase.contains("do not edit")
-        || lowercase.contains("automatically generated") && lowercase.contains("do not edit")
-}
-
-fn push_bounded_diff(output: &mut String, section: &str, truncated: &mut bool) {
-    if output.len() >= MAX_COLD_REVIEW_DIFF_BYTES {
-        *truncated = true;
-        return;
-    }
-    let remaining = MAX_COLD_REVIEW_DIFF_BYTES - output.len();
-    if section.len() <= remaining {
-        output.push_str(section);
-    } else {
-        output.push_str(&section[..section.floor_char_boundary(remaining)]);
-        *truncated = true;
     }
 }
 
@@ -1452,11 +1106,6 @@ fn required_evidence_is_satisfied(task: &AgentTask, requirement: &str) -> bool {
 
 fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
     let task = &result.task;
-    let capsule = task
-        .assignment
-        .task_capsule
-        .as_deref()
-        .and_then(|payload| serde_json::from_str::<TaskCapsuleV1>(payload).ok());
     let proof_references = task
         .validation_calls
         .iter()
@@ -1593,10 +1242,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         "receipt": task.receipt.as_ref().map(|receipt| bounded_receipt_projection_with_proof_limit(receipt, 0)),
         "proof_references": proof_references,
         "workspace": {
-            "epoch": task.workspace_status.epoch,
-            "current_epoch": task.workspace_status.epoch,
-            "snapshot_epoch": capsule.as_ref().map(|capsule| capsule.workspace_epoch),
-            "snapshot_manifest_hash": capsule.as_ref().map(|capsule| capsule.workspace_manifest_hash.as_str()).filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES),
+            "freshness": "not_tracked",
             "last_progress_at": task.workspace_status.last_progress_at,
             "lease_state": task.workspace_status.lease_state,
             "next_required_action": bounded_prose(task.workspace_status.next_required_action.as_deref()),
@@ -2395,7 +2041,7 @@ fn waive_agent_gate_spec() -> ToolSpec {
     function_spec(
         WAIVE_AGENT_GATE_TOOL,
         "Root-only. Waive a pending soft review or verification gate with an explicit reason. \
-         Risk, mutation, and ownership gates cannot be waived.",
+         Other gate kinds cannot be waived.",
         object_schema(
             [
                 ("assignment_id", assignment_id_schema()),
@@ -2417,7 +2063,7 @@ fn abandon_agent_task_spec() -> ToolSpec {
     function_spec(
         ABANDON_AGENT_TASK_TOOL,
         "Root-only. Seal the assignment's current active attempt as abandoned and release its \
-         write claim.",
+         task lease.",
         object_schema(
             [
                 ("assignment_id", assignment_id_schema()),
@@ -2490,6 +2136,7 @@ mod projection_tests {
     use codex_agent_task_store::RuntimeObservation;
     use codex_agent_task_store::ValidationEvidence;
     use codex_agent_task_store::WakeEventId;
+    use codex_agent_task_store::TaskCapsuleV1;
     use codex_agent_task_store::WorkspaceStrategy;
     use codex_agent_task_store::WorkspaceTaskStatus;
 
@@ -2819,12 +2466,10 @@ mod projection_tests {
                 .len()
                 <= TASK_OUTPUT_INLINE_LIMIT_BYTES
         );
-        assert_eq!(projection["workspace"]["epoch"], 14);
-        assert_eq!(projection["workspace"]["snapshot_epoch"], 11);
-        assert_eq!(
-            projection["workspace"]["snapshot_manifest_hash"],
-            "a".repeat(64)
-        );
+        assert_eq!(projection["workspace"]["freshness"], "not_tracked");
+        for field in ["epoch", "current_epoch", "snapshot_epoch", "snapshot_manifest_hash"] {
+            assert!(projection["workspace"].get(field).is_none());
+        }
         assert_eq!(projection["receipt"]["evidence_epoch"], 13);
         assert!(
             projection["completion_evidence"]
@@ -2894,6 +2539,7 @@ mod review_policy_tests {
     use super::*;
     use codex_agent_task_store::AssignmentAdmissionOrigin;
     use codex_agent_task_store::AssignmentDraft;
+    use codex_agent_task_store::LocalAgentTaskStore;
     use codex_agent_task_store::CapabilityProfile;
     use codex_agent_task_store::WorkspaceStrategy;
 
@@ -2955,14 +2601,14 @@ mod review_policy_tests {
             architecture_contract: None,
         };
         assert_eq!(
-            derive_review_reason(&store, repo.path(), &task, &draft, &[])
+            derive_review_reason(repo.path(), &task, &draft)
                 .await
                 .unwrap(),
             None
         );
         let other_repo = tempfile::tempdir().unwrap();
         assert!(
-            derive_review_reason(&store, other_repo.path(), &task, &draft, &[])
+            derive_review_reason(other_repo.path(), &task, &draft)
                 .await
                 .is_err()
         );
@@ -2977,7 +2623,7 @@ mod review_policy_tests {
             other.assignment.role = role;
             other.assignment.capability_profile = role.capability_profile();
             assert!(
-                derive_review_reason(&store, repo.path(), &other, &draft, &[])
+                derive_review_reason(repo.path(), &other, &draft)
                     .await
                     .unwrap()
                     .is_some()
@@ -2989,7 +2635,7 @@ mod review_policy_tests {
             .risk_hints
             .push("concurrency".to_string());
         assert!(
-            derive_review_reason(&store, repo.path(), &explicit_risk, &draft, &[])
+            derive_review_reason(repo.path(), &explicit_risk, &draft)
                 .await
                 .unwrap()
                 .unwrap()
@@ -3001,7 +2647,7 @@ mod review_policy_tests {
             recursive: true,
         });
         assert!(
-            derive_review_reason(&store, repo.path(), &write_scope, &draft, &[])
+            derive_review_reason(repo.path(), &write_scope, &draft)
                 .await
                 .unwrap()
                 .is_some()
@@ -3012,47 +2658,11 @@ mod review_policy_tests {
             summary: "changed".to_string(),
         });
         assert!(
-            derive_review_reason(&store, repo.path(), &task, &declared, &[])
+            derive_review_reason(repo.path(), &task, &declared)
                 .await
                 .unwrap()
                 .is_some()
         );
-
-        // The diff is empty after a write/revert, but the mutation must still gate.
-        let mut reverted = MutationEvidence {
-            assignment_id: assignment.assignment_id,
-            attempt_id: attempt.attempt_id,
-            path: "src/lib.rs".to_string(),
-            pre_write_hash: Some("same".to_string()),
-            pre_write_existed: true,
-            final_hash: Some("same".to_string()),
-            final_write_existed: Some(true),
-            mutation_event_ids: Vec::new(),
-            attribution_confidence: AttributionConfidence::Definitive,
-            snapshot_retained: false,
-            first_observed_at: chrono::Utc::now(),
-            finalized_at: Some(chrono::Utc::now()),
-            start_epoch: 0,
-            end_epoch: Some(0),
-        };
-        for confidence in [
-            AttributionConfidence::Definitive,
-            AttributionConfidence::DetectionOnly,
-        ] {
-            reverted.attribution_confidence = confidence;
-            assert!(
-                derive_review_reason(
-                    &store,
-                    repo.path(),
-                    &task,
-                    &draft,
-                    std::slice::from_ref(&reverted)
-                )
-                .await
-                .unwrap()
-                .is_some()
-            );
-        }
 
         store
             .set_agent_gate(
@@ -3084,37 +2694,5 @@ mod review_policy_tests {
         );
         store.close().await;
         state.close().await;
-    }
-}
-
-#[cfg(test)]
-mod bounded_diff_tests {
-    use super::*;
-    #[test]
-    fn risk_only_diff_keeps_line_counts_without_rendering_large_presentation() {
-        let before_bytes = "old line\n".repeat(10_000).into_bytes();
-        let after_bytes = "new line\n".repeat(10_000).into_bytes();
-        let before = SnapshotContent {
-            existed: true,
-            total_bytes: before_bytes.len() as u64,
-            bytes: Some(before_bytes),
-        };
-        let after = SnapshotContent {
-            existed: true,
-            total_bytes: after_bytes.len() as u64,
-            bytes: Some(after_bytes),
-        };
-        let (risk_text, risk_count, generated) =
-            render_snapshot_diff_bounded("file.rs", &before, &after, 0);
-        assert!(risk_text.is_empty());
-        assert_eq!(risk_count, 20_000);
-        assert!(!generated);
-        let (text, count, _) = render_snapshot_diff("file.rs", &before, &after);
-        assert_eq!(count, risk_count);
-        assert!(text.contains("diff --git"));
-        let (bounded, count, _) = render_snapshot_diff_bounded("file.rs", &before, &after, 1024);
-        assert_eq!(count, risk_count);
-        assert!(bounded.len() <= 1024 + 40);
-        assert!(bounded.contains("presentation truncated"));
     }
 }

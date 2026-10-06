@@ -41,7 +41,6 @@ use std::sync::Arc;
 use supports_color::Stream;
 
 mod app_cmd;
-mod config_cmd;
 mod desktop_app;
 mod doctor;
 mod exec_server_telemetry;
@@ -137,9 +136,6 @@ enum Subcommand {
 
     /// Manage Codex plugins.
     Plugin(PluginCli),
-
-    /// Inspect Codex configuration options.
-    Config(config_cmd::ConfigCli),
 
     /// Start Codex as an MCP server (stdio).
     McpServer(McpServerCommand),
@@ -248,10 +244,6 @@ impl Subcommand {
             Self::Logout(_) => SubcommandRoutingPolicy::new("logout", false, false, false),
             Self::Mcp(_) => SubcommandRoutingPolicy::new("mcp", true, false, false),
             Self::Plugin(_) => SubcommandRoutingPolicy::new("plugin", false, false, false),
-            Self::Config(config) => {
-                SubcommandRoutingPolicy::new(config.config_subcommand_name(), false, false, false)
-                    .with_strict_config_name("config")
-            }
             Self::McpServer(_) => SubcommandRoutingPolicy::new("mcp-server", false, false, true),
             Self::AppServer(app_server) => {
                 let name = app_server_subcommand_name(app_server.subcommand.as_ref());
@@ -1078,9 +1070,6 @@ async fn cli_main(
                     plugin_cmd::run_plugin_remove(overrides, args).await?;
                 }
             }
-        }
-        Some(Subcommand::Config(config_cli)) => {
-            config_cmd::run(config_cli);
         }
         Some(Subcommand::AppServer(app_server_cli)) => {
             reject_runtime_options_for_app_server_subcommand(&app_server_cli)?;
@@ -3879,18 +3868,6 @@ mod tests {
             panic!("expected features enable");
         };
         assert_eq!(feature, "unified_exec");
-    }
-
-    #[test]
-    fn config_explain_parses_optional_filter() {
-        let cli = MultitoolCli::try_parse_from(["codex", "config", "explain", "sandbox"])
-            .expect("parse should succeed");
-        let Some(Subcommand::Config(config)) = cli.subcommand else {
-            panic!("expected config explain subcommand");
-        };
-        assert_eq!(config.config_subcommand_name(), "config explain");
-        let config_cmd::ConfigSubcommand::Explain(args) = config.subcommand;
-        assert_eq!(args.filter.as_deref(), Some("sandbox"));
     }
 
     #[test]

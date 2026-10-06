@@ -966,7 +966,7 @@ async fn run_owned_patch(
         };
         // A retry can also end through denial or a hook error. Every terminal
         // path must finalize evidence retained by the preceding attempt.
-        runtime.finish_pending_mutation_evidence(&tool_ctx).await;
+        runtime.finish_pending_workspace_tracking(&tool_ctx).await;
         let (out, delta) = match out {
             Ok(output) => (Ok(output.exec_output), Some(output.delta)),
             Err(_)
@@ -1000,13 +1000,6 @@ async fn run_owned_patch(
             tracker.as_ref(),
         );
         let result = emitter.finish(event_ctx, out, delta.as_ref()).await;
-        let result = match (result, runtime.mutation_evidence_warning()) {
-            (Ok(output), Some(warning)) => Ok(format!("{output}\n{warning}")),
-            (Err(FunctionCallError::RespondToModel(error)), Some(warning)) => Err(
-                FunctionCallError::RespondToModel(format!("{error}\n{warning}")),
-            ),
-            (result, _) => result,
-        };
         let result = match result {
             Ok(text) => Ok(ApplyPatchToolOutput::from_delta(
                 text,

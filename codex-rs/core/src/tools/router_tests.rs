@@ -1426,7 +1426,7 @@ async fn router_apply_patch_cancellation_settles_committed_write_and_skips_tail(
         );
         turn.permission_profile = PermissionProfile::Disabled;
         turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
-        let (attempt_id, store) =
+        let (_attempt_id, store) =
             enable_typed_router_task(&mut session, &mut turn, &repo, &["first.txt", "tail.txt"])
                 .await;
         let turn = Arc::new(turn);
@@ -1572,167 +1572,14 @@ async fn router_apply_patch_cancellation_settles_committed_write_and_skips_tail(
             "{diff}"
         );
         assert_eq!(diff.contains("tail.txt"), !cancel, "{diff}");
-        let evidence = store
-            .list_mutation_evidence(
-                attempt_id,
-                Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
-            )
-            .await?;
-        let first_evidence = evidence
-            .iter()
-            .find(|entry| entry.path == "first.txt")
-            .expect("first mutation evidence");
-        assert_eq!(first_evidence.attempt_id, attempt_id);
-        assert!(first_evidence.pre_write_existed);
-        assert_eq!(first_evidence.final_write_existed, Some(true));
-        assert_eq!(
-            first_evidence.pre_write_hash.as_deref(),
-            Some("9160d4be34c8695bd172a76c7c7966587ea5a4d991ad22c87b2b91af54aa9ebb")
-        );
-        assert_eq!(
-            first_evidence.final_hash.as_deref(),
-            Some("7b9a72466d3960eb2aacccfc848939453490db0678bd4725def3f789b891c919")
-        );
-        assert!(first_evidence.finalized_at.is_some() && first_evidence.end_epoch.is_some());
-        let tail_evidence = evidence
-            .iter()
-            .find(|entry| entry.path == "tail.txt")
-            .expect("both intended paths were registered before mutation");
-        assert_eq!(tail_evidence.attempt_id, attempt_id);
-        assert!(!tail_evidence.pre_write_existed);
-        assert!(tail_evidence.pre_write_hash.is_none());
-        assert!(tail_evidence.finalized_at.is_some() && tail_evidence.end_epoch.is_some());
-        if cancel {
-            assert_eq!(tail_evidence.final_write_existed, Some(false));
-            assert!(
-                tail_evidence.final_hash.is_none(),
-                "unapplied tail cannot claim written content"
-            );
-        } else {
-            assert_eq!(tail_evidence.final_write_existed, Some(true));
-            assert_eq!(
-                tail_evidence.final_hash.as_deref(),
-                Some("34bb655f4c80ce8343296f6427f36e9f49e2061548f709a10d022da25e819441")
-            );
-        }
         store.close().await;
     }
     Ok(())
 }
 
-#[tokio::test]
-async fn router_apply_patch_partial_mutation_admission_failure_finalizes_begun_paths()
--> anyhow::Result<()> {
-    let temp = tempfile::tempdir()?;
-    let repo = temp.path().join("repo");
-    std::fs::create_dir_all(&repo)?;
-    assert!(
-        Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&repo)
-            .status()?
-            .success()
-    );
-    for path in ["a.txt", "b.txt"] {
-        std::fs::write(repo.join(path), "before\n")?;
-    }
-    let (mut session, mut turn) = make_session_and_context().await;
-    set_router_environment(&mut turn, &repo);
-    turn.permission_profile = PermissionProfile::Disabled;
-    turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
-    let (attempt_id, store) =
-        enable_typed_router_task(&mut session, &mut turn, &repo, &["a.txt", "b.txt"]).await;
-    // A prior completed mutation makes the second begin fail through the real
-    // store contract, after the first path's new admission has committed.
-    store
-        .begin_mutation(
-            attempt_id,
-            &repo,
-            "b.txt".to_string(),
-            codex_agent_task_store::AttributionConfidence::Definitive,
-        )
-        .await?;
-    let previous = store
-        .finalize_mutation(attempt_id, &repo, "b.txt".to_string())
-        .await?;
-    let session = Arc::new(session);
-    let step = StepContext::for_test(Arc::new(turn));
-    let router = Arc::new(ToolRouter::from_context(
-        step.as_ref(),
-        ToolRouterParams {
-            tool_suggest_candidates: None,
-            deferred_mcp_tools: None,
-            mcp_tools: None,
-            extension_tool_executors: Vec::new(),
-            dynamic_tools: &[],
-            exposure_identity: Default::default(),
-        },
-        &Default::default(),
-    ));
-    assert!(step.set_tool_router(router).is_ok());
-    let runtime = crate::tools::parallel::ToolCallRuntime::new(
-        session,
-        step,
-        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-    );
-    let response = runtime.handle_tool_call(
-        ToolCall {
-            tool_name: ToolName::plain("apply_patch"),
-            call_id: "partial-mutation-admission".to_string(),
-            payload: ToolPayload::Custom {
-                input: "*** Begin Patch\n*** Update File: a.txt\n@@\n-before\n+after\n*** Update File: b.txt\n@@\n-before\n+after\n*** End Patch".to_string(),
-            },
-        },
-        CancellationToken::new(),
-    ).await?;
-    let response_text = serde_json::to_string(&response)?;
-    assert!(
-        response_text.contains("mutation evidence could not be recorded for `b.txt`"),
-        "{response_text}"
-    );
-    assert!(
-        !response_text.contains("Success. Updated"),
-        "{response_text}"
-    );
-    for path in ["a.txt", "b.txt"] {
-        assert_eq!(
-            std::fs::read_to_string(repo.join(path))?,
-            "before\n",
-            "admission failure must prevent every patch write"
-        );
-    }
-    let evidence = store
-        .list_mutation_evidence(
-            attempt_id,
-            Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
-        )
-        .await?;
-    assert_eq!(evidence.len(), 2);
-    let begun = evidence
-        .iter()
-        .find(|entry| entry.path == "a.txt")
-        .expect("first begin committed");
-    assert!(
-        begun.finalized_at.is_some(),
-        "failed second admission must not strand first admission"
-    );
-    assert!(begun.end_epoch.is_some());
-    assert_eq!(
-        begun.final_hash, begun.pre_write_hash,
-        "no-write finalization must retain the original bytes"
-    );
-    let retained = evidence
-        .iter()
-        .find(|entry| entry.path == "b.txt")
-        .expect("prior completed evidence retained");
-    assert_eq!(retained.finalized_at, previous.finalized_at);
-    assert_eq!(retained.final_hash, previous.final_hash);
-    store.close().await;
-    Ok(())
-}
 
 #[tokio::test]
-async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Result<()> {
+async fn router_apply_patch_preserves_turn_diff_without_task_snapshots() -> anyhow::Result<()> {
     let temp = tempfile::tempdir().expect("temporary repository");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repository");
@@ -1762,7 +1609,7 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
     set_router_environment(&mut turn, &repo);
     turn.permission_profile = PermissionProfile::Disabled;
     turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
-    let (attempt_id, store) = enable_typed_router_task(
+    let (_attempt_id, store) = enable_typed_router_task(
         &mut session,
         &mut turn,
         &repo,
@@ -1845,30 +1692,8 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
     assert!(diff.contains("deleted file mode 100755"), "{diff}");
     assert!(diff.contains("executable.sh"), "{diff}");
 
-    let evidence = store
-        .list_mutation_evidence(
-            attempt_id,
-            Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
-        )
-        .await
-        .expect("mutation evidence remains queryable");
-    assert_eq!(evidence.len(), 2);
-    let updated = evidence
-        .iter()
-        .find(|item| item.path == "tracked.txt")
-        .expect("updated-file evidence");
-    assert_ne!(updated.pre_write_hash, updated.final_hash);
-    let deleted = evidence
-        .iter()
-        .find(|item| item.path == "executable.sh")
-        .expect("deleted-file evidence");
-    assert!(deleted.pre_write_hash.is_some());
-    assert!(deleted.final_hash.is_none());
-    for item in evidence {
-        assert!(item.finalized_at.is_some());
-        assert!(item.end_epoch.is_some());
-    }
-
+    assert!(!repo.join(".typed-task-home/agent-task-coordination/snapshots").exists());
+    store.close().await;
     Ok(())
 }
 
@@ -2230,18 +2055,7 @@ async fn task_authority_fixture(
         .binding_for_source(&turn.session_source)
         .expect("real worker binding");
     // These are persisted inputs to the authority consumer, not substitutes for its logic.
-    store
-        .begin_mutation(
-            worker_attempt,
-            &repo,
-            "tracked.txt".to_string(),
-            AttributionConfidence::Definitive,
-        )
-        .await?;
     std::fs::write(repo.join("tracked.txt"), "after\n")?;
-    store
-        .finalize_mutation(worker_attempt, &repo, "tracked.txt".to_string())
-        .await?;
     // Fulfill the real persisted validation prerequisite with an actual command;
     // the authority tests below still enter through the registered tool router.
     let validation_id = "authority-diff-check";
@@ -2486,25 +2300,12 @@ async fn assert_task_authority_success(
             worker.current_attempt.attempt_id.to_string()
         );
         assert_eq!(context["nearest_tests"], json!(["router boundary test"]));
-        let diff = context["attempt_specific_diff"]
+        let evidence_scope = context["attempt_specific_diff"]
             .as_str()
-            .expect("persisted snapshot diff");
-        assert!(diff.contains("-before\n"), "{diff}");
-        assert!(diff.contains("+after\n"), "{diff}");
-        assert_eq!(
-            context["observed_writes"]
-                .as_array()
-                .expect("write evidence")
-                .len(),
-            1
-        );
-        assert_eq!(context["observed_writes"][0]["path"], "tracked.txt");
-        assert_eq!(context["observed_writes"][0]["pre_write_existed"], true);
-        assert_eq!(context["observed_writes"][0]["final_write_existed"], true);
-        assert_ne!(
-            context["observed_writes"][0]["pre_write_hash"],
-            context["observed_writes"][0]["final_hash"]
-        );
+            .expect("explicit snapshot limitation");
+        assert!(evidence_scope.contains("Automatic change snapshots are disabled"));
+        assert!(evidence_scope.contains("do not establish current workspace freshness"));
+        assert_eq!(context["observed_writes"], json!([]));
         assert!(context.get("worker_reasoning").is_none());
         assert!(context.get("conversation_history").is_none());
         assert_eq!(

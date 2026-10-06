@@ -45,7 +45,6 @@ use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use sha2::Digest;
 use sha2::Sha256;
-use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -1665,7 +1664,6 @@ async fn construct_and_attach_task_capsule(
     let mut normalized_handles = Vec::with_capacity(handles.len());
     let mut file_handles = HashSet::new();
     let mut symbol_handles = HashSet::new();
-    let mut distinct_paths = BTreeMap::new();
 
     let normalization_root = repo_root.to_path_buf();
     let handles = tokio::task::spawn_blocking(move || {
@@ -1687,7 +1685,7 @@ async fn construct_and_attach_task_capsule(
                 "relevant handle {path:?} is outside the assignment read/write scope"
             )));
         }
-        match tokio::fs::metadata(repo_root.join(&path)).await {
+        let existed = match tokio::fs::metadata(repo_root.join(&path)).await {
             Ok(metadata) if metadata.is_dir() => {
                 return Err(StoreError::InvalidTaskCapsule(format!(
                     "relevant handle {path:?} resolves to a directory"
@@ -1698,15 +1696,12 @@ async fn construct_and_attach_task_capsule(
                     "relevant handle {path:?} is not a regular file"
                 )));
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
             Err(error) => return Err(StoreError::Io(error)),
-        }
+        };
 
         let path_key = path.to_ascii_lowercase();
-        distinct_paths
-            .entry(path_key.clone())
-            .or_insert_with(|| path.clone());
         match handle {
             RelevantHandle::File { .. } => {
                 if !file_handles.insert(path_key) {
@@ -1714,7 +1709,7 @@ async fn construct_and_attach_task_capsule(
                         "duplicate file handle for {path:?}"
                     )));
                 }
-                normalized_handles.push(RelevantHandle::File { path });
+                normalized_handles.push(TaskCapsuleHandle::File { path, existed, content_hash: None });
             }
             RelevantHandle::Symbol { symbol, .. } => {
                 let symbol = symbol.trim().to_string();
@@ -1728,47 +1723,10 @@ async fn construct_and_attach_task_capsule(
                         "duplicate symbol handle for {path:?} and locator {symbol:?}"
                     )));
                 }
-                normalized_handles.push(RelevantHandle::Symbol { path, symbol });
+                normalized_handles.push(TaskCapsuleHandle::Symbol { path, symbol, existed, content_hash: None });
             }
         }
     }
-
-    let revision = store
-        .capture_workspace_revision(repo_root, distinct_paths.into_values().collect())
-        .await?;
-    let entries = revision
-        .files
-        .iter()
-        .map(|entry| {
-            let key = entry.path.to_ascii_lowercase();
-            (key, entry)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let relevant_handles = normalized_handles
-        .into_iter()
-        .map(|handle| {
-            let key = handle.path().to_ascii_lowercase();
-            let entry = entries.get(&key).ok_or_else(|| {
-                StoreError::InvalidTaskCapsule(format!(
-                    "workspace revision omitted relevant handle {:?}",
-                    handle.path()
-                ))
-            })?;
-            Ok(match handle {
-                RelevantHandle::File { path } => TaskCapsuleHandle::File {
-                    path,
-                    existed: entry.existed,
-                    content_hash: entry.content_hash.clone(),
-                },
-                RelevantHandle::Symbol { path, symbol } => TaskCapsuleHandle::Symbol {
-                    path,
-                    symbol,
-                    existed: entry.existed,
-                    content_hash: entry.content_hash.clone(),
-                },
-            })
-        })
-        .collect::<Result<Vec<_>, StoreError>>()?;
 
     let capsule = TaskCapsuleV1 {
         schema_version: 1,
@@ -1788,9 +1746,9 @@ async fn construct_and_attach_task_capsule(
         relation: assignment.relation.clone(),
         architecture_contract_ref: assignment.architecture_contract_ref.clone(),
         integration_plan: assignment.integration_plan,
-        relevant_handles,
-        workspace_epoch: revision.epoch,
-        workspace_manifest_hash: revision.manifest_hash,
+        relevant_handles: normalized_handles,
+        workspace_epoch: 0,
+        workspace_manifest_hash: String::new(),
         prohibited_changes: assignment.prohibited_changes.clone(),
         required_evidence: assignment.required_evidence.clone(),
     };
@@ -1830,7 +1788,7 @@ fn parse_typed_role(agent_type: Option<&str>) -> Result<AgentRole, FunctionCallE
     }
 }
 
-const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Use apply_patch for source edits so mutation evidence is captured. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment.";
+const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment.";
 
 fn typed_assignment_message(assignment: &Assignment, attempt: &Attempt) -> String {
     if matches!(
@@ -1850,7 +1808,7 @@ fn typed_assignment_message(assignment: &Assignment, attempt: &Attempt) -> Strin
             "Integration plan: root_owned; limit changes to the assigned scope and submit a receipt for root reconciliation."
         }
         IntegrationPlan::TypedIntegratorRequired => {
-            "Integration plan: typed_integrator_required; work only in the isolated workspace and publish a versioned receipt handoff for the typed integrator."
+            "Integration plan: typed_integrator_required; work only in the isolated workspace and submit a receipt for the typed integrator to reconcile independently."
         }
     };
     format!(

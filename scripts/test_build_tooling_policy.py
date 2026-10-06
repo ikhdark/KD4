@@ -646,11 +646,8 @@ function Get-Command($Name) {
             self.assertIn("cargo:rerun-if-changed=src/assets/samples", present.stdout)
 
     def test_retired_repo_local_harness_has_no_registration(self) -> None:
-        features = load_toml(REPO_ROOT / "kd4_features.toml")["features"]
-        feature_ids = {feature["id"] for feature in features}
         root_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         self.assertFalse((REPO_ROOT / ".codex" / "harness").exists())
-        self.assertNotIn("kd4-harness", feature_ids)
         self.assertFalse((REPO_ROOT / ".codex" / "skills" / "kd4-harness").exists())
         self.assertNotIn("skills/kd4-harness", root_policy)
         self.assertNotIn(".codex/harness", root_policy)
@@ -2247,11 +2244,8 @@ function Get-Command($Name) {
             self.assertRegex(
                 justfile, rf'\[script\("python"\)\]\n{re.escape(recipe)}(?: [^\n:]*)?:'
             )
-        self.assertIn(
-            '[no-cd]\n[script("python")]\ncheck-kd4-features *args:', justfile
-        )
-        feature_recipe = run_test_command(
-            ["just", "--show", "check-kd4-features"],
+        recipe = run_test_command(
+            ["just", "--show", "fmt-check"],
             cwd=REPO_ROOT,
             text=True,
             encoding="utf-8",
@@ -2259,14 +2253,13 @@ function Get-Command($Name) {
             capture_output=True,
             check=False,
         )
-        self.assertEqual(feature_recipe.returncode, 0, feature_recipe.stderr)
-        self.assertIn('[script("python")]', feature_recipe.stdout)
-        self.assertIn("forwarded = sys.argv[1:]", feature_recipe.stdout)
-        self.assertIn("sys.argv = [script, *forwarded]", feature_recipe.stdout)
+        self.assertEqual(recipe.returncode, 0, recipe.stderr)
+        self.assertIn('[script("python")]', recipe.stdout)
+        self.assertIn('sys.argv = [script, "--check", *sys.argv[1:]]', recipe.stdout)
 
     def test_direct_python_recipe_preserves_argv_and_exit_code(self) -> None:
         help_result = run_test_command(
-            ["just", "check-kd4-features", "--help"],
+            ["just", "fmt-check", "--help"],
             cwd=REPO_ROOT,
             text=True,
             encoding="utf-8",
@@ -2282,7 +2275,7 @@ function Get-Command($Name) {
         # back to backslashreplace and reports the argument as an escape
         # sequence, which says nothing about whether argv survived.
         rejected = run_test_command(
-            ["just", "check-kd4-features", unicode_argument],
+            ["just", "fmt-check", unicode_argument],
             cwd=REPO_ROOT,
             text=True,
             encoding="utf-8",

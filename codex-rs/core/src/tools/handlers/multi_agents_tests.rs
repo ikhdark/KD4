@@ -1051,32 +1051,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start(c
         .task_coordinator()
         .store()
         .expect("typed task store should remain available");
-    task_store
-        .begin_mutation(
-            binding.attempt_id,
-            repo_root.as_path(),
-            risk_path.clone(),
-            codex_agent_task_store::AttributionConfidence::Definitive,
-        )
-        .await
-        .expect("high-risk mutation should begin");
     std::fs::write(&risk_file, "high-risk evidence\n").expect("high-risk file should change");
-    task_store
-        .finalize_mutation(binding.attempt_id, repo_root.as_path(), risk_path.clone())
-        .await
-        .expect("high-risk mutation should be finalized before receipt submission");
-    let finalized_evidence = task_store
-        .list_mutation_evidence(
-            binding.attempt_id,
-            Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
-        )
-        .await
-        .expect("finalized mutation evidence should remain queryable");
-    assert_eq!(finalized_evidence.len(), 1);
-    assert_ne!(
-        finalized_evidence[0].pre_write_hash,
-        finalized_evidence[0].final_hash
-    );
     assert_eq!(
         task_store
             .get_agent_task(assignment_id, Some(0))
@@ -1262,8 +1237,6 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start(c
             .unwrap()
             .is_valid(&receipt_args)
     );
-    let receipt_gate =
-        crate::workspace_operation_gate::acquire_workspace_operation(&repo_root).await;
     let receipt_invocation = invocation(
         child_session,
         child_turn,
@@ -1308,18 +1281,11 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start(c
         call_id: receipt_invocation.call_id,
         payload: receipt_invocation.payload,
     };
-    let mut receipt_task = tokio::spawn(async move {
+    let receipt_task = tokio::spawn(async move {
         receipt_runtime
             .handle_tool_call(receipt_call, receipt_invocation.cancellation_token)
             .await
     });
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(20), &mut receipt_task)
-            .await
-            .is_err(),
-        "receipt submission must wait for the workspace operation gate"
-    );
-    drop(receipt_gate);
     let receipt_response = receipt_task
         .await
         .expect("receipt submission task should join")

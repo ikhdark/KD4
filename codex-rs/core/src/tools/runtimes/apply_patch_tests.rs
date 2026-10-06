@@ -28,7 +28,7 @@ fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::
 }
 
 #[tokio::test]
-async fn finalization_failure_preserves_writes_and_exposes_a_warning_once() {
+async fn typed_patch_commits_without_mutation_snapshots() {
     use codex_agent_task_store::AgentRole;
     use codex_agent_task_store::AgentTaskBindingDraft;
     use codex_agent_task_store::AssignmentDraft;
@@ -122,7 +122,7 @@ async fn finalization_failure_preserves_writes_and_exposes_a_warning_once() {
         tool_name: codex_tools::ToolName::plain("apply_patch"),
     };
     let mut runtime = ApplyPatchRuntime::new();
-    runtime.begin_mutation_evidence(&req, &ctx).await.unwrap();
+    runtime.begin_workspace_tracking(&req, &ctx).await.unwrap();
     runtime.committed_delta = codex_apply_patch::apply_patch(
         &req.action.patch,
         &cwd,
@@ -133,27 +133,13 @@ async fn finalization_failure_preserves_writes_and_exposes_a_warning_once() {
     )
     .await
     .unwrap();
-    // A competing finalizer makes the runtime's finalization fail with
-    // MutationAlreadyFinalized. Filesystem success must still be preserved.
-    coordinator
-        .store()
-        .unwrap()
-        .finalize_mutation(attempt.attempt_id, repo.path(), "written.txt".into())
-        .await
-        .unwrap();
-    runtime.finish_pending_mutation_evidence(&ctx).await;
+    runtime.finish_pending_workspace_tracking(&ctx).await;
     assert_eq!(
         std::fs::read_to_string(repo.path().join("written.txt")).unwrap(),
         "committed\n"
     );
     assert_eq!(runtime.committed_delta().changes().len(), 1);
-    let warning = runtime
-        .mutation_evidence_warning()
-        .expect("finalization failure is visible");
-    assert!(warning.contains("1 path(s)"), "{warning}");
-    assert!(warning.contains("do not repeat the patch"), "{warning}");
-    runtime.finish_pending_mutation_evidence(&ctx).await;
-    assert_eq!(runtime.mutation_evidence_warning(), Some(warning));
+    assert!(!home.path().join("agent-task-coordination/snapshots").exists());
 }
 
 #[test]
@@ -206,7 +192,7 @@ fn unbound_mutation_evidence_allows_paths_outside_the_repo() {
         /*require_complete*/ true,
     )
     .expect_err("bound assignments still require complete mutation evidence");
-    assert!(format!("{error:?}").contains("outside the evidence workspace"));
+    assert!(format!("{error:?}").contains("outside the patch workspace"));
 }
 
 #[tokio::test]

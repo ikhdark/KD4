@@ -23,13 +23,13 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def test_quick_is_static_only_and_full_validation_remains_explicit(self):
+    def test_profiles_select_available_scenarios_and_quick_stays_lightweight(self):
         catalog = kd4_perf_snapshot.scenario_catalog()
         quick = kd4_perf_snapshot.PROFILE_SCENARIOS["quick"]
-        self.assertNotIn("feature-check", quick)
-        self.assertIn("--static-only", catalog[quick[-1]].command)
-        self.assertIn("feature-check", kd4_perf_snapshot.PROFILE_SCENARIOS["phase0"])
-        self.assertNotIn("--static-only", catalog["feature-check"].command)
+        self.assertEqual(quick, ("python-startup", "git-status"))
+        for profile, names in kd4_perf_snapshot.PROFILE_SCENARIOS.items():
+            with self.subTest(profile=profile):
+                self.assertTrue(set(names) <= catalog.keys())
 
     def test_preflight_errors_launch_nothing_and_preserve_reports(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -76,7 +76,7 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             catalog = {
                 "python-startup": first,
                 "git-status": first,
-                "feature-check": first,
+                "installed-codex-version": first,
             }
             original = kd4_perf_snapshot._run_scenario
             calls = []
@@ -106,7 +106,7 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
                         "--scenario",
                         "git-status",
                         "--scenario",
-                        "feature-check",
+                        "installed-codex-version",
                         "--output",
                         str(output),
                         "--json",
@@ -119,7 +119,7 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertEqual(payload["results"][0]["status"], "passed")
             self.assertEqual(payload["results"][1]["samples"][0]["outcome"], "aborted")
-            self.assertEqual(payload["pendingScenarios"], ["feature-check"])
+            self.assertEqual(payload["pendingScenarios"], ["installed-codex-version"])
             self.assertFalse(payload["complete"])
             self.assertFalse(payload["ok"])
             self.assertIn("cleanup unconfirmed", payload["abortReason"])
@@ -476,7 +476,6 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             {
                 "startup",
                 "repository",
-                "validation",
                 "test",
                 "build",
                 "app-server",

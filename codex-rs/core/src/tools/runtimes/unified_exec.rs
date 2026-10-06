@@ -358,12 +358,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             &ctx.call_id,
             None,
         );
-        crate::tools::events::begin_exec_mutation_evidence(
-            event_ctx,
-            native_cwd.as_ref(),
-            &mutation,
-        )
-        .await;
         // Begin is published only after the spawn, too late for this snapshot.
         crate::tools::events::begin_uncertain_command_baseline(
             event_ctx,

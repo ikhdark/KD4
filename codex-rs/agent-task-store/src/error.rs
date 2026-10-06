@@ -36,8 +36,6 @@ pub enum StoreError {
     ReceiptAlreadySealed(AttemptId),
     #[error("dependency validation failed: {blockers:?}")]
     DependencyBlocked { blockers: Vec<DependencyBlocker> },
-    #[error("isolated handoff from assignment {0} changed after it was versioned")]
-    IsolationHandoffSuperseded(AssignmentId),
     #[error("only one immutable correction amendment is allowed for assignment {0}")]
     AmendmentLimitReached(AssignmentId),
     #[error("only worker assignments may create a correction attempt: {0}")]
@@ -60,18 +58,9 @@ pub enum StoreError {
     ValidationCallImmutable(String),
     #[error("receipt references validation calls with incompatible status: {call_ids:?}")]
     ValidationCallStatusInvalid { call_ids: Vec<String> },
-    #[error("validation evidence was superseded by workspace changes: {call_ids:?}")]
-    EvidenceSuperseded { call_ids: Vec<String> },
     #[error("completed receipt is missing required evidence: {obligations:?}")]
     RequiredEvidenceMissing {
         obligations: Vec<MissingEvidenceObligation>,
-    },
-    #[error(
-        "declared changes do not match finalized mutation evidence; declared={declared:?}, finalized={finalized:?}"
-    )]
-    MutationEvidenceMismatch {
-        declared: Vec<String>,
-        finalized: Vec<String>,
     },
     #[error("observation limit must be between 0 and 100, got {0}")]
     InvalidObservationLimit(usize),
@@ -85,30 +74,6 @@ pub enum StoreError {
     RepositoryMismatch(AssignmentId),
     #[error("binding limit must be between 0 and 256, got {0}")]
     InvalidBindingLimit(usize),
-    #[error("mutation evidence limit must be between 1 and 100, got {0}")]
-    InvalidMutationEvidenceLimit(usize),
-    #[error("snapshot chunk size must be between 1 and 262144 bytes, got {0}")]
-    InvalidSnapshotChunkSize(usize),
-    #[error("snapshot offset {offset} exceeds {total_bytes} bytes")]
-    InvalidSnapshotOffset { offset: u64, total_bytes: u64 },
-    #[error("private mutation snapshot for {path} is {bytes} bytes; limit is {max_bytes} bytes")]
-    SnapshotTooLarge {
-        path: String,
-        bytes: u64,
-        max_bytes: u64,
-    },
-    #[error(
-        "private mutation snapshot hash does not match retained evidence for {path} under attempt {attempt_id}"
-    )]
-    SnapshotHashMismatch { attempt_id: AttemptId, path: String },
-    #[error("mutation evidence for {path} has not been started under attempt {attempt_id}")]
-    MutationNotStarted { attempt_id: AttemptId, path: String },
-    #[error("mutation evidence for {path} has not been finalized under attempt {attempt_id}")]
-    MutationNotFinalized { attempt_id: AttemptId, path: String },
-    #[error("mutation evidence for {path} is already finalized under attempt {attempt_id}")]
-    MutationAlreadyFinalized { attempt_id: AttemptId, path: String },
-    #[error("private mutation snapshot is unavailable for {path} under attempt {attempt_id}")]
-    SnapshotUnavailable { attempt_id: AttemptId, path: String },
     #[error("agent task store contains invalid persisted data: {0}")]
     CorruptData(String),
     #[error(transparent)]

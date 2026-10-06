@@ -23,9 +23,6 @@ use codex_agent_task_store::ReceiptDraft;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::StoreResult;
 use codex_agent_task_store::TaskActor;
-use codex_agent_task_store::WorkspaceActorKind;
-use codex_agent_task_store::WorkspaceActorRegistration;
-use codex_agent_task_store::WorkspaceStrategy;
 use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
@@ -230,19 +227,6 @@ impl AgentTaskCoordinator {
         draft: AssignmentDraft,
     ) -> StoreResult<(Assignment, Attempt)> {
         let store = self.required_store()?;
-        store
-            .register_workspace_actor(
-                repo_root,
-                WorkspaceActorRegistration {
-                    root_session_id: draft.root_session_id.clone(),
-                    actor_id: format!("root:{}", draft.root_session_id),
-                    kind: WorkspaceActorKind::Root,
-                    assignment_id: None,
-                    attempt_id: None,
-                    strategy: WorkspaceStrategy::Shared,
-                },
-            )
-            .await?;
         let (assignment, attempt) = store.create_assignment(repo_root, draft).await?;
         self.start_task_metrics(&assignment);
         Ok((assignment, attempt))
@@ -255,19 +239,6 @@ impl AgentTaskCoordinator {
         isolated_integrator_available: bool,
     ) -> StoreResult<AdmittedAssignment> {
         let store = self.required_store()?;
-        store
-            .register_workspace_actor(
-                repo_root,
-                WorkspaceActorRegistration {
-                    root_session_id: draft.root_session_id.clone(),
-                    actor_id: format!("root:{}", draft.root_session_id),
-                    kind: WorkspaceActorKind::Root,
-                    assignment_id: None,
-                    attempt_id: None,
-                    strategy: WorkspaceStrategy::Shared,
-                },
-            )
-            .await?;
         let admitted = store
             .create_admitted_assignment(repo_root, draft, isolated_integrator_available)
             .await?;
@@ -584,26 +555,6 @@ impl AgentTaskCoordinator {
         {
             return Ok(None);
         }
-        let mut risks = Vec::new();
-        if let Err(error) = store.finalize_pending_mutations(binding.attempt_id).await {
-            if binding_no_longer_needs_receipt(store.as_ref(), &binding).await? {
-                return Ok(None);
-            }
-            risks.push(format!("Mutation evidence finalization failed: {error}"));
-            tracing::warn!(
-                %error,
-                attempt_id = %binding.attempt_id,
-                "typed mutation evidence finalization was unavailable; sealing the missing receipt anyway"
-            );
-        }
-        // Finalization can change evidence and another turn can renew the binding.
-        let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
-        if task.current_attempt.attempt_id != binding.attempt_id
-            || task.receipt.is_some()
-            || task.current_attempt.state != AttemptState::Active
-        {
-            return Ok(None);
-        }
         let validation_call_ids = task
             .validation_calls
             .iter()
@@ -656,7 +607,7 @@ impl AgentTaskCoordinator {
             declared_changes: Vec::new(),
             validation_call_ids,
             blockers: vec!["typed agent finished without a valid receipt".to_string()],
-            risks,
+            risks: Vec::new(),
             next_action: Some(
                 format!("Inspect assignment {} attempt {} and the linked validation calls; check evidence freshness and supply the missing criterion report before accepting the result.", binding.assignment_id, binding.attempt_id),
             ),
