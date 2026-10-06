@@ -1056,7 +1056,7 @@ def reserve_cargo_lane(
     command: Sequence[str],
     lane_root: Path | None = None,
     lock_timeout_seconds: float = 30.0,
-    warm_wait_seconds: float = 30.0,
+    warm_wait_seconds: float = 600.0,
     allow_cold_overflow: bool = False,
     build_context: Mapping[str, object] | None = None,
 ) -> Iterator[tuple[str, Path]]:
@@ -1554,6 +1554,39 @@ def _cargo_command_with_target_dir(
     ]
 
 
+def _guard_cargo_checkout_cwd(command: Sequence[str], repo_root: Path) -> None:
+    """Reject the common wrong-root invocation before waiting for a build lane.
+
+    Do not relocate the command: relative arguments and Cargo configuration must
+    keep their caller-selected meaning. Plugins and explicit path overrides stay
+    under Cargo's control rather than emulating their argument parsers here.
+    """
+    if not command or Path(command[0]).stem.lower() != "cargo":
+        return
+    index = _cargo_subcommand_index(command)
+    if index is None or command[index] not in {
+        "build", "b", "check", "c", "test", "t", "bench", "run", "r",
+        "clippy", "doc", "d", "rustc", "rustdoc", "fix",
+    }:
+        return
+    options = command[:command.index("--")] if "--" in command else command
+    if any(
+        arg in {"--help", "-h", "--manifest-path"}
+        or arg.startswith(("--manifest-path=", "-C"))
+        for arg in options
+    ):
+        return
+    cwd = Path.cwd()
+    if cwd != repo_root.resolve() or not (cwd / "codex-rs" / "Cargo.toml").is_file():
+        return
+    if any((directory / "Cargo.toml").is_file() for directory in (cwd, *cwd.parents)):
+        return
+    raise ValueError(
+        "Cargo working directory is the checkout root; run from codex-rs "
+        "or pass --manifest-path codex-rs/Cargo.toml. No build lane was reserved."
+    )
+
+
 def _implicit_cargo_package(command: Sequence[str]) -> str | None:
     """Name the single package Cargo selects without -p, or None if unsure.
 
@@ -1945,7 +1978,7 @@ def run_in_cargo_lane(
     lane_root: Path | None = None,
     lock_timeout_seconds: float = 30.0,
     timing_path: Path | None = None,
-    warm_wait_seconds: float = 30.0,
+    warm_wait_seconds: float = 600.0,
     allow_cold_overflow: bool = False,
 ) -> int:
     if not command:
@@ -1981,6 +2014,7 @@ def run_in_cargo_lane(
         # Refuse before reserving: a raw core test run would otherwise build and
         # then fail on stale helpers instead of using the named runner.
         _guard_raw_lane_test_command(command)
+        _guard_cargo_checkout_cwd(command, repo_root)
         child_env = os.environ.copy()
         updates = local_rust_env(child_env, repo_root=repo_root, which=shutil.which)
         child_env.update(updates)
@@ -2752,6 +2786,8 @@ def main(argv: list[str] | None = None) -> int:
     run_lane_parser = subparsers.add_parser(
         "run-lane",
         help="Reserve a Cargo target lane for the lifetime of a child command.",
+        description="Reserve a build lane without changing the working directory. "
+        "Run Cargo from codex-rs, or supply --manifest-path codex-rs/Cargo.toml.",
     )
     run_lane_parser.add_argument("--lane", required=True)
     run_lane_parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
@@ -2759,8 +2795,8 @@ def main(argv: list[str] | None = None) -> int:
     run_lane_parser.add_argument(
         "--warm-wait-seconds",
         type=positive_float,
-        default=30.0,
-        help="Wait for reusable work before failing or explicitly overflowing (default: 30).",
+        default=600.0,
+        help="Wait for reusable work before failing or explicitly overflowing (default: 600).",
     )
     run_lane_parser.add_argument(
         "--allow-cold-overflow",
