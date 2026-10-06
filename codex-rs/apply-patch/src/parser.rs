@@ -167,8 +167,7 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
     let patch = patch_lines.join("\n");
     let mut parser = StreamingPatchParser::default();
     parser.push_delta_in_place(&patch)?;
-    let hunks = parser.finish()?;
-    let environment_id = parser.environment_id().map(str::to_owned);
+    let (hunks, environment_id) = parser.into_parts()?;
     Ok(ApplyPatchArgs {
         hunks,
         patch,

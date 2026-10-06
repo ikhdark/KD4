@@ -745,6 +745,64 @@ async fn multi_agent_v2_spawn_requires_explicit_turn_authorization() {
     );
 }
 
+#[test_case::test_case("implement subagents again"; "restart")]
+#[test_case::test_case("Use subagents"; "plain")]
+#[test_case::test_case("**Use subagents**"; "emphasized")]
+#[tokio::test]
+async fn multi_agent_v2_spawn_accepts_explicit_user_request(request: &str) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.multi_agent_v2.multi_agent_mode_hint_text = None;
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    set_turn_config(&mut turn, config);
+    turn.multi_agent_version = MultiAgentVersion::V2;
+    // Do not inherit the test helper's grant: exercise the real user-input path.
+    turn.multi_agent_spawn_authorized
+        .store(false, std::sync::atomic::Ordering::Release);
+    turn.update_multi_agent_spawn_authorization(&[UserInput::Text {
+        text: request.to_string(),
+        text_elements: Vec::new(),
+    }]);
+
+    let output = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "authorized_again"
+            })),
+        ))
+        .await
+        .expect("the explicit request must pass authorization and durable admission");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn result should be json");
+    assert_eq!(result["task_name"], "/root/authorized_again");
+    assert!(result["assignment_id"].is_string());
+    assert!(
+        manager
+            .captured_ops()
+            .iter()
+            .any(|(thread_id, _)| *thread_id != root.thread_id),
+        "the authorized child must actually receive its task"
+    );
+    manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+}
+
 #[tokio::test]
 async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;

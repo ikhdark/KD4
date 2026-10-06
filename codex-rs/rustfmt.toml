@@ -2,5 +2,21 @@ edition = "2024"
 # scripts/format.py uses the pinned nightly in scripts/tool_versions.py.
 imports_granularity = "Item"
 
-# Protected crates follow the instructions in their respective directories.
-ignore = ["../DO-NOT-CHANGE"]
+# Keep the relocated crates excluded from automatic formatting.
+ignore = [
+    "aws-auth",
+    "backend-client",
+    "cloud-tasks-mock-client",
+    "codex-backend-openapi-models",
+    "codex-experimental-api-macros",
+    "codex-home",
+    "keyring-store",
+    "login",
+    "model-provider-info",
+    "process-hardening",
+    "response-debug-context",
+    "responses-api-proxy",
+    "utils/rustls-provider",
+    "stdio-to-uds",
+    "terminal-detection",
+]

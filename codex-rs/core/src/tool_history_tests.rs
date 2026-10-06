@@ -1360,6 +1360,76 @@ fn workspace_evidence_remains_visible_only_for_its_captured_revision() {
 }
 
 #[test]
+fn workspace_projection_memoizes_verdicts_without_crossing_mutations_or_snapshots() {
+    let captured = workspace_identity("captured");
+    let changed = workspace_identity("changed");
+    let output = text_output("cached", "captured evidence".into());
+    let items: Arc<[ResponseItem]> = Arc::from([function_call("cached"), output.clone()]);
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
+        Some(captured.clone()), &output, BTreeSet::new(),
+    ).unwrap());
+    let original = state.clone();
+    let project = |state: &ToolHistoryState, identity: &WorkspaceEvidenceIdentity| {
+        state.project_with_workspace_identity(Arc::clone(&items), Some(identity)).items
+    };
+    let hits = |state: &ToolHistoryState| {
+        state.workspace_projection_cache.lock().unwrap()["cached"].hits
+    };
+    assert_eq!(project(&state, &captured), items);
+    assert_eq!(project(&state, &captured), items);
+    assert_eq!(hits(&state), 1);
+    let stale = project(&state, &changed);
+    assert_ne!(stale, items);
+    assert_eq!(hits(&state), 0);
+    assert_eq!(project(&state.clone(), &changed), stale);
+    assert_eq!(hits(&state), 1);
+    assert!(state.invalidate_source_dependencies(None, Some(&captured)));
+    assert_ne!(project(&state, &captured), items);
+    assert_eq!(hits(&state), 0);
+    assert_eq!(project(&original, &captured), items);
+    assert_eq!(hits(&state), 0);
+    let encoded = serde_json::to_value(&state).unwrap();
+    assert!(encoded.get("workspace_projection_cache").is_none());
+    let restored: ToolHistoryState = serde_json::from_value(encoded).unwrap();
+    assert!(restored.workspace_projection_cache.lock().unwrap().is_empty());
+    assert_ne!(project(&restored, &captured), items);
+    state.project_with_workspace_identity(Arc::from([]), Some(&captured));
+    assert!(state.workspace_projection_cache.lock().unwrap().is_empty());
+}
+
+#[test]
+fn workspace_projection_cache_rechecks_output_and_read_arguments() {
+    let identity = workspace_identity("captured");
+    let output = text_output("read", "old evidence".into());
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
+        Some(identity.clone()), &output, BTreeSet::new(),
+    ).unwrap());
+    state.invalidate_source_dependencies(None, Some(&identity));
+    let mut call = function_call("read");
+    if let ResponseItem::FunctionCall { name, arguments, .. } = &mut call {
+        *name = "read_file".into();
+        *arguments = r#"{"path":"before.rs"}"#.into();
+    }
+    let first = state.project_with_workspace_identity(
+        Arc::from([call.clone(), output.clone()]), Some(&identity),
+    );
+    if let ResponseItem::FunctionCall { arguments, .. } = &mut call {
+        *arguments = r#"{"path":"after.rs"}"#.into();
+    }
+    let second = state.project_with_workspace_identity(
+        Arc::from([call.clone(), output]), Some(&identity),
+    );
+    assert_ne!(first.items[1], second.items[1]);
+    let tampered = state.project_with_workspace_identity(
+        Arc::from([call, text_output("read", "unverified replacement".into())]), Some(&identity),
+    );
+    let (_, text) = textual_output_identity(&tampered.items[1]).unwrap();
+    assert!(!text.contains("historical_digest"));
+}
+
+#[test]
 fn workspace_evidence_is_stale_in_a_different_repository() {
     let call_id = "call-1";
     let output = text_output(call_id, "git status output".to_string());
@@ -2107,6 +2177,18 @@ fn nested_workspace_evidence_retains_only_current_results_after_resume() {
     assert!(!output.contains("old A"));
     assert_eq!(notice["historical_digest"], "combined A and B");
     assert_eq!(notice["valid_for_current_workspace"], false);
+
+    let mut mutated = state.clone();
+    mutated.invalidate_source_dependencies(
+        Some(&BTreeSet::from([PathBuf::from("/repo/b")])),
+        Some(&after),
+    );
+    let projected = mutated.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
+    let (_, output) = textual_output_identity(&projected.items[1]).expect("mutated parent");
+    assert!(!output.contains("current B"));
+    let projected = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
+    let (_, output) = textual_output_identity(&projected.items[1]).expect("original snapshot");
+    assert!(output.contains("current B"));
 
     // An unobserved external revision has no proof that B stayed unchanged.
     let projected =
@@ -4396,6 +4478,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
         internal_artifact_origins: BTreeMap::new(),
         artifact_call_ids: BTreeMap::new(),
         model_visible_tool_result_token_budget: None,
+        workspace_projection_cache: Arc::default(),
     };
     let mut serialized = serde_json::to_value(&state).expect("serialize ledger state");
     let candidate = &serialized["candidates"]["call-1"];

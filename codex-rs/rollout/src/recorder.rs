@@ -2096,6 +2096,13 @@ impl RolloutWriterState {
     }
 
     async fn write_pending_once(&mut self) -> std::io::Result<()> {
+        // AddItems already flushes a materialized writer. Its following barrier
+        // must retain ordering and error checks, but has no append transaction
+        // to serialize when neither records nor the initial header remain.
+        // Keep recovery/opening and durable sync on their existing paths.
+        if self.writer.is_some() && self.meta.is_none() && self.pending_items.is_empty() {
+            return Ok(());
+        }
         self.ensure_writer_open().await?;
         let path = self.rollout_path.clone();
         let write_lock = tokio::task::spawn_blocking(move || {
@@ -2311,6 +2318,10 @@ impl JsonlWriter {
         }
         let mut bytes = Vec::new();
         for captured in rollout_items {
+            if !crate::payload_artifact::is_artifact_candidate(&captured.item) {
+                Self::serialize_rollout_item(&mut bytes, &captured.item, captured.captured_at)?;
+                continue;
+            }
             let mut line = Vec::new();
             Self::serialize_rollout_item(&mut line, &captured.item, captured.captured_at)?;
             if line.len() < crate::payload_artifact::INLINE_BYTES {

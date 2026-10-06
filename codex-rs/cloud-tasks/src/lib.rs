@@ -304,12 +304,11 @@ async fn collect_attempt_diffs(
     backend: &dyn codex_cloud_tasks_client::CloudBackend,
     task_id: &codex_cloud_tasks_client::TaskId,
 ) -> anyhow::Result<Vec<AttemptDiffData>> {
-    let text =
-        codex_cloud_tasks_client::CloudBackend::get_task_text(backend, task_id.clone()).await?;
+    let (text, diff) =
+        codex_cloud_tasks_client::CloudBackend::get_task_text_and_diff(backend, task_id.clone())
+            .await?;
     let mut attempts = Vec::new();
-    if let Some(diff) =
-        codex_cloud_tasks_client::CloudBackend::get_task_diff(backend, task_id.clone()).await?
-    {
+    if let Some(diff) = diff {
         attempts.push(AttemptDiffData {
             placement: text.attempt_placement,
             created_at: None,
@@ -2383,6 +2382,103 @@ mod tests {
         assert_eq!(attempts[1].placement, Some(1));
         assert!(!attempts[0].diff.is_empty());
         assert!(!attempts[1].diff.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_attempt_diffs_uses_one_fresh_details_response() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("address"));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = Arc::clone(&request_count);
+        // Dropping the JoinSet also cancels the server if an assertion fails.
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            let mut details_count = 0;
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.expect("request"));
+                    assert!(request.len() < 16 * 1024, "bounded request headers");
+                }
+                let request = String::from_utf8(request).expect("UTF-8 headers");
+                server_count.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if request.starts_with("GET /api/codex/tasks/task HTTP/") {
+                    details_count += 1;
+                    let diff = match details_count {
+                        1 => Some("first diff"),
+                        2 => Some("refreshed diff"),
+                        _ => None,
+                    };
+                    ("200 OK", serde_json::json!({
+                        "current_assistant_turn": {
+                            "id": "turn", "attempt_placement": 1,
+                            "turn_status": "completed", "sibling_turn_ids": ["sibling"]
+                        },
+                        "current_diff_task_turn": {
+                            "output_items": [{"type": "output_diff", "diff": diff}]
+                        }
+                    }))
+                } else if request.starts_with(
+                    "GET /api/codex/tasks/task/turns/turn/sibling_turns HTTP/",
+                ) {
+                    ("200 OK", serde_json::json!({"sibling_turns": [{
+                        "id": "sibling", "attempt_placement": 0,
+                        "turn_status": "completed",
+                        "output_items": [{"type": "output_diff", "diff": "sibling diff"}]
+                    }]}))
+                } else {
+                    assert!(request.starts_with("GET /api/codex/tasks/failed HTTP/"));
+                    ("503 Service Unavailable", serde_json::json!({}))
+                };
+                let body = body.to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.expect("response");
+            }
+        });
+        let backend = codex_cloud_tasks_client::HttpClient::new(
+            base_url,
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+        )
+        .expect("HTTP backend");
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            for (index, current_diff) in [Some("first diff"), Some("refreshed diff"), None]
+                .into_iter()
+                .enumerate()
+            {
+                let attempts = collect_attempt_diffs(&backend, &TaskId("task".to_string()))
+                    .await
+                    .expect("attempts");
+                assert_eq!(attempts[0].placement, Some(0));
+                assert_eq!(attempts[0].diff, "sibling diff");
+                assert_eq!(attempts.len(), 1 + usize::from(current_diff.is_some()));
+                if let Some(diff) = current_diff {
+                    assert_eq!(attempts[1].placement, Some(1));
+                    assert_eq!(attempts[1].diff, diff);
+                }
+                assert_eq!(request_count.load(Ordering::SeqCst), (index + 1) * 2);
+            }
+            assert!(
+                collect_attempt_diffs(&backend, &TaskId("failed".to_string()))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(request_count.load(Ordering::SeqCst), 7);
+        })
+        .await;
+        server.shutdown().await;
+        result.expect("requests complete within timeout");
     }
 
     #[test]

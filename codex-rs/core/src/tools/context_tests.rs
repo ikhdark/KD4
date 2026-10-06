@@ -1856,6 +1856,31 @@ async fn artifact_backed_exec_output(
 }
 
 #[tokio::test]
+async fn exec_small_output_spills_only_when_its_display_is_reduced() {
+    let raw = "retained producer bytes\n".repeat(256);
+    assert!(raw.len() < crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES);
+    for pending in [false, true] {
+        let (mut output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
+        let home = tempfile::tempdir().unwrap();
+        output.raw_output_artifact = pending.then(|| RawOutputArtifact::pending(home.path(), "thread"));
+        output.prepare_recovery_artifact(home.path(), "thread").await;
+        assert!(!home.path().join("tool-output").exists(), "inline output must not spill");
+
+        output.max_output_tokens = Some(100);
+        output.prepare_recovery_artifact(home.path(), "thread").await;
+        let artifact_id = output.raw_output_artifact.as_ref().unwrap().artifact_id().unwrap();
+        let result = output.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
+        assert_eq!(result["output_reduced"], true);
+        assert_eq!(result["raw_output_artifact_id"], artifact_id.to_string());
+        let direct: serde_json::Value = serde_json::from_str(&output.response_text()).unwrap();
+        assert_eq!(direct["artifact_id"], artifact_id.to_string());
+        assert_eq!(std::fs::read(home.path().join("tool-output/thread").join(format!("{artifact_id}.log"))).unwrap(), raw.as_bytes());
+        output.prepare_recovery_artifact(home.path(), "thread").await;
+        assert_eq!(output.raw_output_artifact.as_ref().unwrap().artifact_id(), Some(artifact_id));
+    }
+}
+
+#[tokio::test]
 async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_proof() {
     let tests = (0..160).map(|index| format!("module::日本語::test_{index:04}")).collect::<Vec<_>>();
     let receipt = json!({

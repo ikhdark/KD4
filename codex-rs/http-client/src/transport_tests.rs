@@ -207,6 +207,8 @@ async fn interrupted_error_body_retains_http_status_and_headers() {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // Accepted Windows sockets can inherit the listener's nonblocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

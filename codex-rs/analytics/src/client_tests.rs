@@ -591,6 +591,95 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
 }
 
 #[test]
+fn server_response_analytics_filters_before_queueing_payloads() {
+    use codex_app_server_protocol::DynamicToolCallParams;
+    use codex_app_server_protocol::FileChangeRequestApprovalParams;
+    use codex_app_server_protocol::ServerRequest;
+
+    let (client, mut receiver) = client_with_receiver();
+    let request = ServerRequest::DynamicToolCall {
+        request_id: RequestId::Integer(1),
+        params: DynamicToolCallParams {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            call_id: "call".into(),
+            namespace: None,
+            tool: "read_file".into(),
+            arguments: serde_json::json!({}),
+        },
+    };
+    let result = serde_json::json!({
+        "success": true,
+        "contentItems": [{"type": "inputText", "text": "x".repeat(1024 * 1024)}],
+    });
+    client.track_server_response(42, &request, &result);
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+    for request in [
+        crate::analytics_client_tests::sample_command_approval_request(2, None),
+        ServerRequest::FileChangeRequestApproval {
+            request_id: RequestId::Integer(3),
+            params: FileChangeRequestApprovalParams {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "item".into(),
+                started_at_ms: 1,
+                reason: None,
+                grant_root: None,
+            },
+        },
+    ] {
+        let result = serde_json::json!({"decision": "accept"});
+        client.track_server_response(42, &request, &result);
+        let Ok(AnalyticsFact::ServerResponse {
+            completed_at_ms,
+            response,
+        }) = receiver.try_recv()
+        else {
+            panic!("approval response should be queued");
+        };
+        assert_eq!(completed_at_ms, 42);
+        assert_eq!(response.id(), request.id());
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::to_value(request.response_from_result(result).unwrap()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn server_response_analytics_releases_capacity_after_invalid_response() {
+    let (client, mut receiver) = client_with_receiver();
+    let request = crate::analytics_client_tests::sample_command_approval_request(7, None);
+    for _ in 0..16 {
+        client.track_server_response(42, &request, &serde_json::json!({"decision": "invalid"}));
+    }
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    for _ in 0..8 {
+        client.track_server_response(42, &request, &serde_json::json!({"decision": "accept"}));
+    }
+    client.track_server_response(43, &request, &serde_json::json!({"decision": "decline"}));
+    for _ in 0..8 {
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AnalyticsFact::ServerResponse {
+                completed_at_ms: 42,
+                ..
+            })
+        ));
+    }
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    client.track_server_response(44, &request, &serde_json::json!({"decision": "accept"}));
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AnalyticsFact::ServerResponse {
+            completed_at_ms: 44,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn ignored_notifications_are_not_enqueued() {
     let (client, mut receiver) = client_with_receiver();
     let notification = ServerNotification::AccountUpdated(AccountUpdatedNotification {

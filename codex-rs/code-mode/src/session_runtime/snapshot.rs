@@ -178,7 +178,7 @@ impl DurableState {
         };
         let mut file = NamedTempFile::new_in(self.path.parent().ok_or("snapshot has no parent")?)
             .map_err(|error| error.to_string())?;
-        serde_json::to_writer(file.as_file_mut(), &snapshot).map_err(|error| error.to_string())?;
+        super::write_buffered_json(file.as_file_mut(), &snapshot)?;
         if file.as_file().metadata().map_err(|error| error.to_string())?.len() > MAX_SNAPSHOT_BYTES as u64 {
             return Err("named-state snapshot exceeds its byte limit".into());
         }

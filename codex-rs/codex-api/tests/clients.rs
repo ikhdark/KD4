@@ -423,20 +423,17 @@ async fn non_streaming_retries_reuse_one_prepared_body() -> Result<()> {
     let transport = FailsOnceExecuteTransport::default();
     let client = SearchClient::new(transport.clone(), provider("openai"), Arc::new(NoAuth));
 
-    let response = client
-        .search(
-            &SearchRequest {
-                id: "search-session".to_string(),
-                model: "gpt-test".to_string(),
-                reasoning: None,
-                input: Some(SearchInput::Text("hello".to_string())),
-                commands: None,
-                settings: None,
-                max_output_tokens: None,
-            },
-            HeaderMap::new(),
-        )
-        .await?;
+    let request = SearchRequest {
+        id: "search-session".to_string(),
+        model: "gpt-test".to_string(),
+        reasoning: None,
+        input: Some(SearchInput::Text("café 界 🦀\n\"quoted\"".repeat(16_384))),
+        commands: None,
+        settings: None,
+        max_output_tokens: None,
+    };
+    let expected = serde_json::to_vec(&request)?;
+    let response = client.search(&request, HeaderMap::new()).await?;
 
     assert_eq!(
         response,
@@ -449,6 +446,11 @@ async fn non_streaming_retries_reuse_one_prepared_body() -> Result<()> {
     assert_eq!(requests.len(), 2);
     let first = request_body_bytes(&requests[0]);
     let second = request_body_bytes(&requests[1]);
+    assert_eq!(first, expected);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(first)?,
+        serde_json::to_value(&request)?
+    );
     assert_eq!(first, second);
     assert_eq!(first.as_ptr(), second.as_ptr());
     assert_eq!(

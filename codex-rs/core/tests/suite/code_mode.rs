@@ -256,6 +256,17 @@ fn raw_custom_tool_output_text(req: &ResponsesRequest, call_id: &str) -> String 
     }
 }
 
+fn projected_native_text(output: &str, row: &Value) -> String {
+    if let Some(text) = row["text"].as_str() {
+        return text.to_owned();
+    }
+    let count = row["text_lines"].as_u64().expect("counted native text") as usize;
+    let (_, text) = output.split_once('\n').expect("native text after envelope");
+    let lines = text.split('\n').take(count).collect::<Vec<_>>();
+    assert_eq!(lines.len(), count, "native text must be complete");
+    lines.join("\n")
+}
+
 fn tool_names(body: &Value) -> Vec<String> {
     body.get("tools")
         .and_then(Value::as_array)
@@ -1834,12 +1845,12 @@ async fn output_only_preserves_running_command_and_recovers_middle(
         .await?;
     let raw =
         custom_tool_output_last_non_empty_text(&observed.single_request(), "recover").unwrap();
-    let recovered: Value = serde_json::from_str(&raw)?;
+    let recovered: Value = serde_json::from_str(raw.lines().next().unwrap())?;
     assert_eq!(recovered["complete"], true, "{recovered}");
     assert_eq!(recovered["results"][0]["status"], "ok");
     assert_eq!(recovered["results"][0]["complete"], true);
     assert_eq!(
-        recovered["results"][0]["text"].as_str().unwrap().trim_end(),
+        projected_native_text(&raw, &recovered["results"][0]).trim_end(),
         "DECISIVE_MIDDLE_MATCH"
     );
     assert!(!source.exists());
@@ -2300,7 +2311,6 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
             "exec".to_string(),
             "wait".to_string(),
             "request_user_input".to_string(),
-            "apply_patch".to_string(),
             "web_search".to_string()
         ]
     );
@@ -2326,6 +2336,10 @@ const search = await tools.tool_search({
   query: "calendar timezone option 99",
   limit: 8,
 });
+const patch = await resolve_tool("apply_patch");
+if (patch.name !== "apply_patch" || typeof tools.apply_patch !== "function") {
+  throw new Error("nested apply_patch must remain callable");
+}
 const tool = ALL_TOOLS.find(
   ({ name }) => name === "mcp__codex_apps__calendar_timezone_option_99"
 );
@@ -2406,7 +2420,6 @@ if (!tool) {
             "exec".to_string(),
             "wait".to_string(),
             "request_user_input".to_string(),
-            "apply_patch".to_string(),
             "web_search".to_string()
         ]
     );
@@ -2434,12 +2447,7 @@ if (!tool) {
     assert!(exec_description.contains("callable with `.name`/`.description`"));
     assert!(exec_description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
     assert!(!exec_description.contains("### `tool_search`"));
-    assert!(exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
-    assert!(exec_description.contains("execution: \"client\";"));
-    assert!(exec_description.contains("tools: unknown[];"));
-    assert!(
-        exec_description.contains("omitted_result_count: number /* integer; minimum: 0 */ | null;")
-    );
+    // Result schemas are resolved on demand; verify the actual search result below.
     assert!(!exec_description.contains("calendar_timezone_option_99"));
 
     let request = follow_up_mock.single_request();
@@ -5287,6 +5295,8 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "Reflect",
         "RegExp",
         "resolve_tool",
+        "read_files",
+        "await_command",
         "run_graph",
         "Set",
         "String",

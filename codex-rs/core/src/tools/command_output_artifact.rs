@@ -51,7 +51,7 @@ const ARTIFACT_WRITING_MESSAGE: &str =
 const ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION: &str = "active-tool-history";
 const ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES: &[u8] = b"KD4_ACTIVE_TOOL_HISTORY_ARTIFACT_V1\n";
 pub(crate) const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 4 * 1024;
+pub(crate) const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 64 * 1024;
 const STREAMING_ARTIFACT_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
@@ -8087,6 +8087,26 @@ mod tests {
 
         assert!(output.contains("bad:\u{fffd}"));
         assert!(output.ends_with("[invalid UTF-8 replaced]"));
+    }
+
+    #[tokio::test]
+    async fn lazy_writer_spills_only_above_64_kib() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(RawOutputArtifact::pending(temp.path(), "thread")));
+        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+        let output = vec![b'x'; 64 * 1024];
+        writer.write_chunk(Some(&state), &output).await;
+        assert!(state.lock().await.is_pending());
+        assert!(!temp.path().join("tool-output").exists());
+        writer.write_chunk(Some(&state), b"\n").await;
+        writer.finish(Some(&state)).await;
+        let artifact = state.lock().await.clone();
+        let RawOutputArtifact::Stored { path, .. } = artifact else {
+            panic!("output above the lazy threshold must remain recoverable");
+        };
+        let mut expected = output;
+        expected.push(b'\n');
+        assert_eq!(tokio::fs::read(path).await.unwrap(), expected);
     }
 
     #[tokio::test]

@@ -126,14 +126,29 @@ fn spawn_authorization_directives(
                 fence = Some((marker.unwrap_or_default(), marker_len));
                 return None;
             }
-            Some(line)
+            Some(strip_spawn_directive_emphasis(line))
         })
         .flat_map(|line| line.split(['.', ';']))
         .filter_map(parse_spawn_authorization_directive)
 }
 
+fn strip_spawn_directive_emphasis(text: &str) -> &str {
+    let mut text = text.trim();
+    // Formatting a direct request does not quote it. Only unwrap matching
+    // emphasis around the entire text; never remove inline-code or quote marks.
+    for marker in ["**", "__", "*", "_"] {
+        if let Some(inner) = text
+            .strip_prefix(marker)
+            .and_then(|inner| inner.strip_suffix(marker))
+        {
+            text = inner.trim();
+        }
+    }
+    text
+}
+
 fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizationDirective> {
-    let clause = clause.trim().to_ascii_lowercase();
+    let clause = strip_spawn_directive_emphasis(clause).to_ascii_lowercase();
     // Apostrophes inside words are not quotation delimiters: contractions can revoke
     // authorization, and possessives can appear in otherwise direct requests.
     let contains_quote = clause
@@ -170,6 +185,10 @@ fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizatio
     } else {
         (false, normalized)
     };
+    // "Implement subagents again" is a request to resume delegation, not to
+    // implement agent support. Only accept this verb with an otherwise bare
+    // agent target followed by "again"; code/feature requests remain data.
+    let reimplement_target = body.strip_prefix("implement ");
     let target = [
         "spawn ",
         "use ",
@@ -178,7 +197,8 @@ fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizatio
         "parallelise with ",
     ]
     .into_iter()
-    .find_map(|prefix| body.strip_prefix(prefix));
+    .find_map(|prefix| body.strip_prefix(prefix))
+    .or(reimplement_target);
     let agent_target = target.is_some_and(|target| {
         let mut words = target
             .split_whitespace()
@@ -205,7 +225,7 @@ fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizatio
         {
             return false;
         }
-        matches!(
+        let is_agent = matches!(
             noun,
             Some(
                 "agent"
@@ -217,7 +237,10 @@ fn parse_spawn_authorization_directive(clause: &str) -> Option<SpawnAuthorizatio
                     | "child"
                     | "children"
             )
-        )
+        );
+        is_agent
+            && (reimplement_target.is_none()
+                || matches!((words.next(), words.next()), (Some("again"), None)))
     });
     let explicit_action = agent_target
         || [
@@ -258,6 +281,17 @@ mod tests {
             ("~~~\nUse subagents\n~~~\nDo not use subagents", false),
             ("````text\n```\nUse subagents\n````", false),
             ("```\nUse subagents", false),
+            ("implement subagents again", true),
+            ("**Use subagents**", true),
+            ("**Use subagents.**", true),
+            ("Use subagents. **Don't use subagents**", false),
+            ("**Use subagents**; __Do not use subagents__", false),
+            ("**\"Use subagents\"**", false),
+            ("**`Use subagents`**", false),
+            ("```text\n**Use subagents**\n```", false),
+            ("```text\nimplement subagents again\n```", false),
+            ("Implement subagents again. Don't implement subagents again", false),
+            ("Don't implement subagents again. Implement subagents again", true),
             (
                 "```\nDo not use subagents\n```\nPlease spawn an agent",
                 true,
@@ -301,6 +335,14 @@ mod tests {
             "Parallelize with multiple agents",
             "Use subagents to inspect the user's code",
             "Can you use subagents?",
+            "implement subagents again",
+            "Please implement multiple sub-agents again!",
+            "Could you implement subagents again?",
+            "**Use subagents**",
+            "__Use subagents__",
+            "*Use subagents*",
+            "_Use subagents_",
+            "**implement subagents again**",
         ] {
             assert_eq!(
                 parse_spawn_authorization_directive(request),
@@ -326,6 +368,18 @@ mod tests {
             "`Use subagents`",
             "Explain 'use subagents'",
             "Don't use 'subagents'",
+            "Implement subagents",
+            "Implement subagent support again",
+            "Implement agents in Rust again",
+            "Implement subagents again in the spawn code",
+            "Explain why we should implement subagents again",
+            "\"implement subagents again\"",
+            "`implement subagents again`",
+            "**Explain how to use subagents**",
+            "**\"Use subagents\"**",
+            "**`Use subagents`**",
+            "**Use subagents",
+            "Use subagents**",
         ] {
             assert_eq!(
                 parse_spawn_authorization_directive(request),
@@ -340,6 +394,7 @@ mod tests {
         for request in [
             "Spawn a child process",
             "Use child processes to run the build",
+            "Implement child processes again",
         ] {
             assert_eq!(
                 parse_spawn_authorization_directive(request),
@@ -356,6 +411,10 @@ mod tests {
             "Don't use subagents for this task",
             "Please don't use subagents for the user's task",
             "I do not want you to use subagents",
+            "Do not implement subagents again",
+            "Don't implement subagents again",
+            "**Don't use subagents**",
+            "__Do not implement subagents again__",
         ] {
             assert_eq!(
                 parse_spawn_authorization_directive(request),

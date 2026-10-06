@@ -4,6 +4,9 @@ mod types;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -70,6 +73,14 @@ enum CachedCellEvent {
     Spilled(tempfile::NamedTempFile),
 }
 
+// serde_json emits many small writes. Flush explicitly so an I/O error cannot
+// be hidden by BufWriter::drop before a receipt or snapshot is published.
+fn write_buffered_json(writer: impl Write, value: &impl serde::Serialize) -> Result<(), String> {
+    let mut writer = BufWriter::new(writer);
+    serde_json::to_writer(&mut writer, value).map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())
+}
+
 impl CachedCellEvent {
     // Called off the async runtime and outside the cell registry/cache locks.
     fn new(event: CellEvent) -> (Arc<Self>, usize) {
@@ -77,8 +88,7 @@ impl CachedCellEvent {
         if bytes > TERMINAL_CELL_CACHE_MAX_BYTES {
             let spilled = (|| -> Result<tempfile::NamedTempFile, String> {
                 let mut file = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
-                serde_json::to_writer(file.as_file_mut(), &event)
-                    .map_err(|error| error.to_string())?;
+                write_buffered_json(file.as_file_mut(), &event)?;
                 Ok(file)
             })();
             match spilled {
@@ -100,7 +110,7 @@ impl CachedCellEvent {
                 .map_err(|error| Error::Runtime(format!(
                     "terminal cell result is unavailable: {error}; the cell completed; do not replay its effects"
                 )))
-                .and_then(|file| serde_json::from_reader(file).map_err(|error| Error::Runtime(
+                .and_then(|file| serde_json::from_reader(BufReader::new(file)).map_err(|error| Error::Runtime(
                     format!("terminal cell result cannot be decoded: {error}; do not replay its effects")
                 ))),
         }
@@ -219,18 +229,32 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
 
     pub(crate) async fn execute(
         &self,
-        request: CreateCellRequest,
+        mut request: CreateCellRequest,
         initial_observe_mode: ObserveMode,
     ) -> Result<StartedCell, Error> {
         if self.inner.shutdown_token.is_cancelled() {
             return Err(Error::ShuttingDown);
         }
-        self.restore_durable_state(request.state_path.as_ref()).await?;
+        let persistence_notice = self.restore_durable_state(request.state_path.as_ref()).await?;
+        if persistence_notice.is_some() {
+            request.state_path = None;
+        }
         let admission = self.inner.state_admission.read().await;
         let cell_id = self.allocate_cell_id()?;
         let initial_event = self
             .start_cell(cell_id.clone(), request, initial_observe_mode, admission)
             .await?;
+        let initial_event: RuntimeEventFuture = Box::pin(async move {
+            let mut event = initial_event.await?;
+            if let Some(notice) = persistence_notice {
+                let (CellEvent::Yielded { content_items }
+                    | CellEvent::ExplicitYield { content_items }
+                    | CellEvent::Completed { content_items, .. }
+                    | CellEvent::Terminated { content_items }) = &mut event;
+                content_items.insert(0, OutputItem::Text { text: notice.to_string() });
+            }
+            Ok(event)
+        });
         Ok(StartedCell {
             cell_id,
             initial_event,
@@ -305,14 +329,22 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
     async fn restore_durable_state(
         &self,
         path: Option<&std::path::PathBuf>,
-    ) -> Result<(), Error> {
-        let Some(path) = path else { return Ok(()) };
+    ) -> Result<Option<&'static str>, Error> {
+        let Some(path) = path else { return Ok(None) };
         let selected_path = path.clone();
         let _admission = if self.inner.durable_state.get().is_none() {
             Some(self.inner.state_admission.write().await)
         } else {
             None
         };
+        // Check under exclusive admission before opening (and reserving IDs in)
+        // a durable snapshot. Never replace values or active cells to opt in late.
+        if self.inner.durable_state.get().is_none()
+            && (!self.inner.stored_values.lock().await.is_empty()
+                || self.inner.active_cell_permits.available_permits() != self.inner.active_cell_capacity)
+        {
+            return Ok(Some("Named-state persistence was not enabled: existing values or active cells must be preserved. This cell runs with in-memory state only; it is not durable across restart."));
+        }
         let state = self.inner.durable_state.get_or_try_init(|| async {
             let (state, restored, completed) = tokio::task::spawn_blocking(move || {
                 let (state, restored) = snapshot::DurableState::open(selected_path)?;
@@ -323,11 +355,6 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             }).await.map_err(|error| Error::Runtime(error.to_string()))?
                 .map_err(Error::Runtime)?;
             let mut values = self.inner.stored_values.lock().await;
-            if !values.is_empty() || self.inner.active_cell_permits.available_permits() != self.inner.active_cell_capacity {
-                return Err(Error::Runtime(
-                    "enable named-state persistence before storing values and without other active cells; no values were replaced".into()
-                ));
-            }
             let next_id = state.first_cell_id;
             let mut terminal = self.inner.terminal_cells.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -349,7 +376,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         if &state.path != path {
             return Err(Error::Runtime("a runtime cannot switch named-state snapshot paths".into()));
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn start_cell(

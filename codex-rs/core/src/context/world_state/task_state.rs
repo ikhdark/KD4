@@ -26,7 +26,6 @@ impl TaskState {
                 "step_ids": plan.plan.iter().map(|step| lineage.step_id(&step.step)).collect::<Vec<_>>(),
                 "obligations": lineage.obligation_summary(&plan),
                 "current_plan": plan,
-                "lineage": lineage,
             }),
             None => serde_json::json!({"has_plan": false}),
         };
@@ -123,6 +122,7 @@ mod tests {
         }, PlanLineage::default())));
         let fragment = state.render_diff(PreviousSectionState::Absent).unwrap().render();
         assert_eq!(state.0["obligations"]["completed"], 0);
+        assert!(state.0.get("lineage").is_none());
         assert_eq!(state.0["obligations"]["unresolved"].as_array().unwrap().len(), 1);
         assert!(fragment.contains("&lt;/codex_task_state&gt;"));
         assert!(crate::context::is_contextual_user_fragment(&ContentItem::InputText {

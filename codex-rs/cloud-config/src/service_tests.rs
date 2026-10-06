@@ -1099,3 +1099,26 @@ fn bundle_response_conversion_treats_missing_sections_as_empty() {
         CloudConfigBundle::default()
     );
 }
+
+#[test]
+fn bundle_retry_backoff_preserves_delay_jitter_and_cap() {
+    for (attempt, low_ms, high_ms) in [
+        (0, 180, 220),
+        (1, 180, 220),
+        (2, 360, 440),
+        (3, 720, 880),
+        (4, 1_440, 1_760),
+        (100, 27_000, 30_000),
+        (u64::MAX, 27_000, 30_000),
+    ] {
+        let delay = backoff(attempt);
+        assert!(
+            delay >= Duration::from_millis(low_ms),
+            "{attempt}: {delay:?}"
+        );
+        assert!(
+            delay <= Duration::from_millis(high_ms),
+            "{attempt}: {delay:?}"
+        );
+    }
+}

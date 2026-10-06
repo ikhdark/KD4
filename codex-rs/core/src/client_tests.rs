@@ -280,6 +280,98 @@ async fn completed_websocket_response_reports_its_stream_throughput() {
     );
 }
 
+#[tokio::test]
+async fn websocket_throughput_excludes_downstream_stalls_but_not_terminal_delivery() {
+    for stalled_before_completion in [true, false] {
+        let mut rates = WebsocketStreamThroughput::default();
+        for _ in 0..5 {
+            record_response_rate(&mut rates, 40);
+        }
+        record_response_rate(&mut rates, 10);
+        let original_rates = rates.recent_tokens_per_second.clone();
+        let throughput = Arc::new(Mutex::new(rates));
+        let blocked = Arc::new(Notify::new());
+        let mut events = (0..super::RESPONSE_STREAM_CHANNEL_CAPACITY)
+            .map(|_| ResponseEvent::Created)
+            .collect::<VecDeque<_>>();
+        let item = output_message("1", "complete answer");
+        if stalled_before_completion {
+            events.push_back(ResponseEvent::OutputItemDone(item.clone()));
+        }
+        events.push_back(ResponseEvent::Completed {
+            response_id: "response-backpressure".to_string(),
+            token_usage: Some(TokenUsage {
+                output_tokens: 300,
+                ..Default::default()
+            }),
+            end_turn: Some(true),
+        });
+        let (mut stream, last_response) = super::map_response_events(
+            None,
+            NotifyAfterEventStream {
+                events,
+                yielded: 0,
+                notify_after: super::RESPONSE_STREAM_CHANNEL_CAPACITY + 1,
+                notify: Arc::clone(&blocked),
+            },
+            test_session_telemetry(),
+            InferenceTraceAttempt::disabled(),
+            test_model_provider(),
+            None,
+            Some(Arc::clone(&throughput)),
+        );
+        // Synchronize with an actually full queue, not a timing-dependent sleep.
+        tokio::time::timeout(Duration::from_secs(5), blocked.notified())
+            .await
+            .expect("mapper reaches full downstream queue");
+        let mut count = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                event.expect("backpressure must not lose or fail an event");
+                count += 1;
+            }
+        })
+        .await
+        .expect("consumer drains every event");
+        assert_eq!(
+            count,
+            super::RESPONSE_STREAM_CHANNEL_CAPACITY + 1 + usize::from(stalled_before_completion)
+        );
+        let response = last_response.await.expect("authoritative history retained");
+        assert_eq!(response.response_id, "response-backpressure");
+        assert_eq!(
+            response.items_added,
+            if stalled_before_completion {
+                vec![item]
+            } else {
+                Vec::new()
+            }
+        );
+        let mut rates = throughput.lock().unwrap();
+        if stalled_before_completion {
+            assert_eq!(rates.recent_tokens_per_second, original_rates);
+            assert_eq!(rates.collapsed_streak, 0);
+            assert_eq!(rates.take_collapse(), None);
+            record_response_rate(&mut rates, 10);
+            assert_eq!(
+                rates.take_collapse(),
+                None,
+                "censored sample breaks the streak"
+            );
+            record_response_rate(&mut rates, 10);
+            assert!(
+                rates.take_collapse().is_some(),
+                "real slow responses still rotate"
+            );
+        } else {
+            assert_eq!(
+                rates.recent_tokens_per_second.len(),
+                original_rates.len() + 1
+            );
+        }
+    }
+}
+
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_thread_id(ThreadId::new(), session_source)
 }
@@ -3360,6 +3452,7 @@ async fn provider_response_ids_cannot_replace_trusted_context() {
             InferenceTraceAttempt::disabled(),
             test_model_provider(),
             None,
+            /*stream_throughput*/ None,
         );
         let Some(Ok(ResponseEvent::OutputItemAdded(added))) = stream.next().await else {
             panic!("expected item added");
@@ -3447,6 +3540,7 @@ async fn response_stream_does_not_wait_for_and_cancels_pending_request_measureme
             measurement_cancellation.clone(),
             None,
         )),
+        /*stream_throughput*/ None,
     );
 
     let event = tokio::time::timeout(Duration::from_millis(250), stream.next())
@@ -3513,6 +3607,7 @@ async fn response_completed_does_not_wait_for_pending_request_measurements() {
             measurement_cancellation,
             None,
         )),
+        /*stream_throughput*/ None,
     );
 
     assert!(
@@ -3607,6 +3702,7 @@ async fn completed_response_trace_write_keeps_runtime_responsive() -> anyhow::Re
         attempt,
         test_model_provider(),
         None,
+        /*stream_throughput*/ None,
     );
     terminal_seen_rx.await?;
     assert!(matches!(
@@ -3670,6 +3766,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         attempt,
         test_model_provider(),
         None,
+        /*stream_throughput*/ None,
     );
 
     let observed = stream
@@ -3721,6 +3818,7 @@ async fn response_stream_records_last_model_feedback_ids() {
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
         None,
+        /*stream_throughput*/ None,
     );
 
     while stream.next().await.is_some() {}
@@ -3798,6 +3896,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         attempt,
         test_model_provider(),
         None,
+        /*stream_throughput*/ None,
     );
 
     // Fill the mapper channel with non-terminal events, then yield one output
@@ -3998,6 +4097,7 @@ async fn audit_reports_17_19_stream_has_exactly_one_terminal_outcome() {
             InferenceTraceAttempt::disabled(),
             test_model_provider(),
             None,
+            /*stream_throughput*/ None,
         );
         let results: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
             .await
@@ -4125,6 +4225,7 @@ async fn failed_stream_releases_consumer_and_freezes_clock_while_diagnostics_are
             Default::default(),
             None,
         )),
+        /*stream_throughput*/ None,
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(250), stream.next())

@@ -734,7 +734,7 @@ function Get-Command($Name) {
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
         # Assert the section exists as top-level (H2) guidance and carries the
-        # rebuild contract, without pinning it to a line window that breaks
+        # runtime boundary, without pinning it to a line window that breaks
         # whenever earlier sections grow.
         heading = re.search(
             r"(?m)^## Repository identity and runtime boundary\s*$", text
@@ -742,9 +742,10 @@ function Get-Command($Name) {
         self.assertIsNotNone(heading)
         section = re.split(r"(?m)^## ", text[heading.end() :], maxsplit=1)[0]
         self.assertIn(
-            "Source changes become Desktop-visible only after rebuilding", section
+            "contains the Rust CLI and app-server, not the native Windows shell", section
         )
-        self.assertIn("replacing or updating the local binary", section)
+        self.assertIn("The published fork Desktop must use", section)
+        self.assertIn("CODEX_HOME=", section)
 
     def test_windows_installer_requires_standalone_metadata(self) -> None:
         powershell_installer = (
@@ -1703,7 +1704,7 @@ function Get-Command($Name) {
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             (result.stdout + result.stderr).strip(),
-            "cargo nextest run --profile local --no-tests=fail -p codex-hooks --lib "
+            "just cargo-lane core-tests cargo nextest run --profile local --no-tests=fail -p codex-hooks --lib "
             "-E 'test(=schema::tests::generated_hook_schemas_match_fixtures)'",
         )
 
@@ -1799,9 +1800,7 @@ function Get-Command($Name) {
                 "app-server-schema-regenerate <owner>"
             ),
             "codex-rs/core/src/config/schema.md": "config-schema-regenerate <owner>",
-            "codex-rs/core/src/config/schema_tests.rs": (
-                "config-schema-regenerate <owner>"
-            ),
+            "codex-rs/config/src/schema_fixture_tests.rs": "config-schema-regenerate <owner>",
         }
         for relative_path, canonical_command in canonical_command_sources.items():
             with self.subTest(path=relative_path):
@@ -1926,7 +1925,6 @@ function Get-Command($Name) {
             "run-dev-small package *args:",
             "local-release package:",
             "build-for-release *args:",
-            "bench-workspace *args:",
             "test-lane-fast lane *args:",
             "test-windows-sandbox-processes *args:",
             "deps-duplicates-workspace *args:",

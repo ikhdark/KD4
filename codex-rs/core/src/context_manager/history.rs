@@ -1150,9 +1150,10 @@ impl ContextManager {
     ) -> Option<i64> {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
-        let last_instruction_boundary = pending_user_boundary
-            .then_some(projected_items.len())
-            .or_else(|| projected_items.iter().rposition(is_user_turn_boundary));
+        // Use sampling's completed-task boundary, not every steering or agent
+        // instruction. Those boundaries deliberately retain active reasoning.
+        let last_instruction_boundary =
+            completed_turn_boundary_with_pending_user(projected_items, pending_user_boundary);
         let unchanged = Arc::ptr_eq(source_items, projected_items);
         let mut retained = Vec::with_capacity(projected_items.len());
         let mut introduced_tokens = 0i64;
@@ -1325,9 +1326,8 @@ impl ContextManager {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
-        let last_instruction_boundary = pending_user_boundary
-            .then_some(items.len())
-            .or_else(|| items.iter().rposition(is_user_turn_boundary));
+        let last_instruction_boundary =
+            completed_turn_boundary_with_pending_user(items, pending_user_boundary);
         let items_tokens = items
             .iter()
             .enumerate()
@@ -2506,10 +2506,21 @@ fn evict_resolved_reasoning(items: &mut Vec<ResponseItem>) {
 /// End of the latest answered task before the current real user request.
 /// A user interruption alone is not evidence that the earlier work is finished.
 pub(crate) fn completed_turn_boundary(items: &[ResponseItem]) -> Option<usize> {
-    let user = items.iter().rposition(|item| {
-        matches!(item, ResponseItem::Message { role, .. } if role == "user")
-            && is_user_turn_boundary(item)
-    })?;
+    completed_turn_boundary_with_pending_user(items, false)
+}
+
+fn completed_turn_boundary_with_pending_user(
+    items: &[ResponseItem],
+    pending_user_boundary: bool,
+) -> Option<usize> {
+    let user = if pending_user_boundary {
+        items.len()
+    } else {
+        items.iter().rposition(|item| {
+            matches!(item, ResponseItem::Message { role, .. } if role == "user")
+                && is_user_turn_boundary(item)
+        })?
+    };
     items[..user].iter().rposition(|item| matches!(item,
         ResponseItem::Message { role, phase: Some(codex_protocol::models::MessagePhase::FinalAnswer), .. }
             if role == "assistant"

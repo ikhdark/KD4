@@ -15,6 +15,19 @@ from scripts import process_owner, rust_tool_env, vscode_runtime_proof
 
 
 class ProcessOwnerTest(unittest.TestCase):
+    def test_cli_below_normal_priority_is_opt_in(self):
+        for flags in ([], ["--below-normal-priority"]):
+            with self.subTest(flags=flags), mock.patch.object(
+                process_owner, "run_owned",
+                return_value=subprocess.CompletedProcess(["fixture"], 7),
+            ) as run:
+                self.assertEqual(process_owner.main([*flags, "--", "fixture"]), 7)
+                self.assertEqual(run.call_args.args[0], ["fixture"])
+                self.assertEqual(
+                    run.call_args.kwargs["creationflags"],
+                    getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0) if flags else 0,
+                )
+
     def test_timeout_preserves_flushed_short_diagnostic(self):
         result = process_owner.run_finite(
             [

@@ -342,6 +342,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             .begin_local_phase(crate::turn_timing::TurnLocalPhase::ExecutorReadinessWait);
         let setup_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("command_setup");
         let native_cwd = req.cwd.to_abs_path().ok();
+        let classification_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("command_mutation_classification");
         let mutation = crate::tools::events::command_mutation_for_exec(
             &req.command_for_approval,
             native_cwd
@@ -350,6 +351,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         )
         .await
         .map_err(ToolError::Codex)?;
+        drop(classification_phase);
         let event_ctx = crate::tools::events::ToolEventCtx::new(
             ctx.session.as_ref(),
             ctx.turn.as_ref(),

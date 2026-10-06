@@ -431,21 +431,13 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
-        let validation = crate::validation::resolve_command_validation(
+        let validation_analysis = crate::validation::resolve_command_validation(
             &command_invocation,
             if environment_is_remote { None } else { native_cwd.as_ref().map(|cwd| cwd.as_path()) },
             args.validation.clone(),
-        ).await;
-        args.apply_validation_observation_policy(
-            validation.as_ref().is_some_and(|validation| validation.is_validation()),
         );
-        let validation_launch = !direct_runtime
-            && (validation.is_some()
-                || matches!(
-                    classify_validation_invocations(&validation_invocations),
-                    ValidationClassification::Validation { .. }
-                ));
-        let search_narrowing = if !validation_launch && !environment_is_remote {
+        let search_analysis = async {
+        let search_narrowing = if !environment_is_remote {
             if let Some(native_cwd) = native_cwd.as_ref() {
                 let search_command = resolved_command.safety_command.clone();
                 let search_shell_type = resolved_command.preflight_shell_type;
@@ -489,11 +481,27 @@ impl ExecCommandHandler {
         } else {
             None
         };
+        Ok::<_, FunctionCallError>(search_narrowing)
+        };
         let safety_command = resolved_command.safety_command.clone();
-        let inspection_command = crate::tools::run_blocking_command_analysis(move || {
+        let safety_analysis = crate::tools::run_blocking_command_analysis(move || {
             is_known_safe_command(&safety_command)
-        })
-        .await
+        });
+        // Pure launch analyses share inputs but not results. Join them before
+        // applying observation/approval policy; no process starts in this phase.
+        let (validation, search_narrowing, inspection_command) =
+            tokio::join!(validation_analysis, search_analysis, safety_analysis);
+        args.apply_validation_observation_policy(
+            validation.as_ref().is_some_and(|validation| validation.is_validation()),
+        );
+        let validation_launch = !direct_runtime
+            && (validation.is_some()
+                || matches!(
+                    classify_validation_invocations(&validation_invocations),
+                    ValidationClassification::Validation { .. }
+                ));
+        let search_narrowing = if validation_launch { None } else { search_narrowing? };
+        let inspection_command = inspection_command
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!("command safety worker failed: {error}"))
         })?;
@@ -619,6 +627,7 @@ impl ExecCommandHandler {
         let input_context = format!("prefix={prefix_rule:?}");
         let effective_environment = manager.effective_environment(&context);
         let environment_hash = validation_environment_hash(&effective_environment);
+        crate::tools::parallel::wait_for_workspace_baseline().await;
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         let repository_epoch = session
             .services
@@ -723,8 +732,7 @@ impl ExecCommandHandler {
                     .command_execution
                     .record_exit(&attempt_key, 0)
                     .await;
-                return Ok(boxed_tool_output(
-                    ExecCommandToolOutput {
+                let mut response = ExecCommandToolOutput {
                         process_output: None,
                         error: None,
                         validation: validation.clone(),
@@ -744,8 +752,11 @@ impl ExecCommandHandler {
                         raw_output_artifact,
                         repair_notice,
                         pending_deferred_completions: Vec::new(),
-                    },
-                ));
+                    };
+                response.prepare_recovery_artifact(
+                    turn.config.codex_home.as_path(), &session.thread_id.to_string(),
+                ).await;
+                return Ok(boxed_tool_output(response));
             }
             Ok(None) => {}
             Err(err) => {
@@ -877,6 +888,9 @@ impl ExecCommandHandler {
                 if !environment_is_remote && let Some(native_cwd) = native_cwd.as_ref() {
                     attach_missing_rg_path_advisory(&mut response, native_cwd.as_path()).await;
                 }
+                response.prepare_recovery_artifact(
+                    turn.config.codex_home.as_path(), &session.thread_id.to_string(),
+                ).await;
                 Ok(boxed_tool_output(
                     response,
                 ))
@@ -944,6 +958,9 @@ impl ExecCommandHandler {
                     pending_deferred_completions: Vec::new(),
                 };
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
+                response.prepare_recovery_artifact(
+                    turn.config.codex_home.as_path(), &session.thread_id.to_string(),
+                ).await;
                 Ok(boxed_tool_output(
                     response,
                 ))
@@ -1040,6 +1057,10 @@ impl ExecCommandHandler {
 }
 
 impl CoreToolRuntime for ExecCommandHandler {
+    fn prepares_during_workspace_baseline(&self) -> bool {
+        true
+    }
+
     fn command_argument_format(&self) -> Option<crate::tools::registry::CommandArgumentFormat> {
         Some(crate::tools::registry::CommandArgumentFormat::Exec)
     }

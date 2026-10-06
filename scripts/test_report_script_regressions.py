@@ -379,11 +379,12 @@ class ScriptReportRegressions(unittest.TestCase):
                 second, state = source_inventory.inventory(root, query, state)
                 self.assertEqual((second["count"], second["source_bytes_read"]), (9, 8))
                 self.assertTrue(second["ready_to_render"])
-                self.assertEqual(first["scan_epoch"], second["scan_epoch"])
+                self.assertNotEqual(first["scan_epoch"], second["scan_epoch"])
                 refreshed, _ = source_inventory.inventory(
                     root, query, state, refresh=True
                 )
                 self.assertNotEqual(refreshed["scan_epoch"], second["scan_epoch"])
+                self.assertEqual(refreshed["scan_epoch"], first["scan_epoch"])
                 self.assertEqual(refreshed["source_bytes_read"], 64)
 
     def test_atomic_output_preserves_hardlinked_source_and_checkpoint_on_failure(self):

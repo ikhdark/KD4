@@ -37,16 +37,20 @@ pub(super) struct ParsedSessionImport {
 
 pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut cwd = None;
     let mut custom_title = None;
     let mut ai_title = None;
     let mut fallback_title = None;
     let mut saw_user_message = false;
     let mut latest_timestamp = None;
+    let mut line = String::new();
 
-    for line in reader.lines() {
-        let line = line?;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -428,6 +432,52 @@ mod tests {
         assert_eq!(
             parsed.content_sha256,
             format!("{:x}", Sha256::digest(contents))
+        );
+    }
+
+    #[test]
+    fn summary_reads_through_large_records_and_mixed_line_endings() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("session.jsonl");
+        let user = serde_json::json!({
+            "type": "user", "cwd": root.path(), "timestamp": "2026-06-03T12:00:00Z",
+            "message": {"content": "request"}
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant", "timestamp": "2026-06-03T12:01:00Z",
+            "message": {"content": "界".repeat(32_000)}
+        });
+        let title = serde_json::json!({"type": "custom-title", "customTitle": "final title"});
+        // A short record after the large one must not retain stale buffer text.
+        // The final record deliberately has no newline.
+        std::fs::write(
+            &path,
+            format!("{user}\r\n\r\nnot json\n{assistant}\n{user}\n{title}"),
+        )
+        .unwrap();
+        let summary = summarize_session(&path).unwrap().unwrap();
+        assert_eq!(summary.migration.cwd, root.path());
+        assert_eq!(summary.migration.title.as_deref(), Some("final title"));
+        assert_eq!(
+            summary.latest_timestamp,
+            parse_timestamp("2026-06-03T12:01:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn summary_reports_invalid_utf8_even_after_an_eligible_record() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("session.jsonl");
+        let user = serde_json::json!({
+            "type": "user", "cwd": root.path(), "timestamp": "2026-06-03T12:00:00Z",
+            "message": {"content": "request"}
+        });
+        let mut contents = format!("{user}\n").into_bytes();
+        contents.push(0xff);
+        std::fs::write(&path, contents).unwrap();
+        assert_eq!(
+            summarize_session(&path).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
         );
     }
 

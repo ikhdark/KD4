@@ -29,3 +29,10 @@ Carry changes to live command, cell, and job identifiers, their last observed
 status, supported continuation or cancellation calls, and indispensable artifact
 or recovery references. Retire completed handles.
 Preserve unknown status; do not infer completion or gather new evidence.
+
+Aim for at most 2,400 tokens total, with section-body targets of 250 tokens for
+Goal, 350 for Current state, 250 for Completed work, 350 for Unresolved work,
+500 for Evidence, and 250 for Next action (1,950 body tokens total).
+These are guidance, not hard limits: preserve indispensable changed information.
+An incremental update should normally be much shorter; omit unchanged sections
+rather than filling their budgets. Post-hoc truncation remains a safety net.

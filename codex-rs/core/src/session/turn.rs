@@ -1573,7 +1573,7 @@ async fn record_sampling_notices(
         sess,
         turn,
         "exhaustive_scope_feasibility",
-        "Before committing to an exhaustive review or full-read request, use the known file count, byte volume, and tool throughput to assess whether the requested coverage is feasible. Do not silently substitute a sample for the requested scope. If it is infeasible without delegation, and delegation is not authorized, do not block on a question: choose the scope that best serves the requested deliverable, state it and its exclusions in commentary, and proceed. Ask once only when the request gives no basis for choosing a scope. Reuse a scope or limit the user already chose; do not ask repeatedly or spawn agents without authorization. Preserve a coverage ledger and report unfinished coverage explicitly.",
+        "Before committing to an exhaustive review or full-read request, use the known file count, byte volume, and tool throughput to assess whether the requested coverage is feasible. Do not silently substitute a sample for the requested scope. When the user explicitly requests full reads or exhaustive coverage, do not narrow the scope without the user's approval. Continue reading through compactions, preserving coverage and unread ranges, until the requested coverage is complete or a genuine blocker requires user input or an external change. Implemented fixes, context pressure, or reporting partial coverage are not reasons to stop while required work remains obtainable. Otherwise, if coverage is infeasible without unauthorized delegation, choose the scope that best serves the requested deliverable, state it and its exclusions in commentary, and proceed. Ask once only when the request gives no basis for choosing a scope. Reuse a scope or limit the user already chose; do not ask repeatedly or spawn agents without authorization. Track coverage in working state; write coverage files only when the user asks. Report unfinished coverage explicitly in the final answer.",
     ).await?;
     if mcp_unavailable {
         record_context_notice_if_changed(
@@ -2621,7 +2621,7 @@ fn planning_failure_with_timing(
 struct PendingTokenEstimate {
     total_tokens: i64,
     body_growth_tokens: i64,
-    resolves_active_reasoning: bool,
+    has_real_user_boundary: bool,
 }
 
 fn estimate_pending_tokens(
@@ -2632,6 +2632,11 @@ fn estimate_pending_tokens(
     initial_context: bool,
 ) -> PendingTokenEstimate {
     use crate::context_manager::estimate_item_token_count;
+    let is_real_user_boundary = |item: &ResponseItem| {
+        matches!(item, ResponseItem::Message { role, .. } if role == "user")
+            && crate::context_manager::is_user_turn_boundary(item)
+    };
+    let mut has_real_user_boundary = false;
     let input_tokens = input.iter().fold(0i64, |tokens, item| {
         let item_tokens = match item {
             TurnInput::UserInput { content, .. } => {
@@ -2647,11 +2652,19 @@ fn estimate_pending_tokens(
                         item => item.clone(),
                     })
                     .collect();
-                estimate_item_token_count(&ResponseItem::from(
+                let item = ResponseItem::from(
                     codex_protocol::models::ResponseInputItem::from(content),
-                ))
+                );
+                has_real_user_boundary |= matches!(
+                    &item, ResponseItem::Message { content, .. } if !content.is_empty()
+                ) && is_real_user_boundary(&item);
+                estimate_item_token_count(&item)
             }
-            TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
+            TurnInput::ResponseItem(item) => {
+                has_real_user_boundary |= is_real_user_boundary(item);
+                estimate_item_token_count(item)
+            }
+            TurnInput::InternalResponseItem(item) => {
                 estimate_item_token_count(item)
             }
             TurnInput::InterAgentCommunication(communication) => {
@@ -2695,11 +2708,7 @@ fn estimate_pending_tokens(
             } else {
                 context_update_tokens
             }),
-        resolves_active_reasoning: input.iter().any(|item| match item {
-            TurnInput::UserInput { .. } | TurnInput::InterAgentCommunication(_) => true,
-            TurnInput::ResponseItem(item) => crate::context_manager::is_user_turn_boundary(item),
-            TurnInput::InternalResponseItem(_) => false,
-        }),
+        has_real_user_boundary,
     }
 }
 
@@ -2722,7 +2731,7 @@ async fn projected_prompt_pressure(
         collect_projected_prompt_state(
             sess.get_total_token_usage(),
             async {
-                if pending_token_estimate.resolves_active_reasoning {
+                if pending_token_estimate.has_real_user_boundary {
                     sess.get_estimated_token_count_after_pending_user_boundary(turn_context)
                         .await
                 } else {
@@ -6519,6 +6528,27 @@ async fn try_run_sampling_request(
     drop(tool_blocking_timing_guard);
     let generation_workspace_evidence = tool_runtime.flush_workspace_evidence_generation().await?;
     let required_tool_terminal = required_tool_terminal?;
+
+    // Tool completion is the earliest safe boundary after mutations. Start a
+    // replacement capture here, overlapping terminal/event bookkeeping, instead
+    // of discovering a stale prefetch during the next prompt's preparation.
+    if needs_follow_up && required_tool_terminal.is_none()
+        && generation_workspace_evidence.prefetched_workspace_identity.is_none()
+        && !cancellation_token.is_cancelled()
+    {
+        let revision = turn_diff_tracker.lock().await.current_mutation_revision();
+        if continuation_workspace_prefetch.as_ref()
+            .is_none_or(|(baseline, _)| !continuation_workspace_prefetch_is_current(*baseline, revision, false))
+        {
+            // Drop (and abort) the stale capture before starting its replacement.
+            drop(continuation_workspace_prefetch.take());
+            let history = sess.clone_history().await;
+            continuation_workspace_prefetch = start_continuation_workspace_prefetch(
+                &history, &turn_diff_tracker, Arc::clone(&sess.services.git_workspace),
+                turn_context.config.cwd.clone(), turn_context.environments.clone(),
+            ).await;
+        }
+    }
 
     let terminal = {
         let active_turn = sess.active_turn.lock().await;

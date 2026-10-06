@@ -219,6 +219,9 @@ impl SessionState {
         self.history
             .set_reference_context_item(reference_context_item);
         self.auto_compact_window.clear_prefill();
+        // Compaction and rollback change the prompt composition. Ratios measured
+        // against discarded history must not inflate the replacement checkpoint.
+        self.prompt_token_calibration = PromptTokenCalibration::default();
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {

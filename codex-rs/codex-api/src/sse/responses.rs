@@ -161,13 +161,18 @@ async fn process_sse_with_metadata(
 
         received_events = received_events.saturating_add(1);
         received_payload_bytes = received_payload_bytes.saturating_add(sse.data.len());
-        let event_name = sse.event.chars().take(128).collect::<String>();
+        let event_name_end = sse
+            .event
+            .char_indices()
+            .nth(128)
+            .map_or(sse.event.len(), |(index, _)| index);
+        let event_name = &sse.event[..event_name_end];
         trace!(event = %event_name, payload_bytes = sse.data.len(), "SSE event");
 
         let events = match interpreter.process_payload(&sse.data) {
             Ok(events) => {
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
-                    t.on_sse_event(&event_name, start.elapsed(), None);
+                    t.on_sse_event(event_name, start.elapsed(), None);
                 }
                 events
             }
@@ -181,7 +186,7 @@ async fn process_sse_with_metadata(
                 );
                 let safe_error = ApiError::Stream(diagnostic);
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
-                    t.on_sse_event(&event_name, start.elapsed(), Some(&safe_error));
+                    t.on_sse_event(event_name, start.elapsed(), Some(&safe_error));
                 }
                 debug!(event = %event_name, payload_bytes = sse.data.len(), error = %safe_error, "Failed to parse SSE event");
                 let _ = tx_event.send(Err(safe_error)).await;
@@ -192,7 +197,7 @@ async fn process_sse_with_metadata(
             }
             Err(ResponsesEventError::Api(error)) => {
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
-                    t.on_sse_event(&event_name, start.elapsed(), Some(&error));
+                    t.on_sse_event(event_name, start.elapsed(), Some(&error));
                 }
                 let _ = tx_event.send(Err(error)).await;
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
@@ -947,6 +952,46 @@ mod tests {
                 .lock()
                 .expect("cleanup lock")
                 .push(outcome);
+        }
+    }
+
+    #[tokio::test]
+    async fn event_names_keep_the_character_bound_for_telemetry_and_errors() {
+        for name in [
+            "message".to_string(),
+            format!("{}界🦀", "x".repeat(127)),
+            "界🦀".repeat(128),
+        ] {
+            let expected = name.chars().take(128).collect::<String>();
+            for valid in [true, false] {
+                let payload = if valid {
+                    r#"{"type":"response.completed","response":{"id":"done"}}"#
+                } else {
+                    "{"
+                };
+                let telemetry = Arc::new(RecordingSseTelemetry::default());
+                let body = format!("event: {name}\ndata: {payload}\n\n");
+                let (tx, mut rx) = mpsc::channel(2);
+                process_sse(
+                    Box::pin(stream::iter([Ok(Bytes::from(body))])),
+                    tx,
+                    idle_timeout(),
+                    Some(telemetry.clone()),
+                )
+                .await;
+                let result = rx.recv().await.unwrap();
+                if valid {
+                    assert_matches!(result, Ok(ResponseEvent::Completed { response_id, .. }) if response_id == "done");
+                } else {
+                    assert_matches!(result, Err(ApiError::Stream(message))
+                        if message.contains(&format!("SSE event {expected:?} (1 payload bytes)")));
+                }
+                assert!(rx.recv().await.is_none());
+                assert_eq!(
+                    *telemetry.interpreted_events.lock().unwrap(),
+                    vec![(expected.clone(), valid)]
+                );
+            }
         }
     }
 

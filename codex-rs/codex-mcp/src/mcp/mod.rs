@@ -326,7 +326,9 @@ pub async fn read_mcp_resource(
 ) -> anyhow::Result<ReadResourceResult> {
     let mut mcp_servers = effective_mcp_servers(config, auth);
     mcp_servers.retain(|name, _| name == server);
-    let auth_statuses = compute_auth_statuses(
+    // Preserve local credential diagnostics without making network discovery a
+    // prerequisite for reads. The manager discovers auth only if startup needs it.
+    let auth_statuses = compute_cached_auth_statuses(
         mcp_servers.iter(),
         &config.codex_home,
         config.mcp_oauth_credentials_store_mode,

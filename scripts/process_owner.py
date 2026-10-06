@@ -449,6 +449,11 @@ def main(argv=None):
         type=Path,
         help="Write this file if the tree's exit cannot be confirmed.",
     )
+    parser.add_argument(
+        "--below-normal-priority",
+        action="store_true",
+        help="Windows: launch the owned command below normal priority.",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -465,6 +470,10 @@ def main(argv=None):
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 prepare_sccache=args.prepare_sccache,
+                creationflags=(
+                    getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+                    if args.below_normal_priority else 0
+                ),
             ).returncode
         except CleanupFailed:
             if args.cleanup_failed_marker is not None:

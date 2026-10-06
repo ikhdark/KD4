@@ -635,15 +635,18 @@ pub(crate) struct ToolHistoryState {
     /// not part of the persisted ledger.
     #[serde(skip)]
     model_visible_tool_result_token_budget: Option<usize>,
+    /// Derived, bounded to calls in the latest projection, and shared by history snapshots.
+    #[serde(skip)]
+    workspace_projection_cache: Arc<std::sync::Mutex<BTreeMap<String, WorkspaceProjectionEntry>>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 struct NestedWorkspaceEvidence {
     observation: WorkspaceEvidenceObservation,
     output: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub(crate) struct WorkspaceEvidenceObservation {
     call_id: String,
     output_sha256: String,
@@ -657,6 +660,27 @@ pub(crate) struct WorkspaceEvidenceObservation {
     source_path_observations: Vec<SourcePathChangeObservation>,
     #[serde(default = "default_true")]
     source_dependencies_current: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WorkspaceProjectionKey {
+    workspace_identity: Option<WorkspaceEvidenceIdentity>,
+    // The exact observation state is the mutation revision, including scoped invalidation
+    // and nested-result changes. Comparing it also makes shared snapshot caches safe.
+    observation: Option<WorkspaceEvidenceObservation>,
+    nested: BTreeMap<String, NestedWorkspaceEvidence>,
+    origin_call_id: String,
+    origin_call: Option<(String, String)>,
+    recovery: bool,
+    output_sha256: String,
+}
+
+#[derive(Debug)]
+struct WorkspaceProjectionEntry {
+    key: WorkspaceProjectionKey,
+    replacement: Option<String>,
+    #[cfg(test)]
+    hits: usize,
 }
 
 impl WorkspaceEvidenceObservation {
@@ -2768,8 +2792,21 @@ impl ToolHistoryState {
         git_workspace: Option<&GitWorkspaceCache>,
     ) {
         let requirements = self.workspace_evidence_requirements(items);
+        let calls = items.iter().filter_map(|item| match item {
+            ResponseItem::FunctionCall { name, arguments, call_id, .. }
+                if matches!(name.as_str(), "read_file" | "list_files" | "read_tool_output") =>
+                Some((call_id.as_str(), (name, arguments))),
+            _ => None,
+        }).collect::<BTreeMap<_, _>>();
+        let mut cache = self.workspace_projection_cache.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|call_id, _| requirements.contains_key(call_id));
+        // Own only the small call descriptors before mutating the projected items.
+        let calls = calls.into_iter().map(|(id, (name, args))|
+            (id.to_string(), (name.clone(), args.clone()))).collect::<BTreeMap<_, _>>();
 
         for item_index in 0..items.len() {
+            let mut cache_key = None;
             let replacement = {
                 let item = &items[item_index];
                 let Some((call_id, output)) = canonical_textual_output_identity(item) else {
@@ -2785,6 +2822,39 @@ impl ToolHistoryState {
                 if observation.is_some_and(|observation| !observation.successful) {
                     continue;
                 }
+                let nested = self.code_mode_nested_evidence.get(call_id);
+                // Live path watches can change independently of Git identity (including
+                // ignored files and watch eviction). Keep their existing checks live.
+                let needs_watcher = |observation: &WorkspaceEvidenceObservation| {
+                    observation.source_dependencies_current
+                        && !observation.source_path_observations.is_empty()
+                };
+                if !observation.is_some_and(needs_watcher)
+                    && !nested.into_iter().flat_map(|results| results.values())
+                        .any(|result| needs_watcher(&result.observation))
+                {
+                    let key = WorkspaceProjectionKey {
+                        workspace_identity: workspace_identity.cloned(),
+                        observation: observation.cloned(),
+                        nested: nested.cloned().unwrap_or_default(),
+                        origin_call_id: origin_call_id.clone(),
+                        origin_call: calls.get(origin_call_id).cloned(),
+                        recovery: calls.get(call_id).is_some_and(|(name, _)| name == "read_tool_output"),
+                        output_sha256: sha256(output.as_bytes()),
+                    };
+                    if let Some(entry) = cache.get_mut(call_id).filter(|entry| entry.key == key) {
+                        #[cfg(test)]
+                        { entry.hits += 1; }
+                        if let Some(replacement) = &entry.replacement {
+                            let replacement = replacement.clone();
+                            if let Some((_, body)) = textual_output_body_mut(&mut items.make_owned()[item_index]) {
+                                replace_model_visible_output_text(body, replacement);
+                            }
+                        }
+                        continue;
+                    }
+                    cache_key = Some((call_id.to_string(), key));
+                }
                 let revision_matches = observation.is_some_and(|observation| {
                     observation.is_current(workspace_identity, git_workspace)
                 });
@@ -2793,6 +2863,13 @@ impl ToolHistoryState {
                         observation.output_sha256 == sha256(output.as_bytes())
                     });
                 if revision_matches && output_matches {
+                    if let Some((call_id, key)) = cache_key {
+                        cache.insert(call_id, WorkspaceProjectionEntry {
+                            key, replacement: None,
+                            #[cfg(test)]
+                            hits: 0,
+                        });
+                    }
                     continue;
                 }
                 let (reason_code, reason) = if observation.is_none() {
@@ -2947,12 +3024,20 @@ impl ToolHistoryState {
             let Some(notice) = replacement else {
                 continue;
             };
+            let notice = notice.to_string();
+            if let Some((call_id, key)) = cache_key {
+                cache.insert(call_id, WorkspaceProjectionEntry {
+                    key, replacement: Some(notice.clone()),
+                    #[cfg(test)]
+                    hits: 0,
+                });
+            }
             let Some((_call_id, body)) =
                 textual_output_body_mut(&mut items.make_owned()[item_index])
             else {
                 continue;
             };
-            replace_model_visible_output_text(body, notice.to_string());
+            replace_model_visible_output_text(body, notice);
         }
     }
 
@@ -3832,6 +3917,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
         internal_artifact_origins,
         artifact_call_ids: BTreeMap::new(),
         model_visible_tool_result_token_budget: state.model_visible_tool_result_token_budget,
+        workspace_projection_cache: Arc::default(),
     };
     reminted_state.rebuild_artifact_index();
     (reminted_state, dropped_candidates)

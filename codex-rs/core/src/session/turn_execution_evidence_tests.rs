@@ -112,11 +112,18 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
             novel, "{command} {scope:?} {identity}",
         );
         for markdown in [false, true] {
+            let mut file_lineage = lineage.clone();
             let bytes = if markdown {
+                let body = "# Report\n";
+                file_lineage["content_sha256"] = json!(crate::tool_history::sha256(body.as_bytes()));
                 format!("<!-- codex-evidence: {} -->\n# Report\n",
-                    json!({"evidence_lineage": lineage})).into_bytes()
+                    json!({"evidence_lineage": file_lineage})).into_bytes()
             } else {
-                result.raw_output.clone()
+                let mut document = json!({"rendered_by": command});
+                file_lineage["content_sha256"] = json!(crate::tool_history::sha256(
+                    &serde_json::to_vec(&document).unwrap()));
+                document["evidence_lineage"] = file_lineage;
+                serde_json::to_vec(&document).unwrap()
             };
             std::fs::write(&path, bytes).unwrap();
             let call = invocation("read_file", json!({"path":path})).await;
@@ -549,7 +556,7 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
     let ToolPayload::Function { arguments: original_args } = &invocation.payload else { unreachable!() };
     let ToolPayload::Function { arguments: requested_args } = &requested else { unreachable!() };
     let raw = result.code_mode_result(&invocation.payload);
-    assert!(crate::tools::handlers::reselect_read_file_output(original_args, requested_args, raw.clone()).is_some(), "raw selector projection: {raw}");
+    assert!(crate::tools::handlers::reselect_read_file_output(original_args, requested_args, &raw).is_some(), "raw selector projection: {raw}");
     assert!(collector.register_deterministic_tool_call(
         &ToolName::plain("read_file"), &invocation.payload, "original-again",
     ).replayed_success.is_some(), "original read must remain a candidate");
@@ -626,7 +633,7 @@ async fn default_read_reselection_matches_fresh_selector_engine_without_io() {
     // Production freshness/authorization remains covered by the collector test.
     std::fs::remove_file(&path).unwrap();
     for (arguments, fresh, script) in cases {
-        let replay = crate::tools::handlers::reselect_read_file_output(previous, &arguments, raw.clone());
+        let replay = crate::tools::handlers::reselect_read_file_output(previous, &arguments, &raw);
         if fresh["results"] != script["results"] {
             assert!(replay.is_none(), "consumer-specific ordering/hydration must not be replayed: {arguments}");
             continue;
@@ -638,7 +645,7 @@ async fn default_read_reselection_matches_fresh_selector_engine_without_io() {
         for key in ["file_complete", "canonical_sha256"] {
             let mut invalid = raw.clone();
             invalid[key] = json!(false);
-            assert!(crate::tools::handlers::reselect_read_file_output(previous, &arguments, invalid).is_none());
+            assert!(crate::tools::handlers::reselect_read_file_output(previous, &arguments, &invalid).is_none());
         }
     }
 }
@@ -655,7 +662,7 @@ fn native_selector_reuse_rejects_incomplete_and_shared_only_results() {
         json!({"selector":{"kind":"lines","start":2,"end":2},"status":"aggregate_omitted","complete":false}),
     ] {
         assert!(crate::tools::handlers::reselect_read_file_output(
-            &previous, &requested, json!({"results":[result]}),
+            &previous, &requested, &json!({"results":[result]}),
         ).is_none());
     }
 }
@@ -673,12 +680,38 @@ fn native_selector_reuse_slices_utf8_crlf_without_inventing_bytes() {
     });
     let original = json!({"path":"file"}).to_string();
     let requested = json!({"path":"file","selectors":[{"kind":"bytes","start":4,"end":13}]}).to_string();
-    let result = crate::tools::handlers::reselect_read_file_output(&original, &requested, output.clone()).unwrap();
+    let result = crate::tools::handlers::reselect_read_file_output(&original, &requested, &output).unwrap();
     assert_eq!(result["results"][0]["text"], "日本語");
     assert_eq!(result["results"][0]["exact_bytes"], 9);
     assert_eq!(result["file_complete"], false);
     let split_codepoint = json!({"path":"file","selectors":[{"kind":"bytes","start":1,"end":2}]}).to_string();
-    assert!(crate::tools::handlers::reselect_read_file_output(&original, &split_codepoint, output).is_none());
+    assert!(crate::tools::handlers::reselect_read_file_output(&original, &split_codepoint, &output).is_none());
+}
+
+#[tokio::test]
+async fn selector_replay_keeps_borrowed_evidence_intact_across_misses_and_hits() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.txt");
+    std::fs::write(&path, "first\r\n日本語\r\nlast\n").unwrap();
+    let original = invocation("read_file", json!({"path":path})).await;
+    let raw = ReadFileHandler.handle(original.clone()).await.unwrap().code_mode_result(&original.payload);
+    let before = raw.to_string();
+    let ToolPayload::Function { arguments: previous } = &original.payload else { unreachable!() };
+    for arguments in [
+        json!({"path":path.with_file_name("other.txt"),"offset":2,"limit":1}),
+        json!({"path":path,"environment_id":"other","offset":2,"limit":1}),
+        json!({"path":path,"selectors":[]}),
+    ] {
+        assert!(crate::tools::handlers::reselect_read_file_output(previous, &arguments.to_string(), &raw).is_none());
+        assert_eq!(raw.to_string(), before);
+    }
+    let requested = json!({"path":path,"offset":2,"limit":1}).to_string();
+    let mut first = crate::tools::handlers::reselect_read_file_output(previous, &requested, &raw).unwrap();
+    assert_eq!(first["results"][0]["text"], "日本語\r\n");
+    first["results"][0]["text"] = json!("caller mutation");
+    let second = crate::tools::handlers::reselect_read_file_output(previous, &requested, &raw).unwrap();
+    assert_eq!(second["results"][0]["text"], "日本語\r\n");
+    assert_eq!(raw.to_string(), before);
 }
 
 #[test]

@@ -56,8 +56,7 @@ class CargoLaneTest(unittest.TestCase):
                 errors.open("w", encoding="utf-8") as stderr,
                 owned_process(
                     [self.shell, "-NoProfile", "-File", str(SCRIPT),
-                     "-LanesRoot", str(self.lanes_root), "-Lane", "handoff",
-                     "-WarmWaitSeconds", "10"],
+                     "-LanesRoot", str(self.lanes_root), "-Lane", "handoff"],
                     env=env, stdout=subprocess.PIPE, stderr=stderr, text=True,
                     creationflags=CREATE_NO_WINDOW,
                 ) as process,
@@ -67,7 +66,7 @@ class CargoLaneTest(unittest.TestCase):
                     if "waiting up to" in errors.read_text(encoding="utf-8"):
                         break
                     time.sleep(0.025)
-                self.assertIn("waiting up to", errors.read_text(encoding="utf-8"))
+                self.assertIn("waiting up to 600s", errors.read_text(encoding="utf-8"))
                 with rust_build_status.cargo_lane_coordination_lock(
                     self.lanes_root, timeout_seconds=1
                 ):
@@ -475,8 +474,10 @@ ConvertTo-Json -InputObject $results -Depth 10 -Compress
         self.assertEqual((outside / "sentinel").read_bytes(), b"unchanged")
 
     def test_concurrent_auto_reservations_stay_in_canonical_family(self):
-        self.make_lane("core-2")
-        self.make_lane("core-3")
+        for name in ("core-2", "core-3"):
+            lane = self.make_lane(name)
+            for artifact in (".fingerprint", "deps", "build"):
+                (lane / "debug" / artifact).mkdir(parents=True)
         os.utime(self.lanes_root / "core-2", None)
         line = next(
             i
@@ -536,6 +537,9 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
 
     def test_reservation_rechecks_cargo_lock_after_active_snapshot(self):
         lane = self.make_lane("late-cargo")
+        sibling = self.make_lane("late-cargo-2")
+        for artifact in (".fingerprint", "deps", "build"):
+            (sibling / "debug" / artifact).mkdir(parents=True)
         lock_path = lane / "debug" / ".cargo-lock"
         lock_path.parent.mkdir()
         lock_path.touch()
@@ -1721,6 +1725,49 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         self.assertIn("8388608", lines)
         self.assertIn("target=", lines)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process priority")
+    def test_lane_entrypoints_lower_command_and_descendant_priority(self) -> None:
+        probe = self.temp_root / "priority.py"
+        probe.write_text(
+            "import ctypes,json,subprocess,sys\n"
+            "priority = ctypes.windll.kernel32.GetPriorityClass(ctypes.c_void_p(-1))\n"
+            "if len(sys.argv) > 1:\n"
+            "    print(priority)\n"
+            "else:\n"
+            "    child = subprocess.check_output([sys.executable, __file__, 'child'], text=True)\n"
+            "    print(json.dumps([priority, int(child)]))\n"
+            "    sys.exit(7)\n",
+            encoding="utf-8",
+        )
+        env = {
+            "RUSTC_WRAPPER": "",
+            "CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE": "1",
+            "CODEX_CARGO_LANE_MAINTENANCE_SYNC": "0",
+            "CODEX_CARGO_LANE_ACTIVE_NAMES": "",
+        }
+        for entrypoint in ("python", "powershell"):
+            with self.subTest(entrypoint=entrypoint):
+                if entrypoint == "powershell":
+                    result = self.run_script(
+                        "-Lane", "priority", sys.executable, str(probe), extra_env=env,
+                    )
+                else:
+                    result = subprocess.run(
+                        [sys.executable, str(rust_build_status.__file__), "run-lane",
+                         "--lane", "priority", "--lanes-root", str(self.lanes_root),
+                         "--", sys.executable, str(probe)],
+                        env={**os.environ, **env}, capture_output=True, text=True,
+                        timeout=30, creationflags=CREATE_NO_WINDOW, check=False,
+                    )
+                self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                self.assertIn(
+                    json.dumps([subprocess.BELOW_NORMAL_PRIORITY_CLASS] * 2),
+                    result.stdout.splitlines(),
+                )
+                self.assertFalse(rust_build_status.lane_active_lock_is_held(
+                    self.lanes_root / "priority"
+                ))
 
     def test_no_command_guidance_routes_core_tests_through_named_lanes(self) -> None:
         fake_bin = self.fake_cargo_bin()

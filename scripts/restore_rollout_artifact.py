@@ -2,14 +2,19 @@
 """Restore one deleted-file undo record without overwriting existing work."""
 
 import argparse
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
+import sys
+
+# Keep this standalone repair entrypoint usable with PYTHONSAFEPATH from any cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
-    from scripts.rollout_snapshot import read_rollout_records
+    from scripts.rollout_snapshot import iter_rollout_records
 except ImportError:
-    from rollout_snapshot import read_rollout_records
+    from rollout_snapshot import iter_rollout_records
 
 
 def main(argv=None):
@@ -19,14 +24,17 @@ def main(argv=None):
     parser.add_argument("--deleted-file", required=True, help="Exact path key in the patch changes")
     parser.add_argument("--output", required=True, type=Path, help="New destination; must not exist")
     args = parser.parse_args(argv)
+    if args.output.exists() or args.output.is_symlink():
+        raise FileExistsError(f"restore output already exists: {args.output}")
     matches = []
-    for record, _ in read_rollout_records(args.rollout):
-        payload = record.get("payload", {})
-        if (record.get("type") == "event_msg" and payload.get("type") == "patch_apply_end"
-                and payload.get("call_id") == args.call_id):
-            change = payload.get("changes", {}).get(args.deleted_file)
-            if isinstance(change, dict) and change.get("type") == "delete":
-                matches.append(change["content"])
+    with closing(iter_rollout_records(args.rollout)) as records:
+        for record, _ in records:
+            payload = record.get("payload", {})
+            if (record.get("type") == "event_msg" and payload.get("type") == "patch_apply_end"
+                    and payload.get("call_id") == args.call_id):
+                change = payload.get("changes", {}).get(args.deleted_file)
+                if isinstance(change, dict) and change.get("type") == "delete":
+                    matches.append(change["content"])
     if len(matches) != 1:
         raise ValueError(f"expected one deleted-file record, found {len(matches)}")
     data = matches[0].encode("utf-8")

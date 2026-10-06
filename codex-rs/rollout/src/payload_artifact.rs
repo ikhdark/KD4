@@ -4,6 +4,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
+use codex_protocol::protocol::{EventMsg, RolloutItem};
 
 const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const INLINE_BYTES: usize = 8 * 1024;
@@ -22,19 +23,29 @@ pub(crate) fn root(path: &Path) -> PathBuf {
 
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 
-/// Artifacts are immutable and durable before the referencing line is appended.
+/// Decide from the canonical item before serializing or scheduling filesystem work.
+pub(crate) fn is_artifact_candidate(item: &RolloutItem) -> bool {
+    match item {
+        RolloutItem::SessionMeta(_) | RolloutItem::ToolManifest(_) => true,
+        RolloutItem::SamplingBoundary(boundary) => boundary.timing_checkpoint.is_some(),
+        RolloutItem::EventMsg(event) => matches!(
+            event,
+            EventMsg::PatchApplyEnd(_) | EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
+        ),
+        _ => false,
+    }
+}
+
+/// Artifacts are immutable and atomically published before the referencing line.
+/// Per-record fsync is intentionally avoided; readers reject a missing or corrupt
+/// blob after power loss rather than accepting incomplete payload evidence.
 /// Failures fall back to the original inline record at the writer boundary.
+/// The caller selects eligible items with `is_artifact_candidate`.
 pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
     if line.len() < INLINE_BYTES { return Ok(line.to_vec()); }
     let mut item: serde_json::Value = serde_json::from_slice(line)?;
     // Full tool-manifest definitions are usually byte-identical across threads,
     // so the content address stores one copy for every rollout that uses them.
-    let selected = item["type"] == "session_meta"
-        || item["type"] == "tool_manifest"
-        || (item["type"] == "sampling_boundary" && item["payload"]["timing_checkpoint"].is_object())
-        || (item["type"] == "event_msg" && matches!(item["payload"]["type"].as_str(),
-            Some("patch_apply_end" | "task_complete" | "turn_aborted")));
-    if !selected { return Ok(line.to_vec()); }
     let fields = item.as_object_mut().ok_or_else(|| io::Error::other("invalid rollout object"))?;
     let timestamp = fields.remove("timestamp");
     let format_version = fields.remove("format_version");
@@ -48,9 +59,8 @@ pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
     if !destination.exists() {
         let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
         temporary.write_all(&bytes)?;
-        temporary.as_file().sync_all()?;
         match temporary.persist_noclobber(&destination) {
-            // The destination is exactly the fsynced temporary file we wrote.
+            // The destination is exactly the complete temporary file we wrote.
             Ok(_) => published_here = true,
             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.error),

@@ -74,10 +74,9 @@ fn read_text(body: &Value, id: &str) -> String {
     let file = payload(body, id);
     assert_eq!(file["result"]["complete"], true);
     assert_eq!(file["result"]["file_complete"], true);
-    file["result"]["results"][0]["text"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+    let raw = output_text(output(body, id));
+    let start = raw.find("{\"kind\":").expect("file payload envelope");
+    projected_native_text(&raw[start..], &file["result"]["results"][0])
 }
 
 fn next_action(body: &Value, step: usize) -> Value {
@@ -143,7 +142,8 @@ fn next_action(body: &Value, step: usize) -> Value {
             let recovered = payload(body, "step-5");
             assert_eq!(recovered["exited"], true);
             assert_eq!(recovered["exit_code"], 0);
-            assert!(recovered["result"].to_string().contains(ROW));
+            assert_eq!(recovered["result"]["complete"], true);
+            assert!(output_text(output(body, "step-5")).contains(ROW));
             "text({kind:'file',result:await tools.read_file({path:'contract.txt'})});".to_owned()
         }
         7 => {

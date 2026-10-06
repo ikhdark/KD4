@@ -8,6 +8,7 @@ Token estimates use the harness's ceil(UTF-8 bytes / 4), not provider billing.
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import contextlib
 import difflib
@@ -56,6 +57,7 @@ FIELDS = (
     "description",
     "tools",
 )
+TERMINAL_EVENTS = {"task_complete", "turn_aborted"}
 ARTIFACT = re.compile(
     r'"(?P<key>raw_output_artifact_id|artifact_id)"\s*:\s*"'
     r'(?P<id>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})"'
@@ -132,20 +134,23 @@ def execution_timings(records):
         if row["type"] == "sampling_boundary":
             turn_id = checkpoint.get("turn_id", current)
             timing = checkpoint.get("timing", checkpoint)
-        elif kind == "task_complete":
+        elif kind in TERMINAL_EVENTS:
             turn_id = payload.get("turn_id", current)
             timing = payload.get("timing") or {}
         else:
             continue
         turn = turns.setdefault(turn_id, {
             "turn_id": turn_id, "completed": False, "completion_record": None,
+            "terminal_status": None, "terminal_record": None,
             "checkpoint_records": [], "modelRequests": {}, "toolCalls": {},
             "terminal_fields": [],
         })
-        terminal = kind == "task_complete"
+        terminal = kind in TERMINAL_EVENTS
         if terminal:
-            turn["completed"] = True
-            turn["completion_record"] = line
+            turn["completed"] = kind == "task_complete"
+            turn["completion_record"] = line if turn["completed"] else None
+            turn["terminal_status"] = kind
+            turn["terminal_record"] = line
         else:
             turn["checkpoint_records"].append(line)
         for field, identity in (("modelRequests", "samplingRequestId"), ("toolCalls", "callId")):
@@ -177,6 +182,7 @@ def tool_call_trace(records):
     calls, outputs, timings = {}, collections.defaultdict(list), {}
     turn_id = None
     completed_turns = set()
+    aborted_turns = set()
     for line, row, _ in records:
         payload = row.get("payload", {})
         kind = payload.get("type")
@@ -200,6 +206,8 @@ def tool_call_trace(records):
         if kind == "task_complete":
             completed = payload.get("turn_id", turn_id)
             completed_turns.add(completed)
+        elif kind == "turn_aborted":
+            aborted_turns.add(payload.get("turn_id", turn_id))
     for turn in execution_timings(records):
         for timing in turn["toolCalls"]:
             timings[(turn["turn_id"], timing["callId"])] = timing
@@ -236,6 +244,8 @@ def tool_call_trace(records):
             "outer_calls": sum(c["record"] is not None for c in ordered),
             "nested_calls": sum(c["source"] == "code_mode" for c in ordered),
             "completed_turns": len(completed_turns),
+            "aborted_turns": len(aborted_turns),
+            "terminal_turns": len(completed_turns | aborted_turns),
             "calls_without_timing": [c["call_id"] for c in ordered if not c["timing_available"]],
             "outer_calls_without_output": [c["call_id"] for c in ordered if c["record"] is not None and not c["outputs"]],
             "orphan_output_records": [o["record"] for key, values in outputs.items()
@@ -394,6 +404,16 @@ def execution_context_audit(records):
                 for block in blocks:
                     block_index[block].add(prior_index)
             previous_outputs[prior_index][1].append((line, prior_index))
+    # audit() supplies outputs in record order. Index the owning turn once,
+    # rather than scanning every output for every retained request.
+    outputs_by_turn = collections.defaultdict(list)
+    for output in outputs:
+        outputs_by_turn[output["turn_id"]].append(output)
+    output_records_by_turn = {
+        turn_id: [output["record"] for output in turn_outputs]
+        for turn_id, turn_outputs in outputs_by_turn.items()
+    }
+    request_boundaries_by_turn = collections.defaultdict(list)
     for timing in execution_timings(records):
         requests = timing["modelRequests"]
         for field in ("modelRequests", "toolCalls"):
@@ -405,13 +425,14 @@ def execution_context_audit(records):
             tokens = request.get("tokenUsage") or {}
             context = request.get("requestTokenCategories") or {}
             boundary = boundaries.get(request.get("samplingRequestId"))
-            added_outputs = [
-                o
-                for o in outputs
-                if o["turn_id"] == timing["turn_id"]
-                and boundary is not None
-                and previous_boundary < o["record"] < boundary
+            turn_id = timing["turn_id"]
+            output_records = output_records_by_turn.get(turn_id, [])
+            added_outputs = [] if boundary is None else outputs_by_turn[turn_id][
+                bisect.bisect_right(output_records, previous_boundary):
+                bisect.bisect_left(output_records, boundary)
             ]
+            if boundary is not None:
+                request_boundaries_by_turn[turn_id].append(boundary)
             input_tokens = tokens.get("inputTokens")
             cached = tokens.get("cachedInputTokens")
             rounds.append(
@@ -461,6 +482,8 @@ def execution_context_audit(records):
                 "turn_id": timing["turn_id"],
                 "completed": timing["completed"],
                 "completion_record": timing["completion_record"],
+                "terminal_status": timing["terminal_status"],
+                "terminal_record": timing["terminal_record"],
                 "timing_source": "terminal" if "modelRequests" in timing["terminal_fields"] else "checkpoint",
                 "checkpoint_records": timing["checkpoint_records"],
                 "request_count": len(requests),
@@ -468,13 +491,15 @@ def execution_context_audit(records):
             }
         )
     completed = {t["turn_id"] for t in turns if t["completed"]}
+    terminal = {t["turn_id"] for t in turns if t["terminal_status"] is not None}
+    aborted = {t["turn_id"] for t in turns if t["terminal_status"] == "turn_aborted"}
     # Weighted only within the owning turn, not across compaction/turn boundaries.
+    for turn_boundaries in request_boundaries_by_turn.values():
+        turn_boundaries.sort()
     for output in outputs:
-        exposure = sum(
-            r["boundary_record"] is not None and r["boundary_record"] > output["record"]
-            for t in turns
-            if t["turn_id"] == output["turn_id"]
-            for r in t["rounds"]
+        turn_boundaries = request_boundaries_by_turn[output["turn_id"]]
+        exposure = len(turn_boundaries) - bisect.bisect_right(
+            turn_boundaries, output["record"]
         )
         output["subsequent_requests_in_turn"] = exposure
         output["raw_replay_estimated_tokens"] = ((output["bytes"] + 3) // 4) * exposure
@@ -505,7 +530,9 @@ def execution_context_audit(records):
             "records_scanned": len(records),
             "started_turns": len(started),
             "completed_turns": len(completed),
-            "unfinished_turn_ids": sorted(started - completed, key=str),
+            "aborted_turns": len(aborted),
+            "terminal_turns": len(terminal),
+            "unfinished_turn_ids": sorted(started - terminal, key=str),
             "requests_with_usage": sum(
                 bool(r["provider_usage"]) for t in turns for r in t["rounds"]
             ),
@@ -541,6 +568,7 @@ def execution_context_audit(records):
             "Matching text blocks are byte-equal evidence, not proof they are semantically unnecessary or current.",
             "Repeated-block matching is budgeted; matching_blocks_coverage reports skipped candidate pairs. Repeated bytes are a lower bound when coverage is incomplete. Four-line indexing excludes only pairs that cannot meet the minimum block length.",
             "Terminal arrays take precedence; otherwise incremental checkpoints are merged by request/call identity, never summed as independent requests.",
+            "Aborted turns are terminal, not successful completions; terminal status does not establish complete usage or resolved tools.",
             "Unfinished executions report observed usage only; requests without usage and uncheckpointed tail work are not assumed free or complete.",
             "Usage reconciliation compares request totals with the last cumulative token event; differences can reflect inherited usage or different capture horizons, not necessarily double counting.",
         ],
@@ -590,7 +618,7 @@ def audit(path):
         if row["type"] == "tool_manifest":
             manifests[hashlib.sha256(encoded(payload)).hexdigest()] += 1
             manifest_bytes += wire_bytes
-        if kind == "task_complete" and payload.get("timing"):
+        if kind in TERMINAL_EVENTS and payload.get("timing"):
             timings[payload.get("turn_id", str(line))] = payload["timing"]
         if row["type"] != "response_item":
             continue
@@ -896,7 +924,8 @@ def compact_report(report, path, digest, byte_length, limit=5, source_checks=Non
         unfinished = covered.get("unfinished_turn_ids")
         totals["sessions_without_turn_coverage"] += not bool(covered)
         totals["unfinished_turns"] += len(unfinished or [])
-        for field in ("completed_turns", "requests_with_usage", "requests_without_usage"):
+        for field in ("completed_turns", "aborted_turns", "terminal_turns",
+                      "requests_with_usage", "requests_without_usage"):
             if field in covered:
                 totals[field] += covered[field]
         usage = context.get("provider_usage_totals", {})
@@ -920,6 +949,8 @@ def compact_report(report, path, digest, byte_length, limit=5, source_checks=Non
             "visible_bytes": session["summary"]["visible_bytes"],
             "incomplete_tail": session["incomplete_tail"],
             "completed_turns": covered.get("completed_turns"),
+            "aborted_turns": covered.get("aborted_turns"),
+            "terminal_turns": covered.get("terminal_turns"),
             "unfinished_turns": len(unfinished) if unfinished is not None else None,
             "requests_with_usage": covered.get("requests_with_usage"),
             "requests_without_usage": covered.get("requests_without_usage"),
@@ -1003,6 +1034,7 @@ def describe_contract():
         "metric_semantics": {
             "/sessions/*/summary/truncated_results": "Legacy alias of truncation_marker_results; lexical output-marker matches, including quoted source, not measured truncations.",
             "/sessions/*/timing_counter_totals": "Recorded terminal-turn counters only; missing values and open turns are not zero.",
+            "/sessions/*/execution_context/coverage": "Completed and aborted turns are terminal; unfinished_turn_ids excludes both. Terminal status does not prove usage or tool completeness. Older ledgers can lack terminal/aborted counts.",
         },
         "record_fields": {
             "/sessions/*/results/*": {"line": "1-based source record", "call_id": "outer call ID"},

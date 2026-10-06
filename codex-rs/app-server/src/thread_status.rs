@@ -161,16 +161,16 @@ impl ThreadWatchManager {
         }
     }
 
-    pub(crate) async fn upsert_thread(&self, thread: Thread) {
+    pub(crate) async fn upsert_thread(&self, thread: &Thread) {
         self.mutate_and_publish(move |state| {
-            state.upsert_thread(thread.id, /*emit_notification*/ true)
+            state.upsert_thread(thread.id.clone(), /*emit_notification*/ true)
         })
         .await;
     }
 
-    pub(crate) async fn upsert_thread_silently(&self, thread: Thread) {
+    pub(crate) async fn upsert_thread_silently(&self, thread: &Thread) {
         self.mutate_and_publish(move |state| {
-            state.upsert_thread(thread.id, /*emit_notification*/ false)
+            state.upsert_thread(thread.id.clone(), /*emit_notification*/ false)
         })
         .await;
     }
@@ -719,7 +719,7 @@ mod tests {
     async fn tracks_non_interactive_thread_status() {
         let manager = ThreadWatchManager::new();
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 NON_INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::AppServer,
             ))
@@ -741,7 +741,7 @@ mod tests {
     async fn status_updates_track_single_thread() {
         let manager = ThreadWatchManager::new();
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -854,7 +854,7 @@ mod tests {
     async fn system_error_sets_idle_flag_until_next_turn() {
         let manager = ThreadWatchManager::new();
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -885,7 +885,7 @@ mod tests {
     async fn terminal_failures_set_system_error_without_standalone_error() {
         let manager = ThreadWatchManager::new();
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -929,7 +929,7 @@ mod tests {
     async fn shutdown_marks_thread_not_loaded() {
         let manager = ThreadWatchManager::new();
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -950,7 +950,7 @@ mod tests {
     async fn loaded_statuses_default_to_not_loaded_for_untracked_threads() {
         let manager = ThreadWatchManager::new();
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -980,7 +980,7 @@ mod tests {
     async fn has_running_turns_tracks_runtime_running_flag_only() {
         let manager = ThreadWatchManager::new();
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -1061,7 +1061,7 @@ mod tests {
         )));
 
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -1104,7 +1104,7 @@ mod tests {
         )));
 
         manager
-            .upsert_thread_silently(test_thread(
+            .upsert_thread_silently(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -1139,13 +1139,13 @@ mod tests {
     async fn status_watchers_receive_only_their_thread_updates() {
         let manager = ThreadWatchManager::new();
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
             .await;
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 NON_INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::AppServer,
             ))
@@ -1188,7 +1188,7 @@ mod tests {
     async fn status_watcher_is_pruned_after_subscription_outlives_thread() {
         let manager = ThreadWatchManager::new();
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -1238,7 +1238,7 @@ mod tests {
             codex_analytics::AnalyticsEventsClient::disabled(),
         )));
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -1297,7 +1297,7 @@ mod tests {
             codex_analytics::AnalyticsEventsClient::disabled(),
         )));
         manager
-            .upsert_thread(test_thread(
+            .upsert_thread(&test_thread(
                 INTERACTIVE_THREAD_ID,
                 codex_app_server_protocol::SessionSource::Cli,
             ))
@@ -1369,7 +1369,7 @@ mod tests {
                     codex_analytics::AnalyticsEventsClient::disabled(),
                 )));
             manager
-                .upsert_thread(test_thread(
+                .upsert_thread(&test_thread(
                     INTERACTIVE_THREAD_ID,
                     codex_app_server_protocol::SessionSource::Cli,
                 ))

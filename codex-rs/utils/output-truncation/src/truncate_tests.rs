@@ -21,6 +21,43 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use pretty_assertions::assert_eq;
 
 #[test]
+#[ignore = "manual projection microbenchmark; run with --ignored --nocapture"]
+fn benchmark_output_projection() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let code = "    let result = read_source_file(path).await?;\n".repeat(90_000);
+    let json = serde_json::json!({"output": "source evidence ".repeat(65_536)}).to_string();
+    for (name, source, budget) in [
+        ("code", code.as_str(), 10_000),
+        ("silent_json", json.as_str(), 0),
+    ] {
+        let limits = resolve_projected_output_limits(
+            Some(budget),
+            OutputOutcome::Success,
+            OutputDiagnosticClass::Normal,
+            10_000,
+        );
+        let expected = formatted_truncate_text_with_output_limit(source, limits);
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            for _ in 0..20 {
+                black_box(formatted_truncate_text_with_output_limit(black_box(source), limits));
+            }
+            samples.push(start.elapsed().as_nanos() / 20);
+        }
+        samples.sort_unstable();
+        println!(
+            "projection {name}: bytes={} median_ns={} output_sha1={}",
+            source.len(),
+            samples[2],
+            codex_utils_string::sha1_hex(&expected.text),
+        );
+    }
+}
+
+#[test]
 fn oversized_json_line_is_outlined_instead_of_byte_sliced() {
     // A short listing followed by one huge serialized JSON line: byte slicing
     // kept an uninterpretable fragment of that line. The outline keeps every
@@ -45,6 +82,31 @@ fn oversized_json_line_is_outlined_instead_of_byte_sliced() {
     // Non-JSON long lines keep the existing head/middle/tail projection.
     let plain = format!("{names}\n{}\ntrailer\n", "x".repeat(40_000));
     assert!(!truncate_text_to_token_ceiling(&plain, 600).contains("[JSON line of"));
+}
+
+#[test]
+fn zero_projection_budget_preserves_omission_metadata_without_text() {
+    let json = serde_json::json!({"value": "雪\n".repeat(10_000)}).to_string();
+    for source in ["", "plain\n", json.as_str()] {
+        let limits = resolve_projected_output_limits(
+            Some(0),
+            OutputOutcome::Success,
+            OutputDiagnosticClass::Normal,
+            10_000,
+        );
+        let expected = crate::TruncatedTextOutput {
+            text: String::new(),
+            was_truncated: !source.is_empty(),
+        };
+        assert_eq!(
+            formatted_truncate_text_with_output_limit(source, limits),
+            expected
+        );
+        let marked = crate::formatted_truncate_text_with_line_markers(source, limits);
+        assert_eq!(marked.output, expected);
+        assert!(marked.omitted_lines.is_empty());
+        assert_eq!(crate::truncate_text_with_line_markers(source, 0), "");
+    }
 }
 
 #[test]

@@ -5,6 +5,12 @@ use serde::de::SeqAccess;
 use serde::de::Visitor;
 use serde_json::Value;
 
+// Most keys are discarded. Borrow unescaped keys while still accepting escaped
+// spellings and owning the small set retained in the projection.
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct JsonKey<'a>(#[serde(borrow)] std::borrow::Cow<'a, str>);
+
 #[derive(Clone, Copy)]
 enum Projection {
     Root,
@@ -39,7 +45,7 @@ impl<'de> Visitor<'de> for Projection {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
         let mut retained = serde_json::Map::new();
         let mut first_key = true;
-        while let Some(key) = map.next_key::<String>()? {
+        while let Some(JsonKey(key)) = map.next_key::<JsonKey<'de>>()? {
             // With serde_json's workspace-enabled arbitrary_precision feature,
             // fractional/large numbers arrive as this synthetic one-entry map.
             // Match Value's first-key handling without retaining payload trees.
@@ -55,7 +61,7 @@ impl<'de> Visitor<'de> for Projection {
                 });
             }
             first_key = false;
-            let selection = match (self, key.as_str()) {
+            let selection = match (self, key.as_ref()) {
                 (Self::Root, "type") => Self::EventType,
                 (Self::Root, "timing_metrics") => Self::Timing,
                 (Self::Timing, key)
@@ -76,7 +82,7 @@ impl<'de> Visitor<'de> for Projection {
             let value = map.next_value_seed(selection)?;
             if !matches!(selection, Self::Ignore) {
                 // Preserve Value's last-duplicate-key semantics, including wrong types.
-                retained.insert(key, value);
+                retained.insert(key.into_owned(), value);
             }
         }
         Ok(Value::Object(retained))
@@ -133,6 +139,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unescaped_keys_are_borrowed_and_escaped_keys_remain_supported() {
+        let JsonKey(plain) = serde_json::from_str::<JsonKey<'_>>(r#""type""#).unwrap();
+        assert!(matches!(plain, std::borrow::Cow::Borrowed("type")));
+        let JsonKey(escaped) = serde_json::from_str::<JsonKey<'_>>(r#""ty\u0070e""#).unwrap();
+        assert_eq!(escaped, "type");
+        assert!(matches!(escaped, std::borrow::Cow::Owned(_)));
+        let value =
+            parse(r#"{"type":"first","ty\u0070e":"response.failed","payload":{"ignored":1}}"#)
+                .unwrap();
+        assert_eq!(value["type"], "response.failed");
+        assert!(value.get("payload").is_none());
+    }
+
+    #[test]
     fn preserves_observation_semantics_without_retaining_payloads() {
         for text in [
             r#"{"type":"response.failed","response":{"large":[1,2,3]}}"#,
@@ -140,6 +160,9 @@ mod tests {
             r#"{"type":"response.\u0066ailed","timing_metrics":{"inference_time_ms":12}}"#,
             r#"{"timing_metrics":{"inference_time_ms":12},"timing_metrics":[]}"#,
             r#"{"type":null,"ignored":1e400}"#,
+            r#"{"ignored":{"$serde_json::private::Number":"1.5"},"type":"response.completed"}"#,
+            r#"{"ignored":{"$serde_json::private::Number":"not a number"}}"#,
+            r#"{"type":"response.failed","ignored":{"bad\uZZZZ":0}}"#,
             r#"{"type":"response.failed"} trailing"#,
             "[]",
             "null",

@@ -159,7 +159,7 @@ const MAX_NESTED_INSTRUCTION_PATHS: usize = 20;
 /// by index mtime: neither an untracked addition nor a deletion must update it.
 /// Git also handles linked worktrees, where `.git` is a file.
 fn nested_instruction_notice(cwd: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = std::process::Command::new(codex_git_utils::git_executable())
         .arg("-C")
         .arg(cwd)
         .args([

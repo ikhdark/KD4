@@ -1226,7 +1226,7 @@ impl ThreadRequestProcessor {
 
         listener_task_context
             .thread_watch_manager
-            .upsert_thread_silently(thread.clone())
+            .upsert_thread_silently(&thread)
             .instrument(tracing::info_span!(
                 "app_server.thread_start.upsert_thread",
                 otel.name = "app_server.thread_start.upsert_thread",
@@ -1256,8 +1256,9 @@ impl ThreadRequestProcessor {
         let permission_profile = config_snapshot.permission_profile.clone();
         let thread_originator = config_snapshot.originator.clone();
 
+        let notif = thread_started_notification(&mut thread);
         let response = ThreadStartResponse {
-            thread: thread.clone(),
+            thread,
             model: config_snapshot.model,
             model_provider: config_snapshot.model_provider_id,
             service_tier: config_snapshot.service_tier,
@@ -1271,7 +1272,6 @@ impl ThreadRequestProcessor {
             active_permission_profile,
             reasoning_effort: config_snapshot.reasoning_effort,
         };
-        let notif = thread_started_notification(thread);
         listener_task_context
             .outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)
@@ -2899,7 +2899,9 @@ impl ThreadRequestProcessor {
             &config_snapshot,
             thread.rollout_path(),
         );
-        self.thread_watch_manager.upsert_thread(loaded_thread).await;
+        self.thread_watch_manager
+            .upsert_thread(&loaded_thread)
+            .await;
         let raw_events_enabled = if let Some(parent_thread_id) = config_snapshot.parent_thread_id {
             self.thread_state_manager
                 .thread_state(parent_thread_id)
@@ -3209,9 +3211,7 @@ impl ThreadRequestProcessor {
                     ThreadStatus::Idle,
                     /*has_live_in_progress_turn*/ false,
                 );
-                self.thread_watch_manager
-                    .upsert_thread(thread.clone())
-                    .await;
+                self.thread_watch_manager.upsert_thread(&thread).await;
                 let config_snapshot = codex_thread.config_snapshot().await;
                 let sandbox = thread_response_sandbox_policy(
                     &config_snapshot.permission_profile,
@@ -4121,7 +4121,7 @@ impl ThreadRequestProcessor {
         }
 
         self.thread_watch_manager
-            .upsert_thread_silently(thread.clone())
+            .upsert_thread_silently(&thread)
             .await;
 
         thread.status = resolve_thread_status(
@@ -4140,8 +4140,9 @@ impl ThreadRequestProcessor {
         let permission_profile = config_snapshot.permission_profile.clone();
         let thread_originator = config_snapshot.originator.clone();
 
+        let notif = thread_started_notification(&mut thread);
         let response = ThreadForkResponse {
-            thread: thread.clone(),
+            thread,
             model: session_configured.model,
             model_provider: session_configured.model_provider_id,
             service_tier: session_configured.service_tier,
@@ -4156,7 +4157,6 @@ impl ThreadRequestProcessor {
             reasoning_effort: session_configured.reasoning_effort,
         };
 
-        let notif = thread_started_notification(thread);
         let connection_id = request_id.connection_id;
         self.outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)

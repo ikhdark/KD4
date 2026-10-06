@@ -2155,6 +2155,7 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
@@ -2561,6 +2562,7 @@ async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(model_without_hash)
         .with_config(move |config| {
@@ -2668,6 +2670,7 @@ async fn body_after_prefix_model_switch_budget_compacts_with_previous_model() {
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
@@ -2764,6 +2767,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
 
     let model_provider = non_openai_model_provider(&server);
     let mut initial_builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
@@ -2807,6 +2811,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
 
     let model_provider = non_openai_model_provider(&server);
     let mut resumed_builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
@@ -2885,6 +2890,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
 
     let model_provider = non_openai_model_provider(&server);
     let mut initial_builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
@@ -2938,6 +2944,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
 
     let model_provider = non_openai_model_provider(&server);
     let mut resumed_builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
@@ -3012,6 +3019,7 @@ async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
 
     let model_provider = non_openai_model_provider(&server);
     let mut initial_builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
@@ -3063,6 +3071,7 @@ async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
 
     let model_provider = non_openai_model_provider(&server);
     let mut resumed_builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
@@ -4019,7 +4028,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     let context_window = 100_000;
     let limit = context_window * 90 / 100;
     // Cross the compaction threshold without exhausting the separate evidence
-    // budget that must still carry the completed tool result into this request.
+    // budget that must carry the unread tool result into the continuation.
     let over_limit_tokens = limit + 1;
 
     let first_turn = sse(vec![
@@ -4084,7 +4093,11 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         "first request should include the user message that triggers the function call"
     );
 
-    let function_call_output = auto_compact_mock
+    assert!(
+        auto_compact_mock.single_request().function_call_output_text(DUMMY_CALL_ID).is_none(),
+        "unread tool results must not be interpreted by the summarizer"
+    );
+    let function_call_output = post_auto_compact_mock
         .single_request()
         .function_call_output(DUMMY_CALL_ID);
     let output_text = function_call_output
@@ -4093,7 +4106,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         .unwrap_or_default();
     assert!(
         output_text.contains(DUMMY_FUNCTION_NAME),
-        "function call output should be sent before auto compact"
+        "the continuation must retain the unread tool result across compaction"
     );
 
     let auto_compact_body = auto_compact_mock.single_request().body_json().to_string();
@@ -4105,7 +4118,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     insta::assert_snapshot!(
         "mid_turn_compaction_shapes",
         format_labeled_requests_snapshot(
-            "True mid-turn continuation compaction after tool output: compact request includes tool artifacts, and the continuation request includes the summary in the same turn.",
+            "True mid-turn continuation compaction after tool output: unread tool artifacts bypass the summarizer and remain alongside the summary in the same-turn continuation.",
             &[
                 (
                     "Local Compaction Request",
@@ -4879,8 +4892,8 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
     assert!(instruction_fragments(&requests[1]).is_empty());
     assert_eq!(
         instruction_fragments(&requests[2]),
-        vec![expected_fragment.clone(), expected_fragment],
-        "context reinjection must also use the creation-time instructions"
+        vec![expected_fragment],
+        "compaction must preserve the creation-time instructions without reinjecting duplicates"
     );
     assert_eq!(
         test.codex.instruction_sources().await,
@@ -5087,8 +5100,8 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     assert_single_instruction_fragment(&requests[1], &old_fragment);
     assert_eq!(
         instruction_fragments(&requests[2]),
-        vec![old_fragment.clone(), old_fragment.clone()],
-        "context reinjection must also use the creation-time instructions"
+        vec![old_fragment.clone()],
+        "compaction must preserve the creation-time instructions without reinjecting duplicates"
     );
     assert_eq!(
         requests[1].input().last(),
@@ -5141,7 +5154,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     );
     assert_eq!(
         instruction_fragments(&requests[3]),
-        vec![old_fragment.clone(), old_fragment, replacement_fragment]
+        vec![old_fragment, replacement_fragment]
     );
     assert_eq!(
         resumed.codex.instruction_sources().await,

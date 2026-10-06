@@ -92,7 +92,9 @@ impl SkillNamespaceResolver {
                         let namespace = plugin_namespace_for_root_uri(fs, &manifest_root).await;
                         (manifest_root, namespace)
                     })
-                    .buffered(MAX_CONCURRENT_SKILL_LOADS)
+                    // Roots are unique and collected by key; a slow probe must not
+                    // keep completed probes from freeing slots for remaining roots.
+                    .buffer_unordered(MAX_CONCURRENT_SKILL_LOADS)
                     .collect::<HashMap<_, _>>()
                     .await,
             );

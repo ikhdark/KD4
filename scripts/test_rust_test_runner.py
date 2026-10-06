@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from unittest import mock
 
-from scripts import kd4_perf_snapshot, rust_test_runner
+from scripts import kd4_perf_snapshot, rust_build_status, rust_test_runner
 from scripts.build_tooling_test_support import REPO_ROOT
 from scripts.rust_test_runner import (
     Manifest,
@@ -1258,6 +1258,94 @@ class SelectedMetadataValidationTest(RunnerTestCase):
 
 
 class NamedSelectionTest(RunnerTestCase):
+    def test_unknown_cli_names_fail_before_metadata_provenance_or_admission(self):
+        cases = [("run-target", ["nope"], "target")]
+        cases.extend(
+            (command, names, "gate")
+            for command in ("run-gate", "check-gates")
+            for names in (["nope"], ["demo-gate", "nope"], ["nope", "demo-gate"])
+        )
+        for command, names, kind in cases:
+            with (
+                self.subTest(command=command, names=names),
+                mock.patch.object(Manifest, "load", return_value=self.manifest()),
+                mock.patch.object(rust_test_runner, "load_metadata") as metadata,
+                mock.patch.object(rust_test_runner, "execution_dependency_manifest") as provenance,
+                mock.patch.object(rust_build_status, "reserve_rust_test_target") as lane,
+                mock.patch.object(RustTestRunner, "_execute") as execute,
+                mock.patch.object(subprocess, "Popen") as child,
+                mock.patch.object(Path, "read_bytes") as fingerprint_inputs,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                args = rust_test_runner.build_parser().parse_args([command, *names])
+                self.assertEqual(rust_test_runner._main(args), 2)
+                self.assertIn(f"unknown named Rust test {kind} 'nope'", stderr.getvalue())
+                for call in (metadata, provenance, lane, execute, child, fingerprint_inputs):
+                    call.assert_not_called()
+
+    def test_valid_cli_names_keep_post_admission_freshness_checks(self):
+        manifest = self.manifest()
+        changed_data = copy.deepcopy(MANIFEST_DATA)
+        changed_data["gates"]["demo-gate"]["steps"][0]["tests"] = ["new::test"]
+        changed_manifest = Manifest.from_data(changed_data)
+        manifest_path = self.temp_dir / "manifest.toml"
+        source_path = self.temp_dir / "runner.py"
+        for command, names, method in (
+            ("run-target", ["core_all"], "run_target"),
+            ("run-gate", ["demo-gate", "demo-gate"], "run_gates"),
+            ("check-gates", ["demo-gate", "demo-gate"], "check_gates"),
+        ):
+            changes = [None, "manifest"]
+            if command != "check-gates":
+                changes.extend(["source", "manifest_bytes"])
+            for change in changes:
+                manifest_path.write_bytes(b"initial manifest bytes")
+                source_path.write_bytes(b"initial source bytes")
+                admitted = []
+
+                @contextlib.contextmanager
+                def reserve(*_args, **_kwargs):
+                    admitted.append(True)
+                    if change == "source":
+                        source_path.write_bytes(b"changed while waiting")
+                    elif change == "manifest_bytes":
+                        manifest_path.write_bytes(b"changed while waiting")
+                    yield {"wait_seconds": 0.05}
+
+                with (
+                    self.subTest(command=command, change=change),
+                    mock.patch.object(rust_test_runner, "__file__", str(source_path)),
+                    mock.patch.object(Manifest, "load", side_effect=[
+                        manifest, changed_manifest if change == "manifest" else manifest
+                    ]) as load_manifest,
+                    mock.patch.object(rust_test_runner, "load_metadata", return_value=self.metadata()) as metadata,
+                    mock.patch.object(rust_build_status, "reserve_rust_test_target", side_effect=reserve) as lane,
+                    mock.patch.object(rust_test_runner, "execution_dependency_manifest", return_value=None) as provenance,
+                    mock.patch.object(RustTestRunner, method, return_value={}) as execute,
+                    mock.patch.object(rust_test_runner, "emit_execution_receipt"),
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    args = rust_test_runner.build_parser().parse_args([
+                        "--manifest", str(manifest_path), "--target-dir", str(self.target_dir),
+                        command, *names,
+                    ])
+                    self.assertEqual(rust_test_runner._main(args), 0 if change is None else 2)
+                    metadata.assert_called_once_with()
+                    lane.assert_called_once()
+                    self.assertEqual(admitted, [True])
+                    self.assertEqual(load_manifest.call_count, 2)
+                    if change is not None:
+                        message = "manifest changed" if change == "manifest" else "runner inputs changed"
+                        self.assertIn(message, stderr.getvalue())
+                        provenance.assert_not_called()
+                        execute.assert_not_called()
+                    else:
+                        if command == "run-target":
+                            execute.assert_called_once_with("core_all", [], allow_all=False)
+                        else:
+                            execute.assert_called_once_with(names)
+                        self.assertEqual(provenance.call_count, int(command != "check-gates"))
+
     def test_unknown_target_name_fails(self) -> None:
         runner, _ = self.runner()
         with self.assertRaisesRegex(
@@ -1283,6 +1371,100 @@ class NamedSelectionTest(RunnerTestCase):
 
 
 class GatesForTest(RunnerTestCase):
+    def test_named_targets_verify_nested_shards_without_gates_or_execution(self) -> None:
+        crate = self.temp_dir / "core"
+
+        def shard(modules):
+            return (
+                '#[path = "suite"] mod suite { #[path = "v2"] mod v2 {'
+                + "".join(f'#[path = "{name}.rs"] mod {name};' for name in modules)
+                + "}}"
+            )
+
+        files = {
+            "src/lib.rs": "",
+            "tests/all.rs": (
+                '// mod suite;\n'
+                'const DECOY: &str = r#"mod suite;"#;\n'
+                '/* mod suite; */\n'
+            ),
+            "tests/core_shard.rs": shard(["thread_fork", "thread_resume"]),
+            "tests/core_shard_two.rs": shard(["thread_list"]),
+            "tests/suite/v2/thread_fork.rs": "",
+            "tests/suite/v2/thread_resume.rs": "",
+            "tests/suite/v2/thread_list.rs": "",
+            "tests/suite/v2/orphan.rs": "",
+        }
+        for relative, content in files.items():
+            path = crate / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        runner, executor = self.runner(manifest=self.manifest(gates={}))
+        core = runner.metadata.packages["codex-core"]
+        core["manifest_path"] = str(crate / "Cargo.toml")
+        for target in core["targets"]:
+            target["src_path"] = str(
+                crate / ("src/lib.rs" if "lib" in target["kind"] else f"tests/{target['name']}.rs")
+            )
+        fork, resume, orphan = [
+            f"core/tests/suite/v2/{name}.rs"
+            for name in ("thread_fork", "thread_resume", "orphan")
+        ]
+        result = runner.gates_for([fork, resume, orphan], cwd=self.temp_dir)
+        self.assertEqual(result["gates"], [])
+        self.assertEqual(result["targets"], ["core_shard"])
+        self.assertEqual(result["target_paths"], {
+            fork: ["core_shard"], resume: ["core_shard"], orphan: [],
+        })
+        self.assertEqual(result["unresolved_targets"], [orphan])
+        self.assertEqual(result["ambiguous_targets"], {})
+
+        # A new query must see registration edits; multiple real owners are
+        # explicit advice, not an automatic choice or execution proof.
+        (crate / "tests/core_shard.rs").write_text(shard(["thread_fork"]), encoding="utf-8")
+        (crate / "tests/core_shard_two.rs").write_text(shard(["thread_fork"]), encoding="utf-8")
+        result = runner.gates_for([fork, resume], cwd=self.temp_dir)
+        self.assertEqual(result["target_paths"][fork], ["core_shard", "core_shard_two"])
+        self.assertEqual(result["ambiguous_targets"], {
+            fork: ["core_shard", "core_shard_two"],
+        })
+        self.assertEqual(result["unresolved_targets"], [resume])
+
+        # Duplicate declarations cannot establish a unique route.
+        for name in ("core_shard", "core_shard_two"):
+            (crate / f"tests/{name}.rs").write_text(
+                shard(["thread_fork", "thread_fork"]), encoding="utf-8"
+            )
+        result = runner.gates_for([fork], cwd=self.temp_dir)
+        self.assertEqual(result["target_paths"][fork], [])
+        self.assertEqual(result["unresolved_targets"], [fork])
+        self.assertEqual(executor.calls, [])
+
+    def test_repository_fork_and_resume_advice_names_only_sessions_shard(self) -> None:
+        manifest = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
+        runner, executor = self.runner(manifest=manifest)
+        crate = REPO_ROOT / "codex-rs/app-server"
+        runner.metadata.packages["codex-app-server"] = {
+            "name": "codex-app-server",
+            "manifest_path": str(crate / "Cargo.toml"),
+            "targets": [
+                {"name": source.stem, "kind": ["test"], "src_path": str(source)}
+                for source in sorted((crate / "tests").glob("*.rs"))
+            ],
+        }
+        paths = [
+            f"codex-rs/app-server/tests/suite/v2/{name}.rs"
+            for name in ("thread_fork", "thread_resume")
+        ]
+        result = runner.gates_for(paths, cwd=REPO_ROOT)
+        self.assertEqual(result["targets"], ["app_server_sessions"])
+        self.assertEqual(result["target_paths"], {
+            path: ["app_server_sessions"] for path in paths
+        })
+        self.assertEqual(result["unresolved_targets"], [])
+        self.assertEqual(result["ambiguous_targets"], {})
+        self.assertEqual(executor.calls, [])
+
     def test_module_inventory_is_reused_only_inside_one_query(self) -> None:
         root = self.temp_dir / "src"
         root.mkdir()
@@ -1844,6 +2026,8 @@ class RunTargetTest(RunnerTestCase):
     ) -> None:
         repository = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
         prefixes = [
+            "agent::status::tests::",
+            "tools::handlers::multi_agents_v2::task::review_policy_tests::",
             "context_manager::history::tests::",
             "tools::handlers::tool_search::tests::",
             "tools::handlers::mcp::search_tests::",
@@ -2183,6 +2367,68 @@ class RunTargetTest(RunnerTestCase):
             for command in executor.commands(["cargo", "build"])
         ]
         self.assertEqual(built, ["codex"])
+
+    def test_grouped_helper_artifacts_parse_the_retained_log_once(self) -> None:
+        runner, executor = self.runner(executor=self.build_executor())
+        helpers = runner.active_helpers(["core_all"])
+        command = runner._helper_build(helpers)
+        rows = executor._artifact_output(command).splitlines()
+        artifact = json.loads(rows[0])
+        unrelated = [
+            None,
+            [],
+            {**artifact, "reason": "compiler-message"},
+            {**artifact, "package_id": "another-package"},
+            {**artifact, "package_id": []},
+            {**artifact, "target": None},
+            {**artifact, "target": {"name": [], "kind": ["bin"]}},
+            {**artifact, "target": {"name": "codex", "kind": ["lib"]}},
+            {**artifact, "executable": None},
+        ]
+        rows = ["build progress", *map(json.dumps, unrelated), *rows]
+        log = self.temp_dir / "helper-build.log"
+        log.write_text("\n".join(rows), encoding="utf-8")
+        result = subprocess.CompletedProcess(command, 0, "incomplete tail", "")
+        result.stdout_path = log
+        with (
+            mock.patch.object(runner, "_checked", return_value=result),
+            mock.patch.object(
+                rust_test_runner, "_output_lines", wraps=rust_test_runner._output_lines
+            ) as scans,
+            mock.patch.object(json, "loads", wraps=json.loads) as parses,
+        ):
+            artifacts = runner._build_helpers(helpers)
+        scans.assert_called_once_with(result, "stdout")
+        self.assertEqual(parses.call_count, len(rows))
+        self.assertEqual(
+            artifacts, {name: path.resolve() for name, path in executor.artifacts.items()}
+        )
+
+    def test_grouped_helper_artifacts_reject_duplicates_and_missing_files(self) -> None:
+        for invalid in ("duplicate", "different-executable", "missing-file"):
+            with self.subTest(invalid=invalid):
+                runner, executor = self.runner(executor=self.build_executor())
+                output = executor._artifact_output
+
+                def artifacts(command):
+                    rows = output(command).splitlines()
+                    last = json.loads(rows[-1])
+                    if invalid == "duplicate":
+                        rows.append(rows[-1])
+                    elif invalid == "different-executable":
+                        last["executable"] = str(self.helper_executable("other"))
+                        rows.append(json.dumps(last))
+                    else:
+                        Path(last["executable"]).unlink()
+                    return "\n".join(rows)
+
+                executor._artifact_output = artifacts
+                with self.assertRaisesRegex(
+                    RunnerError, "codex-rmcp-client/test_stdio_server"
+                ):
+                    runner.run_target("core_all", [])
+                self.assertEqual(len(executor.commands(["cargo", "build"])), 1)
+                self.assertEqual(executor.commands(["cargo", "nextest", "run"]), [])
 
     def test_missing_helper_artifact_fails(self) -> None:
         # `codex-code-mode-host` produces no `compiler-artifact` message.

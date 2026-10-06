@@ -19,6 +19,20 @@ mod tests {
     use super::SUMMARY_PREFIX;
 
     #[test]
+    fn compaction_prompts_state_soft_retention_budgets() {
+        for prompt in [SUMMARIZATION_PROMPT, INCREMENTAL_SUMMARIZATION_PROMPT] {
+            let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            for budget in [
+                "2,400 tokens total", "250 tokens for Goal", "350 for Current state",
+                "250 for Completed work", "350 for Unresolved work", "500 for Evidence",
+                "250 for Next action", "1,950 body tokens total", "guidance, not hard limits",
+            ] {
+                assert!(normalized.contains(budget), "missing budget: {budget}");
+            }
+        }
+    }
+
+    #[test]
     fn compaction_base_is_small_and_task_specific() {
         assert!(COMPACTION_BASE_INSTRUCTIONS.len() <= 512);
         assert!(COMPACTION_BASE_INSTRUCTIONS.contains("conversation-compaction model"));

@@ -647,6 +647,8 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
                         "-SkipBuild",
                         "-InstallDir",
                         str(install_dir),
+                        "-LocalCodexHome",
+                        str(Path(temp_dir) / "local-home"),
                         *flags,
                     ],
                     text=True,

@@ -1049,6 +1049,53 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
 }
 
 #[tokio::test]
+async fn empty_writer_flush_does_not_wait_for_another_append() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    let mut state = RolloutWriterState::new(
+        Some(open_log_file(&path)?.into_jsonl_writer()),
+        None,
+        None,
+        home.path().to_path_buf(),
+        Some(None),
+        path.clone(),
+        Default::default(),
+    );
+    state.add_items(captured(vec![agent_message("already-flushed")]));
+    state.flush().await?;
+    let persisted = fs::read(&path)?;
+
+    // Report repeated empty-barrier cost without a timing-dependent assertion.
+    let mut samples = Vec::new();
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            state.flush().await?;
+        }
+        samples.push(started.elapsed().as_nanos() / 20);
+    }
+    eprintln!("empty_flush_ns_per_call={samples:?}");
+
+    let write_lock = compression::lock_rollout_for_write_blocking(&path)?;
+    let outcome = {
+        let mut flush = Box::pin(state.flush());
+        futures::poll!(flush.as_mut())
+    };
+    // Release even on the old implementation, whose blocking task is still waiting.
+    drop(write_lock);
+    assert!(
+        matches!(outcome, std::task::Poll::Ready(Ok(()))),
+        "an empty flush must not schedule or wait for an append transaction: {outcome:?}"
+    );
+    assert_eq!(fs::read(&path)?, persisted);
+
+    state.retry_blocked_error = Some("unconfirmed append".to_string());
+    let error = state.flush().await.expect_err("empty barriers cannot hide errors");
+    assert!(error.to_string().contains("unconfirmed append"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn writer_state_retries_write_error_before_reporting_flush_success() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let rollout_path = home.path().join("rollout.jsonl");
@@ -1878,6 +1925,99 @@ async fn writer_state_flushes_multi_item_batch_in_one_transaction() -> std::io::
     Ok(())
 }
 
+#[tokio::test]
+async fn artifact_selection_preserves_mixed_batch_bytes_and_inline_fallback() -> std::io::Result<()> {
+    let text = "héllo 🦀 task_complete rollout_payload_artifact\n".repeat(300);
+    let cases = vec![
+        (RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta { originator: text.clone(), ..Default::default() },
+            git: None,
+        }), true),
+        (RolloutItem::ToolManifest(ToolManifestItem::full(
+            "large".into(), serde_json::json!({"description": text}),
+        )), true),
+        (RolloutItem::ToolManifest(ToolManifestItem::reference("small".into())), true),
+        (serde_json::from_value(serde_json::json!({
+            "type": "sampling_boundary", "payload": {
+                "sampling_request_id": text, "physical_attempt_id": "attempt",
+                "timing_checkpoint": {
+                    "observed_at_unix_ms": 1, "tail_unknown": true,
+                    "timing": codex_protocol::protocol::TurnTiming::default()
+                }
+            }
+        }))?, true),
+        (serde_json::from_value(serde_json::json!({
+            "type": "sampling_boundary", "payload": {
+                "sampling_request_id": text, "physical_attempt_id": "attempt"
+            }
+        }))?, false),
+        (serde_json::from_value(serde_json::json!({
+            "type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": "turn", "last_agent_message": text
+            }
+        }))?, true),
+        (serde_json::from_value(serde_json::json!({
+            "type": "event_msg", "payload": {
+                "type": "turn_aborted", "turn_id": text, "reason": "interrupted"
+            }
+        }))?, true),
+        (serde_json::from_value(serde_json::json!({
+            "type": "event_msg", "payload": {
+                "type": "patch_apply_end", "call_id": "patch", "stdout": text,
+                "stderr": "", "success": true, "status": "completed", "changes": {}
+            }
+        }))?, true),
+        (RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+            message: text.clone(), phase: None,
+        })), false),
+        (serde_json::from_value(serde_json::json!({
+            "type": "response_item", "payload": {
+                "type": "function_call", "call_id": "call", "name": "tool", "arguments": text
+            }
+        }))?, false),
+    ];
+    for (item, candidate) in &cases {
+        assert_eq!(crate::payload_artifact::is_artifact_candidate(item), *candidate);
+    }
+    let items = captured(cases.iter().map(|(item, _)| item.clone()).collect());
+    let expected = items.iter().map(|item| {
+        let mut line = Vec::new();
+        JsonlWriter::serialize_rollout_item(&mut line, &item.item, item.captured_at)?;
+        Ok(line)
+    }).collect::<std::io::Result<Vec<_>>>()?;
+
+    for fail_artifact_storage in [false, true] {
+        let home = TempDir::new()?;
+        let path = home.path().join("rollout.jsonl");
+        if fail_artifact_storage {
+            // Storage failure must retain the complete inline record, not drop the batch.
+            fs::write(crate::payload_artifact::root(&path), b"not a directory")?;
+        }
+        let mut writer = open_log_file(&path)?.into_jsonl_writer();
+        writer.write_rollout_items(&items.iter().collect::<Vec<_>>()).await?;
+        assert_eq!(writer.append_transaction_count, 1);
+        let bytes = fs::read(&path)?;
+        let lines = bytes.split_inclusive(|byte| *byte == b'\n').collect::<Vec<_>>();
+        assert_eq!(lines.len(), cases.len());
+        for ((line, expected), (_, candidate)) in lines.iter().zip(&expected).zip(&cases) {
+            let stored: serde_json::Value = serde_json::from_slice(line)?;
+            let external = !fail_artifact_storage && *candidate
+                && expected.len() >= crate::payload_artifact::INLINE_BYTES;
+            assert_eq!(stored["type"] == "rollout_payload_artifact", external);
+            if external {
+                let hydrated = crate::payload_artifact::hydrate_line(
+                    &path, String::from_utf8(line.to_vec()).expect("UTF-8"),
+                )?;
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&hydrated)?,
+                    serde_json::from_slice::<serde_json::Value>(expected)?);
+            } else {
+                assert_eq!(*line, expected.as_slice());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn rollout_write_lock_serializes_append_recovery() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
@@ -2077,6 +2217,48 @@ async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Resul
         .await
         .expect("state db lookup should succeed");
     assert_eq!(repaired_path, Some(real_path));
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_db_repairs_archived_path_without_deleting_metadata() -> std::io::Result<()> {
+    let home = TempDir::new().unwrap();
+    let config = test_config(home.path());
+    let uuid = Uuid::from_u128(9012);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
+    let original = write_session_file(home.path(), "2025-01-03T13-00-00", uuid)?;
+    let archive_dir = home.path().join(crate::ARCHIVED_SESSIONS_SUBDIR);
+    std::fs::create_dir_all(&archive_dir)?;
+    let archived = archive_dir.join(original.file_name().unwrap());
+    std::fs::rename(&original, &archived)?;
+    let runtime = codex_state::StateRuntime::init(
+        home.path().to_path_buf(), config.model_provider_id.clone(),
+    ).await.unwrap();
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id, original, chrono::Utc::now(), SessionSource::Cli,
+    );
+    builder.cwd = home.path().to_path_buf();
+    let mut metadata = builder.build(&config.model_provider_id);
+    metadata.title = "Preserve my title".into();
+    metadata.first_user_message = Some("Hello from user".into());
+    metadata.preview = metadata.first_user_message.clone();
+    runtime.upsert_thread(&metadata).await.unwrap();
+
+    let page = crate::state_integration::list_threads_db(
+        Some(&runtime), home.path(), 10, None, ThreadSortKey::CreatedAt,
+        SortDirection::Desc, &[], None, None, None, false, None, None,
+    ).await.unwrap();
+    assert!(page.items.is_empty(), "archived threads must not leak into active results");
+    let repaired = runtime.get_thread(thread_id).await.unwrap().unwrap();
+    assert_eq!(repaired.rollout_path, archived);
+    assert!(repaired.archived_at.is_some());
+    assert_eq!(repaired.title, metadata.title);
+    let page = crate::state_integration::list_threads_db(
+        Some(&runtime), home.path(), 10, None, ThreadSortKey::CreatedAt,
+        SortDirection::Desc, &[], None, None, None, true, None, None,
+    ).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].rollout_path, archived);
     Ok(())
 }
 

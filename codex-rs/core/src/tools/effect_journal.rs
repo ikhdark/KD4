@@ -72,9 +72,11 @@ impl EffectReceipt {
             let parent = self.path.parent().ok_or("effect receipt has no parent")?;
             let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
             serde_json::to_writer(staged.as_file_mut(), &self.record).map_err(|error| error.to_string())?;
-            staged.as_file().sync_all().map_err(|error| error.to_string())?;
-            super::command_execution::persist_synced_file(staged, &self.path, parent)
-                .map_err(|error| error.to_string())
+            // The durable reservation already prevents replay. A power loss
+            // before this atomic update reaches disk leaves that conservative
+            // reservation, not permission to repeat the effect.
+            staged.persist(&self.path).map(|_| ())
+                .map_err(|error| error.error.to_string())
         }).await.map_err(|error| format!("effect receipt worker failed: {error}"))?
     }
 }

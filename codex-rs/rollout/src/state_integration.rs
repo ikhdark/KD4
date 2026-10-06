@@ -470,6 +470,30 @@ pub async fn list_threads_db(
                     item.rollout_path = existing_path;
                     valid_items.push(item);
                 } else {
+                    // A rollout may have moved between active/archive directories
+                    // without the state row following it. Repair only a verified
+                    // file; absence is not permission to delete thread metadata.
+                    let id = item.id.to_string();
+                    let active = crate::list::find_thread_path_by_id_str(codex_home, &id, None)
+                        .await;
+                    let relocated = match active {
+                        Ok(Some(path)) => Some((path, false)),
+                        Ok(None) => crate::list::find_archived_thread_path_by_id_str(
+                            codex_home, &id, None,
+                        ).await.ok().flatten().map(|path| (path, true)),
+                        Err(_) => None,
+                    };
+                    if let Some((path, is_archived)) = relocated
+                        && crate::list::read_session_meta_line(&path).await
+                            .is_ok_and(|meta| meta.meta.id == item.id)
+                    {
+                        read_repair_rollout_path(Some(ctx), Some(item.id), Some(is_archived), &path).await;
+                        if is_archived == archived {
+                            item.rollout_path = path;
+                            valid_items.push(item);
+                        }
+                        continue;
+                    }
                     warn!(
                         "state db list_threads returned stale rollout path for thread {}: {}",
                         item.id,

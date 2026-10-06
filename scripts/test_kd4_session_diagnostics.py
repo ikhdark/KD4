@@ -671,10 +671,24 @@ class SessionDiagnosticsTest(unittest.TestCase):
         saved = copy.deepcopy(report)
         summary = audit.bounded_summary(report)
         self.assertNotIn("sessionDiagnostics", summary)
+        comparison = summary["baselineComparison"]
+        full_comparison = report["baselineComparison"]
         self.assertEqual(
-            summary["baselineComparison"],
-            report["baselineComparison"],
+            comparison["metrics"],
+            full_comparison["metrics"][:len(comparison["metrics"])],
         )
+        self.assertEqual(
+            len(comparison["metrics"]) + comparison.get("omittedMetrics", 0),
+            len(full_comparison["metrics"]),
+        )
+        self.assertEqual(
+            {key: value for key, value in comparison.items()
+             if key not in ("metrics", "omittedMetrics")},
+            {key: value for key, value in full_comparison.items() if key != "metrics"},
+        )
+        with mock.patch.object(audit, "_MAX_SUMMARY_BYTES", 1_000_000):
+            untrimmed = audit.bounded_summary(report)
+        self.assertEqual(untrimmed["baselineComparison"], full_comparison)
         with self.assertRaisesRegex(ValueError, "regenerate"):
             diagnostics.compare_diagnostics(report["sessionDiagnostics"], summary)
         with mock.patch.object(audit, "_MAX_SUMMARY_BYTES", 1):

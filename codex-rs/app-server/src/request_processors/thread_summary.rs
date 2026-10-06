@@ -263,9 +263,14 @@ async fn read_updated_at(path: &Path, created_at: Option<&str>) -> Option<String
     updated_at.or_else(|| created_at.map(str::to_string))
 }
 
-pub(super) fn thread_started_notification(mut thread: Thread) -> ThreadStartedNotification {
-    thread.turns.clear();
-    ThreadStartedNotification { thread }
+pub(super) fn thread_started_notification(thread: &mut Thread) -> ThreadStartedNotification {
+    // Clone only metadata; the response keeps ownership of the restored history.
+    let turns = std::mem::take(&mut thread.turns);
+    let notification = ThreadStartedNotification {
+        thread: thread.clone(),
+    };
+    thread.turns = turns;
+    notification
 }
 
 #[cfg(test)]

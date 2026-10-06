@@ -1152,12 +1152,12 @@ $fingerprints | ConvertTo-Json -Compress
                 {Path(line.strip()).resolve() for line in observed_dirs}, {codex_rs}
             )
 
-    def test_root_frozen_sources_affect_publish_fingerprint_and_dirty_flag(
+    def test_relocated_crate_sources_affect_publish_fingerprint_and_dirty_flag(
         self,
     ) -> None:
         self.init_repo_fixture()
         repo = ps_single_quote(self.repo_root)
-        source = self.repo_root / "DO-NOT-CHANGE" / "fixture" / "src" / "lib.rs"
+        source = self.repo_root / "codex-rs" / "login" / "src" / "lib.rs"
         command = rf"""
 $ErrorActionPreference = 'Stop'
 . {ps_single_quote(SCRIPT)} -ImportOnly

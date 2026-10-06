@@ -89,6 +89,12 @@ async fn ignored_build_events_are_journaled_without_changing_capture_keys() {
     cache.record_watched_source_change_event(Some(vec![build.clone()])).await;
     assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before);
     assert!(!cache.source_path_change_observation_is_current(&observed));
+    assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 1);
+    let other = repo.join("target/another.bin").to_path_buf();
+    std::fs::write(&other, "next build").unwrap();
+    cache.record_watched_source_change_event(Some(vec![other])).await;
+    assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before);
+    assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 1);
     assert!(git_ignores_all_changed_paths(repo.as_path(), &[build.clone()]).await);
     assert!(std::process::Command::new("git").args(["add", "-f", "target/output.bin"])
         .current_dir(repo.as_path()).status().unwrap().success());
@@ -100,6 +106,54 @@ async fn ignored_build_events_are_journaled_without_changing_capture_keys() {
         cache.record_watched_source_change_event(Some(vec![path])).await;
         assert!(cache.source_capture_generation.load(Ordering::Acquire) > before);
     }
+}
+
+#[tokio::test]
+async fn git_internal_events_do_not_query_git_or_invalidate_snapshots() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let root = repo.as_path();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    cache.begin_source_path_change_observation(root, &root.join("file"), false).await.unwrap();
+    for path in [
+        ".git/objects/aa/object", ".git/objects/pack/new.pack",
+        ".git/refs/codex/x", ".git/COMMIT_EDITMSG", ".git/ORIG_HEAD",
+        ".git/index.lock", ".git/HEAD", ".git/refs/heads/main",
+        ".git/packed-refs", ".git/config", ".git/objects-other/file",
+    ] {
+        cache.record_watched_source_change_event(Some(vec![root.join(path)])).await;
+        assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), 0, "{path}");
+        assert_eq!(cache.source_watcher_generation.load(Ordering::Acquire), 0, "{path}");
+        assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 0, "{path}");
+    }
+    assert!(!is_git_internal_source_event(&root.join("objects/file")));
+    assert!(!is_git_internal_source_event(&root.join(".git-other/objects/file")));
+    for path in [root.join(".git/index"), root.join(".git/info/exclude"), root.join(".git"), root.join("file")] {
+        assert!(!is_git_internal_source_event(&path));
+        let before = cache.source_capture_generation.load(Ordering::Acquire);
+        cache.record_watched_source_change_event(Some(vec![root.join(".git/objects/aa/object"), path])).await;
+        assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before + 1);
+    }
+}
+
+#[tokio::test]
+async fn ignored_directory_proofs_expire_on_ignore_edits_and_rescans() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    std::fs::write(repo.join(".gitignore"), "/target/\n").unwrap();
+    std::fs::create_dir(repo.join("target")).unwrap();
+    let path = repo.join("target/output").to_path_buf();
+    std::fs::write(&path, "build").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    cache.begin_source_path_change_observation(repo.as_path(), &path, false).await.unwrap();
+    cache.record_watched_source_change_event(Some(vec![path.clone()])).await;
+    assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 1);
+    cache.record_watched_source_change_event(None).await;
+    cache.record_watched_source_change_event(Some(vec![path.clone()])).await;
+    assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 2);
+    std::fs::write(repo.join(".gitignore"), "# no exclusions\n").unwrap();
+    let before = cache.source_capture_generation.load(Ordering::Acquire);
+    cache.record_watched_source_change_event(Some(vec![path])).await;
+    assert_eq!(cache.source_capture_generation.load(Ordering::Acquire), before + 1);
+    assert_eq!(cache.ignore_query_count.load(Ordering::Relaxed), 3);
 }
 
 fn test_runtime_paths() -> ExecServerRuntimePaths {

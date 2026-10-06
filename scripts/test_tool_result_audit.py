@@ -10,6 +10,53 @@ from scripts.tool_result_audit import audit, execution_context_audit, repeated_i
 
 
 class ToolResultAuditTest(unittest.TestCase):
+    def test_request_output_index_preserves_missing_and_reordered_boundaries(self):
+        records = []
+
+        def add(kind, payload):
+            records.append((len(records) + 1, {"type": kind, "payload": payload}, 0))
+
+        add("response_item", {"type": "function_call_output", "output": "unowned"})
+        for turn in ("first", "second"):
+            add("event_msg", {"type": "task_started", "turn_id": turn})
+            for index in range(40):
+                add("response_item", {"type": "function_call_output", "output": str(index)})
+                add("sampling_boundary", {"sampling_request_id": f"{turn}-{index}"})
+            # Missing boundaries leave the previous boundary unchanged. A
+            # backwards boundary must not acquire outputs from an empty range.
+            order = [39, 0, None, *range(1, 39)]
+            requests = [{"samplingRequestId": f"{turn}-{index}"} for index in order]
+            add("event_msg", {"type": "task_complete", "turn_id": turn,
+                              "timing": {"modelRequests": requests}})
+        add("event_msg", {"type": "task_started", "turn_id": "open"})
+        add("response_item", {"type": "function_call_output", "output": "pending"})
+
+        report = execution_context_audit(records)
+        for turn in report["turns"]:
+            previous = 0
+            for request in turn["rounds"]:
+                boundary = request["boundary_record"]
+                expected = [output for output in report["tool_outputs"]
+                            if output["turn_id"] == turn["turn_id"]
+                            and boundary is not None
+                            and previous < output["record"] < boundary]
+                self.assertEqual(request["added_tool_result_records"],
+                                 [output["record"] for output in expected])
+                self.assertEqual(request["added_tool_result_bytes"],
+                                 sum(output["bytes"] for output in expected))
+                if boundary is not None:
+                    previous = boundary
+        for output in report["tool_outputs"]:
+            expected = sum(request["boundary_record"] is not None
+                           and request["boundary_record"] > output["record"]
+                           for turn in report["turns"]
+                           if turn["turn_id"] == output["turn_id"]
+                           for request in turn["rounds"])
+            self.assertEqual(output["subsequent_requests_in_turn"], expected)
+            self.assertEqual(output["raw_replay_estimated_tokens"],
+                             ((output["bytes"] + 3) // 4) * expected)
+        self.assertEqual(report["coverage"]["unfinished_turn_ids"], ["open"])
+
     @staticmethod
     def output_records(bodies):
         return [(i, {"type": "response_item", "payload": {
@@ -230,6 +277,81 @@ class ToolResultAuditTest(unittest.TestCase):
         self.assertEqual(report["coverage"]["requests_without_usage"], 0)
         self.assertEqual(report["turns"][0]["timing_source"], "terminal")
         self.assertEqual(tool_call_trace(records)["coverage"]["nested_calls"], 0)
+
+    def test_aborted_terminal_arrays_replace_checkpoints_across_all_report_consumers(self):
+        from scripts.tool_result_audit import compact_report
+
+        pending = {"samplingRequestId": "request", "generationIndex": 0}
+        tokens = {"inputTokens": 120, "cachedInputTokens": 80,
+                  "visibleOutputTokens": 7, "reasoningTokens": 3, "totalTokens": 130}
+        final = {**pending, "tokenUsage": tokens}
+        call = {"callId": "call", "toolName": "exec", "source": "direct"}
+        rows = [
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "aborted"}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call",
+                "call_id": "call", "name": "exec", "input": "text(1)"}},
+            {"type": "sampling_boundary", "payload": {"timing_checkpoint": {
+                "turn_id": "aborted", "timing": {"modelRequests": [pending], "toolCalls": [call]}}}},
+            {"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": "aborted",
+                "timing": {"modelRequests": [final], "toolCalls": [
+                    {**call, "outcome": "canceled", "totalDurationMs": 9}],
+                    "counters": {"toolOutputTruncationCount": 4,
+                                 "truncationInducedContinuationCount": 2}}}},
+            # A late checkpoint must not replace authoritative terminal evidence.
+            {"type": "sampling_boundary", "payload": {"timing_checkpoint": {
+                "turn_id": "aborted", "timing": {"modelRequests": [pending], "toolCalls": [call]}}}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 120, "cached_input_tokens": 80,
+                    "output_tokens": 10, "reasoning_output_tokens": 3, "total_tokens": 130}}}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "open"}},
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "aborted.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            session = audit(path)
+            context = session["execution_context"]
+            self.assertEqual(context["provider_usage_totals"], tokens)
+            self.assertEqual(context["provider_usage_reconciliation"]["status"], "matched")
+            self.assertEqual(context["coverage"]["completed_turns"], 0)
+            self.assertEqual(context["coverage"]["aborted_turns"], 1)
+            self.assertEqual(context["coverage"]["terminal_turns"], 1)
+            self.assertEqual(context["coverage"]["unfinished_turn_ids"], ["open"])
+            turn = context["turns"][0]
+            self.assertFalse(turn["completed"])
+            self.assertIsNone(turn["completion_record"])
+            self.assertEqual(turn["terminal_status"], "turn_aborted")
+            self.assertEqual(turn["terminal_record"], 4)
+            self.assertEqual(turn["timing_source"], "terminal")
+            trace = session["tool_call_trace"]
+            self.assertEqual(trace["coverage"]["aborted_turns"], 1)
+            self.assertEqual(trace["coverage"]["terminal_turns"], 1)
+            self.assertEqual(trace["calls"][0]["outcome"], "canceled")
+            self.assertEqual(trace["calls"][0]["duration_ms"], 9)
+            self.assertEqual(trace["coverage"]["outer_calls_without_output"], ["call"])
+            summary = compact_report({"sessions": [session]}, path, "hash", 0)
+            self.assertEqual(summary["totals"]["aborted_turns"], 1)
+            self.assertEqual(summary["totals"]["unfinished_turns"], 1)
+            self.assertEqual(summary["terminal_truncation"]["tool_output_truncations"], 4)
+            self.assertEqual(summary["terminal_truncation"]["induced_continuations"], 2)
+
+    def test_aborted_turn_keeps_missing_usage_unknown_and_empty_terminal_arrays_authoritative(self):
+        pending = {"samplingRequestId": "pending"}
+        rows = [
+            (1, {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t"}}, 0),
+            (2, {"type": "sampling_boundary", "payload": {"timing_checkpoint": {
+                "modelRequests": [pending], "toolCalls": [{"callId": "old"}]}}}, 0),
+            (3, {"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": "t"}}, 0),
+        ]
+        report = execution_context_audit(rows)
+        self.assertEqual(report["coverage"]["unfinished_turn_ids"], [])
+        self.assertEqual(report["coverage"]["requests_without_usage"], 1)
+        self.assertIsNone(report["provider_uncached_input_tokens"])
+        self.assertEqual(report["turns"][0]["timing_source"], "checkpoint")
+        rows[-1][1]["payload"]["timing"] = {"modelRequests": [], "toolCalls": []}
+        report = execution_context_audit(rows)
+        self.assertEqual(report["coverage"]["requests_without_usage"], 0)
+        self.assertEqual(report["turns"][0]["timing_source"], "terminal")
+        self.assertEqual(tool_call_trace(rows)["calls"], [])
 
     def test_checkpoint_requests_without_identity_are_not_silently_merged(self):
         with self.assertRaisesRegex(ValueError, "missing samplingRequestId"):

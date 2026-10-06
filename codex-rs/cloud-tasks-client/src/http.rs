@@ -91,6 +91,13 @@ impl CloudBackend for HttpClient {
         Box::pin(async move { self.tasks_api().task_text(id).await })
     }
 
+    fn get_task_text_and_diff(
+        &self,
+        id: TaskId,
+    ) -> CloudBackendFuture<'_, (TaskText, Option<String>)> {
+        Box::pin(async move { self.tasks_api().task_text_and_diff(id).await })
+    }
+
     fn list_sibling_attempts(
         &self,
         task: TaskId,
@@ -305,10 +312,28 @@ mod api {
                 .details_with_body(&id.0)
                 .await
                 .map_err(|e| CloudTaskError::Http(format!("get_task_details failed: {e}")))?;
+            Ok(Self::text_from_details(&details, &body))
+        }
+
+        pub(crate) async fn task_text_and_diff(
+            &self,
+            id: TaskId,
+        ) -> Result<(TaskText, Option<String>)> {
+            let (details, body, _ct) = self
+                .details_with_body(&id.0)
+                .await
+                .map_err(|e| CloudTaskError::Http(format!("get_task_details failed: {e}")))?;
+            Ok((
+                Self::text_from_details(&details, &body),
+                details.unified_diff(),
+            ))
+        }
+
+        fn text_from_details(details: &backend::CodeTaskDetailsResponse, body: &str) -> TaskText {
             let prompt = details.user_text_prompt();
             let mut messages = details.assistant_text_messages();
             if messages.is_empty() {
-                messages.extend(extract_assistant_messages_from_body(&body));
+                messages.extend(extract_assistant_messages_from_body(body));
             }
             let assistant_turn = details.current_assistant_turn.as_ref();
             let turn_id = assistant_turn.and_then(|turn| turn.id.clone());
@@ -319,14 +344,14 @@ mod api {
             let attempt_status = attempt_status_from_str(
                 assistant_turn.and_then(|turn| turn.turn_status.as_deref()),
             );
-            Ok(TaskText {
+            TaskText {
                 prompt,
                 messages,
                 turn_id,
                 sibling_turn_ids,
                 attempt_placement,
                 attempt_status,
-            })
+            }
         }
 
         pub(crate) async fn create(

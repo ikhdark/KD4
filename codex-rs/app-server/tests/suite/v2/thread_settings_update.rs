@@ -24,6 +24,8 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::test_support::all_model_presets;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use core_test_support::responses;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -155,13 +157,14 @@ async fn thread_settings_update_cwd_retargets_default_environment() -> Result<()
 
 #[tokio::test]
 async fn thread_settings_update_while_turn_is_active_emits_notification() -> Result<()> {
-    let server = responses::start_mock_server().await;
-    let first_response =
-        responses::sse_response(create_final_assistant_message_sse_response("first done")?)
-            .set_delay(Duration::from_secs(2));
-    let _requests = responses::mount_response_sequence(&server, vec![first_response]).await;
+    let (complete_turn, completion_gate) = tokio::sync::oneshot::channel();
+    let (server, _completions) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
+        gate: Some(completion_gate),
+        body: create_final_assistant_message_sse_response("first done")?,
+    }]])
+    .await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    create_config_toml(codex_home.path(), server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -190,11 +193,15 @@ async fn thread_settings_update_while_turn_is_active_emits_notification() -> Res
     assert_eq!(updated.thread_id, thread.id);
     assert_eq!(updated.thread_settings.model, "mock-model-4");
 
+    complete_turn
+        .send(())
+        .expect("model response remains gated");
     timeout(
         DEFAULT_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    server.shutdown().await;
     Ok(())
 }
 

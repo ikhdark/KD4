@@ -402,6 +402,12 @@ async fn run_compact_task_inner_impl(
     let previous_summary = latest_summary_message(history.raw_items()).map(str::to_string);
     let reuse_previous_summary = previous_summary.is_some()
         && can_reuse_previous_summary(history.raw_items(), omitted_user_text);
+    // The unread tail is preserved in replacement history, not interpreted by the
+    // summarizer. Remove its calls as well so normalization cannot synthesize outputs.
+    // Collect recovery pins first, including references that occur only in that tail.
+    let artifact_pin_payload = history.tool_history_state()
+        .artifact_pin_payload_for_items(history.raw_items());
+    history.replace(compaction_summary_items(history.raw_items()));
     if previous_summary.is_some()
         && !reuse_previous_summary
         && let Some(prompt) =
@@ -424,13 +430,11 @@ async fn run_compact_task_inner_impl(
         prefetched_workspace_identity,
     )
     .await;
-    let tool_history = history.tool_history_state();
     let turn_input = history.for_compaction_prompt_with_completed_tool_projection(
         &turn_context.model_info.input_modalities,
         workspace_identity.as_ref(),
     );
     let turn_input = strip_compaction_startup_envelopes(turn_input);
-    let artifact_pin_payload = tool_history.artifact_pin_payload_for_items(&turn_input);
     let summary_text_result = if reuse_previous_summary {
         validated_compaction_summary(previous_summary.as_deref(), "", false)
     } else {
@@ -1169,9 +1173,19 @@ pub(crate) struct CompactedUserMessage {
 }
 
 pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUserMessage> {
-    items
+    collect_user_messages_with_indices(items)
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect()
+}
+
+fn collect_user_messages_with_indices(items: &[ResponseItem]) -> Vec<(usize, CompactedUserMessage)> {
+    let mut seen_task_state = false;
+    let mut messages = items
         .iter()
-        .filter_map(|item| match item {
+        .enumerate()
+        .rev()
+        .filter_map(|(index, item)| match item {
             ResponseItem::Message {
                 id,
                 role,
@@ -1186,17 +1200,40 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
                 {
                     return None;
                 }
-                let content = crate::event_mapping::parse_user_message_content(content).content;
-                Some(CompactedUserMessage {
+                // A fragment supersedes only older task-state fragments, never
+                // other user text or images sharing the same message.
+                let mut retained = content.iter().rev().filter(|part| {
+                    retain_latest_task_state_fragment(part, &mut seen_task_state)
+                }).cloned().collect::<Vec<_>>();
+                retained.reverse();
+                if retained.is_empty() && !content.is_empty() {
+                    return None;
+                }
+                let content = crate::event_mapping::parse_user_message_content(&retained).content;
+                Some((index, CompactedUserMessage {
                     source_item_id: id.as_ref().map(ToString::to_string),
                     content,
                     internal_chat_message_metadata_passthrough:
                         internal_chat_message_metadata_passthrough.clone(),
-                })
+                }))
             }
             _ => None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    messages.reverse();
+    messages
+}
+
+// Call in reverse chronological order, including within mixed-content messages.
+fn retain_latest_task_state_fragment(part: &ContentItem, seen: &mut bool) -> bool {
+    use crate::context::ContextualUserFragment;
+    use crate::context::world_state::TaskState;
+    if let ContentItem::InputText { text } = part
+        && TaskState::matches_text(text)
+    {
+        return !std::mem::replace(seen, true);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1211,6 +1248,17 @@ pub(crate) fn collect_unresolved_user_messages(
 pub(crate) fn collect_unresolved_agent_messages(items: &[ResponseItem]) -> Vec<ResponseItem> {
     let unresolved = unresolved_compaction_items(items);
     append_bounded_agent_messages_with_indices(&unresolved, COMPACT_AGENT_MESSAGE_MAX_TOKENS).0
+}
+
+fn compaction_summary_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    let end = items.iter().rposition(is_compaction_model_generated_item)
+        .map_or(0, |index| index + 1);
+    let pending_output_ids = items[end..].iter()
+        .filter_map(compaction_output_call_id).collect::<BTreeSet<_>>();
+    items.iter().enumerate().filter(|(index, item)| {
+        (*index < end || is_compaction_summary_item(item))
+            && compaction_call_id(item).is_none_or(|id| !pending_output_ids.contains(id))
+    }).map(|(_, item)| item.clone()).collect()
 }
 
 fn unresolved_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
@@ -1423,17 +1471,23 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
             .map(|(_, item)| item.clone())
             .collect::<Vec<_>>(),
     );
+    let mut seen_task_state = false;
+    retained.reverse();
     retained.retain_mut(|item| {
-        if let ResponseItem::Message { content, .. } = item {
+        if let ResponseItem::Message { role, content, .. } = item {
+            content.reverse();
             content.retain(|part| {
-                !matches!(part, ContentItem::InputText { text }
+                (role != "user" || retain_latest_task_state_fragment(part, &mut seen_task_state))
+                && !matches!(part, ContentItem::InputText { text }
                 if text.starts_with("<codex_internal_context source=\"compaction_plan\">")
                     || is_artifact_pin_text(text))
             });
+            content.reverse();
             return !content.is_empty();
         }
         true
     });
+    retained.reverse();
     retained
 }
 
@@ -1475,14 +1529,8 @@ fn build_bounded_input_history(
     unresolved: Vec<ResponseItem>,
     retain_handoff: bool,
 ) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
-    let (user_source_indices, messages): (Vec<_>, Vec<_>) = unresolved
-        .iter()
-        .enumerate()
-        .flat_map(|(index, item)| {
-            collect_user_messages(std::slice::from_ref(item))
-                .into_iter()
-                .map(move |message| (index, message))
-        })
+    let (user_source_indices, messages): (Vec<_>, Vec<_>) = collect_user_messages_with_indices(&unresolved)
+        .into_iter()
         .unzip();
     let (user_items, retained_image_count, omitted_image_count, selected_user_indices) =
         append_bounded_user_messages(

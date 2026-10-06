@@ -91,7 +91,7 @@ function Get-FileSha256 {
 $script:LocalPublishContentHashCache = @{}
 # Git pathspec of the tracked publish inputs; the build fingerprint and the
 # embedded dirty flag must describe the same files.
-$script:LocalPublishBuildInputPathspec = @("codex-rs", "DO-NOT-CHANGE", "scripts/publish-local-codex.ps1", "scripts/common-rust-env.ps1", "justfile")
+$script:LocalPublishBuildInputPathspec = @("codex-rs", "scripts/publish-local-codex.ps1", "scripts/common-rust-env.ps1", "justfile")
 
 function Get-TextSha256 {
     param([string]$Value)
@@ -653,7 +653,6 @@ function Test-LocalPublishBuildRelevantPath {
     $normalized = $Path.Trim('"') -replace "\\", "/"
     return (
         $normalized -like "codex-rs/*" -or
-        $normalized -like "DO-NOT-CHANGE/*" -or
         $normalized -eq "justfile" -or
         $normalized -eq "scripts/publish-local-codex.ps1" -or
         $normalized -eq "scripts/common-rust-env.ps1"
@@ -817,8 +816,9 @@ function Get-LocalPublishBuildInputSnapshot {
             }
             $previousPath = $normalized
             $pathBytes = $utf8.GetBytes($normalized)
-            $path = Join-Path $RepoRoot ($normalized -replace "/", [IO.Path]::DirectorySeparatorChar)
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $path = [IO.Path]::Combine($RepoRoot, ($normalized -replace "/", [IO.Path]::DirectorySeparatorChar))
+            $fileInfo = [System.IO.FileInfo]::new($path)
+            if (-not $fileInfo.Exists) {
                 $missingBytes = $utf8.GetBytes("missing:$($pathBytes.Length):$normalized`n")
                 [void]$sha256.TransformBlock($missingBytes, 0, $missingBytes.Length, $missingBytes, 0)
                 $deletedWriteUtc = [DateTime]::UtcNow
@@ -828,7 +828,6 @@ function Get-LocalPublishBuildInputSnapshot {
                 continue
             }
 
-            $fileInfo = [System.IO.FileInfo]::new($path)
             if ($null -eq $newestWriteUtc -or $fileInfo.LastWriteTimeUtc -gt $newestWriteUtc) {
                 $newestWriteUtc = $fileInfo.LastWriteTimeUtc
             }

@@ -390,6 +390,7 @@ $LocalCodexHome = $LocalCodexSqliteHome = 'fixture-home'
 $RunDoctor = ${str(run_doctor).lower()}
 $DoctorOnNoop = ${str(doctor_on_noop).lower()}
 $RestartDesktop = ${str(restart).lower()}
+$Force = $false
 $ConfigureDesktopLocalCli = $true
 $restartFailure = $null
 $publishCommitted = $false
@@ -403,7 +404,7 @@ function Invoke-DoctorForPublish {{
     Write-Output 'doctor-called'
 }}
 function Restart-CodexDesktop {{
-    param($LocalCliPath, $LocalCodexHome, $LocalCodexSqliteHome)
+    param($LocalCliPath, $LocalCodexHome, $LocalCodexSqliteHome, [switch]$Force)
     if (-not $publishCommitted) {{ throw 'restart before publish commit' }}
     if ($LocalCliPath -ne 'fixture-cli' -or $LocalCodexHome -ne 'fixture-home' -or $LocalCodexSqliteHome -ne 'fixture-home') {{ throw 'wrong restart routing' }}
     Write-Output 'restart-called'
@@ -1144,8 +1145,8 @@ $configFailure = '{{"checks":{{"auth.credentials":{{"status":"fail"}},"config.lo
             "[profile.",
             1,
         )[0]
-        self.assertNotIn("incremental", local_release_block)
-        self.assertNotIn("codegen-units", local_release_block)
+        self.assertIn("incremental = true", local_release_block)
+        self.assertIn("codegen-units = 16", local_release_block)
         self.assertNotIn("debug", local_release_block)
         self.assertNotIn("strip", local_release_block)
 
@@ -1156,6 +1157,90 @@ class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
         cls.shell = powershell()
         if cls.shell is None:
             raise unittest.SkipTest("PowerShell is not available")
+
+    def test_source_snapshot_uses_literal_paths_and_fresh_content_without_provider_probes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "codex-rs" / "src"
+            source.mkdir(parents=True)
+            literal = source / "name [1] caf\u00e9.rs"
+            missing = source / "missing.rs"
+            directory = source / "directory.rs"
+            for path in (literal, missing, directory):
+                path.write_bytes(b"AAAA")
+            for args in (
+                ["init", "--quiet"],
+                ["add", "."],
+                [
+                    "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid",
+                    "commit", "--quiet", "-m", "fixture",
+                ],
+            ):
+                subprocess.run(
+                    ["git", "-C", str(root), *args], check=True,
+                    capture_output=True, timeout=30, env=clean_env(),
+                )
+            head = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                text=True, timeout=30, env=clean_env(),
+            ).strip()
+            missing.unlink()
+            directory.unlink()
+            directory.mkdir()
+            untracked = source / "untracked.rs"
+            untracked.write_bytes(b"untracked")
+            paths = (literal, missing, directory, untracked)
+
+            def expected(literal_content: bytes | None) -> str:
+                digest = hashlib.sha256(
+                    f"codex-local-publish-inputs-v4\nhead={head}\nrecipe={'a' * 64}\n".encode()
+                )
+                for path in sorted(paths):
+                    name = path.relative_to(root).as_posix()
+                    content = (
+                        literal_content if path == literal
+                        else b"untracked" if path == untracked else None
+                    )
+                    if content is None:
+                        record = f"missing:{len(name.encode())}:{name}\n"
+                    else:
+                        record = (
+                            f"file:{len(name.encode())}:{name}:{len(content)}:"
+                            f"{hashlib.sha256(content).hexdigest()}\n"
+                        )
+                    digest.update(record.encode())
+                return digest.hexdigest()
+
+            command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+function Get-LocalPublishBuildRecipeFingerprint {{ return ('a' * 64) }}
+function Join-Path {{ throw 'source snapshot must not invoke path providers' }}
+function Test-Path {{ throw 'source snapshot must not invoke path providers' }}
+$root = {ps_single_quote(root)}
+$path = {ps_single_quote(literal)}
+$first = Get-LocalPublishBuildInputSnapshot -RepoRoot $root
+$timestamp = [IO.File]::GetLastWriteTimeUtc($path)
+[IO.File]::WriteAllBytes($path, [Text.Encoding]::UTF8.GetBytes('BBBB'))
+[IO.File]::SetLastWriteTimeUtc($path, $timestamp)
+$changed = Get-LocalPublishBuildInputSnapshot -RepoRoot $root
+[IO.File]::Delete($path)
+$deleted = Get-LocalPublishBuildInputSnapshot -RepoRoot $root
+@($first.Fingerprint, $changed.Fingerprint, $deleted.Fingerprint) | ConvertTo-Json -Compress
+"""
+            result = subprocess.run(
+                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                text=True, capture_output=True, check=False,
+                timeout=RUN_TIMEOUT_SECONDS, creationflags=CREATE_NO_WINDOW,
+                env=clean_env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout),
+                [expected(b"AAAA"), expected(b"BBBB"), expected(None)],
+            )
 
     def test_version_probe_drains_large_stderr_without_deadlock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

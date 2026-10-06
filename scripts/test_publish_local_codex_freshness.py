@@ -486,6 +486,8 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                     str(install_dir),
                     "-BackupDir",
                     str(Path(temp_dir) / "backups"),
+                    "-LocalCodexHome",
+                    str(Path(temp_dir) / "local-home"),
                 ],
                 text=True,
                 capture_output=True,

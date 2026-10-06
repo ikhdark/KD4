@@ -42,9 +42,9 @@ struct ReadArgs {
 
 #[derive(Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[schemars(deny_unknown_fields)]
-struct ReadResponse {
-    resource: String,
-    contents: String,
+struct ReadResponse<'a> {
+    resource: &'a str,
+    contents: &'a str,
     next_cursor: Option<String>,
 }
 
@@ -144,16 +144,16 @@ impl ToolExecutor<ToolCall> for ReadTool {
     }
 }
 
-fn page_response(
-    resource: &str,
-    contents: &str,
+fn page_response<'a>(
+    resource: &'a str,
+    contents: &'a str,
     start: usize,
     max_response_bytes: usize,
     fingerprint: &OnceCell<u64>,
-) -> Result<ReadResponse, FunctionCallError> {
+) -> Result<ReadResponse<'a>, FunctionCallError> {
     let response = |end, next_cursor| ReadResponse {
-        resource: resource.to_string(),
-        contents: contents[start..end].to_string(),
+        resource,
+        contents: &contents[start..end],
         next_cursor,
     };
     if contents.len() - start <= max_response_bytes {
@@ -220,4 +220,38 @@ pub(super) fn serialized_len(value: &impl Serialize) -> Result<usize, FunctionCa
     serde_json::to_vec(value)
         .map(|value| value.len())
         .map_err(|err| FunctionCallError::Fatal(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pagination_borrows_contents_and_preserves_complete_wire_output() {
+        let resource = "skill://test/demo/SKILL.md";
+        let contents = "é🦀\n\"\\".repeat(200);
+        let fingerprint = OnceCell::new();
+        let page = page_response(resource, &contents, 0, 300, &fingerprint)
+            .expect("a partial page should fit");
+        assert_eq!(page.resource.as_ptr(), resource.as_ptr());
+        assert_eq!(page.contents.as_ptr(), contents.as_ptr());
+        assert!(!page.contents.is_empty());
+        assert!(serialized_len(&page).expect("serialized page") <= 300);
+        let start = parse_pagination_cursor(page.next_cursor.as_deref(), &contents, &fingerprint)
+            .expect("valid continuation");
+        assert_eq!(start, page.contents.len());
+
+        let tail = page_response(resource, &contents, start, 8_000, &fingerprint)
+            .expect("the rest should fit");
+        assert_eq!(tail.contents.as_ptr(), contents[start..].as_ptr());
+        assert_eq!(format!("{}{}", page.contents, tail.contents), contents);
+        assert_eq!(
+            serde_json::to_value(&tail).expect("serialized tail"),
+            serde_json::json!({
+                "resource": resource,
+                "contents": &contents[start..],
+                "next_cursor": null,
+            })
+        );
+    }
 }

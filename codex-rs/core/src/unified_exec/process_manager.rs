@@ -2505,7 +2505,7 @@ impl UnifiedExecProcessManager {
         let mut orchestrator = ToolOrchestrator::new();
         let mut runtime = UnifiedExecRuntime::new_with_pending_spawns(self, pending_spawns);
 
-        let proven_direct_argv = if request.shell_wrapper_is_owned
+        let direct_argv_analysis = async { if request.shell_wrapper_is_owned
             && request.shell_type == crate::shell::ShellType::PowerShell
         {
             match request.normalization_cwd.as_ref() {
@@ -2521,8 +2521,10 @@ impl UnifiedExecProcessManager {
             }
         } else {
             None
-        };
+        }};
 
+        let canonical_approval = async {
+        let proven_direct_argv = direct_argv_analysis.await;
         let canonical_exec_approval_requirement = if let Some(proof) = proven_direct_argv.as_ref() {
             Some(
                 context
@@ -2547,6 +2549,8 @@ impl UnifiedExecProcessManager {
         } else {
             None
         };
+        (proven_direct_argv, canonical_exec_approval_requirement)
+        };
         let exec_approval_request = ExecApprovalRequest {
             command: &request.command,
             command_for_safety: Some(&request.command_for_safety),
@@ -2560,7 +2564,7 @@ impl UnifiedExecProcessManager {
             },
             prefix_rule: request.prefix_rule.clone(),
         };
-        let exec_approval_requirement = if request.shell_wrapper_is_owned {
+        let original_approval = async { if request.shell_wrapper_is_owned {
             context
                 .session
                 .services
@@ -2574,7 +2578,11 @@ impl UnifiedExecProcessManager {
                 .exec_policy
                 .create_exec_approval_requirement_for_direct_argv(exec_approval_request)
                 .await
-        };
+        }};
+        // The canonical policy still depends on the direct-argv proof. Only
+        // the independent original command policy runs alongside that chain.
+        let ((proven_direct_argv, canonical_exec_approval_requirement), exec_approval_requirement) =
+            tokio::join!(canonical_approval, original_approval);
 
         let approved_powershell_direct_argv = if let (Some(proof), Some(canonical_requirement)) =
             (proven_direct_argv, canonical_exec_approval_requirement)

@@ -13,10 +13,10 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
-use codex_tools::JsonToolOutput;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolExposure;
+use codex_tools::telemetry_preview;
 use serde_json::Value;
 use serde_json::json;
 
@@ -381,7 +381,7 @@ impl HistoryNotesToolOutput {
 
 impl ToolOutput for HistoryNotesToolOutput {
     fn log_preview(&self) -> String {
-        JsonToolOutput::new(self.result.clone()).log_preview()
+        telemetry_preview(&self.result.to_string())
     }
 
     fn success_for_logging(&self) -> bool {

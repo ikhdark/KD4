@@ -41,7 +41,9 @@ enum PowershellFlavor {
 type CachedParser = Arc<Mutex<Option<PowershellParserProcess>>>;
 
 type SpareParsers = HashMap<PowershellFlavor, Option<PowershellParserProcess>>;
-static SPARE_PARSERS: LazyLock<Mutex<SpareParsers>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const MAX_SPARE_PARSERS: usize = 4;
+static SPARE_PARSERS: LazyLock<[Mutex<SpareParsers>; MAX_SPARE_PARSERS]> =
+    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(HashMap::new())));
 
 static PARSER_PROCESSES: LazyLock<Mutex<HashMap<PowershellFlavor, CachedParser>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -55,20 +57,20 @@ fn notify_parser_available() {
     PARSER_AVAILABILITY.1.notify_all();
 }
 
-fn wait_for_cached_parser(
-    parser: &CachedParser,
+fn wait_for_cached_parser<'a>(
+    parser: &'a CachedParser,
+    spare_parsers: &'a [Mutex<SpareParsers>],
     deadline: Instant,
-) -> Option<MutexGuard<'_, Option<PowershellParserProcess>>> {
+) -> Option<CachedParserAccess<'a>> {
     let mut available = PARSER_AVAILABILITY
         .0
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     loop {
         let remaining = deadline.checked_duration_since(Instant::now())?;
-        match parser.try_lock() {
-            Ok(parser) => return Some(parser),
-            Err(TryLockError::Poisoned(error)) => return Some(error.into_inner()),
-            Err(TryLockError::WouldBlock) => {}
+        match acquire_cached_parser(parser, spare_parsers) {
+            CachedParserAccess::Saturated => {}
+            parser => return Some(parser),
         }
         available = PARSER_AVAILABILITY
             .1
@@ -224,7 +226,15 @@ fn parse_with_powershell_ast_request(
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
     };
-    let outcome = match acquire_cached_parser(&parser, &SPARE_PARSERS) {
+    let access = match acquire_cached_parser(&parser, SPARE_PARSERS.as_slice()) {
+        CachedParserAccess::Saturated => wait_for_cached_parser(
+            &parser,
+            SPARE_PARSERS.as_slice(),
+            deadline,
+        ).unwrap_or(CachedParserAccess::Saturated),
+        access => access,
+    };
+    let outcome = match access {
         CachedParserAccess::Shared(mut parser) => {
             parse_with_cached_process(&mut parser, executable, script, resolution, deadline)
         }
@@ -234,12 +244,7 @@ fn parse_with_powershell_ast_request(
             let parser = parsers.entry(flavor).or_default();
             parse_with_cached_process(parser, executable, script, resolution, deadline)
         }
-        CachedParserAccess::Saturated => match wait_for_cached_parser(&parser, deadline) {
-            Some(mut parser) => {
-                parse_with_cached_process(&mut parser, executable, script, resolution, deadline)
-            }
-            None => PowershellParseOutcome::Failed,
-        },
+        CachedParserAccess::Saturated => PowershellParseOutcome::Failed,
     };
     notify_parser_available();
     outcome
@@ -253,19 +258,23 @@ enum CachedParserAccess<'a> {
 
 fn acquire_cached_parser<'a>(
     parser: &'a CachedParser,
-    spare_parsers: &'a Mutex<SpareParsers>,
+    spare_parsers: &'a [Mutex<SpareParsers>],
 ) -> CachedParserAccess<'a> {
     match parser.try_lock() {
-        Ok(parser) => CachedParserAccess::Shared(parser),
-        Err(TryLockError::Poisoned(poisoned)) => CachedParserAccess::Shared(poisoned.into_inner()),
-        Err(TryLockError::WouldBlock) => match spare_parsers.try_lock() {
-            Ok(slot) => CachedParserAccess::Spare(slot),
-            Err(TryLockError::Poisoned(poisoned)) => {
-                CachedParserAccess::Spare(poisoned.into_inner())
-            }
-            Err(TryLockError::WouldBlock) => CachedParserAccess::Saturated,
-        },
+        Ok(parser) => return CachedParserAccess::Shared(parser),
+        Err(TryLockError::Poisoned(poisoned)) => return CachedParserAccess::Shared(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => {}
     }
+    for spare in spare_parsers {
+        match spare.try_lock() {
+            Ok(slot) => return CachedParserAccess::Spare(slot),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                return CachedParserAccess::Spare(poisoned.into_inner());
+            }
+            Err(TryLockError::WouldBlock) => {}
+        }
+    }
+    CachedParserAccess::Saturated
 }
 
 pub(crate) fn try_parse_powershell_ast_commands(
@@ -1002,18 +1011,23 @@ mod tests {
     #[test]
     fn cached_parser_contention_bounds_temporary_hosts() {
         let parser: CachedParser = Arc::new(Mutex::new(None));
-        let temporary_slot = Mutex::new(HashMap::new());
+        let temporary_slot: [_; MAX_SPARE_PARSERS] =
+            std::array::from_fn(|_| Mutex::new(HashMap::new()));
         let held = parser.lock().unwrap_or_else(PoisonError::into_inner);
-        let temporary = acquire_cached_parser(&parser, &temporary_slot);
-        assert!(matches!(temporary, CachedParserAccess::Spare(_)));
+        let mut temporary = Vec::new();
+        for _ in 0..MAX_SPARE_PARSERS {
+            let access = acquire_cached_parser(&parser, &temporary_slot);
+            assert!(matches!(access, CachedParserAccess::Spare(_)));
+            temporary.push(access);
+        }
         assert!(matches!(
             acquire_cached_parser(&parser, &temporary_slot),
             CachedParserAccess::Saturated
         ));
-        drop(temporary);
+        temporary.pop();
         assert!(matches!(
-            acquire_cached_parser(&parser, &temporary_slot),
-            CachedParserAccess::Spare(_)
+            wait_for_cached_parser(&parser, &temporary_slot, Instant::now() + Duration::from_secs(1)),
+            Some(CachedParserAccess::Spare(_))
         ));
         drop(held);
         assert!(matches!(
@@ -1250,7 +1264,9 @@ mod tests {
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone();
         let primary = parser.lock().unwrap_or_else(PoisonError::into_inner);
-        let temporary = SPARE_PARSERS.lock().unwrap_or_else(PoisonError::into_inner);
+        let temporary = SPARE_PARSERS.iter()
+            .map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner))
+            .collect::<Vec<_>>();
         let executable = executable.to_string();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
@@ -1286,7 +1302,7 @@ mod tests {
         let parser = Arc::new(Mutex::new(None));
         let _held = parser.lock().unwrap();
         assert!(
-            wait_for_cached_parser(&parser, Instant::now() + Duration::from_millis(20)).is_none()
+            wait_for_cached_parser(&parser, &[], Instant::now() + Duration::from_millis(20)).is_none()
         );
         let mut process = None;
         assert_eq!(

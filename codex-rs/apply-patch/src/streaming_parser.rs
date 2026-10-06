@@ -201,6 +201,12 @@ impl StreamingPatchParser {
         Ok(self.hunks().to_vec())
     }
 
+    /// Finalize a batch parse without cloning the completed patch payload.
+    pub(crate) fn into_parts(mut self) -> Result<(Vec<Hunk>, Option<String>), ParseError> {
+        self.finish_in_place()?;
+        Ok((self.state.hunks, self.state.environment_id))
+    }
+
     fn process_line(&mut self, line: &str) -> Result<(), ParseError> {
         let trimmed = line.trim();
         match self.state.mode {
@@ -443,6 +449,42 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn into_parts_moves_completed_hunks_and_environment() {
+        let mut parser = StreamingPatchParser::default();
+        parser
+            .push_delta_in_place(
+                "*** Begin Patch\n*** Environment ID: remote\n*** Add File: a.txt\n+hello\n*** Update File: b.txt\n@@\n-old\n+new\n*** End Patch",
+            )
+            .unwrap();
+        let hunks_ptr = parser.hunks().as_ptr();
+        let environment_ptr = parser.environment_id().unwrap().as_ptr();
+        let expected = parser.clone().finish().unwrap();
+
+        let (hunks, environment_id) = parser.into_parts().unwrap();
+        assert_eq!(hunks, expected);
+        assert_eq!(environment_id.as_deref(), Some("remote"));
+        assert_eq!(hunks.as_ptr(), hunks_ptr);
+        assert_eq!(environment_id.as_ref().unwrap().as_ptr(), environment_ptr);
+    }
+
+    #[test]
+    fn into_parts_preserves_finalization_errors() {
+        for patch in [
+            "*** End Patch",
+            "*** Begin Patch\n*** End Patch\n*** End Patch",
+            "*** Begin Patch\n*** Add File: a.txt\n+hello",
+            "*** Begin Patch\n*** Update File: a.txt\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n*** End Patch",
+            "*** Begin Patch\n*** End Patch\nextra",
+        ] {
+            let mut parser = StreamingPatchParser::default();
+            parser.push_delta_in_place(patch).unwrap();
+            let expected = parser.clone().finish().unwrap_err();
+            assert_eq!(parser.into_parts().unwrap_err(), expected, "{patch}");
+        }
+    }
 
     #[test]
     fn test_finish_rejects_end_marker_outside_an_active_patch() {

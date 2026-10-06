@@ -5,12 +5,12 @@ use crate::images::ImageEditRequest;
 use crate::images::ImageGenerationRequest;
 use crate::images::ImageResponse;
 use crate::provider::Provider;
+use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestTelemetry;
 use http::HeaderMap;
 use http::Method;
 use serde::Serialize;
-use serde_json::to_value;
 use std::sync::Arc;
 
 pub struct ImagesClient<T: HttpTransport> {
@@ -60,7 +60,7 @@ impl<T: HttpTransport> ImagesClient<T> {
         extra_headers: HeaderMap,
         operation: &str,
     ) -> Result<ImageResponse, ApiError> {
-        let body = to_value(request)
+        let body = EncodedJsonBody::encode(request)
             .map_err(|e| ApiError::Stream(format!("failed to encode {operation} request: {e}")))?;
         let resp = self
             .session
@@ -329,6 +329,58 @@ mod tests {
                 "prompt": "add a red hat",
                 "model": "gpt-image-1.5",
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn image_edit_encodes_large_input_directly_before_authentication() {
+        struct InspectingAuth {
+            expected: Vec<u8>,
+        }
+
+        impl AuthProvider for InspectingAuth {
+            fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
+
+            fn apply_auth(&self, request: Request) -> crate::auth::AuthProviderFuture<'_> {
+                Box::pin(async move {
+                    let body = request.prepare_body_for_send().unwrap();
+                    assert_eq!(body.body_bytes().as_ref(), self.expected.as_slice());
+                    assert_eq!(body.headers[http::header::CONTENT_TYPE], "application/json");
+                    Ok(request)
+                })
+            }
+        }
+
+        let request = ImageEditRequest {
+            images: vec![ImageUrl {
+                image_url: format!("data:image/png;base64,{}", "Zm9v".repeat(65_536)),
+            }],
+            prompt: "café 界 🦀\n\"quoted\"".to_string(),
+            background: None,
+            model: "gpt-image-test".to_string(),
+            n: Some(1),
+            quality: None,
+            size: None,
+        };
+        let expected = serde_json::to_vec(&request).unwrap();
+        let transport = CapturingTransport::new(response_body());
+        let client = ImagesClient::new(
+            transport.clone(),
+            provider(),
+            Arc::new(InspectingAuth {
+                expected: expected.clone(),
+            }),
+        );
+        assert_eq!(
+            client.edit(&request, HeaderMap::new()).await.unwrap(),
+            expected_response()
+        );
+        let captured = captured_request(&transport);
+        let actual = captured.prepare_body_for_send().unwrap().body_bytes();
+        assert_eq!(actual.as_ref(), expected.as_slice());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&actual).unwrap(),
+            serde_json::to_value(&request).unwrap()
         );
     }
 

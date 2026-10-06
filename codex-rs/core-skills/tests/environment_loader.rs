@@ -28,6 +28,7 @@ use tokio::sync::Notify;
 enum ManifestMetadataBehavior {
     Immediate,
     WaitForSkillRead,
+    WaitForManifestProbes(usize),
 }
 
 struct RecordingFileSystem<'a> {
@@ -38,6 +39,7 @@ struct RecordingFileSystem<'a> {
     manifest_metadata_behavior: ManifestMetadataBehavior,
     skill_read_started: AtomicBool,
     skill_read_started_notify: Notify,
+    manifest_probe_started_notify: Notify,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -60,6 +62,7 @@ impl<'a> RecordingFileSystem<'a> {
             manifest_metadata_behavior,
             skill_read_started: AtomicBool::new(false),
             skill_read_started_notify: Notify::new(),
+            manifest_probe_started_notify: Notify::new(),
         }
     }
 
@@ -140,10 +143,36 @@ impl ExecutorFileSystem for RecordingFileSystem<'_> {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
-        self.metadata_files
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(path.clone());
+        let probe_index = {
+            let mut paths = self
+                .metadata_files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            paths.push(path.clone());
+            paths.len()
+        };
+        self.manifest_probe_started_notify.notify_waiters();
+        if let ManifestMetadataBehavior::WaitForManifestProbes(required) =
+            self.manifest_metadata_behavior
+            && probe_index == 1
+        {
+            return Box::pin(async move {
+                loop {
+                    let notified = self.manifest_probe_started_notify.notified();
+                    if self
+                        .metadata_files
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .len()
+                        >= required
+                    {
+                        break;
+                    }
+                    notified.await;
+                }
+                self.inner.get_metadata(path, sandbox).await
+            });
+        }
         if matches!(
             self.manifest_metadata_behavior,
             ManifestMetadataBehavior::WaitForSkillRead
@@ -409,5 +438,114 @@ async fn reads_skill_files_while_resolving_plugin_namespaces() {
             dependencies: None,
             policy: None,
         }]
+    );
+}
+
+#[tokio::test]
+async fn replenishes_namespace_probe_slots_while_the_first_probe_is_pending() {
+    // Exceed the 64 concurrent namespace probes. The first probe stays pending
+    // until a later batch starts; completed probes must release their slots.
+    const PLUGIN_COUNT: usize = 65;
+    let root = tempdir().expect("tempdir");
+    let mut expected_names = Vec::new();
+    for index in 0..PLUGIN_COUNT {
+        let name = format!("plugin-{index:03}");
+        let plugin_root = root.path().join(&name);
+        fs::create_dir_all(plugin_root.join(".codex-plugin")).unwrap();
+        fs::write(
+            plugin_root.join(".codex-plugin/plugin.json"),
+            format!(r#"{{"name":"{name}"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            plugin_root.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo skill.\n---\n",
+        )
+        .unwrap();
+        expected_names.push(format!("{name}:demo"));
+    }
+    // Keep the fallback root probe in this same batch, without ancestor probes.
+    fs::create_dir_all(root.path().join(".codex-plugin")).unwrap();
+    fs::write(
+        root.path().join(".codex-plugin/plugin.json"),
+        r#"{"name":"fallback"}"#,
+    )
+    .unwrap();
+    let file_system = RecordingFileSystem::new(
+        LOCAL_FS.as_ref(),
+        ManifestMetadataBehavior::WaitForManifestProbes(PLUGIN_COUNT),
+    );
+    let root_uri = PathUri::from_host_native_path(root.path()).unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        load_environment_skills_from_root(&file_system, &root_uri, None),
+    )
+    .await
+    .expect("completed probes must not wait behind the first pending probe");
+
+    assert_eq!(outcome.warnings, Vec::<String>::new());
+    assert_eq!(
+        outcome
+            .skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>(),
+        expected_names
+    );
+    assert_eq!(file_system.calls().metadata_files.len(), PLUGIN_COUNT + 1);
+    assert_eq!(file_system.calls().read_files.len(), PLUGIN_COUNT * 2 + 1);
+}
+
+#[tokio::test]
+async fn host_empty_roots_skip_namespace_probes_without_losing_scan_warnings() {
+    use codex_core_skills::loader::SkillRoot;
+    use codex_core_skills::loader::load_skills_from_roots;
+    use codex_protocol::protocol::SkillScope;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use std::sync::Arc;
+
+    let root = tempdir().expect("tempdir");
+    fs::create_dir_all(root.path().join(".codex-plugin")).unwrap();
+    fs::write(
+        root.path().join(".codex-plugin/plugin.json"),
+        r#"{"name":"unused-parent"}"#,
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("empty")).unwrap();
+    // Exceed the traversal depth without finding a skill. The diagnostic must
+    // survive the empty-result fast path just as it does for a populated root.
+    fs::create_dir_all(root.path().join("limited/a/b/c/d/e/f/g")).unwrap();
+
+    let mut observations = Vec::new();
+    for (name, truncated) in [("empty", false), ("missing", false), ("limited", true)] {
+        let file_system = Arc::new(RecordingFileSystem::new(
+            LOCAL_FS.as_ref(),
+            ManifestMetadataBehavior::Immediate,
+        ));
+        let outcome = load_skills_from_roots(
+            [SkillRoot {
+                path: AbsolutePathBuf::try_from(root.path().join(name)).unwrap(),
+                scope: SkillScope::User,
+                file_system: file_system.clone(),
+                plugin_id: None,
+                plugin_namespace: None,
+                plugin_root: None,
+            }],
+            None,
+        )
+        .await;
+        assert!(outcome.skills.is_empty(), "{name}");
+        assert_eq!(outcome.errors.len(), usize::from(truncated), "{name}");
+        if truncated {
+            assert!(outcome.errors[0].message.contains("traversal limit"));
+        }
+        let calls = file_system.calls();
+        assert_eq!(calls.walks, 1, "{name}: discovery must still run");
+        observations.push((name, calls.metadata_files.len(), calls.read_files.len()));
+    }
+    eprintln!("empty-root (root, metadata probes, file reads): {observations:?}");
+    assert_eq!(
+        observations,
+        vec![("empty", 0, 0), ("missing", 0, 0), ("limited", 0, 0)]
     );
 }

@@ -1587,6 +1587,45 @@ def _guard_cargo_checkout_cwd(command: Sequence[str], repo_root: Path) -> None:
     )
 
 
+def _is_named_runner_command(command: Sequence[str]) -> bool:
+    return (
+        len(command) >= 3
+        and Path(command[0]).stem.lower() in {
+            "python", "python3", "py", Path(sys.executable).stem.lower(),
+        }
+        and Path(command[1]).resolve()
+        == Path(__file__).with_name("rust_test_runner.py").resolve()
+    )
+
+
+def _guard_named_runner_args(command: Sequence[str]) -> None:
+    """Preflight direct calls to this checkout's runner before lane admission.
+
+    Leave wrappers, interpreter options and foreign scripts to their owners.
+    The child still performs its normal validation against current inputs.
+    """
+    if not _is_named_runner_command(command):
+        return
+    arguments = list(command[2:])
+    if any(argument in {"-h", "--help"} for argument in arguments):
+        return
+
+    from scripts import rust_test_runner
+
+    try:
+        args = rust_test_runner.build_parser().parse_args(arguments)
+        if args.command == "run-target":
+            filters = list(args.filter_args)
+            if filters[:1] == ["--"]:
+                filters = filters[1:]
+            filters, _, _, _ = rust_test_runner._split_runner_owned_options(filters)
+            rust_test_runner.validate_filtering_args(filters)
+    except rust_test_runner.RunnerError as exc:
+        raise ValueError(str(exc)) from exc
+    except SystemExit as exc:
+        raise ValueError("Invalid named runner arguments; no build lane was reserved.") from exc
+
+
 def _implicit_cargo_package(command: Sequence[str]) -> str | None:
     """Name the single package Cargo selects without -p, or None if unsure.
 
@@ -1915,7 +1954,23 @@ def cargo_build_context(
         if command and Path(command[0]).stem.lower() == "cargo"
         else None
     )
-    nextest = cargo_index is not None and command[cargo_index] == "nextest"
+    reserved_recipe = (
+        command[1]
+        if len(command) >= 2 and Path(command[0]).stem.lower() == "just"
+        else None
+    )
+    # These entrypoints dispatch Nextest through the named runner. Its profile
+    # selects test policy, not Cargo artifacts; use the same distinction as a
+    # direct `cargo nextest` command when ranking warm lanes.
+    nextest = (
+        cargo_index is not None and command[cargo_index] == "nextest"
+        or _is_named_runner_command(command)
+        or reserved_recipe in {
+            "_core-test-reserved", "_core-test-small-reserved", "_core-gate-reserved",
+        }
+    )
+    if reserved_recipe == "_core-test-small-reserved":
+        options.extend(["--profile", "dev-small"])
     tokens = iter(command)
     for token in tokens:
         if token == "--":
@@ -2015,6 +2070,7 @@ def run_in_cargo_lane(
         # then fail on stale helpers instead of using the named runner.
         _guard_raw_lane_test_command(command)
         _guard_cargo_checkout_cwd(command, repo_root)
+        _guard_named_runner_args(command)
         child_env = os.environ.copy()
         updates = local_rust_env(child_env, repo_root=repo_root, which=shutil.which)
         child_env.update(updates)
@@ -2094,6 +2150,9 @@ def run_in_cargo_lane(
                     exit_code = run_owned(
                         child_command,
                         env=child_env,
+                        # Keep foreground harness work ahead of lane builds;
+                        # Windows descendants inherit this priority class.
+                        creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
                         prepare_sccache=True,
                         check=False,
                         stdout=sys.stdout,

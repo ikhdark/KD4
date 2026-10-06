@@ -5,7 +5,6 @@ codex-rs/core/src/tools/command_output_artifact_tests.rs diff
 # include_str!, include_dir!, and sqlx::migrate! embed raw file bytes, so prompts, tool
 # grammars, bundled skills, and migration checksums must not depend on checkout settings.
 codex-rs/** text=auto eol=lf
-DO-NOT-CHANGE/** text=auto eol=lf
 codex-rs/**/*.sql text eol=lf
 # Persisted agent-task ledgers recorded version 20 from CRLF bytes; keep its checksum reproducible.
 codex-rs/agent-task-store/migrations/0020_automatic_wake_delivery.sql text eol=crlf

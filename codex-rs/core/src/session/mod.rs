@@ -1492,6 +1492,25 @@ pub(crate) enum ThreadSettingsUpdateError {
     Persistence(#[from] std::io::Error),
 }
 
+struct StepContextTimer {
+    step: &'static str,
+    started: std::time::Instant,
+}
+
+impl StepContextTimer {
+    fn start(step: &'static str) -> Self {
+        tracing::info!(step, "step context phase started");
+        Self { step, started: std::time::Instant::now() }
+    }
+}
+
+impl Drop for StepContextTimer {
+    fn drop(&mut self) {
+        tracing::info!(step = self.step, duration_ms = self.started.elapsed().as_secs_f64() * 1000.0,
+            "step context phase finished");
+    }
+}
+
 impl Session {
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
         let state = self.state.lock().await;
@@ -4233,6 +4252,7 @@ impl Session {
         previous_world_state: &Arc<WorldState>,
         step_context: &step_context::StepContext,
     ) -> std::io::Result<Arc<WorldState>> {
+        let _timer = StepContextTimer::start("record_step_world_state_if_changed");
         let turn_context = step_context.turn.as_ref();
         // Render model-visible state from the same step used to build and run tools.
         let world_state = Arc::new(
@@ -4328,10 +4348,7 @@ impl Session {
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
     ) -> CodexResult<Arc<StepContext>> {
-        if turn_context.environments.single_local_environment_cwd().is_some() {
-            turn_context.turn_timing_state
-                .start_checkout_snapshot(turn_context.cwd().as_path());
-        }
+        let _timer = StepContextTimer::start("capture_step_context");
         let deferred_executor_enabled = turn_context
             .config
             .features

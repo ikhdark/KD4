@@ -72,9 +72,12 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
 }
 
 fn expected_visible_models() -> Vec<Model> {
+    let mut catalog = codex_models_manager::bundled_models_response()
+        .expect("bundled models.json should parse");
+    catalog.models.sort_by_key(|model| model.priority);
     // Filter by supported_in_api to support testing with both ChatGPT and non-ChatGPT auth modes.
     let mut presets = ModelPreset::filter_by_auth(
-        codex_core::test_support::all_model_presets().clone(),
+        catalog.models.into_iter().map(ModelPreset::from).collect(),
         /*chatgpt_mode*/ false,
     );
 

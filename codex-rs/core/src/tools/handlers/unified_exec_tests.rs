@@ -765,6 +765,77 @@ async fn invocation_for_payload_without_sandbox(
 }
 
 #[tokio::test]
+async fn passive_nested_write_stdin_preserves_wrapper_return_margin() {
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "program": "python",
+            "args": ["-c", "import time; time.sleep(60)"],
+            "yield_time_ms": 250,
+            "stall_timeout_ms": 0,
+        }).to_string(),
+    };
+    let invocation = invocation_for_payload_without_sandbox(
+        "exec_command", "passive-margin-start", payload.clone(),
+    ).await;
+    let session = Arc::clone(&invocation.session);
+    let step_context = Arc::clone(&invocation.step_context);
+    let tracker = Arc::clone(&invocation.tracker);
+    let started = ExecCommandHandler::default().handle(invocation).await.unwrap()
+        .code_mode_result(&payload);
+    let process_id = started["session_id"].as_u64().expect("live silent process");
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "session_id": process_id, "wait_for_output": true,
+        }).to_string(),
+    };
+    let started_at = tokio::time::Instant::now();
+    let timing = Arc::new(crate::tools::tool_dispatch_trace::ToolDispatchTiming::new(
+        started_at, false,
+    ));
+    let handler = WriteStdinHandler::default();
+    let result = crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing(
+        Arc::clone(&timing),
+        handler.handle(ToolInvocation {
+            session: Arc::clone(&session), step_context, tracker,
+            call_id: "passive-margin-poll".into(),
+            tool_name: codex_tools::ToolName::plain("write_stdin"),
+            source: ToolCallSource::CodeMode {
+                cell_id: "passive-margin-cell".into(),
+                parent_call_id: None,
+                runtime_tool_call_id: "passive-margin-tool".into(),
+                nested_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(3)),
+                cancellation_cause: None,
+            },
+            payload: payload.clone(),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+        }),
+    ).await;
+    let elapsed = started_at.elapsed();
+    let snapshot = timing.snapshot(tokio::time::Instant::now());
+    // Clean up before assertions, including when the old handler exhausts the
+    // wrapper budget. No timed-out process is left behind by the regression.
+    assert!(session.services.unified_exec_manager
+        .terminate_process_for_poll(u32::try_from(process_id).unwrap()).await);
+    let result = result.unwrap().code_mode_result(&payload);
+    assert_eq!(result["session_id"], process_id);
+    assert_eq!(result["process_exited"], false);
+    let mut previous_sequence = 0;
+    let mut observations = 0;
+    for wait in &snapshot.timer_waits {
+        // Equivalent waits coalesce; sequence retains their actual count.
+        if wait.wait_kind == "write_stdin_yield" {
+            observations += wait.sequence - previous_sequence;
+        }
+        previous_sequence = wait.sequence;
+    }
+    eprintln!("passive nested poll: observations={observations}, elapsed_ms={}", elapsed.as_millis());
+    // Assert actual manager entries, not a scheduler-sensitive timing bound.
+    // The manager already reserved its return margin; the handler must not
+    // spend it starting more empty observations.
+    assert_eq!(observations, 1);
+}
+
+#[tokio::test]
 async fn write_stdin_terminates_non_pty_process_and_retains_output() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
@@ -2082,7 +2153,8 @@ async fn kd4_latency_unpolled_background_failure_retires_live_metadata() {
     let python = which::which("python")
         .or_else(|_| which::which("python3"))
         .expect("Python is required by the KD4 test environment");
-    let script = "import time; print('X' * 5000, flush=True); time.sleep(6); print('BACKGROUND_FINAL_MARKER'); raise SystemExit(7)";
+    let spill_bytes = crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES + 1;
+    let script = format!("import time; print('X' * {spill_bytes}, flush=True); time.sleep(6); print('BACKGROUND_FINAL_MARKER'); raise SystemExit(7)");
     let program = python.to_string_lossy().into_owned();
     let command = vec![program.clone(), "-c".to_string(), script.to_string()];
     let (session, turn) = make_session_and_context().await;

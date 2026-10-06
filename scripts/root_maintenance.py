@@ -27,7 +27,7 @@ SCRIPT_AUDIT_ROOTS = (
     REPO_ROOT / "codex-cli" / "scripts",
     REPO_ROOT / "codex-rs" / "app-server-test-client" / "scripts",
     REPO_ROOT / "codex-rs" / "config" / "scripts",
-    REPO_ROOT / "DO-NOT-CHANGE" / "responses-api-proxy" / "npm" / "bin",
+    REPO_ROOT / "codex-rs" / "responses-api-proxy" / "npm" / "bin",
     REPO_ROOT / "codex-rs" / "scripts",
     REPO_ROOT / "codex-rs" / "skills" / "src" / "assets" / "samples",
     REPO_ROOT / "sdk" / "python" / "scripts",
@@ -324,6 +324,9 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     ),
     "scripts/atomic_json.py": (
         f"{REPORT_REGRESSIONS}.test_atomic_output_preserves_hardlinked_source_and_checkpoint_on_failure",
+    ),
+    "scripts/benchmark_code_mode_handoffs.mjs": (
+        "scripts.test_benchmark_code_mode_handoffs",
     ),
     "scripts/build_tooling_test_support.py": (
         "scripts.test_build_tooling",

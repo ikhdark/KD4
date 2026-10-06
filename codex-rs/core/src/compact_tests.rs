@@ -220,6 +220,26 @@ fn content_items_to_text_ignores_image_only_content() {
 }
 
 #[test]
+fn compaction_retains_only_latest_task_state_without_dropping_mixed_user_content() {
+    let old = "<codex_task_state>old</codex_task_state>";
+    let latest = "<codex_task_state>latest</codex_task_state>";
+    let mut mixed = user_message("keep this constraint");
+    if let ResponseItem::Message { content, .. } = &mut mixed {
+        content.push(ContentItem::InputText { text: old.into() });
+    }
+    let items = vec![user_message(old), mixed, user_message(latest)];
+    let expected = vec![compacted_user_message("keep this constraint"), compacted_user_message(latest)];
+    assert_eq!(collect_user_messages(&items), expected);
+    let remote = task_compaction_items(&items);
+    assert_eq!(remote, vec![user_message("keep this constraint"), user_message(latest)]);
+    assert_eq!(task_compaction_items(&remote), remote);
+    let (history, _, _, omitted_user_text, omitted_text) = build_bounded_input_history(items, false);
+    assert_eq!(collect_user_messages(&history), expected);
+    assert!(!omitted_user_text);
+    assert!(!omitted_text);
+}
+
+#[test]
 fn collect_user_messages_extracts_user_text_only() {
     let items = vec![
         ResponseItem::Message {
@@ -1144,6 +1164,44 @@ fn unresolved_tool_output_survives_local_compaction_as_typed_receipt() {
     let (history, _, _, _, _) = build_bounded_unresolved_input_history(&items);
 
     assert_eq!(history, vec![call, output]);
+    assert_eq!(compaction_summary_items(&items), vec![user_message("request")]);
+}
+
+#[test]
+fn compaction_summary_excludes_unread_tail_but_keeps_consumed_evidence() {
+    let call = |id: &str| ResponseItem::FunctionCall {
+        id: None, name: "inspect".into(), namespace: None, arguments: "{}".into(),
+        call_id: id.into(), internal_chat_message_metadata_passthrough: None,
+    };
+    let output = |id: &str| ResponseItem::FunctionCallOutput {
+        id: None, call_id: id.into(),
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text("evidence".into()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut assistant = user_message("interpreted earlier evidence");
+    if let ResponseItem::Message { role, .. } = &mut assistant { *role = "assistant".into(); }
+    let consumed = vec![user_message("request"), call("done"), output("done"), assistant];
+    let mut items = consumed.clone();
+    items.extend([call("pending-a"), call("pending-b"), output("pending-a"),
+        output("pending-b"), user_message("new constraint"), agent_message("unread agent result")]);
+    assert_eq!(compaction_summary_items(&items), consumed);
+    let (retained, _, _, _, _) = build_bounded_unresolved_input_history(&items);
+    assert_eq!(retained, items[consumed.len()..]);
+    assert!(compaction_summary_items(&[user_message("first request")]).is_empty());
+    let summary = compaction_summary_item(format!("{SUMMARY_PREFIX}\nprevious handoff"));
+    assert_eq!(compaction_summary_items(&[summary.clone(), user_message("new request")]),
+        vec![summary]);
+
+    let mut history = crate::context_manager::ContextManager::new();
+    history.replace(compaction_summary_items(&items));
+    let prompt = history.for_compaction_prompt_with_completed_tool_projection(
+        &codex_protocol::openai_models::default_input_modalities(), None,
+    );
+    let serialized = serde_json::to_string(&prompt).unwrap();
+    assert!(!serialized.contains("pending-a"));
+    assert!(!serialized.contains("pending-b"));
+    assert!(!serialized.contains("new constraint"));
+    assert!(serialized.contains("interpreted earlier evidence"));
 }
 
 #[test]

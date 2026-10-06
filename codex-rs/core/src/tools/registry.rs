@@ -185,6 +185,12 @@ pub(crate) struct ToolSemanticCapabilities {
 /// Typed runtime contract for locally executed tools, including scheduling,
 /// evidence, cancellation and host-owned delivery capabilities.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    /// Pure preparation may overlap baseline capture only when the runtime
+    /// awaits `wait_for_workspace_baseline` before reading or changing files.
+    fn prepares_during_workspace_baseline(&self) -> bool {
+        false
+    }
+
     /// Trusted opt-in publication receipt; success alone is not completion.
     fn terminal_result_adapter(&self) -> Option<&'static str> {
         None
@@ -1384,6 +1390,10 @@ impl ToolRegistry {
             .map_or(TerminalFailureReuse::Never, |tool| tool.runtime().terminal_failure_reuse())
     }
 
+    pub(crate) fn prepares_during_workspace_baseline(&self, name: &ToolName) -> bool {
+        self.tool(name).is_some_and(|tool| tool.prepares_during_workspace_baseline())
+    }
+
     pub(crate) fn terminal_result_adapter(&self, name: &ToolName) -> Option<&'static str> {
         self.tool(name)?.terminal_result_adapter()
     }
@@ -2094,6 +2104,9 @@ async fn handle_any_tool(
     tool: &dyn CoreToolRuntime,
     invocation: ToolInvocation,
 ) -> Result<AnyToolResult, FunctionCallError> {
+    if !tool.prepares_during_workspace_baseline() {
+        crate::tools::parallel::wait_for_workspace_baseline().await;
+    }
     let class = invocation.step_context.tool_router()
         .map(|router| router.classify_tool_name(&invocation.step_context.turn, &invocation.tool_name))
         .unwrap_or(TypedToolClass::Unknown);
@@ -2126,6 +2139,8 @@ async fn handle_any_tool(
         .record_tool_handler_entry(invocation.tool_name.name.as_str());
     mark_tool_handler_entry();
     let output = tool.handle(invocation.clone()).await;
+    // Early argument failures must also settle capture before post-tool hooks.
+    crate::tools::parallel::wait_for_workspace_baseline().await;
     mark_tool_handler_exit();
     let mut persistence_warning = None;
     if let Some(receipt) = effect_receipt {

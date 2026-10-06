@@ -109,7 +109,7 @@ pub(crate) fn canonical_read_file_arguments(arguments: &str) -> Option<serde_jso
 pub(crate) fn reselect_read_file_output(
     previous: &str,
     requested: &str,
-    mut output: serde_json::Value,
+    output: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let previous = canonical_read_file_arguments(previous)?;
     let requested = canonical_read_file_arguments(requested)?;
@@ -168,6 +168,10 @@ pub(crate) fn reselect_read_file_output(
         }
         json!(selected)
     };
+    // Ledger candidates may belong to another file or fail to satisfy this
+    // selection. Borrow their retained bytes until a reusable selection exists;
+    // cloning them during lookup adds work while the caller holds its ledger lock.
+    let mut output = output.clone();
     output["results"] = json!(selected);
     output["complete"] = json!(true);
     output["delivered_selection_complete"] = json!(true);
@@ -364,6 +368,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 .path
                 .starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
             {
+                crate::tools::parallel::wait_for_workspace_baseline().await;
                 let (contents, path) = read_skill_locator(&invocation, &args).await?;
                 (contents, path, None)
             } else {
@@ -591,6 +596,7 @@ async fn read_environment_file(
     let sandbox = turn.file_system_sandbox_context(None, environment.cwd());
     let fs = environment.environment.get_filesystem();
     let coordinator = invocation.session.services.agent_control.task_coordinator();
+    crate::tools::parallel::wait_for_workspace_baseline().await;
     let inspection = if !environment.environment.is_remote()
         && let Some(binding) = coordinator.binding_for_source(&turn.session_source)
         && let Some(store) = coordinator.store()
@@ -717,6 +723,10 @@ async fn read_skill_locator(
 }
 
 impl CoreToolRuntime for ReadFileHandler {
+    fn prepares_during_workspace_baseline(&self) -> bool {
+        true
+    }
+
     fn cancellation_cleanup_policy(&self) -> crate::tools::registry::ToolCleanupPolicy {
         crate::tools::registry::ToolCleanupPolicy::InterruptibleRead
     }

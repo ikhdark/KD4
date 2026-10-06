@@ -69,7 +69,7 @@ fn repository_runners(cwd: &std::path::Path) -> Vec<codex_shell_command::validat
     // must not let an arbitrary echo authenticate a fabricated execution ledger.
     // Read the exact observed commit so a concurrent HEAD move cannot poison
     // this entry. Replacement refs must not change content at a cached oid.
-    let Ok(output) = std::process::Command::new("git")
+    let Ok(output) = std::process::Command::new(codex_git_utils::git_executable())
         .arg("--no-replace-objects").arg("-C").arg(&root)
         .arg("show").arg(format!("{oid}:.codex/test-runners.json")).output()
     else { return Vec::new() };
@@ -122,7 +122,7 @@ fn repository_head_oid(root: &std::path::Path) -> Option<String> {
         }
         // Unborn branches and alternate ref storage (e.g. reftable) remain
         // Git-owned. Ordinary loose/packed refs need no subprocess here.
-        let output = std::process::Command::new("git").arg("-C").arg(root.as_path())
+        let output = std::process::Command::new(codex_git_utils::git_executable()).arg("-C").arg(root.as_path())
             .args(["rev-parse", "--verify", "HEAD"]).output().ok()?;
         if !output.status.success() { return None; }
         value = String::from_utf8(output.stdout).ok()?;

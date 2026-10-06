@@ -707,6 +707,7 @@ impl RemoteAppServerClient {
             worker_handle,
         } = self;
         let mut worker_handle = worker_handle;
+        let _abort_worker = crate::AbortWorkerOnDrop(worker_handle.abort_handle());
         drop(event_rx);
         let (response_tx, response_rx) = oneshot::channel();
         // Queue admission can block behind a stalled socket write, so it must
@@ -1098,6 +1099,22 @@ fn forward_remote_event(
     }
 
     if remote_event_requires_delivery(&event) {
+        // Do not interpose a worker select pass (or a spurious backlog) while
+        // the consumer has room. Retained events and lag markers keep priority.
+        let event = if pending_delivery.is_empty() && *skipped_events == 0 {
+            match event_tx.try_send(event) {
+                Ok(()) => return Ok(None),
+                Err(mpsc::error::TrySendError::Full(event)) => event,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(IoError::new(
+                        ErrorKind::BrokenPipe,
+                        "remote app-server event consumer channel is closed",
+                    ));
+                }
+            }
+        } else {
+            event
+        };
         if *skipped_events > 0 {
             pending_delivery.push_back(AppServerEvent::Lagged {
                 skipped: *skipped_events,
@@ -1219,6 +1236,53 @@ fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn performance_probe_lossless_forwarding_uses_available_capacity() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut pending_delivery = VecDeque::new();
+        let mut skipped_events = 0;
+        let mut deferred = 0;
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert!(
+                forward_remote_event(
+                    &event_tx,
+                    &mut pending_delivery,
+                    &mut skipped_events,
+                    AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
+                        codex_app_server_protocol::AgentMessageDeltaNotification {
+                            thread_id: "thread".into(),
+                            turn_id: "turn".into(),
+                            item_id: "item".into(),
+                            delta: "hello".into(),
+                        },
+                    )),
+                )
+                .expect("forward event")
+                .is_none()
+            );
+            while let Some(event) = pending_delivery.pop_front() {
+                deferred += 1;
+                event_tx.send(event).await.expect("deliver retained event");
+            }
+            assert!(matches!(
+                event_rx.try_recv().expect("lossless event"),
+                AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
+                    notification
+                )) if notification.delta == "hello"
+            ));
+        }
+        eprintln!(
+            "remote: 10000 events, {deferred} deferred deliveries, {:?}",
+            started.elapsed()
+        );
+        assert_eq!(skipped_events, 0);
+        assert_eq!(
+            deferred, 0,
+            "available capacity must not require another worker pass"
+        );
+    }
+
     #[test]
     fn remote_debug_redacts_authentication() {
         let args = RemoteAppServerConnectArgs {
@@ -1238,6 +1302,89 @@ mod tests {
             assert!(debug.contains("[REDACTED]"));
             assert!(debug.contains("wss://example.com/rpc"));
         }
+    }
+
+    #[tokio::test]
+    async fn lossless_fast_path_preserves_retained_event_order() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut pending_delivery = VecDeque::new();
+        let mut skipped_events = 0;
+        for message in ["first", "second", "third"] {
+            forward_remote_event(
+                &event_tx,
+                &mut pending_delivery,
+                &mut skipped_events,
+                AppServerEvent::Disconnected {
+                    message: message.into(),
+                },
+            )
+            .expect("forward event");
+            if message == "second" {
+                assert!(matches!(
+                    event_rx.try_recv().expect("first event"),
+                    AppServerEvent::Disconnected { message } if message == "first"
+                ));
+                // A dropped best-effort event must be reported before the third event.
+                skipped_events = 1;
+            }
+        }
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(pending_delivery.len(), 3);
+        assert!(
+            matches!(pending_delivery.pop_front(), Some(AppServerEvent::Disconnected { message }) if message == "second")
+        );
+        assert!(matches!(
+            pending_delivery.pop_front(),
+            Some(AppServerEvent::Lagged { skipped: 1 })
+        ));
+        assert!(
+            matches!(pending_delivery.pop_front(), Some(AppServerEvent::Disconnected { message }) if message == "third")
+        );
+        assert_eq!(skipped_events, 0);
+    }
+
+    #[tokio::test]
+    async fn lossless_fast_path_does_not_reject_server_request_when_capacity_is_available() {
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let mut pending_delivery = VecDeque::new();
+        let mut skipped_events = 0;
+        let request = ServerRequest::ToolRequestUserInput {
+            request_id: RequestId::Integer(1),
+            params: codex_app_server_protocol::ToolRequestUserInputParams {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "item".into(),
+                questions: Vec::new(),
+                auto_resolution_ms: None,
+            },
+        };
+        for event in [
+            AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                codex_app_server_protocol::ThreadClosedNotification {
+                    thread_id: "other-thread".into(),
+                },
+            )),
+            AppServerEvent::ServerRequest(request),
+        ] {
+            assert!(
+                forward_remote_event(&event_tx, &mut pending_delivery, &mut skipped_events, event)
+                    .expect("forward event")
+                    .is_none(),
+                "no false overload rejection"
+            );
+        }
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AppServerEvent::ServerNotification(
+                ServerNotification::ThreadClosed(_)
+            ))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AppServerEvent::ServerRequest(_))
+        ));
+        assert!(pending_delivery.is_empty());
+        assert_eq!(skipped_events, 0);
     }
 
     #[test]
@@ -1540,5 +1687,46 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown should complete when worker exits first");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_shutdown_reaps_remote_worker() {
+        for queue_full in [false, true] {
+            let (command_tx, command_rx) = mpsc::channel(1);
+            let observer = command_tx.clone();
+            if queue_full {
+                let (response_tx, _response_rx) = oneshot::channel();
+                command_tx
+                    .try_send(RemoteClientCommand::Shutdown { response_tx })
+                    .expect("fill command queue");
+            }
+            let (_event_tx, event_rx) = mpsc::channel(1);
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let worker_handle = tokio::spawn(async move {
+                let _ = release_rx.await;
+                drop(command_rx);
+            });
+            let worker = worker_handle.abort_handle();
+            let client = RemoteAppServerClient {
+                command_tx,
+                event_rx,
+                pending_events: VecDeque::new(),
+                initialize_response: AppServerInitializeResponse::from_json(serde_json::json!({})),
+                worker_handle,
+            };
+            let mut shutdown = Box::pin(client.shutdown());
+            assert!(futures::poll!(&mut shutdown).is_pending());
+            drop(shutdown);
+            let closed = timeout(Duration::from_secs(1), observer.closed()).await;
+            // Clean up even on the failing baseline, before asserting the result.
+            worker.abort();
+            observer.closed().await;
+            drop(release_tx);
+            assert!(
+                closed.is_ok(),
+                "cancelled shutdown must not detach its worker"
+            );
+            assert!(worker.is_finished());
+        }
     }
 }

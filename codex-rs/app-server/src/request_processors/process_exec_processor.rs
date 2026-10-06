@@ -775,19 +775,19 @@ fn collect_spawn_process_output(
                 if capped_chunk.is_empty() && !cap_reached {
                     continue;
                 }
-                if !outgoing
-                    .send_server_notification_to_connection_bounded(
-                        connection_id,
-                        ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
-                            process_handle: process_handle.clone(),
-                            stream,
-                            delta_base64: STANDARD.encode(capped_chunk),
-                            cap_reached,
-                        }),
-                        &connection_cancellation,
-                    )
-                    .await
-                {
+                if !outgoing.try_send_server_notification_to_connection(
+                    connection_id,
+                    ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
+                        process_handle: process_handle.clone(),
+                        stream,
+                        delta_base64: STANDARD.encode(capped_chunk),
+                        cap_reached,
+                    }),
+                    &connection_cancellation,
+                ) {
+                    // Preserve the rejected delta and every later byte in the
+                    // exit notification; transport waits must not consume the
+                    // pipe reader's post-exit drain window.
                     stream_output = false;
                     buffer.extend_from_slice(capped_chunk);
                 }
@@ -833,6 +833,99 @@ mod tests {
     use super::*;
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
+
+    #[tokio::test(start_paused = true)]
+    async fn output_backpressure_preserves_capped_bytes_without_blocking_pipe_drain() {
+        for (saturated, cancelled) in [(true, false), (false, false), (false, true)] {
+            let (outgoing_tx, mut outgoing_rx) = mpsc::channel(2);
+            let outgoing = Arc::new(OutgoingMessageSender::new(
+                outgoing_tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            ));
+            if saturated {
+                for _ in 0..2 {
+                    assert!(outgoing.try_send_server_notification(
+                        ServerNotification::ThreadClosed(
+                            codex_app_server_protocol::ThreadClosedNotification {
+                                thread_id: "blocker".to_string(),
+                            },
+                        ),
+                    ));
+                }
+            }
+            let (output_tx, output_rx) = mpsc::channel(2);
+            output_tx
+                .send(vec![b'x'; OUTPUT_CHUNK_SIZE_HINT])
+                .await
+                .unwrap();
+            output_tx.send("€!extra".as_bytes().to_vec()).await.unwrap();
+            drop(output_tx);
+            let (_drain_tx, stdio_timeout_rx) = watch::channel(false);
+            let connection_cancellation = CancellationToken::new();
+            if cancelled {
+                connection_cancellation.cancel();
+            }
+            let started = tokio::time::Instant::now();
+            let capture = collect_spawn_process_output(SpawnProcessOutputParams {
+                connection_id: ConnectionId(42),
+                process_handle: "output".to_string(),
+                output_rx,
+                stdio_timeout_rx,
+                outgoing,
+                stream: ProcessOutputStream::Stdout,
+                stream_output: true,
+                output_bytes_cap: Some(OUTPUT_CHUNK_SIZE_HINT + "€!".len()),
+                connection_cancellation,
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "pipe drain must not wait for transport capacity"
+            );
+            let expected = format!("{}€!", "x".repeat(OUTPUT_CHUNK_SIZE_HINT));
+            assert!(capture.cap_reached);
+            if saturated || cancelled {
+                assert_eq!(capture.text, expected);
+                if saturated {
+                    for _ in 0..2 {
+                        assert!(matches!(
+                            outgoing_rx.try_recv().unwrap(),
+                            OutgoingEnvelope::Broadcast { .. }
+                        ));
+                    }
+                }
+            } else {
+                assert!(
+                    capture.text.is_empty(),
+                    "delivered bytes must not repeat in the final response"
+                );
+                let mut delivered = Vec::new();
+                for capped in [false, true] {
+                    let OutgoingEnvelope::ToConnection {
+                        connection_id,
+                        message:
+                            OutgoingMessage::AppServerNotification(
+                                ServerNotification::ProcessOutputDelta(delta),
+                            ),
+                        write_complete_tx,
+                    } = outgoing_rx.try_recv().unwrap()
+                    else {
+                        panic!("expected targeted output");
+                    };
+                    assert_eq!(connection_id, ConnectionId(42));
+                    assert!(write_complete_tx.is_none());
+                    assert_eq!(delta.process_handle, "output");
+                    assert_eq!(delta.stream, ProcessOutputStream::Stdout);
+                    assert_eq!(delta.cap_reached, capped);
+                    delivered.extend(STANDARD.decode(delta.delta_base64).unwrap());
+                }
+                assert_eq!(String::from_utf8(delivered).unwrap(), expected);
+            }
+            assert!(outgoing_rx.try_recv().is_err());
+        }
+    }
 
     #[test]
     fn logging_contract_process_spawn_metadata_omits_argv_and_env_values() {

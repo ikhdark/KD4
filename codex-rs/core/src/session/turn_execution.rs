@@ -896,7 +896,7 @@ impl SamplingRequestSignalCollector {
                                 } else if tool_name_matches(tool_name, "read_file") {
                                     let ToolPayload::Function { arguments: previous } = gate.evidence.read_payload.as_ref()? else { return None; };
                                     let ToolPayload::Function { arguments: requested } = payload else { return None; };
-                                    let output = gate.evidence.read_output.as_ref()?.clone();
+                                    let output = gate.evidence.read_output.as_ref()?;
                                     let output = crate::tools::handlers::reselect_read_file_output(previous, requested, output)?;
                                     let text = serde_json::to_string(&output).ok()?;
                                     if text.len() > SUCCESSFUL_REPLAY_OUTPUT_BYTE_LIMIT { return None; }

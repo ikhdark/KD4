@@ -303,7 +303,7 @@ impl ModelsCacheManager {
             return false;
         }
         if let Err(err) = self
-            .save_internal(&cache, expected_identity, _file_lock)
+            .save_internal(cache, expected_identity, _file_lock)
             .await
         {
             error!("failed to write models cache: {err}");
@@ -393,7 +393,7 @@ impl ModelsCacheManager {
                 "cache identity changed during TTL renewal",
             ));
         }
-        self.save_internal(&cache, expected_identity, _file_lock)
+        self.save_internal(cache, expected_identity, _file_lock)
             .await
     }
 
@@ -454,14 +454,13 @@ impl ModelsCacheManager {
 
     async fn save_internal(
         &self,
-        cache: &ModelsCache,
+        cache: ModelsCache,
         replaced_identity: &str,
         file_lock: AtomicWriteLock,
     ) -> io::Result<()> {
         // Merge under the existing cross-process lock. Revisions are scoped to
         // the selected identity, so another identity's publication is not a
         // conflict and cannot erase its independently fetched catalog.
-        let cache = cache.clone();
         let replaced_identity = replaced_identity.to_string();
         let cache_path = self.cache_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -472,7 +471,7 @@ impl ModelsCacheManager {
                 Err(err) if err.kind() == ErrorKind::NotFound => None,
                 Err(err) => return Err(err),
             };
-            let mut current = cache.clone();
+            let mut current = cache;
             if let Some(file) = existing.as_ref() {
                 // Allocate across the whole file so eviction/reinsertion cannot reuse
                 // a revision and let an older in-flight writer pass an ABA check.
@@ -491,7 +490,7 @@ impl ModelsCacheManager {
                             entry.provider_cache_identity.is_some()
                                 && entry.provider_cache_identity.as_deref()
                                     != Some(replaced_identity.as_str())
-                                && entry.provider_cache_identity != cache.provider_cache_identity
+                                && entry.provider_cache_identity != current.provider_cache_identity
                         })
                         .take(MAX_CACHED_IDENTITIES - 1)
                         .collect()
@@ -526,7 +525,7 @@ impl ModelsCacheManager {
         let current_basis = self.read_write_basis(&self.current_identity()).await?;
         f(&mut cache.fetched_at);
         cache.revision = Some(next_revision(&current_basis.disk_revision));
-        self.save_internal(&cache, &self.current_identity(), _file_lock)
+        self.save_internal(cache, &self.current_identity(), _file_lock)
             .await
     }
 
@@ -545,7 +544,7 @@ impl ModelsCacheManager {
         let current_basis = self.read_write_basis(&self.current_identity()).await?;
         f(&mut cache);
         cache.revision = Some(next_revision(&current_basis.disk_revision));
-        self.save_internal(&cache, &self.current_identity(), _file_lock)
+        self.save_internal(cache, &self.current_identity(), _file_lock)
             .await
     }
 }
@@ -1077,7 +1076,7 @@ mod tests {
                 wait.recv().expect("release");
             });
             ready.await.expect("blocking pool occupied");
-            let mut save = Box::pin(manager.save_internal(&document, "provider", file_lock));
+            let mut save = Box::pin(manager.save_internal(document, "provider", file_lock));
             std::future::poll_fn(|cx| {
                 assert!(save.as_mut().poll(cx).is_pending());
                 std::task::Poll::Ready(())

@@ -81,12 +81,13 @@ pub(crate) fn has_matching_handler(
     matcher_aliases: &[String],
 ) -> bool {
     let matcher_inputs = common::matcher_inputs(tool_name, matcher_aliases);
-    !dispatcher::select_handlers_for_matcher_inputs(
+    dispatcher::matching_handlers_for_matcher_inputs(
         handlers,
         HookEventName::PreToolUse,
         &matcher_inputs,
     )
-    .is_empty()
+    .next()
+    .is_some()
 }
 
 pub(crate) async fn run(
@@ -785,7 +786,11 @@ mod tests {
     fn matching_handler_check_respects_matchers_and_aliases() {
         let handlers = [handler()];
         assert!(super::has_matching_handler(&handlers, "Bash", &[]));
-        assert!(super::has_matching_handler(&handlers, "Write", &["Bash".to_string()]));
+        assert!(super::has_matching_handler(
+            &handlers,
+            "Write",
+            &["Bash".to_string()]
+        ));
         assert!(!super::has_matching_handler(
             &handlers,
             "apply_patch",

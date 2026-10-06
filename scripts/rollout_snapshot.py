@@ -45,7 +45,7 @@ def load_rollout_payload(path: Path, sha256: str, expected_bytes: int | None = N
     if expected_bytes is not None and metadata.st_size != expected_bytes:
         raise ValueError(f"rollout payload size mismatch: {artifact}")
     with artifact.open("rb") as handle:
-        data = handle.read(_MAX_PAYLOAD_BYTES + 1)
+        data = handle.read(metadata.st_size + 1)
     if len(data) != metadata.st_size or hashlib.sha256(data).hexdigest() != sha256:
         raise ValueError(f"rollout payload checksum mismatch: {artifact}")
     return data
@@ -313,15 +313,17 @@ def read_rollout_snapshot(path: Path) -> RolloutSnapshot:
     )
 
 
-def read_rollout_records(path: Path) -> list[tuple[dict[str, Any], int]]:
-    """Return records and their JSONL byte lengths from one fixed snapshot.
+def iter_rollout_records(path: Path) -> Iterator[tuple[dict[str, Any], int]]:
+    """Yield records and their JSONL byte lengths from one fixed snapshot.
 
     A live writer can leave an unterminated, unparseable final record. Keep the
     complete prefix with a warning, but reject corrupt complete lines and
     non-object records rather than silently presenting an incomplete report.
+
+    Exhaust the iterator before publishing results. Consumers that can stop
+    early must close it (for example, with contextlib.closing).
     """
     snapshot = read_rollout_snapshot(path)
-    records = []
     with snapshot, snapshot.open_lines() as lines:
         for number, line in enumerate(lines, 1):
             try:
@@ -341,8 +343,12 @@ def read_rollout_records(path: Path) -> list[tuple[dict[str, Any], int]]:
                 raise ValueError(
                     f"rollout record {snapshot.path}:{number} is not an object"
                 )
-            records.append((hydrate_rollout_record(record, snapshot.path), len(line)))
-    return records
+            yield hydrate_rollout_record(record, snapshot.path), len(line)
+
+
+def read_rollout_records(path: Path) -> list[tuple[dict[str, Any], int]]:
+    """Return all verified records, closing the snapshot before returning."""
+    return list(iter_rollout_records(path))
 
 
 def _parser() -> argparse.ArgumentParser:

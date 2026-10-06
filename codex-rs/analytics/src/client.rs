@@ -39,7 +39,6 @@ use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::ServerResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
@@ -598,8 +597,33 @@ impl AnalyticsEventsClient {
         });
     }
 
-    pub fn track_server_response(&self, completed_at_ms: u64, response: ServerResponse) {
-        self.record_fact(AnalyticsFact::ServerResponse {
+    pub fn track_server_response(
+        &self,
+        completed_at_ms: u64,
+        request: &ServerRequest,
+        result: &serde_json::Value,
+    ) {
+        // Only these responses are consumed by the reducer. In particular, do
+        // not clone and decode large dynamic-tool results on their delivery path.
+        // Permissions telemetry uses the separately resolved effective response.
+        if !matches!(
+            request,
+            ServerRequest::CommandExecutionRequestApproval { .. }
+                | ServerRequest::FileChangeRequestApproval { .. }
+        ) {
+            return;
+        }
+        let Some(permit) = self
+            .queue
+            .as_ref()
+            .and_then(AnalyticsEventsQueue::try_reserve)
+        else {
+            return;
+        };
+        let Ok(response) = request.response_from_result(result.clone()) else {
+            return;
+        };
+        permit.send(AnalyticsFact::ServerResponse {
             completed_at_ms,
             response: Box::new(response),
         });

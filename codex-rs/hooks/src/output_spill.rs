@@ -208,24 +208,34 @@ async fn prune_crash_leftovers_at(
 }
 
 async fn collect_spill_files(output_dir: &Path) -> std::io::Result<Vec<SpillFile>> {
-    let mut thread_dirs = match fs::read_dir(output_dir).await {
+    let output_dir = output_dir.to_path_buf();
+    // Tokio filesystem operations each dispatch blocking work. Scan the whole
+    // tree in one worker instead of yielding for every entry's metadata. Keep
+    // deletion in the caller so a cancelled scan cannot continue pruning.
+    tokio::task::spawn_blocking(move || collect_spill_files_blocking(&output_dir))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn collect_spill_files_blocking(output_dir: &Path) -> std::io::Result<Vec<SpillFile>> {
+    let mut thread_dirs = match std::fs::read_dir(output_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err),
     };
     let mut files = Vec::new();
 
-    while let Some(thread_entry) = ignore_disappeared(thread_dirs.next_entry().await)?.flatten() {
-        if !ignore_disappeared(thread_entry.file_type().await)?.is_some_and(|kind| kind.is_dir()) {
+    while let Some(thread_entry) = ignore_disappeared(thread_dirs.next().transpose())?.flatten() {
+        if !ignore_disappeared(thread_entry.file_type())?.is_some_and(|kind| kind.is_dir()) {
             continue;
         }
         let thread_dir = thread_entry.path();
-        let Some(mut thread_files) = ignore_disappeared(fs::read_dir(&thread_dir).await)? else {
+        let Some(mut thread_files) = ignore_disappeared(std::fs::read_dir(&thread_dir))? else {
             continue;
         };
-        while let Some(file_entry) = ignore_disappeared(thread_files.next_entry().await)?.flatten()
+        while let Some(file_entry) = ignore_disappeared(thread_files.next().transpose())?.flatten()
         {
-            if !ignore_disappeared(file_entry.file_type().await)?.is_some_and(|kind| kind.is_file())
+            if !ignore_disappeared(file_entry.file_type())?.is_some_and(|kind| kind.is_file())
                 || file_entry
                     .path()
                     .extension()
@@ -234,7 +244,7 @@ async fn collect_spill_files(output_dir: &Path) -> std::io::Result<Vec<SpillFile
             {
                 continue;
             }
-            let Some(metadata) = ignore_disappeared(file_entry.metadata().await)? else {
+            let Some(metadata) = ignore_disappeared(file_entry.metadata())? else {
                 continue;
             };
             files.push(SpillFile {

@@ -153,7 +153,7 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
 }
 
 fn resolve_git_root(cwd: &Path) -> io::Result<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new(crate::git_executable())
         .arg("rev-parse")
         .arg("--show-toplevel")
         .current_dir(cwd)
@@ -205,7 +205,7 @@ fn run_git_output_os(
     args: &[OsString],
     env: Option<&[(OsString, OsString)]>,
 ) -> io::Result<std::process::Output> {
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = std::process::Command::new(crate::git_executable());
     for p in git_cfg {
         cmd.arg(p);
     }
@@ -458,7 +458,7 @@ fn tracked_paths_in_index(
     if paths.is_empty() {
         return Ok(std::collections::BTreeSet::new());
     }
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = std::process::Command::new(crate::git_executable());
     cmd.args(git_cfg).args(["ls-files", "-z", "--"]);
     cmd.args(paths)
         .envs(env.iter().cloned())
@@ -480,7 +480,7 @@ fn tracked_paths_in_index(
 }
 
 fn resolve_index_path(git_root: &Path) -> io::Result<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new(crate::git_executable())
         .args(["rev-parse", "--git-path", "index"])
         .current_dir(git_root)
         .output()?;

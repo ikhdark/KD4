@@ -3,7 +3,7 @@ use serde_json::json;
 
 fn evidence_schema() -> Value {
     serde_json::from_str(include_str!(
-        "../../../../docs/schemas/investigation-evidence-v1.schema.json"
+        "../fixtures/investigation-evidence-v1.schema.json"
     ))
     .expect("investigation evidence schema should be valid JSON")
 }

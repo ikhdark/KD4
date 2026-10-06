@@ -494,6 +494,152 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
 }
 
 #[tokio::test]
+async fn typed_turn_preparation_rejects_sealed_or_stale_attempts_before_sampling() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .unwrap();
+    let coordinator = AgentTaskCoordinator::default();
+    coordinator
+        .initialize(state, "root-session".to_string())
+        .await
+        .unwrap();
+    for completed in [true, false] {
+        let mut draft = assignment_draft();
+        draft.workspace_strategy = WorkspaceStrategy::Shared;
+        if completed {
+            draft.role = AgentRole::Explorer;
+            draft.capability_profile = CapabilityProfile::ReadSearch;
+            draft.required_evidence.clear();
+        }
+        let (assignment, attempt) = coordinator
+            .create_assignment(repo.path(), draft)
+            .await
+            .unwrap();
+        let task_name = format!("typed_followup_{completed}");
+        let path = AgentPath::root().join(&task_name).unwrap();
+        let thread_id = ThreadId::new();
+        coordinator
+            .bind_agent_task(AgentTaskBindingDraft {
+                assignment_id: assignment.assignment_id,
+                attempt_id: attempt.attempt_id,
+                agent_path: path.to_string(),
+                task_name,
+                thread_id: Some(thread_id.to_string()),
+            })
+            .await
+            .unwrap();
+        let source =
+            SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::new(),
+                depth: 1,
+                agent_path: Some(path),
+                agent_nickname: None,
+                agent_role: None,
+            });
+        coordinator
+            .prepare_legacy_agent_turn(&source, thread_id)
+            .await
+            .expect("the current active typed attempt remains admissible");
+        let store = coordinator.required_store().unwrap();
+        let receipt = store
+            .submit_agent_receipt(
+                attempt.attempt_id,
+                ReceiptDraft {
+                    status: if completed {
+                        AgentStatusClaim::Completed
+                    } else {
+                        AgentStatusClaim::NeedsMain
+                    },
+                    summary: "retained task result".to_string(),
+                    criterion_results: vec![CriterionResult {
+                        criterion_id: "criterion".to_string(),
+                        status: if completed {
+                            CriterionStatus::Passed
+                        } else {
+                            CriterionStatus::NotRun
+                        },
+                        evidence: completed.then(|| "read-only findings".to_string()),
+                        evidence_ref: None,
+                    }],
+                    declared_changes: Vec::new(),
+                    validation_call_ids: Vec::new(),
+                    blockers: Vec::new(),
+                    risks: Vec::new(),
+                    next_action: None,
+                    architecture_contract: None,
+                },
+            )
+            .await
+            .unwrap();
+        let error = coordinator
+            .prepare_legacy_agent_turn(&source, thread_id)
+            .await
+            .expect_err("sealed typed work must fail before a model or tool request");
+        assert!(error.to_string().contains("no active bound attempt"));
+        assert!(error.to_string().contains("get_agent_task"));
+        assert!(
+            error
+                .to_string()
+                .contains(&assignment.assignment_id.to_string())
+        );
+        let retained = store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(retained.current_attempt.attempt_id, attempt.attempt_id);
+        assert_eq!(retained.current_attempt.ordinal, 0);
+        assert_eq!(retained.receipt, Some(receipt));
+
+        if !completed {
+            store
+                .set_agent_gate(
+                    TaskActor::Root,
+                    assignment.assignment_id,
+                    codex_agent_task_store::GateKind::Review,
+                    codex_agent_task_store::GateStatus::ChangesRequested,
+                    "explicit bounded correction required".to_string(),
+                )
+                .await
+                .unwrap();
+            let next = store
+                .amend_agent_task(
+                    TaskActor::Root,
+                    assignment.assignment_id,
+                    codex_agent_task_store::AttemptAmendment {
+                        reason: "apply the requested correction".to_string(),
+                        objective: None,
+                        acceptance_criteria: None,
+                        stop_condition: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                coordinator
+                    .prepare_legacy_agent_turn(&source, thread_id)
+                    .await
+                    .is_err(),
+                "an active replacement must not authorize the stale cached binding"
+            );
+            coordinator
+                .refresh_binding(assignment.assignment_id)
+                .await
+                .unwrap();
+            coordinator
+                .prepare_legacy_agent_turn(&source, thread_id)
+                .await
+                .expect("an explicitly admitted, rebound correction remains admissible");
+            assert_eq!(
+                coordinator.binding_for_source(&source).unwrap().attempt_id,
+                next.attempt_id
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn binding_refresh_reconciles_absence_and_old_child_cannot_seal_reused_path() {
     let home = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();

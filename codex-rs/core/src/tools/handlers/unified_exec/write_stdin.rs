@@ -154,7 +154,7 @@ impl WriteStdinHandler {
             if !wait_for_output || response.as_ref().map_or(true, |output| {
                 output.process_exited || !output.raw_output.is_empty()
                     || !output.pending_deferred_completions.is_empty()
-                    || source.nested_deadline().is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    || nested_return_margin_reached(source.nested_deadline(), std::time::Instant::now())
             }) {
                 break response;
             }
@@ -238,10 +238,22 @@ impl WriteStdinHandler {
                 .await;
         }
 
-        Ok(boxed_tool_output(
-            response,
-        ))
+        response.prepare_recovery_artifact(
+            turn.config.codex_home.as_path(), &session.thread_id.to_string(),
+        ).await;
+        Ok(boxed_tool_output(response))
     }
+}
+
+fn nested_return_margin_reached(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    // The manager already ended observation early enough to return a handle.
+    // Do not consume its transport headroom by entering another empty wait.
+    deadline.is_some_and(|deadline| {
+        deadline.saturating_duration_since(now) <= crate::unified_exec::NESTED_POLL_MARGIN
+    })
 }
 
 fn owner_wait_yield_time_ms(
@@ -312,6 +324,19 @@ impl CoreToolRuntime for WriteStdinHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passive_nested_wait_preserves_the_manager_return_margin() {
+        let now = std::time::Instant::now();
+        let margin = crate::unified_exec::NESTED_POLL_MARGIN;
+        assert!(!nested_return_margin_reached(None, now));
+        assert!(nested_return_margin_reached(Some(now - margin), now));
+        assert!(nested_return_margin_reached(Some(now), now));
+        assert!(nested_return_margin_reached(Some(now + margin), now));
+        assert!(!nested_return_margin_reached(
+            Some(now + margin + std::time::Duration::from_nanos(1)), now,
+        ));
+    }
 
     #[test]
     fn passive_poll_default_preserves_explicit_bounds_and_writes() {

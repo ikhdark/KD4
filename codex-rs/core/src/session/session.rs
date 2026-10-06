@@ -1856,7 +1856,8 @@ impl Session {
                     thread_id.to_string(),
                     session_configuration.cwd().as_path(),
                 )
-                .await;
+                .await
+                .with_workspace_cache(Arc::clone(&git_workspace));
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
                 // instance. It will be replaced with one created via

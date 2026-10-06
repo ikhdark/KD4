@@ -87,6 +87,8 @@ const REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 const REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
+const REMOTE_CONTROL_REPLAY_BATCH_MESSAGES: usize = 64;
+const REMOTE_CONTROL_REPLAY_BATCH_TARGET_BYTES: usize = 64 * 1024;
 const REMOTE_APP_SERVER_NOT_FOUND_DETAIL: &str = "Remote app server not found";
 
 #[cfg(test)]
@@ -1118,10 +1120,8 @@ impl RemoteControlWebsocket {
         state: Arc<Mutex<WebsocketState>>,
         server_event_rx: Arc<Mutex<mpsc::Receiver<super::QueuedServerEnvelope>>>,
         mut used_rx: watch::Receiver<usize>,
-        mut websocket_writer: SplitSink<
-            WebSocketStream<MaybeTlsStream<TcpStream>>,
-            tungstenite::Message,
-        >,
+        mut websocket_writer: impl futures::Sink<tungstenite::Message, Error = tungstenite::Error>
+        + Unpin,
         ping_interval: std::time::Duration,
         shutdown_token: CancellationToken,
     ) -> io::Result<()> {
@@ -1132,15 +1132,33 @@ impl RemoteControlWebsocket {
             .server_envelopes()
             .map(|envelope| envelope.payload.clone())
             .collect::<Vec<_>>();
-        for payload in payloads {
+        let payload_count = payloads.len();
+        let mut batch_messages = 0;
+        let mut batch_bytes = 0;
+        for (index, payload) in payloads.into_iter().enumerate() {
+            batch_messages += 1;
+            batch_bytes += payload.len();
             tokio::select! {
                 _ = shutdown_token.cancelled() => return Ok(()),
-                send_result = websocket_writer.send(tungstenite::Message::Text(payload)) => {
+                send_result = websocket_writer.feed(tungstenite::Message::Text(payload)) => {
                     if let Err(err) = send_result {
                         return Err(io::Error::other(err));
                     }
                 }
             };
+            // Replay is already buffered: coalesce bounded bursts without waiting
+            // for new messages, and leave ACK ownership with the reader.
+            if batch_messages >= REMOTE_CONTROL_REPLAY_BATCH_MESSAGES
+                || batch_bytes >= REMOTE_CONTROL_REPLAY_BATCH_TARGET_BYTES
+                || index + 1 == payload_count
+            {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => return Ok(()),
+                    result = websocket_writer.flush() => result.map_err(io::Error::other)?,
+                }
+                batch_messages = 0;
+                batch_bytes = 0;
+            }
         }
 
         let mut ping_interval =
@@ -3193,6 +3211,195 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn replay_batches_preserve_frames_and_bound_flushes() {
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::task::Context;
+        use std::task::Poll;
+
+        struct CountFlushes<S> {
+            sink: S,
+            flushes: Arc<AtomicUsize>,
+            flushing: bool,
+        }
+        impl<S: futures::Sink<tungstenite::Message> + Unpin> futures::Sink<tungstenite::Message>
+            for CountFlushes<S>
+        {
+            type Error = S::Error;
+
+            fn poll_ready(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Pin::new(&mut self.sink).poll_ready(cx)
+            }
+
+            fn start_send(
+                mut self: Pin<&mut Self>,
+                item: tungstenite::Message,
+            ) -> Result<(), Self::Error> {
+                Pin::new(&mut self.sink).start_send(item)
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                if !self.flushing {
+                    self.flushes.fetch_add(1, Ordering::Relaxed);
+                    self.flushing = true;
+                }
+                let result = Pin::new(&mut self.sink).poll_flush(cx);
+                if result.is_ready() {
+                    self.flushing = false;
+                }
+                result
+            }
+
+            fn poll_close(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Pin::new(&mut self.sink).poll_close(cx)
+            }
+        }
+
+        let mut observed = Vec::new();
+        for (count, summary_bytes) in [(1, 1), (130, 1), (3, 70 * 1024)] {
+            let (client, mut peer) = connected_websocket_pair().await;
+            let (sink, _reader) = client.split();
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let sink = CountFlushes {
+                sink,
+                flushes: Arc::clone(&flushes),
+                flushing: false,
+            };
+            let (mut outbound_buffer, used_rx) = BoundedOutboundBuffer::new();
+            let client_id = ClientId("client".to_string());
+            let mut expected = Vec::new();
+            for seq_id in 1..=count {
+                let envelope =
+                    server_envelope(&client_id, "stream", seq_id, &"x".repeat(summary_bytes));
+                expected.push(serde_json::to_value(&envelope).expect("envelope should serialize"));
+                outbound_buffer.insert(&envelope);
+            }
+            let state = Arc::new(Mutex::new(WebsocketState {
+                outbound_buffer,
+                subscribe_cursor: None,
+                next_seq_id_by_stream: HashMap::new(),
+                last_completed_client_chunk_seq_id_by_stream: HashMap::new(),
+                client_segment_reassembler: ClientSegmentReassembler::default(),
+            }));
+            let (_tx, rx) = mpsc::channel(1);
+            let shutdown = CancellationToken::new();
+            let writer = tokio::spawn(RemoteControlWebsocket::run_server_writer_inner(
+                state.clone(),
+                Arc::new(Mutex::new(rx)),
+                used_rx.clone(),
+                sink,
+                Duration::from_secs(60),
+                shutdown.clone(),
+            ));
+            for envelope in expected {
+                assert_eq!(read_server_text_event(&mut peer).await, envelope);
+            }
+            shutdown.cancel();
+            writer
+                .await
+                .expect("writer joins")
+                .expect("writer shuts down");
+            assert_eq!(
+                *used_rx.borrow(),
+                count as usize,
+                "replay must not acknowledge itself"
+            );
+            assert_eq!(
+                state
+                    .lock()
+                    .await
+                    .outbound_buffer
+                    .server_envelopes()
+                    .count(),
+                count as usize
+            );
+            let flushes = flushes.load(Ordering::Relaxed);
+            eprintln!("replay frames={count} summary_bytes={summary_bytes} flushes={flushes}");
+            observed.push(flushes);
+        }
+        assert_eq!(observed, vec![1, 3, 3]);
+    }
+
+    #[tokio::test]
+    async fn interrupted_replay_retains_buffer_and_does_not_complete_queued_output() {
+        for blocked in [false, true] {
+            let (mut outbound_buffer, used_rx) = BoundedOutboundBuffer::new();
+            let client_id = ClientId("client".to_string());
+            let envelope = server_envelope(&client_id, "stream", 1, "replay");
+            outbound_buffer.insert(&envelope);
+            let state = Arc::new(Mutex::new(WebsocketState {
+                outbound_buffer,
+                subscribe_cursor: None,
+                next_seq_id_by_stream: HashMap::new(),
+                last_completed_client_chunk_seq_id_by_stream: HashMap::new(),
+                client_segment_reassembler: ClientSegmentReassembler::default(),
+            }));
+            let (tx, rx) = mpsc::channel(1);
+            let rx = Arc::new(Mutex::new(rx));
+            let (done_tx, mut done_rx) = oneshot::channel();
+            tx.try_send(super::super::QueuedServerEnvelope {
+                client_id,
+                stream_id: StreamId("stream".to_string()),
+                event: envelope.event,
+                write_complete_tx: Some(done_tx),
+            })
+            .expect("queue accepts output");
+            let shutdown = CancellationToken::new();
+            let sink = Box::pin(futures::sink::unfold((), move |(), _| async move {
+                if blocked {
+                    futures::future::pending::<()>().await;
+                }
+                Err::<(), _>(tungstenite::Error::Io(io::Error::other(
+                    "test flush failure",
+                )))
+            }));
+            let mut writer = Box::pin(RemoteControlWebsocket::run_server_writer_inner(
+                state.clone(),
+                rx.clone(),
+                used_rx.clone(),
+                sink,
+                Duration::from_secs(60),
+                shutdown.clone(),
+            ));
+            if blocked {
+                assert!(futures::poll!(&mut writer).is_pending());
+                shutdown.cancel();
+                timeout(Duration::from_secs(1), writer)
+                    .await
+                    .expect("shutdown interrupts blocked replay")
+                    .expect("clean shutdown");
+            } else {
+                let err = writer
+                    .await
+                    .expect_err("failed replay must stop the writer");
+                assert!(err.to_string().contains("test flush failure"));
+            }
+            assert_eq!(*used_rx.borrow(), 1);
+            let state = state.lock().await;
+            assert_eq!(state.outbound_buffer.server_envelopes().count(), 1);
+            assert!(state.next_seq_id_by_stream.is_empty());
+            assert!(matches!(
+                done_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            drop(rx);
+            assert!(
+                done_rx.await.is_err(),
+                "unsent output cannot report completion"
+            );
+        }
+    }
     #[tokio::test]
     async fn run_server_writer_inner_sends_periodic_ping_frames() {
         let (client_stream, mut server_stream) = connected_websocket_pair().await;

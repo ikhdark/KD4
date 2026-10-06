@@ -212,7 +212,7 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
         codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
     );
     assert!(
-        instructions_text.contains("Tests must prevent a concrete behavioral failure or meaningful regression.")
+        instructions_text.contains("Add tests only to prevent concrete behavioral failures")
     );
     assert!(!instructions_text.contains("{{ personality }}"));
 
@@ -880,6 +880,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
     .await;
 
     let mut builder = test_codex()
+        .with_remote_models()
         .with_auth(codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config

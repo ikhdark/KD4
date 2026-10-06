@@ -1335,7 +1335,7 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
                 calls.append("generate")
                 return 0
 
-            def stable_check(_root):
+            def stable_check(_root, snapshot_root=None):
                 self.assertEqual(stable.read_bytes(), b'{"stable": true}\n')
                 self.assertEqual(list(stable.parent.iterdir()), [stable])
                 calls.append("check")
@@ -1344,6 +1344,7 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
             with (
                 mock.patch.object(schema, "repo_root", return_value=root),
                 mock.patch.object(schema, "run", side_effect=generate),
+                mock.patch.object(schema, "snapshot_python_sdk_contract") as snapshot,
                 mock.patch.object(
                     schema, "run_protocol_check", side_effect=stable_check
                 ),
@@ -1358,6 +1359,7 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
                     0,
                 )
             self.assertEqual(calls, ["generate", "check", "check"])
+            snapshot.assert_called_once()
             self.assertTrue(
                 (
                     root / "dist/app-server-schema-experimental/json/experimental.json"

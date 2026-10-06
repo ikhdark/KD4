@@ -87,10 +87,16 @@ impl<T: HttpTransport> EndpointSession<T> {
         method: Method,
         path: &str,
         extra_headers: HeaderMap,
-        body: Option<Value>,
+        body: Option<EncodedJsonBody>,
     ) -> Result<Response, ApiError> {
-        self.execute_with(method, path, extra_headers, body, |_| {})
-            .await
+        self.execute_body_with(
+            method,
+            path,
+            extra_headers,
+            body.map(RequestBody::EncodedJson),
+            |_| {},
+        )
+        .await
     }
 
     #[instrument(
@@ -104,9 +110,9 @@ impl<T: HttpTransport> EndpointSession<T> {
         method: Method,
         path: &str,
         extra_headers: HeaderMap,
-        body: Option<Value>,
+        body: Option<EncodedJsonBody>,
     ) -> Result<Response, ApiError> {
-        let body = body.map(RequestBody::Json);
+        let body = body.map(RequestBody::EncodedJson);
         let request = self.make_request(&method, path, &extra_headers, body);
         let request = prepare_request(request).await?;
         let make_request = || request.clone();

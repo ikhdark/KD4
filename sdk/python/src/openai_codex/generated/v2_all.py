@@ -10004,6 +10004,13 @@ class TurnTiming(BaseModel):
     classification_complete: Annotated[bool, Field(alias="classificationComplete")]
     completed_at_unix_ms: Annotated[int | None, Field(alias="completedAtUnixMs")] = None
     counters: TurnTimingCounters
+    credit_delta: Annotated[
+        str | None,
+        Field(
+            alias="creditDelta",
+            description="Observed starting minus ending account credit balance, not an isolated invoice: concurrent turns, replenishments, or delayed reports may affect it.",
+        ),
+    ] = None
     deterministic_continuation_receipt_overflow: Annotated[
         int | None, Field(alias="deterministicContinuationReceiptOverflow", ge=0)
     ] = 0

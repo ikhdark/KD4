@@ -21,7 +21,6 @@ use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestPayload;
-use codex_app_server_protocol::ServerResponse;
 use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
 use codex_otel::span_w3c_trace_context;
 use codex_protocol::ThreadId;
@@ -1074,16 +1073,11 @@ impl OutgoingMessageSender {
         match entry {
             TakeCallbackResult::Taken(id, entry) => {
                 let completed_at_ms = now_unix_timestamp_ms();
-                if let Ok(response) = entry.request.response_from_result(result.clone())
-                    && !matches!(
-                        response,
-                        ServerResponse::PermissionsRequestApproval { .. }
-                            | ServerResponse::ChatgptAuthTokensRefresh { .. }
-                    )
-                {
-                    self.analytics_events_client
-                        .track_server_response(completed_at_ms, response);
-                }
+                self.analytics_events_client.track_server_response(
+                    completed_at_ms,
+                    &entry.request,
+                    &result,
+                );
                 if let Err(err) = entry.callback.send(Ok(result)) {
                     warn!("could not notify callback for {id:?} due to: {err:?}");
                 }
@@ -1447,6 +1441,26 @@ impl OutgoingMessageSender {
             return false;
         }
         true
+    }
+
+    /// Tries a resource-owned delta without blocking its pipe reader. The caller
+    /// must retain rejected bytes for its terminal response instead of dropping them.
+    pub(crate) fn try_send_server_notification_to_connection(
+        &self,
+        connection_id: ConnectionId,
+        notification: ServerNotification,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        if cancellation.is_cancelled() || self.delivery_shutdown.is_cancelled() {
+            return false;
+        }
+        self.notification_sender()
+            .try_send(OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::AppServerNotification(notification),
+                write_complete_tx: None,
+            })
+            .is_ok()
     }
 
     pub(crate) async fn send_server_notification_to_connections(
@@ -3388,14 +3402,14 @@ mod tests {
             .replay_requests_to_connection_for_thread(connections[1], thread_id, true)
             .await;
         assert!(rx.try_recv().is_err());
+        let expected = json!({
+            "success": true,
+            "contentItems": [{"type": "inputText", "text": "x".repeat(1024 * 1024)}],
+        });
         outgoing
-            .notify_client_response(
-                connections[1],
-                request_id,
-                json!({"success":true,"contentItems":[]}),
-            )
+            .notify_client_response(connections[1], request_id, expected.clone())
             .await;
-        assert!(result.await.unwrap().is_ok());
+        assert_eq!(result.await.unwrap(), Ok(expected));
     }
 
     #[tokio::test]
@@ -3661,7 +3675,7 @@ mod tests {
         verify_initial_request_delivery_failure(/*cancel_before_capacity*/ true).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn initial_request_delivery_budget_releases_callback_without_draining_transport() {
         verify_initial_request_delivery_failure(/*cancel_before_capacity*/ false).await;
     }
@@ -3739,7 +3753,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn partial_request_delivery_timeout_releases_callback_after_delivered_peer_disconnects() {
         let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(1);
         let outgoing = Arc::new(OutgoingMessageSender::new(
@@ -3792,7 +3806,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn initial_delivery_timeout_preserves_a_concurrently_replayed_recipient() {
         verify_initial_delivery_replay_authority(false).await;
         verify_initial_delivery_replay_authority(true).await;

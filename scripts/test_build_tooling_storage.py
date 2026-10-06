@@ -341,7 +341,226 @@ class WarmLaneReservationTest(unittest.TestCase):
         )
 
 
+    def test_named_runner_context_tracks_build_profile_not_test_policy(self):
+        runner = [sys.executable, str(REPO_ROOT / "scripts" / "rust_test_runner.py")]
+        context = lambda command: rust_build_status.cargo_build_context(
+            self.repo, command, {}
+        )
+        plain = context([*runner, "run-target", "app_server_lib"])
+        small = context([*runner, "--cargo-profile", "dev-small", "run-target", "app_server_lib"])
+        self.assertNotEqual(plain, small)
+        self.assertEqual(small["options"], ["--profile", "dev-small"])
+        for policy in ("fast", "local"):
+            for flags in (["--profile", policy], ["--profile=" + policy]):
+                with self.subTest(flags=flags):
+                    self.assertEqual(
+                        plain, context([*runner, "run-target", *flags, "app_server_lib"])
+                    )
+                    self.assertEqual(
+                        small, context([*runner, "--cargo-profile=dev-small", "run-target", *flags, "app_server_lib"])
+                    )
+        self.assertEqual(
+            small, context(["just", "_core-test-small-reserved", "app_server_lib", "--profile", "local"])
+        )
+        self.assertEqual(
+            plain, context(["just", "_core-test-reserved", "fast", "app_server_lib", "--profile", "local"])
+        )
+        self.assertEqual(
+            plain, context(["just", "_core-gate-reserved", "example", "--profile", "local"])
+        )
+        # Only the exact local runner owns this profile contract.
+        foreign = context([sys.executable, "foreign/rust_test_runner.py", "--profile", "local"])
+        self.assertEqual(foreign["options"], ["--profile", "local"])
+        opaque = context([sys.executable, "-X", "utf8", runner[1], "--profile", "local"])
+        self.assertEqual(opaque["options"], ["--profile", "local"])
+
+    def test_named_test_policy_change_uses_idle_compatible_lane(self):
+        runner = [sys.executable, str(REPO_ROOT / "scripts" / "rust_test_runner.py")]
+        command = lambda profile: [*runner, "run-target", "--profile", profile, "app_server_lib"]
+        context = lambda profile: rust_build_status.cargo_build_context(
+            self.repo, command(profile), {}
+        )
+        busy, idle = self.warm("core-tests"), self.warm("core-tests-2")
+        (busy / ".lane-build-context.json").write_text(json.dumps(context("local")))
+        (idle / ".lane-build-context.json").write_text(json.dumps(context("fast")))
+        owner = rust_build_status._try_acquire_binary_file_lock(busy / ".lane-active.lock")
+        self.assertIsNotNone(owner)
+        try:
+            with mock.patch.object(rust_build_status.time, "sleep") as sleep:
+                with self.reserve(build_context=context("local"), warm_wait_seconds=0) as (_, selected):
+                    self.assertEqual(selected, idle)
+                    self.assertTrue(rust_build_status.lane_active_lock_is_held(busy))
+                sleep.assert_not_called()
+            self.assertFalse((self.root / "core-tests-3").exists())
+        finally:
+            rust_build_status._release_binary_file_lock(owner)
+            owner.close()
+
+
+class NamedRunnerLanePreflightTest(unittest.TestCase):
+    def test_invalid_filters_fail_before_reservation_or_child_work(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            runner = REPO_ROOT / "scripts" / "rust_test_runner.py"
+            for filters in (
+                ["--offline"],
+                ["-p", "another-package"],
+                ["--no-tests=pass"],
+                ["--profile"],
+                ["--command-timeout-seconds", "0"],
+                ["--", "--nocapture"],
+            ):
+                with (
+                    self.subTest(filters=filters),
+                    mock.patch.object(rust_build_status, "reserve_cargo_lane") as reserve,
+                    mock.patch.object(rust_build_status, "run_owned") as run,
+                    mock.patch.object(rust_build_status, "local_rust_env") as setup,
+                    self.assertRaises(ValueError),
+                ):
+                    rust_build_status.run_in_cargo_lane(
+                        repo_root=repo, requested_lane="core-tests",
+                        command=[sys.executable, str(runner), "run-target", "app_server_lib", "--", *filters],
+                    )
+                reserve.assert_not_called()
+                setup.assert_not_called()
+                run.assert_not_called()
+            self.assertFalse((repo / "codex-rs" / "target").exists())
+
+    def test_preflight_preserves_valid_arguments_without_loading_metadata(self):
+        from scripts import rust_test_runner
+
+        runner = REPO_ROOT / "scripts" / "rust_test_runner.py"
+        for arguments in (
+            ["run-target", "app_server_lib", "--", "-E", "test(example)"],
+            ["run-target", "core_lib", "--all", "--no-fail-fast", "--profile", "fast"],
+            ["--target-dir", "relative", "run-target", "app_server_lib", "-E", "test(example)", "--", "--exact", "example", "--skip", "excluded"],
+            ["run-target", "app_server_lib", "--command-timeout-seconds=30"],
+            ["run-gate", "example", "--profile", "fast"],
+        ):
+            command = [sys.executable, str(runner), *arguments]
+            original = list(command)
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch.object(rust_test_runner, "load_metadata") as metadata,
+                mock.patch.object(rust_test_runner.Manifest, "load") as manifest,
+            ):
+                rust_build_status._guard_named_runner_args(command)
+            self.assertEqual(command, original)
+            metadata.assert_not_called()
+            manifest.assert_not_called()
+
+    def test_opaque_foreign_and_help_commands_remain_with_their_owners(self):
+        from scripts import rust_test_runner
+
+        runner = str(REPO_ROOT / "scripts" / "rust_test_runner.py")
+        for command in (
+            ["python", "other/rust_test_runner.py", "run-target", "example", "--offline"],
+            ["python", "-X", "utf8", runner, "run-target", "example"],
+            ["other-interpreter", runner, "run-target", "example"],
+            [sys.executable, runner, "--help"],
+        ):
+            with (
+                self.subTest(command=command),
+                mock.patch.object(rust_test_runner, "build_parser") as parser,
+            ):
+                rust_build_status._guard_named_runner_args(command)
+            parser.assert_not_called()
+
+    def test_parser_failure_retains_lane_timing_without_reserving(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            timing = repo / "timing.json"
+            with (
+                mock.patch.object(rust_build_status, "reserve_cargo_lane") as reserve,
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaisesRegex(ValueError, "no build lane was reserved"),
+            ):
+                rust_build_status.run_in_cargo_lane(
+                    repo_root=repo, requested_lane="core-tests", timing_path=timing,
+                    command=[sys.executable, str(REPO_ROOT / "scripts" / "rust_test_runner.py"), "run-target"],
+                )
+            reserve.assert_not_called()
+            receipt = json.loads(timing.read_text())
+            self.assertEqual(receipt["status"], "error")
+            self.assertIsNone(receipt["resolvedLane"])
+            self.assertIsNone(receipt["phaseDurationsMs"]["command"])
+
+
 class BuildToolingStorageTest(unittest.TestCase):
+    def test_wrong_checkout_cwd_fails_before_lane_reservation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            (repo / "codex-rs").mkdir()
+            (repo / "codex-rs" / "Cargo.toml").write_text("[workspace]\n")
+            timing = repo / "timing.json"
+            with (
+                contextlib.chdir(repo),
+                mock.patch.object(
+                    rust_build_status, "reserve_cargo_lane",
+                    side_effect=RuntimeError("must not wait for a lane"),
+                ) as reserve,
+                mock.patch.object(rust_build_status, "run_owned") as run,
+                self.assertRaisesRegex(ValueError, "working directory.*codex-rs"),
+            ):
+                rust_build_status.run_in_cargo_lane(
+                    repo_root=repo, requested_lane="core-tests",
+                    command=["cargo", "test", "-p", "codex-git-utils", "--lib"],
+                    warm_wait_seconds=600, timing_path=timing,
+                )
+            reserve.assert_not_called()
+            run.assert_not_called()
+            self.assertFalse((repo / "codex-rs" / "target").exists())
+            receipt = json.loads(timing.read_text())
+            self.assertEqual(receipt["status"], "error")
+            self.assertIsNone(receipt["resolvedLane"])
+            self.assertIsNone(receipt["phaseDurationsMs"]["command"])
+
+    def test_checkout_cwd_guard_preserves_explicit_paths_and_non_build_commands(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            rust = repo / "codex-rs"
+            rust.mkdir()
+            (rust / "Cargo.toml").write_text("[workspace]\n")
+            allowed = [
+                ["cargo", "check", "--manifest-path", "codex-rs/Cargo.toml"],
+                ["cargo", "check", "--manifest-path=codex-rs/Cargo.toml"],
+                ["cargo", "-C", "codex-rs", "check"],
+                ["cargo", "-Ccodex-rs", "check"],
+                ["cargo", "check", "--help"],
+                ["cargo", "test", "-h"],
+                ["cargo", "--version"],
+                ["cargo", "install", "tool"],
+                ["cargo", "nextest", "run", "--archive-file", "tests.tar.zst"],
+                ["cargo", "watch", "-C", "codex-rs", "-xcheck"],
+                ["python", "build.py"],
+                [],
+            ]
+            with contextlib.chdir(repo):
+                for command in allowed:
+                    with self.subTest(command=command):
+                        rust_build_status._guard_cargo_checkout_cwd(command, repo)
+                for command in [
+                    ["cargo", "check"],
+                    ["cargo.exe", "+nightly", "--color", "always", "build"],
+                    ["cargo", "t", "-p", "example"],
+                    # Flags forwarded to the executable are not Cargo overrides.
+                    ["cargo", "run", "--", "--manifest-path", "other.toml"],
+                    ["cargo", "test", "--", "--help"],
+                ]:
+                    with self.subTest(command=command), self.assertRaises(ValueError):
+                        rust_build_status._guard_cargo_checkout_cwd(command, repo)
+            with contextlib.chdir(rust):
+                rust_build_status._guard_cargo_checkout_cwd(["cargo", "check"], repo)
+            # A real manifest in the checkout or an ancestor still belongs to Cargo.
+            with contextlib.chdir(repo):
+                (repo / "Cargo.toml").write_text("[workspace]\n")
+                rust_build_status._guard_cargo_checkout_cwd(["cargo", "check"], repo)
+            nested = repo / "nested"
+            (nested / "codex-rs").mkdir(parents=True)
+            (nested / "codex-rs" / "Cargo.toml").write_text("[workspace]\n")
+            with contextlib.chdir(nested):
+                rust_build_status._guard_cargo_checkout_cwd(["cargo", "check"], nested)
+
     def test_dry_prune_reuses_target_inventory_with_independent_partition_budgets(self):
         for location in ("lanes", "nested/lanes", "external"):
             with self.subTest(location=location), tempfile.TemporaryDirectory() as temp:
@@ -492,7 +711,8 @@ class BuildToolingStorageTest(unittest.TestCase):
             output = repo / "timing.json"
             target = repo / "codex-rs" / "target" / "lanes" / "unit"
 
-            def child(command, *, env, check, stdout, stderr, prepare_sccache):
+            def child(command, *, env, check, stdout, stderr, prepare_sccache, creationflags):
+                self.assertEqual(creationflags, getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
                 self.assertTrue(prepare_sccache)
                 self.assertIs(stdout, sys.stdout)
                 self.assertIs(stderr, sys.stderr)
@@ -567,6 +787,7 @@ class BuildToolingStorageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "timing.json"
             with (
+                contextlib.chdir(REPO_ROOT / "codex-rs"),
                 mock.patch.object(
                     rust_build_status,
                     "reserve_cargo_lane",
@@ -1552,7 +1773,8 @@ class BuildToolingStorageTest(unittest.TestCase):
                     mock.patch.object(rust_build_status, "run_owned") as run,
                 ):
 
-                    def child(command, *, env, check, stdout, stderr, prepare_sccache):
+                    def child(command, *, env, check, stdout, stderr, prepare_sccache, creationflags):
+                        self.assertEqual(creationflags, getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
                         self.assertTrue(prepare_sccache)
                         self.assertIs(stdout, sys.stdout)
                         self.assertIs(stderr, sys.stderr)

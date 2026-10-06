@@ -64,6 +64,8 @@ fn spawn_http_listener(
                     Err(error) => panic!("HTTP listener should accept: {error}"),
                 }
             };
+            // Accepted Windows sockets can inherit the listener's nonblocking mode.
+            stream.set_nonblocking(false).expect("set stream blocking");
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("HTTP stream should get a read timeout");
@@ -545,38 +547,54 @@ impl Write for TestLogSink {
 #[test]
 fn system_proxy_resolution_is_single_flight() {
     let cache = Arc::new(Mutex::new(HashMap::new()));
+    let resolution_lock = Arc::new(Mutex::new(()));
     let request_url = "https://single-flight.test/models";
     let origin = RequestOrigin::parse(request_url).expect("valid request URL");
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let worker_cache = Arc::clone(&cache);
+    let worker_resolution_lock = Arc::clone(&resolution_lock);
     let worker_origin = origin.clone();
 
     let worker = std::thread::spawn(move || {
-        resolve_system_proxy_with(&worker_cache, request_url, &worker_origin, |_, _| {
-            started_tx.send(()).expect("test should still be running");
-            release_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("test should release resolver");
-            SystemProxyDecision::Direct
-        })
+        resolve_system_proxy_with(
+            &worker_cache,
+            &worker_resolution_lock,
+            request_url,
+            &worker_origin,
+            |_, _| {
+                started_tx.send(()).expect("test should still be running");
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("test should release resolver");
+                SystemProxyDecision::Direct
+            },
+        )
     });
 
     started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("resolver should start");
     assert!(matches!(
-        cache.try_lock(),
+        resolution_lock.try_lock(),
         Err(std::sync::TryLockError::WouldBlock)
     ));
+    assert!(
+        cache.try_lock().is_ok(),
+        "platform lookup must leave cached routes readable"
+    );
     let waiter_cache = Arc::clone(&cache);
     let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
     let (finished_tx, finished_rx) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
         waiting_tx.send(()).expect("signal waiter");
-        let decision = resolve_system_proxy_with(&waiter_cache, request_url, &origin, |_, _| {
-            panic!("competing caller must reuse the first result")
-        });
+        let decision = resolve_system_proxy_with(
+            &waiter_cache,
+            &resolution_lock,
+            request_url,
+            &origin,
+            |_, _| panic!("competing caller must reuse the first result"),
+        );
         finished_tx.send(()).expect("signal completion");
         decision
     });
@@ -596,6 +614,32 @@ fn system_proxy_resolution_is_single_flight() {
         waiter.join().expect("waiter finishes"),
         SystemProxyDecision::Direct
     );
+}
+
+#[test]
+fn system_proxy_cache_reads_do_not_extend_expiry() {
+    let mut cache = HashMap::new();
+    let now = Instant::now();
+    for (decision, ttl) in [
+        (SystemProxyDecision::Direct, SYSTEM_PROXY_SUCCESS_CACHE_TTL),
+        (
+            SystemProxyDecision::Unavailable {
+                failure: RouteFailureClass::ProxyResolutionUnavailable,
+            },
+            SYSTEM_PROXY_UNAVAILABLE_CACHE_TTL,
+        ),
+    ] {
+        insert_system_proxy_cache_entry(&mut cache, "test-key", decision.clone(), now);
+        assert_eq!(
+            cached_system_proxy_decision_from_cache(&mut cache, "test-key", now + ttl / 2),
+            Some(decision)
+        );
+        assert_eq!(
+            cached_system_proxy_decision_from_cache(&mut cache, "test-key", now + ttl),
+            None
+        );
+        assert!(cache.is_empty());
+    }
 }
 
 #[test]

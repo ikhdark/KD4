@@ -23,7 +23,7 @@ fn config_schema_matches_fixture() {
     let schema_value = canonicalize(&schema_value);
     assert_eq!(
         fixture_value, schema_value,
-        "regenerate the config schema fixture"
+        "regenerate the config schema fixture with `just config-schema-regenerate <owner>`"
     );
 
     // Make sure the version in the repo matches exactly: https://github.com/openai/codex/pull/10977.

@@ -372,6 +372,31 @@ class CliPerformanceFlagsTest(unittest.TestCase):
 
 
 class CliPreflightTest(unittest.TestCase):
+    def test_ripgrep_role_alias_fails_before_build_lease_or_inputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rg = root / "rg.exe"
+            write_pe(rg)
+            alias = root / "alias.exe"
+            alias.hardlink_to(rg)
+            for name in SourceBuildOutputs.__dataclass_fields__:
+                for path in (rg, alias):
+                    with self.subTest(role=name, path=path):
+                        args = request_args(
+                            target="x86_64-pc-windows-msvc", variant="codex",
+                            package_dir=root / "package", rg_bin=rg, **{name: path},
+                        )
+                        with (
+                            mock.patch.object(cli, "parse_args", return_value=args),
+                            mock.patch.object(cli, "package_build_lease") as lease,
+                            mock.patch.object(cli, "resolve_package_inputs") as inputs,
+                            self.assertRaisesRegex(RuntimeError, "distinct executables"),
+                        ):
+                            cli.main()
+                        lease.assert_not_called()
+                        inputs.assert_not_called()
+                        self.assertFalse((root / "package").exists())
+
     def test_non_pe_ripgrep_fails_before_starting_cargo(self):
         with tempfile.TemporaryDirectory() as temp:
             rg = Path(temp) / "rg.exe"

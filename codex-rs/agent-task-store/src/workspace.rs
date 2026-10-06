@@ -826,7 +826,9 @@ fn hash_regular_file(absolute: &Path, logical_path: &str) -> StoreResult<String>
         )))
     })?;
     let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
+    // Small source files should not allocate and zero a full MiB under the writer
+    // lane. Keep reading to EOF and revalidate identity even if the file grows.
+    let mut buffer = vec![0_u8; before.len.clamp(1, 1024 * 1024) as usize];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -1305,6 +1307,52 @@ mod overlay_observation_tests {
                 .find(|(key, _)| *key == "GIT_OPTIONAL_LOCKS")
                 .and_then(|(_, value)| value),
             Some(std::ffi::OsStr::new("0"))
+        );
+    }
+
+    #[test]
+    fn file_hash_covers_empty_small_and_multichunk_contents() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let path = root.path().join("source");
+        for size in [0, 1, 64, 1024 * 1024, 1024 * 1024 + 17] {
+            let contents = (0..size)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            std::fs::write(&path, &contents).expect("write source");
+            assert_eq!(
+                hash_regular_file(&path, "source").expect("hash complete file"),
+                format!("{:x}", Sha256::digest(&contents)),
+                "file size {size}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual wall-clock benchmark; no timing assertion"]
+    fn benchmark_small_file_manifest_capture() {
+        let root = tempfile::tempdir().expect("temp dir");
+        for index in 0..512 {
+            std::fs::write(root.path().join(format!("file-{index:04}")), [b'x'; 64])
+                .expect("write small file");
+        }
+        let paths = vec![".".to_string()];
+        let expected = collect_manifest_entries(root.path(), &paths, true)
+            .expect("warm capture")
+            .entries;
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let started = Instant::now();
+            let capture =
+                collect_manifest_entries(root.path(), &paths, true).expect("complete capture");
+            samples.push(started.elapsed());
+            assert!(capture.complete);
+            assert_eq!(capture.entries, expected);
+            assert_eq!(capture.entries.len(), 512);
+        }
+        samples.sort();
+        eprintln!(
+            "small-file manifest: 512 files, 64 bytes each, median {:?}",
+            samples[4]
         );
     }
 }

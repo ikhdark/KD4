@@ -60,22 +60,24 @@ pub fn detect_recent_sessions(
             let Ok(modified_at_nanos) = i64::try_from(modified_at.as_nanos()) else {
                 continue;
             };
-            let Ok(source_path) = fs::canonicalize(&path) else {
-                continue;
-            };
-            file_candidates.push((modified_at_nanos, path, source_path));
+            file_candidates.push((modified_at_nanos, path));
         }
     }
 
     file_candidates.sort_unstable_by(
-        |(left_modified_at, left_path, _), (right_modified_at, right_path, _)| {
+        |(left_modified_at, left_path), (right_modified_at, right_path)| {
             right_modified_at
                 .cmp(left_modified_at)
                 .then_with(|| left_path.cmp(right_path))
         },
     );
     let mut migrations = Vec::new();
-    for (_modified_at, path, source_path) in file_candidates {
+    for (_modified_at, path) in file_candidates {
+        // Resolve only candidates reached before the result limit, but still use
+        // canonical identities for every ledger lookup.
+        let Ok(source_path) = fs::canonicalize(&path) else {
+            continue;
+        };
         // Content identity, not modification time, decides whether this version was imported.
         if let Some(hashes) = imported_hashes.get(source_path.as_path()) {
             match session_content_sha256(&source_path) {
@@ -507,6 +509,31 @@ mod tests {
                 cwd: project,
                 title: Some("version-b".to_string()),
             }]
+        );
+    }
+
+    #[test]
+    fn equal_modification_times_use_path_order() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join(".external");
+        let project = root.path().join("repo");
+        let modified_at = SystemTime::now();
+        for name in ["c", "a", "b"] {
+            let path = write_session(
+                &source,
+                &project,
+                &format!("{name}.jsonl"),
+                &[record("user", name, &project)],
+            );
+            set_modified_at(&path, modified_at);
+        }
+        let sessions = detect_recent_sessions(&source, root.path()).unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.title.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("a"), Some("b"), Some("c")]
         );
     }
 

@@ -13,11 +13,11 @@ use crate::metrics::emit_fetch_attempt_metric;
 use crate::metrics::emit_fetch_final_metric;
 use crate::metrics::emit_load_metric;
 use crate::validation::validate_bundle;
+use codex_client::capped_backoff;
 use codex_config::AbsolutePathBuf;
 use codex_config::CloudConfigBundle;
 use codex_config::CloudConfigBundleLoadError;
 use codex_config::CloudConfigBundleLoadErrorCode;
-use codex_core::retry::backoff;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
@@ -39,6 +39,15 @@ const CLOUD_CONFIG_BUNDLE_AUTH_RECOVERY_FAILED_MESSAGE: &str = concat!(
     "Your authentication session could not be refreshed automatically. ",
     "Please log out and sign in again."
 );
+
+// Keep this service's retry policy without depending on the core agent harness.
+fn backoff(attempt: u64) -> Duration {
+    capped_backoff(
+        Duration::from_millis(200),
+        attempt.max(1),
+        Duration::from_secs(30),
+    )
+}
 
 fn auth_identity(auth: &CodexAuth) -> (Option<String>, Option<String>) {
     (auth.get_chatgpt_user_id(), auth.get_account_id())

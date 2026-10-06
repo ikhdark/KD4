@@ -2762,6 +2762,10 @@ async fn sampling_context_notices_are_persisted_once_and_append_only() {
         notices.as_slice()
     );
     let rendered = serde_json::to_string(&notices).unwrap();
+    assert_eq!(rendered.matches("<exhaustive_scope_feasibility>").count(), 1);
+    assert!(rendered.contains("do not narrow the scope without the user's approval"));
+    assert!(rendered.contains("Continue reading through compactions"));
+    assert!(rendered.contains("not reasons to stop while required work remains obtainable"));
     assert_eq!(rendered.matches("<mcp_catalog_notice>").count(), 1);
     assert_eq!(rendered.matches("<forced_terminal_notice>").count(), 1);
     assert!(rendered.contains("Later user input may resume work"));
@@ -4249,8 +4253,18 @@ async fn mid_turn_compaction_failure_preserves_completed_message_impl() -> Resul
     assert!(
         requests[1]
             .function_call_output_text("continue-work")
-            .is_some(),
-        "compaction follows the completed tool result"
+            .is_none(),
+        "unread tool results must remain outside the summarizer input"
+    );
+    test.codex.flush_rollout().await?;
+    let rollout = fs::read_to_string(test.codex.rollout_path().expect("rollout path"))?;
+    assert!(
+        rollout.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).any(|line| {
+            line["type"] == "response_item"
+                && line["payload"]["type"] == "function_call_output"
+                && line["payload"]["call_id"] == "continue-work"
+        }),
+        "compaction failure must preserve the completed tool result in history"
     );
     Ok(())
 }
@@ -6584,6 +6598,64 @@ fn pending_token_estimate_includes_model_visible_tool_schemas() {
 }
 
 #[test]
+fn pending_token_estimate_only_forecasts_real_user_boundaries() {
+    let router = ToolRouter::from_parts(
+        ToolRegistry::from_tools(std::iter::empty::<Arc<dyn crate::tools::registry::CoreToolRuntime>>()),
+        Vec::new(),
+    );
+    let user = ResponseItem::from(ResponseInputItem::from(vec![UserInput::Text {
+        text: "continue".to_string(), text_elements: Vec::new(),
+    }]));
+    let communication = InterAgentCommunication::new(
+        AgentPath::root(), AgentPath::root().join("worker").unwrap(), Vec::new(),
+        "continue".to_string(), true,
+    );
+    for (input, expected) in [
+        (TurnInput::UserInput { content: vec![UserInput::Text {
+            text: "continue".to_string(), text_elements: Vec::new(),
+        }], client_id: None }, true),
+        (TurnInput::UserInput { content: Vec::new(), client_id: None }, false),
+        (TurnInput::ResponseItem(user.clone()), true),
+        (TurnInput::InternalResponseItem(user), false),
+        (TurnInput::ResponseItem(communication.to_model_input_item()), false),
+        (TurnInput::InterAgentCommunication(communication), false),
+    ] {
+        assert_eq!(estimate_pending_tokens(&[input], &[], &[], &router, false).has_real_user_boundary, expected);
+    }
+    let contextual = ContextualUserFragment::into(crate::context::UserInstructions {
+        directory: None, text: "startup context".to_string(),
+    });
+    assert!(!estimate_pending_tokens(&[TurnInput::ResponseItem(contextual)], &[], &[], &router, false).has_real_user_boundary);
+}
+
+#[tokio::test]
+async fn accountingless_completion_preserves_sampling_reasoning_pressure() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let user = |text: &str| ResponseItem::from(ResponseInputItem::from(vec![UserInput::Text {
+        text: text.to_string(), text_elements: Vec::new(),
+    }]));
+    let items = vec![
+        user("task"),
+        ResponseItem::Reasoning {
+            id: None, summary: Vec::new(), content: None,
+            encrypted_content: Some("a".repeat(4_000)),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        user("continue"),
+    ];
+    session.record_conversation_items(&turn, &items).await.unwrap();
+    session.record_token_usage_info(&turn, None).await.unwrap();
+    let expected = items.iter().map(crate::context_manager::estimate_item_token_count)
+        .fold(codex_utils_output_truncation::approx_token_count(&turn.base_instructions.text) as i64, i64::saturating_add);
+    assert_eq!(session.get_estimated_token_count(&turn).await, Some(expected));
+    assert_eq!(session.token_usage_info().await.unwrap().last_token_usage.total_tokens, expected);
+    let pending = PendingTokenEstimate {
+        total_tokens: 20, body_growth_tokens: 10, has_real_user_boundary: false,
+    };
+    assert_eq!(projected_prompt_pressure(&session, &turn, pending).await.total_tokens, expected + 20);
+}
+
+#[test]
 fn pending_token_estimate_excludes_stable_startup_injections_from_body_growth() {
     let empty_registry = crate::tools::registry::ToolRegistry::from_tools(std::iter::empty::<
         Arc<dyn crate::tools::registry::CoreToolRuntime>,
@@ -7026,6 +7098,7 @@ async fn models_etag_refresh_does_not_block_tool_continuation_impl() -> Result<(
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex()
+        .with_remote_models()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model("gpt-5.2")
         .with_config(|config| {
@@ -7569,7 +7642,7 @@ async fn completed_measurements_calibrate_next_prompt_pressure_with_safe_fallbac
     let pending = PendingTokenEstimate {
         total_tokens: 10_000,
         body_growth_tokens: 10,
-        resolves_active_reasoning: false,
+        has_real_user_boundary: false,
     };
     assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 301);
     // A pessimistic recent sample stays in force until four new samples replace it.

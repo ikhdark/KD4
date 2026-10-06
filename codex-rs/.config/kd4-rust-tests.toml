@@ -173,6 +173,10 @@ helpers = [
 "session::turn::completion::tests::" = []
 "state::auto_compact_window::tests::" = []
 "agent::task_capabilities::tests::" = []
+# Status projection is data-only; review-policy tests use the in-process store.
+# Neither path starts an agent runtime, a code-mode host, or a sandbox helper.
+"agent::status::tests::" = []
+"tools::handlers::multi_agents_v2::task::review_policy_tests::" = []
 "client::tests::" = []
 "validation::tests::" = []
 "context_manager::history::tests::" = []

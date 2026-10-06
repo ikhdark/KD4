@@ -293,6 +293,18 @@ class Manifest:
 
         return cls(version, helpers, targets, gates)
 
+    def target(self, name: str) -> Target:
+        try:
+            return self.targets[name]
+        except KeyError as exc:
+            raise RunnerError(f"unknown named Rust test target {name!r}") from exc
+
+    def gate(self, name: str) -> Gate:
+        try:
+            return self.gates[name]
+        except KeyError as exc:
+            raise RunnerError(f"unknown named Rust test gate {name!r}") from exc
+
 
 def _require_table(value: Any, location: str) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -444,8 +456,8 @@ _LIB_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
 def _rust_module_owners(
     metadata: MetadataIndex, raw: str, cwd: Path,
     declarations: dict | None = None,
-) -> tuple[str, list[tuple[str, str | None, str]]] | None:
-    """The package and (selector kind, selector value, module) owning a Rust file."""
+) -> tuple[str, list[tuple[str, str | None, str]], set[tuple[str, str | None]]] | None:
+    """Return legacy module candidates plus independently registered selectors."""
     if not raw.endswith(".rs"):
         return None
     candidates = [Path(raw)] if Path(raw).is_absolute() else [cwd / raw, REPO_ROOT / raw]
@@ -477,12 +489,23 @@ def _rust_module_owners(
             targets.append((selector, Path(src_path).resolve()))
         # A file that is a target root belongs only to that target.
         roots = [(selector, src) for selector, src in targets if src == path]
-        modules = [
-            (kind, value, _rust_module(src, path, declarations=declarations))
-            for (kind, value), src in roots
-            or [(selector, src) for selector, src in targets if path.is_relative_to(src.parent)]
-        ]
-        return (owner[0], modules) if modules else None
+        modules = []
+        registered = set()
+        for (kind, value), src in roots or [
+            (selector, src) for selector, src in targets if path.is_relative_to(src.parent)
+        ]:
+            module = _rust_module(src, path, declarations=declarations)
+            modules.append((kind, value, module))
+            # Layout alone does not establish membership in sibling shards.
+            # Preserve gate matching, but verify target advice against actual
+            # declarations, excluding comments and literals.
+            try:
+                resolved = _rust_module_source(src, module, owner[1])
+            except (OSError, UnicodeError, ValueError):
+                resolved = None
+            if resolved is not None and resolved[0] == path:
+                registered.add((kind, value))
+        return (owner[0], modules, registered) if modules else None
     return None
 
 
@@ -517,6 +540,152 @@ def _rust_module(
     if parts[-1:] == ["mod"]:
         parts.pop()
     return "::".join(parts)
+
+
+def _rust_scope_items(
+    text: str,
+) -> dict[tuple[str, str], list[tuple[str | None, str | None]]]:
+    """Read named module/function declarations at this scope, excluding literal bodies."""
+    token = re.compile(
+        r'//[^\n]*|/\*|r(?P<hashes>\#*)".*?"(?P=hashes)|'
+        r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\'|[A-Za-z_][A-Za-z_0-9]*|[^\s]',
+        re.DOTALL,
+    )
+    tokens = []
+    cursor = 0
+    while match := token.search(text, cursor):
+        value = match.group()
+        cursor = match.end()
+        if value.startswith("//"):
+            continue
+        if value == "/*":
+            depth = 1
+            while depth:
+                nested = re.search(r"/\*|\*/", text[cursor:])
+                if nested is None:
+                    raise ValueError("unclosed Rust comment in verification source")
+                cursor += nested.end()
+                depth += 1 if nested.group() == "/*" else -1
+            continue
+        tokens.append((value, match.start(), cursor))
+    items: dict[tuple[str, str], list[tuple[str | None, str | None]]] = {}
+    index = 0
+    path = None
+    while index < len(tokens):
+        value = tokens[index][0]
+        if (
+            value == "#"
+            and index + 5 < len(tokens)
+            and [item[0] for item in tokens[index : index + 4]]
+            == ["#", "[", "path", "="]
+            and tokens[index + 5][0] == "]"
+        ):
+            literal = tokens[index + 4][0]
+            if not literal.startswith('"'):
+                raise ValueError(
+                    "unsupported Rust path attribute in verification route"
+                )
+            path = json.loads(literal)
+            index += 6
+            continue
+        if value in {"mod", "fn"} and index + 2 < len(tokens):
+            name = tokens[index + 1][0]
+            after_name = index + 2
+            if value == "fn":
+                items.setdefault((value, name), []).append((None, None))
+            elif tokens[after_name][0] == ";":
+                items.setdefault((value, name), []).append((path, None))
+                path = None
+                index += 3
+                continue
+            elif tokens[after_name][0] == "{":
+                depth = 1
+                end = after_name + 1
+                while end < len(tokens) and depth:
+                    depth += (tokens[end][0] == "{") - (tokens[end][0] == "}")
+                    end += 1
+                if depth:
+                    raise ValueError("unclosed Rust module in verification source")
+                body = text[tokens[after_name][2] : tokens[end - 1][1]]
+                items.setdefault((value, name), []).append((path, body))
+                path = None
+                index = end
+                continue
+        if value in {"{", "[", "("}:
+            closing = {"{": "}", "[": "]", "(": ")"}[value]
+            depth = 1
+            index += 1
+            while index < len(tokens) and depth:
+                depth += (tokens[index][0] == value) - (tokens[index][0] == closing)
+                index += 1
+            if value == "{":
+                path = None
+            continue
+        if value == ";":
+            path = None
+        index += 1
+    return items
+
+
+def _rust_module_source(
+    binary_root: Path, module: str, repo_root: Path
+) -> tuple[Path, str | None] | None:
+    """Resolve declared modules, leaving a terminal file's text unread."""
+    source = binary_root.resolve()
+    if not source.is_file():
+        return None
+    text = source.read_text(encoding="utf-8")
+    module_dir = attribute_dir = source.parent
+    components = module.split("::") if module else []
+    for index, component in enumerate(components):
+        declarations = _rust_scope_items(text).get(("mod", component), [])
+        if len(declarations) != 1:
+            return None
+        path, body = declarations[0]
+        if body is not None:
+            module_dir = attribute_dir / path if path else module_dir / component
+            attribute_dir = module_dir
+            text = body
+            continue
+        if path:
+            candidates = [attribute_dir / path]
+        else:
+            candidates = [
+                module_dir / f"{component}.rs",
+                module_dir / component / "mod.rs",
+            ]
+        candidates = [
+            candidate.resolve() for candidate in candidates if candidate.is_file()
+        ]
+        if len(candidates) != 1 or not candidates[0].is_relative_to(
+            repo_root.resolve()
+        ):
+            return None
+        source = candidates[0]
+        if index == len(components) - 1:
+            return source, None
+        text = source.read_text(encoding="utf-8")
+        attribute_dir = source.parent
+        module_dir = (
+            source.parent if source.name == "mod.rs" else source.with_suffix("")
+        )
+    return source, text
+
+
+def _rust_test_source(binary_root: Path, identity: str, repo_root: Path) -> Path | None:
+    """Resolve the exact selected module chain and its declared test function."""
+    components = identity.split("::")
+    resolved = _rust_module_source(binary_root, "::".join(components[:-1]), repo_root)
+    if resolved is None:
+        return None
+    source, text = resolved
+    if text is None:
+        text = source.read_text(encoding="utf-8")
+    return (
+        source
+        if len(_rust_scope_items(text).get(("fn", components[-1]), [])) == 1
+        else None
+    )
 
 
 Executor = Callable[..., subprocess.CompletedProcess[str]]
@@ -916,18 +1085,12 @@ class RustTestRunner:
             self.base_env["NEXTEST_PROFILE"] = profile
 
     def target(self, name: str) -> Target:
-        try:
-            target = self.manifest.targets[name]
-            self.metadata.validate_target(target)
-            return target
-        except KeyError as exc:
-            raise RunnerError(f"unknown named Rust test target {name!r}") from exc
+        target = self.manifest.target(name)
+        self.metadata.validate_target(target)
+        return target
 
     def gate(self, name: str) -> Gate:
-        try:
-            return self.manifest.gates[name]
-        except KeyError as exc:
-            raise RunnerError(f"unknown named Rust test gate {name!r}") from exc
+        return self.manifest.gate(name)
 
     def active_helpers(self, target_names: Iterable[str]) -> list[Helper]:
         return self._active_helper_names(
@@ -1064,6 +1227,7 @@ class RustTestRunner:
         rather than listed with nextest.
         """
         selected: dict[str, list[str]] = {}
+        target_paths: dict[str, list[str]] = {}
         unmapped: list[str] = []
         not_evaluated: set[str] = set()
         # Capture each sibling declaration once for this ownership query, not
@@ -1074,10 +1238,16 @@ class RustTestRunner:
             owners = _rust_module_owners(
                 self.metadata, raw, cwd or Path.cwd(), declarations
             )
+            target_paths[raw] = []
             if not owners:
                 unmapped.append(raw)
                 continue
-            package, modules = owners
+            package, modules, registered = owners
+            target_paths[raw] = sorted(
+                target.name for target in self.manifest.targets.values()
+                if target.package == package
+                and (target.selector_kind, target.selector_value) in registered
+            )
             gates = []
             for gate in self.manifest.gates.values():
                 for step in gate.steps:
@@ -1098,6 +1268,14 @@ class RustTestRunner:
         return {
             "gates": sorted({gate for gates in selected.values() for gate in gates}),
             "paths": selected,
+            "targets": sorted({name for names in target_paths.values() for name in names}),
+            "target_paths": target_paths,
+            "unresolved_targets": [raw for raw, names in target_paths.items() if not names],
+            "ambiguous_targets": {
+                raw: names for raw, names in target_paths.items() if len(names) > 1
+            },
+            "target_scope": "declared module registration only; cfg and macros are not "
+            "evaluated; multiple owners are reported, not selected",
             **({"unmapped": unmapped} if unmapped else {}),
             **(
                 {"filter_only_gates_not_evaluated": sorted(not_evaluated)}
@@ -1649,10 +1827,7 @@ class RustTestRunner:
         if command is None:
             return {}
         result = self._checked(command, env=self.base_env, capture=CAPTURE_STDOUT)
-        return {
-            helper.name: self._helper_artifact(helper, _output_lines(result, "stdout"))
-            for helper in helpers
-        }
+        return self._helper_artifacts(helpers, _output_lines(result, "stdout"))
 
     def _helper_environment(
         self,
@@ -1741,9 +1916,15 @@ class RustTestRunner:
                     ) from exc
         return resource_dirs if selected else []
 
-    def _helper_artifact(self, helper: Helper, output: str | Iterable[str]) -> Path:
-        expected_package_id = self.metadata.package_id(helper.package)
-        executables: list[Path] = []
+    def _helper_artifacts(
+        self, helpers: Sequence[Helper], output: str | Iterable[str]
+    ) -> dict[str, Path]:
+        # A grouped build has one log: decode it once, retaining every match
+        # so duplicate artifacts cannot silently satisfy a helper's proof.
+        executables: dict[tuple[str, str], list[Path]] = {
+            (self.metadata.package_id(helper.package), helper.binary): []
+            for helper in helpers
+        }
         for line in output.splitlines() if isinstance(output, str) else output:
             try:
                 message = json.loads(line)
@@ -1757,20 +1938,26 @@ class RustTestRunner:
             target = message.get("target")
             if not isinstance(target, dict):
                 continue
+            package_id, binary = message.get("package_id"), target.get("name")
             if (
-                message.get("package_id") == expected_package_id
-                and target.get("name") == helper.binary
+                isinstance(package_id, str)
+                and isinstance(binary, str)
+                and (package_id, binary) in executables
                 and isinstance(target.get("kind"), list)
                 and "bin" in target["kind"]
                 and isinstance(message.get("executable"), str)
             ):
-                executables.append(Path(message["executable"]))
-        if len(executables) != 1 or not executables[0].is_file():
-            raise RunnerError(
-                f"helper build did not produce exactly one executable artifact for "
-                f"{helper.package}/{helper.binary}"
-            )
-        return executables[0].resolve()
+                executables[package_id, binary].append(Path(message["executable"]))
+        artifacts = {}
+        for helper in helpers:
+            matches = executables[self.metadata.package_id(helper.package), helper.binary]
+            if len(matches) != 1 or not matches[0].is_file():
+                raise RunnerError(
+                    f"helper build did not produce exactly one executable artifact for "
+                    f"{helper.package}/{helper.binary}"
+                )
+            artifacts[helper.name] = matches[0].resolve()
+        return artifacts
 
     def _execute(
         self,
@@ -2413,7 +2600,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("name")
     gates_for = subparsers.add_parser(
         "gates-for",
-        help="List gates whose declared tests live in the modules owning these Rust files.",
+        help="List gates and declared named-target ownership for these Rust files; no tests run.",
     )
     gates_for.add_argument("paths", nargs="+")
     run_target = subparsers.add_parser("run-target", parents=[run_options])
@@ -2529,14 +2716,19 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
             validate_filtering_args(filter_args)
 
         manifest = Manifest.load(args.manifest)
+        # Resolve the complete selection before metadata, provenance, or waiting
+        # for a lane. Admission still rechecks the manifest and runner inputs.
+        if args.command == "run-target":
+            require_core_lib_filter(
+                manifest.target(args.name), filter_args, allow_all=allow_all
+            )
+        elif args.command in {"run-gate", "check-gates"}:
+            for name in args.names:
+                manifest.gate(name)
         execution_fingerprint = None
         if args.command in {"run-target", "run-gate"}:
             inputs = Path(__file__).read_bytes() + Path(args.manifest).read_bytes()
             execution_fingerprint = hashlib.sha256(inputs).hexdigest()
-        if args.command == "run-target":
-            require_core_lib_filter(
-                manifest.targets.get(args.name), filter_args, allow_all=allow_all
-            )
         if args.command == "list-targets":
             for name in manifest.targets:
                 print(f"target\t{name}")

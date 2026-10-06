@@ -196,6 +196,70 @@ async fn latest_cwd_reads_across_chunks_and_skips_malformed_tail() {
     assert_eq!(parse_latest_turn_context_cwd(&path).await, None);
 }
 
+#[test]
+fn latest_cwd_prefilter_preserves_rollout_decoding() {
+    let cwd = test_path_buf("/tmp/latest-新");
+    let legacy = serde_json::json!({
+        "timestamp": "2026-09-13T00:00:00Z",
+        "type": "turn_context",
+        "payload": {
+            "cwd": cwd,
+            "approval_policy": "never",
+            "sandbox_policy": {"type": "danger-full-access"},
+            "model": "gpt-5",
+            "summary": "auto"
+        }
+    });
+    let mut current = legacy.clone();
+    current["format_version"] = serde_json::json!(1);
+    current["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("summary");
+    let mut future = current.clone();
+    future["format_version"] = serde_json::json!(u32::MAX);
+    let mut invalid = current.clone();
+    invalid["payload"].as_object_mut().unwrap().remove("cwd");
+    let legacy = legacy.to_string();
+    let lines = [
+        legacy.clone(),
+        current.to_string(),
+        future.to_string(),
+        invalid.to_string(),
+        legacy.replace("turn_context", "turn\\u005fcontext"),
+        format!("{{\"type\":\"event_msg\",{}", &legacy[1..]),
+        format!("{},\"type\":\"event_msg\"}}", &legacy[..legacy.len() - 1]),
+        serde_json::json!({
+            "timestamp": "2026-09-13T00:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "large-output",
+                "output": "turn_context".repeat(32768)
+            }
+        })
+        .to_string(),
+        "{\"type\":\"turn_context\",\"payload\":null}".to_string(),
+        "{broken tail".to_string(),
+    ];
+    for (index, line) in lines.into_iter().enumerate() {
+        let expected = serde_json::from_str::<RolloutLine>(&line)
+            .ok()
+            .and_then(|line| match line.item {
+                RolloutItem::TurnContext(item) => Some(item.cwd.into_path_buf()),
+                _ => None,
+            });
+        if matches!(index, 0 | 1 | 4 | 5) {
+            assert_eq!(expected.as_ref(), Some(&cwd));
+        } else {
+            assert_eq!(expected, None);
+        }
+        let mut reversed = line.into_bytes();
+        reversed.reverse();
+        assert_eq!(cwd_from_reversed_rollout_line(&mut reversed), expected);
+    }
+}
+
 fn test_tracing_subscriber() -> impl tracing::Subscriber + Send + Sync {
     let provider = SdkTracerProvider::builder().build();
     let tracer = provider.tracer("codex-exec-tests");

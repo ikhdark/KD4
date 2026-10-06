@@ -51,6 +51,8 @@ use tracing::warn;
 // Eight internal-channel bursts; saturation disconnects only the slow client.
 const WEBSOCKET_OUTBOUND_CHANNEL_CAPACITY: usize = 8 * CHANNEL_CAPACITY;
 const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_WEBSOCKET_BATCH_MESSAGES: usize = 64;
+const WEBSOCKET_BATCH_TARGET_BYTES: usize = 64 * 1024;
 const _: () = assert!(WEBSOCKET_OUTBOUND_CHANNEL_CAPACITY > CHANNEL_CAPACITY);
 
 fn colorize(text: &str, style: Style) -> String {
@@ -369,7 +371,7 @@ async fn run_websocket_outbound_loop<M, SinkError>(
     SinkError: Send + 'static,
 {
     tokio::pin!(websocket_writer);
-    loop {
+    'writer: loop {
         tokio::select! {
             biased;
             _ = disconnect_token.cancelled() => {
@@ -392,16 +394,43 @@ async fn run_websocket_outbound_loop<M, SinkError>(
                 }
             }
             queued_message = writer_rx.recv() => {
-                let Some(queued_message) = queued_message else {
+                let Some(mut queued_message) = queued_message else {
                     break;
                 };
-                let Some(json) = serialize_outgoing_message(queued_message.message) else {
+                let mut batch_bytes = 0;
+                let mut write_complete_tx = None;
+                for index in 0..MAX_WEBSOCKET_BATCH_MESSAGES {
+                    if let Some(json) = serialize_outgoing_message(queued_message.message) {
+                        batch_bytes += json.len();
+                        if websocket_writer.feed(M::text(json)).await.is_err() {
+                            break 'writer;
+                        }
+                        write_complete_tx = queued_message.write_complete_tx;
+                    }
+                    if disconnect_token.is_cancelled() {
+                        break 'writer;
+                    }
+                    // Coalesce only already queued frames, without a timer. Receipts
+                    // and control traffic end a batch so later output cannot delay them.
+                    if write_complete_tx.is_some()
+                        || batch_bytes >= WEBSOCKET_BATCH_TARGET_BYTES
+                        || index + 1 == MAX_WEBSOCKET_BATCH_MESSAGES
+                        || !writer_control_rx.is_empty()
+                    {
+                        break;
+                    }
+                    match writer_rx.try_recv() {
+                        Ok(next) => queued_message = next,
+                        Err(_) => break,
+                    }
+                }
+                if batch_bytes == 0 {
                     continue;
-                };
-                if websocket_writer.send(M::text(json)).await.is_err() {
+                }
+                if websocket_writer.flush().await.is_err() {
                     break;
                 }
-                if let Some(write_complete_tx) = queued_message.write_complete_tx {
+                if let Some(write_complete_tx) = write_complete_tx {
                     let _ = write_complete_tx.send(());
                 }
             }
@@ -485,6 +514,347 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::task::Context;
     use std::task::Poll;
+
+    #[derive(Default)]
+    struct RecordedSocketWrites {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    struct RecordingSocket {
+        recorded: Arc<std::sync::Mutex<RecordedSocketWrites>>,
+        fail_flush: bool,
+    }
+
+    impl tokio::io::AsyncRead for RecordingSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<IoResult<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for RecordingSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<IoResult<usize>> {
+            let mut recorded = self.recorded.lock().unwrap();
+            recorded.bytes.extend_from_slice(bytes);
+            recorded.writes += 1;
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<IoResult<()>> {
+            self.recorded.lock().unwrap().flushes += 1;
+            Poll::Ready(if self.fail_flush {
+                Err(std::io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            })
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_batches_ready_frames_without_changing_wire_or_receipts() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        for (count, payload_bytes, expected_writes) in [(130, 8, 4), (1, 8, 1), (3, 65536, 3)] {
+            let recorded = Arc::new(std::sync::Mutex::new(RecordedSocketWrites::default()));
+            let stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                RecordingSocket {
+                    recorded: Arc::clone(&recorded),
+                    fail_flush: false,
+                },
+                Role::Server,
+                None,
+            )
+            .await;
+            let (sink, _reader) = stream.split();
+            let (writer_tx, writer_rx) = mpsc::channel(count);
+            let (_control_tx, control_rx) = mpsc::channel(1);
+            let mut receipts = Vec::new();
+            let mut expected = Vec::new();
+            for id in 0..count {
+                let result = serde_json::json!({"payload": "x".repeat(payload_bytes)});
+                expected.push(serde_json::json!({"id": id, "result": result}));
+                let write_complete_tx = if id == 64 || id + 1 == count {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    receipts.push(rx);
+                    Some(tx)
+                } else {
+                    None
+                };
+                writer_tx.try_send(QueuedOutgoingMessage {
+                    message: OutgoingMessage::Response(OutgoingResponse {
+                        id: RequestId::Integer(id as i64),
+                        result,
+                    }),
+                    write_complete_tx,
+                }).unwrap();
+            }
+            drop(writer_tx);
+            run_websocket_outbound_loop(sink, writer_rx, control_rx, CancellationToken::new()).await;
+            for receipt in receipts {
+                receipt.await.expect("receipt follows a successful flush");
+            }
+            let recorded = recorded.lock().unwrap();
+            let mut peer = tokio_tungstenite::tungstenite::WebSocket::from_raw_socket(
+                std::io::Cursor::new(recorded.bytes.clone()), Role::Client, None,
+            );
+            for message in expected {
+                let frame = peer.read().expect("every frame remains decodable");
+                assert_eq!(serde_json::from_str::<serde_json::Value>(frame.to_text().unwrap()).unwrap(), message);
+            }
+            assert!(peer.read().is_err(), "no duplicated frames");
+            eprintln!("websocket burst: frames={count}, payload_bytes={payload_bytes}, writes={}, flushes={}", recorded.writes, recorded.flushes);
+            assert_eq!(recorded.writes, expected_writes);
+            assert_eq!(recorded.flushes, expected_writes);
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_batch_flush_failure_never_acknowledges_delivery() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let recorded = Arc::new(std::sync::Mutex::new(RecordedSocketWrites::default()));
+        let stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            RecordingSocket { recorded: Arc::clone(&recorded), fail_flush: true },
+            Role::Server, None,
+        ).await;
+        let (sink, _reader) = stream.split();
+        let (writer_tx, writer_rx) = mpsc::channel(4);
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let mut receipts = Vec::new();
+        for id in 0..4 {
+            let write_complete_tx = if id >= 2 {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                receipts.push(rx);
+                Some(tx)
+            } else { None };
+            writer_tx.try_send(QueuedOutgoingMessage {
+                message: OutgoingMessage::Response(OutgoingResponse {
+                    id: RequestId::Integer(id), result: serde_json::json!(id),
+                }), write_complete_tx,
+            }).unwrap();
+        }
+        drop(writer_tx);
+        run_websocket_outbound_loop(sink, writer_rx, control_rx, CancellationToken::new()).await;
+        for receipt in receipts {
+            assert!(receipt.await.is_err(), "failed or unwritten frames cannot be acknowledged");
+        }
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.writes, 1);
+        assert_eq!(recorded.flushes, 1);
+        let mut peer = tokio_tungstenite::tungstenite::WebSocket::from_raw_socket(
+            std::io::Cursor::new(recorded.bytes.clone()), Role::Client, None,
+        );
+        for id in 0..3 {
+            let frame = peer.read().unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(frame.to_text().unwrap()).unwrap()["id"], id);
+        }
+        assert!(peer.read().is_err(), "receipt boundary stops the next batch after failure");
+    }
+
+    #[tokio::test]
+    async fn websocket_batch_receipt_waits_for_blocked_io() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (server, client) = tokio::io::duplex(64);
+        let server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let mut client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let (sink, _reader) = server.split();
+        let (writer_tx, writer_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (receipt_tx, mut receipt_rx) = tokio::sync::oneshot::channel();
+        writer_tx
+            .try_send(QueuedOutgoingMessage {
+                message: OutgoingMessage::Response(OutgoingResponse {
+                    id: RequestId::Integer(1),
+                    result: serde_json::json!("x".repeat(1024)),
+                }),
+                write_complete_tx: Some(receipt_tx),
+            })
+            .unwrap();
+        drop(writer_tx);
+        let outbound =
+            run_websocket_outbound_loop(sink, writer_rx, control_rx, CancellationToken::new());
+        tokio::pin!(outbound);
+        assert!(futures::poll!(&mut outbound).is_pending());
+        assert!(matches!(
+            receipt_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        timeout(Duration::from_secs(2), async {
+            let (_, frame) = tokio::join!(&mut outbound, client.next());
+            let frame = frame.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(frame.to_text().unwrap()).unwrap(),
+                serde_json::json!({"id":1,"result":"x".repeat(1024)})
+            );
+            receipt_rx.await.expect("receipt follows completed IO");
+        })
+        .await
+        .expect("draining the peer must unblock the receipt");
+    }
+
+    #[tokio::test]
+    async fn websocket_batch_yields_to_control_and_cancellation() {
+        struct BoundarySink {
+            frames: Arc<std::sync::atomic::AtomicUsize>,
+            control: mpsc::Sender<WebSocketControl>,
+            disconnect: CancellationToken,
+            cancel: bool,
+        }
+        impl futures::Sink<TungsteniteWebSocketMessage> for BoundarySink {
+            type Error = std::io::Error;
+
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<IoResult<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn start_send(self: Pin<&mut Self>, _: TungsteniteWebSocketMessage) -> IoResult<()> {
+                self.frames.fetch_add(1, Ordering::SeqCst);
+                if self.cancel {
+                    self.disconnect.cancel();
+                } else {
+                    self.control.try_send(WebSocketControl::FlushClose).unwrap();
+                }
+                Ok(())
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<IoResult<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<IoResult<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        for cancel in [false, true] {
+            let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let disconnect = CancellationToken::new();
+            let (control, control_rx) = mpsc::channel(1);
+            let (writer, writer_rx) = mpsc::channel(2);
+            let (receipt, completion) = tokio::sync::oneshot::channel();
+            for (id, write_complete_tx) in [(1, None), (2, Some(receipt))] {
+                writer
+                    .try_send(QueuedOutgoingMessage {
+                        message: OutgoingMessage::Response(OutgoingResponse {
+                            id: RequestId::Integer(id),
+                            result: serde_json::json!(id),
+                        }),
+                        write_complete_tx,
+                    })
+                    .unwrap();
+            }
+            run_websocket_outbound_loop(
+                BoundarySink {
+                    frames: Arc::clone(&frames),
+                    control,
+                    disconnect: disconnect.clone(),
+                    cancel,
+                },
+                writer_rx,
+                control_rx,
+                disconnect,
+            )
+            .await;
+            assert_eq!(
+                frames.load(Ordering::SeqCst),
+                1,
+                "a batch must stop before the next frame"
+            );
+            assert!(
+                completion.await.is_err(),
+                "unwritten output cannot be acknowledged"
+            );
+            assert!(writer.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_delivers_repeated_bursts_and_pongs() {
+        timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (events_tx, mut events_rx) = mpsc::channel(8);
+            let shutdown = CancellationToken::new();
+            let acceptor = start_websocket_acceptor_with_listener(
+                listener,
+                events_tx,
+                shutdown.clone(),
+                WebsocketAuthPolicy::default(),
+            )
+            .unwrap();
+            let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/rpc"))
+                .await
+                .unwrap();
+            let writer = match events_rx.recv().await.unwrap() {
+                TransportEvent::ConnectionOpened { writer, .. } => writer,
+                event => panic!("expected registration: {event:?}"),
+            };
+            for round in 0..3 {
+                let (receipt, completion) = tokio::sync::oneshot::channel();
+                let mut receipt = Some(receipt);
+                for index in 0..130 {
+                    let id = round * 130 + index;
+                    writer
+                        .try_send(QueuedOutgoingMessage {
+                            message: OutgoingMessage::Response(OutgoingResponse {
+                                id: RequestId::Integer(id),
+                                result: serde_json::json!(id),
+                            }),
+                            write_complete_tx: if index == 129 { receipt.take() } else { None },
+                        })
+                        .unwrap();
+                }
+                for index in 0..130 {
+                    let frame = client.next().await.unwrap().unwrap();
+                    let id = round * 130 + index;
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(frame.to_text().unwrap())
+                            .unwrap(),
+                        serde_json::json!({"id":id,"result":id})
+                    );
+                }
+                completion.await.expect("burst must be flushed");
+                client
+                    .send(TungsteniteWebSocketMessage::Ping(vec![round as u8].into()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    client.next().await.unwrap().unwrap(),
+                    TungsteniteWebSocketMessage::Pong(vec![round as u8].into())
+                );
+            }
+            client.close(None).await.unwrap();
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                TungsteniteWebSocketMessage::Close(None)
+            );
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(TransportEvent::ConnectionClosed { .. })
+            ));
+            shutdown.cancel();
+            acceptor.await.unwrap();
+            assert!(writer.is_closed());
+        })
+        .await
+        .expect("multiple bursts, receipts, control frames and cleanup must complete");
+    }
 
     #[tokio::test]
     async fn ping_with_full_control_queue_keeps_forwarding_messages() {

@@ -492,6 +492,7 @@ pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
     workspace_identity_refresh: tokio::sync::Semaphore,
     persistence: Option<CommandExecutionPersistence>,
+    workspace_cache: Option<Arc<crate::git_workspace::GitWorkspaceCache>>,
     cache_persist: Arc<Mutex<()>>,
     effect_recovery: tokio::sync::OnceCell<Option<serde_json::Value>>,
     #[cfg(test)]
@@ -514,6 +515,7 @@ impl Default for CommandExecutionLedger {
             state: Mutex::new(CommandExecutionState::default()),
             workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
             persistence: None,
+            workspace_cache: None,
             cache_persist: Arc::new(Mutex::new(())),
             effect_recovery: tokio::sync::OnceCell::new(),
             #[cfg(test)]
@@ -543,6 +545,7 @@ impl CommandExecutionLedger {
             state: Mutex::new(CommandExecutionState::default()),
             workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
             persistence: Some(persistence),
+            workspace_cache: None,
             cache_persist: Arc::new(Mutex::new(())),
             effect_recovery: tokio::sync::OnceCell::new(),
             #[cfg(test)]
@@ -552,6 +555,14 @@ impl CommandExecutionLedger {
             #[cfg(test)]
             cache_persist_test_gate: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_workspace_cache(
+        mut self,
+        cache: Arc<crate::git_workspace::GitWorkspaceCache>,
+    ) -> Self {
+        self.workspace_cache = Some(cache);
+        self
     }
 
     pub(crate) async fn effect_recovery(&self) -> Option<serde_json::Value> {
@@ -779,8 +790,13 @@ impl CommandExecutionLedger {
                     #[cfg(test)]
                     self.workspace_identity_capture_count
                         .fetch_add(1, Ordering::Relaxed);
-                    crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd)
-                        .await
+                    match &self.workspace_cache {
+                        Some(cache) => cache
+                            .workspace_evidence_identity_with_attribution(&persistence.cwd)
+                            .await
+                            .identity,
+                        None => crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd).await,
+                    }
                 }
                 None => None,
             },
@@ -3272,6 +3288,28 @@ mod tests {
             state.repository.observed_workspace_identity_hash,
             Some((1, identity_hash))
         );
+    }
+
+    #[tokio::test]
+    async fn repository_refresh_uses_shared_workspace_cache_after_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        initialize_git_repository(&repository);
+        let cache = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+        let ledger = CommandExecutionLedger::load_or_new(
+            temp.path().join("home"), "shared-cache".into(), &repository,
+        ).await.with_workspace_cache(Arc::clone(&cache));
+        ledger.observe_repository_revision("turn", 0).await;
+        let first = ledger.state.lock().await.repository.observed_workspace_identity.clone();
+        let captures = cache.workspace_evidence_capture_count();
+        tokio::fs::write(repository.join("changed.txt"), b"changed").await.unwrap();
+        cache.note_host_workspace_mutation();
+        ledger.observe_repository_revision("turn", 1).await;
+        assert_eq!(cache.workspace_evidence_capture_count(), captures + 1);
+        let second = ledger.state.lock().await.repository.observed_workspace_identity.clone();
+        assert!(first.is_some());
+        assert!(second.is_some());
+        assert_ne!(first.unwrap().1, second.unwrap().1);
     }
 
     #[tokio::test]

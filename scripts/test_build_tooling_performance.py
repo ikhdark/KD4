@@ -266,7 +266,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                         f"{ps_single_quote(explicit_target)}); "
                         f"& {ps_single_quote(script)} "
                         "-CargoTargetLane 'perf explicit target' "
-                        f"-WorkingDirectory {ps_single_quote(REPO_ROOT)} "
+                        f"-WorkingDirectory {ps_single_quote(REPO_ROOT / 'codex-rs')} "
                         "-ProgramArgs $programArgs; "
                         "exit $LASTEXITCODE"
                     ),
@@ -958,8 +958,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
     def test_justfile_bench_and_validation_fast_paths_are_explicit(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
-        self.assertIn("bench package bench_name *args:", justfile)
-        self.assertIn("bench-workspace *args:", justfile)
+        self.assertNotIn("bench package bench_name *args:", justfile)
+        self.assertNotIn("bench-workspace *args:", justfile)
         self.assertIn("build-for-release *args:", justfile)
         self.assertIn("target-optimize-dry-run *args:", justfile)
         self.assertIn("app-server-runtime-check:", justfile)
@@ -992,7 +992,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
     def test_agents_instruction_layout_and_budget_are_explicit(
         self,
     ) -> None:
-        expected_agent_files = ["AGENTS.md", "DO-NOT-CHANGE/AGENTS.md"]
+        expected_agent_files = ["AGENTS.md"]
         discovered_agent_files = subprocess.run(
             [
                 "git",

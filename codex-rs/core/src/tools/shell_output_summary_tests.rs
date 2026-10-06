@@ -230,7 +230,7 @@ fn validation_output_uses_structured_wrapper_classification() {
     for command in [
         "cargo +stable --offline test",
         "env MODE=test cargo test",
-        "just --justfile tasks.just core-test-fast core_lib focused",
+        "just --justfile tasks.just test focused",
     ] {
         assert_eq!(
             summarize_shell_output_for_model(&output, 0, false, options(Some(command), None)),
@@ -743,7 +743,7 @@ fn passing_validation_retains_status_with_a_short_tail() {
         &lines.join("\n"),
         0,
         false,
-        options(Some("just core-test-fast core_lib"), None),
+        options(Some("cargo nextest run -p codex-core --lib"), None),
     )
     .unwrap();
     assert!(summary.contains("699 tests run: 699 passed"));

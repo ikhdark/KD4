@@ -4,11 +4,11 @@ use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::search::SearchRequest;
 use crate::search::SearchResponse;
+use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestTelemetry;
 use http::HeaderMap;
 use http::Method;
-use serde_json::to_value;
 use std::sync::Arc;
 
 pub struct SearchClient<T: HttpTransport> {
@@ -37,7 +37,7 @@ impl<T: HttpTransport> SearchClient<T> {
         request: &SearchRequest,
         extra_headers: HeaderMap,
     ) -> Result<SearchResponse, ApiError> {
-        let body = to_value(request)
+        let body = EncodedJsonBody::encode(request)
             .map_err(|e| ApiError::Stream(format!("failed to encode search request: {e}")))?;
         let resp = self
             .session

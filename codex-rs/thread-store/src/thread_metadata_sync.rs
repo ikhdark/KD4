@@ -215,6 +215,12 @@ impl ThreadMetadataSync {
             return None;
         }
         for item in items {
+            // Resume histories and mixed append batches also contain tool payloads and
+            // sampling records. Reuse the live-path classifier before cloning settings;
+            // these records cannot change either settings or metadata.
+            if !codex_state::rollout_item_affects_thread_metadata(item) {
+                continue;
+            }
             let previous_settings = self.settings_reducer.settings().clone();
             if !matches!(
                 item,
@@ -710,6 +716,52 @@ mod tests {
             .is_some(),
             "the first append should flush resume metadata together with append metadata"
         );
+    }
+
+    #[test]
+    fn irrelevant_resume_history_preserves_the_pending_patch_and_settings() {
+        let thread_id = ThreadId::new();
+        let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
+        let settings = PersistedThreadSettings {
+            model: Some("persisted-model".to_string()),
+            developer_instructions: Some(Some("large instructions".repeat(1_000))),
+            reasoning_effort: Some(None),
+            ..Default::default()
+        };
+        sync.settings_reducer = PersistedThreadSettingsReducer::new(settings.clone());
+        let item = RolloutItem::Compacted(CompactedItem {
+            message: "compacted".to_string(),
+            replacement_history: None,
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        });
+
+        sync.record_resume_history(&vec![item.clone(); 100]);
+
+        assert_eq!(sync.settings_reducer.settings(), &settings);
+        let pending = sync.take_pending_update().expect("nonempty replay patch");
+        assert!(pending.patch.is_empty());
+        assert!(sync.take_pending_update_for_existing_history().is_none());
+
+        // An irrelevant record must not hide the metadata-bearing record next to it.
+        let update = sync
+            .observe_appended_items(&[
+                item,
+                RolloutItem::EventMsg(EventMsg::UserMessage(user_message("first user text"))),
+            ])
+            .expect("mixed batch metadata");
+        assert_eq!(update.patch.preview.as_deref(), Some("first user text"));
+        assert_eq!(update.patch.title.as_deref(), Some("first user text"));
+        assert_eq!(
+            update.patch.first_user_message.as_deref(),
+            Some("first user text")
+        );
+        assert!(update.patch.updated_at.is_some());
+        assert_eq!(sync.settings_reducer.settings(), &settings);
+        sync.mark_pending_update_applied(&update);
+        assert!(sync.take_pending_update().is_none());
     }
 
     fn resume_params(thread_id: ThreadId, history: Vec<RolloutItem>) -> ResumeThreadParams {

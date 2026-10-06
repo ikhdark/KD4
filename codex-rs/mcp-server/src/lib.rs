@@ -98,12 +98,32 @@ fn write_outgoing_messages<W: Write>(
     mut outgoing_rx: mpsc::Receiver<OutgoingMessage>,
     mut stdout: W,
 ) -> IoResult<()> {
-    while let Some(outgoing_message) = outgoing_rx.blocking_recv() {
-        let msg: OutgoingJsonRpcMessage = outgoing_message.into();
-        let mut json = serde_json::to_vec(&msg)?;
-        json.push(b'\n');
+    const MAX_BATCH_MESSAGES: usize = 32;
+    const MAX_BATCH_BYTES: usize = 64 * 1024;
+    let mut json = Vec::new();
+    while let Some(mut outgoing_message) = outgoing_rx.blocking_recv() {
+        json.clear();
+        for index in 0..MAX_BATCH_MESSAGES {
+            let msg: OutgoingJsonRpcMessage = outgoing_message.into();
+            serde_json::to_writer(&mut json, &msg)?;
+            json.push(b'\n');
+            // Drain only ready messages, without a batching timer. Bound each
+            // write by message count and a byte threshold (plus one full frame).
+            if index + 1 == MAX_BATCH_MESSAGES || json.len() >= MAX_BATCH_BYTES {
+                break;
+            }
+            match outgoing_rx.try_recv() {
+                Ok(message) => outgoing_message = message,
+                Err(_) => break,
+            }
+        }
         stdout.write_all(&json)?;
         stdout.flush()?;
+        // Reuse ordinary batches, but do not retain an oversized event's buffer
+        // for the remainder of a long-lived server session.
+        if json.capacity() > MAX_BATCH_BYTES {
+            json = Vec::new();
+        }
     }
     Ok(())
 }
@@ -350,6 +370,115 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
     use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    fn writer_test_message(id: i64, text: &str) -> OutgoingMessage {
+        OutgoingMessage::Response(crate::outgoing_message::OutgoingResponse {
+            id: rmcp::model::RequestId::Number(id),
+            result: serde_json::json!({"text": text}),
+        })
+    }
+
+    #[test]
+    fn stdout_writer_batches_queued_messages_without_changing_wire_bytes() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let mut expected = Vec::new();
+        for id in 0..128 {
+            let message = writer_test_message(id, "streamed \"text\"\nλ");
+            let wire: OutgoingJsonRpcMessage =
+                writer_test_message(id, "streamed \"text\"\nλ").into();
+            serde_json::to_writer(&mut expected, &wire).unwrap();
+            expected.push(b'\n');
+            tx.try_send(message).ok().unwrap();
+        }
+        drop(tx);
+        let mut writer = RecordingWriter::default();
+        write_outgoing_messages(rx, &mut writer).unwrap();
+        assert_eq!(writer.bytes, expected);
+        assert_eq!((writer.writes, writer.flushes), (4, 4));
+    }
+
+    #[test]
+    fn stdout_writer_flushes_a_single_message_without_waiting_for_more() {
+        struct FlushSignal(std::sync::mpsc::Sender<()>);
+        impl Write for FlushSignal {
+            fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> IoResult<()> {
+                let _ = self.0.send(());
+                Ok(())
+            }
+        }
+        let (tx, rx) = mpsc::channel(1);
+        let (flushed_tx, flushed_rx) = std::sync::mpsc::channel();
+        let writer =
+            std::thread::spawn(move || write_outgoing_messages(rx, FlushSignal(flushed_tx)));
+        tx.try_send(writer_test_message(1, "single")).ok().unwrap();
+        // Keep the sender open: the writer must not wait for EOF or another frame.
+        let flushed = flushed_rx.recv_timeout(Duration::from_secs(5));
+        drop(tx);
+        writer.join().unwrap().unwrap();
+        flushed.expect("single message must be flushed promptly");
+    }
+
+    #[test]
+    fn stdout_writer_bounds_batches_by_bytes() {
+        let (tx, rx) = mpsc::channel(3);
+        for id in 0..3 {
+            tx.try_send(writer_test_message(id, &"x".repeat(64 * 1024)))
+                .ok()
+                .unwrap();
+        }
+        drop(tx);
+        let mut writer = RecordingWriter::default();
+        write_outgoing_messages(rx, &mut writer).unwrap();
+        assert_eq!((writer.writes, writer.flushes), (3, 3));
+        assert_eq!(writer.bytes.iter().filter(|&&b| b == b'\n').count(), 3);
+    }
+
+    #[test]
+    fn stdout_writer_propagates_write_and_flush_failures() {
+        struct FailingWriter(bool);
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
+                if self.0 {
+                    Err(std::io::Error::from(ErrorKind::BrokenPipe))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> IoResult<()> {
+                Err(std::io::Error::from(ErrorKind::BrokenPipe))
+            }
+        }
+        for fail_write in [true, false] {
+            let (tx, rx) = mpsc::channel(1);
+            tx.try_send(writer_test_message(1, "failure")).ok().unwrap();
+            // Failure must return even while the sender remains open.
+            let err = write_outgoing_messages(rx, FailingWriter(fail_write)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+        }
+    }
 
     #[tokio::test]
     async fn mcp_server_defaults_analytics_to_enabled() -> anyhow::Result<()> {

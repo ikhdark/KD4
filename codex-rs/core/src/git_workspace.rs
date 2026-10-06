@@ -243,7 +243,7 @@ pub(crate) async fn capture_checkout_snapshot(cwd: &Path) -> Option<String> {
     timeout(WORKSPACE_GENERATION_DEADLINE, async {
         let root = resolve_workspace_evidence_root(cwd).await.ok()??;
         let list = || async {
-            let output = Command::new("git")
+            let output = Command::new(codex_git_utils::git_executable_async().await)
                 .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
                 .env("GIT_OPTIONAL_LOCKS", "0")
                 .current_dir(&root)
@@ -465,7 +465,7 @@ async fn git_ignores_all_changed_paths(root: &Path, paths: &[PathBuf]) -> bool {
     }
     timeout(Duration::from_secs(2), async {
         // An ignored directory can still contain force-added tracked files.
-        let mut tracked = Command::new("git")
+        let mut tracked = Command::new(codex_git_utils::git_executable_async().await)
             .args(["--literal-pathspecs", "ls-files", "--cached", "-z", "--"])
             .args(paths).current_dir(root)
             .stdin(std::process::Stdio::null())
@@ -477,7 +477,7 @@ async fn git_ignores_all_changed_paths(root: &Path, paths: &[PathBuf]) -> bool {
         {
             return Some(false);
         }
-        let mut ignored = Command::new("git")
+        let mut ignored = Command::new(codex_git_utils::git_executable_async().await)
             .args(["check-ignore", "-z", "--stdin"]).current_dir(root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -803,7 +803,7 @@ async fn workspace_generation_status(
     repo_root: &Path,
 ) -> Option<(Vec<u8>, Vec<WorkspaceGenerationPath>)> {
     let _timer = codex_otel::start_global_timer("codex.workspace.git_status.duration_ms", &[]);
-    let mut command = Command::new("git");
+    let mut command = Command::new(codex_git_utils::git_executable_async().await);
     command
         .arg("-c")
         .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
@@ -1396,6 +1396,82 @@ struct GitWorkspaceCacheState {
     metadata: HashMap<PathBuf, MetadataCacheEntry>,
 }
 
+struct IgnoredDirectoryProof {
+    root: PathBuf,
+    directory: PathBuf,
+    dependencies: Vec<DependencyFingerprint>,
+}
+
+impl IgnoredDirectoryProof {
+    fn is_current(&self) -> bool {
+        self.directory.ancestors().take_while(|path| path.starts_with(&self.root)).all(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        }) && self.dependencies.iter().all(|dependency| {
+            dependency_fingerprint(dependency.path.clone(), dependency.path.file_name().is_some_and(|name| name != "index"))
+                .as_ref() == Some(dependency)
+        })
+    }
+}
+
+fn ignore_directory_dependencies(root: &Path, directory: &Path) -> Option<Vec<DependencyFingerprint>> {
+    let absolute = AbsolutePathBuf::from_absolute_path(root).ok()?;
+    let (git_dir, common_dir, _) = resolve_git_dirs(&absolute)?;
+    let mut paths = vec![(git_dir.join("index"), false), (git_dir.join("config.worktree"), true),
+        (common_dir.join("config"), true), (root.join(".git"), true)];
+    for ancestor in directory.ancestors() {
+        if !ancestor.starts_with(root) { break; }
+        // Never cache a proof through a symlink or a removed directory.
+        let metadata = std::fs::symlink_metadata(ancestor).ok()?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() { return None; }
+        paths.push((ancestor.join(".gitignore"), true));
+    }
+    paths.into_iter().map(|(path, hash)| dependency_fingerprint(path, hash)).collect()
+}
+
+// Learn only exclusions from repository .gitignore files. Global excludes/config
+// can change outside our watches; they remain on the uncached fallback path.
+async fn ignored_directory_proof(root: &Path, path: &Path) -> Option<IgnoredDirectoryProof> {
+    use tokio::io::AsyncWriteExt;
+    let parent = if path.is_dir() { path } else { path.parent()? };
+    let dependencies = ignore_directory_dependencies(root, parent)?;
+    let candidates = parent.ancestors().take_while(|dir| *dir != root && dir.starts_with(root))
+        .map(Path::to_path_buf).collect::<Vec<_>>();
+    let mut input = Vec::new();
+    for directory in &candidates {
+        input.extend_from_slice(directory.strip_prefix(root).ok()?.to_str()?.as_bytes());
+        input.push(0);
+    }
+    if input.is_empty() || input.len() > 8 * 1024 { return None; }
+    let output = timeout(Duration::from_secs(2), async {
+        let mut child = Command::new(codex_git_utils::git_executable_async().await).args(["check-ignore", "--verbose", "-z", "--stdin"])
+            .current_dir(root).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+            .kill_on_drop(true).spawn().ok()?;
+        let mut stdin = child.stdin.take()?;
+        let (written, output) = tokio::join!(async move {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await
+        }, child.wait_with_output());
+        written.ok()?;
+        let output = output.ok()?;
+        output.status.success().then_some(output.stdout)
+    }).await.ok()??;
+    let fields = output.strip_suffix(&[0])?.split(|byte| *byte == 0).collect::<Vec<_>>();
+    if fields.len() % 4 != 0 { return None; }
+    let directory = fields.chunks_exact(4).filter_map(|fields| {
+        let source = root.join(std::str::from_utf8(fields[0]).ok()?);
+        let directory = root.join(std::str::from_utf8(fields[3]).ok()?);
+        (fields[2].first() != Some(&b'!')
+            && source.file_name().is_some_and(|name| name == ".gitignore")
+            && source.strip_prefix(root).ok()?.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+            && directory.starts_with(source.parent()?)
+            && candidates.contains(&directory)).then_some(directory)
+    }).min_by_key(|directory| directory.components().count())?;
+    if !git_ignores_all_changed_paths(root, std::slice::from_ref(&directory)).await { return None; }
+    let proof = IgnoredDirectoryProof { root: root.to_path_buf(), directory, dependencies };
+    proof.is_current().then_some(proof)
+}
+
 #[derive(Clone)]
 struct CachedWorkspaceEvidenceIdentity {
     capture_sequence: u64,
@@ -1517,6 +1593,7 @@ pub(crate) struct GitWorkspaceCache {
     source_watcher_generation: AtomicU64,
     source_capture_generation: AtomicU64,
     source_event_gate: tokio::sync::RwLock<()>,
+    ignored_directories: Mutex<HashMap<PathBuf, Vec<IgnoredDirectoryProof>>>,
     source_watcher_reliable: AtomicBool,
     repository_retention: StdMutex<RepositoryRetention>,
     source_change_journal: StdMutex<SourceChangeJournal>,
@@ -1533,6 +1610,8 @@ pub(crate) struct GitWorkspaceCache {
     workspace_evidence_waiter_joined: tokio::sync::Notify,
     #[cfg(test)]
     root_resolution_count: AtomicU64,
+    #[cfg(test)]
+    ignore_query_count: AtomicU64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1838,6 +1917,7 @@ impl GitWorkspaceCache {
             source_watcher_generation: AtomicU64::new(0),
             source_capture_generation: AtomicU64::new(0),
             source_event_gate: tokio::sync::RwLock::new(()),
+            ignored_directories: Mutex::new(HashMap::new()),
             source_watcher_reliable: AtomicBool::new(watcher_available),
             repository_retention: StdMutex::new(RepositoryRetention::default()),
             source_change_journal: StdMutex::new(SourceChangeJournal::default()),
@@ -1853,6 +1933,8 @@ impl GitWorkspaceCache {
             workspace_evidence_waiter_joined: tokio::sync::Notify::new(),
             #[cfg(test)]
             root_resolution_count: AtomicU64::new(0),
+            #[cfg(test)]
+            ignore_query_count: AtomicU64::new(0),
         });
         if let Some(receiver) = receiver
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
@@ -2400,7 +2482,10 @@ impl GitWorkspaceCache {
     async fn record_watched_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) {
         let _guard = self.source_event_gate.write().await;
         let changed_paths = changed_paths.map(|paths| paths.into_iter()
-            .filter(|path| !is_generated_codex_eval_path(path)).collect::<Vec<_>>());
+            .filter(|path| !is_generated_codex_eval_path(path) && !is_git_internal_source_event(path))
+            .collect::<Vec<_>>());
+        if changed_paths.as_ref().is_some_and(Vec::is_empty) { return; }
+        if changed_paths.is_none() { self.ignored_directories.lock().await.clear(); }
         let roots = self.repository_retention.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .source_watch_registrations.keys().cloned().collect::<Vec<_>>();
@@ -2417,10 +2502,26 @@ impl GitWorkspaceCache {
             }
         }
         if ignored {
+            let mut cache = self.ignored_directories.lock().await;
+            cache.retain(|root, _| roots.contains(root));
             for (root, paths) in groups {
-                if !git_ignores_all_changed_paths(&root, &paths).await {
+                let proofs = cache.entry(root.clone()).or_default();
+                proofs.retain(IgnoredDirectoryProof::is_current);
+                let pending = paths.into_iter().filter(|path| {
+                    !proofs.iter().any(|proof| path.starts_with(&proof.directory))
+                }).collect::<Vec<_>>();
+                if pending.is_empty() { continue; }
+                #[cfg(test)]
+                self.ignore_query_count.fetch_add(1, Ordering::Relaxed);
+                if !git_ignores_all_changed_paths(&root, &pending).await {
                     ignored = false;
                     break;
+                }
+                // Learn at most one directory per batch; never turn a source edit
+                // burst into one Git invocation per path.
+                if let Some(proof) = ignored_directory_proof(&root, &pending[0]).await {
+                    if proofs.len() >= RETAINED_REPOSITORY_CAPACITY { proofs.clear(); }
+                    proofs.push(proof);
                 }
             }
         }
@@ -2774,6 +2875,23 @@ fn is_generated_codex_eval_path(path: &Path) -> bool {
         || normalized.contains("/.codex/evals/")
 }
 
+fn is_git_internal_source_event(path: &Path) -> bool {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if component.as_os_str().to_string_lossy().eq_ignore_ascii_case(".git") {
+            // Metadata has its own watch. Only staging and ignore-rule changes
+            // under .git must also invalidate the workspace source capture.
+            // Keep changes to the .git marker itself observable as well.
+            let relative = components.as_path();
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            return !relative.is_empty()
+                && !relative.eq_ignore_ascii_case("index")
+                && !relative.eq_ignore_ascii_case("info/exclude");
+        }
+    }
+    false
+}
+
 fn canonical_workspace_evidence_root(repo_root: &Path) -> PathBuf {
     dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf())
 }
@@ -2817,7 +2935,7 @@ impl StableMetadataDependencies {
     async fn capture(source: &GitWorkspaceMetadataSource) -> Option<Self> {
         let repo_root = source.repo_root.clone();
         let (executable, files) = run_blocking_git_metadata(move || {
-            let executable = which::which("git").ok()?;
+            let executable = which::which(codex_git_utils::git_executable()).ok()?;
             let executable = executable.canonicalize().unwrap_or(executable);
             let (git_dir, common_dir, head_ref) = resolve_git_dirs(&repo_root)?;
             let mut paths = vec![

@@ -586,7 +586,7 @@ fn process_responses_event(
         }
         "response.custom_tool_call_input.delta" => {
             if let (Some(delta), Some(item_id)) =
-                (event.delta, event.item_id.clone().or(event.call_id.clone()))
+                (event.delta, event.item_id.or_else(|| event.call_id.clone()))
             {
                 return Ok(Some(ResponseEvent::ToolCallInputDelta {
                     item_id,
@@ -775,6 +775,68 @@ mod tests {
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn tool_input_delta_moves_owned_item_id() {
+        for call_id in [None, Some("call_1")] {
+            let payload = json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": "ctc_1",
+                "call_id": call_id,
+                "delta": "*** Begin",
+            })
+            .to_string();
+            let event: ResponsesStreamEvent<'_> = serde_json::from_str(&payload).unwrap();
+            let item_allocation = event.item_id.as_ref().unwrap().as_ptr();
+            let call_allocation = event.call_id.as_ref().map(|id| id.as_ptr());
+
+            let Some(ResponseEvent::ToolCallInputDelta {
+                item_id,
+                call_id: actual_call_id,
+                delta,
+            }) = process_responses_event(event).unwrap()
+            else {
+                panic!("expected tool input delta");
+            };
+            assert_eq!(item_id, "ctc_1");
+            assert_eq!(item_id.as_ptr(), item_allocation);
+            assert_eq!(actual_call_id.as_deref(), call_id);
+            assert_eq!(actual_call_id.as_ref().map(|id| id.as_ptr()), call_allocation);
+            assert_eq!(delta, "*** Begin");
+        }
+    }
+
+    #[test]
+    fn tool_input_delta_preserves_fallback_and_missing_fields() {
+        for (item_id, call_id, delta) in [
+            (Some("ctc_1"), Some("call_1"), Some("input")),
+            (Some("ctc_1"), None, Some("input")),
+            (None, Some("call_1"), Some("input")),
+            (Some(""), Some("call_1"), Some("")),
+            (None, None, Some("input")),
+            (Some("ctc_1"), Some("call_1"), None),
+        ] {
+            let payload = json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": item_id,
+                "call_id": call_id,
+                "delta": delta,
+            })
+            .to_string();
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let events = interpreter.process_payload(&payload).unwrap().collect::<Vec<_>>();
+            if let (Some(expected_id), Some(expected_delta)) = (item_id.or(call_id), delta) {
+                assert!(matches!(events.as_slice(), [ResponseEvent::ToolCallInputDelta {
+                    item_id, call_id: actual_call_id, delta,
+                }] if item_id == expected_id
+                    && actual_call_id.as_deref() == call_id
+                    && delta == expected_delta));
+            } else {
+                assert!(events.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn audit_optional_usage_does_not_destroy_completion() {

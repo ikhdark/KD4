@@ -146,6 +146,18 @@ pub trait CloudBackend: Send + Sync {
     fn get_task_messages(&self, id: TaskId) -> CloudBackendFuture<'_, Vec<String>>;
     /// Return the creating prompt and assistant messages (when available).
     fn get_task_text(&self, id: TaskId) -> CloudBackendFuture<'_, TaskText>;
+    /// Return text and diff together so HTTP backends can use one fresh task snapshot.
+    /// The default preserves the separate operations for existing custom backends.
+    fn get_task_text_and_diff(
+        &self,
+        id: TaskId,
+    ) -> CloudBackendFuture<'_, (TaskText, Option<String>)> {
+        Box::pin(async move {
+            let text = self.get_task_text(id.clone()).await?;
+            let diff = self.get_task_diff(id).await?;
+            Ok((text, diff))
+        })
+    }
     /// Return any sibling attempts (best-of-N) for the given assistant turn.
     fn list_sibling_attempts(
         &self,

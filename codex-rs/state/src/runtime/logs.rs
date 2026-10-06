@@ -447,6 +447,8 @@ impl StateRuntime {
         scope: &LogRetentionScope,
         tx: &mut SqliteConnection,
     ) -> anyhow::Result<()> {
+        // Phase diagnostics are exempt from the noisy row-count budget, but
+        // still obey the existing byte and age limits.
         let thread_ids: BTreeSet<&str> = scope.thread_ids.iter().map(String::as_str).collect();
         if !thread_ids.is_empty() {
             // Cheap precheck: only run the heavier window-function prune for
@@ -463,7 +465,7 @@ impl StateRuntime {
             over_limit_threads_query.push("estimated_bytes");
             over_limit_threads_query.push(") > ");
             over_limit_threads_query.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-            over_limit_threads_query.push(" OR COUNT(*) > ");
+            over_limit_threads_query.push(" OR SUM(target != 'codex_core::tools::execution_phase') > ");
             over_limit_threads_query.push_bind(LOG_PARTITION_ROW_LIMIT);
             let over_limit_thread_ids: Vec<String> = over_limit_threads_query
                 .build()
@@ -483,6 +485,7 @@ WHERE id IN (
     FROM (
         SELECT
             id,
+            target,
             SUM(
 "#,
                 );
@@ -493,7 +496,7 @@ WHERE id IN (
                 PARTITION BY thread_id
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
             ) AS cumulative_bytes,
-            ROW_NUMBER() OVER (
+            SUM(target != 'codex_core::tools::execution_phase') OVER (
                 PARTITION BY thread_id
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
             ) AS row_number
@@ -515,9 +518,9 @@ WHERE id IN (
 "#,
                 );
                 prune_threads.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-                prune_threads.push(" OR row_number > ");
+                prune_threads.push(" OR (target != 'codex_core::tools::execution_phase' AND row_number > ");
                 prune_threads.push_bind(LOG_PARTITION_ROW_LIMIT);
-                prune_threads.push("\n)");
+                prune_threads.push(")\n)");
                 prune_threads.build().execute(&mut *tx).await?;
             }
         }
@@ -543,7 +546,7 @@ WHERE id IN (
             over_limit_processes_query.push("estimated_bytes");
             over_limit_processes_query.push(") > ");
             over_limit_processes_query.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-            over_limit_processes_query.push(" OR COUNT(*) > ");
+            over_limit_processes_query.push(" OR SUM(target != 'codex_core::tools::execution_phase') > ");
             over_limit_processes_query.push_bind(LOG_PARTITION_ROW_LIMIT);
             let over_limit_process_uuids: Vec<String> = over_limit_processes_query
                 .build()
@@ -563,6 +566,7 @@ WHERE id IN (
     FROM (
         SELECT
             id,
+            target,
             SUM(
 "#,
                 );
@@ -573,7 +577,7 @@ WHERE id IN (
                 PARTITION BY process_uuid
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
             ) AS cumulative_bytes,
-            ROW_NUMBER() OVER (
+            SUM(target != 'codex_core::tools::execution_phase') OVER (
                 PARTITION BY process_uuid
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
             ) AS row_number
@@ -596,9 +600,9 @@ WHERE id IN (
 "#,
                 );
                 prune_threadless_process_logs.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-                prune_threadless_process_logs.push(" OR row_number > ");
+                prune_threadless_process_logs.push(" OR (target != 'codex_core::tools::execution_phase' AND row_number > ");
                 prune_threadless_process_logs.push_bind(LOG_PARTITION_ROW_LIMIT);
-                prune_threadless_process_logs.push("\n)");
+                prune_threadless_process_logs.push(")\n)");
                 prune_threadless_process_logs
                     .build()
                     .execute(&mut *tx)
@@ -611,7 +615,7 @@ WHERE id IN (
             let mut null_process_usage_query = QueryBuilder::<Sqlite>::new("SELECT SUM(");
             null_process_usage_query.push("estimated_bytes");
             null_process_usage_query.push(
-                ") AS total_bytes, COUNT(*) AS row_count FROM logs WHERE thread_id IS NULL AND process_uuid IS NULL",
+                ") AS total_bytes, COUNT(CASE WHEN target != 'codex_core::tools::execution_phase' THEN 1 END) AS row_count FROM logs WHERE thread_id IS NULL AND process_uuid IS NULL",
             );
             let null_process_usage = null_process_usage_query.build().fetch_one(&mut *tx).await?;
             let total_null_process_bytes: Option<i64> =
@@ -629,6 +633,7 @@ WHERE id IN (
     FROM (
         SELECT
             id,
+            target,
             SUM(
 "#,
                 );
@@ -639,7 +644,7 @@ WHERE id IN (
                 PARTITION BY process_uuid
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
             ) AS cumulative_bytes,
-            ROW_NUMBER() OVER (
+            SUM(target != 'codex_core::tools::execution_phase') OVER (
                 PARTITION BY process_uuid
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
             ) AS row_number
@@ -651,9 +656,9 @@ WHERE id IN (
 "#,
                 );
                 prune_threadless_null_process_logs.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-                prune_threadless_null_process_logs.push(" OR row_number > ");
+                prune_threadless_null_process_logs.push(" OR (target != 'codex_core::tools::execution_phase' AND row_number > ");
                 prune_threadless_null_process_logs.push_bind(LOG_PARTITION_ROW_LIMIT);
-                prune_threadless_null_process_logs.push("\n)");
+                prune_threadless_null_process_logs.push(")\n)");
                 prune_threadless_null_process_logs
                     .build()
                     .execute(&mut *tx)
@@ -1912,6 +1917,41 @@ mod tests {
         assert_eq!(timestamps.last().copied(), Some(recent_test_ts(1_001)));
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn execution_phase_logs_survive_noisy_row_caps_in_all_partitions() {
+        for (thread_id, process_uuid) in [
+            (Some("phase-thread"), Some("phase-process")),
+            (None, Some("phase-process")),
+            (None, None),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into())
+                .await.unwrap();
+            let mut phase = test_log("command_setup", "phase-thread");
+            phase.thread_id = thread_id.map(str::to_owned);
+            phase.process_uuid = process_uuid.map(str::to_owned);
+            phase.target = "codex_core::tools::execution_phase".into();
+            phase.ts = recent_test_ts(0);
+            runtime.insert_logs(&[phase]).await.unwrap();
+            let entries = (1..=1_001).map(|ts| {
+                let mut entry = test_log("noise", "phase-thread");
+                entry.thread_id = thread_id.map(str::to_owned);
+                entry.process_uuid = process_uuid.map(str::to_owned);
+                entry.ts = recent_test_ts(ts);
+                entry
+            }).collect::<Vec<_>>();
+            runtime.insert_logs(&entries).await.unwrap();
+            let phase_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM logs WHERE target = 'codex_core::tools::execution_phase'"
+            ).fetch_one(runtime.logs_pool.as_ref()).await.unwrap();
+            let noise_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM logs WHERE target != 'codex_core::tools::execution_phase'"
+            ).fetch_one(runtime.logs_pool.as_ref()).await.unwrap();
+            assert_eq!(phase_count, 1);
+            assert_eq!(noise_count, 1_000);
+        }
     }
 
     #[tokio::test]

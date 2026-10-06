@@ -15,8 +15,6 @@ use codex_core_plugins::marketplace_add::MarketplaceAddRequest;
 use codex_core_plugins::marketplace_add::add_marketplace;
 use codex_core_plugins::marketplace_add::is_local_marketplace_source;
 use codex_external_agent_migration::build_mcp_config_from_external;
-use codex_external_agent_migration::count_missing_commands;
-use codex_external_agent_migration::count_missing_subagents;
 use codex_external_agent_migration::hook_migration_event_names;
 use codex_external_agent_migration::import_commands;
 use codex_external_agent_migration::import_hooks;
@@ -658,9 +656,9 @@ impl ExternalAgentConfigService {
             || self.home_target_skills_dir(),
             |repo_root| repo_root.join(".agents").join("skills"),
         );
-        let commands_count = count_missing_commands(&source_commands, &target_command_skills)?;
+        let command_names = missing_command_names(&source_commands, &target_command_skills)?;
+        let commands_count = command_names.len();
         if commands_count > 0 {
-            let command_names = missing_command_names(&source_commands, &target_command_skills)?;
             items.push(ExternalAgentConfigMigrationItem {
                 item_type: ExternalAgentConfigMigrationItemType::Commands,
                 description: format!(
@@ -686,9 +684,9 @@ impl ExternalAgentConfigService {
             || self.codex_home.join("agents"),
             |repo_root| repo_root.join(".codex").join("agents"),
         );
-        let subagents_count = count_missing_subagents(&source_subagents, &target_subagents)?;
+        let subagent_names = missing_subagent_names(&source_subagents, &target_subagents)?;
+        let subagents_count = subagent_names.len();
         if subagents_count > 0 {
-            let subagent_names = missing_subagent_names(&source_subagents, &target_subagents)?;
             items.push(ExternalAgentConfigMigrationItem {
                 item_type: ExternalAgentConfigMigrationItemType::Subagents,
                 description: format!(

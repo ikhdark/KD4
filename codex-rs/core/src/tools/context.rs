@@ -1917,6 +1917,32 @@ pub(crate) fn attach_command_validation(
 }
 
 impl ExecCommandToolOutput {
+    /// The streaming spill threshold is independent of the caller's display
+    /// budget. Retain a reduced chunk on demand without replacing a live
+    /// process's cumulative writer or making fully inline output hit disk.
+    pub(crate) async fn prepare_recovery_artifact(
+        &mut self,
+        codex_home: &std::path::Path,
+        thread_id: &str,
+    ) {
+        if self.raw_output.is_empty()
+            || self.raw_output_artifact.as_ref().is_some_and(|artifact| !artifact.is_pending())
+        {
+            return;
+        }
+        let raw_output = String::from_utf8_lossy(&self.raw_output);
+        if self.projected_model_output(
+            raw_output.as_ref(),
+            Some(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS),
+        ).reduced {
+            self.raw_output_artifact = Some(
+                crate::tools::command_output_artifact::create_raw_output_artifact(
+                    codex_home, thread_id, &self.raw_output,
+                ).await,
+            );
+        }
+    }
+
     fn search_no_match_is_success(&self) -> bool {
         // PowerShell can map native rg errors to exit 1 too. Classification of
         // the command alone cannot turn its stderr (or lost streams) into a

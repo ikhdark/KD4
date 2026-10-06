@@ -1231,6 +1231,9 @@ impl FileWatcher {
         let mut actual_watch_moves = Vec::new();
         let mut subscribers_to_notify = Vec::new();
         let mut relevant_paths = Vec::new();
+        // Subscribers sharing a requested path can share its resolution within
+        // this pass. Never retain filesystem observations across event batches.
+        let mut resolved_paths = HashMap::new();
         #[cfg(test)]
         let mut actual_watch_path_resolution_count = 0;
 
@@ -1262,11 +1265,16 @@ impl FileWatcher {
                         false,
                     )
                 } else {
-                    #[cfg(test)]
-                    {
-                        actual_watch_path_resolution_count += 1;
-                    }
-                    actual_watch_path(&subscriber_watch.requested)
+                    resolved_paths
+                        .entry(subscriber_watch.requested.clone())
+                        .or_insert_with(|| {
+                            #[cfg(test)]
+                            {
+                                actual_watch_path_resolution_count += 1;
+                            }
+                            actual_watch_path(&subscriber_watch.requested)
+                        })
+                        .clone()
                 };
                 for event_path in &relevant_paths {
                     let changed_path = changed_path_for_event(

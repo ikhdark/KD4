@@ -5334,20 +5334,6 @@ fn map_response_stream(
         rx_event,
         upstream_request_id: None,
     };
-    let dispatched_at = Instant::now();
-    let api_stream = api_stream.inspect(move |event| {
-        if let Some(stream_throughput) = stream_throughput.as_ref()
-            && let Ok(ResponseEvent::Completed {
-                token_usage: Some(token_usage),
-                ..
-            }) = event
-        {
-            stream_throughput
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record(token_usage.output_tokens, dispatched_at.elapsed());
-        }
-    });
     map_response_events(
         upstream_request_id,
         api_stream,
@@ -5355,6 +5341,7 @@ fn map_response_stream(
         inference_trace_attempt,
         provider,
         attempt,
+        stream_throughput,
     )
 }
 
@@ -5365,6 +5352,7 @@ fn map_response_events<S>(
     inference_trace_attempt: impl Into<AsyncInferenceTraceAttempt>,
     provider: SharedModelProvider,
     mut attempt: Option<ModelAttemptState>,
+    stream_throughput: Option<Arc<StdMutex<WebsocketStreamThroughput>>>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -5379,12 +5367,14 @@ where
     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
     let consumer_dropped = CancellationToken::new();
     let consumer_dropped_for_stream = consumer_dropped.clone();
+    let dispatched_at = Instant::now();
 
     tokio::spawn(async move {
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
         let mut ttft_ms = None;
         let mut api_stream = api_stream;
+        let mut downstream_backpressured = false;
         let upstream_request_id = upstream_request_id.as_deref();
         if let Some(upstream_request_id) = upstream_request_id {
             feedback_tags!(last_model_request_id = upstream_request_id);
@@ -5438,6 +5428,15 @@ where
             let records_visible_output = event
                 .as_ref()
                 .is_ok_and(response_event_records_visible_output);
+            // With one sender, an empty capacity here means forwarding this
+            // nonterminal event can block polling the provider. Its completion
+            // time no longer isolates backend speed. Do not subtract this wait:
+            // it can overlap real provider work and invent an inflated rate.
+            if !matches!(&event, Ok(ResponseEvent::Completed { .. }))
+                && tx_event.capacity() == 0
+            {
+                downstream_backpressured = true;
+            }
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
                     items_added.push(item.clone());
@@ -5464,6 +5463,19 @@ where
                     token_usage,
                     end_turn,
                 }) => {
+                    if let Some(throughput) = stream_throughput.as_ref() {
+                        let mut throughput = throughput
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if downstream_backpressured {
+                            // A censored sample neither pollutes the baseline
+                            // nor joins unrelated slow responses into a streak.
+                            throughput.collapsed_streak = 0;
+                            throughput.latest_collapse = None;
+                        } else if let Some(usage) = token_usage.as_ref() {
+                            throughput.record(usage.output_tokens, dispatched_at.elapsed());
+                        }
+                    }
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(attempt) = attempt.as_ref() {
                         attempt.clock().mark_completed();

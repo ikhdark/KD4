@@ -45,6 +45,147 @@ fn qualified_mcp_tool_name_prefix_sanitizes_server_names_without_lowercasing() {
     );
 }
 
+#[tokio::test]
+async fn threadless_resource_read_skips_oauth_discovery_on_success() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::io::BufReader;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let discovery_requests = Arc::new(AtomicUsize::new(0));
+    let read_requests = Arc::new(AtomicUsize::new(0));
+    let server = tokio::spawn({
+        let discovery_requests = Arc::clone(&discovery_requests);
+        let read_requests = Arc::clone(&read_requests);
+        async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    connection = listener.accept() => {
+                        let (stream, _) = connection.unwrap();
+                        let discovery_requests = Arc::clone(&discovery_requests);
+                        let read_requests = Arc::clone(&read_requests);
+                        connections.spawn(async move {
+                            let mut stream = BufReader::new(stream);
+                            let mut request_line = String::new();
+                            stream.read_line(&mut request_line).await.unwrap();
+                            let mut content_length = 0;
+                            loop {
+                                let mut header = String::new();
+                                stream.read_line(&mut header).await.unwrap();
+                                if header == "\r\n" || header.is_empty() {
+                                    break;
+                                }
+                                if let Some((name, value)) = header.split_once(':')
+                                    && name.eq_ignore_ascii_case("content-length")
+                                {
+                                    content_length = value.trim().parse::<usize>().unwrap();
+                                }
+                            }
+                            let mut body = vec![0; content_length];
+                            stream.read_exact(&mut body).await.unwrap();
+                            let (status, response) = if request_line.starts_with("POST /mcp ") {
+                                let request: serde_json::Value =
+                                    serde_json::from_slice(&body).unwrap();
+                                let result = match request["method"].as_str().unwrap() {
+                                    "initialize" => Some(serde_json::json!({
+                                        "protocolVersion": "2025-06-18",
+                                        "capabilities": {"resources": {}},
+                                        "serverInfo": {"name": "fixture", "version": "1"}
+                                    })),
+                                    "notifications/initialized" => None,
+                                    "resources/read" => {
+                                        read_requests.fetch_add(1, Ordering::Relaxed);
+                                        assert_eq!(request["params"]["uri"], "test://document");
+                                        Some(serde_json::json!({"contents": [{
+                                            "uri": "test://document",
+                                            "mimeType": "text/plain",
+                                            "text": "complete resource content"
+                                        }]}))
+                                    }
+                                    method => panic!("unexpected MCP method: {method}"),
+                                };
+                                match result {
+                                    Some(result) => ("200 OK", serde_json::json!({
+                                        "jsonrpc": "2.0", "id": request["id"], "result": result
+                                    }).to_string()),
+                                    None => ("202 Accepted", String::new()),
+                                }
+                            } else if request_line.starts_with("GET /.well-known/") {
+                                discovery_requests.fetch_add(1, Ordering::Relaxed);
+                                // Discovery latency must not be a prerequisite for a read.
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                ("404 Not Found", String::new())
+                            } else {
+                                // This stateless fixture does not offer a standalone SSE stream.
+                                ("405 Method Not Allowed", String::new())
+                            };
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                                response.len()
+                            );
+                            stream.write_all(response.as_bytes()).await.unwrap();
+                        });
+                    }
+                    Some(result) = connections.join_next(), if !connections.is_empty() => {
+                        result.unwrap();
+                    }
+                }
+            }
+        }
+    });
+    let home = tempfile::tempdir().unwrap();
+    let mut config = test_mcp_config(home.path().to_path_buf());
+    config.mcp_oauth_credentials_store_mode = OAuthCredentialsStoreMode::File;
+    let mut catalog = ResolvedMcpCatalog::builder();
+    catalog.register(McpServerRegistration::from_config(
+        "fixture".to_string(),
+        serde_json::from_value(serde_json::json!({"url": url})).unwrap(),
+    ));
+    config.mcp_server_catalog = catalog.build();
+    let runtime = McpRuntimeContext::new(
+        Arc::new(codex_exec_server::EnvironmentManager::without_environments()),
+        home.path().to_path_buf(),
+    );
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        read_mcp_resource(
+            &config,
+            None,
+            runtime,
+            CodexAppsToolsCache::default(),
+            "fixture",
+            "test://document",
+        ),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    let result = result
+        .expect("bounded resource read")
+        .expect("resource contents");
+    assert_eq!(
+        serde_json::to_value(result).unwrap()["contents"],
+        serde_json::json!([{
+            "uri": "test://document",
+            "mimeType": "text/plain",
+            "text": "complete resource content"
+        }])
+    );
+    assert_eq!(read_requests.load(Ordering::Relaxed), 1);
+    let probes = discovery_requests.load(Ordering::Relaxed);
+    eprintln!(
+        "resource read: {} ms, {probes} discovery requests",
+        started.elapsed().as_millis()
+    );
+    assert_eq!(probes, 0, "successful reads need no diagnostic OAuth probes");
+}
+
 #[test]
 fn mcp_prompt_auto_approval_honors_unrestricted_managed_profiles() {
     assert!(mcp_permission_prompt_is_auto_approved(

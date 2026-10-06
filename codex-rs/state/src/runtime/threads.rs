@@ -327,6 +327,23 @@ ORDER BY depth ASC, child_thread_id ASC
         parent_thread_id: ThreadId,
         child_thread_id: ThreadId,
     ) -> Result<(), ThreadSpawnEdgeWriteError> {
+        // Rollout updates repeatedly infer the same edge. A no-op must not
+        // reserve SQLite's sole writer; WAL readers can check it concurrently.
+        // A miss is only a hint: recheck under BEGIN IMMEDIATE below before
+        // validating topology or inserting, since another writer may win.
+        let edge_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM thread_spawn_edges WHERE child_thread_id = ?)",
+        )
+        .bind(child_thread_id.to_string())
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+            operation: "check inferred thread-spawn edge",
+            source,
+        })? != 0;
+        if edge_exists {
+            return Ok(());
+        }
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -1512,24 +1529,26 @@ pub(super) fn push_thread_filters<'a>(
             SortDirection::Asc => ">",
             SortDirection::Desc => "<",
         };
-        builder.push(" AND (");
-        builder.push(column);
-        builder.push(" ");
-        builder.push(operator);
-        builder.push(" ");
-        builder.push_bind(anchor_ts);
         if include_thread_id_tiebreaker && let Some(anchor_id) = anchor.id {
-            builder.push(" OR (");
+            // A row-value range lets SQLite seek into the composite ordering
+            // index. An equivalent OR predicate scans earlier pages instead.
+            builder.push(" AND (");
             builder.push(column);
-            builder.push(" = ");
-            builder.push_bind(anchor_ts);
-            builder.push(" AND threads.id ");
+            builder.push(", threads.id) ");
             builder.push(operator);
-            builder.push(" ");
+            builder.push(" (");
+            builder.push_bind(anchor_ts);
+            builder.push(", ");
             builder.push_bind(anchor_id.to_string());
             builder.push(")");
+        } else {
+            builder.push(" AND ");
+            builder.push(column);
+            builder.push(" ");
+            builder.push(operator);
+            builder.push(" ");
+            builder.push_bind(anchor_ts);
         }
-        builder.push(")");
     }
 }
 
@@ -2195,6 +2214,108 @@ END
             .expect("list with empty cwd filters should succeed");
 
         assert_eq!(page.items, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn list_threads_cursor_seeks_indexes_and_preserves_ties() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let mut ids = Vec::new();
+        for index in 0..6 {
+            let id = ThreadId::from_string(&format!("00000000-0000-0000-0000-{index:012}"))?;
+            let mut metadata = test_thread_metadata(home.path(), id, home.path().to_path_buf());
+            let timestamp = metadata.created_at + chrono::Duration::seconds(index / 3);
+            metadata.created_at = timestamp;
+            metadata.updated_at = timestamp;
+            metadata.recency_at = timestamp;
+            runtime
+                .upsert_thread_preserving_timestamps(&metadata)
+                .await?;
+            ids.push(id);
+        }
+        let cwd_filters = [home.path().to_path_buf()];
+        for (sort_key, column) in [
+            (SortKey::CreatedAt, "created_at_ms"),
+            (SortKey::UpdatedAt, "updated_at_ms"),
+            (SortKey::RecencyAt, "recency_at_ms"),
+        ] {
+            for direction in [SortDirection::Asc, SortDirection::Desc] {
+                for cwd in [None, Some(cwd_filters.as_slice())] {
+                    let mut anchor = None;
+                    let mut listed = Vec::new();
+                    loop {
+                        let filters = ThreadFilterOptions {
+                            project_id: None,
+                            archived_only: false,
+                            allowed_sources: &[],
+                            model_providers: None,
+                            cwd_filters: cwd,
+                            anchor: anchor.as_ref(),
+                            sort_key,
+                            sort_direction: direction,
+                            search_term: None,
+                        };
+                        if anchor.is_some() {
+                            let mut query = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
+                            push_list_threads_query(&mut query, filters, None, 2);
+                            let plan = query.build().fetch_all(runtime.pool.as_ref()).await?;
+                            let details = plan
+                                .iter()
+                                .map(|row| row.get::<String, _>("detail"))
+                                .collect::<Vec<_>>();
+                            assert!(
+                                details
+                                    .iter()
+                                    .any(|detail| { detail.contains(&format!("({column},id)")) }),
+                                "cursor must seek the timestamp/id range: {details:?}"
+                            );
+                            assert!(!details.iter().any(|detail| detail.contains("TEMP B-TREE")));
+                        }
+                        let page = runtime.list_threads(1, filters).await?;
+                        listed.extend(page.items.iter().map(|item| item.id));
+                        assert!(listed.len() <= ids.len(), "pagination must progress");
+                        anchor = page.next_anchor;
+                        if anchor.is_none() {
+                            break;
+                        }
+                    }
+                    let mut expected = ids.clone();
+                    if direction == SortDirection::Desc {
+                        expected.reverse();
+                    }
+                    assert_eq!(listed, expected);
+
+                    // Legacy timestamp-only cursors exclude the entire tied bucket.
+                    let first = runtime.get_thread(expected[0]).await?.expect("thread");
+                    let legacy = Anchor {
+                        ts: first.created_at,
+                        id: None,
+                    };
+                    let page = runtime
+                        .list_threads(
+                            10,
+                            ThreadFilterOptions {
+                                project_id: None,
+                                archived_only: false,
+                                allowed_sources: &[],
+                                model_providers: None,
+                                cwd_filters: cwd,
+                                anchor: Some(&legacy),
+                                sort_key,
+                                sort_direction: direction,
+                                search_term: None,
+                            },
+                        )
+                        .await?;
+                    assert_eq!(
+                        page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+                        expected[3..]
+                    );
+                }
+            }
+        }
+        runtime.close().await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -3238,6 +3359,75 @@ END
             .expect("thread should exist");
         assert_eq!(persisted.tokens_used, 321);
         assert_eq!(persisted.updated_at, override_updated_at);
+    }
+
+    #[tokio::test]
+    async fn inferred_spawn_edge_skips_writer_and_rechecks_after_a_miss() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let parent = ThreadId::new();
+        let other_parent = ThreadId::new();
+        let child = ThreadId::new();
+        runtime
+            .upsert_thread_spawn_edge(parent, child, DirectionalThreadSpawnEdgeStatus::Closed)
+            .await?;
+
+        let writer = runtime.pool.begin_with("BEGIN IMMEDIATE").await?;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.insert_thread_spawn_edge_if_absent(other_parent, child),
+        )
+        .await??;
+        writer.rollback().await?;
+        assert_eq!(
+            runtime
+                .list_thread_spawn_children_with_status(
+                    parent,
+                    DirectionalThreadSpawnEdgeStatus::Closed
+                )
+                .await?,
+            vec![child]
+        );
+
+        // An uncommitted edge is absent from the initial WAL read. The writer
+        // wins while insertion waits; the in-transaction recheck must preserve it.
+        let next_child = ThreadId::new();
+        let mut writer = runtime.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO thread_spawn_edges VALUES (?, ?, 'closed')")
+            .bind(parent.to_string())
+            .bind(next_child.to_string())
+            .execute(&mut *writer)
+            .await?;
+        let mut insert =
+            Box::pin(runtime.insert_thread_spawn_edge_if_absent(other_parent, next_child));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut insert)
+                .await
+                .is_err()
+        );
+        writer.commit().await?;
+        insert.await?;
+        assert!(
+            runtime
+                .list_thread_spawn_children(other_parent)
+                .await?
+                .is_empty()
+        );
+
+        // The fast path does not cache existence across deletion or later calls.
+        sqlx::query("DELETE FROM thread_spawn_edges WHERE child_thread_id = ?")
+            .bind(child.to_string())
+            .execute(runtime.pool.as_ref())
+            .await?;
+        runtime
+            .insert_thread_spawn_edge_if_absent(other_parent, child)
+            .await?;
+        assert_eq!(
+            runtime.list_thread_spawn_children(other_parent).await?,
+            vec![child]
+        );
+        runtime.close().await;
+        Ok(())
     }
 
     #[tokio::test]

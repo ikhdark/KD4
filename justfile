@@ -267,7 +267,7 @@ test-fast *args:
 # dependencies stay warm between targets. Feature/profile differences can still
 # require separate artifacts. A concurrent run
 # reuses an idle warm sibling lane with matching build settings (such as
-# `core-tests-2`); without one it waits up to 30 s, then stops instead of
+# `core-tests-2`); without one it waits up to 600 s, then stops instead of
 # starting a duplicate cold build (`run-lane --allow-cold-overflow` opts in).
 
 # Run a named core target in the shared core lane; finish the whole selection.

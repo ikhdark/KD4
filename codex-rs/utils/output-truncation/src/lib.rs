@@ -408,6 +408,9 @@ fn truncate_over_budget_text_with_markers(
     max_tokens: usize,
     line_markers: bool,
 ) -> (String, Vec<(usize, usize)>) {
+    if max_tokens == 0 {
+        return (String::new(), Vec::new());
+    }
     if let Some(outlined) = outline_oversized_json_lines(content, max_tokens) {
         if !approx_token_count_exceeds(&outlined, max_tokens) {
             return (outlined, Vec::new());
@@ -602,6 +605,15 @@ fn formatted_truncate_text_to_token_ceiling(
     max_tokens: usize,
     line_markers: bool,
 ) -> (TruncatedTextOutput, Vec<(usize, usize)>) {
+    if max_tokens == 0 {
+        return (
+            TruncatedTextOutput {
+                text: String::new(),
+                was_truncated: !content.is_empty(),
+            },
+            Vec::new(),
+        );
+    }
     let original_tokens = approx_token_count(content);
     if original_tokens <= max_tokens {
         let output = TruncatedTextOutput {

@@ -37,13 +37,25 @@ pub(crate) fn select_handlers_for_matcher_inputs(
     event_name: HookEventName,
     matcher_inputs: &[&str],
 ) -> Vec<ConfiguredHandler> {
+    matching_handlers_for_matcher_inputs(handlers, event_name, matcher_inputs)
+        .cloned()
+        .collect()
+}
+
+/// Borrows matching handlers so existence checks can stop at the first match
+/// without cloning commands, environments, paths, and compiled regex state.
+pub(crate) fn matching_handlers_for_matcher_inputs<'a>(
+    handlers: &'a [ConfiguredHandler],
+    event_name: HookEventName,
+    matcher_inputs: &'a [&str],
+) -> impl Iterator<Item = &'a ConfiguredHandler> {
     // Check each configured handler once, even when several compatibility names
     // match the same regex. A hook like `apply_patch|Write|Edit` should run a
     // single time for one tool call, not once per matching alias.
     handlers
         .iter()
-        .filter(|handler| handler.event_name == event_name)
-        .filter(|handler| match event_name {
+        .filter(move |handler| handler.event_name == event_name)
+        .filter(move |handler| match event_name {
             HookEventName::PreToolUse
             | HookEventName::PermissionRequest
             | HookEventName::PostToolUse
@@ -70,8 +82,6 @@ pub(crate) fn select_handlers_for_matcher_inputs(
                 true
             }
         })
-        .cloned()
-        .collect()
 }
 
 pub(crate) fn running_summary(handler: &ConfiguredHandler) -> HookRunSummary {
@@ -238,6 +248,81 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].display_order, 0);
         assert_eq!(selected[1].display_order, 1);
+    }
+
+    #[test]
+    fn matching_handlers_borrow_the_selected_handlers() {
+        let handlers = vec![
+            make_handler(HookEventName::Stop, None, "stop", 0),
+            make_handler(HookEventName::PreToolUse, Some("^Write$"), "write", 1),
+            make_handler(HookEventName::PreToolUse, Some("Write|Edit"), "both", 2),
+        ];
+        let inputs = ["apply_patch", "Write", "Edit"];
+        let borrowed = super::matching_handlers_for_matcher_inputs(
+            &handlers,
+            HookEventName::PreToolUse,
+            &inputs,
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(borrowed.len(), 2);
+        assert!(std::ptr::eq(borrowed[0], &handlers[1]));
+        assert!(std::ptr::eq(borrowed[1], &handlers[2]));
+        assert_eq!(
+            borrowed.into_iter().cloned().collect::<Vec<_>>(),
+            select_handlers_for_matcher_inputs(&handlers, HookEventName::PreToolUse, &inputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "manual performance measurement; no wall-clock assertion"]
+    fn benchmark_hook_existence_check() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for count in [1, 32] {
+            let handlers = (0..count)
+                .map(|index| {
+                    let mut handler = make_handler(
+                        HookEventName::PreToolUse,
+                        Some("^Bash$"),
+                        &"x".repeat(1024),
+                        index,
+                    );
+                    handler
+                        .env
+                        .insert("PLUGIN_ROOT".to_string(), "p".repeat(256));
+                    handler
+                })
+                .collect::<Vec<_>>();
+            let iterations = 10_000;
+            let started = Instant::now();
+            for _ in 0..iterations {
+                assert!(
+                    !black_box(select_handlers_for_matcher_inputs(
+                        black_box(&handlers),
+                        HookEventName::PreToolUse,
+                        &["Bash"],
+                    ))
+                    .is_empty()
+                );
+            }
+            let cloning = started.elapsed();
+            let started = Instant::now();
+            for _ in 0..iterations {
+                assert!(black_box(
+                    crate::events::pre_tool_use::has_matching_handler(
+                        black_box(&handlers),
+                        "Bash",
+                        &[],
+                    )
+                ));
+            }
+            eprintln!(
+                "hook existence: handlers={count} iterations={iterations} cloning_us={} borrowed_us={}",
+                cloning.as_micros(),
+                started.elapsed().as_micros()
+            );
+        }
     }
 
     #[test]

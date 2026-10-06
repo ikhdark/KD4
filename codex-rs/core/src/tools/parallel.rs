@@ -57,6 +57,38 @@ use codex_tools::ToolOutputSkipDisposition;
 
 pub(crate) const TOOL_RUNTIME_CLEANUP_DEADLINE: Duration = Duration::from_secs(30);
 
+tokio::task_local! {
+    static WORKSPACE_BASELINE_READY: CancellationToken;
+}
+
+pub(crate) async fn wait_for_workspace_baseline() {
+    if let Ok(ready) = WORKSPACE_BASELINE_READY.try_with(Clone::clone) {
+        ready.cancelled().await;
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn baseline_capture_overlaps_preparation_but_precedes_effects() {
+    let ready = CancellationToken::new();
+    let prepared = CancellationToken::new();
+    let capture = async {
+        // This would deadlock if handler preparation still waited for capture.
+        prepared.cancelled().await;
+        ready.cancel();
+    };
+    let handler = WORKSPACE_BASELINE_READY.scope(ready.clone(), async {
+        prepared.cancel();
+        wait_for_workspace_baseline().await;
+        assert!(ready.is_cancelled());
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(capture, handler);
+    }).await.unwrap();
+    // Ordinary direct handler unit tests have no dispatch-scoped baseline.
+    wait_for_workspace_baseline().await;
+}
+
 #[derive(Debug)]
 pub(crate) struct ToolCallCompletion {
     pub(crate) response: ResponseInputItem,
@@ -348,7 +380,11 @@ impl Drop for WorkspaceEvidenceGenerationBatch {
         // sealing early or rejecting effects from a still-running nested call.
         let batch = Arc::new(Self {
             state: Mutex::new(std::mem::take(state)),
-            baselines: Default::default(),
+            baselines: Mutex::new(std::mem::take(
+                self.baselines
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )),
         });
         let terminal_tasks = owner.session.terminal_tasks.clone();
         terminal_tasks.spawn(async move {
@@ -493,6 +529,59 @@ impl WorkspaceEvidenceGenerationBatch {
                 },
             ));
         }
+    }
+
+    /// Start the after-capture once an effect has been accounted for, without
+    /// waiting for result projection and relay. Reserve the existing slot before
+    /// spawning so readers and flush join this scan instead of starting another.
+    pub(crate) async fn prefetch_identity_after_mutation(
+        &self,
+        session: &Session,
+        turn: &TurnContext,
+        cwd: &std::path::Path,
+        mutation_revision: u64,
+    ) {
+        let slot = Arc::clone(
+            self.baselines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(cwd.to_path_buf())
+                .or_default(),
+        );
+        let Ok(mut entry) = slot.try_lock_owned() else {
+            // A sibling already owns a scan. Do not serialize tool completion
+            // behind it or queue redundant scans; flush recaptures if that
+            // in-flight observation has an older mutation revision.
+            return;
+        };
+        if entry
+            .as_ref()
+            .is_some_and(|(revision, _)| *revision >= mutation_revision)
+        {
+            return;
+        }
+        let cache = Arc::clone(&session.services.git_workspace);
+        let environments = turn.environments.clone();
+        let host_cwd = turn.config.cwd.clone();
+        let cwd = cwd.to_path_buf();
+        // No tracker lock is retained or acquired by the worker. Cancellation
+        // of the tool waiter cannot abandon the scan; batch retirement keeps
+        // the same slot, and a newer mutation revision cannot reuse its result.
+        session.terminal_tasks.spawn(async move {
+            let capture = cache
+                .workspace_evidence_for_environment(&environments, host_cwd.as_path(), &cwd)
+                .await;
+            *entry = Some((
+                mutation_revision,
+                WorkspaceEvidenceBaseline {
+                    revision: capture.identity,
+                    cache_hit: false,
+                    timed_out_git_dependencies: capture.timed_out_git_dependencies,
+                    source_dependencies: Default::default(),
+                    source_path_observations: Vec::new(),
+                },
+            ));
+        });
     }
 
     fn retain_generation_owner(
@@ -2857,6 +2946,9 @@ impl ToolCallRuntime {
                             .map(|_| &workspace_admission_classification)
                     })
                     .filter(|classification| classification.observes_workspace);
+                let baseline_ready = CancellationToken::new();
+                let overlap_baseline = router.prepares_during_workspace_baseline(&dispatch_call);
+                let baseline_capture = async {
                 let prefetched_workspace_evidence =
                     if let Some(classification) = evidence_capture_classification {
                         // The repository lease must precede baseline work. A queued
@@ -2915,8 +3007,9 @@ impl ToolCallRuntime {
                     } else {
                         None
                     };
-                let (evidence_revision_before, evidence_mutation_revision_before) =
-                    prefetched_workspace_evidence.unzip();
+                baseline_ready.cancel();
+                prefetched_workspace_evidence
+                };
 
                 let projection_source_dependencies = projection_source_dependencies
                     .or_else(|| {
@@ -2926,9 +3019,8 @@ impl ToolCallRuntime {
                             .map(|classification| classification.source_dependencies.clone())
                     })
                     .or_else(|| {
-                        evidence_revision_before
-                            .as_ref()
-                            .map(|baseline| baseline.source_dependencies.clone())
+                        evidence_capture_classification
+                            .map(|classification| classification.source_dependencies.clone())
                     });
 
                 let dispatch = router
@@ -2944,14 +3036,23 @@ impl ToolCallRuntime {
                     .instrument(dispatch_span.clone());
                 let dispatch =
                     crate::tools::registry::with_prepared_hook_input(hook_notice, dispatch);
-                let mut result = scope_tool_dispatch_timing(
+                let dispatch = WORKSPACE_BASELINE_READY.scope(baseline_ready.clone(), scope_tool_dispatch_timing(
                     Arc::clone(&timing),
                     crate::tools::registry::with_precomputed_projection_source_dependencies(
                         projection_source_dependencies,
                         dispatch,
                     ),
-                )
-                .await;
+                ));
+                // Both futures stay owned by the supervised dispatch. The
+                // repository lease still precedes capture, and opted-in handlers
+                // wait at their read/effect boundary, not before pure preparation.
+                let (prefetched_workspace_evidence, mut result) = if overlap_baseline {
+                    tokio::join!(baseline_capture, dispatch)
+                } else {
+                    (baseline_capture.await, dispatch.await)
+                };
+                let (evidence_revision_before, evidence_mutation_revision_before) =
+                    prefetched_workspace_evidence.unzip();
                 timing.mark_output_collected();
                 // Capture effect order while the execution lease still excludes
                 // later edits; outer response persistence may release that lease.
@@ -6801,6 +6902,51 @@ mod tests {
             captures_before.saturating_add(1),
             "a queued mutation should be observed by one post-admission capture"
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_generation_drop_joins_pending_after_capture() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let repo = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git").args(["init", "--quiet"])
+            .current_dir(repo.path()).status().unwrap().success());
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        tracker.lock().await.record_unknown_mutation();
+        let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
+        batch.retain_generation_owner(&session, &turn, &tracker);
+        assert!(batch.register_call("patch"));
+        assert!(batch.record_mutation("patch", repo.path().to_path_buf(), None, false));
+        let cache = &session.services.git_workspace;
+        let count = cache.workspace_evidence_capture_count();
+        let pause = cache.pause_next_workspace_evidence_capture();
+        batch.prefetch_identity_after_mutation(&session, &turn, repo.path(), 1).await;
+        tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started())
+            .await.expect("prefetch started");
+        drop(batch);
+        let barrier = session.flush_rollout_after_ordered_commits(&turn);
+        tokio::pin!(barrier);
+        assert!(futures::poll!(barrier.as_mut()).is_pending());
+        pause.release();
+        tokio::time::timeout(Duration::from_secs(10), barrier)
+            .await.expect("retirement joins prefetch").unwrap();
+        assert_eq!(cache.workspace_evidence_capture_count(), count + 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_generation_prefetch_preserves_non_git_identity() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let cwd = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        tracker.lock().await.record_unknown_mutation();
+        let batch = Arc::new(WorkspaceEvidenceGenerationBatch::new());
+        assert!(batch.register_call("patch"));
+        assert!(batch.record_mutation("patch", cwd.path().to_path_buf(), None, false));
+        batch.prefetch_identity_after_mutation(&session, &turn, cwd.path(), 1).await;
+        assert_eq!(batch.captured_identity(cwd.path(), 1).await, Some(None));
+        assert!(batch.captured_identity(cwd.path(), 2).await.is_none());
+        assert_eq!(batch.flush(&session, &turn, &tracker).await.unwrap().authoritative_capture_count, 0);
     }
 
     #[tokio::test]

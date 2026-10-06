@@ -722,6 +722,10 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
+    pub(crate) fn active_turn_id(&self) -> Option<&str> {
+        self.current_turn_history.active_turn_id()
+    }
+
     pub(crate) fn indexed_turns_page(
         &self,
         anchor: Option<(&str, bool)>,
@@ -1268,6 +1272,53 @@ mod tests {
     }
 
     #[test]
+    fn active_turn_id_matches_snapshot_without_copying_items() {
+        let mut state = ThreadState::default();
+        assert_eq!(state.active_turn_id(), None);
+        let mut history = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: ModeKind::Default,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(
+                codex_protocol::protocol::ItemCompletedEvent {
+                    thread_id: ThreadId::new(),
+                    turn_id: "turn-1".to_string(),
+                    completed_at_ms: 0,
+                    item: codex_protocol::items::TurnItem::Plan(codex_protocol::items::PlanItem {
+                        id: "large-plan".to_string(),
+                        text: "x".repeat(1024 * 1024),
+                    }),
+                },
+            )),
+        ];
+        for completed in [false, true] {
+            if completed {
+                history.push(RolloutItem::EventMsg(terminal_event("turn-1", "done")));
+            }
+            state.seed_current_turn_history(&history);
+            let snapshot = state.active_turn_snapshot().expect("retained turn");
+            assert_eq!(state.active_turn_id(), Some(snapshot.id.as_str()));
+            let codex_app_server_protocol::ThreadItem::Plan { text, .. } = &snapshot.items[0]
+            else {
+                panic!("expected plan");
+            };
+            assert_eq!(text.len(), 1024 * 1024);
+            if completed {
+                assert_eq!(state.open_turn_id(), None);
+                assert_eq!(state.in_progress_turn_id(), None);
+            }
+        }
+        state.clear_listener();
+        assert_eq!(state.active_turn_id(), None);
+    }
+
+    #[test]
     fn interrupted_history_snapshot_is_not_live_turn_state() {
         let mut state = ThreadState::default();
         state.track_current_turn_event(
@@ -1294,6 +1345,7 @@ mod tests {
         );
 
         assert_eq!(state.in_progress_turn_id(), None);
+        assert_eq!(state.active_turn_id(), Some("turn-1"));
         assert_eq!(
             state.active_turn_snapshot().map(|turn| turn.status),
             Some(codex_app_server_protocol::TurnStatus::Interrupted)
@@ -2194,7 +2246,7 @@ impl ThreadStateManager {
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,
                 had_listener = thread_state.listener_cancellation.is_some(),
-                had_active_turn = thread_state.active_turn_snapshot().is_some(),
+                had_active_turn = thread_state.active_turn_id().is_some(),
                 "clearing thread listener during thread-state teardown"
             );
             thread_state.clear_listener();
@@ -2220,7 +2272,7 @@ impl ThreadStateManager {
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,
                 had_listener = thread_state.listener_cancellation.is_some(),
-                had_active_turn = thread_state.active_turn_snapshot().is_some(),
+                had_active_turn = thread_state.active_turn_id().is_some(),
                 "clearing thread listener during app-server shutdown"
             );
             thread_state.clear_listener();

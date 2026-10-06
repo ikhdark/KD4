@@ -29,6 +29,131 @@ fn test_policy(
     }
 }
 
+// The previous per-operation Tokio scan is retained only as a behavioral and
+// performance reference. Both collectors must inspect the same complete tree.
+async fn collect_spill_files_async_reference(output_dir: &Path) -> std::io::Result<Vec<SpillFile>> {
+    let mut thread_dirs = match fs::read_dir(output_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut files = Vec::new();
+    while let Some(thread_entry) = ignore_disappeared(thread_dirs.next_entry().await)?.flatten() {
+        if !ignore_disappeared(thread_entry.file_type().await)?.is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(mut thread_files) = ignore_disappeared(fs::read_dir(thread_entry.path()).await)?
+        else {
+            continue;
+        };
+        while let Some(file_entry) = ignore_disappeared(thread_files.next_entry().await)?.flatten()
+        {
+            if !ignore_disappeared(file_entry.file_type().await)?.is_some_and(|kind| kind.is_file())
+                || file_entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    != Some("txt")
+            {
+                continue;
+            }
+            let Some(metadata) = ignore_disappeared(file_entry.metadata().await)? else {
+                continue;
+            };
+            files.push(SpillFile {
+                path: file_entry.path(),
+                modified: metadata.modified()?,
+                len: metadata.len(),
+            });
+        }
+    }
+    Ok(files)
+}
+
+fn sorted_spill_records(files: Vec<SpillFile>) -> Vec<(PathBuf, SystemTime, u64)> {
+    let mut records = files
+        .into_iter()
+        .map(|file| (file.path, file.modified, file.len))
+        .collect::<Vec<_>>();
+    records.sort();
+    records
+}
+
+#[tokio::test]
+async fn spill_scan_preserves_complete_metadata_and_filtering() -> Result<()> {
+    let dir = tempdir()?;
+    for (name, text) in [
+        ("one/a.txt", "a"),
+        ("two/b.txt", "bbb"),
+        ("two/skip.json", "skip"),
+        ("root.txt", "skip"),
+    ] {
+        write_spill(&dir.path().join(name), text, SystemTime::UNIX_EPOCH)?;
+    }
+    std::fs::create_dir_all(dir.path().join("one/directory.txt"))?;
+    let actual = sorted_spill_records(collect_spill_files(dir.path()).await?);
+    assert_eq!(actual.len(), 2);
+    assert_eq!(
+        actual,
+        sorted_spill_records(collect_spill_files_async_reference(dir.path()).await?)
+    );
+    assert!(
+        collect_spill_files(&dir.path().join("missing"))
+            .await?
+            .is_empty()
+    );
+    assert!(
+        collect_spill_files(&dir.path().join("root.txt"))
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "manual performance measurement; no wall-clock assertion"]
+async fn benchmark_spill_scan() -> Result<()> {
+    let dir = tempdir()?;
+    for index in 0..512 {
+        write_spill(
+            &dir.path()
+                .join(format!("thread-{}/out-{index}.txt", index % 8)),
+            "retained output",
+            SystemTime::UNIX_EPOCH,
+        )?;
+    }
+    let mut async_us = Vec::new();
+    let mut blocking_us = Vec::new();
+    for round in 0..12 {
+        for blocking in if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let started = Instant::now();
+            let files = if blocking {
+                collect_spill_files(dir.path()).await?
+            } else {
+                collect_spill_files_async_reference(dir.path()).await?
+            };
+            let elapsed = started.elapsed().as_micros();
+            assert_eq!(files.len(), 512);
+            if blocking {
+                blocking_us.push(elapsed);
+            } else {
+                async_us.push(elapsed);
+            }
+        }
+    }
+    async_us.sort_unstable();
+    blocking_us.sort_unstable();
+    eprintln!(
+        "spill scan: files=512 directories=8 samples=12 async_median_us={} blocking_median_us={}",
+        async_us[6], blocking_us[6]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn small_hook_output_remains_inline() -> Result<()> {
     let dir = tempdir()?;

@@ -583,6 +583,10 @@ impl ToolRouter {
             .permits_shared_workspace_observation(&call.tool_name, &call.payload)
     }
 
+    pub(crate) fn prepares_during_workspace_baseline(&self, call: &ToolCall) -> bool {
+        self.registry.prepares_during_workspace_baseline(&call.tool_name)
+    }
+
     pub(crate) fn delegates_workspace_admission(&self, call: &ToolCall) -> bool {
         self.registry.delegates_workspace_admission(&call.tool_name)
     }

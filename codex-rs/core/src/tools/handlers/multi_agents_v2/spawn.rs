@@ -1015,7 +1015,7 @@ async fn create_isolated_worktree(
         cleanup_required: AtomicBool::new(true),
         terminal_tasks: terminal_tasks.clone(),
     });
-    let mut command = Command::new("git");
+    let mut command = Command::new(codex_git_utils::git_executable_async().await);
     command
         .arg("-C")
         .arg(repo_root)
@@ -1062,7 +1062,7 @@ async fn create_isolated_worktree(
             }
         }
         if !initial_overlay.tracked_diff.is_empty() {
-            let mut command = Command::new("git");
+            let mut command = Command::new(codex_git_utils::git_executable_async().await);
             command.arg("-C")
                 .arg(&workspace.path)
                 .args(["apply", "--binary", "--whitespace=nowarn", "-"]);
@@ -1138,7 +1138,7 @@ async fn capture_workspace_overlay(
     cancellation_token: &CancellationToken,
     terminal_tasks: &TaskTracker,
 ) -> Result<WorkspaceOverlay, FunctionCallError> {
-    let mut head_command = Command::new("git");
+    let mut head_command = Command::new(codex_git_utils::git_executable_async().await);
     head_command.arg("-C").arg(repo_root).args(["rev-parse", "--verify", "HEAD"]);
     let head = run_worktree_git(head_command, None, cancellation_token, terminal_tasks).await
         .map_err(|error| FunctionCallError::RespondToModel(format!("spawn_agent: could not capture snapshot HEAD: {error}")))?;
@@ -1148,17 +1148,17 @@ async fn capture_workspace_overlay(
     let head = String::from_utf8(head.stdout).map_err(|error|
         FunctionCallError::RespondToModel(format!("spawn_agent: invalid snapshot HEAD: {error}")))?;
     let head = head.trim().to_string();
-    let mut diff_command = Command::new("git");
+    let mut diff_command = Command::new(codex_git_utils::git_executable_async().await);
     diff_command
         .arg("-C")
         .arg(repo_root)
         .args(["diff", "--binary", "--no-ext-diff", &head, "--"]);
-    let mut untracked_command = Command::new("git");
+    let mut untracked_command = Command::new(codex_git_utils::git_executable_async().await);
     untracked_command
         .arg("-C")
         .arg(repo_root)
         .args(["ls-files", "--others", "--exclude-standard", "-z"]);
-    let mut tracked_paths_command = Command::new("git");
+    let mut tracked_paths_command = Command::new(codex_git_utils::git_executable_async().await);
     tracked_paths_command.arg("-C").arg(repo_root).args([
         "diff", "--name-only", "--no-renames", "--diff-filter=ACMRT", "-z", &head, "--",
     ]);
@@ -1451,7 +1451,7 @@ async fn cleanup_isolated_worktree_paths(
     path: &Path,
     terminal_tasks: &TaskTracker,
 ) -> std::io::Result<()> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(codex_git_utils::git_executable_async().await);
     command
         .arg("-C")
         .arg(repo_root)

@@ -530,30 +530,56 @@ enum SystemProxyDecision {
 
 fn resolve_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProxyDecision {
     let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    resolve_system_proxy_with(cache, request_url, origin, resolve_platform_system_proxy)
+    resolve_system_proxy_with(
+        cache,
+        &SYSTEM_PROXY_RESOLUTION_LOCK,
+        request_url,
+        origin,
+        resolve_platform_system_proxy,
+    )
 }
 
 fn resolve_system_proxy_with(
     cache: &Mutex<HashMap<String, CachedSystemProxyDecision>>,
+    resolution_lock: &Mutex<()>,
     request_url: &str,
     origin: &RequestOrigin,
     resolve_platform_system_proxy: impl FnOnce(&str, &RequestOrigin) -> SystemProxyDecision,
 ) -> SystemProxyDecision {
-    let mut cache = match cache.lock() {
+    let cache_key = system_proxy_cache_key(request_url);
+    {
+        let mut cache = cache
+            .lock()
+            .expect("system proxy cache lock should not be poisoned");
+        if let Some(decision) =
+            cached_system_proxy_decision_from_cache(&mut cache, &cache_key, Instant::now())
+        {
+            return decision;
+        }
+    }
+
+    // Serialize misses, not cache hits. Keep ownership through publication, and recheck
+    // after waiting so competing callers still share a single platform lookup.
+    let _resolution = resolution_lock
+        .lock()
+        .expect("system proxy resolution lock should not be poisoned");
+    let mut decisions = match cache.lock() {
         Ok(cache) => cache,
         Err(error) => panic!("system proxy cache lock should not be poisoned: {error}"),
     };
-    let cache_key = system_proxy_cache_key(request_url);
     if let Some(decision) =
-        cached_system_proxy_decision_from_cache(&mut cache, &cache_key, Instant::now())
+        cached_system_proxy_decision_from_cache(&mut decisions, &cache_key, Instant::now())
     {
         return decision;
     }
+    drop(decisions);
 
-    // Keep cache misses single-flight. Platform PAC/WPAD APIs are synchronous, so async callers
-    // run this work on the blocking pool; serializing misses prevents concurrent requests from
-    // consuming an unbounded number of blocking workers while system lookup is pending.
+    // PAC/WPAD can take seconds. Do not hold the cache lock across platform I/O:
+    // unrelated HTTP requests and WebSocket reconnects may already have cached routes.
     let decision = resolve_platform_system_proxy(request_url, origin);
+    let mut cache = cache
+        .lock()
+        .expect("system proxy cache lock should not be poisoned");
     insert_system_proxy_cache_entry(&mut cache, &cache_key, decision.clone(), Instant::now());
     decision
 }
@@ -586,13 +612,16 @@ struct CachedSystemProxyDecision {
 
 static SYSTEM_PROXY_CACHE: OnceLock<Mutex<HashMap<String, CachedSystemProxyDecision>>> =
     OnceLock::new();
+static SYSTEM_PROXY_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
 
 fn cached_system_proxy_decision(request_url: &str) -> Option<SystemProxyDecision> {
     let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    // A platform lookup holds this lock while resolving PAC/WPAD. Treat contention as a
-    // cache miss so async callers wait on the semaphore and blocking pool instead of here.
-    let mut cache = cache.try_lock().ok()?;
     let key = system_proxy_cache_key(request_url);
+    // Only bounded in-memory work holds this lock. Waiting for a short cache mutation
+    // avoids turning a warm hit into a miss queued behind a slow platform lookup.
+    let mut cache = cache
+        .lock()
+        .expect("system proxy cache lock should not be poisoned");
     cached_system_proxy_decision_from_cache(&mut cache, &key, Instant::now())
 }
 
@@ -890,6 +919,7 @@ mod tests;
 mod cache_contention_tests {
     use super::RequestOrigin;
     use super::SYSTEM_PROXY_CACHE;
+    use super::SYSTEM_PROXY_RESOLUTION_LOCK;
     use super::SystemProxyDecision;
     use super::resolve_system_proxy_with;
     use crate::HttpClientFactory;
@@ -898,6 +928,49 @@ mod cache_contention_tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_cached_route_is_not_delayed_by_unrelated_lookup() {
+        let warm_url = "https://cached-route-during-miss.test/warm";
+        let cold_url = "https://cached-route-during-miss.test/cold";
+        super::cache_system_proxy_decision(warm_url, SystemProxyDecision::Direct);
+        let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let origin = RequestOrigin::parse(cold_url).expect("valid request URL");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut warm_route_finished = false;
+            resolve_system_proxy_with(
+                cache,
+                &SYSTEM_PROXY_RESOLUTION_LOCK,
+                cold_url,
+                &origin,
+                |_, _| {
+                    started_tx.send(()).expect("test is waiting for resolver");
+                    warm_route_finished =
+                        release_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+                    SystemProxyDecision::Direct
+                },
+            );
+            warm_route_finished
+        });
+        started_rx.await.expect("cold lookup started");
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy);
+        let started = std::time::Instant::now();
+        let route = factory
+            .resolve_proxy_route_async(warm_url.to_string())
+            .await
+            .expect("cached route resolves");
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        let warm_route_finished = worker.join().expect("cold lookup finished");
+        eprintln!("cached route during unrelated lookup: {elapsed:?}");
+        assert_eq!(route, OutboundProxyRoute::Direct);
+        assert!(
+            warm_route_finished,
+            "cached route waited for the unrelated lookup"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn async_resolution_keeps_runtime_responsive_during_cache_contention() {
@@ -909,18 +982,26 @@ mod cache_contention_tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut runtime_progressed = false;
-            let decision = resolve_system_proxy_with(cache, request_url, &origin, |_, _| {
-                started_tx.send(()).expect("test is waiting for resolver");
-                // Model a pending platform lookup while retaining the real production cache
-                // lock. Bound the wait outside Tokio so a blocking regression cannot hang it.
-                runtime_progressed = release_rx.recv_timeout(Duration::from_secs(2)).is_ok();
-                SystemProxyDecision::Proxy {
-                    url: proxy_url.to_string(),
-                }
-            });
+            let decision = resolve_system_proxy_with(
+                cache,
+                &SYSTEM_PROXY_RESOLUTION_LOCK,
+                request_url,
+                &origin,
+                |_, _| {
+                    started_tx.send(()).expect("test is waiting for resolver");
+                    // Model a pending platform lookup while retaining resolution ownership.
+                    // Bound the wait outside Tokio so a blocking regression cannot hang it.
+                    runtime_progressed = release_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                    SystemProxyDecision::Proxy {
+                        url: proxy_url.to_string(),
+                    }
+                },
+            );
             (decision, runtime_progressed)
         });
-        started_rx.await.expect("platform resolver acquired cache");
+        started_rx
+            .await
+            .expect("platform resolver acquired ownership");
         let unrelated_task = tokio::spawn(async move {
             // A current-thread runtime can run this only after the public resolver yields.
             let _ = release_tx.send(());

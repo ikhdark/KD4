@@ -1,4 +1,4 @@
-# Shared by codex-rs and the workspace members under DO-NOT-CHANGE.
+# Shared by all codex-rs workspace members.
 allow-expect-in-tests = true
 allow-unwrap-in-tests = true
 await-holding-invalid-types = [

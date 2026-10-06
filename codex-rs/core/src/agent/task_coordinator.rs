@@ -513,16 +513,21 @@ impl AgentTaskCoordinator {
         let authorization = store
             .get_agent_task_authorization(binding.assignment_id)
             .await?;
-        if !matches!(
-            authorization.admission_origin,
-            AssignmentAdmissionOrigin::LegacyMessage { .. }
-        ) {
-            return Ok(());
-        }
         if authorization.current_attempt.attempt_id == binding.attempt_id
             && authorization.current_attempt.state == AttemptState::Active
         {
             return Ok(());
+        }
+        // Typed attempts cannot be renewed implicitly. Reject before sampling,
+        // rather than spending a model request whose first tool must be blocked.
+        if !matches!(
+            authorization.admission_origin,
+            AssignmentAdmissionOrigin::LegacyMessage { .. }
+        ) {
+            return Err(StoreError::InvalidAssignment(format!(
+                "typed assignment {} has no active bound attempt; recover its retained receipt with get_agent_task, or explicitly admit new work before requesting another turn",
+                binding.assignment_id
+            )));
         }
         store.begin_legacy_agent_turn(binding.assignment_id).await?;
         let renewed = store

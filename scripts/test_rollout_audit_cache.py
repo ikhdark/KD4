@@ -13,6 +13,7 @@ from unittest import mock
 from scripts import kd4_turn_latency_audit as audit
 from scripts import rollout_audit_cache as cache
 from scripts import rollout_snapshot
+from scripts.test_kd4_turn_latency_audit import _timing
 
 
 class RolloutAuditCacheTest(unittest.TestCase):
@@ -250,6 +251,96 @@ class RolloutAuditCacheTest(unittest.TestCase):
         )
         self.assertEqual(relative["analysisCache"]["status"], "miss")
 
+    def test_relative_repository_root_preserves_cohorts_and_reuses_cache(self):
+        records = []
+        for turn, cwd in (
+            ("root", self.root),
+            ("eval", self.root / ".codex" / "evals" / "run"),
+            ("other", self.root / "other"),
+        ):
+            records.extend([
+                {"type": "session_meta", "payload": {"cwd": str(cwd)}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn}},
+                {"type": "event_msg", "payload": {
+                    "type": "task_complete", "turn_id": turn, "timing": _timing(),
+                }},
+            ])
+        self.source.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf8")
+        with contextlib.chdir(self.root):
+            relative = audit.analyze_session_path(
+                self.source, Path("."), cache_dir=self.cache
+            )
+            direct = audit.analyze_session_path(self.source, Path("."))
+        absolute = self.run_audit()
+        self.assertEqual(absolute["analysisCache"]["status"], "hit")
+        self.assertEqual(absolute["observedAt"], relative["observedAt"])
+        for report in (relative, direct, absolute):
+            self.assertEqual(report["repoRoot"], str(self.root.resolve()))
+            self.assertEqual(
+                {name: report["populations"][name]["turns"]
+                 for name in ("repository_root", "eval", "other")},
+                {"repository_root": 1, "eval": 1, "other": 1},
+            )
+            self.assertEqual(
+                {turn["turnId"]: turn["population"] for turn in report["perTurn"]},
+                {"root": "repository_root", "eval": "eval", "other": "other"},
+            )
+
+    def test_capture_budget_bypass_reuses_prefix_without_losing_tail_or_startup(self):
+        directory = rollout_snapshot.rollout_payload_root(self.source)
+        directory.mkdir()
+        references = []
+        for label in ("first", "second"):
+            data = json.dumps({"type": "event_msg", "payload": {
+                "type": "example", "text": label * 1000,
+            }}).encode()
+            digest = hashlib.sha256(data).hexdigest()
+            (directory / f"{digest}.json").write_bytes(data)
+            references.append(json.dumps({"type": "rollout_payload_artifact", "payload": {
+                "sha256": digest, "bytes": len(data), "item_type": "event_msg",
+            }}))
+        self.source.write_text(references[0] + "\n", encoding="utf8")
+        self.source.with_name("trace2.jsonl").write_text(
+            references[1] + "\nnot-json\n{}\n", encoding="utf8"
+        )
+        self.source.with_name("trace3.jsonl").write_text(references[0] + "\n", encoding="utf8")
+        startup = self.root / "startup.log"
+        startup.write_text("{}\n", encoding="utf8")
+        direct = audit.analyze_session_path(self.source.parent, self.root, startup_log=startup)
+        original = rollout_snapshot.read_rollout_snapshot
+        snapshots = []
+
+        def capture(path):
+            snapshot = original(path)
+            snapshots.append(snapshot)
+            return snapshot
+
+        # Cross the limit both before decoding a snapshot and midway through
+        # payload discovery. Neither path may treat a partial decode as EOF.
+        for limit, expected_payload_reads in ((1, 3), (8000, 2)):
+            snapshots.clear()
+            with (
+                self.subTest(limit=limit),
+                mock.patch.object(cache, "MAX_CAPTURE_BYTES", limit),
+                mock.patch.object(rollout_snapshot, "read_rollout_snapshot", side_effect=capture),
+                mock.patch.object(audit, "read_rollout_snapshot", side_effect=capture),
+                mock.patch.object(rollout_snapshot, "load_rollout_payload",
+                                  wraps=rollout_snapshot.load_rollout_payload) as load,
+            ):
+                report = audit.analyze_session_path(
+                    self.source.parent, self.root, cache_dir=self.cache, startup_log=startup
+                )
+                self.assertEqual(load.call_count, expected_payload_reads)
+                self.assertEqual(len(snapshots), 4)
+                self.assertTrue(all(snapshot.stream.closed for snapshot in snapshots))
+                self.assertEqual(report["analysisCache"]["status"], "bypassed")
+                self.assertEqual(report["coverage"]["lines"], 5)
+                self.assertEqual(report["coverage"]["parseErrorCount"], 1)
+                self.assertEqual(
+                    {k: v for k, v in report.items() if k not in {"observedAt", "analysisCache"}},
+                    {k: v for k, v in direct.items() if k != "observedAt"},
+                )
+
     def test_directory_snapshots_share_authenticated_payload_bytes(self):
         data = b'{"type":"event_msg","payload":{}}'
         digest = hashlib.sha256(data).hexdigest()
@@ -282,6 +373,48 @@ class RolloutAuditCacheTest(unittest.TestCase):
             self.assertEqual(load.call_count, 1)
         self.assertEqual(report["coverage"]["files"], 2)
         self.assertEqual(len(report["inputProvenance"]["inputs"]["payloads"]), 1)
+
+    def test_bypass_validates_uncaptured_references_and_releases_snapshots_on_error(self):
+        data = b'{"type":"event_msg","payload":{}}'
+        digest = hashlib.sha256(data).hexdigest()
+        directory = rollout_snapshot.rollout_payload_root(self.source)
+        directory.mkdir()
+        (directory / f"{digest}.json").write_bytes(data)
+        reference = {"type": "rollout_payload_artifact", "payload": {
+            "sha256": digest, "bytes": len(data), "item_type": "event_msg",
+        }}
+        self.source.write_text(json.dumps(reference) + "\n", encoding="utf8")
+        # Retain exactly the first file and its payload. The second snapshot
+        # crosses the budget before its references have been authenticated.
+        limit = self.source.stat().st_size + len(data)
+        sibling = self.source.with_name("trace2.jsonl")
+        original = rollout_snapshot.read_rollout_snapshot
+        snapshots = []
+
+        def capture(path):
+            snapshot = original(path)
+            snapshots.append(snapshot)
+            return snapshot
+
+        for changes, error in (
+            ({"bytes": len(data) + 1}, ValueError),
+            ({"item_type": "response_item"}, ValueError),
+            ({"sha256": "0" * 64}, FileNotFoundError),
+            ({"sha256": []}, ValueError),
+        ):
+            sibling.write_text(json.dumps({
+                **reference, "payload": {**reference["payload"], **changes},
+            }) + "\n", encoding="utf8")
+            snapshots.clear()
+            with (
+                self.subTest(changes=changes),
+                mock.patch.object(cache, "MAX_CAPTURE_BYTES", limit),
+                mock.patch.object(rollout_snapshot, "read_rollout_snapshot", side_effect=capture),
+                self.assertRaises(error),
+            ):
+                audit.analyze_session_path(self.source.parent, self.root, cache_dir=self.cache)
+            self.assertEqual(len(snapshots), 2)
+            self.assertTrue(all(snapshot.stream.closed for snapshot in snapshots))
 
     def test_compressed_snapshots_can_be_replayed_without_changing_identity(self):
         try:

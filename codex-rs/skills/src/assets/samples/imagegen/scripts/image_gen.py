@@ -331,6 +331,20 @@ def _derive_downscale_path(path: Path, suffix: str) -> Path:
     return path.with_name(f"{path.stem}{suffix}{path.suffix}")
 
 
+def _check_output_paths(outputs: List[Path], args: argparse.Namespace) -> None:
+    """Reject known collisions before API work; keep write-time checks for races."""
+    if args.force:
+        return
+    candidates = list(outputs)
+    if args.downscale_max_dim is not None:
+        candidates.extend(
+            _derive_downscale_path(path, args.downscale_suffix) for path in outputs
+        )
+    for path in candidates:
+        if path.exists():
+            _die(f"Output already exists: {path} (use --force to overwrite)")
+
+
 def _downscale_image_bytes(
     image_bytes: bytes, *, max_dim: int, output_format: str
 ) -> bytes:
@@ -649,6 +663,23 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
             )
         return 0
 
+    # Check every job before starting any requests, including per-job overrides.
+    for i, job in enumerate(jobs, start=1):
+        output_format = _normalize_output_format(
+            job.get("output_format")
+            if job.get("output_format") is not None
+            else args.output_format
+        )
+        outputs = _job_output_paths(
+            out_dir=out_dir,
+            output_format=output_format,
+            idx=i,
+            prompt=str(job["prompt"]).strip(),
+            n=int(job["n"] if job.get("n") is not None else args.n),
+            explicit_out=job.get("out"),
+        )
+        _check_output_paths(outputs, args)
+
     client = _create_async_client()
     sem = asyncio.Semaphore(args.concurrency)
 
@@ -769,6 +800,7 @@ def _generate(args: argparse.Namespace) -> None:
         )
         return
 
+    _check_output_paths(output_paths, args)
     print(
         "Calling Image API (generation). This can take up to a couple of minutes.",
         file=sys.stderr,
@@ -844,6 +876,7 @@ def _edit(args: argparse.Namespace) -> None:
         )
         return
 
+    _check_output_paths(output_paths, args)
     print(
         f"Calling Image API (edit) with {len(image_paths)} image(s).",
         file=sys.stderr,

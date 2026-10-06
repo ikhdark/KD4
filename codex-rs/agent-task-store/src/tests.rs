@@ -1280,7 +1280,7 @@ async fn audit_task_view_validation_history_and_receipt_references_are_complete(
             command_summary: format!("audit validation {index}"),
             evidence: ValidationEvidence::default(),
             status: ValidationCallStatus::Succeeded,
-            recorded_at,
+            recorded_at: recorded_at + Duration::seconds((index % 3) as i64),
         };
         sqlx::query(
             "INSERT INTO validation_calls (call_id, attempt_id, body_json, status, recorded_at)
@@ -1338,6 +1338,9 @@ async fn audit_task_view_validation_history_and_receipt_references_are_complete(
         task.validation_calls.len(),
         MAX_VALIDATION_CALLS_PER_TASK + 1
     );
+    assert!(task.validation_calls.windows(2).all(|pair| {
+        (pair[0].recorded_at, &pair[0].call_id) <= (pair[1].recorded_at, &pair[1].call_id)
+    }));
     let receipt = task.receipt.expect("receipt is present");
     assert!(receipt.validation_call_ids.iter().all(|receipt_id| {
         task.validation_calls
@@ -1849,6 +1852,14 @@ ADD COLUMN capture_generation INTEGER NOT NULL DEFAULT 0 CHECK (capture_generati
         ),
         false,
     ));
+    // Verify the historical checksum without omitting later applied migrations.
+    historical_migrations.extend(
+        TEST_MIGRATOR
+            .migrations
+            .iter()
+            .filter(|migration| migration.version > 22)
+            .cloned(),
+    );
     sqlx::migrate::Migrator::with_migrations(historical_migrations)
         .run(&pool)
         .await
@@ -1881,6 +1892,76 @@ ADD COLUMN capture_generation INTEGER NOT NULL DEFAULT 0 CHECK (capture_generati
         .await
         .expect("resumed store remains writable");
     restarted.close().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn validation_attempt_index_upgrades_existing_history_without_changing_results() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("memory database opens");
+    task_store_migrator_through(22)
+        .run(&pool)
+        .await
+        .expect("prior schema applies");
+    sqlx::raw_sql(
+        "INSERT INTO assignments VALUES ('assignment', 'root', '{}', '\"2026-01-01T00:00:00Z\"');
+         INSERT INTO attempts VALUES ('target', 'assignment', 0, NULL, '\"active\"', '\"2026-01-01T00:00:00Z\"', NULL);
+         INSERT INTO attempts VALUES ('other', 'assignment', 1, NULL, '\"active\"', '\"2026-01-01T00:00:00Z\"', NULL);
+         INSERT INTO validation_calls VALUES
+             ('z-first', 'target', 'first', '\"succeeded\"', '\"2026-01-01T00:00:00Z\"'),
+             ('b-tied', 'target', 'third', '\"running\"', '\"2026-01-01T00:00:01Z\"'),
+             ('a-tied', 'target', 'second', '\"running\"', '\"2026-01-01T01:00:01+01:00\"'),
+             ('unrelated', 'other', 'not returned', '\"running\"', '\"2026-01-01T00:00:00Z\"');",
+    )
+    .execute(&pool)
+    .await
+    .expect("existing history inserts");
+    let queries = [
+        (
+            "SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY julianday(json_extract(recorded_at, '$')), call_id",
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string(),
+            ],
+        ),
+        (
+            "SELECT call_id FROM validation_calls WHERE attempt_id = ? AND status = '\"running\"' ORDER BY call_id",
+            vec!["a-tied".to_string(), "b-tied".to_string()],
+        ),
+    ];
+    for upgraded in [false, true] {
+        if upgraded {
+            TEST_MIGRATOR.run(&pool).await.expect("history upgrades");
+        }
+        for (query, expected) in &queries {
+            let actual = sqlx::query_scalar::<_, String>(*query)
+                .bind("target")
+                .fetch_all(&pool)
+                .await
+                .expect("history reads");
+            assert_eq!(&actual, expected);
+            let mut plan_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("EXPLAIN QUERY PLAN ");
+            plan_query.push(*query);
+            let plan = plan_query
+                .build_query_as::<(i64, i64, i64, String)>()
+                .bind("target")
+                .fetch_all(&pool)
+                .await
+                .expect("query plan reads");
+            assert_eq!(
+                plan.iter().any(|(_, _, _, detail)| {
+                    detail.contains(
+                        "SEARCH validation_calls USING INDEX validation_calls_attempt_idx",
+                    )
+                }),
+                upgraded
+            );
+        }
+    }
     pool.close().await;
 }
 
@@ -8300,4 +8381,80 @@ async fn reusable_explorer_lookup_matches_admission_without_creating_work() {
     assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), distinct).await.unwrap().is_none());
     fixture.store.submit_agent_receipt(admitted.attempt.attempt_id, completed_receipt(Vec::new())).await.unwrap();
     assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft).await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[ignore = "manual wall-clock benchmark; no timing assertion"]
+async fn benchmark_explorer_lookup_with_sealed_history() {
+    let fixture = Fixture::new().await;
+    let mut draft = explorer_draft("history-benchmark", "src", "new investigation");
+    draft.acceptance_criteria = (0..64)
+        .map(|index| AcceptanceCriterion {
+            id: format!("criterion-{index:03}"),
+            text: format!("inspect the complete contract and consumer for requirement {index}"),
+        })
+        .collect();
+    let mut historical_draft = draft.clone();
+    historical_draft.objective = "prior investigation".to_string();
+    let (template, _) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), historical_draft)
+        .await
+        .expect("active assignment creates");
+    let canonical_root = std::fs::canonicalize(fixture.repo.path()).unwrap();
+    let pool = coordination_pool(&fixture).await;
+    let mut transaction = pool.begin().await.unwrap();
+    let now = serde_json::to_string(&Utc::now()).unwrap();
+    for _ in 0..512 {
+        let mut assignment = template.clone();
+        assignment.assignment_id = AssignmentId::new();
+        let id = assignment.assignment_id.to_string();
+        sqlx::query("INSERT INTO assignments VALUES (?, ?, ?, ?)")
+            .bind(&id)
+            .bind(&assignment.root_session_id)
+            .bind(serde_json::to_string(&assignment).unwrap())
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO assignment_repositories (assignment_id, repository_id, canonical_root, bound_at, workspace_id) VALUES (?, ?, ?, ?, ?)")
+            .bind(&id)
+            .bind(&assignment.repository_id)
+            .bind(canonical_root.to_string_lossy().as_ref())
+            .bind(&now)
+            .bind(&assignment.workspace_id)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO attempts VALUES (?, ?, 0, NULL, '\"completed\"', ?, ?)")
+            .bind(AttemptId::new().to_string())
+            .bind(&id)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+    let mut samples = Vec::new();
+    for iteration in 0..10 {
+        let started = std::time::Instant::now();
+        let result = fixture
+            .store
+            .reusable_explorer_assignment(fixture.repo.path(), draft.clone())
+            .await
+            .expect("lookup reads complete history");
+        let elapsed = started.elapsed();
+        assert_eq!(result, None, "sealed history cannot establish reuse");
+        if iteration > 0 {
+            samples.push(elapsed);
+        }
+    }
+    samples.sort();
+    eprintln!(
+        "explorer lookup: 512 sealed / 1 active, 64 criteria, median {:?}",
+        samples[4]
+    );
+    pool.close().await;
+    fixture.store.close().await;
 }

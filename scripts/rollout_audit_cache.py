@@ -175,12 +175,37 @@ def analyze_cached(
                         raise ValueError("rollout payload size mismatch")
                     if captured_bytes > MAX_CAPTURE_BYTES:
                         break
-            if retained_lines is not None:
+            if retained_lines is not None and captured_bytes <= MAX_CAPTURE_BYTES:
                 decoded[file] = retained_lines
             if captured_bytes > MAX_CAPTURE_BYTES:
                 break
+
+        def hydrate(item, path):
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "rollout_payload_artifact"
+            ):
+                return item
+            ref = item.get("payload")
+            if not isinstance(ref, dict) or type(ref.get("bytes")) is not int:
+                raise ValueError("invalid rollout payload reference")
+            digest = ref.get("sha256")
+            data = payloads.get((rollout_snapshot.rollout_payload_root(path), digest)) if isinstance(digest, str) else None
+            if data is None:
+                return rollout_snapshot.hydrate_rollout_record(item, path)
+            if len(data) != ref["bytes"]:
+                raise ValueError("rollout payload size mismatch")
+            return rollout_snapshot._hydrate_verified_payload(item, data)
+
         if captured_bytes > MAX_CAPTURE_BYTES:
-            report = analyze(source, repo_root, **options)
+            # Bypass persistence, not evidence already acquired in this call.
+            # The analyzer owns only the remaining snapshots; this stack closes
+            # the captured prefix. Never expose a partially decoded file as EOF
+            # or extend the bounded payload pool while reading the remainder.
+            report = analyze(
+                source, repo_root, **options, _captured=captured, _files=files,
+                _hydrate=hydrate, _decoded=decoded,
+            )
             report["analysisCache"] = {
                 "status": "bypassed",
                 "reason": "capture budget exceeded",
@@ -214,22 +239,6 @@ def analyze_cached(
                 "freshness": "captured inputs only",
             }
             return report
-
-        def hydrate(item, path):
-            if (
-                not isinstance(item, dict)
-                or item.get("type") != "rollout_payload_artifact"
-            ):
-                return item
-            return rollout_snapshot._hydrate_verified_payload(
-                item,
-                payloads[
-                    (
-                        rollout_snapshot.rollout_payload_root(path),
-                        item["payload"]["sha256"],
-                    )
-                ],
-            )
 
         report = analyze(
             source,

@@ -324,7 +324,7 @@ fn trim_git_suffix(value: &str) -> &str {
 }
 
 pub async fn get_has_changes(cwd: &Path) -> Option<bool> {
-    let git = Path::new("git");
+    let git = crate::git_executable_async().await;
     let fsmonitor = detect_local_fsmonitor_override(git, cwd).await;
     let output =
         run_git_command_with_timeout_from(git, &["status", "--porcelain"], cwd, fsmonitor).await?;
@@ -449,7 +449,7 @@ pub async fn git_index_entries(cwd: &Path, paths: &[PathBuf]) -> Option<Vec<u8>>
         .to_vec();
     args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
     let output = run_git_command_with_timeout_os_from(
-        Path::new("git"),
+        crate::git_executable_async().await,
         &args,
         cwd,
         crate::FsmonitorOverride::Disabled,
@@ -463,7 +463,7 @@ async fn run_git_command_with_timeout(args: &[&str], cwd: &Path) -> Option<std::
     // These callers only inspect repository metadata. Worktree workflows probe
     // once and pass their override directly to the lower-level runner.
     run_git_command_with_timeout_from(
-        Path::new("git"),
+        crate::git_executable_async().await,
         args,
         cwd,
         crate::FsmonitorOverride::Disabled,
@@ -880,18 +880,8 @@ async fn branch_merge_base_and_distance(
     // by the caller) and shares history with HEAD.
     for remote in remotes {
         let remote_ref = format!("refs/remotes/{remote}/{branch}");
-        let Some(verify_output) =
-            run_git_command_with_timeout(&["rev-parse", "--verify", "--quiet", &remote_ref], cwd)
-                .await
-        else {
-            // Mirror previous behavior: if the verify call times out/fails at the process level,
-            // treat the entire branch as unusable.
-            return None;
-        };
-        if !verify_output.status.success() {
-            continue;
-        }
-
+        // merge-base already rejects missing refs and unrelated histories.
+        // Avoid a separate process that verifies the same ref first.
         let merge_base_output =
             run_git_command_with_timeout(&["merge-base", "HEAD", &remote_ref], cwd).await?;
         if !merge_base_output.status.success() {
@@ -935,6 +925,11 @@ async fn find_closest_sha(cwd: &Path, branches: &[String], remotes: &[String]) -
             // Preserve existing behavior: skip branches that are not present on a remote.
             continue;
         };
+        // Distances cannot be negative, and ties retain the first branch.
+        // No later candidate can improve a zero-distance result.
+        if distance == 0 {
+            return Some(remote_sha);
+        }
         match &closest_sha {
             None => closest_sha = Some((remote_sha, distance)),
             Some((_, best_distance)) if distance < *best_distance => {
@@ -947,7 +942,7 @@ async fn find_closest_sha(cwd: &Path, branches: &[String], remotes: &[String]) -
 }
 
 async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
-    let git = Path::new("git");
+    let git = crate::git_executable_async().await;
     let fsmonitor = detect_local_fsmonitor_override(git, cwd).await;
     let output = run_git_command_with_timeout_from(
         git,
@@ -1636,6 +1631,82 @@ mod tests {
             "successful status must preserve Git's builtin fsmonitor daemon: {}",
             String::from_utf8_lossy(&daemon.stderr)
         );
+    }
+
+    #[tokio::test]
+    async fn closest_sha_skips_missing_and_unrelated_refs_and_improves_nonzero_distance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, _remote, branch, base_sha) = init_repo_with_remote(&temp);
+        let empty_tree = run_git(&repo, &["mktree"]);
+        let unrelated = run_git(&repo, &["commit-tree", &empty_tree, "-m", "unrelated"]);
+        run_git(
+            &repo,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{branch}"),
+                &unrelated,
+            ],
+        );
+        run_git(
+            &repo,
+            &[
+                "update-ref",
+                &format!("refs/remotes/backup/{branch}"),
+                &base_sha,
+            ],
+        );
+        let remotes = ["missing", "origin", "backup"].map(str::to_string);
+        assert_eq!(
+            branch_merge_base_and_distance(&repo, &branch, &remotes).await,
+            Some((Some(GitSha::new(&base_sha)), 0))
+        );
+        assert_eq!(
+            branch_merge_base_and_distance(&repo, "absent", &remotes).await,
+            Some((None, 0))
+        );
+        run_git(&repo, &["commit", "--allow-empty", "-m", "local"]);
+        assert_eq!(
+            branch_merge_base_and_distance(&repo, &branch, &remotes).await,
+            Some((Some(GitSha::new(&base_sha)), 1))
+        );
+        let head = run_git(&repo, &["rev-parse", "HEAD"]);
+        run_git(&repo, &["update-ref", "refs/remotes/origin/closer", &head]);
+        assert_eq!(
+            find_closest_sha(&repo, &[branch, "closer".to_string()], &remotes).await,
+            Some(GitSha::new(&head))
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_to_remote_many_matching_branches_keeps_fresh_results() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, _remote, _branch, base_sha) = init_repo_with_remote(&temp);
+        for index in 0..12 {
+            run_git(
+                &repo,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/origin/topic-{index}"),
+                    &base_sha,
+                ],
+            );
+        }
+
+        for index in 0..5 {
+            let contents = format!("change-{index}\n");
+            std::fs::write(repo.join("tracked.txt"), &contents).expect("change tracked file");
+            let started = std::time::Instant::now();
+            let state = git_diff_to_remote(&repo).await.expect("diff to remote");
+            eprintln!(
+                "many-branches diff elapsed_us={}",
+                started.elapsed().as_micros()
+            );
+            assert_eq!(state.sha, GitSha::new(&base_sha));
+            assert!(state.diff.contains(&format!("+{contents}")));
+            assert_eq!(run_git(&repo, &["diff", "--cached"]), "");
+        }
+        run_git(&repo, &["remote", "remove", "origin"]);
+        assert!(git_diff_to_remote(&repo).await.is_none());
     }
 
     #[tokio::test]

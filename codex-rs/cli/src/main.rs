@@ -937,7 +937,10 @@ fn parse_multitool_cli(args: impl IntoIterator<Item = std::ffi::OsString>) -> Mu
     let command = SharedCliOptions::scope_sandbox_selection(MultitoolCli::command());
     let matches = command.get_matches_from(&args);
     let mut cli = MultitoolCli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    // Global propagation may replace earlier overrides, but cannot erase all
+    // values. With none present, there is nothing for a second parse to recover.
     if cli.subcommand.is_some()
+        && !cli.config_overrides.raw_overrides.is_empty()
         && let Some(config_overrides) = CliConfigOverrides::from_every_command_level(
             SharedCliOptions::scope_sandbox_selection(MultitoolCli::command()),
             args,
@@ -2504,6 +2507,20 @@ mod tests {
     #[test]
     fn config_overrides_before_and_after_subcommands_are_all_applied() {
         let parse = |args: &[&str]| parse_multitool_cli(args.iter().map(std::ffi::OsString::from));
+
+        for (args, expected) in [
+            (vec!["codex", "exec", "task"], vec![]),
+            (vec!["codex", "mcp", "list"], vec![]),
+            (vec!["codex", "exec", "--", "-c"], vec![]),
+            (vec!["codex", "-c", "a=1", "mcp", "list"], vec!["a=1"]),
+            (vec!["codex", "mcp", "list", "--config=a=2"], vec!["a=2"]),
+            (
+                vec!["codex", "-ca=1", "mcp", "list", "--config=a=2"],
+                vec!["a=1", "a=2"],
+            ),
+        ] {
+            assert_eq!(parse(&args).config_overrides.raw_overrides, expected, "{args:?}");
+        }
 
         let cli = parse(&["codex", "-c", "model=root", "exec", "-c", "effort=high", "task"]);
         assert_eq!(

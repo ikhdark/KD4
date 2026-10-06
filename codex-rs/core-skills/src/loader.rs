@@ -567,6 +567,11 @@ async fn load_skills_under_root(
             message: warning,
         });
     }
+    // Empty and missing roots cannot inherit a skill namespace. Preserve scan
+    // diagnostics above, but do not probe ancestor manifests for unused names.
+    if skills.is_empty() {
+        return;
+    }
     let root_uri = PathUri::from_abs_path(root);
     let resolved_skills = futures::stream::iter(skills)
         .map(|skill| async move {

@@ -2450,7 +2450,7 @@ mod tests {
             "resolve the recovery contract, fetch, check completeness",
             "with coverage, failures, and continuation controls",
             "Full-read requests still require full coverage",
-            "start the known expensive validation before independent read-only diff review",
+            "start the known expensive validation before independent patch review",
             "cannot mutate validation inputs, contend for its resources",
             "prepare the conditional final report in that cell",
             "Unexpected results or unresolved semantic questions still require interpretation",

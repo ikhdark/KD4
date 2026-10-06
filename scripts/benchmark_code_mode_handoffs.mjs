@@ -28,7 +28,19 @@ for (let i = 0; i < runs; i++) {
   const context = vm.createContext({ tools: {}, ALL_TOOL_NAMES: [], setTimeout, clearTimeout,
     text: value => messages.push(value) });
   const start = performance.now();
-  await script.runInContext(context, { timeout: 5000 });
+  // vm's timeout bounds synchronous evaluation, not the returned promise.
+  // Bound stalled async fixtures too, without leaving a timer after success.
+  let deadline;
+  try {
+    await Promise.race([
+      new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(Error(`fixture run ${i + 1} timed out after 5000 ms`)), 5000);
+      }),
+      script.runInContext(context, { timeout: 5000 }),
+    ]);
+  } finally {
+    clearTimeout(deadline);
+  }
   wallMs.push(performance.now() - start);
   if (messages.length !== 1 || messages[0] !== 'orchestration scenarios passed') {
     throw Error(`incomplete fixture: ${JSON.stringify(messages)}`);

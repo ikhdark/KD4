@@ -1688,6 +1688,9 @@ def analyze_session_path(
     _hydrate=None,
     _decoded=None,
 ) -> dict[str, Any]:
+    # Classify cohorts with the same root identity printed in the report and
+    # authenticated by the cache, including callers passing --repo-root .
+    repo_root = repo_root.resolve()
     if cache_dir is not None:
         try:
             from scripts.rollout_audit_cache import analyze_cached
@@ -1750,7 +1753,8 @@ def analyze_session_path(
         sampling_boundary_observed = False
         calls_since_sampling_boundary = 0
         last_tool_output_ns: int | None = None
-        snapshot = _captured[file] if _captured is not None else read_rollout_snapshot(file)
+        captured = _captured.get(file) if _captured is not None else None
+        snapshot = captured if captured is not None else read_rollout_snapshot(file)
         action_records = []
         first_action_records.append((snapshot.metadata(), action_records))
         snapshots.append(snapshot.metadata())
@@ -1758,7 +1762,7 @@ def analyze_session_path(
         cwd = ""
         build = None
         decoded = _decoded.get(file) if _decoded is not None else None
-        with (contextlib.nullcontext(snapshot.stream) if _captured is not None else contextlib.closing(snapshot.stream)), (contextlib.nullcontext(decoded) if decoded is not None else contextlib.closing(snapshot.decoded_lines())) as handle:
+        with (contextlib.nullcontext(snapshot.stream) if captured is not None else contextlib.closing(snapshot.stream)), (contextlib.nullcontext(decoded) if decoded is not None else contextlib.closing(snapshot.decoded_lines())) as handle:
             for line_number, item, error, _wire_bytes in handle:
                 line_count += 1
                 if error is not None:
@@ -2277,7 +2281,7 @@ def analyze_session_path(
     report["checkoutOverlaps"] = _checkout_overlaps(valid, edited_paths)
     if startup_log is not None:
         report["startupTiming"] = _startup_log_report(
-            startup_log, _captured[startup_log] if _captured is not None else None
+            startup_log, _captured.get(startup_log) if _captured is not None else None
         )
     return report
 

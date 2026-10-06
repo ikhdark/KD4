@@ -68,7 +68,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let run = run_git_for_stdout_from(Path::new("git"), dir, args, env)?;
+    let run = run_git_for_stdout_from(crate::git_executable(), dir, args, env)?;
     String::from_utf8(run.output.stdout)
         .map(|value| value.trim().to_string())
         .map_err(|source| GitToolingError::GitOutputUtf8 {

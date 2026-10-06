@@ -186,6 +186,9 @@ class RootMaintenanceTest(unittest.TestCase):
                 "scripts.test_build_tooling_policy"
             ),
             "codex-rs/scripts/setup-windows.ps1": "scripts.test_build_tooling",
+            "scripts/benchmark_code_mode_handoffs.mjs": (
+                "scripts.test_benchmark_code_mode_handoffs"
+            ),
             "scripts/cargo-lane-patterns.ps1": "scripts.test_cargo_lane",
             "scripts/cargo-workspace-analyzer.ps1": "scripts.test_build_tooling_policy",
             "scripts/run-python.js": "scripts.test_build_tooling_policy",
@@ -327,7 +330,7 @@ class RootMaintenanceTest(unittest.TestCase):
             "codex-cli/scripts/build_npm_package.py": "python",
             "codex-rs/app-server-test-client/scripts/live_elicitation_hold.ps1": "powershell",
             "codex-rs/config/scripts/generate-proto.ps1": "powershell",
-            "DO-NOT-CHANGE/responses-api-proxy/npm/bin/codex-responses-api-proxy.js": "javascript",
+            "codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js": "javascript",
             "codex-rs/scripts/nextest_windows_stack.py": "python",
             "codex-rs/skills/src/assets/samples/imagegen/scripts/image_gen.py": "python",
             "sdk/python/scripts/update_sdk_artifacts.py": "python",

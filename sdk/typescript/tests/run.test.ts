@@ -479,7 +479,7 @@ describe("Codex", () => {
 
       const payload = requests[0];
       expect(payload).toBeDefined();
-      const lastUser = payload!.json.input.at(-1);
+      const lastUser = payload!.json.input.filter((item) => item.role === "user").at(-1);
       expect(lastUser?.content?.[0]?.text).toBe("Describe file changes\n\nFocus on impacted tests");
     } finally {
       cleanup();

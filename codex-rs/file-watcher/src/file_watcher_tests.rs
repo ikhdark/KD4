@@ -972,6 +972,76 @@ async fn overflow_rearms_a_lost_backend_watch_before_delivering_rescan() {
 }
 
 #[tokio::test]
+async fn shared_fallback_watches_resolve_once_per_batch() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let requested = directory.path().join("requested");
+    let watcher = Arc::new(FileWatcher::noop());
+    let mut subscribers = Vec::new();
+    for _ in 0..32 {
+        let (subscriber, receiver) = watcher.add_subscriber();
+        let registration = subscriber.register_path(requested.clone(), false);
+        subscribers.push((subscriber, registration, receiver));
+    }
+
+    // Each batch must resolve afresh, but all subscribers in it can share
+    // the same observation of the requested path.
+    for exists in [true, false, true] {
+        if exists {
+            std::fs::create_dir(&requested).expect("create requested directory");
+        } else {
+            std::fs::remove_dir(&requested).expect("remove requested directory");
+        }
+        let started = std::time::Instant::now();
+        watcher.send_paths_for_test(vec![requested.clone()]).await;
+        let resolutions = watcher.take_actual_watch_path_resolution_count_for_test();
+        eprintln!(
+            "shared-watch batch elapsed_us={} resolutions={resolutions}",
+            started.elapsed().as_micros()
+        );
+        for (_, _, receiver) in &mut subscribers {
+            assert_eq!(
+                timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .expect("event timeout"),
+                Some(FileWatcherEvent {
+                    paths: vec![requested.clone()],
+                    rescan_required: false,
+                })
+            );
+        }
+        assert_eq!(
+            watcher.watch_counts_for_test(if exists { &requested } else { directory.path() }),
+            Some((32, 0))
+        );
+        assert_eq!(resolutions, 1);
+    }
+
+    FileWatcher::reconcile_changes(
+        &watcher.state,
+        None,
+        None,
+        ObservedChanges {
+            rescan_required: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        watcher.take_actual_watch_path_resolution_count_for_test(),
+        1
+    );
+    for (_, _, receiver) in &mut subscribers {
+        assert_eq!(
+            receiver.recv().await,
+            Some(FileWatcherEvent {
+                paths: Vec::new(),
+                rescan_required: true,
+            })
+        );
+    }
+}
+
+#[tokio::test]
 async fn queued_raw_events_are_reconciled_in_one_pass() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let requested = temp_dir.path().join("requested");

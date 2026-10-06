@@ -400,6 +400,8 @@ async fn start_elicitation_services(
 
 struct ElicitationRoundTripFixture {
     mcp: TestAppServer,
+    // Keep auth, config, and rollouts alive until after the server is dropped.
+    codex_home: TempDir,
     response_mock: ResponseMock,
     _responses_server: wiremock::MockServer,
     thread_id: String,
@@ -509,6 +511,7 @@ impl ElicitationRoundTripFixture {
 
         Ok(Self {
             mcp,
+            codex_home,
             response_mock,
             _responses_server: responses_server,
             thread_id: thread.id,
@@ -518,6 +521,7 @@ impl ElicitationRoundTripFixture {
     }
 
     async fn read_elicitation(&mut self) -> Result<(RequestId, McpServerElicitationRequestParams)> {
+        assert!(self.codex_home.path().join("config.toml").is_file());
         let request = timeout(
             DEFAULT_READ_TIMEOUT,
             self.mcp.read_stream_until_request_message(),
@@ -579,6 +583,7 @@ impl ElicitationRoundTripFixture {
         }
 
         let requests = self.response_mock.requests();
+        assert!(self.codex_home.path().join("config.toml").is_file());
         assert_eq!(requests.len(), 3);
         let function_call_output = requests[2].function_call_output(TOOL_CALL_ID);
         assert_eq!(

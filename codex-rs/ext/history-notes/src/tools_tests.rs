@@ -10,6 +10,30 @@ use serde_json::json;
 use super::HistoryNotesToolOutput;
 
 #[test]
+fn log_preview_preserves_json_truncation_and_retained_result() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    for result in [
+        json!({"text": "short \"quoted\" text\nnext line"}),
+        json!({"encrypted_output": "x".repeat(65_536)}),
+        json!({"text": "é🦀\n".repeat(4_096), "metadata": {"source": "item-1"}}),
+    ] {
+        let expected = codex_tools::JsonToolOutput::new(result.clone()).log_preview();
+        let output = HistoryNotesToolOutput::new(result.clone()).expect("valid output");
+        let response = output.to_response_item("call-1", &payload);
+
+        assert_eq!(output.log_preview(), expected);
+        assert_eq!(output.log_preview(), expected);
+        assert_eq!(
+            output.post_tool_use_response("call-1", &payload),
+            Some(result)
+        );
+        assert_eq!(output.to_response_item("call-1", &payload), response);
+    }
+}
+
+#[test]
 fn preserves_encrypted_history_output() {
     let result = HistoryNotesToolOutput::new(json!({"encrypted_output": "enc_payload"}))
         .expect("valid output")

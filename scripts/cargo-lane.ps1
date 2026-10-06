@@ -55,7 +55,7 @@ function Parse-CargoLaneArguments {
     $parsedIsolateCargoHome = $false
     $parsedFetch = $false
     $allowColdOverflow = $false
-    $warmWaitSeconds = 30.0
+    $warmWaitSeconds = 600.0
     $maintenanceOnly = $false
     $commandStart = $RawArgs.Count
 
@@ -864,7 +864,7 @@ function Acquire-CargoLaneReservation {
         [switch]$PreferWarm,
         [string[]]$ActiveNames = @(),
         [switch]$AllowColdOverflow,
-        [double]$WarmWaitSeconds = 30
+        [double]$WarmWaitSeconds = 600
     )
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $announced = $false
@@ -1017,6 +1017,7 @@ function Get-CargoLaneOwnedCommand {
     return @(
         $python.Source,
         (Join-Path $PSScriptRoot "process_owner.py"),
+        "--below-normal-priority",
         "--parent-pid",
         [string]$PID,
         "--cleanup-failed-marker",

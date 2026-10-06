@@ -239,20 +239,32 @@ where
     }
 
     let apps = if cache_context.cache_key.is_workspace_account {
-        // Overlap the first workspace page with the public directory, then finish
-        // workspace pagination before publishing either listing.
         let workspace_page =
             fetch_page("/connectors/directory/list_workspace?external_logos=true".to_string());
-        let (mut apps, workspace_page) =
-            tokio::try_join!(list_directory_connectors(&mut fetch_page), workspace_page)?;
-        apps.extend(
+        // Share only synchronous future construction, never a lock across await.
+        // Both pagination chains run in this task and are dropped together on error
+        // or cancellation. The mutex preserves Send for mutable fetch callbacks.
+        let fetch_page = StdMutex::new(&mut fetch_page);
+        let fetch_page = |path| {
+            fetch_page
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)(path)
+        };
+        let workspace_listing = async {
             list_directory_pages(
-                &mut fetch_page,
+                &mut &fetch_page,
                 "/connectors/directory/list_workspace",
-                workspace_page,
+                workspace_page.await?,
             )
-            .await?,
-        );
+            .await
+        };
+        let mut public_fetch = &fetch_page;
+        let (mut apps, workspace_apps) = tokio::try_join!(
+            list_directory_connectors(&mut public_fetch),
+            workspace_listing
+        )?;
+        // Keep public-before-workspace precedence regardless of completion order.
+        apps.extend(workspace_apps);
         apps
     } else {
         list_directory_connectors(&mut fetch_page).await?
@@ -667,6 +679,57 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn complete_workspace_and_public_pagination_overlap() -> anyhow::Result<()> {
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let home = TempDir::new()?;
+        let context = cache_context(&home, "overlap-all-pages", true);
+        let start = tokio::time::Instant::now();
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let mut paths = Vec::new();
+        let listing = list_all_connectors_with_options(context.clone(), true, |path| {
+            let completed = Arc::clone(&completed);
+            let workspace = path.starts_with("/connectors/directory/list_workspace");
+            let page = if path.contains("token=3") {
+                3
+            } else if path.contains("token=2") {
+                2
+            } else {
+                1
+            };
+            paths.push(path);
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                completed.lock().unwrap().push(start.elapsed());
+                Ok(DirectoryListResponse {
+                    apps: vec![DirectoryApp {
+                        description: Some(if workspace { "workspace" } else { "public" }.into()),
+                        ..app(&format!("app-{page}"), &format!("App {page}"))
+                    }],
+                    next_token: (page < 3).then(|| (page + 1).to_string()),
+                })
+            }
+        });
+        // Host callers spawn this future; sharing the FnMut callback must retain Send.
+        fn assert_send<T: Send>(value: T) -> T {
+            value
+        }
+        let connectors = assert_send(listing).await?;
+        let network_elapsed = *completed.lock().unwrap().iter().max().unwrap();
+        eprintln!("six directory requests: network critical path {network_elapsed:?}");
+        assert_eq!(paths.len(), 6);
+        assert_eq!(network_elapsed, Duration::from_millis(300));
+        assert_eq!(connectors.len(), 3);
+        assert!(
+            connectors.iter().all(|app| {
+                app.description.as_deref() == Some("workspace") && !app.is_accessible
+            })
+        );
+        clear_directory_memory_cache();
+        assert_eq!(cached_directory_connectors(&context), Some(connectors));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn workspace_pagination_failure_preserves_complete_memory_and_disk_cache()
     -> anyhow::Result<()> {
@@ -709,6 +772,59 @@ mod tests {
             );
             assert_eq!(std::fs::read(context.cache_path())?, disk_before);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_directory_pagination_drops_both_fetches_and_releases_refresh()
+    -> anyhow::Result<()> {
+        struct ActiveFetch(Arc<AtomicUsize>);
+        impl Drop for ActiveFetch {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let _guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let home = TempDir::new()?;
+        let context = cache_context(&home, "cancel-both-directories", true);
+        let previous = vec![directory_app_to_app_info(app("previous", "Previous"))];
+        write_cached_directory_connectors(&context, &previous);
+        let disk_before = std::fs::read(context.cache_path())?;
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut listing = Box::pin(list_all_connectors_with_options(
+            context.clone(),
+            true,
+            |_| {
+                let active = Arc::clone(&active);
+                async move {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _fetch = ActiveFetch(active);
+                    std::future::pending::<anyhow::Result<DirectoryListResponse>>().await
+                }
+            },
+        ));
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(listing.as_mut().poll(cx))).await,
+            std::task::Poll::Pending
+        ));
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        drop(listing);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(cached_directory_connectors(&context), Some(previous));
+        assert_eq!(std::fs::read(context.cache_path())?, disk_before);
+
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(1),
+            list_all_connectors_with_options(context, true, |_| async {
+                Ok(DirectoryListResponse {
+                    apps: Vec::new(),
+                    next_token: None,
+                })
+            }),
+        )
+        .await??;
+        assert!(refreshed.is_empty());
         Ok(())
     }
 

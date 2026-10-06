@@ -13,6 +13,12 @@ evidence, decisions, and task-relevant rationale.
 
 Use exactly these headings, in this order:
 
+Aim for at most 2,400 tokens total, with section-body targets of 250 tokens for
+Goal, 350 for Current state, 250 for Completed work, 350 for Unresolved work,
+500 for Evidence, and 250 for Next action (1,950 body tokens total).
+These are guidance, not hard limits: preserve required sections and indispensable
+information. Keep any introductory prose short; post-hoc truncation is a safety net.
+
 Every section must contain an explicit value. Write `None` when there is no
 task-relevant content for a required section; never leave a section empty.
 

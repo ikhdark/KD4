@@ -1,6 +1,7 @@
 mod apply;
 mod branch;
 mod errors;
+mod executable;
 mod fsmonitor;
 mod info;
 mod operations;
@@ -17,6 +18,8 @@ pub use apply::unescape_c_bytes;
 pub use branch::merge_base_with_head;
 pub use codex_protocol::protocol::GitSha;
 pub use errors::GitToolingError;
+pub use executable::git_executable;
+pub use executable::git_executable_async;
 pub use fsmonitor::FsmonitorOverride;
 pub use fsmonitor::FsmonitorProbeRunner;
 pub use fsmonitor::detect_fsmonitor_override;

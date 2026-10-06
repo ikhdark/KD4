@@ -369,6 +369,43 @@ async fn durable_cells_restore_values_and_terminal_receipts_without_reexecution(
     restored.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn late_persistence_opt_in_runs_cell_without_replacing_live_state() {
+    for active_cell in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+        let permit = if active_cell {
+            Some(Arc::clone(&runtime.inner.active_cell_permits).acquire_owned().await.unwrap())
+        } else {
+            runtime.inner.stored_values.lock().await.insert(
+                "existing".into(), StoredValue::new("existing", JsonValue::from("kept")),
+            );
+            None
+        };
+        let mut request = execute_request(r#"store("ran", true); text("executed");"#);
+        request.state_path = Some(path.clone());
+        let event = runtime.execute(request, ObserveMode::Decision).await.unwrap()
+            .initial_event().await.unwrap();
+        let CellEvent::Completed { content_items, error_text, .. } = event else {
+            panic!("cell must complete");
+        };
+        assert_eq!(error_text, None);
+        assert!(matches!(&content_items[0], OutputItem::Text { text } if text.contains("in-memory state only")));
+        assert!(matches!(&content_items[1], OutputItem::Text { text } if text == "executed"));
+        assert!(runtime.inner.durable_state.get().is_none());
+        assert!(!path.exists(), "late opt-in must not modify the durable snapshot");
+        let values = runtime.inner.stored_values.lock().await;
+        assert_eq!(values["ran"].value.as_ref(), &JsonValue::Bool(true));
+        if !active_cell {
+            assert_eq!(values["existing"].value.as_ref(), &JsonValue::from("kept"));
+        }
+        drop(values);
+        drop(permit);
+        runtime.shutdown().await.unwrap();
+    }
+}
+
 #[test]
 fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
     let completed = |bytes: usize| CellEvent::Completed {
@@ -423,6 +460,111 @@ fn durable_restart_never_reuses_uncompleted_cell_ids() {
     assert!(restarted.completed_cells().is_empty());
     assert!(restarted.first_cell_id >= reserved_limit);
     assert!(restarted.first_cell_id > interrupted_id);
+}
+
+#[test]
+fn buffered_json_batches_writes_and_reports_flush_failures() {
+    #[derive(Default)]
+    struct Writer {
+        bytes: Vec<u8>,
+        writes: usize,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.fail_write {
+                return Err(std::io::Error::other("write failed"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                return Err(std::io::Error::other("flush failed"));
+            }
+            Ok(())
+        }
+    }
+
+    let value = serde_json::json!({"rows": vec!["line\nλ😀\"\\"; 2_000]});
+    let mut writer = Writer::default();
+    write_buffered_json(&mut writer, &value).unwrap();
+    assert_eq!(writer.bytes, serde_json::to_vec(&value).unwrap());
+    assert!(writer.writes < 10, "JSON tokens must share buffered writes");
+
+    // Small values stay buffered until flush. Dropping the buffer would hide
+    // this error and make publication of incomplete evidence look successful.
+    for (fail_write, fail_flush, expected) in [
+        (true, false, "write failed"),
+        (false, true, "flush failed"),
+    ] {
+        let mut writer = Writer { fail_write, fail_flush, ..Writer::default() };
+        assert_eq!(write_buffered_json(&mut writer, &true), Err(expected.into()));
+    }
+}
+
+#[test]
+fn buffered_snapshot_flushes_before_publication_and_restores_exact_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let (state, _) = snapshot::DurableState::open(path.clone()).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let value = serde_json::json!({"rows": vec!["line\nλ😀\"\\"; 2_000]});
+    let event = CellEvent::Completed {
+        content_items: vec![OutputItem::Text { text: "receipt\nλ😀".repeat(2_000) }],
+        error_text: Some("original error".into()),
+        output_loss: Some(codex_code_mode_protocol::OutputLoss {
+            discarded_items: 2,
+            discarded_bytes_lower_bound: 3,
+        }),
+    };
+    let staged = state.stage(
+        "call".into(),
+        HashMap::from([("evidence".into(), StoredValue::new("evidence", value.clone()))]),
+        "1".into(),
+        event.clone(),
+    ).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), original, "staging must not publish");
+    state.publish(staged).unwrap();
+    drop(state);
+    let (restored, values) = snapshot::DurableState::open(path).unwrap();
+    assert_eq!(values["evidence"].value.as_ref(), &value);
+    assert_eq!(restored.completed_cells().get("1"), Some(&event));
+}
+
+#[test]
+fn buffered_spill_read_preserves_receipts_and_rejects_corruption() {
+    let event = CellEvent::Completed {
+        content_items: vec![OutputItem::Text { text: "receipt\nλ😀\"\\".repeat(2_000) }],
+        error_text: Some("original error".into()),
+        output_loss: Some(codex_code_mode_protocol::OutputLoss {
+            discarded_items: 2,
+            discarded_bytes_lower_bound: 3,
+        }),
+    };
+    let bytes = serde_json::to_vec(&event).unwrap();
+    for suffix in [None, Some(b" ".as_slice()), Some(b"!".as_slice()), Some(b"".as_slice())] {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut payload = bytes.clone();
+        match suffix {
+            Some([]) => { payload.pop(); }
+            Some(suffix) => payload.extend_from_slice(suffix),
+            None => {}
+        }
+        std::fs::write(file.path(), payload).unwrap();
+        let cached = CachedCellEvent::Spilled(file);
+        let result = cached.read();
+        if suffix == Some(b"!".as_slice()) || suffix == Some(b"".as_slice()) {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("cannot be decoded") && error.contains("do not replay"));
+        } else {
+            assert_eq!(result.unwrap(), event);
+            assert_eq!(cached.read().unwrap(), event, "recovery must reopen at the start");
+        }
+    }
 }
 
 #[tokio::test]

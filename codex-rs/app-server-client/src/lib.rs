@@ -120,6 +120,16 @@ pub mod legacy_core {
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+// A canceled shutdown must not detach its worker by dropping a plain JoinHandle.
+// Aborting an already completed worker is harmless on the graceful path.
+struct AbortWorkerOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(test)]
 tokio::task_local! {
     // Scheduling control only: the real worker still owns its runtime and queue.
@@ -292,10 +302,10 @@ enum ForwardEventResult {
 /// Forwards a single in-process event to the consumer, respecting the
 /// lossless/best-effort split.
 ///
-/// Lossless events and preceding lag markers are retained until the consumer
-/// drains capacity, with upstream reads paused and delivery selected alongside
-/// commands. Best-effort events use `try_send` and increment `skipped_events`
-/// on failure.
+/// Lossless events use available channel capacity immediately. Otherwise they
+/// and preceding lag markers are retained until the consumer drains capacity,
+/// with upstream reads paused and delivery selected alongside commands.
+/// Best-effort events use `try_send` and increment `skipped_events` on failure.
 ///
 /// If a dropped event is a `ServerRequest`, `reject_server_request` is called
 /// so the server does not wait for a response that will never come.
@@ -313,6 +323,19 @@ where
         return ForwardEventResult::DisableStream;
     }
     if event_requires_delivery(&event) {
+        // Avoid another worker select pass when no retained event or lag marker
+        // needs to precede this one. A full channel still keeps delivery lossless.
+        let event = if pending_delivery.is_empty() && *skipped_events == 0 {
+            match event_tx.try_send(event) {
+                Ok(()) => return ForwardEventResult::Continue,
+                Err(mpsc::error::TrySendError::Full(event)) => event,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return ForwardEventResult::DisableStream;
+                }
+            }
+        } else {
+            event
+        };
         if *skipped_events > 0 {
             pending_delivery.push_back(InProcessServerEvent::Lagged {
                 skipped: *skipped_events,
@@ -907,6 +930,7 @@ impl InProcessAppServerClient {
             worker_handle,
         } = self;
         let mut worker_handle = worker_handle;
+        let _abort_worker = AbortWorkerOnDrop(worker_handle.abort_handle());
         // Drop the caller-facing receiver before asking the worker to shut
         // down. That unblocks any pending must-deliver `event_tx.send(..)`
         // so the worker can reach `handle.shutdown()` instead of timing out
@@ -1878,6 +1902,88 @@ mod tests {
                 notification
             )) if notification.thread_id == "thread"
         ));
+    }
+
+    #[tokio::test]
+    async fn performance_probe_lossless_forwarding_uses_available_capacity() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut pending_delivery = std::collections::VecDeque::new();
+        let mut skipped_events = 0;
+        let mut deferred = 0;
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert_eq!(
+                forward_in_process_event(
+                    &event_tx,
+                    &mut pending_delivery,
+                    &mut skipped_events,
+                    InProcessServerEvent::ServerNotification(agent_message_delta_notification(
+                        "hello",
+                    )),
+                    |_| panic!("no server request to reject"),
+                ),
+                ForwardEventResult::Continue
+            );
+            // Count the worker delivery passes needed after forwarding.
+            while let Some(event) = pending_delivery.pop_front() {
+                deferred += 1;
+                event_tx.send(event).await.expect("deliver retained event");
+            }
+            assert!(matches!(
+                event_rx.try_recv().expect("lossless event"),
+                InProcessServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
+                    notification
+                )) if notification.delta == "hello"
+            ));
+        }
+        eprintln!(
+            "in-process: 10000 events, {deferred} deferred deliveries, {:?}",
+            started.elapsed()
+        );
+        assert_eq!(skipped_events, 0);
+        assert_eq!(
+            deferred, 0,
+            "available capacity must not require another worker pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn lossless_fast_path_preserves_retained_event_order() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut pending_delivery = std::collections::VecDeque::new();
+        let mut skipped_events = 0;
+        for delta in ["first", "second", "third"] {
+            assert_eq!(
+                forward_in_process_event(
+                    &event_tx,
+                    &mut pending_delivery,
+                    &mut skipped_events,
+                    InProcessServerEvent::ServerNotification(agent_message_delta_notification(
+                        delta
+                    )),
+                    |_| panic!("no server request to reject"),
+                ),
+                ForwardEventResult::Continue
+            );
+            if delta == "second" {
+                assert!(matches!(
+                    event_rx.try_recv().expect("first event"),
+                    InProcessServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(notification))
+                        if notification.delta == "first"
+                ));
+            }
+        }
+        // There is room again, but the third event must not bypass the second.
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(pending_delivery.len(), 2);
+        for expected in ["second", "third"] {
+            assert!(matches!(
+                pending_delivery.pop_front().expect("retained event"),
+                InProcessServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(notification))
+                    if notification.delta == expected
+            ));
+        }
+        assert_eq!(skipped_events, 0);
     }
 
     #[tokio::test]
@@ -3448,5 +3554,45 @@ mod tests {
             .await
             .expect("shutdown should not wait for the 5s fallback timeout")
             .expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_reaps_in_process_worker() {
+        let pause = Arc::new(tokio::sync::Notify::new());
+        let client = TEST_WORKER_PAUSE
+            .scope(
+                pause,
+                start_test_client_with_capacity(SessionSource::Cli, 1),
+            )
+            .await;
+        let request_handle = client.request_handle();
+        let worker = client.worker_handle.abort_handle();
+        let mut request = Box::pin(request_handle.request(ClientRequest::GetAccount {
+            request_id: RequestId::Integer(702),
+            params: codex_app_server_protocol::GetAccountParams {
+                refresh_token: false,
+            },
+        }));
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(client.command_tx.capacity(), 0);
+        let mut shutdown = Box::pin(client.shutdown());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        drop(shutdown);
+        let closed = timeout(Duration::from_secs(1), request_handle.command_tx.closed()).await;
+        // Do not leave the baseline's paused worker running after a failure.
+        worker.abort();
+        request_handle.command_tx.closed().await;
+        assert!(
+            closed.is_ok(),
+            "cancelled shutdown must not detach its worker"
+        );
+        assert!(worker.is_finished());
+        assert_eq!(
+            request
+                .await
+                .expect_err("queued request is abandoned")
+                .kind(),
+            ErrorKind::BrokenPipe
+        );
     }
 }

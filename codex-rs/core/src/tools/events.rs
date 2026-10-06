@@ -814,6 +814,7 @@ pub(crate) async fn begin_uncertain_command_baseline(
     let baseline = match admitted_baseline {
         Some(identity) => identity,
         None => {
+            let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("command_workspace_baseline_capture");
             ctx.session
                 .services
                 .git_workspace
@@ -1301,8 +1302,9 @@ async fn emit_patch_end(
             },
             _ => HashMap::new(),
         };
-        let (unified_diff, invalidation_warning) = {
+        let (unified_diff, invalidation_warning, after_capture) = {
             let mut guard = tracker.lock().await;
+            let before_revision = guard.current_mutation_revision();
             let unified_diff = match tracker_update {
                 TurnDiffTrackerUpdate::Track {
                     environment_id,
@@ -1321,8 +1323,18 @@ async fn emit_patch_end(
                 }
                 TurnDiffTrackerUpdate::None => None,
             };
-            (unified_diff, guard.take_invalidation_warning())
+            let revision = guard.current_mutation_revision();
+            let after_capture = (revision != before_revision)
+                .then(|| guard.workspace_evidence_generation_batch_for_call(ctx.call_id))
+                .flatten()
+                .map(|batch| (batch, revision));
+            (unified_diff, guard.take_invalidation_warning(), after_capture)
         };
+        if let (Some((batch, revision)), Some(cwd)) = (after_capture, evidence_cwd.as_ref()) {
+            batch
+                .prefetch_identity_after_mutation(ctx.session, ctx.turn, cwd.as_path(), revision)
+                .await;
+        }
         if let Some(message) = invalidation_warning {
             ctx.session
                 .send_event(
@@ -2060,6 +2072,73 @@ mod tests {
         assert_eq!(evidence[0].pre_write_hash, evidence[0].final_hash);
         assert!(evidence[0].finalized_at.is_some());
         assert!(evidence[0].end_epoch.is_some());
+    }
+
+    #[tokio::test]
+    async fn patch_after_capture_overlaps_relay_and_flush_joins_it() {
+        check_patch_after_capture(false).await;
+    }
+
+    #[tokio::test]
+    async fn patch_after_capture_is_rejected_after_a_later_mutation() {
+        check_patch_after_capture(true).await;
+    }
+
+    async fn check_patch_after_capture(later_mutation: bool) {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        initialize_git_repository(&repo);
+        let (session, mut turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        set_turn_environments(
+            &mut turn,
+            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, repo.as_path())],
+        );
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
+        assert!(batch.register_call("patch"));
+        tracker.lock().await.activate_workspace_evidence_generation_batch(&batch);
+        let path = repo.join("changed.txt");
+        std::fs::write(&path, "after patch").unwrap();
+        let cache = &session.services.git_workspace;
+        let pause = cache.pause_next_workspace_evidence_capture();
+        let count = cache.workspace_evidence_capture_count();
+        tokio::time::timeout(Duration::from_secs(10), emit_patch_end(
+            ToolEventCtx::new(&session, &turn, "patch", Some(&tracker)),
+            HashMap::from([(path.clone(), FileChange::Add { content: "after patch".into() })]),
+            String::new(),
+            String::new(),
+            PatchApplyStatus::Completed,
+            TurnDiffTrackerUpdate::Invalidate,
+        )).await.expect("patch completion must not wait for after-capture").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started())
+            .await.expect("capture starts before generation drain");
+        let revision = tracker.lock().await.current_mutation_revision();
+        assert_eq!(revision, 1);
+        tokio::time::timeout(Duration::from_secs(1), batch.prefetch_identity_after_mutation(
+            &session, &turn, &repo, revision,
+        )).await.expect("duplicate prefetch must not wait for the pending capture");
+        if later_mutation {
+            std::fs::write(&path, "later mutation").unwrap();
+            tracker.lock().await.record_unknown_mutation();
+            cache.note_host_workspace_mutation();
+            tokio::time::timeout(Duration::from_secs(1), batch.prefetch_identity_after_mutation(
+                &session, &turn, &repo, revision + 1,
+            )).await.expect("later completion must not queue a redundant capture");
+        }
+        let flush = batch.flush(&session, &turn, &tracker);
+        tokio::pin!(flush);
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        pause.release();
+        let flushed = tokio::time::timeout(Duration::from_secs(10), flush)
+            .await.expect("flush joins after-capture").unwrap();
+        assert_eq!(flushed.authoritative_capture_count, usize::from(later_mutation));
+        if !later_mutation {
+            assert_eq!(cache.workspace_evidence_capture_count(), count + 1);
+            assert!(batch.captured_identity(&repo, revision).await.flatten().is_some());
+        } else {
+            assert!(batch.captured_identity(&repo, revision + 1).await.is_none());
+        }
     }
 
     #[tokio::test]

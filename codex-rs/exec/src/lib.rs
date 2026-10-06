@@ -1361,6 +1361,19 @@ async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
 
 fn cwd_from_reversed_rollout_line(line: &mut [u8]) -> Option<PathBuf> {
     line.reverse();
+    #[derive(serde::Deserialize)]
+    struct ItemType {
+        #[serde(rename = "type")]
+        item_type: String,
+    }
+    // Most trailing records are tool output or events. Scan their JSON without
+    // materializing payloads that cannot contribute a working directory.
+    // Ambiguous headers (including duplicate tags) still use the full decoder.
+    if let Ok(header) = serde_json::from_slice::<ItemType>(line)
+        && header.item_type != "turn_context"
+    {
+        return None;
+    }
     let rollout_line = serde_json::from_slice::<RolloutLine>(line).ok()?;
     match rollout_line.item {
         RolloutItem::TurnContext(item) => Some(item.cwd.into_path_buf()),

@@ -176,6 +176,7 @@ pub struct TestCodexBuilder {
     external_time_provider: Option<Arc<dyn TimeProvider>>,
     code_mode_host_program: Option<PathBuf>,
     raw_response_items: bool,
+    remote_models: bool,
 }
 
 impl TestCodexBuilder {
@@ -197,6 +198,12 @@ impl TestCodexBuilder {
         self.with_config(move |config| {
             config.model = Some(new_model);
         })
+    }
+
+    /// Exercise the provider's model endpoint instead of installing retired-model fixtures.
+    pub fn with_remote_models(mut self) -> Self {
+        self.remote_models = true;
+        self
     }
 
     pub fn with_model_info_override<T>(self, model: &str, override_model_info: T) -> Self
@@ -584,7 +591,9 @@ impl TestCodexBuilder {
             config.model_provider_id.clone(),
             config.model_provider.clone(),
         );
-        ensure_test_model_catalog(&mut config)?;
+        if !self.remote_models {
+            ensure_test_model_catalog(&mut config)?;
+        }
 
         Ok(config)
     }
@@ -1093,6 +1102,7 @@ pub fn test_codex() -> TestCodexBuilder {
         external_time_provider: None,
         code_mode_host_program: None,
         raw_response_items: false,
+        remote_models: false,
     }
 }
 

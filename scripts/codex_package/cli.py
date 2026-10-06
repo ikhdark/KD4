@@ -672,6 +672,17 @@ def validate_cli_request(
         if not (REPO_ROOT / name).is_file():
             raise RuntimeError(f"Required package input is missing: {name}")
 
+    # Cross-role aliases are already invalid; reject explicit ones before a
+    # build lease, Cargo compilation, or dependency download can start.
+    rg_bin = getattr(args, "rg_bin", None)
+    if rg_bin is not None and rg_bin.is_file():
+        for name in SourceBuildOutputs.__dataclass_fields__:
+            path = getattr(args, name, None)
+            if path is not None and path.is_file() and path.samefile(rg_bin):
+                raise RuntimeError(
+                    f"Package roles must use distinct executables: ripgrep and {name}"
+                )
+
 
 def resolve_source_outputs(
     args: argparse.Namespace,

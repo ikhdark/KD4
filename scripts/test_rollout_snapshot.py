@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +24,120 @@ from scripts import restore_rollout_artifact
 
 
 class RolloutSnapshotTest(unittest.TestCase):
+    def test_payload_read_is_bounded_by_verified_size_and_rejects_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "rollout.jsonl"
+            data = b'{"type":"event_msg","payload":{}}'
+            digest = hashlib.sha256(data).hexdigest()
+            directory = rollout_snapshot.rollout_payload_root(source)
+            directory.mkdir()
+            (directory / f"{digest}.json").write_bytes(data)
+            for actual in (data, data + b"x", data[:-1], b"x" * len(data)):
+                with self.subTest(actual=actual):
+                    opened = mock.mock_open(read_data=actual)
+                    with mock.patch.object(Path, "open", opened):
+                        if actual == data:
+                            self.assertEqual(
+                                rollout_snapshot.load_rollout_payload(source, digest, len(data)),
+                                data,
+                            )
+                        else:
+                            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                                rollout_snapshot.load_rollout_payload(source, digest, len(data))
+                    opened().read.assert_called_once_with(len(data) + 1)
+
+    def test_record_iterator_is_lazy_and_closes_its_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_bytes(b'{"type":"event_msg"}\nbroken\n')
+            snapshot = rollout_snapshot.read_rollout_snapshot(path)
+            with mock.patch.object(rollout_snapshot, "read_rollout_snapshot", return_value=snapshot):
+                with contextlib.closing(rollout_snapshot.iter_rollout_records(path)) as rows:
+                    self.assertEqual(next(rows), ({"type": "event_msg"}, 21))
+                    self.assertFalse(snapshot.stream.closed)
+            self.assertTrue(snapshot.stream.closed)
+            with self.assertRaisesRegex(ValueError, "invalid rollout record"):
+                rollout_snapshot.read_rollout_records(path)
+
+    def test_restore_entrypoint_from_any_cwd_with_safe_path(self):
+        repo = Path(__file__).resolve().parents[1]
+        script = repo / "scripts" / "restore_rollout_artifact.py"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "rollout.jsonl"
+            content = "preserved: 背景\r\n"
+            source.write_text(json.dumps({"type": "event_msg", "payload": {
+                "type": "patch_apply_end", "call_id": "delete-1", "changes": {
+                    "original.txt": {"type": "delete", "content": content}}}}) + "\n", encoding="utf-8")
+            for index, cwd in enumerate((repo, root)):
+                output = root / f"restored-{index}.txt"
+                env = dict(os.environ)
+                env.pop("PYTHONPATH", None)
+                env["PYTHONSAFEPATH"] = "1"
+                result = subprocess.run(
+                    [sys.executable, "-B", str(script), "--rollout", str(source),
+                     "--call-id", "delete-1", "--deleted-file", "original.txt", "--output", str(output)],
+                    cwd=cwd, env=env, capture_output=True, text=True, timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_bytes(), content.encode("utf-8"))
+
+    def test_restore_rejects_late_duplicates_and_corruption_before_writing(self):
+        item = {"type": "event_msg", "payload": {"type": "patch_apply_end",
+                "call_id": "delete-1", "changes": {"original.txt": {
+                    "type": "delete", "content": "preserved"}}}}
+        row = (json.dumps(item) + "\n").encode()
+        for compressed in (False, True):
+            for tail in (row, b"broken\n", b"[]\n"):
+                with self.subTest(compressed=compressed, tail=tail), tempfile.TemporaryDirectory() as temp:
+                    source = Path(temp) / ("rollout.jsonl.zst" if compressed else "rollout.jsonl")
+                    output = Path(temp) / "restored.txt"
+                    data = row + tail
+                    source.write_bytes(zstd.compress(data) if compressed else data)
+                    with self.assertRaises(ValueError):
+                        restore_rollout_artifact.main([
+                            "--rollout", str(source), "--call-id", "delete-1",
+                            "--deleted-file", "original.txt", "--output", str(output),
+                        ])
+                    self.assertFalse(output.exists())
+
+    def test_restore_existing_destination_does_not_read_rollout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "existing.txt"
+            output.write_bytes(b"user work")
+            with mock.patch.object(restore_rollout_artifact, "iter_rollout_records") as read:
+                with self.assertRaises(FileExistsError):
+                    restore_rollout_artifact.main([
+                        "--rollout", str(Path(temp) / "missing.jsonl"), "--call-id", "delete-1",
+                        "--deleted-file", "original.txt", "--output", str(output),
+                    ])
+                read.assert_not_called()
+            self.assertEqual(output.read_bytes(), b"user work")
+
+    def test_restore_preserves_destination_created_during_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "restored.txt"
+            closed = []
+
+            def records(_path):
+                try:
+                    yield {"type": "event_msg", "payload": {"type": "patch_apply_end",
+                           "call_id": "delete-1", "changes": {"original.txt": {
+                               "type": "delete", "content": "restore me"}}}}, 1
+                    output.write_bytes(b"other writer")
+                finally:
+                    closed.append(True)
+
+            with mock.patch.object(restore_rollout_artifact, "iter_rollout_records", records):
+                with self.assertRaises(FileExistsError):
+                    restore_rollout_artifact.main([
+                        "--rollout", str(Path(temp) / "source.jsonl"), "--call-id", "delete-1",
+                        "--deleted-file", "original.txt", "--output", str(output),
+                    ])
+            self.assertEqual(closed, [True])
+            self.assertEqual(output.read_bytes(), b"other writer")
+
     def test_snapshot_context_closes_once_without_reopening_live_source(self):
         data = '{"type":"event_msg","payload":{"text":"日本語"}}\n'.encode()
         with tempfile.TemporaryDirectory() as temp:

@@ -1003,7 +1003,13 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         (
             process.sandbox,
             exit_code,
-            process.output.clone(),
+            // Unsandboxed completion never classifies output. Avoid copying up
+            // to the retention limit while holding the shared process-map lock.
+            if process.sandbox == SandboxType::None {
+                VecDeque::new()
+            } else {
+                process.output.clone()
+            },
             Arc::clone(&process.output_notify),
             process.last_evicted_seq == 0,
         )
@@ -1791,6 +1797,39 @@ mod tests {
         assert!(lost.failure.unwrap().contains("evicted through sequence 1"));
         process.exit(0);
         drop(process);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsandboxed_close_preserves_retained_output_without_classification() {
+        let backend = LocalProcess::default();
+        let mut process = spawn_test_process(&backend, "unsandboxed-close").await;
+        let mut output = vec![b'x'; RETAINED_OUTPUT_BYTES_PER_PROCESS];
+        output[..17].copy_from_slice(b"Access is denied.");
+        process.stdout_tx.send(output.clone()).await.unwrap();
+        read_process_until_change(&backend, &process.process_id, None).await;
+        let process_id = process.process_id.clone();
+        process.exit(1);
+        drop(process);
+
+        let response = read_process_until_closed(&backend, &process_id).await;
+        assert!(response.closed);
+        assert_eq!(response.exit_code, Some(1));
+        assert!(!response.sandbox_denied);
+        let replay = backend
+            .exec_read(ReadParams {
+                process_id,
+                after_seq: None,
+                max_bytes: None,
+                wait_ms: None,
+            })
+            .await
+            .expect("closed output stays available for replay");
+        assert_eq!(replay.failure, None);
+        assert_eq!(replay.chunks.len(), 1);
+        assert_eq!(replay.chunks[0].chunk.0, output);
+        assert!(replay.closed);
+        assert!(!replay.sandbox_denied);
         backend.shutdown().await;
     }
 

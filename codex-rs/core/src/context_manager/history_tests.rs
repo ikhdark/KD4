@@ -1321,7 +1321,7 @@ fn total_token_usage_recomputes_projected_history_when_local_tail_contains_bound
 }
 
 #[test]
-fn pending_user_boundary_estimate_excludes_current_group_reasoning() {
+fn pending_user_boundary_estimate_keeps_unfinished_reasoning() {
     let history = create_history_with_items(vec![
         user_input_text_msg("current instruction"),
         reasoning_with_encrypted_content(/*len*/ 2_000),
@@ -1340,7 +1340,94 @@ fn pending_user_boundary_estimate_excludes_current_group_reasoning() {
         )
         .unwrap();
 
-    assert!(after_pending_boundary < active);
+    assert_eq!(after_pending_boundary, active);
+}
+
+#[test]
+fn sampling_pressure_counts_reasoning_retained_after_steering_and_resume() {
+    let base = BaseInstructions { text: "base".to_string() };
+    let old_reasoning = reasoning_with_encrypted_content(4_000);
+    assert_eq!(estimate_item_token_count(&old_reasoning), 588);
+    for completed in [false, true] {
+        for boundary in [user_input_text_msg("continue"), agent_message("continue")] {
+            for restored in [false, true] {
+                let mut response = assistant_msg("response");
+                if completed && let ResponseItem::Message { phase, .. } = &mut response {
+                    *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+                }
+                let items = vec![
+                    user_input_text_msg("task"),
+                    old_reasoning.clone(),
+                    response,
+                    reasoning_with_encrypted_content(1_000),
+                    user_input_text_msg("<turn_aborted>\nThe previous turn was aborted.\n</turn_aborted>"),
+                    boundary.clone(),
+                ];
+                let mut history = create_history_with_items(items.clone());
+                if restored {
+                    history.replace(items.clone());
+                }
+                let sampled = history.clone().prepare_for_sampling_prompt(
+                    &[InputModality::Text], StableContextTarget::Sampling,
+                );
+                let mut expected_items = items;
+                if completed && matches!(&boundary, ResponseItem::Message { role, .. } if role == "user") {
+                    expected_items.remove(1);
+                }
+                assert_eq!(sampled.items(), expected_items);
+                let expected = sampled.items().iter().map(estimate_item_token_count)
+                    .fold(approx_token_count(&base.text) as i64, i64::saturating_add);
+                for server_tokens in [0, 50_000] {
+                    history.update_token_info(
+                        &TokenUsage { total_tokens: server_tokens, ..Default::default() }, None,
+                    );
+                    for _ in 0..2 {
+                        assert_eq!(history.estimate_prepared_token_count_with_base_instructions(
+                            &[InputModality::Text], &base,
+                        ), Some(expected));
+                        assert_eq!(history.get_total_token_usage(false, &base), expected);
+                    }
+                }
+                assert_eq!(history.raw_items().len(), 6);
+            }
+        }
+    }
+}
+
+#[test]
+fn pending_reasoning_pressure_matches_committed_user_and_agent_input() {
+    let base = BaseInstructions { text: "base".to_string() };
+    for completed in [false, true] {
+        for boundary in [
+            user_input_text_msg("continue"),
+            agent_message("continue"),
+            inter_agent_assistant_msg("continue"),
+        ] {
+            let mut response = assistant_msg("response");
+            if completed && let ResponseItem::Message { phase, .. } = &mut response {
+                *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+            }
+            let mut history = create_history_with_items(vec![
+                user_input_text_msg("task"), reasoning_with_encrypted_content(4_000),
+                response, reasoning_with_encrypted_content(1_000),
+            ]);
+            let before = if matches!(&boundary, ResponseItem::Message { role, .. } if role == "user") {
+                history.estimate_token_count_after_pending_user_boundary(&[InputModality::Text], &base)
+            } else {
+                history.estimate_prepared_token_count_with_base_instructions(&[InputModality::Text], &base)
+            }.unwrap();
+            history.record_items([&boundary], TruncationPolicy::Tokens(10_000));
+            let sampled = history.clone().prepare_for_sampling_prompt(
+                &[InputModality::Text], StableContextTarget::Sampling,
+            );
+            let expected = sampled.items().iter().map(estimate_item_token_count)
+                .fold(approx_token_count(&base.text) as i64, i64::saturating_add);
+            assert_eq!(before + estimate_item_token_count(&boundary), expected);
+            assert_eq!(history.estimate_prepared_token_count_with_base_instructions(
+                &[InputModality::Text], &base,
+            ), Some(expected));
+        }
+    }
 }
 
 #[test]
@@ -1437,7 +1524,7 @@ fn total_token_usage_refreshes_from_server_after_next_model_response() {
 }
 
 #[test]
-fn static_token_estimator_excludes_reasoning_before_latest_boundary() {
+fn static_token_estimator_only_excludes_reasoning_before_completed_boundary() {
     let base_instructions = BaseInstructions {
         text: "base instructions".to_string(),
     };
@@ -1445,12 +1532,19 @@ fn static_token_estimator_excludes_reasoning_before_latest_boundary() {
     let mut raw = vec![reasoning_with_encrypted_content(/*len*/ 4_000)];
     raw.extend(visible.clone());
 
-    assert_eq!(
+    assert_ne!(
         ContextManager::estimate_items_token_count_with_base_instructions(&raw, &base_instructions),
         ContextManager::estimate_items_token_count_with_base_instructions(
             &visible,
             &base_instructions
         )
+    );
+    if let ResponseItem::Message { phase, .. } = &mut raw[1] {
+        *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+    }
+    assert_eq!(
+        ContextManager::estimate_items_token_count_with_base_instructions(&raw, &base_instructions),
+        ContextManager::estimate_items_token_count_with_base_instructions(&raw[1..], &base_instructions),
     );
 }
 

@@ -5890,10 +5890,10 @@ async fn selective_admission_tx(
             && row.try_get::<Option<String>, _>("sealed_at")?.is_none();
         // In-flight work in this checkout can be shared. A sealed result has no
         // authoritative input fingerprint, so semantic identity cannot prove reuse.
-        if candidate_identity.is_some()
+        if existing_is_active
+            && candidate_identity.is_some()
             && candidate_identity == existing.primary_investigation_identity()
             && existing_workspace_id == assignment.workspace_id
-            && existing_is_active
         {
             return Err(StoreError::AdmissionRejected {
                 reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,

@@ -401,6 +401,18 @@ async fn derive_review_reason(
             "{SUBMIT_AGENT_RECEIPT_TOOL}: risk evidence is invalid: {error}"
         ))
     })?;
+    // Inspection has no changed behavior to validate. Keep authority checks above,
+    // and let receipt submission enforce explicit evidence obligations and gates.
+    // An empty diff is insufficient: reverted/generated/detection-only writes must
+    // still take the normal risk path, as must every explicit risk hint.
+    if task.assignment.role == AgentRole::Explorer
+        && task.assignment.write_scope.is_empty()
+        && task.assignment.risk_hints.is_empty()
+        && observed_writes.is_empty()
+        && draft.declared_changes.is_empty()
+    {
+        return Ok(None);
+    }
     Ok(derived.decision.review_required.then(|| {
         format!(
             "cold review required: {}",
@@ -2874,6 +2886,204 @@ mod projection_tests {
                 .iter()
                 .all(|selector| canonical.json_pointers.contains_key(&selector.pointer))
         );
+    }
+}
+
+#[cfg(test)]
+mod review_policy_tests {
+    use super::*;
+    use codex_agent_task_store::AssignmentAdmissionOrigin;
+    use codex_agent_task_store::AssignmentDraft;
+    use codex_agent_task_store::CapabilityProfile;
+    use codex_agent_task_store::WorkspaceStrategy;
+
+    #[tokio::test]
+    async fn mutation_free_explorer_avoids_implicit_validation_but_keeps_safety_gates() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+                .await
+                .unwrap();
+        let store = LocalAgentTaskStore::initialize(&state).await.unwrap();
+        let (assignment, attempt) = store
+            .create_assignment(
+                repo.path(),
+                AssignmentDraft {
+                    root_session_id: "explorer-policy".to_string(),
+                    admission_origin: AssignmentAdmissionOrigin::Typed,
+                    role: AgentRole::Explorer,
+                    capability_profile: CapabilityProfile::ReadSearch,
+                    objective: "inspect the owning path".to_string(),
+                    acceptance_criteria: vec![AcceptanceCriterion {
+                        id: "coverage".to_string(),
+                        text: "report inspected coverage".to_string(),
+                    }],
+                    read_scope: Vec::new(),
+                    write_scope: Vec::new(),
+                    stop_condition: "report findings".to_string(),
+                    dependencies: Vec::new(),
+                    risk_hints: Vec::new(),
+                    required_evidence: Vec::new(),
+                    prohibited_changes: Vec::new(),
+                    contract_claims: Vec::new(),
+                    workspace_strategy: WorkspaceStrategy::Shared,
+                    relation: None,
+                    architecture_contract_ref: None,
+                },
+            )
+            .await
+            .unwrap();
+        let task = store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap();
+        let draft = ReceiptDraft {
+            status: AgentStatusClaim::Completed,
+            summary: "inspection complete; behavior unverified".to_string(),
+            criterion_results: vec![CriterionResult {
+                criterion_id: "coverage".to_string(),
+                status: CriterionStatus::Passed,
+                evidence: Some("source inspected".to_string()),
+                evidence_ref: None,
+            }],
+            declared_changes: Vec::new(),
+            validation_call_ids: Vec::new(),
+            blockers: Vec::new(),
+            risks: Vec::new(),
+            next_action: None,
+            architecture_contract: None,
+        };
+        assert_eq!(
+            derive_review_reason(&store, repo.path(), &task, &draft, &[])
+                .await
+                .unwrap(),
+            None
+        );
+        let other_repo = tempfile::tempdir().unwrap();
+        assert!(
+            derive_review_reason(&store, other_repo.path(), &task, &draft, &[])
+                .await
+                .is_err()
+        );
+
+        for role in [
+            AgentRole::Worker,
+            AgentRole::Reviewer,
+            AgentRole::Verifier,
+            AgentRole::Integrator,
+        ] {
+            let mut other = task.clone();
+            other.assignment.role = role;
+            other.assignment.capability_profile = role.capability_profile();
+            assert!(
+                derive_review_reason(&store, repo.path(), &other, &draft, &[])
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let mut explicit_risk = task.clone();
+        explicit_risk
+            .assignment
+            .risk_hints
+            .push("concurrency".to_string());
+        assert!(
+            derive_review_reason(&store, repo.path(), &explicit_risk, &draft, &[])
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("concurrency risk")
+        );
+        let mut write_scope = task.clone();
+        write_scope.assignment.write_scope.push(RepoScope {
+            path: "src".to_string(),
+            recursive: true,
+        });
+        assert!(
+            derive_review_reason(&store, repo.path(), &write_scope, &draft, &[])
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let mut declared = draft.clone();
+        declared.declared_changes.push(DeclaredChange {
+            path: "src/lib.rs".to_string(),
+            summary: "changed".to_string(),
+        });
+        assert!(
+            derive_review_reason(&store, repo.path(), &task, &declared, &[])
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // The diff is empty after a write/revert, but the mutation must still gate.
+        let mut reverted = MutationEvidence {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            path: "src/lib.rs".to_string(),
+            pre_write_hash: Some("same".to_string()),
+            pre_write_existed: true,
+            final_hash: Some("same".to_string()),
+            final_write_existed: Some(true),
+            mutation_event_ids: Vec::new(),
+            attribution_confidence: AttributionConfidence::Definitive,
+            snapshot_retained: false,
+            first_observed_at: chrono::Utc::now(),
+            finalized_at: Some(chrono::Utc::now()),
+            start_epoch: 0,
+            end_epoch: Some(0),
+        };
+        for confidence in [
+            AttributionConfidence::Definitive,
+            AttributionConfidence::DetectionOnly,
+        ] {
+            reverted.attribution_confidence = confidence;
+            assert!(
+                derive_review_reason(
+                    &store,
+                    repo.path(),
+                    &task,
+                    &draft,
+                    std::slice::from_ref(&reverted)
+                )
+                .await
+                .unwrap()
+                .is_some()
+            );
+        }
+
+        store
+            .set_agent_gate(
+                TaskActor::Root,
+                assignment.assignment_id,
+                GateKind::Review,
+                GateStatus::Pending,
+                "explicit independent review".to_string(),
+            )
+            .await
+            .unwrap();
+        store
+            .submit_agent_receipt(attempt.attempt_id, draft)
+            .await
+            .unwrap();
+        let sealed = store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            sealed.workspace_status.pending_gates,
+            vec![GateKind::Review]
+        );
+        assert!(sealed.validation_calls.is_empty());
+        assert!(
+            sealed
+                .completion_evidence_summary()
+                .contains("behavior unverified")
+        );
+        store.close().await;
+        state.close().await;
     }
 }
 
