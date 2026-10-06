@@ -3,6 +3,13 @@
   "runners": [
     {
       "programs": ["python", "python3", "py"],
+      "prefixes": [["scripts/rust_build_status.py", "run-lane"]],
+      "options": {"-I": 0, "-u": 0},
+      "allow_extra_args": true,
+      "passthrough_after": "--"
+    },
+    {
+      "programs": ["python", "python3", "py"],
       "prefixes": [
         ["scripts/rust_test_runner.py", "run-target"],
         ["scripts/rust_test_runner.py", "run-gate"],

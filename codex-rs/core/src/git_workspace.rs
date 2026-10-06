@@ -2861,7 +2861,7 @@ where
     tokio::task::spawn_blocking(capture).await.ok().flatten()
 }
 
-fn resolve_git_dirs(repo_root: &AbsolutePathBuf) -> Option<(PathBuf, PathBuf, Option<PathBuf>)> {
+pub(crate) fn resolve_git_dirs(repo_root: &AbsolutePathBuf) -> Option<(PathBuf, PathBuf, Option<PathBuf>)> {
     let marker = repo_root.join(".git");
     let git_dir = if marker.is_dir() {
         marker.into_path_buf()

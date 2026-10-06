@@ -44,11 +44,34 @@ struct RepositoryRunners {
 }
 
 fn repository_runners(cwd: &std::path::Path) -> Vec<codex_shell_command::validation::RepositoryRunner> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    type Runners = Vec<codex_shell_command::validation::RepositoryRunner>;
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (String, Runners)>>> = OnceLock::new();
+
     let Some(root) = codex_git_utils::get_git_repo_root(cwd) else { return Vec::new() };
+    let Some(oid) = repository_head_oid(&root) else { return Vec::new() };
+    // This function runs on the blocking analysis pool. Coalesce concurrent
+    // misses; never retain cwd-specific path matching in the shared cache.
+    let mut cache = CACHE.get_or_init(Default::default).lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached_oid, runners)) = cache.get(&root)
+        && cached_oid == &oid
+    {
+        let mut runners = runners.clone();
+        for runner in &mut runners {
+            runner.path_context = Some((root.clone(), cwd.to_path_buf()));
+        }
+        return runners;
+    }
     // HEAD, not the index or working tree: writing a declaration during a turn
     // must not let an arbitrary echo authenticate a fabricated execution ledger.
+    // Read the exact observed commit so a concurrent HEAD move cannot poison
+    // this entry. Replacement refs must not change content at a cached oid.
     let Ok(output) = std::process::Command::new("git")
-        .arg("-C").arg(&root).args(["show", "HEAD:.codex/test-runners.json"]).output()
+        .arg("--no-replace-objects").arg("-C").arg(&root)
+        .arg("show").arg(format!("{oid}:.codex/test-runners.json")).output()
     else { return Vec::new() };
     if !output.status.success() || output.stdout.len() > 64 * 1024 {
         return Vec::new();
@@ -57,13 +80,54 @@ fn repository_runners(cwd: &std::path::Path) -> Vec<codex_shell_command::validat
     else { return Vec::new() };
     if config.version != 1 || config.runners.len() > 256
         || config.runners.iter().any(|runner| runner.options.values().any(|count| *count > 2))
+        || config.runners.iter().any(|runner| runner.passthrough_after.as_ref()
+            .is_some_and(|separator| separator.is_empty() || runner.receipt_runner.is_some()))
     {
         return Vec::new();
     }
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(root.clone(), (oid, config.runners.clone()));
     for runner in &mut config.runners {
         runner.path_context = Some((root.clone(), cwd.to_path_buf()));
     }
     config.runners
+}
+
+fn repository_head_oid(root: &std::path::Path) -> Option<String> {
+    let root = codex_utils_absolute_path::AbsolutePathBuf::try_from(root).ok()?;
+    let (git_dir, common_dir, _) = crate::git_workspace::resolve_git_dirs(&root)?;
+    let mut value = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    // HEAD often contains a stable symbolic ref across commits. Read its target,
+    // including packed refs and linked-worktree common dirs, on every lookup.
+    for _ in 0..8 {
+        let Some(reference) = value.trim().strip_prefix("ref:").map(str::trim) else {
+            let oid = value.trim();
+            return ((oid.len() == 40 || oid.len() == 64)
+                && oid.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| oid.to_string());
+        };
+        if let Ok(next) = std::fs::read_to_string(common_dir.join(reference)) {
+            value = next;
+            continue;
+        }
+        if let Ok(packed) = std::fs::read_to_string(common_dir.join("packed-refs"))
+            && let Some(oid) = packed.lines().find_map(|line| {
+                let (oid, name) = line.split_once(' ')?;
+                (name == reference).then(|| oid.to_string())
+            })
+        {
+            value = oid;
+            continue;
+        }
+        // Unborn branches and alternate ref storage (e.g. reftable) remain
+        // Git-owned. Ordinary loose/packed refs need no subprocess here.
+        let output = std::process::Command::new("git").arg("-C").arg(root.as_path())
+            .args(["rev-parse", "--verify", "HEAD"]).output().ok()?;
+        if !output.status.success() { return None; }
+        value = String::from_utf8(output.stdout).ok()?;
+    }
+    None
 }
 
 fn classify_with_runners(
@@ -183,6 +247,65 @@ mod tests {
     mod manifest_runner {
         use super::*;
 
+        #[test]
+        fn head_oid_tracks_loose_packed_detached_and_linked_refs() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let git = root.join(".git");
+            std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+            let first = "a".repeat(40);
+            let second = "b".repeat(40);
+            std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(git.join("refs/heads/main"), &first).unwrap();
+            assert_eq!(repository_head_oid(root), Some(first.clone()));
+            std::fs::write(git.join("refs/heads/main"), &second).unwrap();
+            assert_eq!(repository_head_oid(root), Some(second.clone()));
+            std::fs::remove_file(git.join("refs/heads/main")).unwrap();
+            std::fs::write(git.join("packed-refs"), format!("{first} refs/heads/main\n")).unwrap();
+            assert_eq!(repository_head_oid(root), Some(first.clone()));
+            std::fs::write(git.join("HEAD"), &second).unwrap();
+            assert_eq!(repository_head_oid(root), Some(second));
+            let linked = root.join("linked");
+            let worktree_git = git.join("worktrees/linked");
+            std::fs::create_dir_all(&linked).unwrap();
+            std::fs::create_dir_all(&worktree_git).unwrap();
+            std::fs::write(linked.join(".git"), "gitdir: ../.git/worktrees/linked\n").unwrap();
+            std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+            std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            assert_eq!(repository_head_oid(&linked), Some(first));
+        }
+
+        #[test]
+        fn runner_cache_uses_committed_revision_and_rebinds_cwd() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git").arg("-C").arg(root)
+                    .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
+                    .args(args).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            };
+            git(&["init"]);
+            std::fs::create_dir(root.join(".codex")).unwrap();
+            std::fs::create_dir(root.join("nested")).unwrap();
+            let manifest = root.join(".codex/test-runners.json");
+            let config = |operation| serde_json::json!({"version":1,"runners":[{
+                "programs":["python"],"prefixes":[["scripts/check.py"]],"operations":[operation]
+            }]}).to_string();
+            std::fs::write(&manifest, config("test")).unwrap();
+            git(&["add", ".codex/test-runners.json"]);
+            git(&["commit", "-m", "first"]);
+            assert_eq!(repository_runners(root)[0].operations, vec![ValidationOperation::Test]);
+            std::fs::write(&manifest, config("lint")).unwrap();
+            let nested = root.join("nested");
+            let cached = repository_runners(&nested);
+            assert_eq!(cached[0].operations, vec![ValidationOperation::Test]);
+            assert_eq!(cached[0].path_context, Some((root.to_path_buf(), nested)));
+            git(&["add", ".codex/test-runners.json"]);
+            git(&["commit", "-m", "second"]);
+            assert_eq!(repository_runners(root)[0].operations, vec![ValidationOperation::Lint]);
+        }
+
         fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {
             let runner = serde_json::from_value(serde_json::json!({
                 "programs": ["python", "py"],
@@ -196,6 +319,35 @@ mod tests {
 
         fn is_validation(invocation: &CommandInvocation) -> bool {
             matches!(classify_validation(invocation), ValidationClassification::Validation { .. })
+        }
+
+        #[test]
+        fn passthrough_runner_classifies_only_the_child_and_cannot_claim_receipts() {
+            let mut runner: codex_shell_command::validation::RepositoryRunner =
+                serde_json::from_value(serde_json::json!({
+                    "programs": ["python"],
+                    "prefixes": [["scripts/rust_build_status.py", "run-lane"]],
+                    "allow_extra_args": true,
+                    "passthrough_after": "--"
+                })).unwrap();
+            for (child, expected) in [
+                (vec!["cargo", "test", "-p", "example"], true),
+                (vec!["cargo", "check"], true),
+                (vec!["cargo", "build"], false),
+                (vec!["cargo", "test", "--help"], false),
+                (vec!["echo", "cargo", "test"], false),
+                (vec![], false),
+            ] {
+                let mut args = vec!["scripts/rust_build_status.py", "run-lane", "--lane", "core-tests", "--"];
+                args.extend(child);
+                let invocation = argv("python", &args);
+                assert_eq!(matches!(classify_with_runners(&invocation, &[runner.clone()]),
+                    ValidationClassification::Validation { .. }), expected, "{args:?}");
+            }
+            runner.receipt_runner = Some("rust_test_runner".into());
+            assert!(!runner.matches("python", &[
+                "scripts/rust_build_status.py", "run-lane", "--", "cargo", "test",
+            ].map(str::to_string)));
         }
 
         #[test]

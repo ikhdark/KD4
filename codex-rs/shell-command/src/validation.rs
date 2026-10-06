@@ -27,6 +27,7 @@ pub struct RepositoryRunner {
     pub path_context: Option<(std::path::PathBuf, std::path::PathBuf)>,
     pub programs: Vec<String>,
     pub prefixes: Vec<Vec<String>>,
+    #[serde(default)]
     pub operations: Vec<ValidationOperation>,
     #[serde(default)]
     pub options: std::collections::BTreeMap<String, usize>,
@@ -34,11 +35,25 @@ pub struct RepositoryRunner {
     pub allow_extra_args: bool,
     #[serde(default)]
     pub receipt_runner: Option<String>,
+    /// Classify child argv; passthrough wrappers cannot authenticate receipts.
+    #[serde(default)]
+    pub passthrough_after: Option<String>,
 }
 
 impl RepositoryRunner {
     pub fn matches(&self, program: &str, args: &[String]) -> bool {
-        if self.operations.is_empty()
+        let args = if let Some(separator) = &self.passthrough_after {
+            if separator.is_empty() || self.receipt_runner.is_some() {
+                return false;
+            }
+            let Some(index) = args.iter().position(|arg| arg == separator) else {
+                return false;
+            };
+            &args[..index]
+        } else {
+            args
+        };
+        if (self.operations.is_empty() && self.passthrough_after.is_none())
             || !self.programs.iter().any(|expected| expected == &normalized_program_name(program))
             || args.iter().any(|arg| matches!(arg.as_str(), "-h" | "--help" | "--version"))
         {
@@ -437,6 +452,14 @@ fn classify_argv_at_depth(
     }
     let binary = normalized_program_name(program);
     if let Some(runner) = runners.iter().find(|runner| runner.matches(program, args)) {
+        if let Some(separator) = &runner.passthrough_after {
+            let nested = args.iter().position(|arg| arg == separator)
+                .and_then(|index| args[index + 1..].split_first());
+            let Some((program, arguments)) = nested else {
+                return ValidationClassification::Opaque;
+            };
+            return classify_argv_at_depth(program, arguments, depth + 1, runners);
+        }
         return classification_from_operations(runner.operations.clone(), false);
     }
 
@@ -1133,6 +1156,24 @@ mod tests {
         ).unwrap();
         let runners: Vec<RepositoryRunner> = serde_json::from_value(config["runners"].clone()).unwrap();
         classify_argv_with_runners(program, &args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>(), &runners)
+    }
+
+    #[test]
+    fn repository_lane_passthrough_preserves_child_classification() {
+        for child in ["test", "check", "clippy"] {
+            assert!(is_validation(&repository_argv("python", &[
+                "-I", "scripts/rust_build_status.py", "run-lane", "--lane", "core-tests",
+                "--", "cargo", child,
+            ])));
+        }
+        for args in [
+            vec!["scripts/rust_build_status.py", "run-lane", "--lane", "test"],
+            vec!["scripts/rust_build_status.py", "run-lane", "--", "echo", "cargo test"],
+            vec!["scripts/rust_build_status.py", "run-lane", "--", "cargo", "build"],
+            vec!["scripts/rust_build_status.py", "run-lane", "--", "cargo", "test", "--help"],
+        ] {
+            assert!(!is_validation(&repository_argv("python", &args)), "{args:?}");
+        }
     }
 
     #[test]
