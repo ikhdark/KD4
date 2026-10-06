@@ -2,10 +2,10 @@ use serde_json::Value;
 use serde_json::json;
 
 fn evidence_schema() -> Value {
-    // The contract for `scripts/kd4_turn_latency_audit.py`'s evidenceMeta
-    // envelope lives with its test; `docs/` is local-only.
-    serde_json::from_str(include_str!("investigation-evidence-v1.schema.json"))
-        .expect("investigation evidence schema should be valid JSON")
+    serde_json::from_str(include_str!(
+        "../../../../docs/schemas/investigation-evidence-v1.schema.json"
+    ))
+    .expect("investigation evidence schema should be valid JSON")
 }
 
 fn provider_example() -> Value {

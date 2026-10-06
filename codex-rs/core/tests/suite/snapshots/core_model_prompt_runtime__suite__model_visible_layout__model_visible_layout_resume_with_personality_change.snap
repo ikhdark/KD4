@@ -24,9 +24,11 @@ Scenario: First post-resume turn where resumed config model differs from rollout
 03:message/user:seed resume history
 04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
 05:message/assistant:recorded before resume
-06:message/developer[3]:
+06:message/developer[4]:
     [01] <model_switch>\nThe user was previously using a different model. Use the active instructions and...
     [02] <PERMISSIONS_INSTRUCTIONS>
     [03] <personality_spec>Use the following communication style for future messages:\nBe warm, collabora...
-07:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-08:message/user:resume and change personality
+    [04] <SKILLS_INSTRUCTIONS>
+07:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+08:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+09:message/user:resume and change personality

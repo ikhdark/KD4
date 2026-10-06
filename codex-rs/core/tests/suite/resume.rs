@@ -32,9 +32,7 @@ async fn resume_until_initial_messages(
     rollout_path: PathBuf,
     predicate: impl Fn(&[EventMsg]) -> bool,
 ) -> Result<TestCodex> {
-    // Each attempt starts a whole resumed session; a cold first start alone
-    // can take over a second.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let poll_interval = Duration::from_millis(10);
     let mut last_initial_messages = "<missing initial messages>".to_string();
 

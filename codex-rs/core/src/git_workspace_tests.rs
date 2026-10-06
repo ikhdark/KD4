@@ -102,38 +102,6 @@ async fn ignored_build_events_are_journaled_without_changing_capture_keys() {
     }
 }
 
-#[tokio::test]
-async fn changes_above_a_watched_root_reach_it_only_when_the_root_is_replaced() {
-    let outer = TempDir::new().unwrap();
-    let outer = dunce::canonicalize(outer.path()).unwrap();
-    let root = outer.join("repo");
-    std::fs::create_dir(&root).unwrap();
-    let source = root.join("source.txt");
-    std::fs::write(&source, "source").unwrap();
-    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let observed = cache
-        .begin_source_path_change_observation(&root, &source, false)
-        .await
-        .unwrap();
-    // The watcher names the parent directory whenever another entry in it changes.
-    std::fs::write(outer.join("sibling.txt"), "unrelated").unwrap();
-    cache.record_watched_source_change_event(Some(vec![outer.clone()])).await;
-    assert!(cache.source_path_change_observation_is_current(&observed));
-    // The same report after the root was swapped is a change to everything in it.
-    std::fs::rename(&root, outer.join("moved")).unwrap();
-    std::fs::create_dir(&root).unwrap();
-    cache.record_watched_source_change_event(Some(vec![outer.clone()])).await;
-    assert!(!cache.source_path_change_observation_is_current(&observed));
-    // The replacement is reported once; the new root is then judged on its own.
-    std::fs::write(&source, "source").unwrap();
-    let observed = cache
-        .begin_source_path_change_observation(&root, &source, false)
-        .await
-        .unwrap();
-    cache.record_watched_source_change_event(Some(vec![outer])).await;
-    assert!(cache.source_path_change_observation_is_current(&observed));
-}
-
 fn test_runtime_paths() -> ExecServerRuntimePaths {
     ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
         .expect("runtime paths")

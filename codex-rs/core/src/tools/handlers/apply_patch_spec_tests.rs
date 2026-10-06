@@ -34,7 +34,6 @@ fn create_apply_patch_freeform_tool_matches_expected_spec() {
         "only remaining changes",
         "FREEFORM",
         "large replacements already fully read",
-        "no lines deletes the range",
         "ordinary contextual hunks suit small edits",
         "whole-file source_sha256, never an excerpt hash",
         "read current source and reconcile before retrying",

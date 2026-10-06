@@ -418,7 +418,7 @@ mod tests {
         assert!(description.contains("after truncation, select only missing evidence from the retained artifact"));
         assert_eq!(
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-            20_000,
+            10_000,
         );
         assert!(description.contains(&format!(
             "Output defaults to {} tokens",

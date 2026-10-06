@@ -955,9 +955,11 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             )
             self.assertIn("Max cache size 10 GiB", result.stdout)
 
-    def test_justfile_validation_fast_paths_are_explicit(self) -> None:
+    def test_justfile_bench_and_validation_fast_paths_are_explicit(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
+        self.assertIn("bench package bench_name *args:", justfile)
+        self.assertIn("bench-workspace *args:", justfile)
         self.assertIn("build-for-release *args:", justfile)
         self.assertIn("target-optimize-dry-run *args:", justfile)
         self.assertIn("app-server-runtime-check:", justfile)
@@ -990,7 +992,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
     def test_agents_instruction_layout_and_budget_are_explicit(
         self,
     ) -> None:
-        expected_agent_files = ["AGENTS.md"]
+        expected_agent_files = ["AGENTS.md", "DO-NOT-CHANGE/AGENTS.md"]
         discovered_agent_files = subprocess.run(
             [
                 "git",

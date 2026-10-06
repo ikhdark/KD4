@@ -120,7 +120,6 @@ pub(crate) fn project_exec_output_for_model_with_budget(
                     enabled: true,
                     applied_token_limit: Some(content_limit),
                     command_text,
-                    launched_as_validation: false,
                 },
             )
         })
@@ -195,7 +194,6 @@ pub(crate) fn project_exec_output_text_with_budget(
                     enabled: true,
                     applied_token_limit: Some(limits.applied_limit),
                     command_text,
-                    launched_as_validation: false,
                 },
             )
         })

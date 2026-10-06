@@ -70,22 +70,14 @@ fn freshness(body: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// Text that JSON would escape follows its one-line envelope, which counts
-/// the lines it owns.
 fn read_text(body: &Value, id: &str) -> String {
     let file = payload(body, id);
     assert_eq!(file["result"]["complete"], true);
     assert_eq!(file["result"]["file_complete"], true);
-    let lines = file["result"]["results"][0]["text_lines"].as_u64().unwrap() as usize;
-    output_text(output(body, id))
-        .split('\n')
-        .skip_while(|line| {
-            !serde_json::from_str::<Value>(line).is_ok_and(|value| value.get("kind").is_some())
-        })
-        .skip(1)
-        .take(lines)
-        .collect::<Vec<_>>()
-        .join("\n")
+    file["result"]["results"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 fn next_action(body: &Value, step: usize) -> Value {
@@ -151,7 +143,7 @@ fn next_action(body: &Value, step: usize) -> Value {
             let recovered = payload(body, "step-5");
             assert_eq!(recovered["exited"], true);
             assert_eq!(recovered["exit_code"], 0);
-            assert!(output_text(output(body, "step-5")).contains(ROW));
+            assert!(recovered["result"].to_string().contains(ROW));
             "text({kind:'file',result:await tools.read_file({path:'contract.txt'})});".to_owned()
         }
         7 => {

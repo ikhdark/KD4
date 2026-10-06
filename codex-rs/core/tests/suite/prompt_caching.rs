@@ -238,10 +238,10 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    // No tool is deferred here, so there is nothing for tool_search to find.
     let expected_tools_names = vec![
         "exec",
         "wait",
+        "tool_search",
         "exec_command",
         "write_stdin",
         "read_tool_output",

@@ -2193,29 +2193,9 @@ const STREAM_THROUGHPUT_WINDOW: usize = 9;
 const STREAM_THROUGHPUT_MIN_BASELINE_SAMPLES: usize = 5;
 const STREAM_THROUGHPUT_COLLAPSE_RATIO: f64 = 0.5;
 const STREAM_THROUGHPUT_COLLAPSE_STREAK: u8 = 2;
-/// A single response this far below the baseline is a collapse on its own.
-const STREAM_THROUGHPUT_SEVERE_COLLAPSE_RATIO: f64 = 0.25;
 /// Responses to observe on a replacement connection before replacing it again.
 /// A provider-wide slowdown fills the window meanwhile and becomes the baseline.
 const STREAM_THROUGHPUT_ROTATION_COOLDOWN: u8 = 4;
-const SHARED_STREAM_THROUGHPUT_WINDOW: usize = 32;
-/// Rates older than this no longer describe what the provider serves now.
-const SHARED_STREAM_THROUGHPUT_MAX_AGE: Duration = Duration::from_secs(30 * 60);
-
-/// Healthy response rates of every thread in this process. A thread without
-/// history of its own is judged against them, so a turn that starts on a
-/// collapsed backend is caught as well.
-static SHARED_STREAM_THROUGHPUT: std::sync::LazyLock<StdMutex<SharedStreamThroughput>> =
-    std::sync::LazyLock::new(|| StdMutex::new(SharedStreamThroughput::default()));
-
-fn median_stream_rate(rates: impl Iterator<Item = f64>) -> Option<f64> {
-    let mut sorted = rates.collect::<Vec<_>>();
-    if sorted.len() < STREAM_THROUGHPUT_MIN_BASELINE_SAMPLES {
-        return None;
-    }
-    sorted.sort_by(f64::total_cmp);
-    Some(sorted[sorted.len() / 2])
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct StreamThroughputCollapse {
@@ -2223,42 +2203,9 @@ struct StreamThroughputCollapse {
     baseline_tokens_per_second: f64,
 }
 
-/// Recent healthy rates by provider, model and service tier.
-#[derive(Debug, Default)]
-struct SharedStreamThroughput {
-    by_class: HashMap<String, VecDeque<(Instant, f64)>>,
-}
-
-impl SharedStreamThroughput {
-    fn baseline_tokens_per_second(&self, class: &str, now: Instant) -> Option<f64> {
-        median_stream_rate(
-            self.by_class
-                .get(class)?
-                .iter()
-                .filter(|(at, _)| {
-                    now.saturating_duration_since(*at) <= SHARED_STREAM_THROUGHPUT_MAX_AGE
-                })
-                .map(|(_, tokens_per_second)| *tokens_per_second),
-        )
-    }
-
-    fn record(&mut self, class: &str, tokens_per_second: f64, now: Instant) {
-        let rates = self.by_class.entry(class.to_string()).or_default();
-        rates.retain(|(at, _)| {
-            now.saturating_duration_since(*at) <= SHARED_STREAM_THROUGHPUT_MAX_AGE
-        });
-        if rates.len() == SHARED_STREAM_THROUGHPUT_WINDOW {
-            rates.pop_front();
-        }
-        rates.push_back((now, tokens_per_second));
-    }
-}
-
 /// Output rates of completed websocket responses, judged against their recent median.
 #[derive(Debug, Default)]
 struct WebsocketStreamThroughput {
-    /// Provider, model and service tier the recent rates were measured on.
-    class: String,
     recent_tokens_per_second: VecDeque<f64>,
     collapsed_streak: u8,
     latest_collapse: Option<StreamThroughputCollapse>,
@@ -2266,42 +2213,22 @@ struct WebsocketStreamThroughput {
 }
 
 impl WebsocketStreamThroughput {
-    /// Returns the rate when it is healthy, for sharing with other threads.
-    fn record(
-        &mut self,
-        class: &str,
-        output_tokens: i64,
-        elapsed: Duration,
-        shared_baseline: Option<f64>,
-    ) -> Option<f64> {
+    fn record(&mut self, output_tokens: i64, elapsed: Duration) {
         if output_tokens < STREAM_THROUGHPUT_MIN_OUTPUT_TOKENS || elapsed.is_zero() {
-            return None;
-        }
-        if self.class != class {
-            // Another model or tier streams at its own rate.
-            self.class = class.to_string();
-            self.recent_tokens_per_second.clear();
-            self.collapsed_streak = 0;
+            return;
         }
         let tokens_per_second = output_tokens as f64 / elapsed.as_secs_f64();
         self.latest_collapse = self
             .baseline_tokens_per_second()
-            .or(shared_baseline)
             .filter(|baseline| tokens_per_second < baseline * STREAM_THROUGHPUT_COLLAPSE_RATIO)
             .map(|baseline_tokens_per_second| StreamThroughputCollapse {
                 observed_tokens_per_second: tokens_per_second,
                 baseline_tokens_per_second,
             });
-        self.collapsed_streak = match self.latest_collapse {
-            Some(collapse)
-                if tokens_per_second
-                    < collapse.baseline_tokens_per_second
-                        * STREAM_THROUGHPUT_SEVERE_COLLAPSE_RATIO =>
-            {
-                STREAM_THROUGHPUT_COLLAPSE_STREAK
-            }
-            Some(_) => self.collapsed_streak.saturating_add(1),
-            None => 0,
+        self.collapsed_streak = if self.latest_collapse.is_some() {
+            self.collapsed_streak.saturating_add(1)
+        } else {
+            0
         };
         if self.recent_tokens_per_second.len() == STREAM_THROUGHPUT_WINDOW {
             self.recent_tokens_per_second.pop_front();
@@ -2310,11 +2237,19 @@ impl WebsocketStreamThroughput {
         if let Some(responses) = self.responses_since_rotation.as_mut() {
             *responses = responses.saturating_add(1);
         }
-        self.latest_collapse.is_none().then_some(tokens_per_second)
     }
 
     fn baseline_tokens_per_second(&self) -> Option<f64> {
-        median_stream_rate(self.recent_tokens_per_second.iter().copied())
+        if self.recent_tokens_per_second.len() < STREAM_THROUGHPUT_MIN_BASELINE_SAMPLES {
+            return None;
+        }
+        let mut sorted = self
+            .recent_tokens_per_second
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        sorted.sort_by(f64::total_cmp);
+        Some(sorted[sorted.len() / 2])
     }
 
     /// Returns the collapse that warrants replacing the connection, at most once per cooldown.
@@ -2329,33 +2264,6 @@ impl WebsocketStreamThroughput {
         self.collapsed_streak = 0;
         self.responses_since_rotation = Some(0);
         self.latest_collapse.take()
-    }
-}
-
-/// Where a websocket response stream reports its completed output rate.
-struct StreamThroughputObserver {
-    thread: Arc<StdMutex<WebsocketStreamThroughput>>,
-    class: String,
-}
-
-impl StreamThroughputObserver {
-    fn observe(&self, output_tokens: i64, elapsed: Duration) {
-        let now = Instant::now();
-        let shared_baseline = SHARED_STREAM_THROUGHPUT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .baseline_tokens_per_second(&self.class, now);
-        let healthy = self
-            .thread
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record(&self.class, output_tokens, elapsed, shared_baseline);
-        if let Some(tokens_per_second) = healthy {
-            SHARED_STREAM_THROUGHPUT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record(&self.class, tokens_per_second, now);
-        }
     }
 }
 
@@ -3378,10 +3286,9 @@ impl ModelClientSession {
             .set_connection_reused(/*connection_reused*/ false);
     }
 
-    /// Replaces a websocket whose responses stopped streaming at the rate
-    /// established for its model and tier. The sticky turn-state token is dropped
-    /// with it: replaying the token would route the full request back to the
-    /// backend that collapsed.
+    /// Replaces a websocket whose responses stopped streaming at this client's
+    /// established rate. The sticky turn-state token is dropped with it: replaying
+    /// the token would route the full request back to the backend that collapsed.
     fn replace_websocket_after_throughput_collapse(&mut self) {
         let collapse = self
             .websocket_session
@@ -4945,15 +4852,6 @@ impl ModelClientSession {
                 verified_history,
             );
             self.effective_input = Some(Arc::clone(&request.input));
-            let stream_throughput = StreamThroughputObserver {
-                thread: Arc::clone(&self.websocket_session.stream_throughput),
-                class: format!(
-                    "{}\n{}\n{}",
-                    self.client.state.provider.info().name,
-                    request.model,
-                    request.service_tier.as_deref().unwrap_or_default(),
-                ),
-            };
             self.websocket_session.last_request = Some(request);
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let (stream, last_request_rx) = map_response_stream(
@@ -4962,7 +4860,7 @@ impl ModelClientSession {
                 inference_trace_attempt,
                 Arc::clone(&self.client.state.provider),
                 attempt,
-                Some(stream_throughput),
+                Some(Arc::clone(&self.websocket_session.stream_throughput)),
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             self.websocket_session.last_response = None;
@@ -5426,7 +5324,7 @@ fn map_response_stream(
     inference_trace_attempt: AsyncInferenceTraceAttempt,
     provider: SharedModelProvider,
     attempt: Option<ModelAttemptState>,
-    stream_throughput: Option<StreamThroughputObserver>,
+    stream_throughput: Option<Arc<StdMutex<WebsocketStreamThroughput>>>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
@@ -5444,7 +5342,10 @@ fn map_response_stream(
                 ..
             }) = event
         {
-            stream_throughput.observe(token_usage.output_tokens, dispatched_at.elapsed());
+            stream_throughput
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(token_usage.output_tokens, dispatched_at.elapsed());
         }
     });
     map_response_events(

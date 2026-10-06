@@ -35,7 +35,6 @@ pub use info::get_git_repo_root;
 pub use info::get_git_repo_root_with_fs;
 pub use info::get_has_changes;
 pub use info::get_head_commit_hash;
-pub use info::git_checkout_paths;
 pub use info::git_diff_to_remote;
 pub use info::git_index_entries;
 pub use info::recent_commits;

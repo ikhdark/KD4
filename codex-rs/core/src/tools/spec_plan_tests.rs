@@ -1250,7 +1250,7 @@ async fn shell_family_advertises_configured_background_wait_limit() {
         assert_eq!(yield_schema["maximum"], expected_max);
         let description = yield_schema["description"].as_str().unwrap();
         assert!(description.contains(&format!(
-            "Bounded empty polls default to {expected_default} ms and cap at {configured} ms"
+            "Empty polls default to {expected_default} ms and cap at {configured} ms"
         )));
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.is_valid(&json!({"session_id": 1, "yield_time_ms": expected_max})));

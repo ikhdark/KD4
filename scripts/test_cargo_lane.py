@@ -475,10 +475,8 @@ ConvertTo-Json -InputObject $results -Depth 10 -Compress
         self.assertEqual((outside / "sentinel").read_bytes(), b"unchanged")
 
     def test_concurrent_auto_reservations_stay_in_canonical_family(self):
-        for lane in ("core-2", "core-3"):
-            # A busy family member hands off only to reusable (warm) siblings.
-            for artifact in (".fingerprint", "deps", "build"):
-                (self.make_lane(lane) / "debug" / artifact).mkdir(parents=True)
+        self.make_lane("core-2")
+        self.make_lane("core-3")
         os.utime(self.lanes_root / "core-2", None)
         line = next(
             i
@@ -555,7 +553,7 @@ $env:CODEX_CARGO_TARGET_MAX_TOTAL_BYTES = '0'
 Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
     $global:lateCargoLock = [IO.File]::Open({ps_single_quote(lock_path)}, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
 }} | Out-Null
-& {ps_single_quote(SCRIPT)} -LanesRoot {ps_single_quote(self.lanes_root)} -Lane late-cargo -AllowColdOverflow -WarmWaitSeconds 0
+& {ps_single_quote(SCRIPT)} -LanesRoot {ps_single_quote(self.lanes_root)} -Lane late-cargo
 """
         result = subprocess.run(
             [self.shell, "-NoProfile", "-Command", command],

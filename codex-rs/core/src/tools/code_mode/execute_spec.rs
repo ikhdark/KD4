@@ -85,10 +85,10 @@ SOURCE: /[\s\S]+/
     fn code_mode_default_stays_below_the_explicit_request_ceiling() {
         let exec_description = codex_code_mode::build_exec_tool_description(true, false, &[]);
 
-        assert!(exec_description.contains("defaults to 20000 tokens"));
+        assert!(exec_description.contains("defaults to 10000 tokens"));
         assert!(
             codex_code_mode::build_wait_tool_description()
-                .contains("default to 20000 tokens")
+                .contains("default to 10000 tokens")
         );
         assert!(
             codex_code_mode::build_wait_tool_description()
@@ -96,7 +96,7 @@ SOURCE: /[\s\S]+/
         );
         assert_eq!(
             codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-            20_000
+            10_000
         );
         assert_eq!(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL, 40_000);
         // Nested display results must still fit an unraised default cell, or

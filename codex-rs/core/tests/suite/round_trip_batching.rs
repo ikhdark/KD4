@@ -576,11 +576,11 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
     // roots and workers alike.
     let instructions = requests[0].instructions_text();
     for rule in [
-        "Finish edits before checks.",
+        "Finish edits before their checks.",
         "Sequence dependencies and shared-resource conflicts, including Cargo commands sharing a target directory.",
-        "Resume live operations rather than restarting them.",
-        "Reuse current reads, schemas, exact values, inventories, and passing checks",
-        "Choose the smallest checks that prove the requested behavior",
+        "Use asynchronous sessions for long commands and resume existing operations.",
+        "Reuse current reads, schemas, exact values, inventories, agent results, and passing checks.",
+        "For any change, use the smallest check that proves it; inspection suffices when execution is unnecessary.",
     ] {
         assert_eq!(
             instructions.matches(rule).count(),
@@ -591,7 +591,7 @@ async fn root_production_request_states_each_orchestration_rule_once() -> anyhow
 
     assert_eq!(
         instructions
-            .matches("Batch known independent calls with bounded tool-native concurrency")
+            .matches("Batch independent calls with bounded tool-native concurrency")
             .count(),
         1,
         "base instructions must state the batching policy exactly once"

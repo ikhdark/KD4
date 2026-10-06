@@ -10,7 +10,6 @@ use crate::parser::EOF_MARKER;
 use crate::parser::Hunk;
 use crate::parser::MOVE_TO_MARKER;
 use crate::parser::ParseError;
-use crate::parser::RANGE_HANDLE_PREFIX;
 use crate::parser::UPDATE_FILE_MARKER;
 use crate::parser::UpdateFileChunk;
 
@@ -18,17 +17,6 @@ use Hunk::*;
 use ParseError::*;
 
 const ENVIRONMENT_ID_MARKER: &str = "*** Environment ID:";
-
-/// A range handle already names the lines it replaces, so it is complete
-/// without a body: no replacement lines deletes the range.
-fn chunk_lacks_lines(chunk: &UpdateFileChunk) -> bool {
-    chunk.old_lines.is_empty()
-        && chunk.new_lines.is_empty()
-        && !chunk
-            .change_context
-            .as_deref()
-            .is_some_and(|context| context.starts_with(RANGE_HANDLE_PREFIX))
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct StreamingPatchParser {
@@ -82,7 +70,10 @@ impl StreamingPatchParser {
                     line_number: hunk_line_number,
                 });
             }
-            if chunks.last().is_some_and(chunk_lacks_lines) {
+            if chunks
+                .last()
+                .is_some_and(|chunk| chunk.old_lines.is_empty() && chunk.new_lines.is_empty())
+            {
                 if line == END_PATCH_MARKER {
                     return Err(InvalidHunkError {
                         message: "Update hunk does not contain any lines".to_string(),
@@ -299,7 +290,9 @@ impl StreamingPatchParser {
 
                     if (update_line == EMPTY_CHANGE_CONTEXT_MARKER
                         || update_line.starts_with(CHANGE_CONTEXT_MARKER))
-                        && chunks.last().is_some_and(chunk_lacks_lines)
+                        && chunks.last().is_some_and(|chunk| {
+                            chunk.old_lines.is_empty() && chunk.new_lines.is_empty()
+                        })
                     {
                         return Err(InvalidHunkError {
                             message: format!(
@@ -332,7 +325,9 @@ impl StreamingPatchParser {
                     }
 
                     if update_line == EOF_MARKER {
-                        if chunks.last().is_some_and(chunk_lacks_lines) {
+                        if chunks.last().is_some_and(|chunk| {
+                            chunk.old_lines.is_empty() && chunk.new_lines.is_empty()
+                        }) {
                             return Err(InvalidHunkError {
                                 message: "Update hunk does not contain any lines".to_string(),
                                 line_number: self.line_number,

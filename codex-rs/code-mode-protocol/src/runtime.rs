@@ -18,9 +18,7 @@ pub const OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS: u64 = u64::MAX;
 /// The caller owns its interruption and idle deadline.
 pub const OWNER_HELD_DECISION_YIELD_TIME_MS: u64 = u64::MAX - 1;
 /// Default coherent evidence-packet budget when no per-call limit is requested.
-/// Sized to carry a typical batch of file reads in one round trip: a cell cut at
-/// the budget is usually recovered by the next model turn anyway.
-pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 20_000;
+pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
 /// Maximum coherent evidence-packet budget accepted from an explicit request.
 /// Above the default so one round trip can carry known-bulk evidence instead
 /// of paging it across model turns; a configured `tool_output_token_limit`
@@ -30,7 +28,8 @@ pub const MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 40_000;
 /// the result JSON-escapes its output and adds lifecycle fields, so the budget
 /// stays below the default cell budget; otherwise a cell without a raised
 /// explicit budget cuts the result a second time.
-pub const MAX_NESTED_COMMAND_OUTPUT_TOKENS: usize = 8_000;
+pub const MAX_NESTED_COMMAND_OUTPUT_TOKENS: usize =
+    DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 / 5;
 /// Hard deadline applied to a single nested tool call when the host supplies no
 /// per-cell default. A host-supplied default must still leave room for the
 /// longest wait its own tools can be asked to perform.

@@ -671,17 +671,9 @@ class SessionDiagnosticsTest(unittest.TestCase):
         saved = copy.deepcopy(report)
         summary = audit.bounded_summary(report)
         self.assertNotIn("sessionDiagnostics", summary)
-        # Status, thresholds, and counts stay; rows beyond the summary budget
-        # are dropped from the tail with exact omission accounting.
-        full = report["baselineComparison"]
-        kept = summary["baselineComparison"]
-        self.assertEqual(kept["metrics"], full["metrics"][: len(kept["metrics"])])
         self.assertEqual(
-            len(kept["metrics"]) + kept.get("omittedMetrics", 0), len(full["metrics"])
-        )
-        self.assertEqual(
-            {k: v for k, v in kept.items() if k not in ("metrics", "omittedMetrics")},
-            {k: v for k, v in full.items() if k != "metrics"},
+            summary["baselineComparison"],
+            report["baselineComparison"],
         )
         with self.assertRaisesRegex(ValueError, "regenerate"):
             diagnostics.compare_diagnostics(report["sessionDiagnostics"], summary)

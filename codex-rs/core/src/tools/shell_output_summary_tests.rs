@@ -8,7 +8,6 @@ fn options(
         enabled: true,
         applied_token_limit,
         command_text,
-        launched_as_validation: false,
     }
 }
 
@@ -231,7 +230,7 @@ fn validation_output_uses_structured_wrapper_classification() {
     for command in [
         "cargo +stable --offline test",
         "env MODE=test cargo test",
-        "just --justfile tasks.just test",
+        "just --justfile tasks.just core-test-fast core_lib focused",
     ] {
         assert_eq!(
             summarize_shell_output_for_model(&output, 0, false, options(Some(command), None)),
@@ -239,25 +238,6 @@ fn validation_output_uses_structured_wrapper_classification() {
             "{command}"
         );
     }
-    // A repository-declared runner is recognized when it launches, not from
-    // its command text.
-    let declared = "just --justfile tasks.just core-test-fast core_lib focused";
-    assert_eq!(
-        summarize_shell_output_for_model(&output, 0, false, options(Some(declared), None)),
-        None
-    );
-    assert_eq!(
-        summarize_shell_output_for_model(
-            &output,
-            0,
-            false,
-            ShellOutputSummaryOptions {
-                launched_as_validation: true,
-                ..options(Some(declared), None)
-            },
-        ),
-        Some(direct.clone())
-    );
     let prose = summarize_shell_output_for_model(
         &output,
         0,
@@ -763,10 +743,7 @@ fn passing_validation_retains_status_with_a_short_tail() {
         &lines.join("\n"),
         0,
         false,
-        ShellOutputSummaryOptions {
-            launched_as_validation: true,
-            ..options(Some("just core-test-fast core_lib"), None)
-        },
+        options(Some("just core-test-fast core_lib"), None),
     )
     .unwrap();
     assert!(summary.contains("699 tests run: 699 passed"));
@@ -962,7 +939,6 @@ fn disabled_summarizer_returns_unchanged_signal() {
         enabled: false,
         applied_token_limit: Some(400),
         command_text: Some("cargo test"),
-        launched_as_validation: true,
     };
 
     assert_eq!(

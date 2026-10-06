@@ -630,10 +630,8 @@ async fn shutdown_cancels_startup_prewarm_waiting_for_mcp_startup() -> anyhow::R
         .await
         .context("shutdown should not wait for startup prewarm MCP startup")??;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    // Session start preconnects the websocket alongside tool preparation, so a
-    // handshake may precede shutdown; the prewarm request must never follow it.
     assert!(
-        server.connections().iter().all(Vec::is_empty),
+        server.connections().is_empty(),
         "startup prewarm should not send a websocket request after shutdown"
     );
 

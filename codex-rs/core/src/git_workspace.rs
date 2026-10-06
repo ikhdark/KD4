@@ -243,11 +243,16 @@ pub(crate) async fn capture_checkout_snapshot(cwd: &Path) -> Option<String> {
     timeout(WORKSPACE_GENERATION_DEADLINE, async {
         let root = resolve_workspace_evidence_root(cwd).await.ok()??;
         let list = || async {
-            // This capture is abandoned at the first model request. The bounded
-            // runner owns the whole Git process tree, so abandoning it leaves
-            // neither an orphaned process nor a pipe read behind.
-            let output = codex_git_utils::git_checkout_paths(&root).await?;
-            let paths = output.split(|byte| *byte == 0)
+            let output = Command::new("git")
+                .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .current_dir(&root)
+                .kill_on_drop(true)
+                .output().await.ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let paths = output.stdout.split(|byte| *byte == 0)
                 .filter(|path| !path.is_empty())
                 .map(|path| std::str::from_utf8(path).map(str::to_owned))
                 .collect::<Result<BTreeSet<_>, _>>().ok()?;
@@ -1401,10 +1406,6 @@ struct CachedWorkspaceEvidenceIdentity {
 
 struct RetainedSourceWatchRegistration {
     generation: u64,
-    /// The watched root as registered. A directory above it is reported
-    /// whenever its other entries change; that reaches the root only when the
-    /// root is no longer this file or directory.
-    root_identity: Option<StableFileIdentity>,
     _registration: GitWatchLease,
 }
 
@@ -2396,64 +2397,10 @@ impl GitWorkspaceCache {
         self.record_source_change_with_capture_effect(changed_paths, true)
     }
 
-    /// Drops paths above a watched root that still is the file or directory
-    /// that was registered. The watcher reports such a directory whenever its
-    /// other entries change, which says nothing about the root or its contents.
-    async fn without_changes_above_intact_roots(&self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
-        let roots = self.repository_retention.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .source_watch_registrations.iter()
-            .map(|(root, registration)| (root.clone(), registration.root_identity.clone()))
-            .collect::<Vec<_>>();
-        if !paths.iter().any(|path| roots.iter().any(|(root, _)| path_is_strict_ancestor(path, root))) {
-            return paths;
-        }
-        let retained = paths.clone();
-        let Ok((paths, replaced)) = tokio::task::spawn_blocking(move || {
-            let mut replaced = Vec::new();
-            let paths = paths.into_iter().filter(|path| {
-                let mut above_root = false;
-                let mut intact = true;
-                for (root, registered) in &roots {
-                    if !path_is_strict_ancestor(path, root) {
-                        continue;
-                    }
-                    above_root = true;
-                    let current = stable_path_identity(root);
-                    if current.is_none() || current != *registered {
-                        intact = false;
-                        // Report a replaced root once, not on every later event.
-                        if current.is_some() {
-                            replaced.push((root.clone(), current));
-                        }
-                    }
-                }
-                !(above_root && intact)
-            }).collect::<Vec<_>>();
-            (paths, replaced)
-        }).await else {
-            return retained;
-        };
-        if !replaced.is_empty() {
-            let mut retention = self.repository_retention.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (root, identity) in replaced {
-                if let Some(registration) = retention.source_watch_registrations.get_mut(&root) {
-                    registration.root_identity = identity;
-                }
-            }
-        }
-        paths
-    }
-
     async fn record_watched_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) {
         let _guard = self.source_event_gate.write().await;
         let changed_paths = changed_paths.map(|paths| paths.into_iter()
             .filter(|path| !is_generated_codex_eval_path(path)).collect::<Vec<_>>());
-        let changed_paths = match changed_paths {
-            Some(paths) => Some(self.without_changes_above_intact_roots(paths).await),
-            None => None,
-        };
         let roots = self.repository_retention.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .source_watch_registrations.keys().cloned().collect::<Vec<_>>();
@@ -2615,11 +2562,6 @@ impl GitWorkspaceCache {
                 )
                 .await
                 .ok()?;
-            let root = repo_root.to_path_buf();
-            let root_identity = tokio::task::spawn_blocking(move || stable_path_identity(&root))
-                .await
-                .ok()
-                .flatten();
             let mut retention = self
                 .repository_retention
                 .lock()
@@ -2633,7 +2575,6 @@ impl GitWorkspaceCache {
                         repo_root.to_path_buf(),
                         RetainedSourceWatchRegistration {
                             generation,
-                            root_identity,
                             _registration: registration,
                         },
                     );
@@ -2843,11 +2784,6 @@ fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
 
 fn source_change_path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
-}
-
-fn path_is_strict_ancestor(ancestor: &Path, path: &Path) -> bool {
-    path_is_same_or_descendant(path, ancestor)
-        && source_change_path_key(path) != source_change_path_key(ancestor)
 }
 
 fn path_is_same_or_descendant_with_case_sensitivity(
@@ -3102,20 +3038,6 @@ fn file_dependency_state(mut file: File, hash_contents: bool) -> Option<Dependen
         stable_id,
         digest,
     })
-}
-
-/// Identity of the file or directory currently at `path`.
-fn stable_path_identity(path: &Path) -> Option<StableFileIdentity> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-
-    // Backup semantics are what allow a directory to be opened.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .ok()?;
-    stable_file_identity(&file)
 }
 
 fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {

@@ -4555,23 +4555,9 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
 async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch() {
     require_network!();
 
-    // A codex-backend login fetches its catalog from the test server; publish
-    // both models there with their catalog metadata, as the sibling tests do.
-    let server = MockServer::start().await;
+    let server = start_mock_server().await;
     let previous_model = "gpt-5.4";
     let next_model = "gpt-5.2";
-    let catalog = bundled_models_response().expect("bundled models.json should parse");
-    mount_models_once(
-        &server,
-        ModelsResponse {
-            models: catalog
-                .models
-                .into_iter()
-                .filter(|model| model.slug == previous_model || model.slug == next_model)
-                .collect(),
-        },
-    )
-    .await;
 
     let request_log = mount_sse_sequence(
         &server,
@@ -4891,11 +4877,9 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
     let expected_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &expected_fragment);
     assert!(instruction_fragments(&requests[1]).is_empty());
-    // Reinjection appends only sections that differ from history, so the new
-    // on-disk text would appear here as a second fragment.
     assert_eq!(
         instruction_fragments(&requests[2]),
-        vec![expected_fragment],
+        vec![expected_fragment.clone(), expected_fragment],
         "context reinjection must also use the creation-time instructions"
     );
     assert_eq!(
@@ -5101,11 +5085,9 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &old_fragment);
     assert_single_instruction_fragment(&requests[1], &old_fragment);
-    // Reinjection appends only sections that differ from history, so the new
-    // on-disk text would appear here as a second fragment.
     assert_eq!(
         instruction_fragments(&requests[2]),
-        vec![old_fragment.clone()],
+        vec![old_fragment.clone(), old_fragment.clone()],
         "context reinjection must also use the creation-time instructions"
     );
     assert_eq!(
@@ -5159,7 +5141,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     );
     assert_eq!(
         instruction_fragments(&requests[3]),
-        vec![old_fragment, replacement_fragment]
+        vec![old_fragment.clone(), old_fragment, replacement_fragment]
     );
     assert_eq!(
         resumed.codex.instruction_sources().await,

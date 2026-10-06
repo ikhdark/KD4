@@ -233,9 +233,7 @@ where
     F: FnMut(&codex_protocol::protocol::EventMsg) -> bool,
 {
     use tokio::time::Duration;
-    // Only an event that never arrives costs this long. A one-second budget
-    // failed correct turns whenever parallel tests loaded the machine.
-    wait_for_event_with_timeout(codex, predicate, Duration::from_secs(10)).await
+    wait_for_event_with_timeout(codex, predicate, Duration::from_secs(1)).await
 }
 
 /// Waits for a configured MCP server to finish startup and requires it to be ready.

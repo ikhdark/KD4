@@ -1159,7 +1159,7 @@ fn compute_replacements(
         if let Some(handle) = chunk
             .change_context
             .as_deref()
-            .and_then(|s| s.strip_prefix(parser::RANGE_HANDLE_PREFIX))
+            .and_then(|s| s.strip_prefix("codex-range "))
         {
             let invalid = || {
                 ApplyPatchError::ComputeReplacements(
@@ -1747,38 +1747,6 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "same\r\nchanged\r\nlast"
         );
-    }
-
-    #[tokio::test]
-    async fn revision_bound_ranges_without_replacement_lines_delete_their_lines() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("a.rs");
-        let original = "keep\none\ntwo\nkeep\nthree\nlast\n";
-        fs::write(&path, original).unwrap();
-        let hash = format!("{:x}", Sha256::digest(original));
-        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        // Consecutive handles, a handle before another file hunk and a handle
-        // closing the patch are all complete without a body.
-        let patch = wrap_patch(&format!(
-            "*** Update File: a.rs\n@@ codex-range 2:3 sha256:{hash}\n@@ codex-range 5:5 sha256:{hash}\n*** Add File: b.rs\n+new\n*** Update File: a.rs\n@@ codex-range 6:6 sha256:{hash}"
-        ));
-        let hunks = parse_patch(&patch).unwrap().hunks;
-        assert_eq!(hunks.len(), 3);
-        apply_patch(
-            &wrap_patch(&format!(
-                "*** Update File: a.rs\n@@ codex-range 2:3 sha256:{hash}\n@@ codex-range 5:5 sha256:{hash}"
-            )),
-            &cwd,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            LOCAL_FS.as_ref(),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "keep\nkeep\nlast\n");
-        // An ordinary context chunk still needs lines.
-        assert!(parse_patch(&wrap_patch("*** Update File: a.rs\n@@ fn keep()\n@@\n+x")).is_err());
     }
 
     #[tokio::test]
