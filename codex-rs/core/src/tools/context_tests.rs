@@ -1793,6 +1793,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
             enabled: true,
             applied_token_limit: None,
             command_text: Some("cargo test"),
+            launched_as_validation: false,
         },
     )
     .expect("large output should summarize");
@@ -1923,6 +1924,10 @@ async fn exec_passing_validation_is_compact_even_when_it_fits_the_output_budget(
     let summary = output.summarized_output(&raw, 10_000).expect("compact passing validation");
     assert!(summary.len() < raw.len());
     assert!(summary.contains("160 passed; 0 failed; 2 ignored"));
+    // A repository-declared runner is validation by its launch-time
+    // classification, even though its command text alone is not recognized.
+    output.hook_command = Some("just core-test-fast core_lib".into());
+    assert_eq!(output.summarized_output(&raw, 10_000), Some(summary));
     output.validation = None;
     assert!(output.summarized_output(&raw, 10_000).is_none(), "ordinary output stays exact below budget");
 }

@@ -458,6 +458,24 @@ pub async fn git_index_entries(cwd: &Path, paths: &[PathBuf]) -> Option<Vec<u8>>
     output.status.success().then_some(output.stdout)
 }
 
+/// List indexed and non-ignored untracked paths, NUL-separated and relative
+/// to `cwd`, using the bounded Git runner. Cancelling the listing ends the
+/// whole Git process tree and leaves no pipe read behind.
+pub async fn git_checkout_paths(cwd: &Path) -> Option<Vec<u8>> {
+    let output = run_git_command_with_timeout(
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        cwd,
+    )
+    .await?;
+    output.status.success().then_some(output.stdout)
+}
+
 /// Run a git command with a timeout to prevent blocking on large repositories
 async fn run_git_command_with_timeout(args: &[&str], cwd: &Path) -> Option<std::process::Output> {
     // These callers only inspect repository metadata. Worktree workflows probe

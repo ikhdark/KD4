@@ -2152,6 +2152,10 @@ impl ExecCommandToolOutput {
                     enabled: true,
                     applied_token_limit: Some(token_limit),
                     command_text: self.hook_command.as_deref(),
+                    launched_as_validation: self
+                        .validation
+                        .as_ref()
+                        .is_some_and(|validation| validation.is_validation()),
                 },
             ),
             _ => None,

@@ -25,6 +25,8 @@ pub(crate) const MOVE_TO_MARKER: &str = "*** Move to: ";
 pub(crate) const EOF_MARKER: &str = "*** End of File";
 pub(crate) const CHANGE_CONTEXT_MARKER: &str = "@@ ";
 pub(crate) const EMPTY_CHANGE_CONTEXT_MARKER: &str = "@@";
+/// Change context that names the replaced lines by revision-bound range.
+pub(crate) const RANGE_HANDLE_PREFIX: &str = "codex-range ";
 
 /// Shared bound for stdin, argument, and in-process patch inputs.
 pub(crate) const MAX_PATCH_INPUT_BYTES: usize = 64 * 1024 * 1024;

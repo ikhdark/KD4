@@ -15,7 +15,9 @@ use super::REQUEST_SCHEMA_CACHE_CAPACITY;
 use super::RequestSchemaCacheKey;
 use super::RequestSchemaCacheValue;
 use super::RequestSchemaSerializationCache;
+use super::SharedStreamThroughput;
 use super::StreamThroughputCollapse;
+use super::StreamThroughputObserver;
 use super::UnauthorizedRecoveryExecution;
 use super::WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION;
 use super::WebsocketCachePublicationPermit;
@@ -143,40 +145,54 @@ fn websocket_rotates_before_the_server_connection_age_limit() {
     ));
 }
 
-fn record_response_rate(throughput: &mut WebsocketStreamThroughput, tokens_per_second: i64) {
-    throughput.record(tokens_per_second * 100, Duration::from_secs(100));
+/// Records a response on one model and tier; healthy rates are returned for sharing.
+fn record_response_rate(
+    throughput: &mut WebsocketStreamThroughput,
+    tokens_per_second: i64,
+) -> Option<f64> {
+    throughput.record(
+        "provider\nmodel\npriority",
+        tokens_per_second * 100,
+        Duration::from_secs(100),
+        /*shared_baseline*/ None,
+    )
 }
 
 #[test]
 fn websocket_throughput_collapse_needs_a_baseline_and_consecutive_slow_responses() {
     let mut throughput = WebsocketStreamThroughput::default();
     for _ in 0..4 {
-        record_response_rate(&mut throughput, 10);
+        record_response_rate(&mut throughput, 15);
     }
     assert_eq!(throughput.take_collapse(), None, "no baseline yet");
 
     let mut throughput = WebsocketStreamThroughput::default();
     for _ in 0..5 {
-        record_response_rate(&mut throughput, 40);
+        assert_eq!(record_response_rate(&mut throughput, 40), Some(40.0));
     }
-    record_response_rate(&mut throughput, 10);
+    assert_eq!(record_response_rate(&mut throughput, 15), None);
     assert_eq!(throughput.take_collapse(), None, "one slow response");
     record_response_rate(&mut throughput, 40);
-    record_response_rate(&mut throughput, 10);
+    record_response_rate(&mut throughput, 15);
     assert_eq!(
         throughput.take_collapse(),
         None,
         "recovery resets the streak"
     );
     // Too small to say anything about the stream rate.
-    throughput.record(100, Duration::from_secs(60));
+    throughput.record(
+        "provider\nmodel\npriority",
+        100,
+        Duration::from_secs(60),
+        None,
+    );
     assert_eq!(throughput.take_collapse(), None);
 
-    record_response_rate(&mut throughput, 12);
+    record_response_rate(&mut throughput, 15);
     assert_eq!(
         throughput.take_collapse(),
         Some(StreamThroughputCollapse {
-            observed_tokens_per_second: 12.0,
+            observed_tokens_per_second: 15.0,
             baseline_tokens_per_second: 40.0,
         })
     );
@@ -189,19 +205,94 @@ fn websocket_throughput_slowdown_that_survives_replacement_becomes_the_baseline(
     for _ in 0..9 {
         record_response_rate(&mut throughput, 40);
     }
-    record_response_rate(&mut throughput, 10);
-    record_response_rate(&mut throughput, 10);
+    record_response_rate(&mut throughput, 15);
+    record_response_rate(&mut throughput, 15);
     assert!(throughput.take_collapse().is_some());
 
     for _ in 0..20 {
-        record_response_rate(&mut throughput, 10);
+        record_response_rate(&mut throughput, 15);
         assert_eq!(throughput.take_collapse(), None);
     }
 
     // A later collapse relative to the new baseline is still caught.
-    record_response_rate(&mut throughput, 3);
-    record_response_rate(&mut throughput, 3);
+    record_response_rate(&mut throughput, 5);
+    record_response_rate(&mut throughput, 5);
     assert!(throughput.take_collapse().is_some());
+}
+
+#[test]
+fn websocket_throughput_severe_collapse_is_reported_after_one_response() {
+    let mut throughput = WebsocketStreamThroughput::default();
+    for _ in 0..5 {
+        record_response_rate(&mut throughput, 40);
+    }
+    record_response_rate(&mut throughput, 5);
+    assert_eq!(
+        throughput.take_collapse(),
+        Some(StreamThroughputCollapse {
+            observed_tokens_per_second: 5.0,
+            baseline_tokens_per_second: 40.0,
+        })
+    );
+}
+
+#[test]
+fn fresh_thread_judges_its_first_responses_against_the_shared_baseline() {
+    let class = "provider\nmodel\npriority";
+    let now = std::time::Instant::now();
+    let mut shared = SharedStreamThroughput::default();
+    for _ in 0..4 {
+        shared.record(class, 40.0, now);
+    }
+    assert_eq!(shared.baseline_tokens_per_second(class, now), None);
+    shared.record(class, 40.0, now);
+    let baseline = shared.baseline_tokens_per_second(class, now);
+    assert_eq!(baseline, Some(40.0));
+    assert_eq!(
+        shared.baseline_tokens_per_second("provider\nmodel\n", now),
+        None,
+        "another tier has its own rate"
+    );
+    assert_eq!(
+        shared.baseline_tokens_per_second(class, now + Duration::from_secs(31 * 60)),
+        None,
+        "stale rates are not a baseline"
+    );
+
+    // No history of its own: the first slow responses are still a collapse,
+    // and are not shared as healthy.
+    let slow = Duration::from_secs(100);
+    let mut throughput = WebsocketStreamThroughput::default();
+    assert_eq!(throughput.record(class, 1_500, slow, baseline), None);
+    assert_eq!(throughput.take_collapse(), None);
+    assert_eq!(throughput.record(class, 1_500, slow, baseline), None);
+    assert_eq!(
+        throughput.take_collapse(),
+        Some(StreamThroughputCollapse {
+            observed_tokens_per_second: 15.0,
+            baseline_tokens_per_second: 40.0,
+        })
+    );
+    assert_eq!(throughput.record(class, 4_000, slow, baseline), Some(40.0));
+}
+
+#[test]
+fn changing_model_or_tier_restarts_the_thread_baseline() {
+    let mut throughput = WebsocketStreamThroughput::default();
+    for _ in 0..5 {
+        record_response_rate(&mut throughput, 40);
+    }
+    record_response_rate(&mut throughput, 15);
+    for _ in 0..3 {
+        let rate = throughput.record(
+            "provider\nmodel\n",
+            1_500,
+            Duration::from_secs(100),
+            /*shared_baseline*/ None,
+        );
+        assert_eq!(rate, Some(15.0));
+        assert_eq!(throughput.take_collapse(), None);
+    }
 }
 
 #[test]
@@ -251,7 +342,10 @@ async fn completed_websocket_response_reports_its_stream_throughput() {
         InferenceTraceAttempt::disabled().into(),
         test_model_provider(),
         None,
-        Some(Arc::clone(&throughput)),
+        Some(StreamThroughputObserver {
+            thread: Arc::clone(&throughput),
+            class: "test\nmapper\n".to_string(),
+        }),
     );
     tokio::time::sleep(Duration::from_millis(5)).await;
     tx_event

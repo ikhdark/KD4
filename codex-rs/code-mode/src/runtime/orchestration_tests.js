@@ -111,6 +111,15 @@ try {
   // The caller may compute a final answer only after checking its full task
   // postcondition. Helpers do not print progress or infer semantic success.
   check((await await_command(done)).observations.length === 1 && polls === 3, "terminal was polled");
+  // The pending start is accepted directly, so starting and draining a command
+  // is one expression in one cell.
+  polls = 0;
+  const started = await await_command(Promise.resolve(live("started")));
+  check(polls === 3 && started.terminal === done && started.observations.length === 4,
+    "pending command start was not drained");
+  const unstarted = await rejected(() => await_command(Promise.reject(Error("spawn failed"))));
+  check(unstarted.evidence.cause.message === "spawn failed" && unstarted.evidence.observations.length === 0 &&
+    polls === 3, "failed start lost its cause or was polled");
   for (const value of [{ ...done, exit_code: 9 }, { ...done, session_id: 7 },
     { ...live(), error: "cancelled" }, { ...live(), pending_deferred_completions: [1] },
     { ...live(), pending_deferred_completions: 1 }, { ...live(), session_capabilities: {} },

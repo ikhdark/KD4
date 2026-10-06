@@ -48,7 +48,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         for package in ("sha2", "libsqlite3-sys"):
             self.assertEqual(packages[package]["opt-level"], 3)
         core = load_toml(REPO_ROOT / "codex-rs" / "core" / "Cargo.toml")
-        self.assertNotIn("test-deterministic-process-ids", core["features"])
+        self.assertNotIn("test-deterministic-process-ids", core.get("features", {}))
         self.assertFalse({"codex-web-search-extension", "codex-image-generation-extension"} & core["dev-dependencies"].keys())
         tui = load_toml(REPO_ROOT / "codex-rs" / "tui" / "Cargo.toml")
         self.assertFalse({"codex-cli", "app_test_support"} & tui["dev-dependencies"].keys())

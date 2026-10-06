@@ -41,6 +41,8 @@ use codex_utils_output_truncation::TruncationPolicy;
 /// Ephemeral calibration: resume starts with the local estimator until a fresh
 /// completed request supplies a matching provider measurement. The largest of
 /// four recent ratios avoids reacting optimistically to one cheap prompt.
+/// Replacing history (compaction, rollback, a new window) discards the samples,
+/// so ratios from the old prompt never decide whether the replacement fits.
 #[derive(Default)]
 pub(crate) struct PromptTokenCalibration {
     basis: Option<(String, String)>,

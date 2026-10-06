@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 from scripts.publish_local_codex_test_support import clean_env
@@ -391,6 +392,7 @@ $RunDoctor = ${str(run_doctor).lower()}
 $DoctorOnNoop = ${str(doctor_on_noop).lower()}
 $RestartDesktop = ${str(restart).lower()}
 $ConfigureDesktopLocalCli = $true
+$Force = $false
 $restartFailure = $null
 $publishCommitted = $false
 function Write-ProofLine {{
@@ -403,7 +405,7 @@ function Invoke-DoctorForPublish {{
     Write-Output 'doctor-called'
 }}
 function Restart-CodexDesktop {{
-    param($LocalCliPath, $LocalCodexHome, $LocalCodexSqliteHome)
+    param([switch]$Force, $LocalCliPath, $LocalCodexHome, $LocalCodexSqliteHome)
     if (-not $publishCommitted) {{ throw 'restart before publish commit' }}
     if ($LocalCliPath -ne 'fixture-cli' -or $LocalCodexHome -ne 'fixture-home' -or $LocalCodexSqliteHome -ne 'fixture-home') {{ throw 'wrong restart routing' }}
     Write-Output 'restart-called'
@@ -1131,7 +1133,9 @@ $configFailure = '{{"checks":{{"auth.credentials":{{"status":"fail"}},"config.lo
             3,
         )
 
-    def test_local_release_profile_is_minimal_release_inheritance(self) -> None:
+    def test_local_release_profile_inherits_release_with_fast_workspace_codegen(
+        self,
+    ) -> None:
         cargo_toml = (SCRIPT.parent.parent / "codex-rs" / "Cargo.toml").read_text(
             encoding="utf-8"
         )
@@ -1144,8 +1148,14 @@ $configFailure = '{{"checks":{{"auth.credentials":{{"status":"fail"}},"config.lo
             "[profile.",
             1,
         )[0]
-        self.assertNotIn("incremental", local_release_block)
-        self.assertNotIn("codegen-units", local_release_block)
+        # Only workspace crates trade codegen for rebuild speed; dependencies
+        # keep the release value so their artifacts and cache entries stay valid.
+        self.assertIn("codegen-units = 16\nincremental = true", local_release_block)
+        profiles = tomllib.loads(cargo_toml)["profile"]
+        self.assertEqual(
+            profiles["local-release"]["package"]["*"]["codegen-units"],
+            profiles["release"]["codegen-units"],
+        )
         self.assertNotIn("debug", local_release_block)
         self.assertNotIn("strip", local_release_block)
 

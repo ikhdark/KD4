@@ -72,9 +72,15 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
 }
 
 fn expected_visible_models() -> Vec<Model> {
+    // The picker lists exactly the catalog `write_models_cache` installs. Core's
+    // test presets also carry retired regression fixtures, which it does not.
+    let mut catalog = codex_models_manager::bundled_models_response()
+        .expect("bundled models.json should parse")
+        .models;
+    catalog.sort_by_key(|model| model.priority);
     // Filter by supported_in_api to support testing with both ChatGPT and non-ChatGPT auth modes.
     let mut presets = ModelPreset::filter_by_auth(
-        codex_core::test_support::all_model_presets().clone(),
+        catalog.into_iter().map(Into::into).collect(),
         /*chatgpt_mode*/ false,
     );
 

@@ -112,11 +112,19 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
             novel, "{command} {scope:?} {identity}",
         );
         for markdown in [false, true] {
+            // A report file shares its producer's lineage only when it signs
+            // the content that lineage describes.
+            let mut signed = lineage.clone();
             let bytes = if markdown {
-                format!("<!-- codex-evidence: {} -->\n# Report\n",
-                    json!({"evidence_lineage": lineage})).into_bytes()
+                let body = "# Report\n";
+                signed["content_sha256"] = json!(crate::tool_history::sha256(body.as_bytes()));
+                format!("<!-- codex-evidence: {} -->\n{body}",
+                    json!({"evidence_lineage": signed})).into_bytes()
             } else {
-                result.raw_output.clone()
+                let content = serde_json::to_vec(&json!({"rendered_by": command})).unwrap();
+                signed["content_sha256"] = json!(crate::tool_history::sha256(&content));
+                serde_json::to_vec(&json!({"rendered_by": command, "evidence_lineage": signed}))
+                    .unwrap()
             };
             std::fs::write(&path, bytes).unwrap();
             let call = invocation("read_file", json!({"path":path})).await;

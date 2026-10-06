@@ -584,19 +584,25 @@ impl TestCodexBuilder {
             config.model_provider_id.clone(),
             config.model_provider.clone(),
         );
-        ensure_test_model_catalog(&mut config)?;
+        ensure_test_model_catalog(&mut config, self.auth.uses_codex_backend())?;
 
         Ok(config)
     }
 }
 
-fn ensure_test_model_catalog(config: &mut Config) -> Result<()> {
+fn ensure_test_model_catalog(config: &mut Config, fetches_remote_catalog: bool) -> Result<()> {
     if config.model_catalog.is_some() {
         return Ok(());
     }
 
     let bundled_models = bundled_models_response().expect("bundled models.json should parse");
     if config.model.as_deref() != Some(TEST_MODEL_WITH_EXPERIMENTAL_TOOLS) {
+        // A codex-backend login fetches its catalog from the test server, so a
+        // scenario that mounts /models defines its own models, retired or not.
+        // A static catalog would never fetch it.
+        if fetches_remote_catalog {
+            return Ok(());
+        }
         let production = codex_models_manager::bundled_models_response()?;
         if let Some(slug) = config.model.as_deref()
             && !production.models.iter().any(|model| model.slug == slug)

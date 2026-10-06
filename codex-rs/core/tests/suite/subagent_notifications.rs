@@ -71,14 +71,14 @@ fn body_contains(req: &wiremock::Request, text: &str) -> bool {
         .is_some_and(|body| body.contains(text))
 }
 
-fn prompt_cache_key(req: &wiremock::Request) -> Option<String> {
-    decoded_body(req)
-        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
-        .and_then(|body| {
-            body.get("prompt_cache_key")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+/// The thread a model request belongs to. Prompt cache keys hash the stable
+/// prompt prefix, so they do not separate a parent from its child.
+fn turn_thread_id(req: &wiremock::Request) -> Option<String> {
+    req.headers
+        .get("x-codex-turn-metadata")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|metadata| metadata["thread_id"].as_str().map(str::to_owned))
 }
 
 fn request_has_input_type(req: &wiremock::Request, ty: &str) -> bool {
@@ -951,18 +951,18 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
     )
     .await;
 
-    let parent_prompt_cache_key = Arc::new(Mutex::new(None::<String>));
-    let child_parent_prompt_cache_key = Arc::clone(&parent_prompt_cache_key);
+    let parent_thread_id = Arc::new(Mutex::new(None::<String>));
+    let child_parent_thread_id = Arc::clone(&parent_thread_id);
     let _child_request_log = mount_sse_once_match(
         &server,
         move |req: &wiremock::Request| {
-            let parent_key = child_parent_prompt_cache_key
+            let parent_thread_id = child_parent_thread_id
                 .lock()
-                .expect("parent prompt cache key lock poisoned")
+                .expect("parent thread id lock poisoned")
                 .clone();
             req.url.path() == "/v1/responses"
-                && parent_key.is_some()
-                && prompt_cache_key(req) != parent_key
+                && parent_thread_id.is_some()
+                && turn_thread_id(req).is_some_and(|thread_id| Some(thread_id) != parent_thread_id)
         },
         sse(vec![
             ev_response_created("resp-child-1"),
@@ -996,14 +996,15 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.submit_turn(TURN_0_FORK_PROMPT).await?;
-    let seed_request = seed_turn.single_request();
-    let seed_prompt_cache_key = seed_request.body_json()["prompt_cache_key"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("seed request should include prompt_cache_key"))?;
-    *parent_prompt_cache_key
+    let seed_thread_id = seed_turn
+        .single_request()
+        .header("x-codex-turn-metadata")
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .and_then(|metadata| metadata["thread_id"].as_str().map(str::to_owned))
+        .ok_or_else(|| anyhow::anyhow!("seed request should carry its thread id"))?;
+    *parent_thread_id
         .lock()
-        .expect("parent prompt cache key lock poisoned") = Some(seed_prompt_cache_key.clone());
+        .expect("parent thread id lock poisoned") = Some(seed_thread_id.clone());
 
     test.submit_turn(TURN_1_PROMPT).await?;
     let _ = spawn_turn.single_request();
@@ -1017,8 +1018,7 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
             .into_iter()
             .find(|request| {
                 request.url.path() == "/v1/responses"
-                    && prompt_cache_key(request)
-                        .is_some_and(|request_key| request_key != seed_prompt_cache_key)
+                    && turn_thread_id(request).is_some_and(|thread_id| thread_id != seed_thread_id)
             })
         {
             break request;
@@ -1032,7 +1032,7 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
                 .map(|request| {
                     (
                         request.url.path().to_string(),
-                        prompt_cache_key(&request),
+                        turn_thread_id(&request),
                         body_contains(&request, TURN_0_FORK_PROMPT),
                         body_contains(&request, TURN_1_PROMPT),
                         body_contains(&request, SPAWN_CALL_ID),

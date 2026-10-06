@@ -208,6 +208,7 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
             enabled: true,
             applied_token_limit: None,
             command_text: Some("cargo test"),
+            launched_as_validation: false,
         },
     )
     .expect("large output should be summarized");

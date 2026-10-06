@@ -155,11 +155,14 @@ fn normalize_script_output_items(items: Vec<Value>) -> Vec<Value> {
         // Payload tests inspect script output. Receipt tests below inspect the
         // unmodified provider request separately, including tiny-budget cases.
         if let Some(text) = item.get("text").and_then(Value::as_str) {
+            // A reduced result names its retained artifact, or says that
+            // nothing was retained to recover from.
             let is_recovery_notice = |line: &str| {
                 serde_json::from_str::<Value>(line).is_ok_and(|value| {
                     value["output_truncated"] == true
-                        && value["artifact_id"].is_string()
-                        && value["recovery_tool"] == "read_tool_output"
+                        && (value["recovery_available"] == false
+                            || value["artifact_id"].is_string()
+                                && value["recovery_tool"] == "read_tool_output")
                 })
             };
             if is_recovery_notice(text) {
@@ -1834,14 +1837,16 @@ async fn output_only_preserves_running_command_and_recovers_middle(
         .await?;
     let raw =
         custom_tool_output_last_non_empty_text(&observed.single_request(), "recover").unwrap();
-    let recovered: Value = serde_json::from_str(&raw)?;
+    // Recovered text that JSON would escape follows its one-line envelope.
+    let (envelope, text) = raw
+        .split_once('\n')
+        .expect("envelope followed by the recovered text");
+    let recovered: Value = serde_json::from_str(envelope)?;
     assert_eq!(recovered["complete"], true, "{recovered}");
     assert_eq!(recovered["results"][0]["status"], "ok");
     assert_eq!(recovered["results"][0]["complete"], true);
-    assert_eq!(
-        recovered["results"][0]["text"].as_str().unwrap().trim_end(),
-        "DECISIVE_MIDDLE_MATCH"
-    );
+    assert_eq!(recovered["results"][0]["text_lines"], 2, "{recovered}");
+    assert_eq!(text.trim_end(), "DECISIVE_MIDDLE_MATCH");
     assert!(!source.exists());
     Ok(())
 }
@@ -1948,6 +1953,42 @@ text(JSON.stringify(result));
     assert_eq!(result["execution_state"], "exited");
     assert_eq!(result["process_exited"], true);
     assert!(result.get("session_id").is_none(), "{result}");
+
+    Ok(())
+}
+
+/// One expression starts a command and drains it to exit, so a command that
+/// outlives its first yield needs no second model round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_await_command_drains_a_pending_exec_command() -> Result<()> {
+    require_network!();
+
+    let server = responses::start_mock_server().await;
+    let (_test, second_mock) = run_code_mode_turn(
+        &server,
+        "use exec to run a command to exit",
+        r#"
+const completed = await await_command(tools.exec_command({
+  cmd: "Start-Sleep -Seconds 2; [Console]::Out.Write('drained_marker')",
+  yield_time_ms: 250,
+}));
+text(JSON.stringify({
+  exit_code: completed.terminal.exit_code,
+  started_live: completed.observations[0].process_exited === false,
+  output: completed.observations.map(result => result.output).join(""),
+}));
+"#,
+    )
+    .await?;
+
+    let request = second_mock.single_request();
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("code-mode output should contain the drained command summary");
+    let result: Value = serde_json::from_str(&output)?;
+    assert_eq!(
+        result,
+        serde_json::json!({"exit_code": 0, "started_live": true, "output": "drained_marker"})
+    );
 
     Ok(())
 }
@@ -2300,7 +2341,6 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
             "exec".to_string(),
             "wait".to_string(),
             "request_user_input".to_string(),
-            "apply_patch".to_string(),
             "web_search".to_string()
         ]
     );
@@ -2406,7 +2446,6 @@ if (!tool) {
             "exec".to_string(),
             "wait".to_string(),
             "request_user_input".to_string(),
-            "apply_patch".to_string(),
             "web_search".to_string()
         ]
     );
@@ -2434,12 +2473,9 @@ if (!tool) {
     assert!(exec_description.contains("callable with `.name`/`.description`"));
     assert!(exec_description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
     assert!(!exec_description.contains("### `tool_search`"));
-    assert!(exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
-    assert!(exec_description.contains("execution: \"client\";"));
-    assert!(exec_description.contains("tools: unknown[];"));
-    assert!(
-        exec_description.contains("omitted_result_count: number /* integer; minimum: 0 */ | null;")
-    );
+    // The search contract resolves on demand instead of riding every request.
+    assert!(!exec_description.contains("tool_search(args:"));
+    assert!(exec_description.contains("resolve_tool(\"tool_search\")"));
     assert!(!exec_description.contains("calendar_timezone_option_99"));
 
     let request = follow_up_mock.single_request();
@@ -5246,6 +5282,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "ALL_TOOL_NAMES",
         "console",
         "ALL_TOOLS",
+        "await_command",
         "exec",
         "exec_command",
         "execTool",
@@ -5283,6 +5320,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "Promise",
         "Proxy",
         "RangeError",
+        "read_files",
         "ReferenceError",
         "Reflect",
         "RegExp",

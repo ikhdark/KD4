@@ -7628,6 +7628,22 @@ async fn completed_measurements_calibrate_next_prompt_pressure_with_safe_fallbac
     assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 301);
 }
 
+#[tokio::test]
+async fn history_replacement_discards_prompt_token_calibration() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    session.state.lock().await.prompt_token_calibration.observe(
+        &turn.config.model_provider_id,
+        &turn.model_info.slug,
+        Some((3_000, 330_000)),
+    );
+    assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 33_110);
+
+    // Compaction re-estimates the replacement history; the pre-compaction ratio
+    // must not keep a prompt that fits over its limit and abort the turn.
+    session.recompute_token_usage(&turn).await;
+    assert_eq!(session.calibrated_prompt_tokens(&turn, 301).await, 301);
+}
+
 #[test]
 fn projected_prompt_pressure_adds_pending_body_growth_to_server_usage() {
     assert_eq!(

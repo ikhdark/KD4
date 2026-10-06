@@ -138,7 +138,11 @@
         throw new TypeError("on_progress must be a function");
       }
       const observations = [];
-      let current = initial;
+      // A pending exec_command promise is accepted so one expression can start
+      // a command and drain it to exit in the same cell.
+      let current;
+      try { current = await initial; }
+      catch (cause) { fail("command did not start", { terminal: undefined, observations, cause }); }
       let session;
       while (true) {
         observations.push(current);

@@ -6166,11 +6166,6 @@ impl Session {
         } else {
             // Successful generation can lack usable provider accounting. Keep
             // budget protection using the existing prepared-history estimate.
-            self.state.lock().await.prompt_token_calibration.observe(
-                &turn_context.config.model_provider_id,
-                &turn_context.model_info.slug,
-                None,
-            );
             self.recompute_token_usage(turn_context).await;
         }
         let coordinator = self.services.agent_control.task_coordinator();
@@ -6196,7 +6191,14 @@ impl Session {
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
         let (history, base_instructions) = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
+            // Calibration ratios were measured on the prompt being replaced, like
+            // the usage this estimate supersedes.
+            state.prompt_token_calibration.observe(
+                &turn_context.config.model_provider_id,
+                &turn_context.model_info.slug,
+                /*sample*/ None,
+            );
             (
                 state.history.clone(),
                 BaseInstructions {

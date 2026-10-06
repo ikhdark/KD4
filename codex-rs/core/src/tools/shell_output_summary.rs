@@ -38,6 +38,10 @@ pub(crate) struct ShellOutputSummaryOptions<'a> {
     /// Optional command text may classify output shape, such as validation/build
     /// output. Do not add extra plumbing just to carry this value.
     pub(crate) command_text: Option<&'a str>,
+    /// The command was classified as validation when it launched. That
+    /// classification knows the repository's declared runners, which the
+    /// command text alone does not.
+    pub(crate) launched_as_validation: bool,
 }
 
 pub(crate) fn summarize_shell_output_for_model(
@@ -65,12 +69,13 @@ pub(crate) fn summarize_shell_output_for_model(
         return None;
     }
     let failed = timed_out || exit_code != 0;
-    let validation = options.command_text.is_some_and(|command| {
-        matches!(
-            classify_validation_script(command),
-            ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
-        )
-    });
+    let validation = options.launched_as_validation
+        || options.command_text.is_some_and(|command| {
+            matches!(
+                classify_validation_script(command),
+                ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
+            )
+        });
     let summary_after_lines = if validation && !failed {
         VALIDATION_SUCCESS_SUMMARY_AFTER_LINES
     } else {

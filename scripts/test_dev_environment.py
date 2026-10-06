@@ -1320,6 +1320,11 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
             stable = root / schema.GENERATED_OUTPUTS[0] / "json" / "stable.json"
             stable.parent.mkdir(parents=True)
             stable.write_bytes(b'{"stable": true}\n')
+            sdk = root / "sdk" / "python"
+            for directory in ("src", "scripts", "tests"):
+                (sdk / directory).mkdir(parents=True)
+            for path in ("pyproject.toml", "tests/test_contract_generation.py"):
+                (sdk / path).write_text("", encoding="utf-8")
             calls = []
 
             def generate(args, *, cwd):
@@ -1335,9 +1340,13 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
                 calls.append("generate")
                 return 0
 
-            def stable_check(_root):
-                self.assertEqual(stable.read_bytes(), b'{"stable": true}\n')
-                self.assertEqual(list(stable.parent.iterdir()), [stable])
+            def stable_check(_root, snapshot_root=None):
+                # The SDK consumer reads the locked snapshot, not the live tree.
+                checked = (snapshot_root or root) / schema.GENERATED_OUTPUTS[0] / "json"
+                self.assertEqual(
+                    (checked / "stable.json").read_bytes(), b'{"stable": true}\n'
+                )
+                self.assertEqual([path.name for path in checked.iterdir()], ["stable.json"])
                 calls.append("check")
                 return 0
 
