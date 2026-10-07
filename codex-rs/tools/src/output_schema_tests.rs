@@ -20,15 +20,19 @@ fn materializing_mcp_output_preserves_json_and_keeps_mutations_private() {
     };
     assert!(Arc::ptr_eq(&raw, shared));
     let mut materialized = schema.to_value();
+    let expected: Value = serde_json::from_str(
+        r#"{"properties":{"a":{"type":"string"},"z":{"enum":[9007199254740993,1.0]}},"required":["a","z"]}"#,
+    ).unwrap();
     assert_eq!(
         serde_json::to_string(&materialized["properties"]["structuredContent"]).unwrap(),
-        serde_json::to_string(&raw).unwrap(),
+        serde_json::to_string(&expected).unwrap(),
     );
     materialized["properties"]["structuredContent"] = Value::Null;
     assert_eq!(
         schema.to_value()["properties"]["structuredContent"],
-        Value::Object(raw.as_ref().clone()),
+        expected,
     );
+    assert_eq!(raw["required"], serde_json::json!(["z", "a"]));
 }
 
 #[test]

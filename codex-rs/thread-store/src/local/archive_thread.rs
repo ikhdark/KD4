@@ -14,6 +14,9 @@ pub(super) async fn archive_thread(
     params: ArchiveThreadParams,
 ) -> ThreadStoreResult<()> {
     let thread_id = params.thread_id;
+    if super::live_writer::rollout_path(store, thread_id).await.is_ok() {
+        super::live_writer::shutdown_thread(store, thread_id).await?;
+    }
     let state_db_ctx = store.state_db().await;
     let rollout_path = find_thread_path_by_id_str(
         store.config.codex_home.as_path(),

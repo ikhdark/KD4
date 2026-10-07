@@ -147,7 +147,7 @@ pub(crate) async fn run(
     let updated_input = if should_block {
         None
     } else {
-        latest_updated_input(&results)
+        configured_updated_input(&results)
     };
 
     let mut additional_contexts = Vec::new();
@@ -166,18 +166,17 @@ pub(crate) async fn run(
     }
 }
 
-/// Chooses the rewrite from the hook that actually finished last.
+/// Chooses the last configured hook that produced a rewrite.
 ///
-/// Hook results stay in configured order for stable reporting, but the
-/// `PreToolUse` contract resolves competing rewrites by completion order.
-fn latest_updated_input(
+/// The dispatcher keeps results in configured order while executing hooks
+/// concurrently. Scheduler timing must not decide which command is executed.
+fn configured_updated_input(
     results: &[dispatcher::ParsedHandler<PreToolUseHandlerData>],
 ) -> Option<Value> {
     results
         .iter()
-        .filter(|result| result.data.updated_input.is_some())
-        .max_by_key(|result| result.completion_order)
-        .and_then(|result| result.data.updated_input.clone())
+        .rev()
+        .find_map(|result| result.data.updated_input.clone())
 }
 
 /// Serializes command stdin for a selected `PreToolUse` hook.
@@ -355,7 +354,7 @@ mod tests {
 
     use super::PreToolUseHandlerData;
     use super::command_input_json;
-    use super::latest_updated_input;
+    use super::configured_updated_input;
     use super::parse_completed;
     use super::preview;
     use crate::engine::ConfiguredHandler;
@@ -432,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn last_completed_updated_input_wins() {
+    fn last_configured_updated_input_wins_in_either_completion_order() {
         let mut later_configured = parse_completed(
             &handler(),
             run_result(
@@ -454,10 +453,78 @@ mod tests {
         );
         earlier_configured.completion_order = 1;
 
-        assert_eq!(
-            latest_updated_input(&[earlier_configured, later_configured]),
-            Some(serde_json::json!({ "command": "echo finished later" }))
-        );
+        let mut results = [earlier_configured, later_configured];
+        for completion_order in [[0, 1], [1, 0]] {
+            results[0].completion_order = completion_order[0];
+            results[1].completion_order = completion_order[1];
+            assert_eq!(
+                configured_updated_input(&results),
+                Some(serde_json::json!({ "command": "echo configured later" }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn configured_rewrites_ignore_hook_delays_and_denial_always_wins() {
+        let shell = crate::engine::CommandShell {
+            program: "powershell.exe".into(),
+            args: vec!["-NoProfile".into(), "-Command".into()],
+        };
+        for delays in [[0, 1_000], [1_000, 0]] {
+            for deny in [false, true] {
+                let handlers = delays
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, delay)| {
+                        let mut handler = handler();
+                        let output = if deny && index == 0 {
+                            serde_json::json!({"hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "deny",
+                                "permissionDecisionReason": "denied"
+                            }})
+                        } else {
+                            serde_json::json!({"hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "allow",
+                                "updatedInput": {"command": format!("echo configured {index}")}
+                            }})
+                        };
+                        handler.command = format!("Start-Sleep -Milliseconds {delay}; '{output}'");
+                        handler.display_order = index as i64;
+                        handler.timeout_sec = 15;
+                        handler
+                    })
+                    .collect::<Vec<_>>();
+                let mut request = request_for_tool_use("rewrite-precedence");
+                request.cwd =
+                    codex_utils_absolute_path::AbsolutePathBuf::current_dir().expect("cwd");
+                let outcome = super::run(&handlers, &shell, request, &ScopedRunGate::unscoped()).await;
+                assert_eq!(outcome.should_block, deny);
+                assert_eq!(
+                    outcome.updated_input,
+                    if deny {
+                        None
+                    } else {
+                        Some(serde_json::json!({"command": "echo configured 1"}))
+                    }
+                );
+                assert_eq!(outcome.block_reason.as_deref(), deny.then_some("denied"));
+                assert_eq!(outcome.hook_events.len(), 2);
+                for (index, event) in outcome.hook_events.iter().enumerate() {
+                    assert_eq!(event.run.display_order, index as i64);
+                    assert_eq!(
+                        event.run.status,
+                        if deny && index == 0 {
+                            HookRunStatus::Blocked
+                        } else {
+                            HookRunStatus::Completed
+                        }
+                    );
+                }
+            }
+        }
     }
 
     #[test]

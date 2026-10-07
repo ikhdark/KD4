@@ -59,6 +59,7 @@ pub(crate) struct TurnInputQueue {
 /// Session-scoped pending input storage and active-turn mailbox delivery coordination.
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
+    agent_activity_tx: watch::Sender<InputQueueActivity>,
     startup_recovery_items: Mutex<TurnInputQueue>,
     mailbox: Mutex<MailboxState>,
     max_pending_mailbox_communications: usize,
@@ -78,8 +79,10 @@ struct MailboxState {
 impl InputQueue {
     pub(crate) fn new() -> Self {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
+        let (agent_activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         Self {
             activity_tx,
+            agent_activity_tx,
             startup_recovery_items: Mutex::new(TurnInputQueue::default()),
             mailbox: Mutex::new(MailboxState::default()),
             max_pending_mailbox_communications: MAX_PENDING_MAILBOX_COMMUNICATIONS,
@@ -110,7 +113,7 @@ impl InputQueue {
     /// Subscribing first is what makes the pair safe: anything that lands
     /// between the two is retained state the caller sees on the second half, or
     /// a wake the receiver has already registered for.
-    pub(crate) async fn subscribe_activity(
+    pub(crate) async fn subscribe_code_mode_activity(
         &self,
         turn_state: Option<&Mutex<TurnState>>,
         has_internal_completion: bool,
@@ -123,6 +126,28 @@ impl InputQueue {
             .pending_activity(turn_state, has_internal_completion)
             .await;
         (activity_rx, pending_activity)
+    }
+
+    pub(crate) async fn subscribe_activity(
+        &self,
+        turn_state: Option<&Mutex<TurnState>>,
+        has_internal_completion: bool,
+    ) -> (watch::Receiver<InputQueueActivity>, Option<InputQueueActivity>) {
+        let (receiver, pending) = self.subscribe_agent_activity(turn_state).await;
+        (receiver, pending.or(has_internal_completion.then_some(InputQueueActivity::InternalCompletion)))
+    }
+
+    /// Agent waits retain their original policy: any mailbox message wakes them.
+    pub(crate) async fn subscribe_agent_activity(
+        &self,
+        turn_state: Option<&Mutex<TurnState>>,
+    ) -> (watch::Receiver<InputQueueActivity>, Option<InputQueueActivity>) {
+        let receiver = self.agent_activity_tx.subscribe();
+        let mut pending = self.pending_activity(turn_state, false).await;
+        if pending != Some(InputQueueActivity::Steer) && self.has_pending_mailbox_items().await {
+            pending = Some(InputQueueActivity::Mailbox);
+        }
+        (receiver, pending)
     }
 
     /// Derives the highest-priority pending activity from queue state.
@@ -148,7 +173,7 @@ impl InputQueue {
         };
         if has_recovered_steer || has_pending_steer {
             Some(InputQueueActivity::Steer)
-        } else if self.has_pending_mailbox_items().await {
+        } else if self.has_trigger_turn_mailbox_items().await {
             Some(InputQueueActivity::Mailbox)
         } else if has_internal_completion {
             Some(InputQueueActivity::InternalCompletion)
@@ -164,6 +189,8 @@ impl InputQueue {
     #[cfg(test)]
     pub(crate) fn publish_internal_completion(&self) {
         self.activity_tx
+            .send_replace(InputQueueActivity::InternalCompletion);
+        self.agent_activity_tx
             .send_replace(InputQueueActivity::InternalCompletion);
     }
 
@@ -193,10 +220,14 @@ impl InputQueue {
             mailbox.seen_communication_id_order.push_back(id.clone());
             compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
         }
+        let trigger_turn = communication.trigger_turn;
         mailbox.bytes += bytes;
         mailbox.pending_mails.push_back((communication, bytes));
         drop(mailbox);
-        self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+        self.agent_activity_tx.send_replace(InputQueueActivity::Mailbox);
+        if trigger_turn {
+            self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+        }
         Ok(true)
     }
 
@@ -243,7 +274,6 @@ impl InputQueue {
         clippy::await_holding_invalid_type,
         reason = "Read recovered input and mailbox input as one snapshot in recovery -> mailbox lock order"
     )]
-    #[cfg(test)]
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
         let recovered = self.startup_recovery_items.lock().await;
         recovered.iter().any(
@@ -298,13 +328,20 @@ impl InputQueue {
             Some(InputQueueActivity::Steer)
         } else if recovered
             .iter()
-            .any(|item| matches!(item, TurnInput::InterAgentCommunication(_)))
+            .any(|item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn))
         {
             Some(InputQueueActivity::Mailbox)
         } else {
             None
         };
+        let agent_activity = activity.or_else(|| {
+            recovered.iter().any(|item| matches!(item, TurnInput::InterAgentCommunication(_)))
+                .then_some(InputQueueActivity::Mailbox)
+        });
         drop(recovered);
+        if let Some(activity) = agent_activity {
+            self.agent_activity_tx.send_replace(activity);
+        }
         if let Some(activity) = activity {
             self.activity_tx.send_replace(activity);
         }
@@ -406,6 +443,7 @@ impl InputQueue {
             turn_state.accept_mailbox_delivery_for_current_turn();
         }
         self.activity_tx.send_replace(InputQueueActivity::Steer);
+        self.agent_activity_tx.send_replace(InputQueueActivity::Steer);
         Ok(())
     }
 
@@ -444,6 +482,7 @@ impl InputQueue {
             .await?;
         if !input.is_empty() {
             self.activity_tx.send_replace(InputQueueActivity::Steer);
+            self.agent_activity_tx.send_replace(InputQueueActivity::Steer);
         }
         Ok(())
     }
@@ -699,7 +738,7 @@ impl InputQueue {
         if !accepts_mailbox_delivery {
             return false;
         }
-        self.has_pending_mailbox_items().await
+        self.has_trigger_turn_mailbox_items().await
     }
 }
 
@@ -787,7 +826,11 @@ impl TurnInput {
     }
 
     fn requires_turn_continuation(&self) -> bool {
-        !matches!(self, Self::InternalResponseItem(_))
+        match self {
+            Self::InternalResponseItem(_) => false,
+            Self::InterAgentCommunication(mail) => mail.trigger_turn,
+            Self::UserInput { .. } | Self::ResponseItem(_) => true,
+        }
     }
 }
 
@@ -919,8 +962,10 @@ mod tests {
     #[tokio::test]
     async fn input_queue_notifies_mailbox_subscribers() {
         let input_queue = InputQueue::new();
+        let (mut agent_rx, pending) = input_queue.subscribe_agent_activity(None).await;
+        assert_eq!(pending, None);
         let (mut activity_rx, pending_activity) = input_queue
-            .subscribe_activity(
+            .subscribe_code_mode_activity(
                 /*turn_state*/ None, /*has_internal_completion*/ false,
             )
             .await;
@@ -935,12 +980,17 @@ mod tests {
             ))
             .await
             .expect("mailbox admission");
+        assert!(!activity_rx.has_changed().unwrap());
+        assert!(agent_rx.has_changed().unwrap());
+        assert_eq!(*agent_rx.borrow_and_update(), InputQueueActivity::Mailbox);
+        assert_eq!(input_queue.subscribe_agent_activity(None).await.1, Some(InputQueueActivity::Mailbox));
+        assert_eq!(input_queue.pending_activity(None, false).await, None);
         input_queue
             .enqueue_mailbox_communication(make_mail(
                 AgentPath::root(),
                 AgentPath::try_from("/root/worker").expect("agent path"),
                 "two",
-                /*trigger_turn*/ false,
+                /*trigger_turn*/ true,
             ))
             .await
             .expect("mailbox admission");
@@ -957,7 +1007,7 @@ mod tests {
         let input_queue = InputQueue::new();
         let turn_state = Mutex::new(TurnState::default());
         let (mut activity_rx, pending_activity) = input_queue
-            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ false)
+            .subscribe_code_mode_activity(Some(&turn_state), /*has_internal_completion*/ false)
             .await;
         assert_eq!(pending_activity, None);
 
@@ -1000,7 +1050,7 @@ mod tests {
             .expect("steer input should fit");
 
         let (_activity_rx, pending_activity) = input_queue
-            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ false)
+            .subscribe_code_mode_activity(Some(&turn_state), /*has_internal_completion*/ false)
             .await;
 
         assert_eq!(pending_activity, Some(InputQueueActivity::Steer));
@@ -1015,7 +1065,7 @@ mod tests {
 
         // Nothing pending but a completion: it is reported.
         let (_activity_rx, pending_activity) = input_queue
-            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ true)
+            .subscribe_code_mode_activity(Some(&turn_state), /*has_internal_completion*/ true)
             .await;
         assert_eq!(
             pending_activity,
@@ -1040,7 +1090,7 @@ mod tests {
         // Both pending: steering wins, however late the completion's wake was.
         input_queue.publish_internal_completion();
         let (_activity_rx, pending_activity) = input_queue
-            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ true)
+            .subscribe_code_mode_activity(Some(&turn_state), /*has_internal_completion*/ true)
             .await;
         assert_eq!(
             pending_activity,
@@ -1057,7 +1107,7 @@ mod tests {
         let input_queue = InputQueue::new();
         let turn_state = Mutex::new(TurnState::default());
         let (_activity_rx, _) = input_queue
-            .subscribe_activity(Some(&turn_state), /*has_internal_completion*/ false)
+            .subscribe_code_mode_activity(Some(&turn_state), /*has_internal_completion*/ false)
             .await;
 
         input_queue
@@ -1361,6 +1411,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_only_mail_does_not_interrupt_activity_waits() {
+        for queued_before_subscription in [false, true] {
+            let input_queue = InputQueue::new();
+            let status = make_mail(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("agent path"),
+                "status only",
+                /*trigger_turn*/ false,
+            );
+            if queued_before_subscription {
+                input_queue
+                    .enqueue_mailbox_communication(status.clone())
+                    .await
+                    .expect("mailbox admission");
+            }
+            let (mut activity_rx, pending) = input_queue.subscribe_code_mode_activity(None, false).await;
+            assert_eq!(pending, None);
+            if !queued_before_subscription {
+                input_queue
+                    .enqueue_mailbox_communication(status.clone())
+                    .await
+                    .expect("mailbox admission");
+            }
+            assert!(!activity_rx.has_changed().unwrap());
+            assert_eq!(input_queue.pending_activity(None, false).await, None);
+            assert_eq!(
+                input_queue.pending_activity(None, true).await,
+                Some(InputQueueActivity::InternalCompletion)
+            );
+
+            let mut trigger = status.clone();
+            trigger.content = "needs a turn".to_string();
+            trigger.trigger_turn = true;
+            input_queue
+                .enqueue_mailbox_communication(trigger.clone())
+                .await
+                .expect("mailbox admission");
+            assert!(activity_rx.has_changed().unwrap());
+            assert_eq!(*activity_rx.borrow_and_update(), InputQueueActivity::Mailbox);
+            assert_eq!(
+                input_queue.pending_activity(None, false).await,
+                Some(InputQueueActivity::Mailbox)
+            );
+            assert_eq!(
+                input_queue.get_pending_input(&Mutex::new(None)).await,
+                vec![
+                    TurnInput::InterAgentCommunication(status),
+                    TurnInput::InterAgentCommunication(trigger),
+                ],
+                "status mail remains available for the next request"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn input_queue_tracks_pending_trigger_turn_mail() {
         let input_queue = InputQueue::new();
 
@@ -1563,6 +1668,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn informational_mail_does_not_reopen_a_finished_turn() {
+        for trigger_turn in [false, true] {
+            for recovered in [false, true] {
+                let queue = InputQueue::new();
+                let mail = make_mail(AgentPath::root(), AgentPath::try_from("/root/worker").unwrap(), "done", trigger_turn);
+                if recovered {
+                    queue.restore_transferred_startup_input(vec![TurnInput::InterAgentCommunication(mail)]).await;
+                } else {
+                    queue.enqueue_mailbox_communication(mail).await.unwrap();
+                }
+                assert_eq!(queue.has_pending_input(&Mutex::new(None)).await, trigger_turn);
+                assert_eq!(queue.has_pending_turn_start_work().await, trigger_turn);
+                assert_eq!(queue.subscribe_code_mode_activity(None, false).await.1.is_some(), trigger_turn);
+                assert_eq!(queue.subscribe_activity(None, false).await.1, Some(InputQueueActivity::Mailbox));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn recovered_user_input_is_pending_turn_start_work() {
         let input_queue = InputQueue::new();
         input_queue
@@ -1602,7 +1726,7 @@ mod tests {
                 Some(InputQueueActivity::Steer),
             ),
             (vec![mail(true)], Some(InputQueueActivity::Mailbox)),
-            (vec![mail(false)], Some(InputQueueActivity::Mailbox)),
+            (vec![mail(false)], None),
             (
                 vec![TurnInput::InternalResponseItem(ResponseItem::Other)],
                 None,
@@ -1610,7 +1734,7 @@ mod tests {
         ] {
             let queue = InputQueue::new();
             let (mut receiver, pending) = queue
-                .subscribe_activity(None, /*has_internal_completion*/ false)
+                .subscribe_code_mode_activity(None, /*has_internal_completion*/ false)
                 .await;
             assert_eq!(pending, None);
             queue.restore_transferred_startup_input(input.clone()).await;
@@ -1619,7 +1743,7 @@ mod tests {
                 assert_eq!(*receiver.borrow_and_update(), expected);
             }
             let (_, pending) = queue
-                .subscribe_activity(None, /*has_internal_completion*/ false)
+                .subscribe_code_mode_activity(None, /*has_internal_completion*/ false)
                 .await;
             assert_eq!(
                 pending, expected,
@@ -1627,7 +1751,7 @@ mod tests {
             );
             assert_eq!(queue.get_pending_input(&Mutex::new(None)).await, input);
             let (_, pending) = queue
-                .subscribe_activity(None, /*has_internal_completion*/ false)
+                .subscribe_code_mode_activity(None, /*has_internal_completion*/ false)
                 .await;
             assert_eq!(pending, None);
         }
@@ -1637,7 +1761,7 @@ mod tests {
             .restore_transferred_startup_input(vec![user.clone()])
             .await;
         let (mut receiver, _) = queue
-            .subscribe_activity(None, /*has_internal_completion*/ false)
+            .subscribe_code_mode_activity(None, /*has_internal_completion*/ false)
             .await;
         let later_mail = mail(true);
         queue

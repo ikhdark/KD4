@@ -346,6 +346,9 @@ pub enum Op {
     UserInputAnswer {
         /// Turn id for the in-flight request.
         id: String,
+        /// Request item identity. Legacy turn-only answers are accepted only
+        /// while the turn has issued exactly one request.
+        call_id: Option<String>,
         /// User-provided answers.
         response: RequestUserInputResponse,
     },
@@ -360,6 +363,8 @@ pub enum Op {
 
     /// Resolve a dynamic tool call request.
     DynamicToolResponse {
+        /// Originating turn, required to prevent replies crossing turn boundaries.
+        turn_id: String,
         /// Call id for the in-flight request.
         id: String,
         /// Tool output payload.
@@ -1026,6 +1031,9 @@ pub enum EventMsg {
     /// v1 wire format uses `task_started`; accept `turn_started` for v2 interop.
     #[serde(rename = "task_started", alias = "turn_started")]
     TurnStarted(TurnStartedEvent),
+
+    /// Current owner-authored harness waits; transient, never reconstructed from timing.
+    TurnPhaseChanged(TurnPhaseChangedEvent),
 
     /// Persistent thread-settings overrides from the correlated submission have
     /// been applied to the session configuration.
@@ -1746,6 +1754,12 @@ pub struct ContextCompactedEvent;
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTiming {
+    /// Completion diagnostics captured at the terminal boundary. These are
+    /// independent of execution status and timing validity; empty diagnostics
+    /// are not proof that the user's entire task was verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub completion_assessment: Option<TurnCompletionAssessment>,
     /// Observed starting minus ending account credit balance, not an isolated
     /// invoice: concurrent turns, replenishments, or delayed reports may affect it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1822,6 +1836,15 @@ pub struct TurnTiming {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub pre_first_model_output: Option<TurnTimingPreFirstModelOutput>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnCompletionAssessment {
+    pub failed_checks: Vec<String>,
+    pub verification_gaps: Vec<String>,
+    pub advisories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -1987,6 +2010,24 @@ pub enum NextSampleBlockReason {
     WaitingForProcessCleanup,
     #[default]
     ReadyToSample,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum HarnessPhase {
+    ResourceResolution,
+    DiffTracker,
+    WorkspaceGate,
+    EvidenceTracker,
+    Delivery,
+    ProcessCleanup,
+    ReadyToSample,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TurnPhaseChangedEvent {
+    pub turn_id: String,
+    pub phases: Vec<HarnessPhase>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3701,6 +3742,12 @@ pub struct McpToolCallProgressEvent {
     /// Identifier of the in-progress MCP tool-call item.
     pub call_id: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub progress: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub total: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq)]
@@ -5090,6 +5137,9 @@ pub struct ExecCommandBeginEvent {
 pub struct ExecCommandEndEvent {
     /// Identifier for the ExecCommandBegin that finished.
     pub call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output_metadata: Option<crate::items::CommandExecutionOutputMetadata>,
     /// Identifier for the underlying PTY process (when available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -5118,8 +5168,8 @@ pub struct ExecCommandEndEvent {
     /// Captured aggregated output
     #[serde(default)]
     pub aggregated_output: String,
-    /// The command's exit code.
-    pub exit_code: i32,
+    /// The observed command exit code; null when the platform did not supply one.
+    pub exit_code: Option<i32>,
     /// The duration of the command execution.
     #[ts(type = "string")]
     pub duration: Duration,
@@ -7223,6 +7273,7 @@ mod tests {
             turn_id: "turn-1".into(),
             started_at_ms: 10,
             item: TurnItem::CommandExecution(CommandExecutionItem {
+                output_metadata: None,
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
                 parent_call_id: None,
@@ -7250,6 +7301,7 @@ mod tests {
             turn_id: "turn-1".into(),
             completed_at_ms: 20,
             item: TurnItem::CommandExecution(CommandExecutionItem {
+                output_metadata: None,
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
                 parent_call_id: None,

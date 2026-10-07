@@ -293,6 +293,33 @@ fn execute_request(source: &str) -> ExecuteRequest {
     }
 }
 
+#[tokio::test]
+async fn first_wait_in_replacement_host_recovers_original_receipt() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let program = codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").unwrap();
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(program.clone());
+    let delegate = Arc::new(RecordingDelegate::default());
+    let session = provider.create_session(delegate.clone()).await.unwrap();
+    let mut request = execute_request(r#"store("kept", 1); text("original host receipt");"#);
+    request.state_path = Some(path.clone());
+    request.yield_time_ms = Some(60_000);
+    let started = session.execute(request).await.unwrap();
+    let id = started.cell_id.clone();
+    let original = started.initial_response().await.unwrap();
+    session.shutdown().await.unwrap();
+    drop(session);
+    drop(provider);
+    let replacement = ProcessOwnedCodeModeSessionProvider::with_host_program(program);
+    let session = replacement.create_session(delegate.clone()).await.unwrap();
+    assert_eq!(session.wait(WaitRequest {
+        cell_id: id, yield_time_ms: 1,
+        recovery: Some(codex_code_mode::ReceiptRecovery { path, terminal_only: false }),
+    }).await.unwrap(), WaitOutcome::LiveCell(original));
+    assert!(delegate.invocations.lock().unwrap().is_empty());
+    session.shutdown().await.unwrap();
+}
+
 async fn execute(session: &Arc<dyn CodeModeSession>, request: ExecuteRequest) -> RuntimeResponse {
     session
         .execute(request)
@@ -315,6 +342,7 @@ async fn execute_to_terminal(
             | RuntimeResponse::ExplicitYield { cell_id, .. } => {
                 response = match session
                     .wait(WaitRequest {
+                        recovery: None,
                         cell_id,
                         yield_time_ms: 60_000,
                     })
@@ -607,6 +635,7 @@ text(result.value);
             tool_kind: CodeModeToolKind::Function,
             input: Some(json!({ "value": "persisted" })),
             nested_deadline: None,
+            buffered_output_bytes: 0,
         }]
     );
     assert_eq!(
@@ -614,7 +643,7 @@ text(result.value);
         vec![("call-2".to_string(), cell_id("2"), "notice".to_string())]
     );
 
-    let mut pending_request = execute_request("await new Promise(() => {});");
+    let mut pending_request = execute_request("await new Promise(resolve => setTimeout(resolve, 60_000));");
     pending_request.tool_call_id = "call-3".to_string();
     pending_request.yield_time_ms = Some(1);
     assert_eq!(
@@ -627,6 +656,7 @@ text(result.value);
     assert_eq!(
         session
             .wait(WaitRequest {
+                recovery: None,
                 cell_id: cell_id("3"),
                 yield_time_ms: 1,
             })
@@ -656,6 +686,42 @@ text(result.value);
 }
 
 #[tokio::test]
+async fn nested_poll_deadlines_survive_stdio_with_and_without_explicit_options() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let delegate = Arc::new(RecordingDelegate::default());
+    let session = provider.create_session(delegate.clone()).await.unwrap();
+    for (source, expected_ms) in [
+        ("await tools.write_stdin({session_id: 7, yield_time_ms: 300000});", Some(315_000)),
+        ("await tools.write_stdin({session_id: 7, yield_time_ms: 300000}, {timeout_ms: 15000});", Some(15_000)),
+        // Passive observation deliberately has no wrapper deadline; the cell idle bound owns it.
+        ("await tools.write_stdin({session_id: 7, wait_for_output: true});", None),
+        ("await tools.write_stdin({session_id: 7, wait_for_output: true}, {timeout_ms: 15000});", Some(15_000)),
+    ] {
+        let mut request = execute_request(source);
+        request.enabled_tools = vec![ToolDefinition {
+            name: "write_stdin".to_string(), tool_name: ToolName::plain("write_stdin"),
+            description: "".into(), kind: CodeModeToolKind::Function,
+            input_schema: None, default_timeout_ms: Some(315_000), output_schema: None,
+        }].into();
+        assert!(matches!(execute_to_terminal(&session, request).await,
+            RuntimeResponse::Result { error_text: None, .. }));
+        let calls = delegate.invocations.lock().unwrap();
+        let deadline = calls.last().unwrap().nested_deadline;
+        match expected_ms {
+            Some(ms) => {
+                let remaining = deadline.expect("deadline survives transport")
+                    .saturating_duration_since(std::time::Instant::now());
+                assert!(remaining > Duration::ZERO && remaining <= Duration::from_millis(ms));
+            }
+            None => assert!(deadline.is_none()),
+        }
+    }
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn dropping_session_outside_runtime_closes_cells_and_preserves_shared_host() {
     let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
@@ -679,7 +745,7 @@ async fn dropping_session_outside_runtime_closes_cells_and_preserves_shared_host
         }
     );
 
-    let mut request = execute_request("await new Promise(() => {});");
+    let mut request = execute_request("await new Promise(resolve => setTimeout(resolve, 60_000));");
     request.yield_time_ms = Some(1);
     let started = session.execute(request).await.expect("start pending cell");
     let running_cell_id = started.cell_id.clone();
@@ -723,7 +789,7 @@ async fn dropping_long_wait_releases_observer_before_next_wait() {
         .create_session(Arc::new(RecordingDelegate::default()))
         .await
         .expect("create remote session");
-    let mut request = execute_request("await new Promise(() => {});");
+    let mut request = execute_request("await new Promise(resolve => setTimeout(resolve, 60_000));");
     request.yield_time_ms = Some(1);
     let started = session.execute(request).await.expect("start execution");
     let running_cell_id = started.cell_id.clone();
@@ -740,6 +806,7 @@ async fn dropping_long_wait_releases_observer_before_next_wait() {
     let first_wait = tokio::spawn(async move {
         wait_session
             .wait(WaitRequest {
+                recovery: None,
                 cell_id: wait_cell_id,
                 yield_time_ms: 60_000,
             })
@@ -753,6 +820,7 @@ async fn dropping_long_wait_releases_observer_before_next_wait() {
         tokio::time::timeout(
             Duration::from_secs(2),
             session.wait(WaitRequest {
+                recovery: None,
                 cell_id: running_cell_id.clone(),
                 yield_time_ms: 1,
             })
@@ -833,6 +901,7 @@ return;
     let wait_task = tokio::spawn(async move {
         wait_session
             .wait(WaitRequest {
+                recovery: None,
                 cell_id: wait_cell_id,
                 yield_time_ms: 60_000,
             })

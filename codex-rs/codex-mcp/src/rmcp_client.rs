@@ -136,6 +136,8 @@ fn make_progress_sender(tx_event: Sender<Event>) -> SendProgress {
                     msg: EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
                         call_id: item_id,
                         message,
+                        progress: Some(params.progress),
+                        total: params.total,
                     }),
                 })
                 .await
@@ -468,6 +470,7 @@ impl ManagedClientStartup {
 
 #[derive(Clone)]
 pub(crate) struct AsyncManagedClient {
+    pub(crate) approval_incarnation: u64,
     pub(crate) client: ManagedClientFuture,
     pub(crate) is_codex_apps_mcp_server: bool,
     pub(crate) cached_server_info: Option<McpServerInfo>,
@@ -481,6 +484,11 @@ pub(crate) struct AsyncManagedClient {
 }
 
 impl AsyncManagedClient {
+    pub(crate) fn next_approval_incarnation() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
     // Keep this constructor flat so the startup inputs remain readable at the
     // single call site instead of introducing a one-off params wrapper.
     #[instrument(level = "trace", skip_all, fields(server_name = %server_name))]
@@ -574,6 +582,7 @@ impl AsyncManagedClient {
 
         Self {
             client,
+            approval_incarnation: Self::next_approval_incarnation(),
             is_codex_apps_mcp_server,
             cached_server_info,
             codex_apps_tools_cache_context,
@@ -1471,10 +1480,11 @@ mod tests {
         let (tx_event, rx_event) = async_channel::unbounded();
         let send_progress = make_progress_sender(tx_event);
 
+        for (progress, total) in [(2.0, Some(5.0)), (3.0, Some(5.0)), (4.0, None)] {
         send_progress(ProgressNotificationParam {
-            progress_token: ProgressToken(NumberOrString::String(token.into())),
-            progress: 2.0,
-            total: Some(5.0),
+            progress_token: ProgressToken(NumberOrString::String(token.clone().into())),
+            progress,
+            total,
             message: Some("working".to_string()),
         })
         .await;
@@ -1485,9 +1495,13 @@ mod tests {
             EventMsg::McpToolCallProgress(event) => {
                 assert_eq!(event.call_id, "item-1");
                 assert_eq!(event.message, "working");
+                assert_eq!(event.progress, Some(progress));
+                assert_eq!(event.total, total);
             }
             other => panic!("expected MCP tool progress event, got {other:?}"),
         }
+        }
+        assert!(rx_event.try_recv().is_err());
     }
 
     fn listed_test_tool(name: &str, connector_id: Option<&str>) -> ToolWithConnectorId {

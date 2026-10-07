@@ -228,6 +228,7 @@ fn turn_started_emits_turn_started_event() {
 fn command_execution_started_and_completed_translate_to_thread_events() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
     let command_item = ThreadItem::from(CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
+        output_metadata: None,
         id: "cmd-1".to_string(),
         process_id: Some("123".to_string()),
         parent_call_id: Some("exec-parent-1".to_string()),
@@ -262,6 +263,9 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
                 item: ExecThreadItem {
                     id: "item_0".to_string(),
                     details: ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                        output_metadata: None,
+                        stdout: None,
+                        stderr: None,
                         command: "ls".to_string(),
                         aggregated_output: String::new(),
                         exit_code: None,
@@ -290,6 +294,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::from(CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
+                output_metadata: None,
                 id: "cmd-1".to_string(),
                 process_id: Some("123".to_string()),
                 parent_call_id: Some("exec-parent-1".to_string()),
@@ -321,6 +326,9 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
                 item: ExecThreadItem {
                     id: "item_0".to_string(),
                     details: ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                        output_metadata: None,
+                        stdout: None,
+                        stderr: None,
                         command: "ls".to_string(),
                         aggregated_output: "a.txt\n".to_string(),
                         exit_code: Some(0),
@@ -1575,6 +1583,9 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
     let started =
         processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
             item: ThreadItem::CommandExecution {
+                output_metadata: None,
+                stdout: None,
+                stderr: None,
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
                 cwd: test_path_buf("/tmp/project").abs().into(),
@@ -1601,6 +1612,9 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 item: ExecThreadItem {
                     id: "item_0".to_string(),
                     details: ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                        output_metadata: None,
+                        stdout: None,
+                        stderr: None,
                         command: "ls".to_string(),
                         aggregated_output: String::new(),
                         exit_code: None,
@@ -1625,6 +1639,9 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::CommandExecution {
+                    output_metadata: None,
+                    stdout: None,
+                    stderr: None,
                     id: "cmd-1".to_string(),
                     command: "ls".to_string(),
                     cwd: test_path_buf("/tmp/project").abs().into(),
@@ -1660,6 +1677,9 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                     item: ExecThreadItem {
                         id: "item_0".to_string(),
                         details: ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                            output_metadata: None,
+                            stdout: None,
+                            stderr: None,
                             command: "ls".to_string(),
                             aggregated_output: "a.txt\n".to_string(),
                             exit_code: Some(0),
@@ -1979,6 +1999,9 @@ fn turn_failure_prefers_structured_error_message() {
                 error: ThreadErrorEvent {
                     message: "backend failed (request id abc)".to_string(),
                 },
+                disposition: codex_exec::TurnFailureDisposition::Failed,
+                usage: None,
+                timing: None,
             })],
             status: CodexStatus::InitiateShutdown,
         }
@@ -2047,6 +2070,9 @@ fn interrupted_turn_emits_turn_failed_terminal_event() {
                 error: ThreadErrorEvent {
                     message: "turn interrupted".to_string(),
                 },
+                disposition: codex_exec::TurnFailureDisposition::Interrupted,
+                usage: None,
+                timing: None,
             })],
             status: CodexStatus::InitiateShutdown,
         }

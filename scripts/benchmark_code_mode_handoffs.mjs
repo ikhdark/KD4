@@ -8,13 +8,14 @@ import vm from 'node:vm';
 
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
-  console.log('Usage: node scripts/benchmark_code_mode_handoffs.mjs [--runs N] [--output PATH]\nRuns the same orchestration fixture as the native V8 test. No model, network, or repository mutation. Output includes source hashes, individual timings and coverage limits.');
+  console.log('Usage: node scripts/benchmark_code_mode_handoffs.mjs [--runs N] [--output PATH] [--model-evaluations PATH]\nRuns the same orchestration fixture as the native V8 test. No model, network, or repository mutation. Optionally compare independently reviewed live-model trials against fixtures/uncertainty_evaluation.json. Missing trials never establish semantic safety.');
   process.exit(0);
 }
-let runs = 5, output;
+let runs = 5, output, modelEvaluations;
 for (let i = 0; i < args.length; i += 2) {
   if (args[i] === '--runs') runs = Number(args[i + 1]);
   else if (args[i] === '--output' && args[i + 1]) output = args[i + 1];
+  else if (args[i] === '--model-evaluations' && args[i + 1]) modelEvaluations = args[i + 1];
   else throw Error(`unknown/missing argument: ${args[i]}`);
 }
 if (!Number.isInteger(runs) || runs < 1 || runs > 100) throw Error('--runs must be 1–100');
@@ -47,6 +48,59 @@ for (let i = 0; i < runs; i++) {
   }
 }
 const sorted = [...wallMs].sort((a, b) => a - b);
+let uncertaintyEvaluation = { status: 'unmeasured', accepted: false,
+  reason: 'Scripted helper/provider fixtures cannot establish model uncertainty handling.' };
+if (modelEvaluations) {
+  const fixtureBytes = await readFile(new URL('./fixtures/uncertainty_evaluation.json', import.meta.url));
+  const fixture = JSON.parse(fixtureBytes);
+  const trialBytes = await readFile(modelEvaluations);
+  const trials = JSON.parse(trialBytes);
+  const metrics = ['wallMs', 'modelRequests', 'toolCalls', 'validationMs', 'recoveries', 'retries'];
+  if (!Array.isArray(trials) || !trials.length) throw Error('model evaluations require paired trial records');
+  const groups = new Map();
+  for (const trial of trials) {
+    const scenario = fixture.cases.find(test => test.id === trial.caseId);
+    if (!scenario || !['baseline', 'candidate'].includes(trial.variant)
+        || (scenario.modes && !scenario.modes.includes(trial.compactionMode))
+        || !Number.isInteger(trial.pair) || trial.pair < 0
+        || ['model', 'provider', 'revision', 'reviewer'].some(key => typeof trial[key] !== 'string' || !trial[key].trim())
+        || !/^[a-f0-9]{64}$/.test(trial.transcriptSha256 ?? '')
+        || !/^[a-f0-9]{64}$/.test(trial.inputSha256 ?? '')
+        || metrics.some(key => !Number.isFinite(trial[key]) || trial[key] < 0)
+        || ['modelRequests', 'toolCalls', 'recoveries', 'retries', 'unsupportedConclusions'].some(key => !Number.isInteger(trial[key]) || trial[key] < 0)
+        || !['correct', 'complete'].every(key => typeof trial[key] === 'boolean')
+        || !scenario.assertions.every(key => typeof trial.assertions?.[key] === 'boolean')) {
+      throw Error('incomplete or invalid reviewed model trial');
+    }
+    const key = `${trial.caseId}:${trial.compactionMode ?? 'none'}:${trial.pair}`;
+    const group = groups.get(key) ?? {};
+    if (group[trial.variant]) throw Error(`duplicate trial ${key}:${trial.variant}`);
+    group[trial.variant] = trial;
+    groups.set(key, group);
+  }
+  const comparisons = [];
+  for (const [key, { baseline, candidate }] of groups) {
+    if (!baseline || !candidate || ['model', 'provider', 'inputSha256'].some(field => baseline[field] !== candidate[field])) {
+      throw Error(`unmatched model/input trial ${key}`);
+    }
+    const quality = trial => trial.correct && trial.complete && trial.unsupportedConclusions === 0
+      && Object.values(trial.assertions).every(value => value === true);
+    comparisons.push({ key, baselineCorrectAndComplete: quality(baseline),
+      candidateCorrectAndComplete: quality(candidate),
+      metrics: Object.fromEntries(metrics.map(metric => [metric, {
+        baseline: baseline[metric], candidate: candidate[metric], delta: candidate[metric] - baseline[metric],
+      }])) });
+  }
+  if (fixture.cases.some(test => (test.modes ?? [undefined]).some(mode =>
+      !trials.some(trial => trial.caseId === test.id && trial.compactionMode === mode)))) {
+    throw Error('missing required uncertainty case');
+  }
+  uncertaintyEvaluation = { status: 'reviewed_trials',
+    accepted: comparisons.every(row => row.candidateCorrectAndComplete && row.metrics.wallMs.delta <= 0),
+    fixtureSha256: createHash('sha256').update(fixtureBytes).digest('hex'),
+    trialsSha256: createHash('sha256').update(trialBytes).digest('hex'), comparisons,
+    limitation: 'Scores are supplied independent review, not inferred from call counts; pairing does not eliminate provider variance.' };
+}
 const report = {
   schemaVersion: 1, engine: process.version, runs, wallMs,
   medianMs: sorted.length % 2 ? sorted[Math.floor(sorted.length / 2)]
@@ -54,6 +108,7 @@ const report = {
   sources: files.map((path, i) => ({ path, bytes: Buffer.byteLength(sources[i]),
     sha256: createHash('sha256').update(sources[i]).digest('hex') })),
   passed: true,
+  uncertaintyEvaluation,
   coverage: ['bounded concurrency', 'batch deduplication', 'settled partial failure',
     'immutable UTF-8/CRLF recovery', 'gaps/hash drift/no-progress stops',
     'passive command drainage', 'all output packets retained', 'failure/input/handle stops'],

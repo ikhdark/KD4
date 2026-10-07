@@ -27,6 +27,7 @@ use tracing::info;
 
 // Bound allocation before JSON parsing and request-queue admission can run.
 const MAX_STDIN_LINE_BYTES: usize = 32 * 1024 * 1024;
+const STDIN_READ_AHEAD: usize = 1;
 const MAX_STDOUT_BATCH_MESSAGES: usize = 64;
 const STDOUT_BATCH_TARGET_BYTES: usize = 64 * 1024;
 
@@ -204,7 +205,9 @@ fn spawn_stdin_line_reader() -> IoResult<mpsc::Receiver<IoResult<String>>> {
     // Tokio's stdin reader uses an uncancellable blocking read that runtime shutdown waits for.
     // Keep that read on a detached OS thread so closing the async receiver lets this transport and
     // its runtime finish even when the client deliberately leaves stdin open.
-    let (line_tx, line_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    // One queued line plus the native reader's current line bounds staging to
+    // two frames, rather than CHANNEL_CAPACITY potentially 32-MiB messages.
+    let (line_tx, line_rx) = mpsc::channel(STDIN_READ_AHEAD);
     std::thread::Builder::new()
         .name("codex-app-server-stdin".to_string())
         .spawn(move || {
@@ -403,7 +406,7 @@ where
                 }
             }
             if let Some(write_complete_tx) = write_complete_tx {
-                let _ = write_complete_tx.send(());
+                let _ = write_complete_tx.send(std::time::Instant::now());
             }
         }
         // Release blocked router sends before close publication waits on ingress.
@@ -657,6 +660,37 @@ mod tests {
         read_stdin_lines(std::io::Cursor::new(b"1234567\n"), tx, 8);
         assert_eq!(rx.blocking_recv().unwrap().unwrap(), "1234567");
         assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn blocked_stdin_stages_at_most_one_queued_and_one_current_line() {
+        struct Counted {
+            cursor: std::io::Cursor<Vec<u8>>,
+            read: Arc<std::sync::atomic::AtomicUsize>,
+            two_lines: std::sync::mpsc::Sender<()>,
+        }
+        impl Read for Counted {
+            fn read(&mut self, bytes: &mut [u8]) -> IoResult<usize> { self.cursor.read(bytes) }
+        }
+        impl BufRead for Counted {
+            fn fill_buf(&mut self) -> IoResult<&[u8]> { self.cursor.fill_buf() }
+            fn consume(&mut self, amount: usize) {
+                self.cursor.consume(amount);
+                if self.read.fetch_add(amount, Ordering::SeqCst) + amount == 16 {
+                    let _ = self.two_lines.send(());
+                }
+            }
+        }
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ready, entered) = std::sync::mpsc::channel();
+        let input = Counted { cursor: std::io::Cursor::new(b"1234567\n".repeat(128)), read: Arc::clone(&read), two_lines: ready };
+        let (tx, rx) = mpsc::channel(STDIN_READ_AHEAD);
+        let reader = std::thread::spawn(move || read_stdin_lines(input, tx, 8));
+        entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(read.load(Ordering::SeqCst), 16);
+        drop(rx);
+        reader.join().unwrap();
+        assert_eq!(read.load(Ordering::SeqCst), 16);
     }
 
     #[tokio::test]

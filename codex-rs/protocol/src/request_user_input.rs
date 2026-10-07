@@ -134,10 +134,23 @@ pub struct RequestUserInputAnswer {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestUserInputDisposition {
+    Answered,
+    TimedOut,
+    Skipped,
+    Interrupted,
+    TransportError,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct RequestUserInputResponse {
     pub answers: HashMap<String, RequestUserInputAnswer>,
     #[serde(default)]
     pub interrupted: bool,
+    /// Absent for legacy clients; empty legacy answers do not imply approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<RequestUserInputDisposition>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]

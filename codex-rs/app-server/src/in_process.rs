@@ -549,7 +549,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         }
                     }
                     if let Some(ack) = queued.write_complete_tx {
-                        let _ = ack.send(());
+                        let _ = ack.send(std::time::Instant::now());
                     }
                 }
             }
@@ -848,7 +848,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         }
                     }
                     if let Some(write_complete_tx) = queued_message.write_complete_tx {
-                        let _ = write_complete_tx.send(());
+                        let _ = write_complete_tx.send(std::time::Instant::now());
                     }
                 }
             }

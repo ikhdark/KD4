@@ -653,7 +653,6 @@ async fn delegated_user_input_preserves_answers_and_reports_interruption() {
         let cancel_token = CancellationToken::new();
         let mut request = Box::pin(handle_request_user_input(
             &child,
-            "child-input".to_string(),
             &parent_session,
             &parent_ctx,
             RequestUserInputEvent {
@@ -683,6 +682,8 @@ async fn delegated_user_input_preserves_answers_and_reports_interruption() {
         assert_eq!(event.questions[0].id, "next");
 
         let expected = RequestUserInputResponse {
+            disposition: matches!(outcome, "cancelled" | "closed").then_some(
+                codex_protocol::request_user_input::RequestUserInputDisposition::Interrupted),
             answers: if outcome == "answered" {
                 HashMap::from([(
                     "next".to_string(),
@@ -719,7 +720,8 @@ async fn delegated_user_input_preserves_answers_and_reports_interruption() {
         assert_eq!(
             submission.submission.op,
             Op::UserInputAnswer {
-                id: "child-input".to_string(),
+                id: "child-turn".to_string(),
+                call_id: Some("child-input".to_string()),
                 response: expected,
             },
             "outcome: {outcome}"

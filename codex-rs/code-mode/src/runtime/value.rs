@@ -268,7 +268,8 @@ pub(super) fn v8_value_to_json_with_limit(
 ) -> Result<Option<JsonValue>, JsonConversionError> {
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
-    let Some(stringified) = v8::json::stringify(&tc, value) else {
+    let Some(stringified) = super::output_projection::json_codec(&mut tc, value, "stringify")
+        .and_then(|value| v8::Local::<v8::String>::try_from(value).ok()) else {
         if tc.has_caught() {
             return Err(JsonConversionError::Invalid(tc
                 .exception()
@@ -298,22 +299,50 @@ pub(super) fn serialized_json_to_v8<'s>(
     json: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
     let json = v8::String::new(scope, json)?;
-    v8::json::parse(scope, json)
+    super::output_projection::json_codec(scope, json.into(), "parse")
 }
 
 pub(super) fn value_to_error_text(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
 ) -> String {
-    if value.is_object()
-        && let Ok(object) = v8::Local::<v8::Object>::try_from(value)
-        && let Some(key) = v8::String::new(scope, "stack")
-        && let Some(stack) = object.get(scope, key.into())
-        && stack.is_string()
-    {
-        return stack.to_rust_string_lossy(scope);
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let object = v8::Local::<v8::Object>::try_from(value).ok();
+    let stack = object.and_then(|object| {
+        let key = v8::String::new(&tc, "stack")?;
+        v8::Local::<v8::String>::try_from(object.get(&tc, key.into())?).ok()
+    });
+    tc.reset();
+    let mut text = stack
+        .map(|stack| bounded_string(&mut tc, stack, MAX_NOTIFICATION_BYTES)
+            .unwrap_or_else(|_| "[error stack exceeds 1 MiB]".to_string()))
+        .unwrap_or_else(|| value.to_rust_string_lossy(&tc));
+    // Uncaught helper failures must carry their settled receipts through the
+    // existing canonical cell-output artifact, not just the small nested-call
+    // fallback. Do not run this on successful results or emit extra tool calls.
+    if let Some(object) = object {
+        for field in ["results", "evidence"] {
+            let Some(key) = v8::String::new(&tc, field) else { continue; };
+            let attached = object.get(&tc, key.into());
+            tc.reset();
+            let Some(attached) = attached.filter(|value| !value.is_undefined()) else { continue; };
+            let remaining = MAX_PAYLOAD_BYTES.saturating_sub(text.len() + field.len() + 32);
+            let mut serialized = super::output_projection::stringify(&mut tc, attached)
+                .and_then(|json| bounded_string(&mut tc, json, remaining).ok());
+            tc.reset();
+            if serialized.is_none() {
+                serialized = super::output_projection::json_codec(&mut tc, attached, "helper_evidence")
+                    .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
+                    .and_then(|json| bounded_string(&mut tc, json, remaining).ok());
+                tc.reset();
+            }
+            text.push_str(&format!("\nHelper {field}:\n"));
+            text.push_str(serialized.as_deref().unwrap_or(
+                "[evidence unavailable: unserializable or exceeds remaining 8 MiB error budget]"));
+        }
     }
-    value.to_rust_string_lossy(scope)
+    text
 }
 
 pub(super) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {

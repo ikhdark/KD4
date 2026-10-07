@@ -55,6 +55,7 @@ pub const MAX_IN_FLIGHT_REQUESTS: usize = 256;
 pub const MAX_PENDING_DELEGATE_REQUESTS: usize = 256;
 pub const TOOL_CATALOG_CAPABILITY: &str = "tool-catalog-v1";
 pub const NAMED_STATE_CAPABILITY: &str = "named-state-v1";
+pub const RECEIPT_RECOVERY_CAPABILITY: &str = "terminal-receipt-recovery-v1";
 
 #[cfg(test)]
 #[path = "host_tests.rs"]

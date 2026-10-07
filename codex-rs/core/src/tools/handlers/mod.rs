@@ -8,7 +8,6 @@ pub(crate) mod command_search;
 pub(crate) mod command_shape;
 #[cfg(test)]
 mod command_windows_corpus_tests;
-mod context_checkpoint;
 mod current_time;
 mod get_context_remaining;
 mod get_context_remaining_spec;
@@ -31,7 +30,6 @@ pub(crate) mod multi_agents_v2;
 mod plan;
 pub(crate) mod plan_spec;
 mod read_file;
-pub(crate) use context_checkpoint::ContextCheckpointHandler;
 mod read_tool_output;
 pub(crate) mod read_tool_output_spec;
 mod request_permissions;
@@ -93,6 +91,7 @@ pub use mcp_resource::ListMcpResourcesHandler;
 pub use mcp_resource::ReadMcpResourceHandler;
 pub use plan::PlanHandler;
 pub(crate) use read_file::ReadFileHandler;
+pub(crate) use read_file::ReadStatusHandler;
 pub use read_tool_output::ReadToolOutputHandler;
 #[cfg(test)]
 pub(crate) use read_tool_output::execute_recovery_transaction;
@@ -103,6 +102,7 @@ pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
 pub use shell::ShellCommandHandler;
 pub(crate) use shell::ShellCommandHandlerOptions;
+pub(crate) use shell::VALIDATION_COMMAND_TIMEOUT_MS;
 pub use sleep::SleepHandler;
 pub use test_sync::TestSyncHandler;
 pub(crate) use tool_search::ToolSearchHandlerCache;
@@ -113,6 +113,7 @@ pub(crate) use unified_exec::validate_exec_command_arguments;
 pub(crate) use read_file::validate_read_file_arguments;
 pub(crate) use read_file::canonical_read_file_arguments;
 pub(crate) use read_file::reselect_read_file_output;
+pub(crate) use read_file::validate_retained_file_hash;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 
@@ -341,7 +342,14 @@ pub(crate) fn resolve_tool_environment<'a>(
     environment_id: Option<&str>,
 ) -> Result<Option<&'a TurnEnvironment>, FunctionCallError> {
     environment_id.map_or_else(
-        || Ok(environments.primary()),
+        || {
+            if environments.starting.iter().any(|environment| environment.selection_index == 0) {
+                return Err(FunctionCallError::RespondToModel(
+                    "the selected primary environment is not ready; no other environment was selected".into(),
+                ));
+            }
+            Ok(environments.primary())
+        },
         |environment_id| {
             environments
                 .turn_environments
@@ -375,7 +383,8 @@ pub(crate) async fn wait_for_tool_environment(
     let starting = match environment_id {
         Some(id) => environments.starting.iter()
             .find(|environment| environment.selection.environment_id == id),
-        None => environments.starting.first(),
+        None => environments.starting.iter()
+            .find(|environment| environment.selection_index == 0),
     };
     let Some(starting) = starting else {
         return resolve_tool_environment(environments, environment_id)

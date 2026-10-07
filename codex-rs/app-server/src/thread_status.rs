@@ -227,6 +227,7 @@ impl ThreadWatchManager {
 
     pub(crate) async fn note_turn_started(&self, thread_id: &str) {
         self.update_runtime_for_thread(thread_id, |runtime| {
+            runtime.harness_phases.clear();
             runtime.is_loaded = true;
             runtime.running = true;
             runtime.has_system_error = false;
@@ -236,6 +237,16 @@ impl ThreadWatchManager {
 
     pub(crate) async fn note_turn_completed(&self, thread_id: &str, failed: bool) {
         self.clear_active_state(thread_id, Some(failed)).await;
+    }
+
+    pub(crate) async fn note_harness_phases(
+        &self, thread_id: &str, phases: Vec<codex_protocol::protocol::HarnessPhase>,
+    ) {
+        self.update_runtime_for_thread(thread_id, move |runtime| {
+            if runtime.running {
+                runtime.harness_phases = phases;
+            }
+        }).await;
     }
 
     pub(crate) async fn note_turn_aborted(&self, thread_id: &str, reason: &TurnAbortReason) {
@@ -560,6 +571,7 @@ impl ThreadWatchState {
 
 #[derive(Clone, Default)]
 struct RuntimeFacts {
+    harness_phases: Vec<codex_protocol::protocol::HarnessPhase>,
     lifecycle: Arc<()>,
     is_loaded: bool,
     running: bool,
@@ -574,6 +586,20 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
     }
 
     let mut active_flags = Vec::new();
+    if runtime.running {
+        active_flags.extend(runtime.harness_phases.iter().map(|phase| {
+            use codex_protocol::protocol::HarnessPhase;
+            match phase {
+                HarnessPhase::ResourceResolution => ThreadActiveFlag::ResolvingResources,
+                HarnessPhase::DiffTracker => ThreadActiveFlag::WaitingOnDiffTracker,
+                HarnessPhase::WorkspaceGate => ThreadActiveFlag::WaitingOnWorkspaceGate,
+                HarnessPhase::EvidenceTracker => ThreadActiveFlag::WaitingOnEvidenceTracker,
+                HarnessPhase::Delivery => ThreadActiveFlag::WaitingOnDelivery,
+                HarnessPhase::ProcessCleanup => ThreadActiveFlag::WaitingOnProcessCleanup,
+                HarnessPhase::ReadyToSample => ThreadActiveFlag::ReadyToSample,
+            }
+        }));
+    }
     if runtime.pending_permission_requests > 0 {
         active_flags.push(ThreadActiveFlag::WaitingOnApproval);
     }

@@ -52,6 +52,30 @@ pub enum ToolSpec {
 }
 
 impl ToolSpec {
+    /// Complete callable contract, distinct from the Responses wire schema.
+    pub fn callable_contract(&self) -> Value {
+        let mut value = serde_json::to_value(self).expect("tool specs serialize");
+        match self {
+            Self::Function(tool) => {
+                if let Some(output) = &tool.output_schema {
+                    value["output_schema"] = output.to_value();
+                }
+            }
+            Self::Namespace(namespace) => {
+                for (child, tool) in value["tools"].as_array_mut().expect("namespace tools")
+                    .iter_mut().zip(&namespace.tools)
+                {
+                    let crate::ResponsesApiNamespaceTool::Function(tool) = tool;
+                    if let Some(output) = &tool.output_schema {
+                        child["output_schema"] = output.to_value();
+                    }
+                }
+            }
+            _ => {}
+        }
+        crate::json_schema::canonical_json(value)
+    }
+
     pub fn name(&self) -> &str {
         match self {
             ToolSpec::Function(tool) => tool.name.as_str(),

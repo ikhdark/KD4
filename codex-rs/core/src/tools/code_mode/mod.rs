@@ -71,6 +71,13 @@ const FAILED_CELL_ITEM_TOOL: &str = "code_mode_cell";
 /// canonical artifact retains, so admission must name that artifact.
 pub(crate) const VISIBLE_OUTPUT_TRUNCATED_KEY: &str = "visible_output_truncated";
 
+/// Process exit is not output completion: a terminal command can still own a
+/// drainable pipe and must keep its handle in rendering and history admission.
+pub(crate) fn command_owns_work(state: &JsonValue) -> bool {
+    state["session_id"].as_u64().is_some()
+        && (state["process_exited"] != true || state["output_complete"] == false)
+}
+
 /// Returns true for the un-namespaced code-mode `exec` tool.
 pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
     tool_name.namespace.is_none() && tool_name.name == PUBLIC_TOOL_NAME
@@ -91,6 +98,7 @@ pub(crate) struct ExecContext {
 
 pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
+    recovery_path: Option<std::path::PathBuf>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
     packet_admission: Mutex<CodeModePacketAdmission>,
@@ -109,6 +117,7 @@ struct CodeModePacketMetrics {
     output_budget: Option<usize>,
     delivery_intent: Option<CodeModeDeliveryIntent>,
     delivery_blocked: bool,
+    delivery_recovery: HashMap<String, DeliveryArtifactCoverage>,
     command_states: Vec<JsonValue>,
     next_nested_ordinal: usize,
     nested_call_count: usize,
@@ -116,6 +125,7 @@ struct CodeModePacketMetrics {
     result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
+    nested_recovery: std::collections::BTreeMap<usize, JsonValue>,
     omitted_nested_result_count: usize,
     first_required_terminal: Option<CodeModeNestedTerminal>,
 }
@@ -125,6 +135,55 @@ struct CodeModeDeliveryIntent {
     input_activity: tokio::sync::watch::Receiver<crate::session::InputQueueActivity>,
     schema: Option<JsonValue>,
     limit: usize,
+}
+
+#[derive(Default)]
+struct DeliveryArtifactCoverage {
+    sha256: String,
+    bytes: u64,
+    ranges: Vec<(u64, u64)>,
+    // Empty means the whole canonical artifact. Otherwise only these requested
+    // selections are required; unrelated source bytes are not an obligation.
+    required_ranges: Vec<(u64, u64)>,
+}
+
+impl DeliveryArtifactCoverage {
+    fn recovered(&self) -> bool {
+        if self.required_ranges.is_empty() {
+            self.bytes == 0 || self.ranges.first().is_some_and(|range| *range == (0, self.bytes))
+        } else {
+            self.required_ranges.iter().all(|(start, end)| start == end
+                || self.ranges.iter().any(|range| range.0 <= *start && *end <= range.1))
+        }
+    }
+
+    fn observe(&mut self, evidence: &JsonValue) {
+        if evidence["identity"]["sha256"].as_str() != Some(self.sha256.as_str()) { return; }
+        if let Some(ranges) = evidence["identity"]["ranges"].as_array() {
+            for range in ranges {
+                if let (Some(start), Some(end)) = (range[0].as_u64(), range[1].as_u64())
+                    && start <= end && end <= self.bytes
+                {
+                    self.ranges.push((start, end));
+                }
+            }
+        }
+        // A successful root JSON selection is also the entire canonical value.
+        if evidence["identity"]["values"].as_array().is_some_and(|values| values.iter().any(|value|
+            value["selector"]["kind"] == "json_pointer"
+                && value["selector"]["pointer"] == "" && value.get("value").is_some()))
+        {
+            self.ranges.push((0, self.bytes));
+        }
+        self.ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in self.ranges.drain(..) {
+            if let Some(last) = merged.last_mut() && start <= last.1 {
+                last.1 = last.1.max(end);
+            } else { merged.push((start, end)); }
+        }
+        self.ranges = merged;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +198,8 @@ struct CodeModeNestedResultEvidence {
     failed: bool,
     #[serde(skip)]
     command_state: Option<JsonValue>,
+    #[serde(skip)]
+    output_fingerprints: Vec<(String, usize, [u8; 32])>,
     #[serde(skip)]
     ordinal: usize,
     call_id: String,
@@ -157,6 +218,7 @@ struct CodeModePacketReceipt {
     result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
+    nested_recovery: std::collections::BTreeMap<usize, JsonValue>,
     omitted_nested_result_count: usize,
     first_required_terminal: Option<CodeModeNestedTerminal>,
 }
@@ -232,6 +294,7 @@ impl CodeModeService {
         let dispatch_broker = Arc::new(CodeModeDispatchBroker::new());
         Self {
             session: OnceCell::new(),
+            recovery_path: None,
             session_provider,
             dispatch_broker,
             packet_admission: Mutex::new(CodeModePacketAdmission::default()),
@@ -239,6 +302,11 @@ impl CodeModeService {
             trace_tails: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn with_recovery_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.recovery_path = Some(path.as_ref().to_path_buf());
+        self
     }
 
     pub(crate) fn session_provider(&self) -> Arc<dyn CodeModeSessionProvider> {
@@ -254,8 +322,11 @@ impl CodeModeService {
 
     pub(crate) async fn wait(
         &self,
-        request: codex_code_mode::WaitRequest,
+        mut request: codex_code_mode::WaitRequest,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
+        request.recovery = self.recovery_path.clone().map(|path| codex_code_mode::ReceiptRecovery {
+            path, terminal_only: false,
+        });
         self.session().await?.wait(request).await
     }
 
@@ -264,6 +335,7 @@ impl CodeModeService {
         cell_id: codex_code_mode::CellId,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
         self.wait(codex_code_mode::WaitRequest {
+            recovery: None,
             cell_id,
             yield_time_ms: codex_code_mode::OWNER_HELD_DECISION_YIELD_TIME_MS,
         })
@@ -365,30 +437,38 @@ impl CodeModeService {
         cell_id: &CellId,
         turn: &TurnContext,
         response: &RuntimeResponse,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, JsonValue> {
         let mut admission = self.packet_admission
             .lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let metrics = admission.cells.get_mut(cell_id.as_str())?;
+        let Some(metrics) = admission.cells.get_mut(cell_id.as_str()) else { return Ok(None); };
         if let RuntimeResponse::Yielded { content_items, .. }
             | RuntimeResponse::ExplicitYield { content_items, .. } = response
         {
             // A partial visible answer cannot safely be delivered again, or
             // reconstructed from an incomplete tail. Empty yields retain intent.
+            let requested = metrics.delivery_intent.is_some();
             if !content_items.is_empty() {
                 metrics.delivery_intent = None;
             }
-            return None;
+            return if requested { Err(serde_json::json!({"category":if content_items.is_empty() {
+                "cell_running" } else { "partial_output" }, "cell_id":cell_id.as_str()})) } else { Ok(None) };
         }
-        let intent = metrics.delivery_intent.take()?;
-        if intent.turn_id != turn.sub_id
-            || intent.schema != turn.final_output_json_schema
-            || intent.input_activity.has_changed().unwrap_or(true)
-            || metrics.delivery_blocked
-            || metrics.first_required_terminal.is_some()
-            || metrics.command_states.iter().any(|state| {
+        let Some(intent) = metrics.delivery_intent.take() else { return Ok(None); };
+        let refusal = if intent.turn_id != turn.sub_id { Some("turn_changed") }
+            else if intent.schema != turn.final_output_json_schema { Some("schema_changed") }
+            else if intent.input_activity.has_changed().unwrap_or(true) { Some("input_changed") }
+            else if metrics.delivery_blocked { Some("nested_work_failed_or_incomplete") }
+            else if metrics.delivery_recovery.values().any(|coverage| !coverage.recovered()) {
+                Some("evidence_recovery_pending")
+            }
+            else if metrics.first_required_terminal.is_some() { Some("required_tool_failed") }
+            else { None };
+        if let Some(category) = refusal { return Err(serde_json::json!({"category":category})); }
+        if let Some(state) = metrics.command_states.iter().find(|state| {
                 // Absence of a running flag is not terminal proof. The command
                 // owner must settle execution and deferred work affirmatively.
                 state.get("execution_state").and_then(JsonValue::as_str) != Some("exited")
+                    || state.get("session_id").is_some_and(|id| !id.is_null())
                     || state.get("process_exited").and_then(JsonValue::as_bool) != Some(true)
                     || !(state.get("exit_code").and_then(JsonValue::as_i64) == Some(0)
                         || (state["search_no_match"] == true && state["exit_code"] == 1))
@@ -397,13 +477,20 @@ impl CodeModeService {
                         .is_some_and(|pending| !pending.as_array().is_some_and(Vec::is_empty))
             })
         {
-            return None;
+            let category = if state.get("pending_deferred_completions")
+                .is_some_and(|pending| !pending.as_array().is_some_and(Vec::is_empty)) {
+                "deferred_work_pending"
+            } else if state["execution_state"] == "running" || state["session_id"].is_number() {
+                "command_running_or_draining"
+            } else { "command_failed_or_unverified" };
+            return Err(serde_json::json!({"category":category, "session_id":state["session_id"],
+                "execution_state":state["execution_state"], "exit_code":state["exit_code"]}));
         }
         execute_handler::schema_validated_delivery(
             response,
             intent.limit.min(metrics.output_budget.unwrap_or(intent.limit)),
             intent.schema.as_ref(),
-        )
+        ).map(Some)
     }
 
     pub(crate) fn cell_parent_call_id(&self, cell_id: &CellId) -> Option<String> {
@@ -412,6 +499,89 @@ impl CodeModeService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(cell_id.as_str())
             .cloned()
+    }
+
+    fn record_delivery_evidence(
+        &self,
+        cell_id: &CellId,
+        artifact_required: bool,
+        artifact: Option<(String, String, u64)>,
+        signal: Option<&JsonValue>,
+        value: &JsonValue,
+    ) -> Option<JsonValue> {
+        let mut admission = self.packet_admission.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(metrics) = admission.cells.get_mut(cell_id.as_str()) else { return None; };
+        let mut recovery = None;
+        if artifact_required {
+            if let Some((id, sha256, bytes)) = artifact {
+                let text = value.as_str().or_else(|| value["output"].as_str());
+                let parsed = text.and_then(|text| serde_json::from_str::<JsonValue>(text).ok());
+                let exact = text.is_some_and(|text| format!("{:x}", Sha256::digest(text.as_bytes())) == sha256)
+                    || serde_json::to_vec(parsed.as_ref().unwrap_or(value)).is_ok_and(|bytes|
+                        format!("{:x}", Sha256::digest(bytes)) == sha256);
+                let coverage = metrics.delivery_recovery.entry(id.clone()).or_insert_with(||
+                    DeliveryArtifactCoverage { sha256, bytes, ranges: Vec::new(), required_ranges: Vec::new() });
+                // An originating canonical-output obligation covers the whole
+                // artifact, even if earlier calls requested only a subset.
+                coverage.required_ranges.clear();
+                if exact { coverage.ranges = vec![(0, coverage.bytes)]; }
+                if !coverage.recovered() {
+                    recovery = Some(serde_json::json!({
+                        "artifact_id": id, "canonical_sha256": coverage.sha256,
+                        "canonical_bytes": coverage.bytes, "tool": "read_tool_output",
+                        "arguments": {"artifact_id": id, "selectors": [
+                            {"kind": "bytes", "start": 0, "end": coverage.bytes}
+                        ]},
+                    }));
+                }
+            } else {
+                // Without authenticated identity, a later arbitrary read cannot
+                // prove this missing canonical output was recovered.
+                metrics.delivery_blocked = true;
+            }
+        }
+        if value["complete"] == false
+            && let (Some(id), Some(sha256), Some(bytes), Some(results)) = (
+                value["artifact_id"].as_str(), value["canonical_sha256"].as_str(),
+                value["canonical_bytes"].as_u64(), value["results"].as_array(),
+            )
+        {
+            let required_ranges = results.iter().filter_map(|result| {
+                let start = result["canonical_range"]["start"].as_u64()?;
+                let end = result["canonical_range"]["end"].as_u64()?;
+                (start <= end && end <= bytes).then_some((start, end))
+            }).collect::<Vec<_>>();
+            if required_ranges.is_empty() {
+                // A cursor without authenticated ranges is not proof of exact
+                // coverage. Do not make an incomplete search deliverable.
+                metrics.delivery_blocked = true;
+            } else {
+                match metrics.delivery_recovery.entry(id.to_string()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(DeliveryArtifactCoverage {
+                            sha256: sha256.to_string(), bytes, ranges: Vec::new(), required_ranges,
+                        });
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        if !entry.get().required_ranges.is_empty() {
+                            entry.get_mut().required_ranges.extend(required_ranges);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(evidence) = signal.and_then(|signal| signal.get("semantic_evidence"))
+            && evidence["source"] == "artifact"
+            && let Some(id) = evidence["scope"].as_str()
+            && let Some(coverage) = metrics.delivery_recovery.get_mut(id)
+        {
+            coverage.observe(evidence);
+        }
+        // Keep only unresolved ownership. Exact data and resolved recovery stay
+        // in the existing evidence/history owners, not a growing cell ledger.
+        metrics.delivery_recovery.retain(|_, coverage| !coverage.recovered());
+        recovery
     }
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
@@ -443,6 +613,14 @@ impl CodeModeService {
         metrics.next_nested_ordinal = metrics.next_nested_ordinal.saturating_add(1);
         metrics.nested_call_count = metrics.nested_call_count.saturating_add(1);
         Some(ordinal)
+    }
+
+    fn record_packet_recovery(&self, cell_id: &CellId, ordinal: usize, recovery: JsonValue) {
+        if let Some(metrics) = self.packet_admission.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).cells.get_mut(cell_id.as_str())
+        {
+            metrics.nested_recovery.insert(ordinal, recovery);
+        }
     }
 
     #[expect(
@@ -477,6 +655,12 @@ impl CodeModeService {
             .post_tool_use_feedback
             .extend(post_tool_use_feedback);
         if let Some(nested_result) = nested_result {
+            metrics.nested_recovery.entry(ordinal).or_insert_with(|| serde_json::json!({
+                "call_id": nested_result.call_id, "tool_name": nested_result.tool_name,
+                "failed": nested_result.failed, "output": nested_result.output,
+                "output_truncated": nested_result.output_truncated,
+                "recovery_available": !nested_result.output_truncated,
+            }));
             if let Some(state) = &nested_result.command_state {
                 let session = command_state_session(state);
                 if let Some(session) = session {
@@ -556,6 +740,7 @@ impl CodeModeService {
                 metrics.output_budget = packet.output_budget;
                 metrics.delivery_intent = packet.delivery_intent.take();
                 metrics.delivery_blocked = packet.delivery_blocked;
+                metrics.delivery_recovery = std::mem::take(&mut packet.delivery_recovery);
                 if metrics.delivery_intent.is_some() {
                     metrics.command_states = packet.command_states.clone();
                 }
@@ -575,6 +760,7 @@ impl CodeModeService {
             result_bytes: metrics.result_bytes,
             post_tool_use_feedback: metrics.post_tool_use_feedback,
             nested_results: metrics.nested_results,
+            nested_recovery: metrics.nested_recovery,
             omitted_nested_result_count: metrics.omitted_nested_result_count,
             first_required_terminal: metrics.first_required_terminal,
         }
@@ -690,13 +876,15 @@ pub(super) fn handle_runtime_response(
         "code-mode packet admission receipt"
     );
     let mut post_tool_use_feedback = packet.post_tool_use_feedback;
-    let nested_results = if response_needs_retained_nested_results(&response) {
+    let needs_retained_results = response_needs_retained_nested_results(&response);
+    let nested_results = if needs_retained_results {
         if packet.omitted_nested_result_count > 0 {
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
-                text: format!(
-                    "{} additional nested tool results were omitted from this fallback output; it retains at most {MAX_RETAINED_NESTED_RESULTS} results. Use text(...) to include the results needed from a script.",
-                    packet.omitted_nested_result_count,
-                ),
+                text: serde_json::json!({
+                    "nested_result_recovery_directory": packet.nested_recovery.into_values().collect::<Vec<_>>(),
+                    "omitted_inline_result_count": packet.omitted_nested_result_count,
+                    "notice": "Inline diagnostics retain at most two results. Recover settled outcomes through this directory; do not rerun successful siblings. Artifact bytes are historical evidence, not fresh execution.",
+                }).to_string(),
             });
         }
         packet.nested_results
@@ -730,9 +918,24 @@ pub(super) fn handle_runtime_response(
             });
         }
     }
+    // Reserve the controls before admitting ordinary text to the shared budget.
+    // Controls and the failure itself remain visible even at a zero text budget.
+    let control_tokens = codex_utils_output_truncation::model_token_count(
+        &code_mode_text_content(&command_control_receipts(&canonical_states, "", completed_cleanly)),
+    );
+    let diagnostic_tokens = match &response {
+        RuntimeResponse::Result { error_text: Some(error), .. } =>
+            codex_utils_output_truncation::model_token_count(&format!("Script error:\n{error}")),
+        _ => 0,
+    };
+    let requested = max_output_tokens.unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL).min(hard_limit);
+    let text_budget = requested.saturating_sub(control_tokens)
+        .max(diagnostic_tokens.min(requested))
+        .max(usize::from(requested > 0)); // Preserve an omission marker beside mandatory controls.
+    let completed_cell_id = cell_id.to_string();
     let mut output = format_runtime_response(
         response,
-        max_output_tokens,
+        Some(text_budget),
         hard_limit,
         original_image_detail_supported,
         started_at,
@@ -740,19 +943,51 @@ pub(super) fn handle_runtime_response(
         nested_results,
         packet.first_required_terminal,
     );
+    if completed_cleanly && !needs_retained_results {
+        // The script consumed its recovery results and emitted its own result.
+        // Keep drain accounting without appending raw recovered pages to that
+        // computed answer. Failed, silent, and yielded cells retain the fallback.
+        let service = &exec.session.services.code_mode_service;
+        let receipts = service.owner_drained_continuation_snapshot(&completed_cell_id)
+            .into_iter().map(|continuation| continuation.receipt).collect::<Vec<_>>();
+        service.acknowledge_owner_drained_continuations(&completed_cell_id, &receipts);
+        output.deterministic_continuation_receipts.extend(receipts);
+    }
+    output.body.extend(command_control_receipts(
+        &canonical_states, &code_mode_text_content(&output.body), completed_cleanly,
+    ));
+    output.essential_inline.insert(
+        "nested_commands".into(),
+        JsonValue::Array(canonical_states.clone()),
+    );
+    if !canonical_states.is_empty()
+        && let Some(canonical) = &mut output.canonical_body
+    {
+        canonical.push(FunctionCallOutputContentItem::InputText {
+            text: serde_json::json!({"nested_commands": canonical_states}).to_string(),
+        });
+    }
+    Ok(output)
+}
+
+fn command_control_receipts(
+    states: &[JsonValue],
+    visible: &str,
+    completed_cleanly: bool,
+) -> Vec<FunctionCallOutputContentItem> {
+    let mut items = Vec::new();
     // A zero text budget must not erase the only handle for still-owned work.
-    for state in &canonical_states {
+    for state in states {
         // A terminal process may still own an undrained pipe. Its handle is
         // actionable until the command owner removes it, even after exit.
-        if state["session_id"].as_u64().is_some()
-            && (state["process_exited"] != true || state["output_complete"] == false)
-            && !shows_session_handle(&code_mode_text_content(&output.body), &state["session_id"])
+        if command_owns_work(state)
+            && !shows_session_handle(visible, state)
         {
-            output.body.push(FunctionCallOutputContentItem::InputText {
+            items.push(FunctionCallOutputContentItem::InputText {
                 text: format!("Running command session_id: {}", state["session_id"]),
             });
             if state["session_capabilities"].is_object() {
-                output.body.push(FunctionCallOutputContentItem::InputText {
+                items.push(FunctionCallOutputContentItem::InputText {
                     text: serde_json::json!({
                         "session_id": state["session_id"],
                         "session_capabilities": state["session_capabilities"],
@@ -767,10 +1002,12 @@ pub(super) fn handle_runtime_response(
             && !(completed_cleanly && state["display_suppressed"] == true)
         {
             let mut receipt = serde_json::json!({
-                "output_truncated": true,
+                "nested_command_display_reduced": true,
+                "call_id": state["call_id"],
+                "cumulative_streams_complete": state["streams_complete"],
             });
             if let Some(artifact_id) = state["raw_output_artifact_id"].as_str() {
-                if shows_command_recovery(&code_mode_text_content(&output.body), state) {
+                if shows_command_recovery(visible, state) {
                     continue;
                 }
                 receipt["artifact_id"] = artifact_id.into();
@@ -793,23 +1030,12 @@ pub(super) fn handle_runtime_response(
             if state["raw_output_artifact_retention_limit_hit"] == true {
                 receipt["raw_output_artifact_retention_limit_hit"] = JsonValue::Bool(true);
             }
-            output.body.push(FunctionCallOutputContentItem::InputText {
+            items.push(FunctionCallOutputContentItem::InputText {
                 text: receipt.to_string(),
             });
         }
     }
-    output.essential_inline.insert(
-        "nested_commands".into(),
-        JsonValue::Array(canonical_states.clone()),
-    );
-    if !canonical_states.is_empty()
-        && let Some(canonical) = &mut output.canonical_body
-    {
-        canonical.push(FunctionCallOutputContentItem::InputText {
-            text: serde_json::json!({"nested_commands": canonical_states}).to_string(),
-        });
-    }
-    Ok(output)
+    items
 }
 
 fn failed_code_mode_cell_item(
@@ -817,21 +1043,24 @@ fn failed_code_mode_cell_item(
     response: &RuntimeResponse,
     duration: Duration,
 ) -> Option<DynamicToolCallItem> {
-    let (cell_id, error) = match response {
+    let (cell_id, state, status, error) = match response {
         RuntimeResponse::Result {
             cell_id,
             error_text: Some(error),
             ..
-        } => (cell_id.as_str(), bounded_failed_cell_error(error)),
+        } => (cell_id.as_str(), "failed", DynamicToolCallStatus::Failed, Some(bounded_failed_cell_error(error))),
         RuntimeResponse::Terminated { cell_id, .. } => (
             cell_id.as_str(),
-            "code-mode cell terminated before completion".to_string(),
+            "terminated",
+            DynamicToolCallStatus::Failed,
+            Some("code-mode cell terminated before completion".to_string()),
         ),
-        RuntimeResponse::Yielded { .. }
-        | RuntimeResponse::ExplicitYield { .. }
-        | RuntimeResponse::Result {
-            error_text: None, ..
-        } => return None,
+        RuntimeResponse::Yielded { cell_id, .. } =>
+            (cell_id.as_str(), "in_progress", DynamicToolCallStatus::InProgress, None),
+        RuntimeResponse::ExplicitYield { cell_id, .. } =>
+            (cell_id.as_str(), "yielded", DynamicToolCallStatus::InProgress, None),
+        RuntimeResponse::Result { cell_id, error_text: None, .. } =>
+            (cell_id.as_str(), "completed", DynamicToolCallStatus::Completed, None),
     };
 
     Some(DynamicToolCallItem {
@@ -841,11 +1070,16 @@ fn failed_code_mode_cell_item(
         arguments: serde_json::json!({
             "call_id": call_id,
             "cell_id": cell_id,
+            "state": state,
         }),
-        status: DynamicToolCallStatus::Failed,
+        success: match status {
+            DynamicToolCallStatus::InProgress => None,
+            DynamicToolCallStatus::Completed => Some(true),
+            DynamicToolCallStatus::Failed => Some(false),
+        },
+        status,
         content_items: None,
-        success: Some(false),
-        error: Some(error),
+        error,
         duration: Some(duration),
     })
 }
@@ -873,9 +1107,15 @@ pub(super) async fn emit_failed_code_mode_cell_item(
     let Some(item) = failed_code_mode_cell_item(call_id, response, started_at.elapsed()) else {
         return;
     };
-    exec.session
-        .emit_turn_item_completed(exec.turn.as_ref(), TurnItem::DynamicToolCall(item))
-        .await;
+    if item.status == DynamicToolCallStatus::InProgress {
+        exec.session
+            .emit_turn_item_started(exec.turn.as_ref(), &TurnItem::DynamicToolCall(item))
+            .await;
+    } else {
+        exec.session
+            .emit_turn_item_completed(exec.turn.as_ref(), TurnItem::DynamicToolCall(item))
+            .await;
+    }
 }
 
 fn merge_code_mode_signal(mut output: FunctionToolOutput, signal: JsonValue) -> FunctionToolOutput {
@@ -954,10 +1194,12 @@ fn nested_result_content_items(
                 .unwrap_or_else(|_| JsonValue::String(result.output));
             let value = model_visible_nested_result(&ToolName::plain(&result.tool_name), value);
             FunctionCallOutputContentItem::InputText {
-                text: value
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| value.to_string()),
+                text: serde_json::json!({
+                    "call_id": result.call_id,
+                    "tool_name": result.tool_name,
+                    "output_truncated": result.output_truncated,
+                    "result": value,
+                }).to_string(),
             }
         })
         .collect()
@@ -1096,7 +1338,7 @@ fn format_runtime_response(
     // plus the item separator), and optionally one output-loss metadata line.
     let line_offset = script_status.lines().count() + 3 + usize::from(output_loss.is_some());
     let total_lines = line_offset + code_mode_text_content(&canonical_content_items).lines().count();
-    let (mut content_items, visible_output_truncated) = truncate_code_mode_result_at_lines(
+    let (mut content_items, visible_output_truncated, omitted_lines) = truncate_code_mode_result_at_lines(
         content_items,
         max_output_tokens,
         outcome,
@@ -1156,6 +1398,10 @@ fn format_runtime_response(
             VISIBLE_OUTPUT_TRUNCATED_KEY.to_string(),
             JsonValue::Bool(true),
         );
+        if let Some((start, end)) = omitted_lines {
+            output.essential_inline.insert("cell_output_recovery_selector".into(),
+                serde_json::json!({"kind":"lines", "start":start, "end":end.min(start.saturating_add(199))}));
+        }
     }
     match required_terminal {
         Some(terminal) => fold_nested_required_terminal(output, terminal),
@@ -1206,7 +1452,8 @@ fn truncate_code_mode_result(
     hard_limit: usize,
     diagnostic_index: Option<usize>,
 ) -> (Vec<FunctionCallOutputContentItem>, bool) {
-    truncate_code_mode_result_at_lines(items, max_output_tokens, outcome, hard_limit, diagnostic_index, None)
+    let (items, omitted, _) = truncate_code_mode_result_at_lines(items, max_output_tokens, outcome, hard_limit, diagnostic_index, None);
+    (items, omitted)
 }
 
 fn truncate_code_mode_result_at_lines(
@@ -1216,10 +1463,11 @@ fn truncate_code_mode_result_at_lines(
     hard_limit: usize,
     diagnostic_index: Option<usize>,
     source_lines: Option<(usize, usize)>,
-) -> (Vec<FunctionCallOutputContentItem>, bool) {
+) -> (Vec<FunctionCallOutputContentItem>, bool, Option<(usize, usize)>) {
     let diagnostic_text = code_mode_text_content(&items);
     let requested_limit =
         max_output_tokens.unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
+    let hard_limit = hard_limit.min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
     let limits = resolve_output_limits(
         Some(requested_limit),
         outcome,
@@ -1227,6 +1475,17 @@ fn truncate_code_mode_result_at_lines(
         &diagnostic_text,
         hard_limit,
     );
+    // Avoid a recovery round trip when retaining the whole packet costs at
+    // most one third more than its soft budget. Larger packets still use the
+    // original budget, and neither a zero budget nor a hard cap is relaxed.
+    let whole_packet_limit = limits.applied_limit
+        .saturating_add(limits.applied_limit / 3)
+        .min(hard_limit);
+    if limits.applied_limit != 0
+        && codex_utils_output_truncation::model_token_count(&diagnostic_text) <= whole_packet_limit
+    {
+        return (items, false, None);
+    }
     let policy = TruncationPolicy::Tokens(limits.applied_limit);
     if let Some(error_index) = diagnostic_index {
         return truncate_code_mode_failure(items, error_index, limits.applied_limit, source_lines);
@@ -1236,21 +1495,23 @@ fn truncate_code_mode_result_at_lines(
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
         let (offset, total) = source_lines.unwrap_or((0, diagnostic_text.lines().count()));
-        let truncated = codex_utils_output_truncation::truncate_model_text_at_lines(
+        let (truncated, omitted_lines) = codex_utils_output_truncation::truncate_model_text_at_lines_with_recovery(
             &diagnostic_text,
             limits.applied_limit,
             offset, total,
+            Some("{cell_output_artifact_id}"),
         );
         let omitted = truncated != diagnostic_text;
         return (
             vec![FunctionCallOutputContentItem::InputText { text: truncated }],
             omitted,
+            omitted_lines,
         );
     }
 
     let projected = truncate_function_output_items_with_policy(&items, policy);
     let omitted = projected != items;
-    (projected, omitted)
+    (projected, omitted, None)
 }
 
 fn truncate_code_mode_failure(
@@ -1258,7 +1519,7 @@ fn truncate_code_mode_failure(
     error_index: usize,
     token_limit: usize,
     source_lines: Option<(usize, usize)>,
-) -> (Vec<FunctionCallOutputContentItem>, bool) {
+) -> (Vec<FunctionCallOutputContentItem>, bool, Option<(usize, usize)>) {
     let FunctionCallOutputContentItem::InputText { text: error_text } = items.remove(error_index)
     else {
         unreachable!("the caller identifies a script-error text item")
@@ -1269,48 +1530,64 @@ fn truncate_code_mode_failure(
     let error_offset = offset + preceding.bytes().filter(|byte| *byte == b'\n').count() + usize::from(!items.is_empty());
     let reserved_error_tokens = error_tokens.min(token_limit);
     let other_policy = TruncationPolicy::Tokens(token_limit.saturating_sub(reserved_error_tokens));
-    let (mut projected, mut omitted) = if items
+    let (mut projected, mut omitted, mut omitted_lines) = if items
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
         let text = code_mode_text_content(&items);
-        let truncated =
-            codex_utils_output_truncation::truncate_model_text_at_lines(&text, other_policy.token_budget(), offset, total);
+        let (truncated, omitted_lines) =
+            codex_utils_output_truncation::truncate_model_text_at_lines_with_recovery(&text, other_policy.token_budget(), offset, total, Some("{cell_output_artifact_id}"));
         let omitted = truncated != text;
         (
             vec![FunctionCallOutputContentItem::InputText { text: truncated }],
             omitted,
+            omitted_lines,
         )
     } else {
         let projected = truncate_function_output_items_with_policy(&items, other_policy);
         let omitted = projected != items;
-        (projected, omitted)
+        (projected, omitted, None)
     };
     let error_text = if error_tokens <= reserved_error_tokens {
         error_text
     } else {
         omitted = true;
-        codex_utils_output_truncation::truncate_model_text_at_lines(&error_text, reserved_error_tokens, error_offset, total)
+        let (text, gap) = codex_utils_output_truncation::truncate_model_text_at_lines_with_recovery(
+            &error_text, reserved_error_tokens, error_offset, total, Some("{cell_output_artifact_id}"));
+        omitted_lines = omitted_lines.or(gap);
+        text
     };
     if !error_text.is_empty() {
         projected.push(FunctionCallOutputContentItem::InputText { text: error_text });
     }
-    (projected, omitted)
+    (projected, omitted, omitted_lines)
 }
 
 /// Whether visible text already carries this live handle: in a printed result
-/// envelope or an earlier receipt. A longer ID sharing the prefix does not count.
-fn shows_session_handle(visible: &str, session_id: &JsonValue) -> bool {
-    [
-        format!("\"session_id\":{session_id}"),
-        format!("Running command session_id: {session_id}"),
-    ]
-    .iter()
-    .any(|handle| {
-        visible.match_indices(handle.as_str()).any(|(index, _)| {
-            !visible[index + handle.len()..].starts_with(|c: char| c.is_ascii_digit())
+/// envelope or an earlier structured receipt. Quoted source/history is not a
+/// receipt, and an ID without its current capabilities is insufficient.
+fn shows_session_handle(visible: &str, state: &JsonValue) -> bool {
+    visible.lines().filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
+        .any(|value| {
+            let mut pending = vec![&value];
+            while let Some(value) = pending.pop() {
+                if value.get("session_id") == state.get("session_id")
+                    && value["session_capabilities"].is_object()
+                    && value.get("session_capabilities") == state.get("session_capabilities")
+                    && (value["execution_state"] == "running"
+                        || value.get("continuation").is_some_and(|continuation|
+                            !continuation.is_null() && Some(continuation) == state.get("continuation")))
+                {
+                    return true;
+                }
+                match value {
+                    JsonValue::Object(fields) => pending.extend(fields.values()),
+                    JsonValue::Array(items) => pending.extend(items),
+                    _ => {}
+                }
+            }
+            false
         })
-    })
 }
 
 fn shows_command_recovery(visible: &str, state: &JsonValue) -> bool {
@@ -1372,6 +1649,7 @@ async fn call_nested_tool(
         tool_kind,
         input,
         nested_deadline,
+        buffered_output_bytes,
     } = invocation;
     let packet_ordinal = exec
         .session
@@ -1421,6 +1699,7 @@ async fn call_nested_tool(
                     Some(CodeModeNestedResultEvidence {
                         failed: true,
                         command_state: None,
+                        output_fingerprints: Vec::new(),
                         ordinal: packet_ordinal,
                         call_id: nested_call_id,
                         parent_call_id: parent_tool_call_id,
@@ -1469,12 +1748,12 @@ async fn call_nested_tool(
         call_id: nested_call_id.clone(),
         payload: payload.clone(),
     };
-    // Capture before dispatch, not after a concurrent mutation or at the
-    // generation baseline: earlier calls in this cell may have edited files.
-    let mutation_revision_before = tool_runtime.current_mutation_revision().await;
+    // Filled by dispatch only after workspace admission, including any edits
+    // that finish while this nested call waits for its lease.
+    let admitted_revision = Arc::new(std::sync::Mutex::new(None));
     let result = tool_runtime
         .clone()
-        .handle_tool_call_with_source(
+        .handle_tool_call_with_admitted_revision(
             call,
             ToolCallSource::CodeMode {
                 cell_id: cell_id.to_string(),
@@ -1487,6 +1766,7 @@ async fn call_nested_tool(
                 cancellation_cause: Some(cancellation.cause_cell()),
             },
             cancellation_token,
+            Some(Arc::clone(&admitted_revision)),
         )
         .await;
     let mut result = match result {
@@ -1512,6 +1792,7 @@ async fn call_nested_tool(
                     Some(CodeModeNestedResultEvidence {
                         failed: true,
                         command_state: None,
+                        output_fingerprints: Vec::new(),
                         ordinal: packet_ordinal,
                         call_id: nested_call_id,
                         parent_call_id: parent_tool_call_id,
@@ -1531,9 +1812,13 @@ async fn call_nested_tool(
     };
     let outcome_context = result.outcome_context();
     let mut signal = result.sampling_request_signal();
-    signal.get_or_insert_with(|| serde_json::json!({}))["validation_mutation_revision"] =
-        serde_json::json!(mutation_revision_before);
+    if let Some(revision) = *admitted_revision.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        signal.get_or_insert_with(|| serde_json::json!({}))["validation_mutation_revision"] =
+            serde_json::json!(revision);
+    }
     let canonical_artifact_required = result.requires_canonical_artifact();
+    let retained_artifact = result.canonical_delivery_artifact();
+    let delivery_artifact = canonical_artifact_required.then(|| retained_artifact.clone()).flatten();
     let receipts = result.intrinsic_deterministic_continuation_receipts();
     let source_dependencies = result.source_dependencies.clone();
     if let Some(continuation) = result.owner_drained_continuation() {
@@ -1547,7 +1832,32 @@ async fn call_nested_tool(
     }
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let failure_is_error = result.code_mode_failure_is_error();
-    let result_value = result.code_mode_result();
+    // Encoded bytes are a conservative estimate of already-printed tokens.
+    // Keep the existing 20% envelope reserve, scaled to the actual cell limit.
+    // Parallel calls share a dispatch-time estimate; the outer projection
+    // remains authoritative for their eventual combined printed output.
+    let budget = exec.session.services.code_mode_service.output_budget(cell_id.as_str())
+        .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+        .saturating_sub(buffered_output_bytes.div_ceil(3)) * 4 / 5;
+    let mut result_value = result.code_mode_result_with_budget(budget);
+    let recovery = exec.session.services.code_mode_service.record_delivery_evidence(
+        &cell_id, canonical_artifact_required, delivery_artifact, signal.as_ref(), &result_value,
+    );
+    if let Some(recovery) = recovery {
+        // Keep the native representation while exposing the retained recovery
+        // route to JavaScript, not only to the later model-facing projection.
+        if let Some(fields) = result_value.as_object_mut() {
+            fields.insert("canonical_recovery".to_string(), recovery);
+        } else if let Some(text) = result_value.as_str() {
+            if let Ok(JsonValue::Object(mut fields)) = serde_json::from_str::<JsonValue>(text) {
+                fields.insert("canonical_recovery".to_string(), recovery);
+                result_value = JsonValue::String(JsonValue::Object(fields).to_string());
+            } else {
+                result_value = JsonValue::String(format!("{text}\n{}", serde_json::json!({"canonical_recovery": recovery})));
+            }
+        }
+    }
     if (tool_name == ToolName::plain("exec_command")
         || tool_name == ToolName::plain("write_stdin"))
         && result_value.get("output_reduced") == Some(&JsonValue::Bool(true))
@@ -1557,6 +1867,37 @@ async fn call_nested_tool(
             .record_nested_tool_output_reduction();
     }
     let (retained_output, output_truncated, result_bytes) = bounded_serialized_json(&result_value);
+    // Reuse dispatcher retention. Only results without a canonical receipt need
+    // new storage, and only when their complete inline outcome does not fit.
+    let mut recovery_artifact = retained_artifact;
+    if recovery_artifact.is_none() && output_truncated {
+        let canonical = codex_tools::CanonicalToolResult::json(result_value.clone());
+        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+            &exec.turn.config.codex_home, &exec.session.thread_id.to_string(), &canonical,
+        ).await;
+        if artifact.complete && let Some(id) = artifact.artifact_id() {
+            exec.session.register_tool_artifact_origin(id.clone(), nested_call_id.clone(),
+                canonical.exact_bytes, canonical.sha256.clone()).await;
+            recovery_artifact = Some((id, canonical.sha256, canonical.exact_bytes));
+        }
+    }
+    let recovery = if let Some((id, sha256, bytes)) = &recovery_artifact {
+        serde_json::json!({
+            "artifact_id": id, "canonical_sha256": sha256, "canonical_bytes": bytes,
+            "recovery": {"tool":"read_tool_output", "arguments": {
+                "artifact_id":id, "selectors":[{"kind":"bytes","start":0,"end":bytes}]
+            }},
+        })
+    } else if !output_truncated {
+        serde_json::json!({"result": result_value})
+    } else {
+        serde_json::json!({"output": retained_output, "output_truncated":true,
+            "recovery_available":false, "notice":"Canonical retention failed; do not replay effects."})
+    };
+    exec.session.services.code_mode_service.record_packet_recovery(&cell_id, packet_ordinal,
+        serde_json::json!({"call_id":nested_call_id,"tool_name":tool_name.to_string(),
+            "failed":!matches!(outcome_context.outcome, ToolOutputOutcome::Success | ToolOutputOutcome::Yielded),
+            "outcome":recovery}));
     if let Some(parent_call_id) = parent_tool_call_id.as_ref()
         && source_dependencies
             .as_ref()
@@ -1565,50 +1906,14 @@ async fn call_nested_tool(
         let evidence_output = if !output_truncated && retained_output.len() <= 4_096 {
             Some(retained_output.clone())
         } else if tool_name == ToolName::plain("read_file")
-            && result_value["retained_artifact_complete"] == true
-            && result_value["artifact_id"].is_string()
+            && result_value["source_sha256"].is_string()
         {
-            Some(serde_json::json!({
-                "artifact_id": result_value["artifact_id"],
-                "historical_source": true,
-                "recovery_tool": "read_tool_output",
-                "selectors": result_value["results"].as_array().into_iter().flatten()
-                    .filter_map(|result| result.get("selector").cloned()).collect::<Vec<_>>(),
-                "file_complete": result_value["file_complete"],
-            }).to_string())
+            Some(crate::tool_history::compact_read_evidence(&result_value).to_string())
         } else {
-            let canonical = codex_tools::CanonicalToolResult::json(result_value.clone());
-            let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
-                &exec.turn.config.codex_home,
-                &exec.session.thread_id.to_string(),
-                &canonical,
-            )
-            .await;
-            if artifact.complete {
-                if let Some(artifact_id) = artifact.artifact_id() {
-                    exec.session
-                        .register_tool_artifact_origin(
-                            artifact_id.clone(),
-                            nested_call_id.clone(),
-                            canonical.exact_bytes,
-                            canonical.sha256,
-                        )
-                        .await;
-                    Some(
-                        serde_json::json!({
-                            "artifact_id": artifact_id,
-                            "historical_source": true,
-                            "recovery_tool": "read_tool_output",
-                            "selectors": [{"kind": "json_pointer", "pointer": ""}]
-                        })
-                        .to_string(),
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            recovery_artifact.as_ref().map(|(id, _, bytes)| serde_json::json!({
+                "artifact_id":id, "historical_source":true, "recovery_tool":"read_tool_output",
+                "selectors":[{"kind":"bytes","start":0,"end":bytes}],
+            }).to_string())
         };
         if let Some(output) = evidence_output {
             exec.session
@@ -1628,7 +1933,8 @@ async fn call_nested_tool(
             outcome_context.outcome,
             codex_tools::ToolOutputOutcome::Success | codex_tools::ToolOutputOutcome::Yielded
         ),
-        command_state: nested_command_state(&tool_name, &nested_call_id, &payload, &result_value),
+        command_state: nested_command_state(tool_runtime.command_semantic_name(&tool_name).as_ref(), &nested_call_id, &payload, &result_value),
+        output_fingerprints: nested_output_fingerprints(&tool_name, &result_value),
         ordinal: packet_ordinal,
         call_id: nested_call_id.clone(),
         parent_call_id: parent_tool_call_id,
@@ -1741,12 +2047,37 @@ fn retained_nested_output(
     }
 }
 
+/// Exact identities let bounded fallback diagnostics recognize already printed commands.
+fn nested_output_fingerprints(tool: &ToolName, value: &JsonValue) -> Vec<(String, usize, [u8; 32])> {
+    if tool.namespace.is_some() || !matches!(tool.name.as_str(), "exec_command" | "write_stdin")
+        || value["repair"].as_str().is_some_and(|repair| !repair.is_empty())
+    {
+        return Vec::new();
+    }
+    let Some(output) = value["output"].as_str().filter(|output| output.len() >= 32) else {
+        return Vec::new();
+    };
+    let escaped = serde_json::to_string(output).expect("string serialization");
+    [output, &escaped[1..escaped.len() - 1]].into_iter().map(|text| {
+        (text.chars().take(32).collect(), text.len(), Sha256::digest(text.as_bytes()).into())
+    }).collect()
+}
+
 /// Whether the script already printed this retained result before the cell
 /// ended. `text(result)` shows it JSON-escaped and `text(result.output)`
-/// verbatim. Both ends of the retained copy must appear, so a different result
-/// that only shares a prefix, such as build progress, stays visible.
+/// verbatim. Require the entire bounded payload, not matching ends: siblings
+/// can share wrappers while carrying different diagnostics in the middle.
 fn nested_result_already_emitted(result: &CodeModeNestedResultEvidence, emitted: &str) -> bool {
-    const PROBE_BYTES: usize = 256;
+    if result.output_fingerprints.iter().any(|(prefix, bytes, digest)| {
+        // Repetition must not turn fallback deduplication into quadratic work.
+        // Uncertain matches keep their diagnostic rather than dropping evidence.
+        emitted.match_indices(prefix).take(32).any(|(start, _)| {
+            emitted.as_bytes().get(start..start.saturating_add(*bytes))
+                .is_some_and(|candidate| <[u8; 32]>::from(Sha256::digest(candidate)) == *digest)
+        })
+    }) {
+        return true;
+    }
     // A short result costs little to repeat and is weak evidence of printing.
     const MIN_PAYLOAD_BYTES: usize = 32;
     let matches_output = |output: &str| {
@@ -1755,20 +2086,14 @@ fn nested_result_already_emitted(result: &CodeModeNestedResultEvidence, emitted:
             .and_then(|rest| rest.split_once('\n'))
         {
             Some((_, output)) => output,
-            // A script may spread a result object into another, so its opening
-            // brace is not evidence.
-            None => output.strip_prefix('{').unwrap_or(output),
+            None => output,
         };
         if payload.len() < MIN_PAYLOAD_BYTES {
             return false;
         }
-        let head = &payload[..payload.floor_char_boundary(PROBE_BYTES)];
-        let tail = &payload[payload.ceil_char_boundary(payload.len().saturating_sub(PROBE_BYTES))..];
-        [head, tail].into_iter().all(|probe| {
-            emitted.contains(probe)
-                || serde_json::to_string(probe)
-                    .is_ok_and(|escaped| emitted.contains(&escaped[1..escaped.len() - 1]))
-        })
+        emitted.contains(payload)
+            || serde_json::to_string(payload)
+                .is_ok_and(|escaped| emitted.contains(&escaped[1..escaped.len() - 1]))
     };
     matches_output(&result.output)
         || serde_json::from_str(&result.output)
@@ -2007,18 +2332,41 @@ fn result_has_live_exec_session(result: &JsonValue) -> bool {
 }
 
 fn nested_command_state(
-    tool_name: &ToolName,
+    tool_name: Option<&ToolName>,
     call_id: &str,
     payload: &ToolPayload,
     result: &JsonValue,
 ) -> Option<JsonValue> {
-    if tool_name.namespace.is_some()
-        || !matches!(tool_name.name.as_str(), "exec_command" | "write_stdin")
-        || result.get("process_exited").is_none()
+    let tool_name = tool_name?;
+    let mut state = command_result_state(result)?;
+    state["call_id"] = call_id.into();
+    state["tool"] = tool_name.name.clone().into();
+    if let ToolPayload::Function { arguments } = payload
+        && let Ok(arguments) = serde_json::from_str::<JsonValue>(arguments)
     {
+        if tool_name.name == "write_stdin" {
+            state["polled_session_id"] = arguments["session_id"].clone();
+        }
+        // Display intent is not a claim that the script consumed the result.
+        if arguments["max_output_tokens"] == 0
+            && result["streams_complete"] == true && result["exit_code"] == 0
+            && result["process_exited"] == true && result["session_id"].is_null()
+            && result["error"].is_null()
+        {
+            state["display_suppressed"] = true.into();
+        }
+    }
+    Some(state)
+}
+
+/// Exact command controls shared by code-mode and history pressure receipts.
+pub(crate) fn command_result_state(result: &JsonValue) -> Option<JsonValue> {
+    // Command capability comes from the registered runtime, not a public-name
+    // whitelist. Legacy shell forwarding returns the unified owner's contract.
+    if result.get("process_exited").is_none() {
         return None;
     }
-    let mut state = serde_json::json!({"call_id": call_id, "tool": tool_name.name});
+    let mut state = serde_json::json!({});
     for key in [
         "error",
         "chunk_id",
@@ -2031,6 +2379,7 @@ fn nested_command_state(
         "pending_deferred_completions",
         "output_complete",
         "output_reduced",
+        "streams_complete",
         "raw_output_artifact_id",
         "raw_output_artifact_bytes",
         "raw_output_artifact_error",
@@ -2041,27 +2390,11 @@ fn nested_command_state(
             state[key] = value.clone();
         }
     }
-    if let ToolPayload::Function { arguments } = payload
-        && let Ok(arguments) = serde_json::from_str::<JsonValue>(arguments)
+    if let Some(session_id) = result.get("session_id").filter(|id| id.as_u64().is_some())
+        && let Some(incarnation) = result.pointer("/session_capabilities/incarnation").and_then(JsonValue::as_str)
     {
-        if tool_name.name == "write_stdin" {
-            state["polled_session_id"] = arguments["session_id"].clone();
-        }
-        // Explicitly silent successful reads still expose exact streams to JS.
-        // This is display intent, not a claim that the script consumed them.
-        if arguments["max_output_tokens"] == 0
-            && result["streams_complete"] == true
-            && result["exit_code"] == 0
-            && result["process_exited"] == true
-            && result["session_id"].is_null()
-            && result["error"].is_null()
-        {
-            state["display_suppressed"] = true.into();
-        }
-    }
-    if let Some(session_id) = result.get("session_id").filter(|id| id.as_u64().is_some()) {
         state["continuation"] = serde_json::json!({
-            "tool": "write_stdin", "arguments": {"session_id": session_id, "chars": ""}
+            "tool": "write_stdin", "arguments": {"session_id": session_id, "incarnation": incarnation, "chars": ""}
         });
     }
     if let Some(artifact_id) = result.get("raw_output_artifact_id")
@@ -2213,6 +2546,78 @@ mod tests {
 
     fn test_service() -> CodeModeService {
         CodeModeService::new(Arc::new(ProcessOwnedCodeModeSessionProvider::default()))
+    }
+
+    #[tokio::test]
+    async fn completion_boundary_recovery_is_independent_of_empty_yields() {
+        let (_session, turn) = crate::session::tests::make_session_and_context().await;
+        for yielded in [false, true] {
+            let service = test_service();
+            let cell = CellId::new("recovery-boundary".into());
+            let (activity, receiver) = tokio::sync::watch::channel(crate::session::InputQueueActivity::InternalCompletion);
+            service.record_cell_parent_call_id(&cell, "outer");
+            service.record_delivery_intent(&cell, &turn, receiver.clone());
+            let recovery = service.record_delivery_evidence(&cell, true,
+                Some(("artifact".into(), "hash".into(), 12)), None, &json!({"preview":"partial"}));
+            assert_eq!(recovery.unwrap()["arguments"]["artifact_id"], "artifact");
+            if yielded { service.finish_packet(cell.as_str(), false); }
+            let response = RuntimeResponse::Result {
+                cell_id: cell.clone(), error_text: None, output_loss: None,
+                content_items: vec![codex_code_mode::FunctionCallOutputContentItem::InputText { text:"answer".into() }],
+            };
+            assert_eq!(service.delivery_for_response(&cell, &turn, &response).unwrap_err()["category"], "evidence_recovery_pending");
+            for (hash, ranges) in [("wrong", json!([[0,12]])), ("hash", json!([[0,5]])), ("hash", json!([[5,12]]))] {
+                service.record_delivery_evidence(&cell, false, None,
+                    Some(&json!({"semantic_evidence":{"source":"artifact","scope":"artifact",
+                        "identity":{"sha256":hash,"ranges":ranges,"values":[]}}})), &json!({}));
+                if yielded { service.finish_packet(cell.as_str(), false); }
+            }
+            service.record_delivery_intent(&cell, &turn, receiver);
+            assert_eq!(service.delivery_for_response(&cell, &turn, &response).unwrap(), Some("answer".into()));
+            drop(activity);
+        }
+    }
+
+    #[test]
+    fn completion_boundary_storage_only_output_does_not_require_recovery() {
+        let service = test_service();
+        let cell = CellId::new("storage-only".into());
+        service.record_cell_parent_call_id(&cell, "outer");
+        let raw = json!({"answer":42});
+        let canonical = codex_tools::CanonicalToolResult::json(raw.clone());
+        assert!(service.record_delivery_evidence(&cell, true,
+            Some(("artifact".into(), canonical.sha256, canonical.exact_bytes)), None, &raw).is_none());
+        assert!(service.packet_admission.lock().unwrap().cells["storage-only"].delivery_recovery.is_empty());
+    }
+
+    #[test]
+    fn paginated_selection_requires_exact_authenticated_coverage() {
+        let service = test_service();
+        let cell = CellId::new("partial-selection".into());
+        service.record_cell_parent_call_id(&cell, "outer");
+        service.record_delivery_evidence(&cell, false, None, None, &json!({
+            "complete": false, "artifact_id": "artifact", "canonical_sha256": "hash",
+            "canonical_bytes": 100, "results": [{"canonical_range": {"start": 20, "end": 40}}]
+        }));
+        for (hash, ranges, pending) in [
+            ("wrong", json!([[20,40]]), true),
+            ("hash", json!([[20,30]]), true),
+            ("hash", json!([[31,40]]), true),
+            ("hash", json!([[30,31]]), false),
+        ] {
+            service.record_delivery_evidence(&cell, false, None, Some(&json!({
+                "semantic_evidence": {"source":"artifact", "scope":"artifact",
+                    "identity":{"sha256":hash, "ranges":ranges, "values":[]}}
+            })), &json!({}));
+            let admission = service.packet_admission.lock().unwrap();
+            let metrics = &admission.cells[cell.as_str()];
+            assert_eq!(!metrics.delivery_recovery.is_empty(), pending);
+            assert!(!metrics.delivery_blocked);
+        }
+        service.complete_packet_call(&cell, 0, false, 0, Vec::new(), None,
+            Some((RequiredToolTerminalCause::Failure, "genuine failure".into())));
+        service.record_delivery_evidence(&cell, false, None, None, &json!({"complete":true}));
+        assert!(service.packet_admission.lock().unwrap().cells[cell.as_str()].delivery_blocked);
     }
 
     #[test]
@@ -2539,6 +2944,7 @@ mod tests {
             tool_kind: CodeModeToolKind::Function,
             input: Some(json!({ "cmd": format!("@'\n{envelope}\n'@ | apply_patch") })),
             nested_deadline: None,
+            buffered_output_bytes: 0,
         }
     }
 
@@ -2614,6 +3020,7 @@ mod tests {
                 tool_kind: CodeModeToolKind::Function,
                 input: Some(json!({ "command": "echo '*** Begin Patch'" })),
                 nested_deadline: None,
+                buffered_output_bytes: 0,
             },
             codex_code_mode::NestedCancellation::new(tokio_util::sync::CancellationToken::new()),
         )
@@ -2666,6 +3073,7 @@ mod tests {
                 tool_kind: CodeModeToolKind::Function,
                 input: Some(json!({"command":command})),
                 nested_deadline: None,
+                buffered_output_bytes: 0,
             },
             codex_code_mode::NestedCancellation::new(tokio_util::sync::CancellationToken::new()),
         )
@@ -2801,6 +3209,7 @@ mod tests {
                 Some(super::CodeModeNestedResultEvidence {
                     failed: index == 9,
                     command_state: None,
+                    output_fingerprints: Vec::new(),
                     ordinal,
                     call_id: format!("call-{index}"),
                     parent_call_id: Some("outer-exec".into()),
@@ -2821,6 +3230,12 @@ mod tests {
         let packet = service.finish_packet("late-failure-cell", false);
         assert_eq!(packet.nested_results.len(), 2);
         assert_eq!(packet.omitted_nested_result_count, 8);
+        assert_eq!(packet.nested_recovery.len(), 10);
+        for (index, result) in packet.nested_recovery.values().enumerate() {
+            assert_eq!(result["call_id"], format!("call-{index}"));
+            assert_eq!(result["output"], if index == 9 { "late failure" } else { "success" });
+            assert_eq!(result["recovery_available"], true);
+        }
         assert!(packet.nested_results.iter().any(|result| result.failed
             && result.call_id == "call-9"
             && result.output == "late failure"));
@@ -3034,6 +3449,12 @@ mod tests {
                     arguments: r#"{"value":null}"#.to_string(),
                 }),
             ),
+            (
+                Some(json!({"value":9_007_199_254_740_993_u64})),
+                Ok(ToolPayload::Function {
+                    arguments:r#"{"value":9007199254740993}"#.to_string(),
+                }),
+            ),
         ] {
             let invocation = CodeModeNestedToolCall {
                 cell_id: codex_code_mode::CellId::new("cell-input".to_string()),
@@ -3043,6 +3464,7 @@ mod tests {
                 tool_kind: CodeModeToolKind::Function,
                 input,
                 nested_deadline: None,
+                buffered_output_bytes: 0,
             };
             let runtime_json = serde_json::to_vec(&invocation).expect("encode runtime input");
             let runtime: CodeModeNestedToolCall =
@@ -3053,6 +3475,12 @@ mod tests {
                 serde_json::from_slice(&wire_json).expect("decode host input");
 
             for received in [invocation, runtime, wire.into()] {
+                if received.input.as_ref().is_some_and(|value| value["value"].is_number()) {
+                    let schema = json!({"type":"object", "properties":{"value":{
+                        "type":"integer", "const":9_007_199_254_740_993_u64
+                    }}, "required":["value"]});
+                    jsonschema::validator_for(&schema).unwrap().validate(received.input.as_ref().unwrap()).unwrap();
+                }
                 assert_eq!(
                     build_nested_tool_payload(
                         received.tool_kind,
@@ -3204,7 +3632,7 @@ mod tests {
                 ),
             ),
             serde_json::json!({"exit_code": 7, "output": "assertion failed: left 3 right 7",
-                "process_exited": true, "output_reduced": false, "session_id": null})
+                "process_exited": true, "current_chunk_display_complete": true, "session_id": null})
         );
         assert_eq!(
             super::model_visible_nested_result(
@@ -3212,8 +3640,8 @@ mod tests {
                 serde_json::json!({"session_id": 12, "output": "building", "output_reduced": true,
                 "raw_output_artifact_id": "artifact"})
             ),
-            serde_json::json!({"session_id": 12, "output": "building", "output_reduced": true,
-                "raw_output_artifact_id": "artifact"})
+            serde_json::json!({"session_id": 12, "output": "building", "current_chunk_display_complete": false,
+                "raw_output_artifact_id": "artifact", "retained_artifact_complete": false})
         );
         assert_eq!(
             super::model_visible_nested_result(
@@ -3422,6 +3850,11 @@ mod tests {
             })
             .expect("canonical code-mode result");
         assert!(String::from_utf8_lossy(&canonical.bytes).contains(sentinel));
+        let selector = &output.essential_inline["cell_output_recovery_selector"];
+        assert_eq!(selector["kind"], "lines");
+        let start = selector["start"].as_u64().unwrap() as usize;
+        assert!(start > 1, "recovery skips the canonical status prefix");
+        assert!(String::from_utf8_lossy(&canonical.bytes).lines().nth(start - 1).unwrap().contains(sentinel));
         assert!(
             output
                 .projection_metadata()
@@ -3448,6 +3881,39 @@ mod tests {
         assert!(codex_utils_string::approx_token_count(text) <= 5);
         assert!(!text.is_empty());
         assert!(!text.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn code_mode_truncation_keeps_near_budget_packets_but_not_overflow() {
+        let text = "output line\n".repeat(6_000);
+        let tokens = codex_utils_output_truncation::model_token_count(&text);
+        let budget = (tokens * 3).div_ceil(4);
+        assert!(tokens <= budget + budget / 3);
+        assert!(tokens > (budget - 1) + (budget - 1) / 3);
+        let items = vec![FunctionCallOutputContentItem::InputText { text }];
+        for outcome in [OutputOutcome::Success, OutputOutcome::Failure] {
+            let diagnostic = (outcome == OutputOutcome::Failure).then_some(0);
+            let (whole, omitted) = truncate_code_mode_result(
+                items.clone(), Some(budget), outcome, usize::MAX, diagnostic,
+            );
+            assert_eq!(whole, items);
+            assert!(!omitted);
+            for (requested, hard) in [(budget - 1, usize::MAX), (budget, tokens - 1), (0, usize::MAX)] {
+                let (cut, omitted) = truncate_code_mode_result(
+                    items.clone(), Some(requested), outcome, hard, diagnostic,
+                );
+                assert!(omitted);
+                assert!(codex_utils_output_truncation::model_token_count(&super::code_mode_text_content(&cut)) <= requested.min(hard));
+            }
+        }
+        let text = "output line\n".repeat(20_000);
+        assert!(codex_utils_output_truncation::model_token_count(&text) > codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
+        let (cut, omitted) = truncate_code_mode_result(
+            vec![FunctionCallOutputContentItem::InputText { text }],
+            Some(usize::MAX), OutputOutcome::Success, usize::MAX, None,
+        );
+        assert!(omitted);
+        assert!(codex_utils_output_truncation::model_token_count(&super::code_mode_text_content(&cut)) <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
     }
 
     #[test]
@@ -3492,10 +3958,10 @@ mod tests {
         let default_text = super::code_mode_text_content(&default_projection);
         assert_eq!(default_text, text);
         let (small, omitted) = truncate_code_mode_result(
-            items.clone(), Some(4_000), OutputOutcome::Success, 10_000, None);
+            items.clone(), Some(3_000), OutputOutcome::Success, 10_000, None);
         assert!(omitted);
         assert!(codex_utils_output_truncation::model_token_count(
-            &super::code_mode_text_content(&small)) <= 4_000);
+            &super::code_mode_text_content(&small)) <= 3_000);
         let (projected, omitted) =
             truncate_code_mode_result(items, Some(10_000), OutputOutcome::Success, 10_000, None);
 

@@ -26,6 +26,7 @@ pub struct ToolDefinition {
     pub input_schema: Option<JsonValue>,
     pub output_schema: Option<JsonValue>,
     /// Default for this tool only; an explicit per-call timeout takes precedence.
+    /// Zero delegates deadline ownership to the tool (host policy only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_timeout_ms: Option<u64>,
 }
@@ -152,7 +153,7 @@ fn render_tool_types(definition: &ToolDefinition) -> RenderedToolTypes {
 }
 
 fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String {
-    let description = definition.description.trim();
+    let mut description = definition.description.trim().to_string();
     let input_name = match definition.kind {
         CodeModeToolKind::Function => "args",
         CodeModeToolKind::Freeform => "input",
@@ -163,6 +164,21 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         input_fragments,
         output_fragments,
     } = render_tool_types(definition);
+    // Lazy resolution already returns this authoritative description. Retain
+    // JSON only for projections that lost structure; ordinary tools do not pay
+    // for a second schema tree in every cell. Output recovery can page this text.
+    for (label, schema, incomplete) in [
+        ("input_schema", definition.input_schema.as_ref(), input_fragments.incomplete),
+        ("output_schema", definition.output_schema.as_ref(), output_fragments.incomplete),
+    ] {
+        if let Some(schema) = schema {
+            if incomplete {
+                description.push_str(&format!(
+                    "\n\nAuthoritative {label} (TypeScript projection incomplete):\n```json\n{schema}\n```"
+                ));
+            }
+        }
+    }
     // One shape reached from several properties, or from both the argument and
     // result schemas, is described once and referenced by name afterwards.
     let aliases = hoist_shared_fragments(
@@ -235,7 +251,14 @@ pub fn render_code_mode_tool_bundle(definitions: &[ToolDefinition]) -> String {
         output.push('\n');
     }
     let mut declarations = Vec::with_capacity(definitions.len());
-    for (definition, (input_type, mut output_type)) in definitions.iter().zip(types) {
+    for (index, (definition, (input_type, mut output_type))) in definitions.iter().zip(types).enumerate() {
+        if fragments[index * 2].incomplete || fragments[index * 2 + 1].incomplete
+        {
+            output.push_str(&format!(
+                "// Use resolve_tool({}) for its authoritative JSON schema; do not infer arguments from unknown.\n",
+                serde_json::to_string(&definition.name).expect("tool name serializes")
+            ));
+        }
         if definition.name == "tool_search" {
             output.push_str(&format!("type CodeModeToolSearchResult = {output_type};\n"));
             output_type = "CodeModeToolSearchResult".to_string();
@@ -298,6 +321,90 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn incomplete_projections_retain_selective_authoritative_contracts() {
+        let large = json!({"type":"object", "properties": {
+            "payload": {"type":"string", "description": format!("{}Use seconds, only after approval.", "界".repeat(50_000))}
+        }});
+        let small = json!({"type":"object", "description":"Root prerequisite", "properties": {"count":{"type":"integer"}}});
+        for (input, output, label) in [
+            (large.clone(), small.clone(), "input_schema"),
+            (small.clone(), large.clone(), "output_schema"),
+        ] {
+            let definition = ToolDefinition {
+                name: "sample".into(), tool_name: ToolName::plain("sample"),
+                description: "Operation".into(), kind: CodeModeToolKind::Function,
+                input_schema: Some(input), output_schema: Some(output), default_timeout_ms: None,
+            };
+            let bundle = render_code_mode_tool_bundle(std::slice::from_ref(&definition));
+            assert!(bundle.contains("resolve_tool(\"sample\")"));
+            assert!(!bundle.contains("Authoritative"));
+            assert!(bundle.contains("Root prerequisite"));
+            let augmented = augment_tool_definition(definition);
+            assert_eq!(augmented.description.matches("Authoritative ").count(), 1);
+            let marker = format!("Authoritative {label} (TypeScript projection incomplete):\n```json\n");
+            let json = augmented.description.split_once(&marker).unwrap().1.split_once("\n```").unwrap().0;
+            assert_eq!(serde_json::from_str::<JsonValue>(json).unwrap(), large);
+        }
+    }
+
+    #[test]
+    fn verified10_guidance_survives_refs_items_and_branches() {
+        let schema = json!({
+            "type": "object", "properties": {
+                "duration": {"$ref": "#/$defs/minutes"},
+                "items": {"type": "array", "items": {"type": "string", "description": "Use canonical recipient IDs"}},
+                "mode": {"oneOf": [
+                    {"const": "archive", "description": "Archive only after confirmation"},
+                    {"const": "read", "description": "Read without marking seen"}
+                ]}
+            },
+            "$defs": {"minutes": {"type": "number", "description": "duration in minutes"}}
+        });
+        let definition = ToolDefinition {
+            name: "guidance".into(), tool_name: ToolName::plain("guidance"),
+            description: "".into(), kind: CodeModeToolKind::Function,
+            input_schema: Some(schema.clone()), output_schema: None, default_timeout_ms: None,
+        };
+        let rendered = augment_tool_definition(definition.clone());
+        let bundle = render_code_mode_tool_bundle(&[definition]);
+        for text in [rendered.description.as_ref(), &bundle] {
+            for guidance in ["duration in minutes", "Use canonical recipient IDs", "Archive only after confirmation", "Read without marking seen"] {
+                assert_eq!(text.matches(guidance).count(), 1, "{text}");
+            }
+        }
+        let duplicate = json!({"$ref":"#/$defs/value", "description":"minutes", "$defs":{"value":{"type":"number", "description":"minutes"}}});
+        assert_eq!(super::super::schema_ts::render_json_schema_to_typescript(&duplicate).matches("minutes").count(), 1);
+        let property = json!({"type":"object", "properties":{"duration":duplicate}, "$defs":{"value":{"type":"number", "description":"minutes"}}});
+        assert_eq!(super::super::schema_ts::render_json_schema_to_typescript(&property).matches("minutes").count(), 1);
+    }
+
+    #[test]
+    fn verified10_incomplete_projections_return_authoritative_contracts() {
+        for schema in [
+            json!({"$ref":"https://example.invalid/schema"}),
+            json!({"$ref":"#"}),
+            json!({"$ref":"#/$defs/missing"}),
+            json!({"type":"object", "not":{"required":["unsafe"]}}),
+            json!({"type":"object", "patternProperties":{"^x":{"type":"string"}}}),
+        ] {
+            for output in [false, true] {
+                let definition = ToolDefinition {
+                    name: "incomplete".into(), tool_name: ToolName::plain("incomplete"),
+                    description: "".into(), kind: CodeModeToolKind::Function,
+                    input_schema: (!output).then(|| schema.clone()),
+                    output_schema: output.then(|| schema.clone()), default_timeout_ms: None,
+                };
+                assert!(render_code_mode_tool_bundle(std::slice::from_ref(&definition)).contains("resolve_tool"));
+                let rendered = augment_tool_definition(definition);
+                let label = if output { "output_schema" } else { "input_schema" };
+                let marker = format!("Authoritative {label} (TypeScript projection incomplete):\n```json\n");
+                let recovered = rendered.description.split_once(&marker).unwrap().1.split_once("\n```").unwrap().0;
+                assert_eq!(serde_json::from_str::<JsonValue>(recovered).unwrap(), schema);
+            }
+        }
+    }
 
     #[test]
     fn bundle_shares_numeric_bounds_and_call_options_without_widening_inputs() {

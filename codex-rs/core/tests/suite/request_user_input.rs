@@ -170,7 +170,8 @@ async fn reserved_turn_start_rejects_active_turn_instead_of_steering() -> anyhow
     test.codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id,
-            response: RequestUserInputResponse {
+            call_id: Some(request.call_id),
+            response: RequestUserInputResponse { disposition: None,
                 answers,
                 interrupted: false,
             },
@@ -307,13 +308,14 @@ async fn request_user_input_round_trip_for_mode(
             answers: vec!["yes".to_string()],
         },
     );
-    let response = RequestUserInputResponse {
+    let response = RequestUserInputResponse { disposition: None,
         answers,
         interrupted: false,
     };
     codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id.clone(),
+            call_id: Some(request.call_id.clone()),
             response,
         })
         .await?;

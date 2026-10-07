@@ -30,6 +30,7 @@ pub(crate) use self::types::CellHost;
 pub(crate) use self::types::CellState;
 pub(crate) use self::types::CellToolCall;
 pub(crate) use self::types::CompletionCommit;
+pub(crate) use self::types::prepend_initial_yield;
 use self::types::CompletionDelivery;
 use self::types::ObservationDelivery;
 use crate::TaskFailureHandler;
@@ -38,6 +39,7 @@ use crate::runtime::OutputAdmission;
 use crate::runtime::RuntimeCommand;
 use crate::runtime::RuntimeEvent;
 use crate::runtime::StoredValue;
+#[cfg(test)]
 use crate::runtime::spawn_runtime;
 use crate::session_runtime::CellEvent;
 use crate::session_runtime::CreateCellRequest as CellRequest;
@@ -46,12 +48,14 @@ use crate::session_runtime::OutputItem;
 use crate::session_runtime::ToolName as CellToolName;
 
 const STATE_CHANGE_COMPLETION_GRACE: Duration = Duration::from_millis(500);
+const DECISION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) struct CellActor;
 
 impl CellActor {
     pub(crate) async fn prepare<H: CellHost>(
         request: CellRequest,
+        catalog: Arc<crate::runtime::EnabledToolCatalog>,
         stored_values: HashMap<String, StoredValue>,
         host: Arc<H>,
         initial_observe_mode: ObserveMode,
@@ -70,9 +74,10 @@ impl CellActor {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
         let output_admission = Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES));
-        let (runtime_tx, runtime_terminate_handle) = spawn_runtime(
+        let (runtime_tx, runtime_terminate_handle) = crate::runtime::spawn_runtime_with_catalog(
             stored_values,
             runtime_request(request),
+            catalog,
             default_tool_timeout_ms,
             event_tx,
             Arc::clone(&output_admission),
@@ -130,7 +135,7 @@ async fn run_cell<H: CellHost>(
     } = context;
     let cancellation_token = cell_state.cancellation_token();
     let tool_cancellation = NestedCancellation::new(cancellation_token.child_token());
-    let notification_cancellation_token = CancellationToken::new();
+    let notification_cancellation_token = cancellation_token.child_token();
     let mut content_items = Vec::new();
     let mut admitted_output_bytes = 0usize;
     let mut observer = Some(initial_observer);
@@ -237,6 +242,11 @@ async fn run_cell<H: CellHost>(
                 }
             } => {
                 yield_timer = None;
+                if matches!(observer.as_ref().map(|observer| observer.mode), Some(ObserveMode::Decision)) {
+                    content_items.push(OutputItem::Text {
+                        text: "Code-mode wait idle for 10 minutes without output or a nested-call completion. The cell is still running, not terminated. Inspect its state before waiting again; do not restart uncertain work.".to_string(),
+                    });
+                }
                 finish_yield_delivery(
                     send_observer_event(
                         observer.take(),
@@ -338,6 +348,9 @@ async fn run_cell<H: CellHost>(
                         content_items.push(output_item(item));
                         admitted_output_bytes =
                             admitted_output_bytes.saturating_add(admitted_bytes);
+                        if matches!(observer.as_ref().map(|observer| observer.mode), Some(ObserveMode::Decision)) {
+                            yield_timer = Some(Box::pin(tokio::time::sleep(DECISION_IDLE_TIMEOUT)));
+                        }
                         if matches!(
                             observer.as_ref().map(|observer| observer.mode),
                             Some(ObserveMode::StateChange)
@@ -392,6 +405,7 @@ async fn run_cell<H: CellHost>(
                                 kind: cell_tool_kind(kind),
                                 input,
                                 timeout: std::time::Duration::from_millis(timeout_ms),
+                                buffered_output_bytes: admitted_output_bytes,
                                 deadline: None,
                             },
                             runtime_tx.clone(),
@@ -480,6 +494,9 @@ async fn run_cell<H: CellHost>(
                 }
             }
             task_result = notification_tasks.join_next(), if !notification_tasks.is_empty() => {
+                if matches!(observer.as_ref().map(|observer| observer.mode), Some(ObserveMode::Decision)) {
+                    yield_timer = Some(Box::pin(tokio::time::sleep(DECISION_IDLE_TIMEOUT)));
+                }
                 report_task_result(
                     task_result,
                     "notification",
@@ -487,6 +504,9 @@ async fn run_cell<H: CellHost>(
                 );
             }
             task_result = tool_tasks.join_next(), if !tool_tasks.is_empty() => {
+                if matches!(observer.as_ref().map(|observer| observer.mode), Some(ObserveMode::Decision)) {
+                    yield_timer = Some(Box::pin(tokio::time::sleep(DECISION_IDLE_TIMEOUT)));
+                }
                 report_task_result(task_result, "tool", task_failure_handler.as_ref());
             }
         }
@@ -578,7 +598,8 @@ fn observer_timer(
         ObserveMode::StateChange if has_buffered_output => {
             Some(Box::pin(tokio::time::sleep(STATE_CHANGE_COMPLETION_GRACE)))
         }
-        ObserveMode::StateChange | ObserveMode::Decision => None,
+        ObserveMode::StateChange => None,
+        ObserveMode::Decision => Some(Box::pin(tokio::time::sleep(DECISION_IDLE_TIMEOUT))),
     }
 }
 

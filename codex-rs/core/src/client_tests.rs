@@ -399,15 +399,15 @@ fn test_model_client_with_thread_id(
 }
 
 #[tokio::test]
-async fn prompt_cache_routing_is_shared_across_threads_but_bound_to_the_stable_prefix() {
+async fn prompt_cache_routing_is_stable_per_thread() {
     let first = test_model_client(SessionSource::Cli);
     let second = test_model_client(SessionSource::Cli);
-    let mut prompt = Prompt::default();
-    let key = first.prompt_cache_key(&prompt, "model");
-    assert_eq!(key, second.prompt_cache_key(&prompt, "model"));
-    prompt.base_instructions.text.push_str("changed");
-    assert_ne!(key, first.prompt_cache_key(&prompt, "model"));
-    assert_ne!(key, first.prompt_cache_key(&Prompt::default(), "other-model"));
+    let resumed = test_model_client_with_thread_id(first.state.thread_id, SessionSource::Cli);
+    let key = first.prompt_cache_key();
+    assert_eq!(key, first.state.thread_id.to_string());
+    assert_ne!(key, second.prompt_cache_key());
+    assert_eq!(key, resumed.prompt_cache_key());
+    assert_eq!(key, first.new_session().client.prompt_cache_key());
 }
 
 #[tokio::test]
@@ -2204,6 +2204,65 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
         response.items_added,
         vec![history_test_item("assistant", Some("turn-a"))]
     );
+}
+
+#[tokio::test]
+async fn websocket_send_preserves_appended_manifest_proof_but_rejects_replacements() {
+    use core_test_support::responses::{ev_completed, ev_response_created, start_websocket_server};
+    let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("first"), ev_completed("first")],
+        vec![ev_response_created("second"), ev_completed("second")],
+        vec![ev_response_created("third"), ev_completed("third")],
+        vec![ev_response_created("fourth"), ev_completed("fourth")],
+    ]]).await;
+    let mut provider = create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = true;
+    let client = ModelClient::new(
+        None, AgentIdentityAuthPolicy::JwtOnly, ThreadId::new(), provider, SessionSource::Cli,
+        "test_originator".into(), None, false, false, None, false, None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let metadata = test_responses_metadata_for_client(&client, None,
+        format!("{}:0", client.state.thread_id), None, TestCodexResponsesRequestKind::Turn);
+    let mut session = client.new_session();
+    let model = test_model_info();
+    let telemetry = test_session_telemetry();
+    let mut prompt = Prompt {
+        input: vec![history_test_item("first", None)].into(),
+        stable_context_manifest: StableContextManifest::default().with_base_model("gpt-test", "first"),
+        ..Default::default()
+    };
+    for step in 0..4 {
+        match step {
+            1 => {
+                let mut input = prompt.input.to_vec();
+                input.push(history_test_item("appended", None));
+                prompt.input = input.into();
+                prompt.stable_context_manifest = StableContextManifest::default().with_base_model("gpt-test", "appended");
+            }
+            2 => Arc::make_mut(&mut prompt.input)[0] = history_test_item("replacement", None),
+            3 => prompt.base_instructions.text = "changed request property".into(),
+            _ => {}
+        }
+        let result = session.stream_responses_websocket(
+            &prompt, &model, &telemetry, "fixture", ModelAttemptRequestKind::Initial,
+            None, codex_protocol::config_types::ReasoningSummary::None, None, &metadata,
+            false, None, &InferenceTraceContext::disabled(), None,
+        ).await.unwrap();
+        let super::WebsocketStreamOutcome::Stream(mut stream) = result else { panic!("unexpected fallback") };
+        while let Some(event) = stream.next().await { event.unwrap(); }
+    }
+    let requests = server.single_connection();
+    assert_eq!(requests.len(), 4, "exactly one provider request per logical request");
+    let appended = requests[1].body_json();
+    assert_eq!(appended["previous_response_id"], "first");
+    assert_eq!(appended["input"].as_array().unwrap().len(), 1);
+    assert!(appended["input"][0].to_string().contains("appended"));
+    for request in &requests[2..] {
+        let body = request.body_json();
+        assert!(body.get("previous_response_id").is_none_or(serde_json::Value::is_null));
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+    }
 }
 
 #[test]

@@ -134,7 +134,7 @@ pub(super) async fn spawn_review_thread(
         developer_instructions: None,
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
         multi_agent_version: MultiAgentVersion::Disabled,
-        multi_agent_spawn_authorized: AtomicBool::new(false),
+        multi_agent_spawn_authorized: Default::default(),
         personality: parent_turn_context.personality,
         approval_policy: parent_turn_context.approval_policy.clone(),
         permission_profile: parent_turn_context.permission_profile(),
@@ -172,6 +172,8 @@ pub(super) async fn spawn_review_thread(
         client_id: None,
     }];
     let tc = Arc::new(review_turn_context);
+    tc.turn_timing_state
+        .bind_live_phase_events(tc.sub_id.clone(), sess.tx_event.clone());
     if tc.environments.single_local_environment_cwd().is_some() {
         tc.turn_metadata_state.spawn_git_enrichment_task();
     }

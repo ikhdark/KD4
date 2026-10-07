@@ -50,7 +50,8 @@ pub struct QueuedOutgoingMessage {
     pub message: OutgoingMessage,
     /// Signals successful completion of this transport's write/flush, not peer receipt
     /// or execution. Cancellation leaves delivery uncertain and does not establish safe replay.
-    pub write_complete_tx: Option<oneshot::Sender<()>>,
+    /// The monotonic timestamp is captured by the writer, not its scheduled observer.
+    pub write_complete_tx: Option<oneshot::Sender<std::time::Instant>>,
 }
 
 impl QueuedOutgoingMessage {

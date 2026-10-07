@@ -277,6 +277,7 @@ fn terminal_runtime_payloads_use_terminal_runtime_payload_kind() -> anyhow::Resu
         interaction_input: None,
     });
     let end = EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+        output_metadata: None,
         call_id: "call-terminal".to_string(),
         process_id: Some("process-1".to_string()),
         turn_id: "turn-1".to_string(),
@@ -289,7 +290,7 @@ fn terminal_runtime_payloads_use_terminal_runtime_payload_kind() -> anyhow::Resu
         stdout: "/workspace".to_string(),
         stderr: String::new(),
         aggregated_output: "/workspace".to_string(),
-        exit_code: 0,
+        exit_code: Some(0),
         duration: Duration::from_millis(10),
         formatted_output: "/workspace".to_string(),
         status: ExecCommandStatus::Completed,

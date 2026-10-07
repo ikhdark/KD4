@@ -7,7 +7,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use codex_app_server_protocol::ClientRequestSerializationScope;
-use futures::future::join_all;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
@@ -250,6 +251,7 @@ impl Default for RequestSerializationLimits {
 struct KeyQueues {
     control: VecDeque<QueuedSerializedRequest>,
     ordered: VecDeque<QueuedSerializedRequest>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl KeyQueues {
@@ -274,6 +276,7 @@ impl KeyQueues {
         } else {
             self.ordered.push_back(request);
         }
+        self.changed.notify_one();
     }
 }
 
@@ -473,58 +476,46 @@ impl RequestSerializationQueues {
     }
 
     async fn drain(self, key: RequestSerializationQueueKey) {
+        let mut running = FuturesUnordered::new();
+        let mut exclusive = false;
         loop {
-            let requests = {
+            let changed = {
                 let mut state = self.inner.lock().await;
-                let Some(queues) = state.queues.get_mut(&key) else {
-                    return;
-                };
-                // Control traffic runs ahead of queued mutations. Mutations keep strict FIFO
-                // among themselves because they are only ever taken from the ordered lane.
-                let next = queues
-                    .control
-                    .pop_front()
-                    .map(|request| (request, true))
-                    .or_else(|| queues.ordered.pop_front().map(|request| (request, false)));
-                match next {
-                    Some((request, from_control)) => {
-                        let mut popped = 1;
-                        let access = request.access;
-                        let mut requests = vec![request];
-                        if access == RequestSerializationAccess::SharedRead {
-                            while requests.len() < self.limits.max_concurrent_shared_reads
-                                && queues.ordered.front().is_some_and(|request| {
-                                    request.access == RequestSerializationAccess::SharedRead
-                                })
-                            {
-                                let Some(request) = queues.ordered.pop_front() else {
-                                    break;
-                                };
-                                requests.push(request);
-                                popped += 1;
-                            }
-                        }
-                        if !from_control {
-                            state.total_queued -= popped;
-                            state.total_queued_bytes = state.total_queued_bytes.saturating_sub(
-                                requests
-                                    .iter()
-                                    .map(QueuedSerializedRequest::estimated_bytes)
-                                    .fold(0usize, usize::saturating_add),
-                            );
-                        }
-                        requests
+                loop {
+                    let queues = state.queues.get_mut(&key).expect("drain owns its queue");
+                    let next = queues.control.front().or_else(|| queues.ordered.front());
+                    let Some(next) = next else { break };
+                    // Refill free reader slots, but never cross a queued writer.
+                    if !running.is_empty() && (exclusive
+                        || next.access != RequestSerializationAccess::SharedRead
+                        || running.len() >= self.limits.max_concurrent_shared_reads)
+                    {
+                        break;
                     }
-                    None => {
-                        state.queues.remove(&key);
-                        return;
+                    let control = next.access == RequestSerializationAccess::Control;
+                    let request = if control { queues.control.pop_front() } else { queues.ordered.pop_front() }.unwrap();
+                    exclusive = request.access != RequestSerializationAccess::SharedRead;
+                    if !control {
+                        state.total_queued -= 1;
+                        state.total_queued_bytes = state.total_queued_bytes.saturating_sub(request.estimated_bytes());
+                    }
+                    running.push(request.request.run());
+                }
+                if running.is_empty() {
+                    state.queues.remove(&key);
+                    return;
+                }
+                Arc::clone(&state.queues[&key].changed)
+            };
+            tokio::select! {
+                biased;
+                _ = running.next() => {
+                    if running.is_empty() { exclusive = false; }
+                    if matches!(key, RequestSerializationQueueKey::Control(_)) {
+                        self.inner.lock().await.total_control -= 1;
                     }
                 }
-            };
-
-            join_all(requests.into_iter().map(|request| request.request.run())).await;
-            if matches!(key, RequestSerializationQueueKey::Control(_)) {
-                self.inner.lock().await.total_control -= 1;
+                _ = changed.notified() => {}
             }
         }
     }
@@ -1404,6 +1395,32 @@ mod tests {
             .await
             .expect("next shared-read batch should start")
             .expect("sender should be open");
+    }
+
+    #[tokio::test]
+    async fn shared_read_window_refills_behind_a_slow_read_but_stops_at_writer() {
+        let queues = RequestSerializationQueues::with_limits(16, 16, 2);
+        let key = RequestSerializationQueueKey::Global("sliding-window");
+        let (release, blocked) = oneshot::channel();
+        let (started, mut events) = mpsc::unbounded_channel();
+        let slow_started = started.clone();
+        queues.enqueue(key.clone(), RequestSerializationAccess::SharedRead, QueuedInitializedRequest::new(gate(), async move {
+            slow_started.send(0).unwrap(); let _ = blocked.await;
+        })).await;
+        assert_eq!(events.recv().await, Some(0));
+        for index in 1..5 {
+            let started = started.clone();
+            queues.enqueue(key.clone(), RequestSerializationAccess::SharedRead, QueuedInitializedRequest::new(gate(), async move { started.send(index).unwrap(); })).await;
+        }
+        for index in 1..5 { assert_eq!(timeout(queue_drain_timeout(), events.recv()).await.unwrap(), Some(index)); }
+        for (index, access) in [(5, RequestSerializationAccess::Exclusive), (6, RequestSerializationAccess::SharedRead)] {
+            let started = started.clone();
+            queues.enqueue(key.clone(), access, QueuedInitializedRequest::new(gate(), async move { started.send(index).unwrap(); })).await;
+        }
+        assert!(timeout(shutdown_wait_timeout(), events.recv()).await.is_err());
+        release.send(()).unwrap();
+        assert_eq!(timeout(queue_drain_timeout(), events.recv()).await.unwrap(), Some(5));
+        assert_eq!(timeout(queue_drain_timeout(), events.recv()).await.unwrap(), Some(6));
     }
 
     #[tokio::test]

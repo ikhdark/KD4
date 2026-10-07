@@ -660,9 +660,10 @@ impl CodexAuth {
     fn persist_managed_chatgpt_agent_identity_record(
         &self,
         record: AgentIdentityAuthRecord,
+        expected_tokens: &TokenData,
     ) -> std::io::Result<()> {
         if let Self::Chatgpt(chatgpt_auth) = self {
-            chatgpt_auth.persist_agent_identity_record(record)?;
+            chatgpt_auth.persist_agent_identity_record(record, expected_tokens)?;
         }
         Ok(())
     }
@@ -705,37 +706,41 @@ impl CodexAuth {
         auth_route_config: &AuthRouteConfig,
         session_source: SessionSource,
     ) -> std::io::Result<AgentIdentityAuth> {
+        let expected_tokens = self.get_token_data()?;
         let binding =
             ManagedChatGptAgentIdentityBinding::from_auth(self, forced_chatgpt_workspace_id)
                 .ok_or_else(|| std::io::Error::other("ChatGPT auth is unavailable"))?;
-
-        // JWT auth is loaded as CodexAuth::AgentIdentity; this path only reuses
-        // records created by the managed ChatGPT Agent Identity bootstrap.
-        if let Some(record) = self.stored_managed_chatgpt_agent_identity_record(&binding.account_id)
-            && record_matches_managed_chatgpt_binding(&record, &binding)
-        {
-            let should_persist = record_needs_task_registration(&record);
-            let auth = AgentIdentityAuth::from_record(
-                record,
-                agent_identity_authapi_base_url,
-                auth_route_config,
-            )
-            .await
-            .map_err(|err| classify_bootstrap_error("agent task registration", err))?;
-            if should_persist {
-                self.persist_managed_chatgpt_agent_identity_record(auth.record().clone())?;
-            }
-            return Ok(auth);
+        if self.get_token_data()? != expected_tokens {
+            return Err(std::io::Error::other("authentication changed before identity bootstrap"));
         }
 
-        let auth = register_managed_chatgpt_agent_identity(
-            binding,
-            agent_identity_authapi_base_url,
-            session_source,
-            auth_route_config,
-        )
-        .await?;
-        self.persist_managed_chatgpt_agent_identity_record(auth.record().clone())?;
+        let mut record = match self.stored_managed_chatgpt_agent_identity_record(&binding.account_id) {
+            Some(mut record) if record_matches_managed_chatgpt_binding(
+                &record, &binding, agent_identity_authapi_base_url,
+            ) => {
+                // Signing identity is durable; entitlement and routing claims are not.
+                record.email = binding.email;
+                record.plan_type = binding.plan_type;
+                record.chatgpt_account_is_fedramp = binding.chatgpt_account_is_fedramp;
+                record
+            }
+            _ => register_managed_chatgpt_agent_identity(
+                binding, agent_identity_authapi_base_url, session_source, auth_route_config,
+            ).await?,
+        };
+        // Save runtime/key material before the second network stage. Retry can
+        // then resume the missing task without registering another runtime.
+        self.persist_managed_chatgpt_agent_identity_record(record.clone(), &expected_tokens)?;
+        let needs_task = record_needs_task_registration(&record);
+        let auth = AgentIdentityAuth::from_record(
+            record, agent_identity_authapi_base_url, auth_route_config,
+        ).await.map_err(|err| classify_bootstrap_error("agent task registration", err))?;
+        // Recheck even when the task already existed: never return authority for
+        // an account replaced while bootstrap was in flight.
+        if needs_task {
+            record = auth.record().clone();
+            self.persist_managed_chatgpt_agent_identity_record(record, &expected_tokens)?;
+        }
         Ok(auth)
     }
 
@@ -853,8 +858,9 @@ impl ChatgptAuth {
     fn persist_agent_identity_record(
         &self,
         record: AgentIdentityAuthRecord,
+        expected_tokens: &TokenData,
     ) -> std::io::Result<()> {
-        persist_agent_identity_record(&self.state.auth_dot_json, &self.storage, record)
+        persist_agent_identity_record(&self.state.auth_dot_json, &self.storage, record, expected_tokens)
     }
 }
 
@@ -862,14 +868,20 @@ fn persist_agent_identity_record(
     auth_dot_json: &Arc<Mutex<Option<AuthDotJson>>>,
     storage: &Arc<dyn AuthStorageBackend>,
     record: AgentIdentityAuthRecord,
+    expected_tokens: &TokenData,
 ) -> std::io::Result<()> {
     let mut guard = auth_dot_json
         .lock()
         .map_err(|_| std::io::Error::other("failed to lock auth state"))?;
     let mut auth = storage
         .load()?
-        .or_else(|| guard.clone())
         .ok_or_else(|| std::io::Error::other("auth data is not available"))?;
+    if auth.resolved_mode() != AuthMode::Chatgpt
+        || auth.tokens.as_ref() != Some(expected_tokens)
+        || guard.as_ref().and_then(|auth| auth.tokens.as_ref()) != Some(expected_tokens)
+    {
+        return Err(std::io::Error::other("authentication changed during identity bootstrap"));
+    }
     auth.agent_identity = Some(AgentIdentityStorage::Record(record));
     storage.save(&auth)?;
     *guard = Some(auth);
@@ -1305,56 +1317,15 @@ async fn enforce_login_restrictions_with_agent_identity_authapi_base_url(
     }
 
     if let Some(expected_account_ids) = config.forced_chatgpt_workspace_id.as_deref() {
-        let chatgpt_account_id = match &auth {
-            CodexAuth::ApiKey(_) | CodexAuth::Headers(_) | CodexAuth::BedrockApiKey(_) => {
-                return Ok(());
-            }
-            CodexAuth::AgentIdentity(_) | CodexAuth::PersonalAccessToken(_) => {
-                auth.get_account_id()
-            }
-            CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_) => {
-                let token_data = match auth.get_token_data() {
-                    Ok(data) => data,
-                    Err(err) => {
-                        return logout_with_message(
-                            &config.codex_home,
-                            format!(
-                                "Failed to load ChatGPT credentials while enforcing workspace restrictions: {err}. Logging out."
-                            ),
-                            config.auth_credentials_store_mode,
-                            config.keyring_backend_kind,
-                        );
-                    }
-                };
-                token_data.id_token.chatgpt_account_id
-            }
-        };
-
-        // workspace is the external identifier for account id.
-        let chatgpt_account_id = chatgpt_account_id.as_deref();
-        if !chatgpt_account_id.is_some_and(|actual| {
-            expected_account_ids
-                .iter()
-                .any(|expected| expected == actual)
-        }) {
-            let expected_workspaces = expected_account_ids.join(", ");
-            let message = match chatgpt_account_id {
-                Some(actual) => format!(
-                    "Login is restricted to workspace(s) {expected_workspaces}, but current credentials belong to {actual}. Logging out."
-                ),
-                None => format!(
-                    "Login is restricted to workspace(s) {expected_workspaces}, but current credentials lack a workspace identifier. Logging out."
-                ),
-            };
+        if let Err(message) = validate_auth_restrictions(None, Some(expected_account_ids), &auth) {
             return logout_with_message(
                 &config.codex_home,
-                message,
+                format!("{message}. Logging out."),
                 config.auth_credentials_store_mode,
                 config.keyring_backend_kind,
             );
         }
     }
-
     Ok(())
 }
 

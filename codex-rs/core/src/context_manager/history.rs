@@ -288,7 +288,6 @@ impl PreparedPromptInput {
         self.fallback_items.shared()
     }
 
-    #[cfg(test)]
     pub(crate) fn shared_unreplaced_items(&self) -> Arc<[ResponseItem]> {
         self.unreplaced_items.shared()
     }
@@ -434,7 +433,6 @@ pub(crate) struct ContextManager {
     item_token_estimates:
         Arc<StdMutex<HashMap<ItemTokenEstimateCacheNamespace, HashMap<usize, i64>>>>,
     token_info: Option<TokenUsageInfo>,
-    active_requirement_count: usize,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
     ///
@@ -451,12 +449,6 @@ pub(crate) struct ContextManager {
 }
 
 impl ContextManager {
-    pub(crate) fn phase_checkpoint_receipts(
-        &self,
-        call_ids: &[String],
-    ) -> Result<serde_json::Value, String> {
-        self.tool_history.phase_checkpoint_receipts(call_ids)
-    }
     pub(crate) fn new() -> Self {
         Self {
             items: Arc::new(Vec::new()),
@@ -469,7 +461,6 @@ impl ContextManager {
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
-            active_requirement_count: 0,
             realized_context_baseline: RealizedContextBaseline::Unknown,
             world_state_baseline: None,
         }
@@ -481,11 +472,6 @@ impl ContextManager {
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.token_info = info;
-        self.sync_tool_result_token_budget();
-    }
-
-    pub(crate) fn set_active_requirement_count(&mut self, count: usize) {
-        self.active_requirement_count = count;
         self.sync_tool_result_token_budget();
     }
 
@@ -508,7 +494,6 @@ impl ContextManager {
                     window,
                     usage.map_or(0, |usage| usize::try_from(usage.input_tokens).unwrap_or(0)),
                     generation_room,
-                    self.active_requirement_count,
                 )
             });
         if self
@@ -740,21 +725,38 @@ impl ContextManager {
         }
         if stable_context_target != StableContextTarget::Sampling {
             evict_resolved_reasoning(Arc::make_mut(&mut self.items));
-            project_update_plan_history(Arc::make_mut(&mut self.items));
         } else if let Some(boundary) = completed_turn_boundary(&self.items) {
-            // A final answer followed by a real user request closes the old
-            // reasoning chain. Keep steering/aborted turns and the active chain;
-            // this is a model projection, not a canonical-history deletion.
+            // Only authoritative completion closes the old reasoning chain.
+            // This is a model projection, not a canonical-history deletion.
             let mut index = 0;
             Arc::make_mut(&mut self.items).retain(|item| {
-                let keep = index >= boundary || !matches!(item, ResponseItem::Reasoning { .. });
+                let keep = !is_resolved_reasoning(index, item, Some(boundary));
                 index += 1;
                 keep
             });
         }
+        // A newly accepted plan is the projection boundary; continuations with
+        // no plan update retain the same projected prefix.
+        project_update_plan_history(Arc::make_mut(&mut self.items));
         self.normalize_history(input_modalities);
         let mut normalized_items = Arc::unwrap_or_clone(self.items);
+        retire_expired_turn_advice(&mut normalized_items);
         if stable_context_target == StableContextTarget::Sampling {
+            // Retire superseded trusted slots only through the latest real
+            // request. Never hoist surviving fragments or rewrite active-tail
+            // injections on each continuation.
+            if let Some(boundary) = normalized_items.iter().rposition(|item| {
+                matches!(item, ResponseItem::Message { role, .. } if role == "user")
+                    && is_user_turn_boundary(item)
+                    && !crate::compact::is_compaction_summary_item(item)
+                    && !crate::stable_context::is_trusted_stable_context_item(item)
+            }) {
+                let tail = normalized_items.split_off(boundary + 1);
+                normalized_items = crate::stable_context::project_compaction_context(
+                    normalized_items.into(),
+                );
+                normalized_items.extend(tail);
+            }
             // Ingestion already filters new injections. Apply the same trusted,
             // nonvolatile equality rule to resumed/replaced history as well.
             // Do not hoist newer instructions or infer trust from their text.
@@ -845,8 +847,10 @@ impl ContextManager {
         )
     }
 
-    /// Compaction also benefits from settled, exactly recoverable tool receipts.
-    /// This is explicit so generic prompt preparation remains lossless.
+    /// The non-agentic summarizer cannot dereference receipts. Use the existing
+    /// priority-ordered, budgeted raw fallback: diagnostic and active evidence
+    /// gets the allowance before generic digests, without a recovery loop.
+    #[cfg(test)]
     pub(crate) fn for_compaction_prompt_with_completed_tool_projection(
         self,
         input_modalities: &[InputModality],
@@ -859,7 +863,22 @@ impl ContextManager {
             None,
             true,
         )
-        .shared_items()
+        .shared_unreplaced_items()
+    }
+
+    /// The local summarizer cannot recover artifacts. Keep acquired evidence
+    /// in its request and annotate freshness without substituting receipts.
+    pub(crate) fn for_local_compaction_prompt(
+        self,
+        input_modalities: &[InputModality],
+        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
+        git_workspace: &crate::git_workspace::GitWorkspaceCache,
+    ) -> Arc<[ResponseItem]> {
+        let tool_history = Arc::clone(&self.tool_history);
+        let prepared = self.prepare_for_prompt_target(input_modalities, StableContextTarget::FailOpen);
+        tool_history.project_workspace_freshness_with_cache(
+            prepared.shared_items(), workspace_identity, git_workspace,
+        ).items
     }
 
     fn prepare_for_prompt_with_completed_tool_projection_target(
@@ -1541,10 +1560,10 @@ impl ContextManager {
             )
             && self.items.iter().rev().any(|prior| match prior {
                 ResponseItem::FunctionCall {
-                    call_id: id, name, ..
+                    call_id: id, name, namespace: None, ..
                 }
                 | ResponseItem::CustomToolCall {
-                    call_id: id, name, ..
+                    call_id: id, name, namespace: None, ..
                 } => id == call_id && matches!(name.as_str(), "exec" | "wait"),
                 _ => false,
             })
@@ -1648,47 +1667,41 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
         .iter()
         .enumerate()
         .filter_map(|(index, item)| match item {
-            ResponseItem::FunctionCall { name, call_id, .. } if name == "update_plan" => {
+            ResponseItem::FunctionCall { name, namespace: None, call_id, .. } if name == "update_plan" => {
                 Some((index, call_id.clone()))
             }
             _ => None,
         })
         .collect::<Vec<_>>();
-    let Some((latest_call_index, latest_call_id)) = update_calls.last() else {
-        return;
-    };
-    let Some((latest_output_index, latest_output)) =
-        items.iter().enumerate().rev().find(|(_, item)| {
-            matches!(
-                item,
-                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == latest_call_id
-            )
+    // Rejections/cancellation after an accepted update remain verbatim. They
+    // must not resurrect every obsolete checklist in compaction input.
+    let latest = update_calls.iter().rev().find_map(|(call_index, call_id)| {
+        items.iter().enumerate().rev().find_map(|(output_index, item)| {
+            let ResponseItem::FunctionCallOutput { call_id: output_id, output, .. } = item else {
+                return None;
+            };
+            if output_id != call_id || output.success == Some(false) {
+                return None;
+            }
+            let FunctionCallOutputBody::Text(text) = &output.body else { return None };
+            let value: serde_json::Value = serde_json::from_str(text).ok()?;
+            value.get("current_plan").filter(|plan| plan.is_object())?;
+            Some((*call_index, output_index, value))
         })
-    else {
+    });
+    let Some((latest_call_index, latest_output_index, mut authoritative_output)) = latest else {
         return;
     };
-    let ResponseItem::FunctionCallOutput { output, .. } = latest_output else {
-        return;
-    };
-    let FunctionCallOutputBody::Text(text) = &output.body else {
-        return;
-    };
-    let Ok(mut authoritative_output) = serde_json::from_str::<serde_json::Value>(text) else {
-        return;
-    };
-    if authoritative_output.get("current_plan").is_none() {
-        return;
-    }
     let Some(output_object) = authoritative_output.as_object_mut() else {
         return;
     };
     output_object.remove("normalized_plan");
     output_object.insert(
         "superseded_updates".to_string(),
-        serde_json::json!(update_calls.len().saturating_sub(1)),
+        serde_json::json!(update_calls.iter().filter(|(index, _)| *index < latest_call_index).count()),
     );
 
-    let mut projected_call = items[*latest_call_index].clone();
+    let mut projected_call = items[latest_call_index].clone();
     let ResponseItem::FunctionCall { arguments, .. } = &mut projected_call else {
         return;
     };
@@ -1704,18 +1717,29 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
 
     let update_call_ids = update_calls
         .iter()
+        .filter(|(index, call_id)| *index <= latest_call_index && items.iter().any(|item| {
+            let ResponseItem::FunctionCallOutput { call_id: output_id, output, .. } = item else {
+                return false;
+            };
+            output_id == call_id && output.success != Some(false)
+                && output.body.to_text().is_some_and(|text| {
+                    serde_json::from_str::<serde_json::Value>(&text)
+                        .is_ok_and(|value| value["current_plan"].is_object())
+                })
+        }))
         .map(|(_, call_id)| call_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut index = 0;
     let mut retained = 0;
     let mut insertion_index = 0;
     items.retain(|item| {
-        if index == *latest_call_index {
+        if index == latest_call_index {
             insertion_index = retained;
         }
         let belongs_to_update_plan = matches!(
             item,
-            ResponseItem::FunctionCall { name, .. } if name == "update_plan"
+            ResponseItem::FunctionCall { name, namespace: None, call_id, .. }
+                if name == "update_plan" && update_call_ids.contains(call_id.as_str())
         ) || matches!(
             item,
             ResponseItem::FunctionCallOutput { call_id, .. }
@@ -1746,7 +1770,8 @@ fn prepared_append_can_be_completed(items: &[ResponseItem], supports_images: boo
                                 | codex_protocol::models::ContentItem::OutputText { .. }
                         )
                     }) => {}
-            ResponseItem::FunctionCall { name, call_id, .. } if name != "update_plan" => {
+            ResponseItem::FunctionCall { name, namespace, call_id, .. }
+                if namespace.is_some() || name != "update_plan" => {
                 if !calls.insert((false, call_id.as_str())) {
                     return false;
                 }
@@ -2490,7 +2515,27 @@ fn is_resolved_reasoning(
     last_instruction_boundary: Option<usize>,
 ) -> bool {
     last_instruction_boundary.is_some_and(|boundary| index < boundary)
-        && matches!(item, ResponseItem::Reasoning { .. })
+        && (matches!(item, ResponseItem::Reasoning { .. }) || is_turn_local_advice(item))
+}
+
+pub(crate) fn is_turn_local_advice(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { id: Some(id), role, .. }
+        if role == "developer" && id.as_str().starts_with("msg_turn_advice_"))
+}
+
+pub(crate) fn retire_expired_turn_advice(items: &mut Vec<ResponseItem>) {
+    let current_turn = items.iter().rev().find(|item| is_user_turn_boundary(item))
+        .and_then(ResponseItem::turn_id).map(str::to_string);
+    let completed = completed_turn_boundary(items);
+    let mut index = 0;
+    items.retain(|item| {
+        let expired = is_turn_local_advice(item) && (
+            completed.is_some_and(|boundary| index < boundary)
+                || current_turn.as_deref().is_some_and(|turn| item.turn_id().is_some_and(|owner| owner != turn))
+        );
+        index += 1;
+        !expired
+    });
 }
 
 fn evict_resolved_reasoning(items: &mut Vec<ResponseItem>) {
@@ -2503,28 +2548,21 @@ fn evict_resolved_reasoning(items: &mut Vec<ResponseItem>) {
     });
 }
 
-/// End of the latest answered task before the current real user request.
-/// A user interruption alone is not evidence that the earlier work is finished.
+/// End of a task established by authoritative terminal evidence, if available.
+/// A final-channel answer or a later user request does not establish completion.
 pub(crate) fn completed_turn_boundary(items: &[ResponseItem]) -> Option<usize> {
     completed_turn_boundary_with_pending_user(items, false)
 }
 
 fn completed_turn_boundary_with_pending_user(
-    items: &[ResponseItem],
-    pending_user_boundary: bool,
+    _items: &[ResponseItem],
+    _pending_user_boundary: bool,
 ) -> Option<usize> {
-    let user = if pending_user_boundary {
-        items.len()
-    } else {
-        items.iter().rposition(|item| {
-            matches!(item, ResponseItem::Message { role, .. } if role == "user")
-                && is_user_turn_boundary(item)
-        })?
-    };
-    items[..user].iter().rposition(|item| matches!(item,
-        ResponseItem::Message { role, phase: Some(codex_protocol::models::MessagePhase::FinalAnswer), .. }
-            if role == "assistant"
-    )).map(|index| index + 1)
+    // ResponseItem carries presentation and checklist state, not an accepted
+    // task-completion receipt. Fail open rather than interpreting prose (or
+    // unchecked boxes) as terminal evidence. Explicit turn-scoped advice still
+    // expires by its owning turn; normal bounded compaction remains available.
+    None
 }
 
 pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {

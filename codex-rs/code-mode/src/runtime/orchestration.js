@@ -22,6 +22,16 @@
     return tools[name];
   };
 
+  Object.defineProperty(globalThis, "read_status", {
+    value: async function read_status(paths, options = {}) {
+      if (!Array.isArray(paths) || paths.length < 1 || paths.length > 32 ||
+          paths.some(path => typeof path !== "string" || !path.trim())) {
+        throw new TypeError("read_status requires 1–32 nonempty paths");
+      }
+      return capability("read_status")({ ...options, paths: [...paths] });
+    },
+  });
+
   Object.defineProperty(globalThis, "read_files", {
     value: async function read_files(paths, { concurrency = 4, full = false } = {}) {
       // Strings deliberately exclude ambiguous selector merges and environment
@@ -33,12 +43,11 @@
       integer(concurrency, 1, 16, "concurrency");
       if (typeof full !== "boolean") throw new TypeError("full must be boolean");
       const read = capability("read_file");
-      const recover = full ? capability("read_tool_output") : undefined;
       const requested = [...paths];
       const unique = [...new Set(requested)];
       // Bound aggregate full-recovery data to 8 MiB, in addition to the normal
       // per-call payload cap. Oversize results retain their initial receipt.
-      const fileLimit = Math.floor(8 * 1024 * 1024 / unique.length);
+      let remainingBytes = 8 * 1024 * 1024;
       const nodes = unique.map((path, index) => ({
         id: String(index),
         run: async () => {
@@ -50,9 +59,12 @@
           }
           if (!full) return evidence;
           const size = initial.canonical_bytes;
-          if (!Number.isSafeInteger(size) || size > fileLimit || size < 0) {
+          if (!Number.isSafeInteger(size) || size > remainingBytes || size < 0) {
             fail("full read exceeds its bounded snapshot scope", evidence);
           }
+          // Reserve the whole snapshot synchronously before any recovery await.
+          // Duplicate paths share this reservation; uneven files share the budget.
+          remainingBytes -= size;
           if (evidence.file_complete) return evidence;
           const hash = initial.source_sha256;
           if (typeof hash !== "string" || !hash || !initial.artifact_id ||
@@ -88,9 +100,11 @@
           }
           // The full-read scope is already authorized. Recover only the unread
           // suffix of the original artifact, never reopen a mutable source file.
+          let recover;
           for (let call = 0; offset < size && call < 64; call++) {
             let page;
             try {
+              recover ??= capability("read_tool_output");
               page = await recover({ artifact_id: initial.artifact_id,
                 selectors: [{ kind: "bytes", start: offset, end: size }], max_bytes: 1024 * 1024 });
             } catch (cause) {
@@ -132,14 +146,17 @@
   });
 
   Object.defineProperty(globalThis, "await_command", {
-    value: async function await_command(initial, { max_observations = 256, on_progress } = {}) {
+    value: async function await_command(initial, { max_observations = 256, max_wait_ms = 300_000, on_progress } = {}) {
       integer(max_observations, 1, 1024, "max_observations");
+      integer(max_wait_ms, 5_000, 300_000, "max_wait_ms");
+      const deadline = Date.now() + max_wait_ms;
       if (on_progress !== undefined && typeof on_progress !== "function") {
         throw new TypeError("on_progress must be a function");
       }
       const observations = [];
       let current = initial;
       let session;
+      let incarnation;
       while (true) {
         observations.push(current);
         const evidence = { terminal: current, observations };
@@ -150,26 +167,40 @@
         }
         const exited = current.process_exited === true || current.execution_state === "exited";
         if (exited) {
-          if (!Number.isInteger(current.exit_code) || current.exit_code !== 0 ||
-              current.session_id != null || current.process_exited !== true ||
+          if (current.process_exited !== true ||
               current.execution_state !== "exited") {
-            fail("command did not succeed", evidence);
+            fail("inconsistent command exit state", evidence);
           }
-          return evidence;
+          // An exited process can still own unread output. Drain its authorized
+          // handle before interpreting the final exit code, including failures.
+          if (current.session_id == null) {
+            if (current.exit_code === 0 ||
+                (current.exit_code === 1 && current.search_no_match === true)) return evidence;
+            fail(`command did not succeed (exit_code=${current.exit_code ?? "unknown"}, ` +
+              `execution_state=${current.execution_state ?? "unknown"}, ` +
+              `process_exited=${current.process_exited ?? "unknown"})`, evidence);
+          }
         }
-        if (current.execution_state !== "running" ||
+        if ((!exited && current.execution_state !== "running") ||
             !Number.isInteger(current.session_id) || current.session_id < 0 ||
             current.session_capabilities?.polling !== true ||
-            (session !== undefined && current.session_id !== session)) {
+            typeof current.session_capabilities?.incarnation !== "string" ||
+            !current.session_capabilities.incarnation ||
+            (session !== undefined && (current.session_id !== session ||
+              current.session_capabilities.incarnation !== incarnation))) {
           fail("missing or changed live command handle", evidence);
         }
         session = current.session_id;
+        incarnation = current.session_capabilities.incarnation;
         if (observations.length >= max_observations) fail("command observation limit reached", evidence);
         try {
           if (on_progress && await on_progress(current) !== true) fail("command progress needs review", evidence);
-          // Only observe the existing process. Passive waits stay steerable through
-          // the normal cell owner; no shell restart, stdin, cancellation or retry.
-          current = await capability("write_stdin")({ session_id: session, wait_for_output: true });
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) fail("command wait budget reached; inspect and resume the retained handle", evidence);
+          // A passive output wait can remain pending forever. Bound the existing
+          // poll instead; never race/detach a tool, kill the process, or restart it.
+          current = await capability("write_stdin")({ session_id: session, incarnation,
+            wait_for_output: false, yield_time_ms: Math.max(5_000, remaining) });
         } catch (cause) {
           if (cause?.evidence === evidence) throw cause;
           evidence.cause = cause;

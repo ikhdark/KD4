@@ -198,7 +198,7 @@ impl ToolRouter {
             .filter(|tool| tool.exposure() == codex_tools::ToolExposure::Deferred)
             .filter_map(RegisteredTool::search_info)
             .collect::<Vec<_>>();
-        let tool_search_sources = if search_infos.is_empty() {
+        let mut tool_search_sources = if search_infos.is_empty() {
             String::new()
         } else {
             crate::tools::handlers::tool_search_spec::render_tool_search_sources(
@@ -207,8 +207,19 @@ impl ToolRouter {
                     .filter_map(|info| info.source_info.clone())
                     .collect::<Vec<_>>(),
                 search_infos.iter().any(|info| info.source_info.is_none()),
+                &search_infos,
             )
         };
+        // Keep installed-but-rejected capabilities visible through the existing
+        // source notice even when no callable survived registration.
+        for warning in planning_warnings.iter().filter(|warning| {
+            warning.starts_with(super::spec_plan::REJECTED_TOOL_WARNING_PREFIX)
+        }) {
+            if !tool_search_sources.is_empty() {
+                tool_search_sources.push('\n');
+            }
+            tool_search_sources.push_str(warning);
+        }
         let mut planning_warnings = planning_warnings;
         if let Some(warning) = tool_schema_size_warning(&registry.model_visible_schemas()) {
             tracing::warn!("{warning}");
@@ -234,6 +245,22 @@ impl ToolRouter {
 
     pub(crate) fn has_registered_tool(&self, name: &ToolName) -> bool {
         self.registry.tool_exposure(name).is_some()
+    }
+
+    pub(crate) fn tool_search_sources_for_instructions(&self, instructions: Option<&str>) -> std::borrow::Cow<'_, str> {
+        let Some(instructions) = instructions.filter(|text| text.contains("<app-context>")) else {
+            return std::borrow::Cow::Borrowed(&self.tool_search_sources);
+        };
+        let entries = self.registry.manifest_entries();
+        let available = entries.iter().map(|tool| tool.tool_name().name.as_str()).collect();
+        let missing = crate::context::desktop_instructions::unavailable_tools(instructions, &available);
+        if missing.is_empty() {
+            std::borrow::Cow::Borrowed(&self.tool_search_sources)
+        } else {
+            // Routers can be reused across turns; the current instructions are
+            // not part of their inventory cache identity.
+            std::borrow::Cow::Owned(format!("{}\n{missing}", self.tool_search_sources))
+        }
     }
 
     pub(crate) fn exposure_identity(&self) -> &ToolExposureIdentity {
@@ -297,7 +324,9 @@ impl ToolRouter {
                         let name = tool.tool_name();
                         let encoded = serde_json::to_vec(&serde_json::json!({
                             "provenance": name.to_string(),
+                            "provider_authority": tool.provider_authority(),
                             "spec_sha256": tool.canonical_spec_sha256(),
+                            "callable_contract": tool.spec().callable_contract(),
                         }))
                         .unwrap_or_default();
                         (name.clone(), format!("{:x}", Sha256::digest(encoded)))
@@ -588,7 +617,7 @@ impl ToolRouter {
     }
 
     pub(crate) fn delegates_workspace_admission(&self, call: &ToolCall) -> bool {
-        self.registry.delegates_workspace_admission(&call.tool_name)
+        self.registry.delegates_workspace_admission(&call.tool_name, &call.payload)
     }
 
     pub(crate) fn native_addition_paths(&self, call: &ToolCall) -> Option<Vec<std::path::PathBuf>> {

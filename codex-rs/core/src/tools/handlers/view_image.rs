@@ -18,7 +18,7 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::resolve_tool_environment;
+use crate::tools::handlers::wait_for_tool_environment;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::handlers::view_image_spec::create_view_image_tool;
 use crate::tools::registry::CoreToolRuntime;
@@ -121,6 +121,7 @@ impl ViewImageHandler {
         let ToolInvocation {
             session,
             step_context,
+            cancellation_token,
             payload,
             call_id,
             ..
@@ -156,7 +157,7 @@ impl ViewImageHandler {
         };
 
         let Some(turn_environment) =
-            resolve_tool_environment(&step_context.environments, environment_id.as_deref())?
+            wait_for_tool_environment(&step_context.environments, environment_id.as_deref(), &cancellation_token).await?
         else {
             return Err(FunctionCallError::RespondToModel(
                 "view_image is unavailable in this session".to_string(),

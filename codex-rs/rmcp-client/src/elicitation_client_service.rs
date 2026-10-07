@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::logging_client_handler::LoggingClientHandler;
 use crate::rmcp_client::Elicitation;
-use crate::rmcp_client::ElicitationPauseState;
+use crate::rmcp_client::ElicitationPauseRegistry;
 use crate::rmcp_client::ElicitationResponse;
 use crate::rmcp_client::SendElicitation;
 use crate::rmcp_client::SendProgress;
@@ -43,7 +43,7 @@ pub(crate) struct ElicitationClientService {
     handler: LoggingClientHandler,
     supports_openai_form: bool,
     send_elicitation: Arc<SendElicitation>,
-    pause_state: ElicitationPauseState,
+    pause_state: ElicitationPauseRegistry,
 }
 
 impl ElicitationClientService {
@@ -52,7 +52,7 @@ impl ElicitationClientService {
         send_elicitation: SendElicitation,
         send_progress: SendProgress,
         send_tool_list_changed: SendToolListChanged,
-        pause_state: ElicitationPauseState,
+        pause_state: ElicitationPauseRegistry,
     ) -> Self {
         let supports_openai_form = client_info
             .capabilities
@@ -79,8 +79,10 @@ impl ElicitationClientService {
         context: RequestContext<RoleClient>,
     ) -> Result<ElicitationResponse, rmcp::ErrorData> {
         let RequestContext { id, meta, .. } = context;
-        let request = restore_context_meta(request, meta);
+        // Operation timing is distinct from the global UI pause owned by the
+        // caller. An uncorrelated dialog cannot pause concurrent requests.
         let _pause = self.pause_state.enter();
+        let request = restore_context_meta(request, meta);
         (self.send_elicitation)(id, request)
             .await
             .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))

@@ -83,9 +83,13 @@ pub(crate) fn agent_status_from_task(
         }
         _ => receipt.summary.as_str(),
     };
-    if !plain_message && !task.workspace_status.pending_gates.is_empty() {
-        return Some(AgentStatus::Errored(format!(
-            "durable typed task has pending gates: {}\n\nAgent-reported result (not verification evidence): {reported_message}\n\nResolve the gates on assignment {}; do not rerun the agent merely to recover this report.",
+    if !plain_message && receipt.status == AgentStatusClaim::Completed
+        && !task.workspace_status.pending_gates.is_empty()
+    {
+        // Execution finished; acceptance is still owned by the durable gates.
+        // Do not surface a typed result or turn pending review into a failure.
+        return Some(AgentStatus::Completed(Some(format!(
+            "Agent execution completed; durable typed task has pending gates: {}\n\nAgent-reported result (not verification evidence): {reported_message}\n\nResolve the gates on assignment {}; do not rerun the agent merely to recover this report.",
             task.workspace_status
                 .pending_gates
                 .iter()
@@ -93,7 +97,7 @@ pub(crate) fn agent_status_from_task(
                 .collect::<Vec<_>>()
                 .join(", "),
             task.assignment.assignment_id,
-        )));
+        ))));
     }
     match receipt.status {
         AgentStatusClaim::Completed
@@ -447,10 +451,14 @@ mod tests {
     }
 
     #[test]
-    fn pending_gate_blocks_completed_receipt_projection() {
+    fn pending_gate_preserves_execution_completion_without_claiming_acceptance() {
         assert!(matches!(
             agent_status_from_task(&typed_task_with_receipt(AgentStatusClaim::Completed, true), None),
-            Some(AgentStatus::Errored(message)) if message.contains("pending gates")
+            Some(AgentStatus::Completed(Some(message))) if message.contains("pending gates")
+        ));
+        assert!(matches!(
+            agent_status_from_task(&typed_task_with_receipt(AgentStatusClaim::Failed, true), None),
+            Some(AgentStatus::Errored(message)) if message.contains("status: failed")
         ));
     }
 
@@ -469,7 +477,7 @@ mod tests {
         assert!(message.contains("Running Desktop build: not established"));
 
         task.workspace_status.pending_gates = vec![codex_agent_task_store::GateKind::Review];
-        let Some(AgentStatus::Errored(message)) =
+        let Some(AgentStatus::Completed(Some(message))) =
             agent_status_from_task(&task, Some((attempt_id, &observed)))
         else {
             panic!("report delivery must not clear pending gates");
@@ -479,7 +487,7 @@ mod tests {
         assert!(message.contains("not verification evidence"));
         assert!(message.contains(&task.assignment.assignment_id.to_string()));
 
-        let Some(AgentStatus::Errored(stale)) =
+        let Some(AgentStatus::Completed(Some(stale))) =
             agent_status_from_task(&task, Some((AttemptId::new(), &observed)))
         else {
             panic!("stale report must not bypass pending gates");
@@ -511,7 +519,7 @@ mod tests {
         task.workspace_status =
             typed_task_with_receipt(AgentStatusClaim::Completed, true).workspace_status;
         assert!(
-            matches!(agent_status_from_task(&task, Some((attempt_id, &observed))), Some(AgentStatus::Errored(message)) if message.contains("pending gates"))
+            matches!(agent_status_from_task(&task, Some((attempt_id, &observed))), Some(AgentStatus::Completed(Some(message))) if message.contains("pending gates"))
         );
     }
 }

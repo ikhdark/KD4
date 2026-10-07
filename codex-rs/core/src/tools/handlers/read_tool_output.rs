@@ -286,11 +286,11 @@ impl RecoveryContinuationState {
         let ToolOutputSelector::Bytes { start, end } = &selector else {
             return selector;
         };
-        let remaining_end = self.output.results.iter().find_map(|owner| {
+        let remaining_end = self.output.results.iter().enumerate().find_map(|(index, owner)| {
             if owner.continuation.as_ref() != Some(&selector) {
                 return None;
             }
-            let range = owner.canonical_range?;
+            let range = self.output.results[self.result_owners[index]].canonical_range?;
             (range.start <= *start && *end <= range.end).then_some(range.end)
         });
         match remaining_end {
@@ -300,9 +300,11 @@ impl RecoveryContinuationState {
     }
 
     fn first_pending_selector(&self) -> Option<ToolOutputSelector> {
-        self.output.results.iter().find_map(|result| {
+        (self.initial_result_count..self.output.results.len()).rev()
+            .chain(0..self.initial_result_count).find_map(|index| {
+            let result = &self.output.results[index];
             if selector_stop_reason(result.status).is_some() {
-                Some(result.selector.clone())
+                None
             } else {
                 result.continuation.clone()
             }
@@ -310,9 +312,16 @@ impl RecoveryContinuationState {
     }
 
     fn next_step(&self) -> ContinuationStep {
-        for (result_index, result) in self.output.results.iter().enumerate() {
-            if let Some(reason) = selector_stop_reason(result.status) {
-                return ContinuationStep::Stop(reason);
+        // Drain an unfinished child before advancing its parent's next range.
+        // Otherwise a bounded child can leave a gap ahead of later source bytes.
+        for result_index in (self.initial_result_count..self.output.results.len()).rev()
+            .chain(0..self.initial_result_count)
+        {
+            let result = &self.output.results[result_index];
+            if selector_stop_reason(result.status).is_some() {
+                // A selector-local failure remains in results, but must not
+                // strand independent selectors later in this transaction.
+                continue;
             }
             let Some(selector) = result.continuation.as_ref() else {
                 continue;
@@ -365,15 +374,17 @@ impl RecoveryContinuationState {
         {
             return Err(ContinuationStopReason::IncompleteOwnerResult);
         }
-        if let Some(reason) = selector_stop_reason(page.results[0].status) {
-            return Err(reason);
-        }
+        let selector_failed = selector_stop_reason(page.results[0].status).is_some();
 
         let previous_length = self.output.results.len();
         let previous_complete = self.output.complete;
         let previous_cost = self.result_costs[result_index];
         let predecessor = &mut self.output.results[result_index];
-        let next_continuation = next_owner_continuation(predecessor, selector);
+        let next_continuation = if selector_failed {
+            None
+        } else {
+            next_owner_continuation(predecessor, selector)
+        };
         let previous_continuation =
             std::mem::replace(&mut predecessor.continuation, next_continuation);
         let predecessor_was_complete = predecessor.complete;
@@ -398,7 +409,7 @@ impl RecoveryContinuationState {
         self.output.complete = self.output.results.iter().all(|result| {
                 result.status == ToolOutputSelectorStatus::Ok
                     && result.complete
-                    && result.continuation.is_none()
+                    && (result.selector.is_search() || result.continuation.is_none())
             });
         self.refresh_reconstruction();
         if self.projected_size(None).tokens() > self.token_ceiling {
@@ -470,7 +481,7 @@ impl RecoveryContinuationState {
                 reconstructed.complete = reconstructed.results.iter().all(|r| {
                     r.status == ToolOutputSelectorStatus::Ok
                         && r.complete
-                        && r.continuation.is_none()
+                        && (r.selector.is_search() || r.continuation.is_none())
                 });
                 return reconstructed;
             }
@@ -523,6 +534,15 @@ impl RecoveryContinuationState {
     }
 
     fn finish(mut self) -> DrainedRecoveryTransaction {
+        if self.continuation_stop.is_none()
+            && let Some((reason, selector)) = self.output.results.iter().find_map(|result| {
+                selector_stop_reason(result.status).map(|reason| (reason, result.selector.clone()))
+            })
+        {
+            // Report the local error after draining independent work, without
+            // replacing a global identity/cancellation/budget stop.
+            self.record_stop(reason, Some(selector));
+        }
         loop {
             if self
                 .projected_size(self.continuation_stop.as_ref())
@@ -631,6 +651,8 @@ impl RecoveryContinuationState {
         let mut size = TokenCountEstimate::default();
         let mut count = 0;
         let mut complete = true;
+        let mut any_success = false;
+        let mut all_selections_complete = true;
         for (index, raw) in self.output.results.iter().enumerate() {
             if self.fragment_is_reconstructed(index) {
                 continue;
@@ -647,14 +669,26 @@ impl RecoveryContinuationState {
             }
             size = size.add_delimited(cost.serialized);
             count += 1;
+            any_success |= result.status == ToolOutputSelectorStatus::Ok;
+            all_selections_complete &= result.status == ToolOutputSelectorStatus::Ok && result.complete;
             complete &= result.status == ToolOutputSelectorStatus::Ok
                 && result.complete
-                && result.continuation.is_none();
+                && (result.selector.is_search() || result.continuation.is_none());
         }
         if !self.reconstructed.iter().any(Option::is_some) {
             complete = self.output.complete;
         }
         size = size.add_delimited(self.envelope_costs[usize::from(complete)]);
+        // Cached envelopes have no results and therefore a "failed" status.
+        let status = if complete && any_success && all_selections_complete {
+            "\"complete\""
+        } else if any_success {
+            "\"partial\""
+        } else {
+            "\"failed\""
+        };
+        size = size.subtract_delimited(TokenCountEstimate::new("\"failed\""))
+            .add_delimited(TokenCountEstimate::new(status));
         if let Some(stop) = stop {
             size = size
                 .add_delimited(TokenCountEstimate::new(",\"continuation_stop\":"))
@@ -685,7 +719,7 @@ impl RecoveryContinuationState {
         self.output.complete = self.output.results.iter().all(|result| {
             result.status == ToolOutputSelectorStatus::Ok
                 && result.complete
-                && result.continuation.is_none()
+                && (result.selector.is_search() || result.continuation.is_none())
         });
     }
 }
@@ -926,6 +960,10 @@ struct ReadToolOutputToolOutput {
 }
 
 impl ToolOutput for ReadToolOutputToolOutput {
+    fn code_mode_failure_is_error(&self) -> bool {
+        self.inner.code_mode_failure_is_error()
+    }
+
     fn log_preview(&self) -> String {
         self.inner.log_preview()
     }
@@ -1067,13 +1105,13 @@ async fn handle_read_tool_output(
         action_bounds_hash,
         drained_continuation_pages,
     );
-    let successful = output.results.iter().any(|result| result.status == ToolOutputSelectorStatus::Ok);
+    let successful = recovery_call_succeeded(&output, continuation_stop.as_ref());
     let evidence = output.delivered_evidence().map(|identity| serde_json::json!({
         "source": "artifact",
         "scope": output.artifact_id,
         "identity": identity,
     }));
-    if successful {
+    if evidence.is_some() {
         let selectors = output.delivered_ranges().into_iter()
             .map(|(start, end)| serde_json::json!({"kind": "bytes", "start": start, "end": end}))
             .collect();
@@ -1089,11 +1127,31 @@ async fn handle_read_tool_output(
     }))
 }
 
+// Pagination is a successful bounded read, not a terminal selection failure.
+// Keep selection completeness and the continuation owner's remaining selectors
+// intact; cancellation, missing bytes and invalid siblings still fail the call.
+fn recovery_call_succeeded(output: &ReadToolOutputResult, stop: Option<&RecoveryContinuationStopV1>) -> bool {
+    if stop.is_some_and(|stop| stop.reason != ContinuationStopReason::Budget) {
+        return false;
+    }
+    if output.selection_status() == "complete" {
+        return true;
+    }
+    output.unavailable_ranges.is_empty()
+        && !output.results.is_empty()
+        && stop.is_some_and(|stop| stop.reason == ContinuationStopReason::Budget
+            && stop.resumable && (stop.selector.is_some() || !stop.page_selectors.is_empty()))
+        && output.results.iter().all(|result| matches!(result.status,
+            ToolOutputSelectorStatus::Ok | ToolOutputSelectorStatus::SelectorTooLarge
+                | ToolOutputSelectorStatus::AggregateOmitted))
+}
+
 fn recovery_tool_output(output: Value, successful: bool, evidence: Option<Value>) -> JsonToolOutput {
     let projected = codex_code_mode::model_visible_tool_result(
         &ToolName::plain(READ_TOOL_OUTPUT_TOOL_NAME), &output,
     );
-    let mut result = JsonToolOutput::with_success(output, Some(successful));
+    let mut result = JsonToolOutput::with_success(output, Some(successful))
+        .with_code_mode_failure_as_data();
     if let Some(projected) = projected {
         result = result.with_model_value(projected);
     }
@@ -1104,16 +1162,25 @@ fn recovery_tool_output(output: Value, successful: bool, evidence: Option<Value>
             );
         }
     } else {
-        let statuses = result.value()["results"].as_array().into_iter().flatten()
-            .filter_map(|result| result["status"].as_str())
-            .collect::<std::collections::BTreeSet<_>>();
+        let errors = result.value()["results"].as_array().into_iter().flatten()
+            .filter(|result| result["status"] != "ok" || result["complete"] == false)
+            .map(|result| serde_json::json!({
+                "selector": result["selector"], "status": result["status"],
+                "complete": result["complete"], "message": result["message"],
+            }))
+            .collect::<Vec<_>>();
         let mut signal = crate::tools::context::semantic_failure_sampling_signal(serde_json::json!({
             "artifact": result.value()["canonical_sha256"],
-            "statuses": statuses,
+            "errors": errors,
+            "continuation_stop": result.value()["continuation_stop"],
         }));
-        // Rejection is diagnostic, not successful source coverage.
+        // Partial recovery has two independent facts: delivered source bytes
+        // and unresolved selections. Neither may erase the other.
         if let Some(signal) = signal.as_object_mut() {
             signal.remove("semantic_evidence");
+            if let Some(evidence) = evidence {
+                signal.insert("semantic_evidence".to_string(), evidence);
+            }
         }
         result = result.with_sampling_request_signal(signal);
     }
@@ -1182,28 +1249,22 @@ async fn drain_recovery_snapshot_with_byte_limit(
     cancellation_token: &CancellationToken,
 ) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
     loop {
-        let result = drain_recovery_snapshot(
-            snapshot, selectors.clone(), token_ceiling, cancellation_token,
+        let result = drain_recovery_snapshot_with_source_budget(
+            snapshot, selectors.clone(), token_ceiling, max_bytes, cancellation_token,
         ).await?;
-        let delivered_bytes: u64 = result.output.delivered_ranges().iter()
-            .map(|(start, end)| end - start).sum();
         let envelope_bytes = recovery_envelope(&result.output, result.continuation_stop.as_ref())
             .and_then(|value| serde_json::to_vec(&value))
             .map_err(|error| ReadToolOutputError::Io(error.to_string()))?.len();
-        if delivered_bytes <= max_bytes as u64
-            && envelope_bytes <= READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES
-        {
+        if envelope_bytes <= READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES {
             return Ok(result);
         }
         // Refit against the same authenticated snapshot, never rerun or reread
         // the producer. Preserve the selector engine's exact ranges/continuation.
-        let smaller = (token_ceiling.saturating_mul(max_bytes)
-            / usize::try_from(delivered_bytes).unwrap_or(usize::MAX).max(1))
-            .min(token_ceiling.saturating_mul(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES)
-                / envelope_bytes.max(1));
+        let smaller = token_ceiling.saturating_mul(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES)
+            / envelope_bytes.max(1);
         if smaller >= token_ceiling || smaller < 256 {
             return Err(ReadToolOutputError::InvalidRange(
-                "max_bytes is too small for an exact recovery page; increase it or request a smaller selector".to_string(),
+                "recovery metadata exceeds the serialized payload budget".to_string(),
             ));
         }
         token_ceiling = smaller;
@@ -1216,10 +1277,60 @@ async fn drain_recovery_snapshot(
     token_ceiling: usize,
     cancellation_token: &CancellationToken,
 ) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
+    drain_recovery_snapshot_with_source_budget(
+        snapshot, selectors, token_ceiling, usize::MAX, cancellation_token,
+    ).await
+}
+
+// Source bytes and envelope metadata have independent budgets. Turn an exact
+// oversized selection into the same byte-subdivision contract used by the
+// selector owner, rather than shrinking the token budget below its metadata floor.
+fn bound_recovery_source_bytes(output: &mut ReadToolOutputResult, max_bytes: usize) {
+    let mut remaining = max_bytes as u64;
+    for result in &mut output.results {
+        if result.status != ToolOutputSelectorStatus::Ok { continue; }
+        let bytes = result.canonical_range.filter(|_| result.text.is_some()
+            || result.data_base64.is_some() || result.value.is_some())
+            .map_or(0, |range| range.end - range.start)
+            .saturating_add(result.value.as_ref().and_then(|value| value["hydrated_ranges"].as_array())
+                .map_or(0, |ranges| ranges.iter().filter_map(|range| {
+                    if !range["text"].is_string() && !range["data_base64"].is_string() { return None; }
+                    range["canonical_range"]["end"].as_u64()?.checked_sub(range["canonical_range"]["start"].as_u64()?)
+                }).sum::<u64>()));
+        if bytes <= remaining {
+            remaining -= bytes;
+            continue;
+        }
+        result.status = ToolOutputSelectorStatus::SelectorTooLarge;
+        result.complete = false;
+        result.text = None;
+        result.data_base64 = None;
+        result.value = None;
+        result.child_selectors.clear();
+        result.subdivision_plan = None;
+        result.continuation = Some(result.canonical_range.map_or_else(
+            || result.selector.clone(),
+            |range| ToolOutputSelector::Bytes {
+                start: range.start, end: range.start.saturating_add(remaining.max(1)).min(range.end),
+            },
+        ));
+        result.message = Some("Exact selection exceeds the remaining source-byte budget; continue with the unconsumed byte range.".into());
+        output.complete = false;
+    }
+}
+
+async fn drain_recovery_snapshot_with_source_budget(
+    snapshot: &std::sync::Arc<ToolOutputSnapshot>,
+    selectors: Vec<ToolOutputSelector>,
+    token_ceiling: usize,
+    max_bytes: usize,
+    cancellation_token: &CancellationToken,
+) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
     let token_ceiling = token_ceiling.saturating_add(
         crate::tools::command_output_artifact::RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN,
     );
-    let complete_output = snapshot.select(selectors.clone(), token_ceiling).await?;
+    let mut complete_output = snapshot.select(selectors.clone(), token_ceiling).await?;
+    bound_recovery_source_bytes(&mut complete_output, max_bytes);
     if complete_output.complete
         && recovery_envelope_fits(&complete_output, None, token_ceiling)
     {
@@ -1234,14 +1345,15 @@ async fn drain_recovery_snapshot(
         .max()
         .unwrap_or_default()
         .saturating_add(256);
-    let output = snapshot
+    let mut output = snapshot
         .select(selectors, token_ceiling.saturating_sub(reserve))
         .await?;
+    bound_recovery_source_bytes(&mut output, max_bytes);
     // Loading this transaction did perform an artifact read. Following its
     // pages reuses that same identity-checked observation, without more I/O.
     let mut state = RecoveryContinuationState::new(output, token_ceiling);
     loop {
-        let (result_index, selector) = match state.next_step() {
+        let (result_index, mut selector) = match state.next_step() {
             ContinuationStep::Complete => break,
             ContinuationStep::Stop(reason) => {
                 let selector = state.first_pending_selector();
@@ -1256,6 +1368,19 @@ async fn drain_recovery_snapshot(
         if cancellation_token.is_cancelled() {
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
             break;
+        }
+        let delivered = state.output.delivered_ranges().iter().map(|(start, end)| end - start).sum::<u64>();
+        let remaining = (max_bytes as u64).saturating_sub(delivered);
+        if remaining == 0 {
+            state.record_stop(ContinuationStopReason::Budget, Some(selector));
+            break;
+        }
+        if let ToolOutputSelector::Bytes { start, end } = &mut selector
+            && *end - *start > remaining
+        {
+            *end = start.saturating_add(remaining);
+            state.output.results[result_index].continuation = Some(selector.clone());
+            state.result_costs[result_index] = RecoveryResultCost::new(&state.output.results[result_index]);
         }
         let page = if let Some(page) = state.cached_page(&selector) {
             Ok(page)
@@ -1273,13 +1398,20 @@ async fn drain_recovery_snapshot(
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
             break;
         }
-        let page = match page {
+        let mut page = match page {
             Ok(page) => page,
             Err(error) => {
                 state.record_page_read_error(&error, selector);
                 break;
             }
         };
+        bound_recovery_source_bytes(&mut page, usize::try_from(remaining).unwrap_or(usize::MAX));
+        if page.delivered_ranges().is_empty()
+            && page.results.iter().any(|result| result.continuation.as_ref() == Some(&selector))
+        {
+            state.record_stop(ContinuationStopReason::Budget, Some(selector));
+            break;
+        }
         if let Err(reason) = state.accept_page(result_index, &selector, page) {
             state.record_stop(reason, Some(selector));
             break;

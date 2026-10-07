@@ -15,7 +15,7 @@
         ["scripts/rust_test_runner.py", "run-gate"],
         ["scripts/rust_test_runner.py", "parity"]
       ],
-      "options": {"-I": 0, "-u": 0, "--manifest": 1, "--target-dir": 1, "--profile": 1, "--cargo-profile": 1},
+      "options": {"-I": 0, "-u": 0, "--manifest": 1, "--target-dir": 1, "--profile": 1, "--cargo-profile": 1, "--admission-timeout-seconds": 1},
       "allow_extra_args": true,
       "operations": ["test"],
       "receipt_runner": "rust_test_runner"

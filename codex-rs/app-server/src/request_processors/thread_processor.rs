@@ -718,8 +718,20 @@ impl ThreadRequestProcessor {
         Ok(ThreadUnsubscribeResponse { status })
     }
 
-    async fn prepare_thread_for_archive(&self, thread_id: ThreadId) {
-        self.prepare_thread_for_removal(thread_id, "archive").await;
+    async fn prepare_thread_for_archive(&self, thread_id: ThreadId) -> Result<(), JSONRPCErrorError> {
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            match wait_for_thread_shutdown(&thread).await {
+                ThreadShutdownResult::Complete => {}
+                ThreadShutdownResult::SubmitFailed | ThreadShutdownResult::TimedOut => {
+                    return Err(internal_error(format!(
+                        "thread {thread_id} writer did not quiesce; archive was not performed"
+                    )));
+                }
+            }
+            self.thread_manager.remove_thread(&thread_id).await;
+        }
+        self.finalize_thread_teardown(thread_id).await;
+        Ok(())
     }
 
     pub(super) async fn prepare_thread_for_removal(&self, thread_id: ThreadId, operation: &str) {
@@ -1399,6 +1411,7 @@ impl ThreadRequestProcessor {
             return Ok((ThreadArchiveResponse {}, archived_thread_ids));
         };
 
+        self.prepare_thread_for_archive(*parent_thread_id).await?;
         match self
             .thread_store
             .archive_thread(StoreArchiveThreadParams {
@@ -1407,13 +1420,16 @@ impl ThreadRequestProcessor {
             .await
         {
             Ok(()) => {
-                self.prepare_thread_for_archive(*parent_thread_id).await;
                 archived_thread_ids.push(parent_thread_id.to_string());
             }
             Err(err) => return Err(thread_store_archive_error("archive", err)),
         }
 
         for descendant_thread_id in descendant_thread_ids.iter().rev().copied() {
+            if let Err(err) = self.prepare_thread_for_archive(descendant_thread_id).await {
+                warn!("failed to quiesce spawned descendant {descendant_thread_id}: {err:?}");
+                continue;
+            }
             match self
                 .thread_store
                 .archive_thread(StoreArchiveThreadParams {
@@ -1422,7 +1438,6 @@ impl ThreadRequestProcessor {
                 .await
             {
                 Ok(()) => {
-                    self.prepare_thread_for_archive(descendant_thread_id).await;
                     archived_thread_ids.push(descendant_thread_id.to_string());
                 }
                 Err(err) => {

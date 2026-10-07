@@ -445,6 +445,7 @@ async fn file_system_walk_returns_a_bounded_tree(
                 max_entries: 10,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                filters: Default::default(),
             },
             /*sandbox*/ None,
         )
@@ -453,6 +454,7 @@ async fn file_system_walk_returns_a_bounded_tree(
     assert_eq!(
         outcome,
         WalkOutcome {
+            applied_filters: None,
             entries: vec![
                 WalkEntry {
                     path: PathUri::from_host_native_path(&nested_dir)?,
@@ -469,6 +471,7 @@ async fn file_system_walk_returns_a_bounded_tree(
             ],
             errors: Vec::new(),
             truncated: false,
+            unexplored: Vec::new(),
         }
     );
 
@@ -491,6 +494,7 @@ async fn file_system_walk_returns_a_bounded_tree(
                 max_entries: 10,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                filters: Default::default(),
             },
             /*sandbox*/ None,
         )
@@ -499,9 +503,12 @@ async fn file_system_walk_returns_a_bounded_tree(
     assert_eq!(
         shallow,
         WalkOutcome {
+            applied_filters: None,
             entries: root_entries.clone(),
             errors: Vec::new(),
             truncated: true,
+            unexplored: vec![codex_file_system::WalkStop { path: PathUri::from_host_native_path(&nested_dir)?,
+                reason: "depth_limit".into(), effective_limit: 0, partially_examined: false }],
         }
     );
 
@@ -514,6 +521,7 @@ async fn file_system_walk_returns_a_bounded_tree(
                 max_entries: 10,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                filters: Default::default(),
             },
             /*sandbox*/ None,
         )
@@ -522,9 +530,12 @@ async fn file_system_walk_returns_a_bounded_tree(
     assert_eq!(
         directory_bounded,
         WalkOutcome {
+            applied_filters: None,
             entries: root_entries.clone(),
             errors: Vec::new(),
             truncated: true,
+            unexplored: vec![codex_file_system::WalkStop { path: PathUri::from_host_native_path(&nested_dir)?,
+                reason: "directory_limit".into(), effective_limit: 1, partially_examined: false }],
         }
     );
 
@@ -537,6 +548,7 @@ async fn file_system_walk_returns_a_bounded_tree(
                 max_entries: 1,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                filters: Default::default(),
             },
             /*sandbox*/ None,
         )
@@ -576,6 +588,7 @@ async fn file_system_walk_honors_read_sandbox(
                 max_entries: 2,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                filters: Default::default(),
             },
             Some(&sandbox),
         )
@@ -590,6 +603,8 @@ async fn file_system_walk_honors_read_sandbox(
             }],
             errors: Vec::new(),
             truncated: false,
+            unexplored: Vec::new(),
+            applied_filters: None,
         }
     );
 

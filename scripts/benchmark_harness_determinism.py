@@ -215,6 +215,8 @@ def main():
         ) <= args.max_scan_ms
     unchanged = all(sha256(snapshot / row["path"]) == row["sha256"] for row in sources)
     report = {"scope": "fixed-source inventory scans and retained replay; no live-model speedup claim",
+              "requirement_adherence_verified": False,
+              "semantic_evaluation": "Use the paired real-task protocol in docs/session-usage-diagnostics.md; projection equivalence is not task adherence.",
               "correctness_verified": bool(args.expected) and unchanged and all(checks.values()),
               "manifest_sha256": sha256(output / "manifest.json"),
               "baseline": baseline, "runs": runs, "replays": replay,

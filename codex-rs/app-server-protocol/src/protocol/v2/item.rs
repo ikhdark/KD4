@@ -219,6 +219,15 @@ pub enum ThreadItem {
     #[ts(rename_all = "camelCase")]
     CommandExecution {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        output_metadata: Option<codex_protocol::items::CommandExecutionOutputMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        stdout: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        stderr: Option<String>,
         /// The command to be executed.
         command: String,
         /// The command's working directory.
@@ -466,6 +475,9 @@ impl From<CoreTurnItem> for ThreadItem {
             },
             CoreTurnItem::CommandExecution(command) => ThreadItem::CommandExecution {
                 id: command.id,
+                output_metadata: command.output_metadata,
+                stdout: command.stdout,
+                stderr: command.stderr,
                 command: command_display_string(&command.command),
                 cwd: command.cwd.clone().into(),
                 process_id: command.process_id,
@@ -1006,6 +1018,14 @@ pub struct CommandExecutionOutputDeltaNotification {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+    /// Origin of this delta; absent only for legacy producers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stream: Option<codex_protocol::protocol::ExecOutputStream>,
+    /// Whether invalid UTF-8 was replaced while decoding this delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub decoding_lossy: Option<bool>,
 }
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1233,4 +1253,8 @@ pub struct ToolRequestUserInputResponse {
     pub answers: HashMap<String, ToolRequestUserInputAnswer>,
     #[serde(default)]
     pub interrupted: bool,
+    /// Absent for legacy clients. Timeout, skip and transport failure never imply approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub disposition: Option<codex_protocol::request_user_input::RequestUserInputDisposition>,
 }

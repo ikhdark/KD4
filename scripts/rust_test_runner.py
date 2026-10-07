@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -52,6 +53,26 @@ MAX_FAILURE_STREAM_CHARS = 4096
 WINDOWS_RESOURCE_HELPERS = ("codex-windows-sandbox-setup", "codex-command-runner")
 
 
+class ExecutionReceipts(dict):
+    """Compatibility projection plus the execution identities behind it."""
+
+    def __init__(self, projection, executed, required=None, *, gates=None):
+        super().__init__(projection)
+        self.executed = set(executed)
+        self.required = None if required is None else set(required)
+        self.gates = gates
+
+    @staticmethod
+    def identities(values):
+        return [{"binary": binary, "helpers": sorted(helpers), "test": test}
+                for binary, helpers, test in sorted(values, key=lambda row: (row[0], sorted(row[1]), row[2]))]
+
+    def completed_tests(self):
+        binaries = sorted({binary for binary, _, _ in self.executed})
+        return {binary: sorted({test for owner, _, test in self.executed if owner == binary})
+                for binary in binaries}
+
+
 class RunnerError(RuntimeError):
     """Raised when a declared test contract cannot be honored."""
 
@@ -66,7 +87,7 @@ class RunnerError(RuntimeError):
         super().__init__(message)
         self.outcome = outcome
         self.result = result
-        self.completed_gates = completed_gates or {}
+        self.completed_gates = completed_gates if completed_gates is not None else {}
         self.completed_tests: dict[str, list[str]] = {}
 
 
@@ -794,6 +815,15 @@ def _nextest_results(
                 yield match.groups()
 
 
+def _nextest_selected_count(result: subprocess.CompletedProcess[str]) -> int | None:
+    for stream in ("stdout", "stderr"):
+        for line in _output_lines(result, stream):
+            match = re.search(r"\bStarting\s+(\d+) tests? across\b", line)
+            if match:
+                return int(match[1])
+    return None
+
+
 def _stop_process_tree(process: subprocess.Popen) -> None:
     if getattr(process, "_codex_owned_job", None) is not None:
         process._codex_owned_job.stop(time.monotonic() + 15)
@@ -1016,6 +1046,34 @@ def _exact_test_ids(args: Sequence[str]) -> list[str] | None:
     return ids or None
 
 
+def _required_exact_test_ids(args: Sequence[str]) -> list[str] | None:
+    """Reconcile explicit IDs after intentional libtest name/skip narrowing."""
+    head, tail = (list(args), [])
+    if "--" in head:
+        separator = head.index("--")
+        head, tail = head[:separator], head[separator + 1:]
+    selected = _exact_test_ids(head)
+    if selected is None:
+        return None
+    names, skips = [], []
+    index = 0
+    while index < len(tail):
+        token = tail[index]
+        if token == "--skip":
+            skips.append(tail[index + 1])
+            index += 2
+            continue
+        if token.startswith("--skip="):
+            skips.append(token.split("=", 1)[1])
+        elif not token.startswith("-"):
+            names.append(token)
+        index += 1
+    matches = (lambda name, pattern: name == pattern) if "--exact" in tail else (lambda name, pattern: pattern in name)
+    return sorted({name for name in selected
+                   if (not names or any(matches(name, pattern) for pattern in names))
+                   and not any(matches(name, pattern) for pattern in skips)})
+
+
 class RustTestRunner:
     def __init__(
         self,
@@ -1033,6 +1091,7 @@ class RustTestRunner:
         cwd: Path = CODEX_RS_ROOT,
     ) -> None:
         self.manifest = manifest
+        self.manifest_path = DEFAULT_MANIFEST
         self.metadata = metadata
         self.target_dir = (target_dir or metadata.target_directory).resolve()
         self.platform = platform or current_platform()
@@ -1297,6 +1356,8 @@ class RustTestRunner:
         target = self.target(name)
         require_core_lib_filter(target, args, allow_all=allow_all)
         helpers = self.active_helpers([name])
+        selected = _exact_test_ids(args)
+        required_ids = _required_exact_test_ids(args)
         discovered_build: dict[str, Any] = {}
         print(
             f"Rust test target {name}: {subprocess.list2cmdline(target.selection_args())}; "
@@ -1326,7 +1387,13 @@ class RustTestRunner:
                     "Selecting tests with nextest list (this compiles the test binary).",
                     file=sys.stderr,
                 )
-                selected = self._list_tests(target, args, discovered_build=discovered_build)
+                try:
+                    selected = self._list_tests(target, args, discovered_build=discovered_build)
+                    if required_ids is None:
+                        required_ids = sorted(selected)
+                except RunnerError:
+                    self._report_failed_tests(name, [], [], None)
+                    raise
             required = []
             for test in selected:
                 required.extend(
@@ -1340,7 +1407,11 @@ class RustTestRunner:
                     )
                 )
             helpers = self._active_helper_names(required)
-        env = self._helper_environment([target], helpers, self._build_helpers(helpers))
+        try:
+            env = self._helper_environment([target], helpers, self._build_helpers(helpers))
+        except RunnerError:
+            self._report_failed_tests(name, [], [], selected)
+            raise
         # Discovery already compiled this invocation's test binary. Inserting a
         # helper build can change Cargo's feature fingerprints and otherwise
         # compile it again. Reuse that build, not test results or a previous run.
@@ -1356,7 +1427,8 @@ class RustTestRunner:
         try:
             result = self._checked(command, env=env, capture=CAPTURE_BOTH)
         except RunnerError as error:
-            if error.result is None or error.result.returncode != 100:
+            if error.result is None:
+                self._report_failed_tests(name, [], [], selected)
                 raise
             failure = error
             result = error.result
@@ -1370,7 +1442,16 @@ class RustTestRunner:
             for test, statuses in outcomes.items()
             if statuses in (["PASS"], ["LEAK"])
         )
-        receipts = {binary_id: passed} if passed else {}
+        receipts = {binary_id: passed} if passed and result.returncode in {0, 100} else {}
+        helper_ids = frozenset(helper.name for helper in helpers)
+        receipts = ExecutionReceipts(receipts,
+            ((binary_id, helper_ids, test) for test in receipts.get(binary_id, [])),
+            ((binary_id, helper_ids, test) for test in required_ids) if required_ids is not None else None)
+        missing = sorted(set(required_ids or ()) - set(passed))
+        if failure is None and required_ids is not None and missing:
+            failure = RunnerError(
+                f"target {name!r} has unfulfilled exact test IDs: {missing}",
+                outcome="not_executed", result=result)
         # These are execution receipts, not a cache or proof after input changes.
         rendered = json.dumps({"completed_tests": receipts}, sort_keys=True)
         path = self._retain_text(rendered, prefix="completed-tests-")
@@ -1380,8 +1461,45 @@ class RustTestRunner:
         )
         if failure is not None:
             failure.completed_tests = receipts
+            failed = sorted(test for test, statuses in outcomes.items()
+                            if any(status not in {"PASS", "LEAK"} for status in statuses))
+            self._report_failed_tests(name, passed, failed, selected,
+                                      selected_count=_nextest_selected_count(result))
             raise failure
         return receipts
+
+    def _report_failed_tests(
+        self, name: str, passed: Sequence[str], failed: Sequence[str],
+        selected: Sequence[str] | None,
+        *, selected_count: int | None = None,
+    ) -> None:
+        """Keep the failure inventory outside the bounded diagnostic excerpt."""
+        not_run = (len(set(selected) - set(passed) - set(failed)) if selected is not None
+                   else max(0, selected_count - len(set(passed) | set(failed)))
+                   if selected_count is not None else "unknown (selection count unavailable)")
+        print(f"Test results {name}: passed={len(passed)}, failed={len(failed)}, "
+              f"not-run={not_run}", file=sys.stderr)
+        print("Failed test IDs (complete):", file=sys.stderr)
+        for test in sorted(set(failed)):
+            print(f"{_nextest_binary_id(self.target(name))} {test}", file=sys.stderr)
+        if not failed:
+            print("(none reported; no failed-only rerun available)", file=sys.stderr)
+            return
+        command = ["python", "scripts/rust_test_runner.py", "--manifest",
+                   str(self.manifest_path), "--target-dir", str(self.target_dir)]
+        if self.cargo_profile:
+            command.extend(["--cargo-profile", self.cargo_profile])
+        command.extend(["run-target", name, "--no-fail-fast"])
+        if self.base_env.get("NEXTEST_PROFILE"):
+            command.extend(["--profile", self.base_env["NEXTEST_PROFILE"]])
+        command.extend(["--", "--run-ignored", "all", "--ignore-default-filter", "-E",
+                        " | ".join(f"test(={test})" for test in sorted(set(failed)))])
+        # Quote every argument: even a single test expression contains shell
+        # metacharacters. PowerShell and POSIX shells escape apostrophes differently.
+        quote = (lambda value: "'" + value.replace("'", "''") + "'") if os.name == "nt" else shlex.quote
+        print("Rerun failed only (from repository root):\n"
+              + ("& " if os.name == "nt" else "")
+              + " ".join(quote(arg) for arg in command), file=sys.stderr)
 
     def check_gates(
         self, names: Sequence[str], *, include_generated: bool = True
@@ -1445,7 +1563,13 @@ class RustTestRunner:
         # Exact generated selections are proved by completed results below.
         # Explicit filters must always prove parity before batching: execution
         # of the declared IDs alone cannot detect an over-broad source filter.
-        resolved_tests = self.check_gates(names, include_generated=discover)
+        try:
+            resolved_tests = self.check_gates(names, include_generated=discover)
+        except RunnerError:
+            for name in dict.fromkeys(names):
+                for step in self.gate(name).steps:
+                    self._report_failed_tests(step.target, [], [], step.tests or None)
+            raise
         grouped = self._group_gate_steps(names, resolved_tests=resolved_tests)
 
         required_by_gate = {
@@ -1455,7 +1579,7 @@ class RustTestRunner:
         proved: set[tuple[str, frozenset[str], str]] = set()
 
         def completed_gates() -> dict[str, list[str]]:
-            return {
+            gates = {
                 name: sorted({test for step in steps for test in step.tests})
                 for name, steps in required_by_gate.items()
                 if all(
@@ -1469,8 +1593,14 @@ class RustTestRunner:
                     for test in step.tests
                 )
             }
+            required = {
+                (_nextest_binary_id(self.target(step.target)), frozenset(step.helpers or ()), test)
+                for step in grouped for test in step.tests
+            }
+            return ExecutionReceipts(gates, proved, required, gates=gates)
 
         failures: list[RunnerError] = []
+        reports = {step: (step.target, [], [], step.tests) for step in grouped}
         try:
             artifacts = self._build_helpers(
                 self._active_helper_names(
@@ -1516,7 +1646,7 @@ class RustTestRunner:
                 failures.append(error)
                 # Nextest's test-failure exit still carries independent PASS
                 # receipts. Build/transport/abnormal exits are not test proof.
-                if error.result is None or error.result.returncode != 100:
+                if error.result is None:
                     continue
                 result = error.result
             # Require completed per-test results from this execution, not just
@@ -1542,6 +1672,15 @@ class RustTestRunner:
             required = {
                 (binary, test) for binary, tests in expected.items() for test in tests
             }
+            for target, step in zip(targets, batch):
+                binary = _nextest_binary_id(target)
+                reports[step] = (step.target,
+                    sorted(test for owner, test in passed if owner == binary and (owner, test) not in failed),
+                    sorted(test for owner, test in failed if owner == binary), step.tests)
+            if result.returncode not in {0, 100}:
+                # Preserve observed diagnostics, but abnormal exits cannot
+                # establish per-test proof or missing-result proof failures.
+                continue
             if (
                 not unexpected
                 and all(count == 1 for count in passed.values())
@@ -1577,6 +1716,8 @@ class RustTestRunner:
                 for step in batch:
                     print(f"gate {step.target}: {len(step.tests)} passed")
         if failures:
+            for report in reports.values():
+                self._report_failed_tests(*report)
             outcomes = {error.outcome for error in failures}
             raise RunnerError(
                 "gate runs failed after completing the unblocked selected targets:\n"
@@ -2349,6 +2490,10 @@ def validate_filtering_args(raw_args: Sequence[str]) -> list[str]:
             if token.startswith("--skip=") or not token.startswith("-"):
                 index += 1
                 continue
+            if token in {"-E", "--filterset"} or token.startswith("--filterset="):
+                raise RunnerError(
+                    f"unsupported test filtering option {token!r}: put {token.split('=', 1)[0]} before --"
+                )
             raise RunnerError(f"unsupported test filtering option {token!r}")
         if token in {"-E", "--filterset", "--run-ignored"}:
             if index + 1 >= len(args):
@@ -2752,6 +2897,7 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
             command_timeout_seconds=getattr(args, "command_timeout_seconds", None),
         )
         runner.metrics = metrics
+        runner.manifest_path = args.manifest
         if metrics is not None:
             metrics.bind(runner.target_dir)
             metrics.record["proof"]["obligations"] = (
@@ -2766,7 +2912,14 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
                 exc.outcome if metrics.record["commands"]
                 or exc.outcome in {"cancelled", "timed_out", "cleanup_failed"} else "blocked"
             )
-            metrics.record["proof"]["completed_tests"] = exc.completed_tests or exc.completed_gates
+            partial = exc.completed_tests if isinstance(exc.completed_tests, ExecutionReceipts) else exc.completed_gates
+            metrics.record["proof"]["completed_tests"] = (
+                partial.completed_tests() if isinstance(partial, ExecutionReceipts) else partial)
+            if isinstance(partial, ExecutionReceipts):
+                metrics.record["proof"]["executions"] = partial.identities(partial.executed)
+                metrics.record["proof"]["required_executions"] = (
+                    partial.identities(partial.required) if partial.required is not None else None)
+                metrics.record["proof"]["satisfied_gates"] = partial.gates
         print(f"rust_test_runner: {exc}", file=sys.stderr)
         return 2
 
@@ -2866,6 +3019,12 @@ def _dispatch_with_admission(
                     }
         if runner.metrics is not None:
             runner.metrics.record["dependency_manifest"] = dependencies
+        execution_configuration = {
+            "cargo_profile": runner.cargo_profile or "test",
+            "nextest_profile": runner.base_env.get("NEXTEST_PROFILE"),
+            "target_dir": str(runner.target_dir),
+            "platform": runner.platform,
+        }
         if args.command == "check-manifest":
             metadata.validate_manifest(runner.manifest)
             print(
@@ -2878,17 +3037,41 @@ def _dispatch_with_admission(
         elif args.command == "gates-for":
             print(json.dumps(runner.gates_for(args.paths), indent=2))
         elif args.command == "run-target":
-            receipts = runner.run_target(args.name, filter_args, allow_all=allow_all)
+            try:
+                receipts = runner.run_target(args.name, filter_args, allow_all=allow_all)
+            except RunnerError as error:
+                if isinstance(error.completed_tests, ExecutionReceipts):
+                    emit_execution_receipt(execution_fingerprint, error.completed_tests,
+                        [args.name], skipped=None, exit_code=2,
+                        selected_packages=[runner.target(args.name).package],
+                        dependency_manifest=dependencies,
+                        execution_configuration=execution_configuration)
+                raise
             emit_execution_receipt(
                 execution_fingerprint, receipts, [args.name], skipped=None,
+                execution_configuration=execution_configuration,
+                selected_packages=[runner.target(args.name).package],
                 dependency_manifest=dependencies,
                 admission=admission,
                 metrics=runner.metrics,
             )
         elif args.command == "run-gate":
-            receipts = runner.run_gates(args.names)
+            try:
+                receipts = runner.run_gates(args.names)
+            except RunnerError as error:
+                if isinstance(error.completed_gates, ExecutionReceipts):
+                    emit_execution_receipt(execution_fingerprint, error.completed_gates,
+                        args.names, skipped=0, exit_code=2,
+                        selected_packages=sorted({runner.target(step.target).package
+                            for name in args.names for step in runner.gate(name).steps}),
+                        dependency_manifest=dependencies,
+                        execution_configuration=execution_configuration)
+                raise
             emit_execution_receipt(
                 execution_fingerprint, receipts, args.names, skipped=0,
+                execution_configuration=execution_configuration,
+                selected_packages=sorted({runner.target(step.target).package
+                    for name in args.names for step in runner.gate(name).steps}),
                 dependency_manifest=dependencies,
                 admission=admission,
                 metrics=runner.metrics,
@@ -2976,9 +3159,12 @@ def emit_execution_receipt(
     selected_targets: Sequence[str],
     *,
     skipped: int | None,
+    selected_packages: Sequence[str] = (),
     dependency_manifest: dict[str, Any] | None = None,
     admission: dict[str, object] | None = None,
     metrics: ValidationMetrics | None = None,
+    exit_code: int = 0,
+    execution_configuration: dict[str, Any] | None = None,
 ) -> None:
     """Publish the runner's completed-test ledger, not a parsed success slogan.
 
@@ -2990,17 +3176,30 @@ def emit_execution_receipt(
         "runner": "rust_test_runner",
         "runner_input_fingerprint": fingerprint,
         "selected_targets": list(selected_targets),
-        "completed_tests": receipts,
-        "executed_tests": sum(len(set(tests)) for tests in receipts.values()),
+        "selected_packages": sorted(set(selected_packages)),
+        "workspace_root": str(CODEX_RS_ROOT),
+        "completed_tests": receipts.completed_tests() if isinstance(receipts, ExecutionReceipts) else receipts,
+        "executed_tests": len(receipts.executed) if isinstance(receipts, ExecutionReceipts)
+            else sum(len(set(tests)) for tests in receipts.values()),
         "skipped_tests": skipped,
-        "exit_code": 0,
+        "exit_code": exit_code,
     }
+    if isinstance(receipts, ExecutionReceipts):
+        receipt["executions"] = receipts.identities(receipts.executed)
+        receipt["required_executions"] = (
+            receipts.identities(receipts.required) if receipts.required is not None else None)
+        receipt["satisfied_gates"] = receipts.gates
     if dependency_manifest is not None:
         receipt["dependency_manifest"] = dependency_manifest
+    if execution_configuration is not None:
+        receipt["execution_configuration"] = execution_configuration
     if admission is not None:
         receipt["admission"] = admission
     if metrics is not None:
-        metrics.completed(receipts, selected_targets)
+        metrics.completed(receipt["completed_tests"], selected_targets)
+        metrics.record["proof"]["executions"] = receipt.get("executions")
+        metrics.record["proof"]["required_executions"] = receipt.get("required_executions")
+        metrics.record["proof"]["satisfied_gates"] = receipt.get("satisfied_gates")
         receipt["validation_run_id"] = metrics.record["run_id"]
     print(json.dumps(receipt, sort_keys=True))
 

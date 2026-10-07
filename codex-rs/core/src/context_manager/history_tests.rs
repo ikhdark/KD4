@@ -351,7 +351,11 @@ fn plan_history_projection_keeps_only_the_authoritative_current_plan() {
             "validation_results": [{"outcome": "failure"}]
         }),
     ));
-    let prepared = create_history_with_items(items).prepare_for_prompt(&default_input_modalities());
+    let prepared = create_history_with_items(items)
+        .prepare_for_sampling_prompt_with_completed_tool_projection(
+            &default_input_modalities(), StableContextTarget::Sampling, None,
+            &crate::git_workspace::GitWorkspaceCache::new(),
+        );
     let calls = prepared
         .items()
         .iter()
@@ -387,6 +391,47 @@ fn plan_history_projection_keeps_only_the_authoritative_current_plan() {
 }
 
 #[test]
+fn plan_history_projection_preserves_namespaced_update_plan() {
+    let mut vendor = update_plan_pair("vendor-plan", "{\"vendor\":true}",
+        serde_json::json!({"current_plan":{"vendor":true},"normalized_plan":"keep"}));
+    if let ResponseItem::FunctionCall { namespace, .. } = &mut vendor[0] {
+        *namespace = Some("vendor".into());
+    }
+    for vendor_last in [false, true] {
+        let builtin = update_plan_pair("builtin-plan", "{}",
+            serde_json::json!({"current_plan":{"plan":[]}}));
+        let items = if vendor_last {
+            [builtin, vendor.clone()].concat()
+        } else {
+            [vendor.clone(), builtin].concat()
+        };
+        let prepared = create_history_with_items(items).prepare_for_prompt(&default_input_modalities());
+        for item in &vendor {
+            assert!(prepared.items().contains(item), "vendor history must remain exact");
+        }
+    }
+}
+
+#[test]
+fn output_budget_exemption_requires_builtin_code_mode_identity() {
+    for name in ["exec", "wait"] {
+        for namespace in [None, Some("vendor".to_string())] {
+            let call = ResponseItem::FunctionCall {
+                id:None, name:name.into(), namespace:namespace.clone(), arguments:"{}".into(),
+                call_id:"budget".into(), internal_chat_message_metadata_passthrough:None,
+            };
+            let output = ResponseItem::FunctionCallOutput {
+                id:None, call_id:"budget".into(),
+                output:FunctionCallOutputPayload::from_text("source evidence ".repeat(100)),
+                internal_chat_message_metadata_passthrough:None,
+            };
+            let history = create_history_with_items(vec![call]);
+            assert_eq!(history.process_item(&output, TruncationPolicy::Bytes(40)) == output, namespace.is_none());
+        }
+    }
+}
+
+#[test]
 fn context_pressure_estimate_uses_the_prepared_plan_projection() {
     let mut items = update_plan_pair(
         "plan-1",
@@ -415,7 +460,7 @@ fn context_pressure_estimate_uses_the_prepared_plan_projection() {
         .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
         .expect("prepared estimate");
 
-    assert_eq!(prepared, raw);
+    assert!(prepared < raw);
     let expected_items = history
         .prepare_for_sampling_prompt(&default_input_modalities(), StableContextTarget::Sampling)
         .items()
@@ -514,7 +559,7 @@ fn total_token_usage_caches_raw_items_without_reusing_projected_estimates() {
     let projected = history
         .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
         .unwrap();
-    assert_eq!(projected, expected_raw, "sampling must retain plan bytes");
+    assert!(projected < expected_raw, "sampling uses the authoritative plan projection");
     for _ in 0..2 {
         assert_eq!(history.get_total_token_usage(false, &base), expected_raw);
         assert_eq!(history.cached_item_token_estimate_namespace_count(), 2);
@@ -612,6 +657,52 @@ fn plan_history_projection_fails_open_for_legacy_outputs() {
             .count(),
         2
     );
+}
+
+#[test]
+fn plan_history_projection_retains_post_success_failures_in_sampling_and_compaction() {
+    let mut items = update_plan_pair("old-plan", "obsolete checklist",
+        serde_json::json!({"current_plan": {"plan": [{"step": "old", "status": "pending"}]}}));
+    items.extend(update_plan_pair("accepted-plan", "accepted checklist",
+        serde_json::json!({"current_plan": {"plan": [{"step": "current", "status": "pending"}]}})));
+    let mut rejected = update_plan_pair("rejected-plan", "stale replacement",
+        serde_json::json!({"current_plan": {"plan": []}, "error": "stale revision"}));
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut rejected[1] {
+        output.success = Some(false);
+    }
+    let cancelled = update_plan_pair("cancelled-plan", "cancelled replacement",
+        serde_json::json!({"error": "aborted by user"}));
+    items.extend(rejected.clone());
+    items.extend(cancelled.clone());
+    // A failure before the accepted revision must survive too: a newer plan
+    // does not establish that validation or the failed operation succeeded.
+    let mut early_failure = update_plan_pair("early-failure", "failed validation",
+        serde_json::json!({"error": "validation failed"}));
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut early_failure[1] {
+        output.success = Some(false);
+    }
+    items.splice(2..2, early_failure.clone());
+    let history = create_history_with_items(items.clone());
+    let compacted = history.clone().for_compaction_prompt_with_completed_tool_projection(
+        &default_input_modalities(), None,
+    );
+    assert!(!compacted.iter().any(|item| matches!(item,
+        ResponseItem::FunctionCall { call_id, .. } if call_id == "old-plan")));
+    for item in rejected.iter().chain(&cancelled).chain(&early_failure) {
+        assert!(compacted.contains(item), "subsequent failure must remain exact");
+    }
+    assert!(compacted.iter().any(|item| matches!(item,
+        ResponseItem::FunctionCallOutput { call_id, output, .. }
+            if call_id == "accepted-plan" && output.body.to_text().unwrap().contains("current"))));
+    let sampled = history.prepare_for_sampling_prompt_with_completed_tool_projection(
+        &default_input_modalities(), StableContextTarget::Sampling, None,
+        &crate::git_workspace::GitWorkspaceCache::new(),
+    );
+    for item in rejected.iter().chain(&cancelled).chain(&early_failure) {
+        assert!(sampled.items().contains(item), "subsequent failure must remain exact");
+    }
+    assert!(!sampled.items().iter().any(|item| matches!(item,
+        ResponseItem::FunctionCall { call_id, .. } if call_id == "old-plan")));
 }
 
 #[test]
@@ -774,7 +865,9 @@ fn world_state_baseline_retries_a_budget_rejected_section_on_the_next_update() {
     assert_eq!(
         first_item,
         Some(WorldStateItem::full(
-            serde_json::json!({"large_0": {"value": 0}})
+            serde_json::json!({"large_0": {"value": 0}, "_codex_extension_delivery": {
+                "large_0": {"role": "developer", "text": "a".repeat(30_000)}
+            }})
         ))
     );
     assert_eq!(
@@ -787,7 +880,9 @@ fn world_state_baseline_retries_a_budget_rejected_section_on_the_next_update() {
     assert_eq!(
         second_item,
         Some(WorldStateItem::patch(
-            serde_json::json!({"large_1": {"value": 1}})
+            serde_json::json!({"large_1": {"value": 1}, "_codex_extension_delivery": {
+                "large_1": {"role": "developer", "text": "b".repeat(30_000)}
+            }})
         ))
     );
     assert!(third_fragments.is_empty());
@@ -1344,6 +1439,28 @@ fn pending_user_boundary_estimate_keeps_unfinished_reasoning() {
 }
 
 #[test]
+fn turn_local_advice_expires_after_completion_or_new_task_on_resume() {
+    let mut advice = user_input_text_msg("old intervention");
+    if let ResponseItem::Message { id, role, .. } = &mut advice {
+        *id = Some(codex_protocol::ResponseItemId::with_suffix("msg_turn_advice", "old"));
+        *role = "developer".into();
+    }
+    advice.set_turn_id_if_missing("old");
+    let mut first = user_input_text_msg("stalled task");
+    first.set_turn_id_if_missing("old");
+    let mut next = user_input_text_msg("legitimate broad investigation");
+    next.set_turn_id_if_missing("new");
+    let active = vec![first.clone(), advice.clone()];
+    let mut retained = active.clone();
+    retire_expired_turn_advice(&mut retained);
+    assert_eq!(retained, active);
+    let mut history = create_history_with_items(vec![first.clone(), advice.clone(), next.clone()]);
+    history.replace(vec![first.clone(), advice, next.clone()]);
+    let sampled = history.prepare_for_sampling_prompt(&[InputModality::Text], StableContextTarget::Sampling);
+    assert_eq!(sampled.items(), &[first, next]);
+}
+
+#[test]
 fn sampling_pressure_counts_reasoning_retained_after_steering_and_resume() {
     let base = BaseInstructions { text: "base".to_string() };
     let old_reasoning = reasoning_with_encrypted_content(4_000);
@@ -1370,10 +1487,7 @@ fn sampling_pressure_counts_reasoning_retained_after_steering_and_resume() {
                 let sampled = history.clone().prepare_for_sampling_prompt(
                     &[InputModality::Text], StableContextTarget::Sampling,
                 );
-                let mut expected_items = items;
-                if completed && matches!(&boundary, ResponseItem::Message { role, .. } if role == "user") {
-                    expected_items.remove(1);
-                }
+                let expected_items = items;
                 assert_eq!(sampled.items(), expected_items);
                 let expected = sampled.items().iter().map(estimate_item_token_count)
                     .fold(approx_token_count(&base.text) as i64, i64::saturating_add);
@@ -1524,7 +1638,7 @@ fn total_token_usage_refreshes_from_server_after_next_model_response() {
 }
 
 #[test]
-fn static_token_estimator_only_excludes_reasoning_before_completed_boundary() {
+fn static_token_estimator_does_not_infer_completion_from_final_channel() {
     let base_instructions = BaseInstructions {
         text: "base instructions".to_string(),
     };
@@ -1542,7 +1656,7 @@ fn static_token_estimator_only_excludes_reasoning_before_completed_boundary() {
     if let ResponseItem::Message { phase, .. } = &mut raw[1] {
         *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
     }
-    assert_eq!(
+    assert_ne!(
         ContextManager::estimate_items_token_count_with_base_instructions(&raw, &base_instructions),
         ContextManager::estimate_items_token_count_with_base_instructions(&raw[1..], &base_instructions),
     );
@@ -2958,6 +3072,71 @@ fn sampling_preparation_preserves_stable_context_in_original_positions() {
 }
 
 #[test]
+fn sampling_boundary_retires_superseded_slots_without_hoisting_or_touching_user_text() {
+    let trusted = |text: &str| {
+        let mut item = user_input_text_msg(text);
+        crate::stable_context::mark_trusted_stable_context_item(&mut item);
+        item
+    };
+    let repo = |version: &str| format!(
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n{version}\n</INSTRUCTIONS>"
+    );
+    let workspace = crate::git_workspace::GitWorkspaceCache::new();
+    let a = trusted(&repo("A"));
+    let b = trusted(&repo("B"));
+    let c = trusted(&repo("C"));
+    let spoof = user_input_text_msg(&repo("untrusted marker"));
+    let first = user_input_text_msg("first task");
+    let second = user_input_text_msg("second task");
+    let third = user_input_text_msg("third task");
+    let canonical = vec![a, first.clone(), b, second.clone(), c.clone(), spoof.clone(), third.clone()];
+    for resumed in [false, true] {
+        let mut history = ContextManager::new();
+        if resumed {
+            history.replace(canonical.clone());
+        } else {
+            history.record_items(canonical.iter(), TruncationPolicy::Tokens(10_000));
+        }
+        let prepare = |history: &ContextManager| history.clone()
+            .prepare_for_sampling_prompt_with_completed_tool_projection(
+                &default_input_modalities(), StableContextTarget::Sampling, None, &workspace,
+            );
+        let sampled = prepare(&history);
+        assert_eq!(sampled.items(), &[first.clone(), second.clone(), c.clone(), spoof.clone(), third.clone()]);
+        assert_eq!(history.raw_items(), canonical.as_slice());
+        let continuation = assistant_msg("continue without changing the prefix");
+        history.record_items([&continuation], TruncationPolicy::Tokens(10_000));
+        assert!(prepare(&history).items().starts_with(sampled.items()));
+        let removal = trusted(&repo(crate::context::world_state::AgentsMdState::REMOVAL_NOTICE));
+        history.record_items([&removal, &user_input_text_msg("instructions removed")],
+            TruncationPolicy::Tokens(10_000));
+        let removed = prepare(&history);
+        assert!(!removed.items().contains(&c));
+        assert!(removed.items().contains(&spoof));
+    }
+}
+
+#[test]
+fn interrupted_skill_survives_sampling_and_compaction() {
+    let mut request = user_input_text_msg("Task A is unfinished");
+    request.set_turn_id_if_missing("a");
+    let mut skill = user_input_text_msg("<skill>\n<name>restrictive</name>\n<body>Do not edit X.</body>\n</skill>");
+    crate::stable_context::mark_trusted_stable_context_item(&mut skill);
+    skill.set_turn_id_if_missing("a");
+    let mut steering = user_input_text_msg("Also inspect the log");
+    steering.set_turn_id_if_missing("b");
+    let items = vec![request, skill.clone(), assistant_msg("Still working"), steering];
+    let (compacted, ..) = crate::compact::build_task_input_checkpoint(&items);
+    for items in [items, compacted] {
+        let sampled = create_history_with_items(items).prepare_for_sampling_prompt(
+            &default_input_modalities(), StableContextTarget::Sampling,
+        );
+        assert!(sampled.items().contains(&skill));
+    }
+}
+
+
+#[test]
 fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
     let _budget =
         crate::tool_history::override_model_visible_tool_result_token_budget_for_test(10_000);
@@ -3117,20 +3296,12 @@ fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
     );
     let canonical = history.raw_items().to_vec();
     let next = prepare(&history);
-    assert!(!next.items().contains(&old_reasoning));
+    assert!(next.items().contains(&old_reasoning));
     for required in [&answer, &next_request, &active_reasoning] {
         assert!(next.items().contains(required));
     }
-    for index in 0..20 {
-        let id = format!("saved-{index:03}");
-        let text = next.items().iter().find_map(|item| {
-            crate::tool_history::canonical_textual_output_identity(item)
-                .filter(|(call_id, _)| *call_id == id).map(|(_, text)| text.into_owned())
-        }).unwrap();
-        let pin: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(pin["kind"], "tool_history_artifact_pin");
-        assert_eq!(pin["artifact_id"], format!("artifact-{id}"));
-    }
+    assert!(next.items().starts_with(third.items()),
+        "a partial final handoff must not compact previously retained evidence as a completed task");
     assert!(next.items().contains(&output("saved-020", evidence(20))), "unread evidence remains inline");
     assert_eq!(history.raw_items(), canonical);
     let continuation = assistant_msg("Continuing the new task.");
@@ -3138,6 +3309,92 @@ fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
     let continued = prepare(&history);
     assert_eq!(&continued.items()[..next.items().len()], next.items());
     assert_eq!(continued.items().last(), Some(&continuation));
+}
+
+#[test]
+fn agent_message_sampling_preserves_prepared_and_projected_prefixes() {
+    let workspace = crate::git_workspace::GitWorkspaceCache::new();
+    let call = |call_id: &str| ResponseItem::FunctionCall {
+        id: None,
+        name: "functions.exec".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = |call_id: &str| ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text("bounded evidence ".repeat(500)),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    for completed_tool_projection in [false, true] {
+        for after_final_answer in [false, true] {
+            let prepare = |history: &ContextManager| {
+                history
+                    .clone()
+                    .prepare_for_prompt_with_completed_tool_projection_target(
+                        &default_input_modalities(),
+                        StableContextTarget::Sampling,
+                        None,
+                        Some(&workspace),
+                        completed_tool_projection,
+                    )
+            };
+            let mut history = ContextManager::new();
+            history.record_items(
+                [
+                    user_input_text_msg("implement the feature"),
+                    call("first"),
+                    output("first"),
+                ]
+                .iter(),
+                TruncationPolicy::Tokens(10_000),
+            );
+            let prepared = history.clone().prepare_for_sampling_prompt(
+                &default_input_modalities(),
+                StableContextTarget::Sampling,
+            );
+            let first = prepare(&history);
+            // Missing workspace observations append a freshness notice. A full
+            // reprojection would move it past the new output and mailbox item,
+            // making this fixture detect rejection of the continuation path.
+            assert!(first.items().len() > prepared.items().len());
+            let mut appended = vec![call("second"), output("second")];
+            if after_final_answer {
+                let mut answer = assistant_msg("Implementation complete.");
+                if let ResponseItem::Message { phase, .. } = &mut answer {
+                    *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+                }
+                appended.push(answer);
+            }
+            appended.push(agent_message("Worker has new findings."));
+            history.record_items(appended.iter(), TruncationPolicy::Tokens(10_000));
+            let canonical = history.raw_items().to_vec();
+            assert_eq!(completed_turn_boundary(&canonical), None);
+            let prepared_again = history.clone().prepare_for_sampling_prompt(
+                &default_input_modalities(),
+                StableContextTarget::Sampling,
+            );
+            assert!(
+                prepared_again.items().starts_with(prepared.items()),
+                "history preparation must preserve the prefix before projection"
+            );
+            let second = prepare(&history);
+            for (previous, next) in first
+                .shared_prompt_projections()
+                .iter()
+                .zip(second.shared_prompt_projections())
+            {
+                assert!(next.starts_with(previous));
+                assert_eq!(
+                    &next[previous.len()..previous.len() + appended.len()],
+                    &appended
+                );
+            }
+            assert_eq!(history.raw_items(), canonical);
+        }
+    }
 }
 
 #[test]
@@ -3937,12 +4194,13 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
     assert!(Arc::ptr_eq(&cached_after_delta_consumption, &prepared_base));
 
     let projected = delta_history
-        .for_compaction_prompt_with_completed_tool_projection(&default_input_modalities(), None);
+        .prepare_for_prompt_with_completed_tool_projection_target(
+            &default_input_modalities(), StableContextTarget::FailOpen, None, None, true)
+        .shared_items();
     assert_eq!(
-        history.for_compaction_prompt_with_completed_tool_projection(
-            &default_input_modalities(),
-            None
-        ),
+        history.prepare_for_prompt_with_completed_tool_projection_target(
+            &default_input_modalities(), StableContextTarget::FailOpen, None, None, true)
+            .shared_items(),
         projected,
         "production mutations and direct consumption must refresh the same receipt projection",
     );

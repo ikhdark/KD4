@@ -111,6 +111,7 @@ use tracing::warn;
 const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 const IMAGE_GEN_NAMESPACE: &str = "image_gen";
 const IMAGEGEN_TOOL_NAME: &str = "imagegen";
+pub(super) const REJECTED_TOOL_WARNING_PREFIX: &str = "Tool registration rejected (not callable): ";
 
 #[derive(Default)]
 struct PlannedTools {
@@ -120,6 +121,28 @@ struct PlannedTools {
 }
 
 impl PlannedTools {
+    fn reject_tool(&mut self, name: &ToolName, error: &dyn std::fmt::Display) {
+        warn!(%name, %error, "tool registration rejected");
+        // Diagnostic metadata only: never register a permissive replacement.
+        let count = self.warnings.iter()
+            .filter(|warning| warning.starts_with(REJECTED_TOOL_WARNING_PREFIX)).count();
+        if count > 16 {
+            return;
+        }
+        let warning = if count == 16 {
+            format!("{REJECTED_TOOL_WARNING_PREFIX}additional rejected tools omitted; see host logs.")
+        } else {
+            let bounded = |text: String, limit| {
+                if text.len() <= limit { text } else {
+                    format!("{}…", &text[..text.floor_char_boundary(limit)])
+                }
+            };
+            format!("{REJECTED_TOOL_WARNING_PREFIX}{}: {}. Repair the installed contract; repeated discovery will not make it callable.",
+                bounded(name.to_string(), 256), bounded(error.to_string(), 384))
+        };
+        self.warnings.push(warning);
+    }
+
     fn add_with_authorization_class<T>(&mut self, handler: T, class: TypedToolClass)
     where
         T: CoreToolRuntime + 'static,
@@ -157,7 +180,7 @@ impl PlannedTools {
         self.hosted_specs.push(spec);
     }
 
-    fn add_mcp_runtime(&mut self, handler: McpHandler, exposure: ToolExposure) {
+    fn add_mcp_runtime(&mut self, handler: McpHandler, exposure: ToolExposure, authority: String) {
         let intent = handler.external_mutation_intent();
         self.runtimes.push(
             RegisteredTool::with_exposure(
@@ -165,7 +188,8 @@ impl PlannedTools {
                 exposure,
                 TypedToolClass::DynamicExternal,
             )
-            .with_external_mutation_intent(intent),
+            .with_external_mutation_intent(intent)
+            .with_provider_authority(authority),
         );
     }
 
@@ -258,6 +282,7 @@ fn build_tool_specs_and_registry(
         planned_tools.add_hosted_spec(spec);
     }
 
+    quarantine_conflicting_namespaces(&mut planned_tools);
     apply_namespace_description_budget(&mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
     prepend_code_mode_executors(&context, &mut planned_tools)?;
@@ -677,6 +702,7 @@ fn build_code_mode_executors(
     let mut eager_nested_tool_definitions = Vec::new();
     let mut direct_only_tool_names = Vec::new();
     let mut has_deferred_tools = false;
+    let mut has_nested_apply_patch = false;
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
     for executor in executors {
         let exposure = executor.exposure();
@@ -693,7 +719,20 @@ fn build_code_mode_executors(
             continue;
         }
 
-        let spec = executor.spec().clone();
+        let mut spec = executor.spec().clone();
+        has_nested_apply_patch |= executor.tool_name() == &ToolName::plain("apply_patch");
+        if executor.authorization_class() != TypedToolClass::DynamicExternal
+            && executor.tool_name().name == "read_file"
+            && let ToolSpec::Function(tool) = &mut spec
+        {
+            if let Some(properties) = &mut tool.parameters.properties {
+                properties.remove("force_fresh");
+            }
+            tool.description = tool.description.replace(
+                "Workspace results are freshness-tracked and may reuse dependency-current evidence; force_fresh bypasses replay and reads current contents.",
+                "Nested calls read current contents; retained-result replay does not apply.",
+            );
+        }
 
         if exposure == ToolExposure::Deferred {
             if deferred_tools_guidance_enabled {
@@ -701,10 +740,8 @@ fn build_code_mode_executors(
             }
             deferred_code_mode_nested_tool_specs.push(spec);
         } else {
-            // Keep execution/bootstrap and native file-read contracts eager.
-            // Artifact recovery remains registered and resolves lazily when needed.
-            // Planning and directory discovery remain callable through
-            // resolve_tool without charging every generation for their schemas.
+            // Keep frequently used built-in contracts eager to avoid discovery
+            // round trips for execution, recovery, editing, and planning.
             // Keep descriptions and argument
             // schemas once when the same tool is also exposed directly. MCP,
             // plugin, extension, and other dynamic-external tools remain discoverable at runtime but
@@ -713,12 +750,8 @@ fn build_code_mode_executors(
             if executor.authorization_class() != TypedToolClass::DynamicExternal
                 && matches!(executor.tool_name().name.as_str(),
                     "exec_command" | "shell_command" | "write_stdin" | "apply_patch" | "read_file"
+                        | "read_tool_output" | "tool_search" | "update_plan"
                 )
-                // Freeform contracts cannot be loaded by tool_search. In
-                // code-mode-only sessions resolve_tool exposes the registered
-                // patch contract on demand instead of charging every read turn.
-                && !(tool_mode == ToolMode::CodeModeOnly
-                    && executor.tool_name() == &ToolName::plain("apply_patch"))
                 && let Some(mut definition) = codex_tools::code_mode_tool_definition_for_spec(&spec)
             {
                 if !is_hidden_by_code_mode_only(turn_context, executor.tool_name(), exposure)
@@ -733,10 +766,11 @@ fn build_code_mode_executors(
                 // Detailed result contracts are available through resolve_tool.
                 // Eager descriptions retain lifecycle/recovery semantics; do not
                 // replay the large transport union on every model generation.
-                if matches!(definition.name.as_str(),
-                    "read_file" | "read_tool_output" | "exec_command" | "write_stdin"
-                ) {
-                    definition.output_schema = None;
+                definition.output_schema = None;
+                if definition.name == "apply_patch" {
+                    definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, text, changes, changes_exact, environment_id, diagnostics, retry?}}; check success before continuing.", definition.description).into();
+                } else if definition.name == "read_file" {
+                    definition.description = format!("{}\nResult fields: path, total_lines, source_sha256, canonical_bytes, retained_bytes, complete, file_complete, retained_artifact_complete, results; optional artifact_id, continuation, page_selectors, snapshot_error. Each results[] item has selector, status, complete and text or value (search hydrated_ranges), with recovery fields when incomplete.", definition.description).into();
                 }
                 eager_nested_tool_definitions.push(definition);
             }
@@ -746,13 +780,16 @@ fn build_code_mode_executors(
 
     direct_only_tool_names.sort();
     direct_only_tool_names.dedup();
-    let eager_nested_tool_descriptions = if eager_nested_tool_definitions.is_empty() {
+    let mut eager_nested_tool_descriptions = if eager_nested_tool_definitions.is_empty() {
         Vec::new()
     } else {
         vec![codex_code_mode::render_code_mode_tool_bundle(
             &eager_nested_tool_definitions,
         )]
     };
+    if !has_nested_apply_patch {
+        eager_nested_tool_descriptions.push("Nested apply_patch is unavailable in this session; use its direct interface only if advertised.".to_string());
+    }
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new(
         create_code_mode_tool(
             tool_mode == ToolMode::CodeModeOnly,
@@ -769,11 +806,15 @@ fn build_code_mode_executors(
 
 #[instrument(level = "trace", skip_all, fields(tool_spec_count = specs.len()))]
 fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
+    let conflicts = conflicting_namespace_metadata(specs.iter());
     let mut merged_specs = Vec::with_capacity(specs.len());
     let mut namespace_indices = BTreeMap::<String, usize>::new();
     for spec in specs {
         match spec {
             ToolSpec::Namespace(mut namespace) => {
+                if conflicts.contains(&namespace.name) {
+                    continue;
+                }
                 if let Some(index) = namespace_indices.get(&namespace.name).copied() {
                     let ToolSpec::Namespace(existing_namespace) = &mut merged_specs[index] else {
                         unreachable!("namespace index must point to a namespace spec");
@@ -832,6 +873,35 @@ fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
     }
 
     merged_specs
+}
+
+fn quarantine_conflicting_namespaces(planned: &mut PlannedTools) {
+    let conflicts = conflicting_namespace_metadata(
+        planned.runtimes.iter().map(|runtime| runtime.spec()).chain(planned.hosted_specs.iter()),
+    );
+    for name in &conflicts {
+        planned.warnings.push(format!("Namespace `{name}` was not loaded: conflicting descriptions."));
+    }
+    let allowed = |spec: &ToolSpec| !matches!(spec, ToolSpec::Namespace(ns) if conflicts.contains(&ns.name));
+    planned.runtimes.retain(|runtime| allowed(runtime.spec()));
+    planned.hosted_specs.retain(allowed);
+}
+
+fn conflicting_namespace_metadata<'a>(specs: impl IntoIterator<Item = &'a ToolSpec>) -> std::collections::BTreeSet<String> {
+    let mut descriptions = BTreeMap::<&str, &str>::new();
+    let mut conflicts = std::collections::BTreeSet::new();
+    for spec in specs {
+        if let ToolSpec::Namespace(namespace) = spec {
+            let description = namespace.description.as_str();
+            if description.trim().is_empty() { continue; }
+            if descriptions.insert(&namespace.name, description)
+                .is_some_and(|previous| previous != description)
+            {
+                conflicts.insert(namespace.name.clone());
+            }
+        }
+    }
+    conflicts
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1001,6 +1071,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     // Host skill locators remain readable even when no execution environment exists.
     // The handler still requires an environment for ordinary filesystem paths.
     planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
+    planned_tools.add_with_authorization_class(crate::tools::handlers::ReadStatusHandler, TypedToolClass::ReadSearch);
     if !context
         .step_context
         .environments
@@ -1012,10 +1083,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     // Mode restrictions belong in dispatch, not in the cached tool schema.
     planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);
-    planned_tools.add_with_authorization_class(
-        crate::tools::handlers::ContextCheckpointHandler,
-        TypedToolClass::OwnTask,
-    );
 
     if features.enabled(Feature::DeferredExecutor)
         && !context.step_context.environments.starting.is_empty()
@@ -1328,14 +1395,25 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
     )
 )]
 fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
+    let authority = |tool: &codex_mcp::ToolInfo| {
+        // Share the exact provider inputs used by remembered approvals. Do not
+        // expose their raw transport/auth values in the model-visible revision.
+        let inputs = context.step_context.mcp.manager().approval_authority(&tool.server_name);
+        let canonical = codex_config::schema::canonicalize(&serde_json::json!({
+            "provider": inputs,
+            "server": tool.server_name,
+            "origin": tool.server_origin,
+            "connector": tool.connector_id,
+            "annotations": tool.tool.annotations,
+        }));
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(canonical.to_string().as_bytes()))
+    };
     if let Some(mcp_tools) = context.mcp_tools {
         for tool in mcp_tools {
             match McpHandler::new(tool.clone()) {
-                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Direct),
-                Err(err) => warn!(
-                    "Skipping MCP tool `{}`: failed to build tool spec: {err}",
-                    tool.canonical_tool_name()
-                ),
+                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Direct, authority(tool)),
+                Err(err) => planned_tools.reject_tool(&tool.canonical_tool_name(), &err),
             }
         }
     }
@@ -1343,11 +1421,8 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
     if let Some(deferred_mcp_tools) = context.deferred_mcp_tools {
         for tool in deferred_mcp_tools {
             match McpHandler::new(tool.clone()) {
-                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Deferred),
-                Err(err) => warn!(
-                    "Skipping deferred MCP tool `{}`: failed to build tool spec: {err}",
-                    tool.canonical_tool_name()
-                ),
+                Ok(handler) => planned_tools.add_mcp_runtime(handler, ToolExposure::Deferred, authority(tool)),
+                Err(err) => planned_tools.reject_tool(&tool.canonical_tool_name(), &err),
             }
         }
     }
@@ -1365,10 +1440,7 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
                 let handler = match DynamicToolHandler::new(tool) {
                     Ok(handler) => handler,
                     Err(err) => {
-                        tracing::error!(
-                            "Failed to convert dynamic tool {:?} to OpenAI tool: {err}",
-                            tool.name,
-                        );
+                        planned_tools.reject_tool(&ToolName::plain(&tool.name), &err);
                         continue;
                     }
                 };
@@ -1381,11 +1453,7 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
                     let handler = match DynamicToolHandler::new_in_namespace(namespace, tool) {
                         Ok(handler) => handler,
                         Err(err) => {
-                            tracing::error!(
-                                "Failed to convert dynamic tool {:?}.{:?} to OpenAI tool: {err}",
-                                namespace.name,
-                                tool.name,
-                            );
+                            planned_tools.reject_tool(&ToolName::namespaced(&namespace.name, &tool.name), &err);
                             continue;
                         }
                     };

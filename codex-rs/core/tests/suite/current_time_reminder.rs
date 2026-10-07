@@ -332,6 +332,7 @@ async fn current_time_reminder_is_refreshed_after_compaction() -> Result<()> {
     let test = test_codex()
         .with_config(move |config| {
             config.model_provider = model_provider;
+            config.compact_prompt = Some(codex_core::compact::SUMMARIZATION_PROMPT.to_string());
             enable_current_time_reminder(
                 config,
                 /*interval*/ 3_000,
@@ -481,7 +482,7 @@ async fn current_time_tool_returns_json_through_code_mode() -> Result<()> {
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_custom_tool_call(CALL_ID, "exec", "text(await tools.clock__curr_time({}));"),
+                ev_custom_tool_call(CALL_ID, "exec", "text(await resolve_tool('clock.curr_time')({}));"),
                 ev_completed("resp-1"),
             ]),
             sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),

@@ -37,6 +37,8 @@ pub(crate) enum TypedToolClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalMutationIntent {
     ProvenReadOnly,
+    /// Provider metadata is useful for consent, but is not host-established authority.
+    ProviderAssertedReadOnly,
     MayMutate,
 }
 
@@ -76,8 +78,9 @@ pub(crate) fn validate_independent_review_shell(
 pub(crate) fn validate_independent_review_stdin(
     source: &SessionSource,
     chars: &str,
+    terminate: bool,
 ) -> Result<(), &'static str> {
-    if is_independent_review_source(source) && !chars.is_empty() {
+    if is_independent_review_source(source) && (!chars.is_empty() || terminate) {
         return Err("independent reviewers may only poll read-only shell commands");
     }
     Ok(())

@@ -14,6 +14,7 @@ use crate::outgoing_message::ClientRequestResult;
 use crate::server_request_error::is_turn_transition_server_request_error;
 
 pub(crate) async fn on_call_response(
+    turn_id: String,
     call_id: String,
     receiver: oneshot::Receiver<ClientRequestResult>,
     conversation: Arc<CodexThread>,
@@ -40,6 +41,7 @@ pub(crate) async fn on_call_response(
     let core_response = into_core_response(response);
     if let Err(err) = conversation
         .submit(Op::DynamicToolResponse {
+            turn_id,
             id: call_id.clone(),
             response: core_response,
         })

@@ -1227,9 +1227,7 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
     assert_eq!(request_originator, originator().value);
     assert_eq!(request_authorization, "Bearer Test API Key");
     let cache_key = request_body["prompt_cache_key"].as_str().expect("prefix cache key");
-    assert_ne!(cache_key, thread_id_string);
-    assert_eq!(cache_key.len(), 64);
-    assert!(cache_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(cache_key, thread_id_string);
     assert_codex_client_metadata(
         &request_body,
         installation_id.as_str(),
@@ -1719,7 +1717,7 @@ async fn includes_user_instructions_message_in_request() {
     assert!(
         !request_body["instructions"]
             .as_str()
-            .unwrap()
+            .unwrap_or_default()
             .contains("be nice")
     );
     let permissions_text = request
@@ -2799,7 +2797,7 @@ async fn includes_developer_instructions_message_in_request() {
     assert!(
         !request_body["instructions"]
             .as_str()
-            .unwrap()
+            .unwrap_or_default()
             .contains("be nice")
     );
     assert!(
@@ -2816,7 +2814,7 @@ async fn includes_developer_instructions_message_in_request() {
     assert!(
         developer_messages
             .iter()
-            .any(|item| message_input_texts(item).contains(&"be useful")),
+            .any(|item| message_input_texts(item).iter().any(|text| text.contains("be useful"))),
         "expected developer instructions in a developer message, got {:?}",
         request_body["input"]
     );
@@ -3095,6 +3093,7 @@ async fn token_count_includes_rate_limits_snapshot() {
     provider.supports_websockets = false;
 
     let mut builder = test_codex()
+        .with_model("gpt-5.4")
         .with_auth(CodexAuth::from_api_key("test"))
         .with_config(move |config| {
             config.model_provider = provider;

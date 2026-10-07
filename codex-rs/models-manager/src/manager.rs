@@ -345,10 +345,11 @@ pub type ModelsManagerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a
 pub type SharedModelsManager = Arc<dyn ModelsManager>;
 
 fn build_available_models_for_auth(
-    mut remote_models: Vec<ModelInfo>,
+    remote_models: Vec<ModelInfo>,
     uses_codex_backend: bool,
 ) -> Vec<ModelPreset> {
-    remote_models.sort_by_key(|model| model.priority);
+    let mut remote_models = normalize_model_catalog(remote_models);
+    remote_models.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.slug.cmp(&b.slug)));
     if !uses_codex_backend {
         remote_models.retain(|model| model.supported_in_api);
     }
@@ -368,8 +369,9 @@ struct AvailableModelPresets {
 
 impl AvailableModelPresets {
     fn new(remote_models: &[ModelInfo]) -> Self {
-        let mut sorted_models: Vec<&ModelInfo> = remote_models.iter().collect();
-        sorted_models.sort_by_key(|model| model.priority);
+        let normalized = normalize_model_catalog(remote_models.to_vec());
+        let mut sorted_models: Vec<&ModelInfo> = normalized.iter().collect();
+        sorted_models.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.slug.cmp(&b.slug)));
         let mut api = Vec::with_capacity(sorted_models.len());
         let mut codex = Vec::with_capacity(sorted_models.len());
         for model in sorted_models {
@@ -434,6 +436,7 @@ impl ModelState {
         etag: Option<String>,
         active_cache_identity: String,
     ) -> Self {
+        let remote_models = normalize_model_catalog(remote_models);
         let available_models = AvailableModelPresets::new(&remote_models);
         Self {
             remote_models,
@@ -445,6 +448,7 @@ impl ModelState {
     }
 
     fn replace_remote_models(&mut self, remote_models: Vec<ModelInfo>) {
+        let remote_models = normalize_model_catalog(remote_models);
         if self.remote_models == remote_models {
             return;
         }
@@ -557,9 +561,10 @@ impl OpenAiModelsManager {
 impl StaticModelsManager {
     /// Construct a static model manager from an authoritative catalog.
     pub fn new(auth_manager: Option<Arc<AuthManager>>, model_catalog: ModelsResponse) -> Self {
-        let available_models = AvailableModelPresets::new(&model_catalog.models);
+        let remote_models = normalize_model_catalog(model_catalog.models);
+        let available_models = AvailableModelPresets::new(&remote_models);
         Self {
-            remote_models: model_catalog.models,
+            remote_models,
             available_models,
             auth_manager,
             model_catalog_activity: Arc::new(ModelCatalogActivity::new()),
@@ -1171,7 +1176,8 @@ impl OpenAiModelsManager {
         true
     }
 
-    fn merged_remote_models(&self, mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    fn merged_remote_models(&self, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+        let mut models = normalize_model_catalog(models);
         crate::prompt_resolver::apply_prompt_policy(&mut models);
         // Use the remote models list as the source of truth if it contains at least one
         // non-hidden model and the user is using ChatGPT auth.
@@ -1419,6 +1425,30 @@ impl ModelsManager for StaticModelsManager {
     }
 }
 
+/// Quarantine every conflicting slug, rather than letting input order choose
+/// metadata. Apply before auth-dependent merging, including cache loads.
+fn normalize_model_catalog(models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    let mut by_slug = std::collections::BTreeMap::<String, Option<ModelInfo>>::new();
+    for model in models {
+        match by_slug.entry(model.slug.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(model));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref().is_some_and(|existing| existing != &model) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    by_slug.into_iter().filter_map(|(slug, model)| {
+        if model.is_none() {
+            tracing::warn!(%slug, "quarantining conflicting model definitions");
+        }
+        model
+    }).collect()
+}
+
 fn load_bundled_models() -> Result<Vec<ModelInfo>, std::io::Error> {
     Ok(crate::bundled_models()?.models.clone())
 }
@@ -1452,8 +1482,9 @@ fn requested_model_is_available(
 }
 
 fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
+    let candidates = normalize_model_catalog(candidates.to_vec());
     let mut best: Option<ModelInfo> = None;
-    for candidate in candidates {
+    for candidate in &candidates {
         if !model_info::matches_model_slug(model, &candidate.slug) {
             continue;
         }

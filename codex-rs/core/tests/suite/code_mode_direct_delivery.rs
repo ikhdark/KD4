@@ -8,6 +8,8 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 
+const BEHAVIORAL_VALIDATOR: &str = "import sys,time; from pathlib import Path; from changed_fixture import transform; assert transform(41) == 42; assert transform(-1) == 0; time.sleep(float(sys.argv[1])); sys.stdout.write(Path('answer.txt').read_text(encoding='utf-8'))";
+
 #[test_case::test_case("delivery")]
 #[cfg_attr(windows, test_case::test_case("leaf-glob"))]
 #[test_case::test_case("lookup")]
@@ -41,6 +43,9 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
         let test = builder.build(&server).await?;
         let answer = "Verified answer: α → β.\nPreserve this exact text.\n";
         fs::write(test.cwd.path().join("answer.txt"), answer)?;
+        if scenario == "validation-helper" {
+            fs::write(test.cwd.path().join("changed_fixture.py"), "def transform(value):\n    return value + 1\n")?;
+        }
         fs::write(test.cwd.path().join("first.txt"), "Verified answer: α → β.\n")?;
         fs::write(test.cwd.path().join("second.txt"), "Preserve this exact text.\n")?;
         fs::write(test.cwd.path().join("ranges.txt"), "Verified answer: α → β.\nnot requested\nPreserve this exact text.\n")?;
@@ -189,14 +194,16 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
             ),
             "validation_overlap" | "validation-progress" | "validation-helper" => {
                 let python = which::which("python").or_else(|_| which::which("python3"))?;
-                let script = if scenario == "validation-progress" {
+                let script = if scenario == "validation-helper" {
+                    BEHAVIORAL_VALIDATOR
+                } else if scenario == "validation-progress" {
                     "import sys,time; sys.stdout.buffer.write(sys.argv[1].encode('utf-8')); sys.stdout.buffer.flush(); time.sleep(3)"
                 } else {
                     "import sys,time; time.sleep(3); sys.stdout.write(sys.argv[1])"
                 };
                 let command = serde_json::json!({
                     "program":python,
-                    "args":["-X", "utf8", "-c", script, answer],
+                    "args":["-X", "utf8", "-c", script, if scenario == "validation-helper" { "3" } else { answer }],
                     "yield_time_ms":250,
                 });
                 // The wait models read-only report work, not inference. No
@@ -206,11 +213,11 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                 let drain = if scenario == "validation-progress" && candidate {
                     "const completed = await await_command(r); const terminal = completed.terminal; if (!terminal.streams_complete || terminal.stdout !== load('review') || !completed.observations.some(p => !p.process_exited && p.output.includes(load('review')))) throw Error('incomplete terminal/progress evidence: '+JSON.stringify({terminal,observations:completed.observations,review:load('review')})); text(terminal.stdout);"
                 } else if scenario == "validation-progress" {
-                    "const observations = [r]; while (r.session_id && !r.process_exited) { r = await tools.write_stdin({session_id:r.session_id,wait_for_output:true}); observations.push(r); } if (!r.process_exited || r.exit_code !== 0 || !r.streams_complete || r.stdout !== load('review') || !observations.some(p => !p.process_exited && p.output.includes(load('review')))) throw Error('incomplete terminal/progress evidence: '+JSON.stringify({terminal:r,observations,review:load('review')})); text(r.stdout);"
+                    "const observations = [r]; while (r.session_id && !r.process_exited) { r = await tools.write_stdin({session_id:r.session_id,incarnation:r.session_capabilities.incarnation,wait_for_output:true}); observations.push(r); } if (!r.process_exited || r.exit_code !== 0 || !r.streams_complete || r.stdout !== load('review') || !observations.some(p => !p.process_exited && p.output.includes(load('review')))) throw Error('incomplete terminal/progress evidence: '+JSON.stringify({terminal:r,observations,review:load('review')})); text(r.stdout);"
                 } else if candidate && scenario == "validation-helper" {
                     "const completed = await await_command(r); const output = completed.observations.map(p => p.output).join(''); if (completed.observations.some(p => p.output_reduced) || output !== load('review')) throw Error('validation or review mismatch'); text(output);"
                 } else {
-                    "let output = r.output; while (r.session_id && !r.process_exited) { r = await tools.write_stdin({session_id:r.session_id,wait_for_output:true}); output += r.output; } if (!r.process_exited || r.exit_code !== 0 || output !== load('review')) throw Error('validation or review mismatch'); text(output);"
+                    "let output = r.output; while (r.session_id && !r.process_exited) { r = await tools.write_stdin({session_id:r.session_id,incarnation:r.session_capabilities.incarnation,wait_for_output:true}); output += r.output; } if (!r.process_exited || r.exit_code !== 0 || output !== load('review')) throw Error('validation or review mismatch'); text(output);"
                 };
                 (
                     Some(review.to_string()),
@@ -229,18 +236,18 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                     "yield_time_ms":250,
                 });
                 (
-                    Some(format!("const started = await tools.exec_command({command}); if (!started.session_id) throw Error('fixture must start a background process'); store('process', started.session_id);")),
+                    Some(format!("const started = await tools.exec_command({command}); if (!started.session_id) throw Error('fixture must start a background process'); store('process', started);")),
                     // Output can precede process exit. Drain that mechanical
                     // transition in-cell, but reject every empty live result:
                     // those are the timer-only handoffs this regression targets.
-                    "let output = ''; let r; do { r = await tools.write_stdin({session_id:load('process')}); if (!r.process_exited && !r.output) throw Error('timer-only handoff'); output += r.output; } while (!r.process_exited && r.session_id); if (!r.process_exited || r.exit_code !== 0) throw Error('command did not succeed'); text(output);".to_string(),
+                    "let output = ''; let r; do { r = await tools.write_stdin({session_id:load('process').session_id,incarnation:load('process').session_capabilities.incarnation}); if (!r.process_exited && !r.output) throw Error('timer-only handoff'); output += r.output; } while (!r.process_exited && r.session_id); if (!r.process_exited || r.exit_code !== 0) throw Error('command did not succeed'); text(output);".to_string(),
                 )
             }
             _ => unreachable!(),
         };
         if !candidate && let Some(prepare) = &prepare {
             let extra = if scenario == "poll" {
-                "const bounded = await tools.write_stdin({session_id:load('process'),wait_for_output:false}); if (bounded.process_exited) throw Error('fixture must cross a bounded poll'); text('still waiting');"
+                "const bounded = await tools.write_stdin({session_id:load('process').session_id,incarnation:load('process').session_capabilities.incarnation,wait_for_output:false}); if (bounded.process_exited) throw Error('fixture must cross a bounded poll'); text('still waiting');"
             } else if scenario == "bounded-inventory" {
                 "text(load('inventory'));"
             } else {
@@ -382,17 +389,7 @@ async fn explicit_delivery_preserves_answer_and_removes_final_model_request(scen
                 "compute-answer",
             )
             .expect("computed answer");
-            if matches!(scenario, "large-recovery" | "full-recovery-helper") {
-                // The display-sized baseline attaches recovery controls to the
-                // computed answer. The final model removes those receipts; the
-                // candidate must deliver the exact persisted answer directly.
-                assert!(output.starts_with(answer), "missing exact computed answer: {output}");
-                if scenario == "large-recovery" {
-                    assert!(output[answer.len()..].contains("continuation_stop"));
-                }
-            } else {
-                assert_eq!(output, answer);
-            }
+            assert_eq!(output, answer);
         }
         let model_requests = server
             .received_requests()
@@ -503,7 +500,12 @@ async fn explicit_delivery_accepts_schema_valid_json_and_supported_media() -> Re
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result<()> {
     require_network!();
+    let python = which::which("python").or_else(|_| which::which("python3"))?;
+    let command = serde_json::json!({"program": python,
+        "args": ["-X", "utf8", "-c", BEHAVIORAL_VALIDATOR, "0"]});
+    let broken_validation = format!("// @exec: {{\"deliver\":true}}\nconst result = await await_command(await tools.exec_command({command})); text(result.terminal.stdout);");
     for (name, code, sibling) in [
+        ("broken-validation", broken_validation.as_str(), false),
         ("error", "// @exec: {\"deliver\":true}\ntext('premature'); throw new Error('failed');", false),
         ("budget", "// @exec: {\"deliver\":true,\"max_output_tokens\":0}\ntext('premature');", false),
         ("empty", "// @exec: {\"deliver\":true}\ntext('');", false),
@@ -529,6 +531,10 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
             let _ = config.features.enable(Feature::Kd4Runtime);
         });
         let test = builder.build(&server).await?;
+        if name == "broken-validation" {
+            fs::write(test.cwd.path().join("changed_fixture.py"), "def transform(value):\n    return value - 1\n")?;
+            fs::write(test.cwd.path().join("answer.txt"), "premature")?;
+        }
         let mut events = vec![
             ev_response_created("initial"),
             ev_custom_tool_call("delivery", "exec", code),
@@ -543,7 +549,7 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
         }
         events.push(ev_completed("initial"));
         responses::mount_sse_once(&server, sse(events)).await;
-        responses::mount_sse_once(
+        let final_response = responses::mount_sse_once(
             &server,
             sse(vec![
                 ev_assistant_message("answer", fallback),
@@ -583,6 +589,10 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
             assert_eq!(completed.last_agent_message.as_deref(), Some(fallback), "{name}");
         }
         assert!(completed.error.is_none(), "{name}: {:?}", completed.error);
+        if name == "broken-validation" {
+            let (output, _) = custom_tool_output_body_and_success(&final_response.single_request(), "delivery");
+            assert!(output.contains("AssertionError"), "must detect the fixture defect, not fail in setup: {output}");
+        }
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.iter().filter(|r| r.url.path().contains("responses")).count(),
             if name == "completed-sibling" { 1 } else { 2 }, "{name}");
@@ -591,7 +601,7 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
 }
 /// Closing the last checklist obligation is bookkeeping, not another inference
 /// boundary. Evidence and plan closure may share the final execution cell.
-#[test_case::test_case(false; "unfinished_obligation_continues")]
+#[test_case::test_case(false; "unfinished_obligation_is_advisory")]
 #[test_case::test_case(true; "evidence_and_plan_close_deliver_immediately")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completion_audit_plan_closure_uses_existing_evidence(close_plan: bool) -> Result<()> {
@@ -630,9 +640,13 @@ text('Required work completed.');"#), ev_completed("fallback"),
     let completed = test.submit_turn_and_capture_completion("Inspect and verify the source.").await?;
     assert!(completed.surfaced_result.is_some());
     assert_eq!(completed.last_agent_message.as_deref(),
-        Some(if close_plan { "verified result" } else { "Required work completed." }));
+        Some("verified result"));
+    let assessment = completed.timing.as_ref().unwrap().completion_assessment.as_ref().unwrap();
+    assert!(assessment.failed_checks.is_empty());
+    assert!(assessment.verification_gaps.is_empty());
+    assert_eq!(assessment.advisories.is_empty(), close_plan);
     assert_eq!(server.received_requests().await.unwrap().iter()
         .filter(|request| request.url.path().contains("responses")).count(),
-        if close_plan { 1 } else { 2 });
+        1);
     Ok(())
 }

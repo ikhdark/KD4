@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +70,7 @@ pub(crate) use process::SpawnLifecycle;
 pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;
 pub(crate) use process_manager::NESTED_POLL_MARGIN;
+pub(crate) use process_manager::nested_poll_bound;
 
 pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
 pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
@@ -273,13 +275,19 @@ pub(crate) struct WriteStdinRequest<'a> {
 pub(crate) struct ProcessStore {
     processes: HashMap<u32, ProcessEntry>,
     reserved_process_ids: HashSet<u32>,
+    // Never assign an observed handle to another process, even after replay eviction.
+    used_process_ids: HashMap<u32, Option<uuid::Uuid>>,
+    finished: VecDeque<(u32, crate::tools::context::ExecCommandToolOutput)>,
+    // Capacity admitted before launch, not yet transferred to `processes`.
+    reserved_process_slots: HashSet<u32>,
 }
 
-/// Owns a reserved process id until it is atomically transferred into the
-/// process store. Dropping the transfer sender before then wakes the manager's
-/// cleanup task, including when the calling future is cancelled.
+/// Owns a reserved process id and its pre-launch capacity admission until they
+/// are atomically transferred into the process store. Dropping the transfer
+/// sender wakes the manager's cleanup task, including when the caller is cancelled.
 pub(crate) struct ProcessIdReservation {
     process_id: u32,
+    capacity_reserved: bool,
     transfer_sender: Option<oneshot::Sender<()>>,
 }
 
@@ -287,6 +295,7 @@ impl ProcessIdReservation {
     fn new(process_id: u32, transfer_sender: oneshot::Sender<()>) -> Self {
         Self {
             process_id,
+            capacity_reserved: false,
             transfer_sender: Some(transfer_sender),
         }
     }
@@ -303,9 +312,50 @@ impl ProcessIdReservation {
 }
 
 impl ProcessStore {
+    fn remember_finished(&mut self, id: u32, response: &crate::tools::context::ExecCommandToolOutput) {
+        const MAX_FINISHED: usize = 32;
+        self.used_process_ids.entry(id).or_insert(None);
+        if self.finished.len() == MAX_FINISHED {
+            self.finished.pop_front();
+        }
+        let mut response = response.clone();
+        // A replay observes completion; it must not run PostToolUse twice.
+        response.hook_command = None;
+        self.finished.push_back((id, response));
+        // Bound retained output as well as record count; never retain process
+        // handles/tasks just to support an idempotent terminal poll.
+        while self.finished.len() > 1 && self.finished.iter().map(|(_, output)| {
+            output.raw_output.len() + output.process_output.as_ref().map_or(0, |snapshot| {
+                snapshot.aggregated_output.len() + snapshot.stdout.len() + snapshot.stderr.len()
+            })
+        }).sum::<usize>() > 8 * 1024 * 1024 {
+            self.finished.pop_front();
+        }
+    }
+
+    fn finished_response(&self, request: &WriteStdinRequest<'_>) -> Option<Result<crate::tools::context::ExecCommandToolOutput, UnifiedExecError>> {
+        let (_, response) = self.finished.iter().find(|(id, _)| *id == request.process_id)?;
+        if !request.input.is_empty() {
+            return Some(Err(UnifiedExecError::process_failed(format!(
+                "process {} has exited; input was not delivered", request.process_id,
+            ))));
+        }
+        let mut response = response.clone();
+        response.truncation_policy = request.truncation_policy;
+        response.max_output_tokens = request.max_output_tokens;
+        Some(Ok(response))
+    }
+
+    fn occupied_slots(&self) -> usize {
+        self.processes.len() + self.reserved_process_slots.len()
+    }
+
     fn remove(&mut self, process_id: u32) -> Option<ProcessEntry> {
         self.reserved_process_ids.remove(&process_id);
-        self.processes.remove(&process_id)
+        self.reserved_process_slots.remove(&process_id);
+        let entry = self.processes.remove(&process_id)?;
+        self.used_process_ids.insert(process_id, Some(entry.process.session_capabilities(entry.tty).incarnation));
+        Some(entry)
     }
 }
 
@@ -348,6 +398,7 @@ impl Default for UnifiedExecProcessManager {
     }
 }
 
+#[derive(Clone)]
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
     command_execution_id: crate::tools::command_execution::CommandExecutionId,

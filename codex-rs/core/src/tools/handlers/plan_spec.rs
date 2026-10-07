@@ -27,7 +27,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
         "continues".to_string(),
         JsonSchema::array(
             JsonSchema::string(None),
-            Some("Step IDs from the last result whose unfinished obligations this step carries forward after rewording, splitting, or merging. A step continuing unfinished work cannot be completed in the same update.".to_string()),
+            Some("Step IDs or unresolved orphan requirement IDs from the last result whose obligations this step carries forward after rewording, splitting, merging, or recovery. May be completed in this same revision when the work is finished; checklist status is not proof.".to_string()),
         ),
     );
     let revision_item =
@@ -37,17 +37,17 @@ pub fn create_update_plan_tool() -> ToolSpec {
             BTreeMap::from([
                 (
                     "step_id".to_string(),
-                    JsonSchema::string(Some("ID of an unfinished step this revision removes.".to_string())),
+                    JsonSchema::string(Some("ID of an unfinished step this revision removes, or an unresolved orphan requirement from lineage.".to_string())),
                 ),
                 (
                     "reason".to_string(),
-                    JsonSchema::string(Some("Why it is dropped, such as the user's authorization.".to_string())),
+                    JsonSchema::string(Some("Proposed retirement reason. Cite the accepted user instruction when claiming a scope change. Model-authored prose is not authorization; the original obligation remains unresolved.".to_string())),
                 ),
             ]),
             Some(vec!["step_id".to_string(), "reason".to_string()]),
             Some(false.into()),
         ),
-        Some("Unfinished steps this plan revision intentionally drops; recorded in the stored explanation and persistent requirement lineage. Each unfinished step a revision removes must be continued or superseded, or nothing changes.".to_string()),
+        Some("Proposed checklist removals, recorded with justification in the explanation and durable lineage without retiring original obligations. Each unfinished step removed must be continued or listed here, or nothing changes.".to_string()),
     );
     let mut status_updates = JsonSchema::array(
         JsonSchema {
@@ -62,7 +62,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     ..JsonSchema::integer(Some("Zero-based index in the latest current_plan.plan. Requires expected_revision; prefer step_id.".to_string()))
                 }),
                 ("step_id".to_string(), JsonSchema::string(Some(
-                    "Stable ID from step_ids in the previous result; survives reordering and one-to-one continues renames. New split/merge steps get new IDs. Provide step_id or index, not both.".into()
+                    "Stable ID from step_ids in the previous result, or a unique prefix of at least 8 characters; survives reordering and one-to-one continues renames. New split/merge steps get new IDs. Provide step_id or index, not both.".into()
                 ))),
                 ("status".to_string(), JsonSchema::string_enum(
                     vec![json!("pending"), json!("in_progress"), json!("completed")], None,
@@ -88,7 +88,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
             ..JsonSchema::object(
             BTreeMap::from([
                 ("expected_revision".to_string(), JsonSchema::string(Some(
-                    "Revision from the last update_plan result. Checked atomically before any change; required for index-based updates.".into()
+                    "Revision from the last update_plan result or conflict reconciliation. Checked atomically before any change; required when replacing an existing plan and for index-based updates. Stable-ID status deltas do not require it.".into()
                 ))),
                 (
                     "explanation".to_string(),
@@ -117,10 +117,10 @@ pub fn create_update_plan_tool() -> ToolSpec {
             "properties": {
                 "obligations": {
                     "type": "object",
-                    "description": "Derived original-requirement status: continue unresolved work only. When unresolved is empty, reconcile existing evidence and publish the final result; do not recheck satisfied requirements without changed inputs or uncertainty. Checklist status is not evidence or authority to stop.",
+                    "description": "Model-declared checklist accounting, not verified requirement completion. Continuations do not establish equivalent scope; proposed supersessions remain unresolved. Reconcile original acceptance scope against evidence and accepted user instructions during this update; counts do not authorize stopping or overriding legitimate scope changes.",
                     "properties": {
                         "completed": { "type": "integer", "minimum": 0 },
-                        "superseded": { "type": "integer", "minimum": 0 },
+                        "superseded": { "type": "integer", "minimum": 0, "description": "Authorized retirements only; currently zero because this format stores no accepted-instruction authorization." },
                         "unresolved": { "type": "array", "items": { "type": "string" } }
                     },
                     "required": ["completed", "superseded", "unresolved"],
@@ -152,7 +152,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                             "properties": {
                                 "text": { "type": "string" },
                                 "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] },
-                                "superseded_reason": { "type": "string" }
+                                "superseded_reason": { "type": "string", "description": "Unverified model-proposed retirement; not authority to remove this obligation." }
                             },
                             "required": ["text", "status"],
                             "additionalProperties": false

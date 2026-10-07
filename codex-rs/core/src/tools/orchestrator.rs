@@ -362,9 +362,18 @@ impl ToolOrchestrator {
                         tool_ctx,
                         &otel,
                     )
-                    .await?;
-
-                    Self::reject_if_not_approved(decision).await?;
+                    .await;
+                    let approved = match decision {
+                        Ok(decision) => Self::reject_if_not_approved(decision).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = approved {
+                        return Err(ToolError::Denied(format!(
+                            "retry refused; no second attempt: {error:?}\nInitial command exit code: {}\nCommand output:\n{}",
+                            output.exit_code,
+                            bounded_denial_diagnostic(output.as_ref()).unwrap_or_else(|| "[no diagnostic output]".into()),
+                        )));
+                    }
                 }
 
                 let retry_sandbox_requested = !unsandboxed_allowed
@@ -404,6 +413,9 @@ impl ToolOrchestrator {
                 };
 
                 // Second attempt.
+                if let Some(timing) = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing() {
+                    timing.increment_retry_count();
+                }
                 let escalated_attempt_start = Instant::now();
                 let (retry_result, retry_deferred_network_approval) =
                     Self::run_attempt(tool, req, tool_ctx, &retry_attempt, managed_network_active)
@@ -546,6 +558,13 @@ fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str> {
 
 fn build_denial_reason_from_output(output: &ExecToolCallOutput) -> String {
     let reason = "command failed; retry without sandbox?";
+    match bounded_denial_diagnostic(output) {
+        Some(excerpt) => format!("{reason}\nCommand output:\n{excerpt}"),
+        None => reason.to_string(),
+    }
+}
+
+fn bounded_denial_diagnostic(output: &ExecToolCallOutput) -> Option<String> {
     let diagnostic = [
         &output.stderr.text,
         &output.aggregated_output.text,
@@ -554,15 +573,13 @@ fn build_denial_reason_from_output(output: &ExecToolCallOutput) -> String {
     .into_iter()
     .map(|text| text.trim())
     .find(|text| !text.is_empty());
-    let Some(diagnostic) = diagnostic else {
-        return reason.to_string();
-    };
+    let diagnostic = diagnostic?;
     let mut chars = diagnostic.chars();
     let mut excerpt: String = chars.by_ref().take(1_024).collect();
     if chars.next().is_some() {
         excerpt.push('…');
     }
-    format!("{reason}\nCommand output:\n{excerpt}")
+    Some(excerpt)
 }
 
 #[cfg(test)]
@@ -584,6 +601,7 @@ mod tests {
         replay_safe: bool,
         denial_output: ExecToolCallOutput,
         approval_reason: Option<String>,
+        approve_retry: bool,
     }
 
     impl Sandboxable for DeniedAfterDispatchRuntime {
@@ -620,7 +638,8 @@ mod tests {
             ctx: ApprovalCtx<'a>,
         ) -> BoxFuture<'a, ReviewDecision> {
             self.approval_reason = ctx.retry_reason;
-            Box::pin(async { ReviewDecision::Denied })
+            let approve = self.approve_retry;
+            Box::pin(async move { if approve { ReviewDecision::Approved } else { ReviewDecision::Denied } })
         }
     }
 
@@ -640,6 +659,28 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_sandbox_retry_increments_dispatch_counter_once() {
+        use crate::tools::tool_dispatch_trace::{ToolDispatchTiming, scope_tool_dispatch_timing};
+        let (session, mut turn) = make_session_and_context().await;
+        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+        turn.approval_policy.set(AskForApproval::UnlessTrusted).unwrap();
+        let turn = Arc::new(turn);
+        let ctx = ToolCtx { session: Arc::new(session), turn: Arc::clone(&turn),
+            call_id: "retry-metric".into(), tool_name: ToolName::plain("test") };
+        for approve_retry in [false, true] {
+            let mut runtime = DeniedAfterDispatchRuntime { replay_safe: true, approve_retry,
+                ..Default::default() };
+            let timing = Arc::new(ToolDispatchTiming::new(tokio::time::Instant::now(), false));
+            let result = scope_tool_dispatch_timing(Arc::clone(&timing), ToolOrchestrator::new()
+                .run(&mut runtime, &(), &ctx, &turn, AskForApproval::UnlessTrusted)).await;
+            assert_eq!(result.is_ok(), approve_retry);
+            assert_eq!(runtime.attempts, if approve_retry { 2 } else { 1 });
+            assert_eq!(timing.snapshot(tokio::time::Instant::now()).retry_count,
+                u32::from(approve_retry));
         }
     }
 
@@ -742,7 +783,9 @@ mod tests {
                     AskForApproval::UnlessTrusted,
                 )
                 .await;
-            assert!(matches!(result, Err(ToolError::Denied(_))));
+            let Err(ToolError::Denied(ref refusal)) = result else { panic!("retry must be refused"); };
+            assert!(refusal.contains("retry refused; no second attempt"));
+            if let Some(excerpt) = &excerpt { assert!(refusal.contains(excerpt)); }
             assert_eq!(
                 runtime.attempts, 1,
                 "denied approval must not rerun the command"

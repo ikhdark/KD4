@@ -186,6 +186,7 @@ pub(crate) async fn execute_user_shell_command(
         .emit_turn_item_started(
             turn_context.as_ref(),
             &TurnItem::CommandExecution(CommandExecutionItem {
+                output_metadata: None,
                 id: call_id.clone(),
                 process_id: None,
                 parent_call_id: None,
@@ -251,6 +252,7 @@ pub(crate) async fn execute_user_shell_command(
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
                     TurnItem::CommandExecution(CommandExecutionItem {
+                        output_metadata: None,
                         id: call_id,
                         process_id: None,
                         parent_call_id: None,
@@ -280,6 +282,7 @@ pub(crate) async fn execute_user_shell_command(
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
                     TurnItem::CommandExecution(CommandExecutionItem {
+                        output_metadata: None,
                         id: call_id.clone(),
                         process_id: None,
                         parent_call_id: None,
@@ -336,6 +339,7 @@ pub(crate) async fn execute_user_shell_command(
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
                     TurnItem::CommandExecution(CommandExecutionItem {
+                        output_metadata: None,
                         id: call_id,
                         process_id: None,
                         parent_call_id: None,

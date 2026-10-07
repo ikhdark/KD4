@@ -97,7 +97,7 @@ async fn typed_patch_commits_without_mutation_snapshots() {
         });
     let cwd = PathUri::from_abs_path(&repo.path().to_path_buf().abs());
     let path = cwd.join("written.txt").unwrap();
-    let req = ApplyPatchRequest {
+    let mut req = ApplyPatchRequest {
         turn_environment: crate::session::turn_context::TurnEnvironment::new(
             "local".into(),
             std::sync::Arc::new(codex_exec_server::Environment::default_for_tests()),
@@ -115,7 +115,7 @@ async fn typed_patch_commits_without_mutation_snapshots() {
         permissions_preapproved: false,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
     };
-    let ctx = ToolCtx {
+    let mut ctx = ToolCtx {
         session: session.clone(),
         turn,
         call_id: "evidence-failure".into(),
@@ -139,6 +139,32 @@ async fn typed_patch_commits_without_mutation_snapshots() {
         "committed\n"
     );
     assert_eq!(runtime.committed_delta().changes().len(), 1);
+    assert!(!home.path().join("agent-task-coordination/snapshots").exists());
+
+    // A second call in the same bound attempt may edit the same path. Tracking
+    // must not treat the earlier completed call as finalization of that path.
+    req.action.patch =
+        "*** Begin Patch\n*** Update File: written.txt\n@@\n-committed\n+updated\n*** End Patch"
+            .into();
+    ctx.call_id = "follow-up-edit".into();
+    let mut follow_up = ApplyPatchRuntime::new();
+    follow_up.begin_workspace_tracking(&req, &ctx).await.unwrap();
+    follow_up.committed_delta = codex_apply_patch::apply_patch(
+        &req.action.patch,
+        &cwd,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        codex_exec_server::LOCAL_FS.as_ref(),
+        None,
+    )
+    .await
+    .unwrap();
+    follow_up.finish_pending_workspace_tracking(&ctx).await;
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("written.txt")).unwrap(),
+        "updated\n"
+    );
+    assert_eq!(follow_up.committed_delta().changes().len(), 1);
     assert!(!home.path().join("agent-task-coordination/snapshots").exists());
 }
 

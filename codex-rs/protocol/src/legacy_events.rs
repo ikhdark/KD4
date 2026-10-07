@@ -180,6 +180,7 @@ impl CommandExecutionItem {
         };
         Some(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
             call_id: self.id.clone(),
+            output_metadata: self.output_metadata.clone(),
             process_id: self.process_id.clone(),
             turn_id,
             completed_at_ms,
@@ -191,7 +192,7 @@ impl CommandExecutionItem {
             stdout: self.stdout.clone().unwrap_or_default(),
             stderr: self.stderr.clone().unwrap_or_default(),
             aggregated_output: self.aggregated_output.clone().unwrap_or_default(),
-            exit_code: self.exit_code.unwrap_or_default(),
+            exit_code: self.exit_code,
             duration: self.duration.unwrap_or_default(),
             formatted_output: self.formatted_output.clone().unwrap_or_default(),
             status,
@@ -548,6 +549,11 @@ impl HasLegacyEvent for ItemStartedEvent {
                 vec![item.as_legacy_begin_event(self.turn_id.clone(), self.started_at_ms)]
             }
             TurnItem::DynamicToolCall(item) => {
+                if item.namespace.as_deref() == Some("codex.internal")
+                    && item.tool == "code_mode_cell"
+                {
+                    return Vec::new();
+                }
                 vec![item.as_legacy_request_event(self.turn_id.clone(), self.started_at_ms)]
             }
             TurnItem::CollabAgentToolCall(item) => item

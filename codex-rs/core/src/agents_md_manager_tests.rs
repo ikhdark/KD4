@@ -763,6 +763,34 @@ async fn same_key_read_failure_retains_last_successful_instructions_and_recovers
 }
 
 #[tokio::test]
+async fn successful_primary_refresh_is_not_hidden_by_secondary_failure() {
+    let primary = tempfile::tempdir().unwrap();
+    let secondary = tempfile::tempdir().unwrap();
+    fs::write(primary.path().join("AGENTS.md"), "primary one").unwrap();
+    fs::write(secondary.path().join("AGENTS.md"), "secondary one").unwrap();
+    let config = config_for(&primary).await;
+    let secondary_cwd = AbsolutePathBuf::try_from(secondary.path().to_path_buf()).unwrap();
+    let secondary_fs = Arc::new(ControlledFileSystem::new(secondary_cwd.join("AGENTS.md")));
+    let mut environments = environment_snapshot(&config.cwd, 1);
+    environments.turn_environments.push(TurnEnvironment::new("secondary".into(),
+        Arc::new(Environment::default_for_tests_with_filesystem(secondary_fs.clone())),
+        PathUri::from_abs_path(&secondary_cwd), None));
+    let manager = AgentsMdManager::new(None);
+    manager.refresh_and_observe(&config, &environments).await;
+    fs::write(primary.path().join("AGENTS.md"), "primary two: do not modify X").unwrap();
+    secondary_fs.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
+    let result = manager.refresh_and_observe(&config, &environments).await;
+    let text = result.loaded.unwrap().text();
+    assert!(text.contains("primary two: do not modify X"));
+    assert!(!text.contains("primary one"));
+    assert!(text.contains("secondary one"));
+    assert_eq!(result.freshness, AgentsMdFreshness::CachedFallback);
+    fs::remove_file(secondary.path().join("AGENTS.md")).unwrap();
+    let result = manager.refresh_and_observe(&config, &environments).await;
+    assert!(!result.loaded.unwrap().text().contains("secondary one"));
+}
+
+#[tokio::test]
 async fn content_and_missing_higher_precedence_file_invalidate_cache() {
     let root = tempfile::tempdir().expect("workspace");
     let agents = root.path().join("AGENTS.md");
@@ -799,6 +827,40 @@ async fn content_and_missing_higher_precedence_file_invalidate_cache() {
             override_path.display()
         )
     );
+}
+
+#[tokio::test]
+async fn a_failed_instruction_file_does_not_hide_a_sibling_change_or_deletion() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    let child = root.path().join("child");
+    fs::create_dir(&child).unwrap();
+    let parent_doc = root.path().join("AGENTS.md");
+    let child_doc = child.join("AGENTS.md");
+    fs::write(&parent_doc, "parent old").unwrap();
+    fs::write(&child_doc, "child retained").unwrap();
+    let mut config = config_for(&root).await;
+    config.cwd = AbsolutePathBuf::from_absolute_path(&child).unwrap();
+    let filesystem = Arc::new(ControlledFileSystem::new(
+        AbsolutePathBuf::from_absolute_path(&child_doc).unwrap()));
+    let environments = environment_snapshot_with_environment(&config.cwd, 1,
+        Arc::new(Environment::default_for_tests_with_filesystem(filesystem.clone())));
+    let manager = AgentsMdManager::new(None);
+    manager.refresh_and_observe(&config, &environments).await;
+    fs::write(&parent_doc, "parent new restriction").unwrap();
+    filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
+    let changed = manager.refresh_and_observe(&config, &environments).await;
+    assert_eq!(changed.freshness, AgentsMdFreshness::CachedFallback);
+    let text = changed.loaded.unwrap().text();
+    assert!(text.contains("parent new restriction"));
+    assert!(!text.contains("parent old"));
+    assert!(text.contains("child retained"));
+    fs::remove_file(parent_doc).unwrap();
+    filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
+    let deleted = manager.refresh_and_observe(&config, &environments).await;
+    let text = deleted.loaded.unwrap().text();
+    assert!(!text.contains("parent new restriction"));
+    assert!(text.contains("child retained"));
 }
 
 #[tokio::test]

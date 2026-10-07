@@ -1721,6 +1721,7 @@ def analyze_session_path(
     line_count = 0
     byte_count = 0
     snapshots: list[dict[str, str | int]] = []
+    subscription_usage = kd4_session_diagnostics.SubscriptionUsage()
     first_action_records = []
     command_orchestration_records: list[dict[str, Any]] = []
     source_discovery_events: list[dict[str, Any]] = []
@@ -1848,6 +1849,8 @@ def analyze_session_path(
                     cwd = str(payload.get("cwd") or cwd)
                     build = _build_identity(payload) or build
                 payload_type = payload.get("type")
+                if item.get("type") == "event_msg" and payload_type == "token_count":
+                    subscription_usage.observe(str(file), timestamp_ns, payload.get("rate_limits"))
                 if (
                     item.get("type") == "response_item"
                     and payload_type == "message"
@@ -2276,6 +2279,7 @@ def analyze_session_path(
         per_turn=per_turn,
         evidence=diagnostic_evidence,
     )
+    report["sessionDiagnostics"]["subscriptionUsage"] = subscription_usage.report(parse_error_count)
     report["requestCostModel"] = _request_cost_model(valid)
     report["outputChannels"] = _output_channels(output_channel_bytes, valid)
     report["checkoutOverlaps"] = _checkout_overlaps(valid, edited_paths)
@@ -3082,6 +3086,26 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
             0, len(rows) - 8
         )
     result = compact_tokens(result)
+    subscription = report.get("sessionDiagnostics", {}).get("subscriptionUsage")
+    # With no token-count events, leave the unavailable section to full JSON/text
+    # rather than displacing existing turn evidence in legacy compact reports.
+    if subscription is not None and subscription["tokenCountEvents"]:
+        result["subscriptionUsage"] = {
+            **{
+                key: value for key, value in subscription.items()
+                if key != "measurementNote"
+                and (subscription["available"] or value or key == "available")
+            },
+            "windows": [dict(row) for row in subscription["windows"][:8]],
+            "omittedWindows": max(0, len(subscription["windows"]) - 8),
+        }
+        if subscription["available"]:
+            # Unlike other token notes, retain the essential attribution warning.
+            result["subscriptionUsage"]["measurementNote"] = (
+                "Account-level snapshots, not usage attributable to this session or "
+                "monetary cost. Last observed quota, not live; repeated samples are "
+                "not requests. Changes stay within one file/plan/limit/window/reset."
+            )
     # Full distributions belong in --json baselines, not the compact view.
     # Copy comparison detail before trimming, preserving the full report.
     if "baselineComparison" in report:
@@ -3156,6 +3180,8 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         trim_rows(container, key, omitted)
     if "startupTiming" in result:
         trim_rows(result["startupTiming"], "records", "omittedRecords")
+    if "subscriptionUsage" in result:
+        trim_rows(result["subscriptionUsage"], "windows", "omittedWindows")
     if "baselineComparison" in result:
         trim_rows(result["baselineComparison"], "metrics", "omittedMetrics")
         # The gate's status and counts stay; only its supporting rows shrink.

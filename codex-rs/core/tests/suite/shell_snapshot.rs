@@ -133,7 +133,7 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
     )
     .await?;
     assert_eq!(normalize_newlines(&warmup.stdout).trim(), "warmup");
-    assert_eq!(warmup.exit_code, 0);
+    assert_eq!(warmup.exit_code, Some(0));
     // PowerShell snapshots deliberately remain disabled: replaying function
     // source loses captured variables and module state. Exercise normal execution.
     let end = run_tool_turn_on_harness(
@@ -149,7 +149,7 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
     .await?;
 
     assert_eq!(normalize_newlines(&end.stdout).trim(), "snapshot-windows");
-    assert_eq!(end.exit_code, 0);
+    assert_eq!(end.exit_code, Some(0));
     let snapshot_dir = codex_home.join("shell_snapshots");
     if snapshot_dir.exists() {
         let mut entries = fs::read_dir(snapshot_dir).await?;

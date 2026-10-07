@@ -71,13 +71,39 @@ impl Session {
             return;
         }
 
-        for contributor in self.services.extensions.thread_lifecycle_contributors() {
-            contributor
-                .on_thread_idle(codex_extension_api::ThreadIdleInput {
-                    session_store: &self.services.session_extension_data,
-                    thread_store: &self.services.thread_extension_data,
-                })
-                .await;
+        // One budget for the whole phase, not one renewed budget per contributor.
+        if bounded_lifecycle(async {
+            for contributor in self.services.extensions.thread_lifecycle_contributors() {
+                contributor
+                    .on_thread_idle(codex_extension_api::ThreadIdleInput {
+                        session_store: &self.services.session_extension_data,
+                        thread_store: &self.services.thread_extension_data,
+                    })
+                    .await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            tracing::warn!("thread idle lifecycle panicked or exceeded its phase deadline");
+        }
+    }
+
+    pub(crate) async fn emit_thread_stop_lifecycle(&self) {
+        if bounded_lifecycle(async {
+            for contributor in self.services.extensions.thread_lifecycle_contributors() {
+                contributor
+                    .on_thread_stop(codex_extension_api::ThreadStopInput {
+                        session_store: &self.services.session_extension_data,
+                        thread_store: &self.services.thread_extension_data,
+                    })
+                    .await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            tracing::warn!("thread stop lifecycle panicked or exceeded its phase deadline");
         }
     }
 
@@ -162,6 +188,48 @@ async fn bounded_lifecycle(
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    struct SlowThreadContributor(std::time::Duration);
+
+    impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
+        for SlowThreadContributor
+    {
+        fn on_thread_idle<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadIdleInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(tokio::time::sleep(self.0))
+        }
+
+        fn on_thread_stop<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadStopInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(tokio::time::sleep(self.0))
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_lifecycle_phases_share_one_deadline_and_shutdown_converges() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let (mut session, _) = crate::session::tests::make_session_and_context().await;
+        let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+        builder.thread_lifecycle_contributor(Arc::new(SlowThreadContributor(Duration::from_secs(20))));
+        builder.thread_lifecycle_contributor(Arc::new(SlowThreadContributor(Duration::from_secs(3600))));
+        session.services.extensions = Arc::new(builder.build());
+        let session = Arc::new(session);
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        session.emit_thread_idle_lifecycle_if_idle().await;
+        assert!(started.elapsed() >= Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(31));
+        let started = tokio::time::Instant::now();
+        assert!(tokio::time::timeout(Duration::from_secs(35), session.shutdown_runtime_for_test())
+            .await.expect("pending stop callback must not strand ShutdownComplete"));
+        assert!(started.elapsed() >= Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(35));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn lifecycle_deadline_preserves_success_and_reports_stalls_and_panics() {

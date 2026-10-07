@@ -15,7 +15,8 @@ pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 10_000;
 /// ordinary yield intervals far below this value.
 pub const OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS: u64 = u64::MAX;
 /// Reserved owner wait that buffers output until explicit yield or completion.
-/// The caller owns its interruption and idle deadline.
+/// The caller owns interruption; the cell actor yields after ten idle minutes
+/// without output or a nested-call completion, without terminating the cell.
 pub const OWNER_HELD_DECISION_YIELD_TIME_MS: u64 = u64::MAX - 1;
 /// Default coherent evidence-packet budget when no per-call limit is requested.
 pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
@@ -24,10 +25,8 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
 /// of paging it across model turns; a configured `tool_output_token_limit`
 /// still lowers the effective ceiling.
 pub const MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 40_000;
-/// Output budget of a nested command result returned to a script. Printing
-/// the result JSON-escapes its output and adds lifecycle fields, so the budget
-/// stays below the default cell budget; otherwise a cell without a raised
-/// explicit budget cuts the result a second time.
+/// Fallback nested display budget when no owning cell budget is available.
+/// Runtime dispatch scales this reserve with the cell's remaining budget.
 pub const MAX_NESTED_COMMAND_OUTPUT_TOKENS: usize =
     DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 / 5;
 /// Hard deadline applied to a single nested tool call when the host supplies no
@@ -58,6 +57,18 @@ pub struct ExecuteRequest {
 pub struct WaitRequest {
     pub cell_id: CellId,
     pub yield_time_ms: u64,
+    /// Host-selected recovery of an already opted-in thread snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ReceiptRecovery>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptRecovery {
+    pub path: std::path::PathBuf,
+    /// Stale generations may recover receipts, never observe or cancel actors.
+    #[serde(default)]
+    pub terminal_only: bool,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -113,6 +124,10 @@ pub struct CodeModeNestedToolCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
     pub runtime_tool_call_id: String,
+    /// Encoded output already buffered in the cell at dispatch. Nested display
+    /// projection uses this estimate; unprinted tool results are not charged.
+    #[serde(default)]
+    pub buffered_output_bytes: usize,
     pub tool_name: ToolName,
     pub tool_kind: CodeModeToolKind,
     /// Missing input is distinct from an explicitly supplied JSON null.

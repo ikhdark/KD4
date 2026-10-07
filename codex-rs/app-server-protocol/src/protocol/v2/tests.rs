@@ -1690,6 +1690,8 @@ fn command_execution_output_delta_round_trips() {
         turn_id: "turn-1".to_string(),
         item_id: "item-1".to_string(),
         delta: "\u{fffd}a\n".to_string(),
+        stream: Some(codex_protocol::protocol::ExecOutputStream::Stderr),
+        decoding_lossy: Some(true),
     };
 
     let value = serde_json::to_value(&notification)
@@ -1701,6 +1703,8 @@ fn command_execution_output_delta_round_trips() {
             "turnId": "turn-1",
             "itemId": "item-1",
             "delta": "\u{fffd}a\n",
+            "stream": "stderr",
+            "decodingLossy": true,
         })
     );
 
@@ -2709,6 +2713,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     );
 
     let command_item = TurnItem::CommandExecution(CommandExecutionItem {
+        output_metadata: None,
         id: "exec-1".to_string(),
         process_id: Some("pid-1".to_string()),
         parent_call_id: Some("outer-exec".to_string()),
@@ -2734,6 +2739,9 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     assert_eq!(
         ThreadItem::from(command_item),
         ThreadItem::CommandExecution {
+            output_metadata: None,
+            stdout: Some("done\n".to_string()),
+            stderr: Some(String::new()),
             id: "exec-1".to_string(),
             command: "echo done".to_string(),
             cwd: LegacyAppPathString::from_abs_path(&test_path_buf("/tmp").abs()),
@@ -3058,6 +3066,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
 #[test]
 fn core_windows_command_execution_uses_windows_display_quoting() {
     let command_item = TurnItem::CommandExecution(CommandExecutionItem {
+        output_metadata: None,
         id: "exec-windows".to_string(),
         process_id: None,
         parent_call_id: None,

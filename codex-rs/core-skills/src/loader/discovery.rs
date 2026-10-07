@@ -75,6 +75,7 @@ pub(super) async fn discover_skills(
                     options.hidden_directories,
                     HiddenDirectoryPolicy::Skip
                 ),
+                filters: Default::default(),
             },
             /*sandbox*/ None,
         )

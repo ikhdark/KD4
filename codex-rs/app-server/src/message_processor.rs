@@ -163,6 +163,7 @@ fn serialized_request_queue_bytes<T: Serialize + ?Sized>(
 }
 
 pub(crate) struct MessageProcessor {
+    draining: AtomicBool,
     outgoing: Arc<OutgoingMessageSender>,
     models_refresh_worker: ModelsRefreshWorker,
     skills_watcher: Arc<SkillsWatcher>,
@@ -550,6 +551,7 @@ impl MessageProcessor {
 
         Self {
             outgoing,
+            draining: AtomicBool::new(false),
             models_refresh_worker,
             skills_watcher,
             account_processor,
@@ -586,6 +588,10 @@ impl MessageProcessor {
         self.apps_processor.shutdown();
         self.models_refresh_worker.shutdown();
         self.skills_watcher.shutdown();
+    }
+
+    pub(crate) fn begin_drain(&self) {
+        self.draining.store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) async fn process_request(
@@ -845,6 +851,20 @@ impl MessageProcessor {
     ) -> Result<(), JSONRPCErrorError> {
         if !session.initialized() {
             return Err(invalid_request("Not initialized"));
+        }
+        if self.draining.load(std::sync::atomic::Ordering::Acquire)
+            && matches!(&codex_request,
+                ClientRequest::TurnStart { .. } | ClientRequest::ThreadCompactStart { .. }
+                | ClientRequest::ThreadStart { .. } | ClientRequest::ThreadResume { .. }
+                | ClientRequest::ThreadFork { .. } | ClientRequest::ThreadQueueStart { .. }
+                | ClientRequest::ThreadQueueAdd { .. } | ClientRequest::ThreadGoalSet { .. }
+                | ClientRequest::ThreadShellCommand { .. })
+        {
+            return Err(JSONRPCErrorError {
+                code: -32000,
+                message: "app-server is draining; retry new work after reconnecting".into(),
+                data: Some(serde_json::json!({"kind": "server_draining", "retryable": true})),
+            });
         }
 
         if let Some(reason) = codex_request.experimental_reason()

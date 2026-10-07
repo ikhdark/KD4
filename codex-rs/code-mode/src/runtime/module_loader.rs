@@ -182,7 +182,18 @@ pub(super) fn completion_state(
     } else if let Some(pending_promise) = pending_promise {
         let promise = v8::Local::new(scope, pending_promise);
         match promise.state() {
-            v8::PromiseState::Pending => return CompletionState::Pending,
+            v8::PromiseState::Pending => {
+                // Called only after a microtask checkpoint. Without a host
+                // callback or timer there is no producer that can wake JS.
+                if scope.get_slot::<RuntimeState>().is_some_and(|state| {
+                    !state.pending_tool_calls.is_empty()
+                        || !state.pending_notifications.is_empty()
+                        || !state.pending_timeouts.is_empty()
+                }) {
+                    return CompletionState::Pending;
+                }
+                Some("unresolved top-level promise: no pending tools, timers, or notifications can resolve it".to_string())
+            }
             v8::PromiseState::Fulfilled => None,
             v8::PromiseState::Rejected => {
                 let result = promise.result(scope);
@@ -198,22 +209,22 @@ pub(super) fn completion_state(
     };
     // Accepted notifications retain the existing drain contract. Tool calls are
     // cancelled by the owner at completion; make abandonment an explicit failure.
-    if error_text.is_none() && scope.get_slot::<RuntimeState>().is_some_and(|state| !state.exit_requested && !state.pending_notifications.is_empty()) {
-        return CompletionState::Pending;
-    }
     let error_text = error_text.or_else(|| scope.get_slot::<RuntimeState>().and_then(|state| {
         (!state.exit_requested && !state.pending_tool_calls.is_empty()).then(|| format!(
             "cell completed with {} unawaited tool call(s); outstanding tool work is cancelled",
             state.pending_tool_calls.len()
         ))
     }));
-    let (stored_value_writes, stored_value_limit_error) = scope
+    if error_text.is_none() && scope.get_slot::<RuntimeState>().is_some_and(|state| !state.exit_requested && !state.pending_notifications.is_empty()) {
+        return CompletionState::Pending;
+    }
+    let stored_value_writes = scope
         .get_slot_mut::<RuntimeState>()
         .map(RuntimeState::stored_value_completion)
         .unwrap_or_default();
     CompletionState::Completed {
         stored_value_writes,
-        error_text: stored_value_limit_error.or(error_text),
+        error_text,
     }
 }
 

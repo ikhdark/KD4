@@ -620,6 +620,7 @@ async fn collect_agent_role_files(
                 max_entries: MAX_AGENT_ROLE_ENTRIES,
                 follow_directory_symlinks: true,
                 prune_hidden_directories: false,
+                filters: Default::default(),
             },
             /*sandbox*/ None,
         )

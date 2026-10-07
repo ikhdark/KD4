@@ -811,6 +811,9 @@ pub(super) fn begin_exec_with_source(
         .map(|parsed| AppServerCommandAction::from_core_with_cwd(parsed, &chat.config.cwd))
         .collect();
     let item = AppServerThreadItem::CommandExecution {
+        output_metadata: None,
+        stdout: None,
+        stderr: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -838,6 +841,9 @@ pub(super) fn begin_unified_exec_startup(
 ) -> AppServerThreadItem {
     let command = vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()];
     let item = AppServerThreadItem::CommandExecution {
+        output_metadata: None,
+        stdout: None,
+        stderr: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -1077,6 +1083,9 @@ pub(super) fn end_exec(
     handle_exec_end(
         chat,
         AppServerThreadItem::CommandExecution {
+            output_metadata: None,
+            stdout: None,
+            stderr: None,
             id,
             command,
             cwd,

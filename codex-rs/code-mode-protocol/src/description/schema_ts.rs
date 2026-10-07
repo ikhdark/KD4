@@ -22,12 +22,14 @@ pub fn render_json_schema_to_typescript_recording(schema: &JsonValue) -> (String
     let mut budget = RenderBudget::default();
     let rendered = render_json_schema_to_typescript_inner(schema, schema, &mut budget)
         .unwrap_or_else(|()| {
+            budget.incomplete = true;
             "unknown /* schema projection incomplete: rendering limit reached */".to_string()
         });
     (
         rendered,
         SharedFragments {
             candidates: std::mem::take(&mut budget.fragments),
+            incomplete: budget.incomplete,
         },
     )
 }
@@ -37,6 +39,7 @@ pub fn render_json_schema_to_typescript_recording(schema: &JsonValue) -> (String
 #[derive(Default)]
 pub struct SharedFragments {
     candidates: Vec<(Option<String>, String)>,
+    pub incomplete: bool,
 }
 
 /// Replaces shapes that occur more than once across `types` with named aliases.
@@ -240,6 +243,7 @@ mod fragment_tests {
                 (Some("leaf".to_string()), leaf.clone()),
                 (Some("container".to_string()), container),
             ],
+            ..Default::default()
         };
         let aliases = hoist_shared_fragments(&[&fragments], &mut [&mut rendered]).join("\n");
         assert!(
@@ -254,6 +258,7 @@ mod fragment_tests {
         let original = expensive.clone();
         let fragments = SharedFragments {
             candidates: vec![(Some("x".repeat(500)), leaf)],
+            ..Default::default()
         };
         assert!(hoist_shared_fragments(&[&fragments], &mut [&mut expensive]).is_empty());
         assert_eq!(
@@ -310,6 +315,7 @@ fn alias_name(hint: Option<&str>, index: usize, used: &mut HashSet<String>) -> S
 // Bound traversal before expanding references, and account for intermediate strings
 // as well as the final output. A DAG can expand exponentially without any cycles.
 struct RenderBudget {
+    incomplete: bool,
     active_refs: HashSet<String>,
     fragments: Vec<(Option<String>, String)>,
     nodes: usize,
@@ -320,6 +326,7 @@ struct RenderBudget {
 impl Default for RenderBudget {
     fn default() -> Self {
         Self {
+            incomplete: false,
             active_refs: HashSet::new(),
             fragments: Vec::new(),
             nodes: 1024,
@@ -346,6 +353,16 @@ fn render_json_schema_to_typescript_inner(
     root: &JsonValue,
     budget: &mut RenderBudget,
 ) -> Rendered {
+    render_schema_position(schema, root, budget, true)
+}
+
+fn render_schema_position(
+    schema: &JsonValue,
+    root: &JsonValue,
+    budget: &mut RenderBudget,
+    include_description: bool,
+) -> Rendered {
+    let available_bytes = budget.bytes;
     budget.nodes = budget.nodes.checked_sub(1).ok_or(())?;
     if budget.depth >= 64 {
         return Err(());
@@ -353,8 +370,19 @@ fn render_json_schema_to_typescript_inner(
     budget.depth += 1;
     let rendered = render_schema(schema, root, budget);
     budget.depth -= 1;
-    let rendered = rendered?;
-    budget.spend(rendered.len())?;
+    let mut rendered = rendered?;
+    if include_description
+        && let Some(description) = schema.get("description").and_then(JsonValue::as_str)
+        && !description.trim().is_empty()
+    {
+        let comment = format!("/* {} */", sanitize_comment(description.trim()));
+        if !rendered.contains(&comment) {
+            rendered = format!("{comment} {rendered}");
+        }
+    }
+    // Children have already charged their rendered bytes. The enclosing shape
+    // contains those same bytes; charge its final size once, not once per depth.
+    budget.bytes = available_bytes.checked_sub(rendered.len()).ok_or(())?;
     if rendered.len() >= FRAGMENT_HOIST_MIN_BYTES || rendered.starts_with("number /*") {
         budget.fragments.push((None, rendered.clone()));
     }
@@ -365,6 +393,7 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
     // A nested resource has its own reference identity. Until resource resolution
     // is supported, never resolve its fragments against the enclosing document.
     if !std::ptr::eq(schema, root) && schema.get("$id").and_then(JsonValue::as_str).is_some() {
+        budget.incomplete = true;
         return Ok(NESTED_RESOURCE_UNKNOWN.to_string());
     }
     match schema {
@@ -400,6 +429,7 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
                         )
                     });
                     return Ok(if dialect.is_empty() && has_siblings {
+                        budget.incomplete = true;
                         format!(
                             "{rendered} /* $ref siblings not projected: schema dialect unspecified */"
                         )
@@ -539,12 +569,15 @@ fn render_local_schema_ref(
 ) -> Rendered {
     budget.spend(reference.len())?;
     let Some(pointer) = reference.strip_prefix('#') else {
+        budget.incomplete = true;
         return Ok("unknown /* external $ref not projected */".to_string());
     };
     let Some(pointer) = decode_schema_fragment(pointer) else {
+        budget.incomplete = true;
         return Ok("unknown /* invalid $ref URI fragment */".to_string());
     };
     if !pointer.is_empty() && !pointer.starts_with('/') {
+        budget.incomplete = true;
         return Ok("unknown /* unresolved $ref */".to_string());
     }
     let mut target = root;
@@ -553,14 +586,17 @@ fn render_local_schema_ref(
     for token in pointer.split('/').skip(1) {
         budget.nodes = budget.nodes.checked_sub(1).ok_or(())?;
         if !std::ptr::eq(target, root) && target.get("$id").and_then(JsonValue::as_str).is_some() {
+            budget.incomplete = true;
             return Ok(NESTED_RESOURCE_UNKNOWN.to_string());
         }
         let Some(next) = target.pointer(&format!("/{token}")) else {
+            budget.incomplete = true;
             return Ok("unknown /* unresolved $ref */".to_string());
         };
         target = next;
     }
     if !budget.active_refs.insert(pointer.clone()) {
+        budget.incomplete = true;
         return Ok("unknown /* recursive $ref */".to_string());
     }
     let rendered = render_json_schema_to_typescript_inner(target, root, budget);
@@ -605,11 +641,24 @@ fn annotate_schema_constraints(
             annotations.push(format!("{keyword}: {value}"));
         }
     }
+    if let Some(value) = map.get("default") {
+        let value = sanitize_comment(&render_bounded_literal(value, budget)?);
+        annotations.push(format!("default annotation: {value}; not automatically applied on omission"));
+    }
+    if !map.contains_key("type") {
+        for keyword in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"] {
+            if let Some(value) = map.get(keyword) {
+                let value = sanitize_comment(&render_bounded_literal(value, budget)?);
+                annotations.push(format!("{keyword} (numbers only): {value}"));
+            }
+        }
+    }
     if map.contains_key("oneOf") {
         annotations.push("oneOf: exactly one branch must match".to_string());
     }
     for keyword in ["not", "if", "then", "else", "$dynamicRef", "$recursiveRef"] {
         if map.contains_key(keyword) {
+            budget.incomplete = true;
             annotations.push(format!("unprojected keyword: {keyword}"));
         }
     }
@@ -639,6 +688,11 @@ fn render_json_schema_type_keyword(
 }
 
 fn render_numeric_schema(map: &serde_json::Map<String, JsonValue>, integer: bool) -> String {
+    let safe = map.get("minimum").or_else(|| map.get("exclusiveMinimum"))
+        .and_then(JsonValue::as_f64).is_some_and(|bound| bound >= -9_007_199_254_740_991.0)
+        && map.get("maximum").or_else(|| map.get("exclusiveMaximum"))
+            .and_then(JsonValue::as_f64).is_some_and(|bound| bound <= 9_007_199_254_740_991.0);
+    let numeric_type = if integer && !safe { "(number | bigint)" } else { "number" };
     let mut constraints = Vec::new();
     if integer {
         constraints.push("integer".to_string());
@@ -655,9 +709,9 @@ fn render_numeric_schema(map: &serde_json::Map<String, JsonValue>, integer: bool
         }
     }
     if constraints.is_empty() {
-        "number".to_string()
+        numeric_type.to_string()
     } else {
-        format!("number /* {} */", constraints.join("; "))
+        format!("{numeric_type} /* {} */", constraints.join("; "))
     }
 }
 
@@ -805,11 +859,20 @@ fn render_json_schema_object(
         }
         budget.spend(name.len().saturating_mul(6))?;
         let property_name = render_json_schema_property_name(name);
-        let property_type = render_json_schema_to_typescript_inner(value, root, budget)?;
+        let mut property_type = render_schema_position(value, root, budget, false)?;
+        // A reference can repeat the property's own guidance. Keep the existing
+        // property comment without duplicating that same annotation at its type.
+        if let Some(description) = value.get("description").and_then(JsonValue::as_str) {
+            let comment = format!("/* {} */ ", sanitize_comment(description.trim()));
+            if let Some(rest) = property_type.strip_prefix(&comment) {
+                property_type = rest.to_string();
+            }
+        }
         let optional = if required.contains(name) { "" } else { "?" };
         lines.push(format!("{property_name}{optional}: {property_type};"));
     }
     if has_patterns {
+        budget.incomplete = true;
         lines.push("[key: string]: unknown; /* patternProperties not projected */".to_string());
     } else if additional != &JsonValue::Bool(false)
         && (map.contains_key("additionalProperties") || properties.is_empty())
@@ -940,7 +1003,7 @@ mod tests {
                 "type": "integer", "minimum": 1, "const": 2, "enum": [2, 3],
                 "allOf": [{"type": "number", "maximum": 4}]
             })),
-            "(number /* integer; minimum: 1 */) & (2) & (2 | 3) & (number /* maximum: 4 */)"
+            "((number | bigint) /* integer; minimum: 1 */) & (2) & (2 | 3) & (number /* maximum: 4 */)"
         );
     }
 
@@ -1135,6 +1198,7 @@ mod tests {
             (10, 0, 5, Err(())),
         ] {
             let mut budget = RenderBudget {
+                incomplete: false,
                 active_refs: HashSet::new(),
                 fragments: Vec::new(),
                 nodes,

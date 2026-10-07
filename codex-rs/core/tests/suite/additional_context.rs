@@ -450,9 +450,9 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
     })
     .await;
 
-    let reset = external_context(
-        "__codex_additional_context_reset__",
-        "Additional context snapshot replaced. All previously supplied additional context values are obsolete (previous_value_obsolete=\"true\"). Only additional-context entries following this reset in the current update remain available. Do not infer omitted values from earlier messages.",
+    let removal = external_context(
+        "browser_info",
+        "This source's previous additional-context value is obsolete (previous_value_obsolete=\"true\"). It is no longer available; do not treat earlier values from this source as current. Any replacement follows separately.",
     );
     assert_eq!(
         first_request.single_request().message_input_texts("user"),
@@ -468,8 +468,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
             "first turn".to_string(),
-            reset.clone(),
-            external_context("automation_info", "run one"),
+            removal.clone(),
             external_context("terminal_info", "pty one"),
             "second turn".to_string(),
         ]
@@ -480,8 +479,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
             "first turn".to_string(),
-            reset,
-            external_context("automation_info", "run one"),
+            removal,
             external_context("terminal_info", "pty one"),
             "second turn".to_string(),
             external_context("browser_info", "tab one"),
@@ -560,14 +558,8 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
         application_context_prefix("automation_info"),
         "a".repeat(1024)
     )));
-    assert!(automation_text.contains("tokens truncated"));
-    assert!(automation_text.ends_with("automation-tail\n</application_context>"));
-    assert!(automation_text.len() < untruncated_automation_fragment.len());
-    assert!(
-        automation_text.len() <= MAX_EXPECTED_EXTERNAL_CONTEXT_TEXT_BYTES,
-        "application additional context was not capped before model input: {} bytes",
-        automation_text.len()
-    );
+    // Application policy is admitted whole; only untrusted context is truncated.
+    assert_eq!(automation_text, &untruncated_automation_fragment);
 
     let user_texts = request.message_input_texts("user");
     let [external_text, user_text] = user_texts.as_slice() else {
@@ -810,7 +802,9 @@ async fn additional_context_overflow_resets_stale_values_in_the_model_request() 
             format!("long-source-{index:02}-{}", "\"\n\\".repeat(8_000)),
             AdditionalContextEntry {
                 value: "a".repeat(20_000),
-                kind: AdditionalContextKind::Application,
+                // Application policies are rejected atomically when oversized;
+                // exercise bounded overflow admission with untrusted sources.
+                kind: AdditionalContextKind::Untrusted,
             },
         );
     }

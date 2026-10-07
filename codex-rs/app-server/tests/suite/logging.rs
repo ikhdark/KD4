@@ -129,7 +129,7 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
         .remove("trace_id")
         .context("tool call log event must include trace_id")?;
     anyhow::ensure!(trace_id.is_string(), "trace_id must be a string");
-    let item_to_first_poll_ms = fields
+    let _item_to_first_poll_ms = fields
         .remove("item_to_first_poll_ms")
         .and_then(|duration| duration.as_u64())
         .context("item_to_first_poll_ms must be a nonnegative integer")?;
@@ -184,7 +184,7 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
     );
     anyhow::ensure!(
         [
-            item_to_first_poll_ms,
+            // Total starts at first poll; queueing before it is a separate span.
             parallel_gate_wait_ms,
             authorization_state_coordination_ms,
             first_poll_to_handler_entry_ms,

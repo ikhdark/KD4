@@ -10,9 +10,41 @@ use codex_shell_command::validation::combine_validation_classifications;
 /// trust is never deserialized from model arguments or inferred from stdout.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandValidation {
+    pub(crate) execution_context: Option<ValidationExecutionContext>,
     pub(crate) declared: Option<codex_protocol::validation::ValidationCommandContext>,
     pub(crate) classification: ValidationClassification,
     pub(crate) receipt_runner: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct ValidationExecutionContext {
+    pub(crate) environment_id: String,
+    pub(crate) cwd: Option<std::path::PathBuf>,
+    /// Exact owner-resolved argv (including any shell wrapper). Do not infer
+    /// shell/argv equivalence from display text or overlapping path scopes.
+    pub(crate) command: Vec<String>,
+    pub(crate) environment_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunnerTestIdentity {
+    pub(crate) binary: String,
+    pub(crate) helpers: Vec<String>,
+    pub(crate) test: String,
+}
+
+pub(crate) fn runner_test_identities(value: &serde_json::Value) -> Option<std::collections::BTreeSet<RunnerTestIdentity>> {
+    let rows: Vec<RunnerTestIdentity> = serde_json::from_value(value.clone()).ok()?;
+    if rows.iter().any(|row| row.binary.is_empty() || row.test.is_empty()
+        || row.helpers.iter().any(String::is_empty)
+        || row.helpers.windows(2).any(|pair| pair[0] >= pair[1]))
+    {
+        return None;
+    }
+    let count = rows.len();
+    let identities = rows.into_iter().collect::<std::collections::BTreeSet<_>>();
+    (identities.len() == count).then_some(identities)
 }
 
 impl CommandValidation {
@@ -22,17 +54,48 @@ impl CommandValidation {
 
     pub(crate) fn is_test(&self) -> bool {
         matches!(&self.classification, ValidationClassification::Validation { leaves, .. }
-            if leaves.iter().any(|leaf| leaf.operation == ValidationOperation::Test))
+            if leaves.iter().any(|leaf| leaf.operation == ValidationOperation::Test
+                && leaf.mode == codex_shell_command::validation::ValidationExecutionMode::Execution))
     }
 
     pub(crate) fn signal(&self) -> serde_json::Value {
+        let modes = match &self.classification {
+            ValidationClassification::Validation { leaves, .. } =>
+                leaves.iter().map(|leaf| leaf.mode).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
         serde_json::json!({
             "validation": self.is_validation(),
             "proof": matches!(self.classification, ValidationClassification::Validation {
                 exit_code_is_authoritative: true, has_unclassified_targets: false, ..
-            }),
+            }) && !modes.is_empty() && modes.iter().all(|mode| mode.can_prove_validation()),
             "tests": self.is_test(),
+            "execution_modes": modes,
+            "execution_context": self.execution_context,
         })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn validation_signals_require_executing_or_checking_modes() {
+    for (command, proof, tests, mode) in [
+        ("cargo test", true, true, "execution"),
+        ("cargo bench --no-run", false, false, "compilation_only"),
+        ("cargo test -- --list", false, false, "listing"),
+        ("cargo fuzz list", false, false, "listing"),
+        ("cargo fuzz run target", true, false, "execution"),
+        ("cargo fmt", false, false, "mutation"),
+        ("cargo fmt --check", true, false, "checking"),
+        ("just --dry-run test", false, false, "dry_run"),
+        ("cargo nextest run --no-run", false, false, "compilation_only"),
+    ] {
+        let validation = CommandValidation { execution_context: None, declared:None, receipt_runner:None,
+            classification:classify_validation_script(command) };
+        let signal = validation.signal();
+        assert_eq!(signal["proof"], proof, "{command}");
+        assert_eq!(signal["tests"], tests, "{command}");
+        assert_eq!(signal["execution_modes"], serde_json::json!([mode]), "{command}");
     }
 }
 
@@ -43,41 +106,61 @@ struct RepositoryRunners {
     runners: Vec<codex_shell_command::validation::RepositoryRunner>,
 }
 
-fn repository_runners(cwd: &std::path::Path) -> Vec<codex_shell_command::validation::RepositoryRunner> {
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-    type Runners = Vec<codex_shell_command::validation::RepositoryRunner>;
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (String, Runners)>>> = OnceLock::new();
+type Runners = Vec<codex_shell_command::validation::RepositoryRunner>;
+type RunnerCacheSlot = std::sync::Arc<std::sync::OnceLock<Option<Runners>>>;
 
+#[derive(Default)]
+struct RepositoryRunnerCache {
+    entries: std::sync::Mutex<std::collections::HashMap<(std::path::PathBuf, String), RunnerCacheSlot>>,
+}
+
+impl RepositoryRunnerCache {
+    fn get_or_load(
+        &self, root: &std::path::Path, oid: &str, load: impl FnOnce() -> Option<Runners>,
+    ) -> Runners {
+        let key = (root.to_path_buf(), oid.to_string());
+        let slot = {
+            let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !entries.contains_key(&key) && entries.len() >= 64 {
+                // Never evict an in-flight key: its waiters must coalesce.
+                entries.retain(|_, slot| std::sync::Arc::strong_count(slot) > 1);
+                if entries.len() >= 64 {
+                    return Vec::new();
+                }
+            }
+            std::sync::Arc::clone(entries.entry(key.clone()).or_default())
+        };
+        // Only same-key callers wait here. No process or parsing work holds
+        // the global map lock. None remains retryable; Some(empty) is negative.
+        let cached = slot.get_or_init(load).clone();
+        if cached.is_none() {
+            // Current waiters share this failed lookup too, but a later request
+            // gets a fresh attempt. Never remove a replacement slot.
+            let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if entries.get(&key).is_some_and(|current| std::sync::Arc::ptr_eq(current, &slot)) {
+                entries.remove(&key);
+            }
+        }
+        cached.unwrap_or_default()
+    }
+}
+
+pub(crate) fn repository_runners(cwd: &std::path::Path) -> Runners {
+    static CACHE: std::sync::OnceLock<RepositoryRunnerCache> = std::sync::OnceLock::new();
     let Some(root) = codex_git_utils::get_git_repo_root(cwd) else { return Vec::new() };
     let Some(oid) = repository_head_oid(&root) else { return Vec::new() };
-    // This function runs on the blocking analysis pool. Coalesce concurrent
-    // misses; never retain cwd-specific path matching in the shared cache.
-    let mut cache = CACHE.get_or_init(Default::default).lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((cached_oid, runners)) = cache.get(&root)
-        && cached_oid == &oid
-    {
-        let mut runners = runners.clone();
-        for runner in &mut runners {
-            runner.path_context = Some((root.clone(), cwd.to_path_buf()));
-        }
-        return runners;
+    let mut runners = CACHE.get_or_init(Default::default)
+        .get_or_load(&root, &oid, || load_repository_runners(&root, &oid));
+    for runner in &mut runners {
+        runner.path_context = Some((root.clone(), cwd.to_path_buf()));
     }
-    // HEAD, not the index or working tree: writing a declaration during a turn
-    // must not let an arbitrary echo authenticate a fabricated execution ledger.
-    // Read the exact observed commit so a concurrent HEAD move cannot poison
-    // this entry. Replacement refs must not change content at a cached oid.
-    let Ok(output) = std::process::Command::new(codex_git_utils::git_executable())
-        .arg("--no-replace-objects").arg("-C").arg(&root)
-        .arg("show").arg(format!("{oid}:.codex/test-runners.json")).output()
-    else { return Vec::new() };
-    if !output.status.success() || output.stdout.len() > 64 * 1024 {
-        return Vec::new();
-    }
-    let Ok(mut config) = serde_json::from_slice::<RepositoryRunners>(&output.stdout)
-    else { return Vec::new() };
+    runners
+}
+
+const MAX_RUNNER_DECLARATION_BYTES: usize = 64 * 1024;
+
+fn parse_repository_runners(bytes: &[u8]) -> Runners {
+    let Ok(config) = serde_json::from_slice::<RepositoryRunners>(bytes) else { return Vec::new() };
     if config.version != 1 || config.runners.len() > 256
         || config.runners.iter().any(|runner| runner.options.values().any(|count| *count > 2))
         || config.runners.iter().any(|runner| runner.passthrough_after.as_ref()
@@ -85,14 +168,95 @@ fn repository_runners(cwd: &std::path::Path) -> Vec<codex_shell_command::validat
     {
         return Vec::new();
     }
-    if cache.len() >= 64 {
-        cache.clear();
-    }
-    cache.insert(root.clone(), (oid, config.runners.clone()));
-    for runner in &mut config.runners {
-        runner.path_context = Some((root.clone(), cwd.to_path_buf()));
-    }
     config.runners
+}
+
+fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<Runners> {
+    // Batch mode distinguishes immutable absence (a successful "missing"
+    // response) from execution failures, without a second Git invocation.
+    let object = format!("{oid}:.codex/test-runners.json");
+    let mut command = std::process::Command::new(codex_git_utils::git_executable());
+    command.arg("--no-replace-objects").arg("-C").arg(root).args(["cat-file", "--batch"])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let (success, bytes) = bounded_runner_lookup(
+        command, format!("{oid}\n{object}\n").as_bytes(), std::time::Duration::from_secs(5),
+    )?;
+    // First prove the commit exists. A missing/corrupt commit object is a
+    // retryable lookup failure, not proof that its optional declaration is absent.
+    let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+    let header = std::str::from_utf8(&bytes[..newline]).ok()?;
+    let fields = header.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields[0] != oid || fields[1] != "commit" { return None; }
+    let commit_size = fields[2].parse::<usize>().ok()?;
+    if commit_size > MAX_RUNNER_DECLARATION_BYTES { return None; }
+    let bytes = bytes.get(newline + 1 + commit_size + 1..)?;
+    let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+    let header = std::str::from_utf8(&bytes[..newline]).ok()?;
+    if header == format!("{object} missing") {
+        return success.then(Vec::new);
+    }
+    let fields = header.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || !fields[0].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let size = fields[2].parse::<usize>().ok()?;
+    // A valid object header proves an immutable invalid declaration even when
+    // the bounded reader intentionally kills Git before the body completes.
+    if size > MAX_RUNNER_DECLARATION_BYTES {
+        return Some(Vec::new());
+    }
+    if !success { return None; }
+    if fields[1] != "blob" { return Some(Vec::new()); }
+    let body = bytes.get(newline + 1..)?;
+    if body.len() != size + 1 || body.last() != Some(&b'\n') { return None; }
+    Some(parse_repository_runners(&body[..size]))
+}
+
+/// Runs only Git plumbing (no hooks, filters or shell). The owning blocking
+/// worker retains/reaps the child even if its async caller is cancelled.
+fn bounded_runner_lookup(
+    mut command: std::process::Command,
+    input: &[u8],
+    timeout: std::time::Duration,
+) -> Option<(bool, Vec<u8>)> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    std::thread::scope(|scope| {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut child = ChildGuard(command.stdin(Stdio::piped()).stdout(Stdio::piped())
+            .stderr(Stdio::null()).spawn().ok()?);
+        child.0.stdin.take()?.write_all(input).ok()?;
+        let stdout = child.0.stdout.take()?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        // Bound both the commit proof and declaration, including Git headers.
+        let limit = 2 * MAX_RUNNER_DECLARATION_BYTES + 1024;
+        scope.spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout.take((limit + 1) as u64).read_to_end(&mut bytes).map(|_| bytes);
+            let _ = tx.send(result);
+        });
+        let bytes = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()?.ok()?;
+        if bytes.len() > limit {
+            return Some((false, bytes));
+        }
+        loop {
+            if let Some(status) = child.0.try_wait().ok()? {
+                return Some((status.success(), bytes));
+            }
+            if std::time::Instant::now() >= deadline { return None; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // ChildGuard drops before the scope joins its reader, also on timeout.
+    })
 }
 
 fn repository_head_oid(root: &std::path::Path) -> Option<String> {
@@ -122,10 +286,11 @@ fn repository_head_oid(root: &std::path::Path) -> Option<String> {
         }
         // Unborn branches and alternate ref storage (e.g. reftable) remain
         // Git-owned. Ordinary loose/packed refs need no subprocess here.
-        let output = std::process::Command::new(codex_git_utils::git_executable()).arg("-C").arg(root.as_path())
-            .args(["rev-parse", "--verify", "HEAD"]).output().ok()?;
-        if !output.status.success() { return None; }
-        value = String::from_utf8(output.stdout).ok()?;
+        let mut command = std::process::Command::new(codex_git_utils::git_executable());
+        command.arg("-C").arg(root.as_path()).args(["rev-parse", "--verify", "HEAD"]);
+        let (success, bytes) = bounded_runner_lookup(command, &[], std::time::Duration::from_secs(5))?;
+        if !success { return None; }
+        value = String::from_utf8(bytes).ok()?;
     }
     None
 }
@@ -163,7 +328,7 @@ pub(crate) async fn resolve_command_validation(
             .and_then(|(program, args)| runners.iter().find(|runner| runner.matches(program, args)))
             .and_then(|runner| runner.receipt_runner.clone());
         (declared.is_some() || matches!(classification, ValidationClassification::Validation { .. }))
-            .then_some(CommandValidation { declared, classification, receipt_runner })
+            .then_some(CommandValidation { execution_context: None, declared, classification, receipt_runner })
     }).await.ok().flatten()
 }
 
@@ -246,6 +411,100 @@ mod tests {
 
     mod manifest_runner {
         use super::*;
+
+        #[test]
+        fn runner_cache_negative_entries_and_failures_have_distinct_lifetimes() {
+            let cache = RepositoryRunnerCache::default();
+            let root = std::path::Path::new("repo");
+            let calls = std::cell::Cell::new(0);
+            for oid in ["first", "first", "second", "second"] {
+                assert!(cache.get_or_load(root, oid, || {
+                    calls.set(calls.get() + 1);
+                    Some(parse_repository_runners(b"invalid immutable JSON"))
+                }).is_empty());
+            }
+            assert_eq!(calls.get(), 2);
+            for _ in 0..2 {
+                cache.get_or_load(root, "transient", || {
+                    calls.set(calls.get() + 1);
+                    None
+                });
+            }
+            assert_eq!(calls.get(), 4, "execution failures must remain retryable");
+        }
+
+        #[test]
+        fn runner_cache_coalesces_one_key_without_blocking_other_repositories() {
+            let cache = RepositoryRunnerCache::default();
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let cache = &cache;
+                let calls = &calls;
+                let first = scope.spawn(move || cache.get_or_load(std::path::Path::new("slow"), "oid", || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    Some(Vec::new())
+                }));
+                started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                let second = scope.spawn(move || cache.get_or_load(std::path::Path::new("slow"), "oid", || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(Vec::new())
+                }));
+                let start = std::time::Instant::now();
+                cache.get_or_load(std::path::Path::new("other"), "oid", || Some(Vec::new()));
+                let elapsed = start.elapsed();
+                release_tx.send(()).unwrap();
+                assert!(first.join().unwrap().is_empty());
+                assert!(second.join().unwrap().is_empty());
+                assert!(elapsed < std::time::Duration::from_secs(1));
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            });
+        }
+
+        #[test]
+        fn runner_declaration_absence_invalid_content_and_revision_are_cached() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new(codex_git_utils::git_executable())
+                    .arg("-C").arg(root)
+                    .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
+                    .args(args).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            };
+            git(&["init"]);
+            git(&["commit", "--allow-empty", "-m", "missing"]);
+            let cache = RepositoryRunnerCache::default();
+            let calls = std::cell::Cell::new(0);
+            for contents in [None, Some("invalid"), Some(r#"{"version":1,"runners":[]}"#)] {
+                if let Some(contents) = contents {
+                    std::fs::create_dir_all(root.join(".codex")).unwrap();
+                    std::fs::write(root.join(".codex/test-runners.json"), contents).unwrap();
+                    git(&["add", ".codex/test-runners.json"]);
+                    git(&["commit", "-m", "declaration"]);
+                }
+                let oid = repository_head_oid(root).unwrap();
+                for _ in 0..2 {
+                    cache.get_or_load(root, &oid, || {
+                        calls.set(calls.get() + 1);
+                        let loaded = load_repository_runners(root, &oid);
+                        assert!(loaded.as_ref().is_some_and(Vec::is_empty));
+                        loaded
+                    });
+                }
+            }
+            assert_eq!(calls.get(), 3);
+            assert!(load_repository_runners(root, &"0".repeat(40)).is_none());
+            std::fs::write(root.join(".codex/test-runners.json"),
+                vec![b'x'; MAX_RUNNER_DECLARATION_BYTES * 4]).unwrap();
+            git(&["add", ".codex/test-runners.json"]);
+            git(&["commit", "-m", "oversized"]);
+            assert!(load_repository_runners(root, &repository_head_oid(root).unwrap())
+                .is_some_and(|runners| runners.is_empty()));
+        }
 
         #[test]
         fn head_oid_tracks_loose_packed_detached_and_linked_refs() {
@@ -723,6 +982,7 @@ mod tests {
             ValidationClassification::Validation {
                 leaves: vec![ValidationCommandDescriptor {
                     operation: ValidationOperation::Check,
+                    mode: codex_shell_command::validation::ValidationExecutionMode::Checking,
                 }],
                 has_unclassified_targets: false,
                 exit_code_is_authoritative: true,

@@ -6,6 +6,38 @@ use std::ffi::OsString;
 
 pub const CODEX_THREAD_ID_ENV_VAR: &str = "CODEX_THREAD_ID";
 
+/// Apply an explicit overlay after an earlier environment layer.
+///
+/// Windows names are case-insensitive. Within a layer, the lexicographically
+/// last spelling wins, independently of HashMap iteration order. Across layers,
+/// the overlay always wins. Unix names remain case-sensitive.
+pub fn apply_env_overlay(env: &mut HashMap<String, String>, overlay: HashMap<String, String>) {
+    apply_env_overlay_for_platform(env, overlay, cfg!(windows));
+}
+
+fn apply_env_overlay_for_platform(
+    env: &mut HashMap<String, String>,
+    overlay: HashMap<String, String>,
+    is_windows: bool,
+) {
+    if !is_windows {
+        env.extend(overlay);
+        return;
+    }
+    // Normalize both layers, including inherited or exact environments which
+    // may already contain aliases. Do not sort the combined layers: doing so
+    // would let spelling override explicit overlay precedence.
+    let inherited = std::mem::take(env);
+    for layer in [inherited, overlay] {
+        let mut entries = layer.into_iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, value) in entries {
+            env.retain(|existing, _| !existing.eq_ignore_ascii_case(&key));
+            env.insert(key, value);
+        }
+    }
+}
+
 /// Construct a shell environment from the supplied process environment and
 /// shell-environment policy.
 pub fn create_env(
@@ -97,6 +129,8 @@ where
         }
     };
 
+    apply_env_overlay_for_platform(&mut env_map, HashMap::new(), is_windows);
+
     // Windows command lookup needs PATHEXT, but the policy's explicit exclude
     // and include-only filters remain authoritative.
     if inject_pathext && !env_map.keys().any(|k| k.eq_ignore_ascii_case("PATHEXT")) {
@@ -123,18 +157,7 @@ where
     }
 
     // Step 4 - Apply user-provided overrides.
-    let mut overrides = policy.r#set.iter().collect::<Vec<_>>();
-    if is_windows {
-        // Explicit aliases use the lexicographically last spelling so HashMap
-        // iteration cannot decide which value a Windows child receives.
-        overrides.sort_unstable_by_key(|(left, _)| *left);
-    }
-    for (key, val) in overrides {
-        if is_windows {
-            env_map.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
-        }
-        env_map.insert(key.clone(), val.clone());
-    }
+    apply_env_overlay_for_platform(&mut env_map, policy.r#set.clone(), is_windows);
 
     // Step 5 - If include_only is non-empty, keep only the matching vars.
     if !policy.include_only.is_empty() {
@@ -143,10 +166,11 @@ where
 
     // Step 6 - Populate the thread ID environment variable when provided.
     if let Some(thread_id) = thread_id {
-        if is_windows {
-            env_map.retain(|existing, _| !existing.eq_ignore_ascii_case(CODEX_THREAD_ID_ENV_VAR));
-        }
-        env_map.insert(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string());
+        apply_env_overlay_for_platform(
+            &mut env_map,
+            HashMap::from([(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string())]),
+            is_windows,
+        );
     }
 
     env_map
@@ -196,6 +220,35 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn environment_overlay_precedence_is_independent_of_case_and_insertion_order() {
+        for inherited in [
+            [("PATH", "upper"), ("Path", "mixed")],
+            [("Path", "mixed"), ("PATH", "upper")],
+        ] {
+            for overlay in [
+                [("PATH", "overlay-upper"), ("Path", "overlay-mixed")],
+                [("Path", "overlay-mixed"), ("PATH", "overlay-upper")],
+            ] {
+                let mut env = make_vars(&inherited).into_iter().collect();
+                apply_env_overlay_for_platform(&mut env, HashMap::new(), true);
+                assert_eq!(env, HashMap::from([("Path".into(), "mixed".into())]));
+                apply_env_overlay_for_platform(
+                    &mut env,
+                    make_vars(&overlay).into_iter().collect(),
+                    true,
+                );
+                assert_eq!(env, HashMap::from([("Path".into(), "overlay-mixed".into())]));
+                apply_env_overlay_for_platform(
+                    &mut env,
+                    HashMap::from([("PATH".into(), "last-layer".into())]),
+                    true,
+                );
+                assert_eq!(env, HashMap::from([("PATH".into(), "last-layer".into())]));
+            }
+        }
     }
 
     #[test]

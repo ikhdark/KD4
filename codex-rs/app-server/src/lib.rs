@@ -232,8 +232,12 @@ fn prepare_connection(
 struct ShutdownState {
     requested: bool,
     forced: bool,
+    signal_listener_failed: bool,
+    deadline: Option<tokio::time::Instant>,
     last_logged_running_turn_count: Option<usize>,
 }
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 enum ShutdownAction {
     Noop,
@@ -285,9 +289,10 @@ impl ShutdownState {
         }
 
         self.requested = true;
+        self.deadline = Some(tokio::time::Instant::now() + SHUTDOWN_TIMEOUT);
         self.last_logged_running_turn_count = None;
         info!(
-            "received shutdown signal; entering graceful restart drain (connections={}, runningAssistantTurns={}, requests still accepted until no assistant turns are running)",
+            "received shutdown signal; entering graceful restart drain (connections={}, runningAssistantTurns={}, new work rejected; completion controls remain available)",
             connection_count, running_turn_count,
         );
     }
@@ -297,10 +302,17 @@ impl ShutdownState {
             return ShutdownAction::Noop;
         }
 
+        if self
+            .deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.forced = true;
+            warn!("app-server shared shutdown deadline expired; forcing cleanup");
+        }
         if self.forced || running_turn_count == 0 {
             if self.forced {
                 info!(
-                    "received second shutdown signal; forcing restart with {running_turn_count} running assistant turn(s) and {connection_count} connection(s)"
+                    "forcing restart with {running_turn_count} running assistant turn(s) and {connection_count} connection(s)"
                 );
             } else {
                 info!(
@@ -318,6 +330,42 @@ impl ShutdownState {
         }
 
         ShutdownAction::Noop
+    }
+
+    async fn finish_cleanup(
+        &mut self,
+        cleanup: impl std::future::Future<Output = ()>,
+        signal: impl std::future::Future<Output = IoResult<ShutdownSignal>>,
+    ) {
+        if self.forced {
+            return;
+        }
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + SHUTDOWN_TIMEOUT);
+        tokio::pin!(cleanup);
+        tokio::pin!(signal);
+        tokio::select! {
+            biased;
+            result = &mut signal, if !self.signal_listener_failed => {
+                match result {
+                    Ok(ShutdownSignal::Forceable) => {
+                        self.forced = true;
+                        warn!("shutdown signal during cleanup; forcing restart");
+                    }
+                    Err(error) => {
+                        self.signal_listener_failed = true;
+                        warn!(%error, "shutdown signal listener failed during cleanup; retaining shared deadline");
+                        self.forced = tokio::time::timeout_at(deadline, &mut cleanup).await.is_err();
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                self.forced = true;
+                warn!("app-server shared shutdown deadline expired during cleanup");
+            }
+            _ = &mut cleanup => {}
+        }
     }
 }
 
@@ -692,6 +740,9 @@ pub async fn run_main(
     }
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let transport_shutdown_token = CancellationToken::new();
+    let force_shutdown_token = CancellationToken::new();
+    let (shutdown_observation_tx, shutdown_observation_rx) =
+        oneshot::channel::<futures::future::BoxFuture<'static, ()>>();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
@@ -884,13 +935,13 @@ pub async fn run_main(
         let mut remote_control_status_rx = remote_control_handle.status_receiver();
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
         let transport_shutdown_token = transport_shutdown_token.clone();
+        let force_shutdown_token = force_shutdown_token.clone();
         async move {
             let mut listen_for_threads = true;
             let mut shutdown_state = ShutdownState::default();
             // Keep the registered listener across unrelated select branches so a pending
             // SIGTERM is not lost when transport traffic wins the race.
-            let shutdown_signal_wait = shutdown_signal();
-            tokio::pin!(shutdown_signal_wait);
+            let mut shutdown_signal_wait = Box::pin(shutdown_signal());
             let exit_reason = loop {
                 let running_turn_count = {
                     let running_turn_count = running_turn_count_rx.borrow();
@@ -901,14 +952,14 @@ pub async fn run_main(
                     ShutdownAction::Finish
                 ) {
                     transport_shutdown_token.cancel();
-                    let _ = outbound_control_tx
-                        .send(OutboundControlEvent::DisconnectAll)
-                        .await;
                     break "shutdown_requested";
                 }
 
                 tokio::select! {
                     _ = transport_shutdown_token.cancelled() => break "outbound_delivery_failed",
+                    _ = tokio::time::sleep_until(shutdown_state.deadline.unwrap_or_else(|| tokio::time::Instant::now() + SHUTDOWN_TIMEOUT)), if shutdown_state.requested() => {
+                        shutdown_state.forced = true;
+                    }
                     shutdown_signal_result = &mut shutdown_signal_wait, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
                         shutdown_signal_wait.set(shutdown_signal());
                         let signal = match shutdown_signal_result {
@@ -920,6 +971,7 @@ pub async fn run_main(
                         };
                         let running_turn_count = *running_turn_count_rx.borrow();
                         shutdown_state.on_signal(signal, connections.len(), running_turn_count);
+                        processor.begin_drain();
                     }
                     changed = running_turn_count_rx.changed(), if graceful_signal_restart_enabled && shutdown_state.requested() => {
                         if changed.is_err() {
@@ -1114,19 +1166,39 @@ pub async fn run_main(
                 }
             };
 
-            processor.account_processor.cancel_active_login().await;
-            if !shutdown_state.forced() {
-                futures::future::join_all(
-                    connections
-                        .values()
-                        .map(|connection_state| connection_state.session.rpc_gate.shutdown()),
+            let disconnect_all = shutdown_state.requested();
+            shutdown_state
+                .finish_cleanup(
+                    async {
+                        if disconnect_all {
+                            let _ = outbound_control_tx
+                                .send(OutboundControlEvent::DisconnectAll)
+                                .await;
+                        }
+                        processor.account_processor.cancel_active_login().await;
+                        futures::future::join_all(
+                            connections.values().map(|connection_state| {
+                                connection_state.session.rpc_gate.shutdown()
+                            }),
+                        )
+                        .await;
+                        connection_cleanup_tasks.drain().await;
+                        processor.drain_background_tasks().await;
+                        processor.thread_processor.shutdown_threads().await;
+                    },
+                    async {
+                        if graceful_signal_restart_enabled {
+                            shutdown_signal_wait.as_mut().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    },
                 )
                 .await;
-                connection_cleanup_tasks.drain().await;
-                processor.drain_background_tasks().await;
-                processor.thread_processor.shutdown_threads().await;
-            } else {
+            if shutdown_state.forced() {
                 connection_cleanup_tasks.abort();
+                transport_shutdown_token.cancel();
+                force_shutdown_token.cancel();
             }
             info!(
                 exit_reason,
@@ -1134,6 +1206,19 @@ pub async fn run_main(
                 shutdown_forced = shutdown_state.forced(),
                 "processor task exited"
             );
+            // Transfer the same listener and remaining budget, rather than
+            // ending supervision while outbound/transport owners still drain.
+            let _ = shutdown_observation_tx.send(Box::pin(async move {
+                shutdown_state
+                    .finish_cleanup(std::future::pending(), async {
+                        if graceful_signal_restart_enabled {
+                            shutdown_signal_wait.await
+                        } else {
+                            std::future::pending().await
+                        }
+                    })
+                    .await;
+            }));
         }
     });
 
@@ -1144,6 +1229,14 @@ pub async fn run_main(
         outbound_handle,
         transport_shutdown_token,
         transport_accept_handles,
+        force_shutdown_token,
+        async {
+            match shutdown_observation_rx.await {
+                Ok(observation) => observation.await,
+                // Processor failure already has its own failure-drain bound.
+                Err(_) => std::future::pending().await,
+            }
+        },
     )
     .await;
 
@@ -1159,6 +1252,8 @@ async fn finish_runtime_task_groups(
     outbound: JoinHandle<()>,
     transport_shutdown: CancellationToken,
     transport_handles: Vec<JoinHandle<()>>,
+    force_shutdown: CancellationToken,
+    shutdown_observation: impl std::future::Future<Output = ()>,
 ) -> IoResult<()> {
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
@@ -1179,26 +1274,50 @@ async fn finish_runtime_task_groups(
     let mut first_error = None;
     let mut primary_owners = 2;
     let mut failure_deadline = None;
+    let mut forced = false;
+    tokio::pin!(shutdown_observation);
     while !owners.is_empty() {
-        let next = if let Some(deadline) = failure_deadline {
-            match tokio::time::timeout_at(deadline, owners.next()).await {
-                Ok(next) => next,
-                Err(_) => {
-                    for handle in &abort_handles {
-                        handle.abort();
+        let next_owner = async {
+            if let Some(deadline) = failure_deadline {
+                match tokio::time::timeout_at(deadline, owners.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        for handle in &abort_handles {
+                            handle.abort();
+                        }
+                        failure_deadline = None;
+                        owners.next().await
                     }
-                    failure_deadline = None;
-                    continue;
                 }
+            } else {
+                owners.next().await
             }
-        } else {
-            owners.next().await
+        };
+        let next = tokio::select! {
+            biased;
+            _ = async {
+                tokio::select! {
+                    _ = force_shutdown.cancelled() => {}
+                    _ = &mut shutdown_observation => {}
+                }
+            }, if !forced => {
+                forced = true;
+                transport_shutdown.cancel();
+                for handle in &abort_handles {
+                    handle.abort();
+                }
+                continue;
+            }
+            next = next_owner => next,
         };
         let Some((task, result)) = next else { break };
         if task != "transport" {
             primary_owners -= 1;
         }
         if let Err(error) = result {
+            if forced && error.is_cancelled() {
+                continue;
+            }
             warn!(task, %error, "app-server runtime task failed");
             if first_error.is_none() {
                 first_error = Some(std::io::Error::other(format!(
@@ -1279,7 +1398,9 @@ async fn init_sqlite_state_db_with_fresh_start_on_corruption(
             "Codex local database at {} appears damaged. Moving it into a backup folder so the app server can rebuild it from saved data.",
             database_path.display()
         ));
-        let backups = codex_state::backup_runtime_db_for_fresh_start(database_path.as_path())
+        let backups = codex_state::StateRuntime::recover_for_fresh_start(
+            database_path.clone(), config.model_provider_id.clone(),
+        )
             .await
             .map_err(|backup_err| {
                 anyhow::anyhow!(
@@ -1432,6 +1553,122 @@ mod tests {
         assert!(matches!(state.update(1, 1), super::ShutdownAction::Finish));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cleanup_keeps_second_signal_and_shared_deadline_live() {
+        for second_signal in [false, true] {
+            let mut state = super::ShutdownState::default();
+            state.on_signal(super::ShutdownSignal::Forceable, 1, 1);
+            tokio::time::advance(super::SHUTDOWN_TIMEOUT - std::time::Duration::from_secs(1)).await;
+            let (release, held) = tokio::sync::oneshot::channel::<()>();
+            let signal = async {
+                if second_signal {
+                    Ok(super::ShutdownSignal::Forceable)
+                } else {
+                    std::future::pending().await
+                }
+            };
+            let started = tokio::time::Instant::now();
+            state
+                .finish_cleanup(
+                    async {
+                        let _ = held.await;
+                    },
+                    signal,
+                )
+                .await;
+            assert!(state.forced());
+            assert_eq!(
+                started.elapsed(),
+                if second_signal {
+                    std::time::Duration::ZERO
+                } else {
+                    std::time::Duration::from_secs(1)
+                }
+            );
+            assert!(release.send(()).is_err(), "held cleanup observer released");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_force_retires_runtime_owners_with_open_channels() {
+        let force = tokio_util::sync::CancellationToken::new();
+        force.cancel();
+        let result = super::finish_runtime_task_groups(
+            tokio::spawn(std::future::pending()),
+            tokio::spawn(std::future::pending()),
+            tokio_util::sync::CancellationToken::new(),
+            vec![tokio::spawn(std::future::pending())],
+            force,
+            std::future::pending(),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_listener_failure_keeps_deadline_after_custody_transfer() {
+        let mut state = super::ShutdownState::default();
+        state.on_signal(super::ShutdownSignal::Forceable, 1, 1);
+        let mut signal = Box::pin(async { Err(std::io::Error::other("listener unavailable")) });
+        state.finish_cleanup(async {}, signal.as_mut()).await;
+        assert!(!state.forced());
+        let started = tokio::time::Instant::now();
+        // A completed async signal future must not be polled a second time.
+        state.finish_cleanup(std::future::pending(), signal).await;
+        assert!(state.forced());
+        assert_eq!(started.elapsed(), super::SHUTDOWN_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_supervision_survives_processor_cleanup() {
+        for second_signal in [false, true] {
+            let mut state = super::ShutdownState::default();
+            state.on_signal(super::ShutdownSignal::Forceable, 1, 1);
+            tokio::time::advance(super::SHUTDOWN_TIMEOUT - std::time::Duration::from_secs(1)).await;
+            let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+            let mut signal = Box::pin(async {
+                signal_rx.await.expect("signal sender retained");
+                Ok(super::ShutdownSignal::Forceable)
+            });
+            state.finish_cleanup(async {}, signal.as_mut()).await;
+            assert!(!state.forced());
+            if second_signal {
+                signal_tx.send(()).unwrap();
+            }
+            let started = tokio::time::Instant::now();
+            let (outbound_tx, outbound_rx) = tokio::sync::oneshot::channel::<()>();
+            let (transport_tx, transport_rx) = tokio::sync::oneshot::channel::<()>();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            super::finish_runtime_task_groups(
+                tokio::spawn(async {}),
+                tokio::spawn(async {
+                    let _ = outbound_rx.await;
+                }),
+                shutdown.clone(),
+                vec![tokio::spawn(async {
+                    let _ = transport_rx.await;
+                })],
+                tokio_util::sync::CancellationToken::new(),
+                async {
+                    state.finish_cleanup(std::future::pending(), signal).await;
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                started.elapsed(),
+                if second_signal {
+                    std::time::Duration::ZERO
+                } else {
+                    std::time::Duration::from_secs(1)
+                }
+            );
+            assert!(shutdown.is_cancelled());
+            assert!(outbound_tx.send(()).is_err(), "outbound owner retired");
+            assert!(transport_tx.send(()).is_err(), "transport owner retired");
+        }
+    }
+
     #[derive(Clone, Default)]
     struct EventCapture(Arc<Mutex<Vec<(String, Level)>>>);
 
@@ -1481,6 +1718,8 @@ mod tests {
                 outbound,
                 shutdown.clone(),
                 vec![failing_transport, healthy_transport],
+                CancellationToken::new(),
+                std::future::pending(),
             );
             tokio::pin!(finish);
             tokio::select! {
@@ -1525,7 +1764,14 @@ mod tests {
         let outbound = tokio::spawn(async { panic!("outbound witness") });
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            super::finish_runtime_task_groups(processor, outbound, shutdown.clone(), vec![]),
+            super::finish_runtime_task_groups(
+                processor,
+                outbound,
+                shutdown.clone(),
+                vec![],
+                CancellationToken::new(),
+                std::future::pending(),
+            ),
         )
         .await
         .expect("failure must be observed before sibling exits");

@@ -197,7 +197,8 @@ async fn apps_guidance_stays_frozen_after_background_recovery_within_a_turn() ->
     test.codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id,
-            response: RequestUserInputResponse {
+            call_id: Some(request.call_id),
+            response: RequestUserInputResponse { disposition: None,
                 answers: HashMap::from([(
                     "continue".to_string(),
                     RequestUserInputAnswer {

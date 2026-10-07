@@ -1,6 +1,16 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "RequestUserInputDisposition": {
+      "enum": [
+        "answered",
+        "timed_out",
+        "skipped",
+        "interrupted",
+        "transport_error"
+      ],
+      "type": "string"
+    },
     "ToolRequestUserInputAnswer": {
       "description": "EXPERIMENTAL. Captures a user's answer to a request_user_input question.",
       "properties": {
@@ -24,6 +34,17 @@
         "$ref": "#/definitions/ToolRequestUserInputAnswer"
       },
       "type": "object"
+    },
+    "disposition": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RequestUserInputDisposition"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Absent for legacy clients. Timeout, skip and transport failure never imply approval."
     },
     "interrupted": {
       "default": false,

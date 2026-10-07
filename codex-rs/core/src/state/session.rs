@@ -86,8 +86,6 @@ pub(crate) struct SessionState {
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) prompt_token_calibration: PromptTokenCalibration,
-    pub(crate) command_output_classes: HashMap<String, String>,
-    pub(crate) recovered_output_classes: HashSet<String>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
@@ -132,8 +130,6 @@ impl SessionState {
             history,
             latest_rate_limits: None,
             prompt_token_calibration: PromptTokenCalibration::default(),
-            command_output_classes: HashMap::new(),
-            recovered_output_classes: HashSet::new(),
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
@@ -215,6 +211,7 @@ impl SessionState {
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
     ) {
+        self.additional_context.reconcile_history(&items);
         self.history.replace(items);
         self.history
             .set_reference_context_item(reference_context_item);

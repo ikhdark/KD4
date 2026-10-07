@@ -461,7 +461,12 @@ async fn registered_user_input_rejects_stale_turn_and_preserves_live_replacement
     )
     .unwrap();
     session
-        .notify_user_input_response(&turn.sub_id, response.clone())
+        .notify_user_input_response_for_request(&turn.sub_id, Some("old-input"), response.clone())
+        .await;
+    session.notify_user_input_response(&turn.sub_id, response.clone()).await;
+    assert!(state.lock().await.has_pending_user_input(&turn.sub_id));
+    session
+        .notify_user_input_response_for_request(&turn.sub_id, Some("new-input"), response.clone())
         .await;
     let result = replacement
         .await

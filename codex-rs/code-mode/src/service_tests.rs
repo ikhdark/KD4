@@ -30,6 +30,136 @@ use tokio_util::sync::CancellationToken;
 /// prove which tool a call form reached.
 struct EchoDelegate;
 
+struct OutputBudgetDelegate;
+
+#[tokio::test]
+async fn first_wait_restores_receipt_without_starting_a_cell() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let service = InProcessCodeModeSession::new();
+    let mut request = execute_request(r#"store("kept", 42); text("original receipt");"#);
+    request.state_path = Some(path.clone());
+    request.yield_time_ms = Some(60_000);
+    let started = service.execute(request).await.unwrap();
+    let id = started.cell_id.clone();
+    let original = started.initial_response().await.unwrap();
+    service.shutdown().await.unwrap();
+    drop(service);
+    let restored = InProcessCodeModeSession::new();
+    let recovery = Some(crate::ReceiptRecovery { path, terminal_only: false });
+    assert_eq!(restored.wait(WaitRequest {
+        cell_id: id, yield_time_ms: 1, recovery,
+    }).await.unwrap(), WaitOutcome::LiveCell(original));
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminated_receipt_recovers_without_cancelled_values_or_replayed_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let delegate = Arc::new(ReceiptEffectDelegate {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        settled: tokio::sync::Notify::new(),
+    });
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let mut request = execute_request(r#"
+store("cancelled", true);
+const receipt = await tools.exec_command({sentinel: "settled"});
+text(receipt);
+await notify("settled");
+await new Promise(() => {});
+"#);
+    request.enabled_tools = vec![exec_command_definition()].into();
+    request.state_path = Some(path.clone());
+    request.yield_time_ms = Some(60_000);
+    let started = service.execute(request).await.unwrap();
+    let id = started.cell_id.clone();
+    // Wait for the nested invocation and buffered evidence, without observing
+    // (and consuming) that evidence before cancellation.
+    tokio::time::timeout(Duration::from_secs(5), delegate.settled.notified()).await.unwrap();
+    let terminal = service.terminate(id.clone()).await.unwrap();
+    let WaitOutcome::LiveCell(RuntimeResponse::Terminated { ref content_items, .. }) = terminal else {
+        panic!("expected termination");
+    };
+    assert!(content_items.iter().any(|item| matches!(item,
+        FunctionCallOutputContentItem::InputText { text } if text.contains("settled"))));
+    drop(started);
+    service.shutdown().await.unwrap();
+    drop(service);
+    let restored = InProcessCodeModeSession::new();
+    assert_eq!(restored.wait(WaitRequest {
+        cell_id: id, yield_time_ms: 1,
+        recovery: Some(crate::ReceiptRecovery { path: path.clone(), terminal_only: false }),
+    }).await.unwrap(), terminal);
+    let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert!(snapshot["values"].get("cancelled").is_none());
+    assert_eq!(delegate.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_receipt_lookup_cannot_alias_a_new_nondurable_cell() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = InProcessCodeModeSession::new();
+    let started = service.execute(execute_request("text('new cell');")).await.unwrap();
+    let id = started.cell_id.clone();
+    started.initial_response().await.unwrap();
+    let outcome = service.wait(WaitRequest {
+        cell_id: id, yield_time_ms: 1,
+        recovery: Some(crate::ReceiptRecovery { path: directory.path().join("absent.json"), terminal_only: true }),
+    }).await.unwrap();
+    assert!(matches!(outcome, WaitOutcome::MissingCell(_)));
+    service.shutdown().await.unwrap();
+}
+
+struct ReceiptEffectDelegate {
+    calls: std::sync::atomic::AtomicUsize,
+    settled: tokio::sync::Notify,
+}
+
+impl CodeModeSessionDelegate for ReceiptEffectDelegate {
+    fn invoke_tool<'a>(&'a self, _: CodeModeNestedToolCall, _: NestedCancellation) -> ToolInvocationFuture<'a> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(serde_json::json!({"receipt": "settled"})) })
+    }
+    fn notify<'a>(&'a self, _: String, _: CellId, _: String, _: CancellationToken) -> NotificationFuture<'a> {
+        self.settled.notify_one();
+        Box::pin(async { Ok(()) })
+    }
+    fn cell_closed(&self, _: &CellId) {}
+}
+
+impl CodeModeSessionDelegate for OutputBudgetDelegate {
+    fn invoke_tool<'a>(&'a self, invocation: CodeModeNestedToolCall, _cancel: NestedCancellation) -> ToolInvocationFuture<'a> {
+        Box::pin(async move { Ok(serde_json::json!(invocation.buffered_output_bytes)) })
+    }
+
+    fn notify<'a>(&'a self, _call_id: String, _cell_id: CellId, _text: String, _cancel: CancellationToken) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+#[tokio::test]
+async fn nested_budget_counts_printed_output_not_unprinted_results() {
+    let service = InProcessCodeModeSession::with_delegate(Arc::new(OutputBudgetDelegate));
+    let response = execute(&service, ExecuteRequest {
+        enabled_tools: vec![exec_command_definition()].into(),
+        yield_time_ms: None,
+        ..execute_request(r#"
+const first = await tools.exec_command({});
+const second = await tools.exec_command({});
+if (first !== 0 || second !== 0) throw Error('unprinted results consumed budget');
+text('x'.repeat(3000));
+const used = await tools.exec_command({});
+if (used < 3000) throw Error('printed output not counted');
+text('budget accounting passed');
+"#)
+    }).await;
+    assert!(result_text(&response).ends_with("budget accounting passed"));
+}
+
 impl CodeModeSessionDelegate for EchoDelegate {
     fn invoke_tool<'a>(
         &'a self,
@@ -549,7 +679,7 @@ text({canonical: resolve_tool("mcp__github_fetch_file").name,
         values,
         vec![
             serde_json::json!({"name":"mcp__github_fetch", "description":"_fetch schema"}),
-            serde_json::json!({"tool":"mcp__github_fetch", "input":{"url":"namespaced"}}),
+            serde_json::json!({"tool":"mcp__github___fetch", "input":{"url":"namespaced"}}),
             serde_json::json!({"canonical":"mcp__github_fetch_file", "wrongNamespace":true, "missingMember":true, "ambiguous":true}),
         ]
     );
@@ -667,6 +797,40 @@ async fn oversized_store_rejects_all_writes_from_the_cell() {
             error_text: None,
         }
     );
+}
+
+#[tokio::test]
+async fn rejected_store_can_compact_settled_evidence_without_rerunning_producers() {
+    let session = InProcessCodeModeSession::new();
+    let response = execute(&session, ExecuteRequest {
+        source: format!(r#"
+            let producers = 0;
+            const batch = await Promise.allSettled([Promise.resolve(++producers)]);
+            store("prior", "preserved");
+            let rejected = false;
+            try {{ store("batch", {{ batch, padding: "x".repeat({}) }}); }}
+            catch (_) {{ rejected = true; }}
+            if (!rejected || producers !== 1) throw new Error("admission fixture failed");
+            store("batch", batch);
+            text("retained");
+        "#, MAX_SESSION_STORED_VALUE_BYTES + 1),
+        yield_time_ms: None,
+        ..execute_request("")
+    }).await;
+    assert!(matches!(response, RuntimeResponse::Result { error_text: None, .. }), "{response:?}");
+    let response = execute(&session, ExecuteRequest {
+        source: r#"text([load("prior"), load("batch")]);"#.to_string(),
+        yield_time_ms: None,
+        ..execute_request("")
+    }).await;
+    let RuntimeResponse::Result { error_text: None, content_items, .. } = response else {
+        panic!("compacted evidence must commit: {response:?}");
+    };
+    let [FunctionCallOutputContentItem::InputText { text }] = content_items.as_slice() else {
+        panic!("expected retained evidence");
+    };
+    assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap(),
+        serde_json::json!(["preserved", [{"status":"fulfilled","value":1}]]));
 }
 
 #[tokio::test]
@@ -1306,19 +1470,21 @@ async fn wait_reports_missing_cell_separately_from_runtime_results() {
 
     let response = service
         .wait(WaitRequest {
+            recovery: None,
             cell_id: cell_id("missing"),
             yield_time_ms: 1,
         })
         .await
         .unwrap();
 
-    assert_eq!(
-        response,
-        WaitOutcome::MissingCell(RuntimeResponse::Result {
-            output_loss: None,
-            cell_id: cell_id("missing"),
-            content_items: Vec::new(),
-            error_text: Some("exec cell missing not found".to_string()),
-        })
-    );
+    let WaitOutcome::MissingCell(RuntimeResponse::Result { cell_id: id, content_items, error_text: Some(error), output_loss }) = response else {
+        panic!("expected missing-cell receipt");
+    };
+    assert_eq!(id, cell_id("missing"));
+    assert!(content_items.is_empty());
+    assert!(output_loss.is_none());
+    let receipt: serde_json::Value = serde_json::from_str(&error).unwrap();
+    assert_eq!(receipt["status"], "unknown_cell");
+    assert_eq!(receipt["terminal_state"], "unknown");
+    assert_eq!(receipt["automatic_replay_allowed"], false);
 }

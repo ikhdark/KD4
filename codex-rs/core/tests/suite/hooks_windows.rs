@@ -151,7 +151,7 @@ async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution_im
 let output = await tools.exec_command({{ cmd: {original_command_json} }});
 while (output.session_id) {{
   output = await tools.write_stdin({{
-    session_id: output.session_id,
+    session_id: output.session_id,incarnation:output.session_capabilities.incarnation,
     chars: "",
     yield_time_ms: 30_000,
   }});

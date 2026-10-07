@@ -22,9 +22,10 @@ pub(crate) enum UnifiedExecError {
         exit_code: i32,
         duration: std::time::Duration,
         event_call_id: Option<String>,
+        output: Option<Box<crate::tools::context::ExecCommandToolOutput>>,
     },
     // The model is trained on `session_id`, but internally we track a `process_id`.
-    #[error("Unknown process id {process_id}")]
+    #[error("Process session_id {process_id} is not live. This does not establish whether the command completed; inspect recorded output and uncertain effects before rerunning it.")]
     UnknownProcessId { process_id: u32 },
     #[error("failed to write to stdin")]
     WriteToStdin,

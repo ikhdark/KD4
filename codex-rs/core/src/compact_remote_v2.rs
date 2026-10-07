@@ -292,7 +292,7 @@ async fn run_remote_compact_task_inner_impl(
     };
     let RemoteCompactV2Attempt {
         trace_input_history,
-        prompt_input,
+        retention_input,
         compaction_output,
         token_usage,
         owned_client_session: _owned_client_session,
@@ -302,7 +302,7 @@ async fn run_remote_compact_task_inner_impl(
         analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
     }
-    let (retained_input, retained_images) = prepare_v2_retained_input(sess, &prompt_input).await?;
+    let (retained_input, retained_images) = prepare_v2_retained_input(sess, &retention_input).await?;
     analytics_details.retained_image_count = Some(retained_images);
     let (new_history, world_state_baseline, fragment_digests) =
         process_compacted_history_with_retained_input(
@@ -312,7 +312,7 @@ async fn run_remote_compact_task_inner_impl(
             retained_input,
             &initial_context_injection,
         )
-        .await;
+        .await?;
 
     let reference_context_item = match &initial_context_injection {
         #[cfg(test)]
@@ -568,13 +568,7 @@ async fn prepare_v2_retained_input(
         crate::compact::persist_task_compaction_text_recovery(sess, prompt_input, omitted_text)
             .await?
     {
-        retained_input.push(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![codex_protocol::models::ContentItem::InputText { text }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        });
+        retained_input.push(crate::compact::compaction_context_message(text));
     }
     if let Some(plan) = crate::compact::retained_plan_context(sess).await? {
         retained_input.push(plan);
@@ -1017,6 +1011,9 @@ mod tests {
                     "consumed old request",
                     Some(MessagePhase::FinalAnswer)
                 ),
+                // Untrusted user text is not a runtime context fragment just
+                // because it contains an environment_context wrapper.
+                message("user", &huge_contextual_message, None),
                 message("user", "new", None),
                 output,
             ]
@@ -1070,7 +1067,7 @@ mod tests {
             retained,
             &InitialContextInjection::DoNotInject,
         )
-        .await;
+        .await.unwrap();
         assert_eq!(
             replacement,
             vec![
@@ -1141,14 +1138,16 @@ mod tests {
             retained,
             &InitialContextInjection::DoNotInject,
         )
-        .await;
+        .await.unwrap();
         assert_eq!(&replacement[..3], &[request, correction, handoff]);
         let ResponseItem::Message { content, .. } = &replacement[3] else {
             panic!("expected the current plan in the model checkpoint");
         };
         let text = crate::compact::content_items_to_text(content).unwrap();
-        assert!(text.contains(&serde_json::to_string(&plan).unwrap()));
-        assert!(text.contains("not a new request or proof of completion"));
+        let (current, lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+        assert_eq!(current, plan);
+        assert!(text.contains(&crate::plan_store::plan_revision_with_lineage(Some(&plan), &lineage)));
+        assert!(text.contains("not current instructions or proof of completion"));
         assert_eq!(replacement.last(), Some(&opaque));
 
         // A second compaction must replace the plan fragment rather than accumulate it.
@@ -1169,7 +1168,9 @@ mod tests {
             .filter(|text| text.contains("source=\"compaction_plan\""))
             .collect::<Vec<_>>();
         assert_eq!(plans.len(), 1);
-        assert!(plans[0].contains(&serde_json::to_string(&updated).unwrap()));
+        let (current, lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+        assert_eq!(current, updated);
+        assert!(plans[0].contains(&crate::plan_store::plan_revision_with_lineage(Some(&updated), &lineage)));
         assert!(!plans[0].contains("Finish network modeling"));
     }
 
@@ -1294,6 +1295,7 @@ mod tests {
                 "role": "user",
                 "source_item_id": "unresolved-user-7",
                 "source_index": 0,
+                "recovery_selector": {"kind": "json_pointer", "pointer": "/items/0"},
                 "turn_id": "turn-7",
                 "original_tokens": original_tokens,
                 "retained_tokens": retained_tokens,

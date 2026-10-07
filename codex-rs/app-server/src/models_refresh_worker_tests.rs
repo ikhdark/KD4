@@ -153,6 +153,7 @@ async fn activity_after_deadline_refreshes_before_serving_catalog() {
         .expect("bundled catalog")
         .models;
     expected_catalog.push(refreshed_test_model());
+    expected_catalog.sort_by(|a, b| a.slug.cmp(&b.slug));
     assert_eq!(catalog_read.await, expected_catalog);
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
     worker.shutdown_and_wait().await;

@@ -157,7 +157,7 @@ async fn request_user_input_holds_an_elicitation_until_response() {
     session
         .notify_user_input_response(
             "stray-turn",
-            RequestUserInputResponse {
+            RequestUserInputResponse { disposition: None,
                 answers: HashMap::new(),
                 interrupted: true,
             },
@@ -188,7 +188,7 @@ async fn request_user_input_holds_an_elicitation_until_response() {
     events.recv().await.expect("request user input event");
     wait_until_held(&mut pause_state).await;
 
-    let response = RequestUserInputResponse {
+    let response = RequestUserInputResponse { disposition: None,
         answers: HashMap::new(),
         interrupted: true,
     };

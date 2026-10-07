@@ -149,6 +149,7 @@ pub(super) enum PendingRequest {
     Wait {
         session: RemoteSession,
         cell_id: WireCellId,
+        terminal_only: bool,
         cancellation: CancellableRequest,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },

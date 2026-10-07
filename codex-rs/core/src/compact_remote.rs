@@ -11,11 +11,10 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tool_history::response_item_has_valid_tool_history_receipt;
 use codex_protocol::models::BaseInstructions;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
-use serde::Deserialize;
-use serde::Serialize;
+use crate::tool_history::ToolSearchReceiptV1 as RemoteToolSearchReceiptV1;
+use crate::tool_history::tool_search_receipt_id as remote_tool_search_receipt_id;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -25,22 +24,6 @@ const REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS: i64 = 512;
 const TOOL_SEARCH_RECEIPT_KIND: &str = "tool_search_receipt";
 const TOOL_SEARCH_RECEIPT_MAX_TOKENS: usize = 256;
 const TOOL_SEARCH_ARGUMENT_VALUE_MAX_TOKENS: usize = 64;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct RemoteToolSearchReceiptV1 {
-    version: u8,
-    receipt_id: String,
-    call_id: String,
-    status: String,
-    execution: String,
-    arguments: serde_json::Value,
-    result_set_sha256: String,
-    result_count: usize,
-    omitted_result_count: Option<usize>,
-    complete: bool,
-    ordered_tool_identities: Vec<String>,
-    omitted_identity_count: usize,
-}
 
 #[cfg(test)]
 pub(crate) async fn process_compacted_history(
@@ -61,6 +44,7 @@ pub(crate) async fn process_compacted_history(
         initial_context_injection,
     )
     .await
+    .expect("test compaction must retain its artifacts")
 }
 
 pub(crate) async fn process_compacted_history_with_retained_input(
@@ -69,11 +53,11 @@ pub(crate) async fn process_compacted_history_with_retained_input(
     compacted_history: Vec<ResponseItem>,
     mut retained_input: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
-) -> (
+) -> codex_protocol::error::Result<(
     Vec<ResponseItem>,
     Option<WorldStateSnapshot>,
     Vec<codex_protocol::protocol::ContextFragmentDigest>,
-) {
+)> {
     // Preserve the caller-selected replacement ordering. The default `AtStart` path retains the
     // cacheable prompt prefix while still leaving the summary or compaction item last.
     let (initial_context, world_state_baseline, fragment_digests) =
@@ -86,16 +70,17 @@ pub(crate) async fn process_compacted_history_with_retained_input(
     let history = sess.clone_history().await;
     let mut reference_items = history.raw_items().to_vec();
     reference_items.extend(retained_input.iter().cloned());
-    let artifact_pin_payload = history
-        .tool_history_state()
-        .artifact_pin_payload_for_items(&reference_items);
+    // Failure must reach the installer: the original history is not a new checkpoint.
+    let artifact_pin_payload = sess
+        .compaction_artifact_pins(&history.tool_history_state(), &reference_items)
+        .await?;
     // Recover exact registered references before the provider-output filter
     // removes consumed tool pairs. Their sidecar must survive that removal.
     let provider_output = retained_input.split_off(retained_input_len);
     retained_input.extend(bounded_remote_compacted_history(provider_output));
     let compacted_history =
         append_remote_compaction_artifact_pins(retained_input, artifact_pin_payload);
-    (
+    Ok((
         insert_compaction_initial_context(
             compacted_history,
             initial_context,
@@ -103,7 +88,7 @@ pub(crate) async fn process_compacted_history_with_retained_input(
         ),
         world_state_baseline,
         fragment_digests,
-    )
+    ))
 }
 
 fn append_remote_compaction_artifact_pins(
@@ -111,13 +96,7 @@ fn append_remote_compaction_artifact_pins(
     artifact_pin_payload: Option<String>,
 ) -> Vec<ResponseItem> {
     if let Some(text) = artifact_pin_payload {
-        history.push(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText { text }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        });
+        history.push(crate::compact::compaction_context_message(text));
     }
     history
 }
@@ -437,61 +416,7 @@ fn remote_tool_search_receipt_is_valid(
     status: &str,
     execution: &str,
 ) -> bool {
-    receipt.version == 1
-        && receipt.call_id == call_id
-        && receipt.status == status
-        && receipt.execution == execution
-        && receipt.receipt_id
-            == remote_tool_search_receipt_id(
-                call_id,
-                status,
-                execution,
-                &receipt.arguments,
-                &receipt.result_set_sha256,
-                receipt.result_count,
-                receipt.omitted_result_count,
-                receipt.complete,
-                receipt.omitted_identity_count,
-            )
-        && receipt.result_set_sha256.len() == 64
-        && receipt
-            .result_set_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-        && (!receipt.complete
-            || (receipt.status == "completed" && receipt.omitted_result_count.unwrap_or(0) == 0))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn remote_tool_search_receipt_id(
-    call_id: &str,
-    status: &str,
-    execution: &str,
-    arguments: &serde_json::Value,
-    result_set_sha256: &str,
-    result_count: usize,
-    omitted_result_count: Option<usize>,
-    complete: bool,
-    omitted_identity_count: usize,
-) -> String {
-    let semantic_identity = serde_json::json!({
-        "call_id": call_id,
-        "status": status,
-        "execution": execution,
-        "arguments": arguments,
-        "result_set_sha256": result_set_sha256,
-        "result_count": result_count,
-        "omitted_result_count": omitted_result_count,
-        "complete": complete,
-        "omitted_identity_count": omitted_identity_count,
-    });
-    format!(
-        "tsr1-{}",
-        &format!(
-            "{:x}",
-            Sha256::digest(semantic_identity.to_string().as_bytes())
-        )[..16]
-    )
+    receipt.is_valid(call_id, status, execution)
 }
 
 fn compact_tool_search_arguments(arguments: &serde_json::Value) -> serde_json::Value {

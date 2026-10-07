@@ -16,6 +16,81 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 
 #[tokio::test]
+async fn fallback_cleanup_worker_does_not_serialize_independent_custody() {
+    use crate::unified_exec::process_tests::TerminationControl;
+    use crate::unified_exec::process_tests::remote_process_with_termination_control;
+    let first_control = Arc::new(TerminationControl::new());
+    let second_control = Arc::new(TerminationControl::new());
+    second_control.allowed.send_replace(true);
+    let first_process = remote_process_with_termination_control(codex_exec_server::WriteStatus::Accepted, None, Some(first_control.clone())).await;
+    let second_process = remote_process_with_termination_control(codex_exec_server::WriteStatus::Accepted, None, Some(second_control.clone())).await;
+    let owners = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let blocked_store = Arc::new(tokio::sync::Mutex::new(ProcessStore::default()));
+    let held = blocked_store.lock().await;
+    let make = |process_id, process_store, process| Arc::new(PendingProcessCleanup {
+        process_id, process_store, session: std::sync::Weak::new(),
+        cleanup_owners: Arc::downgrade(&owners),
+        attempt_key: crate::tools::command_execution::CommandAttemptKey::new("exec_command", "local", ".", &[]),
+        processes: vec![PendingProcessToTerminate { process, requires_confirmed_termination: true }],
+        primary_process: None, network_approval: None,
+    });
+    let first = make(1, Arc::downgrade(&blocked_store), first_process);
+    let second = make(2, std::sync::Weak::new(), second_process);
+    owners.lock().unwrap().extend([first.clone(), second.clone()]);
+    let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+    let worker = tokio::spawn(drain_pending_process_cleanups(receive));
+    send.send(first).unwrap();
+    send.send(second).unwrap();
+    drop(send);
+    tokio::time::timeout(Duration::from_secs(1), first_control.started.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if owners.lock().unwrap().len() == 1 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("second cleanup retires while first remains held");
+    assert_eq!(owners.lock().unwrap()[0].process_id, 1);
+    assert!(second_control.completed.load(Ordering::Acquire));
+    assert!(!first_control.completed.load(Ordering::Acquire));
+    first_control.allowed.send_replace(true);
+    drop(held);
+    worker.await.unwrap();
+    assert!(owners.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn verified_validation_reuse_preserves_live_owner_and_rejects_retired_identity() {
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted, None,
+    ).await;
+    process.set_validation(Some(crate::validation::CommandValidation {
+        execution_context: None,
+        declared: None, receipt_runner: None,
+        classification: crate::validation::classify_validation(
+            &crate::tools::handlers::command_shape::CommandInvocation::Argv {
+                program: "cargo".into(), args: vec!["test".into(), "-p".into(), "app".into()],
+            }),
+    }));
+    crate::unified_exec::process_tests::store_process_for_test(manager, &session, &turn, 1000, Arc::clone(&process)).await;
+    let execution_id = manager.process_store.lock().await.processes[&1000].command_execution_id;
+    let policy = codex_utils_output_truncation::TruncationPolicy::Bytes(1000);
+    let reused = manager.reuse_running_validation(1000, execution_id, policy, None).await.unwrap();
+    assert_eq!(reused.process_id, Some(1000));
+    assert!(reused.raw_output.is_empty());
+    assert!(reused.session_capabilities.is_some());
+    assert_eq!(reused.event_call_id, "exec-call-1000");
+    assert!(manager.process_store.lock().await.processes.contains_key(&1000));
+    let other_id = session.services.command_execution.allocate_execution_id();
+    assert!(manager.reuse_running_validation(1000, other_id, policy, None).await.is_none());
+    process.signal_exit_for_test(Some(0));
+    assert!(manager.reuse_running_validation(1000, execution_id, policy, None).await.is_none());
+    manager.process_store.lock().await.remove(1000);
+    process.terminate_confirmed().await.unwrap();
+}
+
+#[tokio::test]
 async fn validation_workspace_lease_survives_observer_and_releases_at_process_exit() {
     let workspace = tempfile::tempdir().unwrap();
     let independent = tempfile::tempdir().unwrap();
@@ -50,6 +125,70 @@ async fn validation_workspace_lease_survives_observer_and_releases_at_process_ex
     )
     .await
     .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_exit_returns_observed_state_without_expired_lock_waits() {
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted, None,
+    ).await;
+    crate::unified_exec::process_tests::store_process_for_test(manager, &session, &turn,
+        1000, Arc::clone(&process)).await;
+    let interaction = process.interaction_lock().lock_owned().await;
+    let request = WriteStdinRequest { process_id: 1000, input: "do not deliver", yield_time_ms: 5000,
+        max_output_tokens: None,
+        truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+        nested_deadline: Some((Instant::now() + NESTED_POLL_MARGIN + Duration::from_secs(1)).into_std()),
+    };
+    let poll = manager.write_stdin(request);
+    tokio::pin!(poll);
+    assert!(futures::poll!(&mut poll).is_pending());
+    // Timeout must not reacquire either owner or wait on terminal completion.
+    let store = manager.process_store.lock().await;
+    process.signal_exit_for_test(Some(0));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let response = tokio::time::timeout(Duration::from_millis(10), &mut poll).await.unwrap().unwrap();
+    assert!(response.process_exited);
+    assert_eq!(response.exit_code, Some(0));
+    assert_eq!(response.process_id, Some(1000));
+    assert!(response.wall_time >= Duration::from_millis(500));
+    let notice = response.repair_notice.unwrap();
+    assert!(notice.contains("Input was not delivered"));
+    assert!(!notice.contains("still running"));
+    drop(store);
+    drop(interaction);
+    manager.process_store.lock().await.remove(1000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn nested_deadline_clips_recorded_yield_budget() {
+    use crate::tools::tool_dispatch_trace::{ToolDispatchTiming, scope_tool_dispatch_timing};
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = crate::unified_exec::process_tests::remote_process(
+        codex_exec_server::WriteStatus::Accepted, None,
+    ).await;
+    crate::unified_exec::process_tests::store_process_for_test(manager, &session, &turn,
+        1000, Arc::clone(&process)).await;
+    let start = Instant::now();
+    let nested = (start + NESTED_POLL_MARGIN + Duration::from_secs(1)).into_std();
+    let effective = nested_poll_bound(Some(nested)).unwrap().duration_since(start).as_millis() as u64;
+    let timing = Arc::new(ToolDispatchTiming::new(start, false));
+    scope_tool_dispatch_timing(Arc::clone(&timing), manager.write_stdin(WriteStdinRequest {
+        process_id: 1000, input: "", yield_time_ms: 30_000, max_output_tokens: None,
+        truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+        nested_deadline: Some(nested),
+    })).await.unwrap();
+    let snapshot = timing.snapshot(Instant::now());
+    let wait = snapshot.timer_waits.iter().find(|w| w.wait_kind == "write_stdin_yield").unwrap();
+    assert_eq!(wait.requested_timeout_ms, Some(30_000));
+    assert_eq!(wait.effective_timeout_ms, Some(effective));
+    assert!(snapshot.timer_waits.iter().any(|w| w.wait_kind == "owner_output_wait"));
+    assert!(!snapshot.timer_waits.iter().any(|w| w.wait_kind == "post_exit_output_drain"));
+    manager.process_store.lock().await.remove(1000);
+    process.terminate_confirmed().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -184,7 +323,8 @@ async fn poll_advertises_noninteractive_session_capabilities() {
     assert_eq!(
         value["session_capabilities"],
         serde_json::json!({
-            "stdin": false, "interrupt": false, "cancellation": true, "polling": true
+            "stdin": false, "interrupt": false, "cancellation": true, "polling": true,
+            "incarnation": process.session_capabilities(false).incarnation
         })
     );
     let response = result.to_response_item("capabilities", &payload);
@@ -399,7 +539,8 @@ async fn retirement_waits_for_output_without_blocking_store_or_removing_reused_i
 #[tokio::test]
 async fn dropped_process_id_reservation_is_released_before_store_transfer() {
     let manager = UnifiedExecProcessManager::default();
-    let reservation = manager.reserve_process_id().await;
+    let mut reservation = manager.reserve_process_id().await;
+    manager.reserve_process_capacity(&mut reservation).await.unwrap();
     assert_eq!(reservation.process_id(), 1000);
     drop(reservation);
 
@@ -419,9 +560,10 @@ async fn dropped_process_id_reservation_is_released_before_store_transfer() {
     })
     .await
     .expect("dropped reservation should be released");
+    assert!(manager.process_store.lock().await.reserved_process_slots.is_empty());
 
     let next = manager.reserve_process_id().await;
-    assert_eq!(next.process_id(), 1000);
+    assert_ne!(next.process_id(), 1000);
     manager.release_process_id(next.process_id()).await;
 }
 
@@ -493,9 +635,15 @@ fn coherent_packet_budget_uses_bounded_defaults_and_honors_override() {
 async fn explicitly_released_reservation_cannot_remove_a_reused_id() {
     let manager = UnifiedExecProcessManager::default();
     let mut first = manager.reserve_process_id().await;
+    manager.reserve_process_capacity(&mut first).await.unwrap();
     let id = first.process_id();
     manager.release_process_id_reservation(&mut first).await;
-    let second = manager.reserve_process_id().await;
+    assert!(manager.process_store.lock().await.reserved_process_slots.is_empty());
+    // Production no longer recycles handles. Force legacy reuse here to retain
+    // coverage of the delayed-cleanup ownership boundary as well.
+    manager.process_store.lock().await.used_process_ids.remove(&id);
+    let mut second = manager.reserve_process_id().await;
+    manager.reserve_process_capacity(&mut second).await.unwrap();
     assert_eq!(second.process_id(), id);
     drop(first);
     // Let the original reservation's cleanup task consume its disarm signal.
@@ -510,6 +658,95 @@ async fn explicitly_released_reservation_cannot_remove_a_reused_id() {
     );
     let third = manager.reserve_process_id().await;
     assert_ne!(third.process_id(), id);
+    assert!(manager.process_store.lock().await.reserved_process_slots.contains(&id));
+}
+
+#[tokio::test]
+async fn capacity_admission_counts_concurrent_launch_reservations() {
+    let manager = UnifiedExecProcessManager::default();
+    let mut reservations = futures::future::join_all(
+        (0..=MAX_UNIFIED_EXEC_PROCESSES).map(|_| manager.reserve_process_id()),
+    )
+    .await;
+    let results = futures::future::join_all(
+        reservations.iter_mut().map(|reservation| manager.reserve_process_capacity(reservation)),
+    )
+    .await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), MAX_UNIFIED_EXEC_PROCESSES);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(manager.process_store.lock().await.occupied_slots(), MAX_UNIFIED_EXEC_PROCESSES);
+    manager.reserve_process_capacity(&mut reservations[0]).await.unwrap();
+    manager.terminate_all_processes().await;
+    assert_eq!(manager.process_store.lock().await.occupied_slots(), MAX_UNIFIED_EXEC_PROCESSES);
+    drop(reservations);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager.process_store.lock().await.occupied_slots() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled launches release all capacity");
+    let mut reservation = manager.reserve_process_id().await;
+    manager.reserve_process_capacity(&mut reservation).await.unwrap();
+}
+
+#[tokio::test]
+async fn saturated_admission_rejects_before_marker_command_can_start() {
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let mut occupied = Vec::new();
+    for _ in 0..MAX_UNIFIED_EXEC_PROCESSES {
+        let mut reservation = manager.reserve_process_id().await;
+        manager.reserve_process_capacity(&mut reservation).await.unwrap();
+        occupied.push(reservation);
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let marker = fixture.path().join("must-not-exist.txt");
+    let command = vec![
+        if cfg!(windows) { "python" } else { "python3" }.to_string(),
+        "-c".to_string(),
+        "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('started')".to_string(),
+        marker.to_string_lossy().into_owned(),
+    ];
+    let reservation = manager.reserve_process_id().await;
+    let process_id = reservation.process_id();
+    let context = UnifiedExecContext::new(Arc::clone(&session), Arc::clone(&turn), "capacity-marker".into());
+    let request = ExecCommandRequest {
+        stall_timeout_ms: None,
+        validation: None,
+        command: command.clone(),
+        command_for_safety: command.clone(),
+        attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
+            "exec_command", "local", turn.cwd().to_string_lossy(), &command,
+        ),
+        raw_output_artifact: crate::tools::command_output_artifact::create_raw_output_artifact(
+            fixture.path(), "capacity-marker", b"",
+        ).await,
+        shell_type: crate::shell::ShellType::Sh,
+        shell_wrapper_is_owned: false,
+        hook_command: command.join(" "),
+        process_id,
+        yield_time_ms: 1000,
+        max_output_tokens: None,
+        cwd: turn.cwd().clone().into(),
+        normalization_cwd: None,
+        sandbox_cwd: turn.cwd().clone().into(),
+        turn_environment: turn.environments.primary().cloned().expect("primary environment"),
+        network: None,
+        tty: false,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        additional_permissions_uri: None,
+        additional_permissions_preapproved: false,
+        justification: None,
+        prefix_rule: None,
+        validation_launch: false,
+    };
+    let result = manager.exec_command(request, reservation, &context, &CancellationToken::new()).await;
+    let error = result.expect_err("saturated capacity must reject before spawn");
+    assert!(error.to_string().contains("command was not started"), "{error}");
+    assert!(!marker.exists(), "rejected launch must have no command side effects");
+    drop(occupied);
 }
 
 #[tokio::test(start_paused = true)]
@@ -593,6 +830,13 @@ async fn refresh_rejects_reused_identity_and_keeps_unread_closed_output() {
         .await
         .push_chunk(b"final tail\n");
     handles.output_closed.store(true, Ordering::Release);
+
+    // Admission pressure must leave the exited process's polling route intact.
+    for other_id in 0..MAX_UNIFIED_EXEC_PROCESSES as u32 - 1 {
+        store_process_for_test(manager, &session, &turn, other_id, Arc::clone(&original)).await;
+    }
+    let mut reservation = manager.reserve_process_id().await;
+    assert!(manager.reserve_process_capacity(&mut reservation).await.is_err());
 
     assert!(matches!(
         manager.refresh_process_state(id, &original).await,
@@ -725,6 +969,19 @@ async fn pruning_preserves_an_active_initial_response() {
     store.processes[&0]
         .initial_exec_command_active
         .store(false, Ordering::Release);
+    // Neither exit without output closure nor a pending receipt is sufficient.
+    assert!(UnifiedExecProcessManager::prune_processes_if_needed(&mut store).is_none());
+    let handles = process.output_handles();
+    handles.output_closed.store(true, Ordering::Release);
+    let terminal = process.register_terminal_completion();
+    assert!(UnifiedExecProcessManager::prune_processes_if_needed(&mut store).is_none());
+    terminal.send_replace(Some(Ok(())));
+    let interaction = process.interaction_lock().try_lock_owned().unwrap();
+    assert!(UnifiedExecProcessManager::prune_processes_if_needed(&mut store).is_none());
+    drop(interaction);
+    let buffer = handles.output_buffer.try_lock().unwrap();
+    assert!(UnifiedExecProcessManager::prune_processes_if_needed(&mut store).is_none());
+    drop(buffer);
     let pruned = UnifiedExecProcessManager::prune_processes_if_needed(&mut store)
         .expect("finished initial response is eligible");
     assert_eq!(pruned.process_id, 0);
@@ -1793,7 +2050,9 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
     let remote = Arc::new(codex_exec_server::Environment::create_for_tests(Some(url)).unwrap());
     remote.wait_until_ready().await.unwrap();
     let manager = &session.services.unified_exec_manager;
-    let reservation = manager.reserve_process_id().await;
+    let mut reservation = manager.reserve_process_id().await;
+    // Admit before holding the store at the post-launch registration boundary.
+    manager.reserve_process_capacity(&mut reservation).await.unwrap();
     let process_id = reservation.process_id();
     let context = UnifiedExecContext::new(
         Arc::clone(&session),
@@ -1955,12 +2214,13 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
         completed.status,
         codex_protocol::items::CommandExecutionStatus::Failed
     );
-    assert_eq!(completed.exit_code, Some(-1));
+    assert_eq!(completed.exit_code, None);
     assert_eq!(completed.process_id, Some(process_id.to_string()));
     let completed_output = completed
-        .aggregated_output
-        .as_deref()
-        .expect("failure output");
+        .output_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.failure_cause.as_deref())
+        .expect("typed failure cause must remain separate from captured output");
     if cancel_during_registration {
         assert!(
             completed_output.contains("unified exec cancelled"),
@@ -2487,12 +2747,14 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         item.status,
         codex_protocol::items::CommandExecutionStatus::Failed
     );
-    assert_eq!(item.exit_code, Some(-1));
+    assert_eq!(item.exit_code, None);
     assert_eq!(item.process_id.as_deref(), Some("123"));
     assert_eq!(
         item.aggregated_output.as_deref(),
-        Some("PRE_DENIAL_MARKER\nNetwork access denied")
+        Some("PARTIAL_TRANSCRIPT")
     );
+    assert_eq!(item.output_metadata.as_ref().unwrap().failure_cause.as_deref(),
+        Some("Network access denied"));
 }
 
 #[test]
@@ -2590,6 +2852,7 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
     .expect("actual process exits");
     let receipt = process.register_terminal_completion();
     let response = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -2660,8 +2923,8 @@ async fn exited_process_rejects_success_when_terminal_watcher_disappears() {
     .await
     .expect("closed receipt must not hang");
     assert!(
-        matches!(result, Err(UnifiedExecError::ToolHistoryPersistence { message, exit_code: 0, .. })
-        if message == "unified exec exit watcher closed before terminal finalization")
+        matches!(result, Err(UnifiedExecError::ToolHistoryPersistence { message, exit_code: 0, output: Some(output), .. })
+        if message == "unified exec exit watcher closed before terminal finalization" && output.raw_output == b"completed")
     );
 }
 
@@ -2751,7 +3014,8 @@ fn check_pending_remote_exec_drop(entered_shutdown: bool) {
                 }).await.expect("exec server readiness deadline")
             });
             let manager = &session.services.unified_exec_manager;
-            let reservation = runtime.block_on(manager.reserve_process_id());
+            let mut reservation = runtime.block_on(manager.reserve_process_id());
+            runtime.block_on(manager.reserve_process_capacity(&mut reservation)).unwrap();
             let process_id = reservation.process_id();
             let context = UnifiedExecContext::new(Arc::clone(&session), Arc::clone(&turn), "outside-runtime".to_string());
             let script = format!(
@@ -3467,6 +3731,7 @@ fn registered_nonpty_interrupt_yields_to_worker_and_preserves_unsupported_proces
         let payload = crate::tools::context::ToolPayload::Function {
             arguments: serde_json::json!({
                 "session_id": process_id, "chars": "\u{3}", "yield_time_ms": 1000,
+                "incarnation": process.session_capabilities(true).incarnation,
             }).to_string(),
         };
         // Exercise the normal handler directly to isolate native signal work
@@ -3605,7 +3870,8 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
                 }).await.expect("exec server readiness deadline")
             });
             let manager = &session.services.unified_exec_manager;
-            let reservation = runtime.block_on(manager.reserve_process_id());
+            let mut reservation = runtime.block_on(manager.reserve_process_id());
+            runtime.block_on(manager.reserve_process_capacity(&mut reservation)).unwrap();
             let process_id = reservation.process_id();
             let context = UnifiedExecContext::new(Arc::clone(&session), Arc::clone(&turn), "commit-retirement".to_string());
             let script = format!(
@@ -3816,4 +4082,30 @@ async fn audit_pause_cannot_extend_nested_hard_deadline() {
     .await;
     assert_eq!(result.wake_reason, ToolLifecycleWakeReason::Timeout);
     assert_eq!(Instant::now() - started, Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn collected_output_carries_absolute_poll_ranges_and_retention_gap() {
+    let buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(8)));
+    let notify = Arc::new(Notify::new());
+    let closed = Arc::new(AtomicBool::new(true));
+    let closed_notify = Arc::new(Notify::new());
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    for (bytes, expected, gap) in [
+        (b"first".as_slice(), 0..5, None),
+        (b"0123456789abcdef".as_slice(), 5..21, Some(9..17)),
+        (b"".as_slice(), 21..21, None),
+    ] {
+        buffer.lock().await.push_chunk(bytes);
+        let result = UnifiedExecProcessManager::collect_output_until_deadline_with_quiet_yield(
+            &buffer, &notify, &closed, &closed_notify, &cancel, None,
+            Instant::now(), None, None, &mut None,
+        ).await;
+        let ranges = result.ranges.unwrap();
+        assert_eq!(ranges.range, expected);
+        assert_eq!(ranges.gap, gap);
+        if gap.is_none() { assert_eq!(result.bytes, bytes); }
+        buffer.lock().await.acknowledge_pending_output();
+    }
 }

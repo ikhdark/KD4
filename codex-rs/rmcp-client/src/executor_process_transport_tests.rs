@@ -147,6 +147,7 @@ impl codex_exec_server::ExecProcess for ReplayProcess {
                 exit_code: None,
                 closed: false,
                 failure: None,
+                output_gap: None,
                 sandbox_denied: false,
             })
         })

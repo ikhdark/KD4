@@ -54,6 +54,33 @@ fn template(uri_template: &str, name: &str) -> ResourceTemplate {
     .no_annotation()
 }
 
+#[test]
+fn incomplete_collection_prefix_preserves_status_and_continuation_in_delivery() {
+    let mut meta = rmcp::model::Meta::new();
+    meta.insert("codex/collectionError".into(), json!("incomplete collection: later page timed out"));
+    let resources = ListResourcesResult {
+        meta: Some(meta.clone()), next_cursor: Some("next".into()),
+        resources: vec![resource("file:///retained", "retained")],
+    };
+    let canonical = canonical_single_list_resources("server", &resources).unwrap();
+    assert_eq!(canonical["nextCursor"], "next");
+    assert!(canonical["errors"][0]["message"].as_str().unwrap().contains("incomplete"));
+    let payload = ListResourcesPayload::from_single_server("server".into(), resources, TruncationPolicy::Bytes(10_000)).unwrap();
+    assert_eq!(payload.resources.len(), 1);
+    assert_eq!(payload.next_cursor.as_deref(), Some("next"));
+    assert_eq!(payload.errors.len(), 1);
+    let templates = ListResourceTemplatesResult {
+        meta: Some(meta), next_cursor: Some("next-template".into()),
+        resource_templates: vec![template("file:///{id}", "retained")],
+    };
+    let canonical = canonical_single_list_resource_templates("server", &templates).unwrap();
+    assert_eq!(canonical["nextCursor"], "next-template");
+    assert!(canonical["errors"][0]["message"].as_str().unwrap().contains("incomplete"));
+    let payload = ListResourceTemplatesPayload::from_single_server("server".into(), templates, TruncationPolicy::Bytes(10_000)).unwrap();
+    assert_eq!(payload.resource_templates.len(), 1);
+    assert_eq!(payload.errors.len(), 1);
+}
+
 async fn step_context_with_blocked_mcp_server(
     turn: &Arc<TurnContext>,
     server_name: &str,

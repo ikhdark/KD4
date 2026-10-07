@@ -144,6 +144,40 @@ fn collect_mentions(
     collect_explicit_skill_mentions(inputs, skills, disabled_paths, connector_slug_counts)
 }
 
+#[tokio::test]
+async fn selected_host_resolution_is_authoritative_after_file_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("SKILL.md");
+    std::fs::write(&path, "new file body with a different connector").unwrap();
+    let mut skill = make_skill("review", "/tmp/review/SKILL.md");
+    skill.path_to_skills_md = path.abs();
+    let mut selected = InjectedHostSkillPrompts::default();
+    selected.record_resolution(
+        skill.clone(),
+        Ok("Never modify X. [$old](app://old)".to_string()),
+    );
+    let plan = plan_skill_injections_with_resolved(&[skill.clone()], None, Some(&selected)).await;
+    assert_eq!(
+        plan.injections.items[0].contents,
+        "Never modify X. [$old](app://old)"
+    );
+    assert_eq!(plan.invocations.len(), 1);
+    assert_eq!(plan.metrics[0].status, "ok");
+    assert_eq!(selected.admitted_skills(), vec![skill.clone()]);
+    let mut omitted = selected.clone();
+    omitted.retain_admitted_items(&[]);
+    assert!(omitted.admitted_skills().is_empty());
+    let accepted = plan.injections.items[0].clone().into_response_input_item();
+    selected.retain_admitted_items(&[accepted.into()]);
+    assert_eq!(selected.admitted_skills(), vec![skill.clone()]);
+    selected.record_resolution(skill.clone(), Err("not admitted".to_string()));
+    let plan = plan_skill_injections_with_resolved(&[skill], None, Some(&selected)).await;
+    assert!(plan.injections.items.is_empty());
+    assert!(plan.invocations.is_empty());
+    assert!(selected.admitted_skills().is_empty());
+    assert_eq!(plan.metrics[0].status, "error");
+}
+
 #[test]
 fn text_mentions_skill_requires_exact_boundary() {
     assert_eq!(
@@ -217,6 +251,23 @@ fn extract_tool_mentions_handles_plain_and_linked_mentions() {
         &["alpha", "beta"],
         &["/tmp/beta"],
     );
+}
+
+#[test]
+fn markdown_examples_do_not_invoke_skills() {
+    for text in [
+        "`$danger` $safe",
+        "``[$danger](skill:danger)`` $safe",
+        "```rust\n$danger\n```\n$safe",
+        "~~~~\n[$danger](skill:danger)\n~~~~\n$safe",
+        "    $danger\n$safe",
+        "> $danger\n$safe",
+        "\\$danger $safe",
+    ] {
+        assert_mentions(text, &["safe"], &[]);
+    }
+    assert_mentions("```\n$danger", &[], &[]);
+    assert_mentions("[$safe](skill:safe)", &["safe"], &["skill:safe"]);
 }
 
 #[test]

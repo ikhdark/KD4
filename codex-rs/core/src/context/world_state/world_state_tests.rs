@@ -207,7 +207,9 @@ fn rendered_sections_share_one_hard_budget() {
     assert_eq!(rendered, vec!["a".repeat(30_000)]);
     assert_eq!(
         first_snapshot.clone().into_value(),
-        json!({"large_0": {"value": 0}})
+        json!({"large_0": {"value": 0}, "_codex_extension_delivery": {
+            "large_0": {"role": "developer", "text": "a".repeat(30_000)}
+        }})
     );
 
     let (rendered, second_snapshot) = world_state.render_diff_with_snapshot(&first_snapshot);
@@ -216,7 +218,13 @@ fn rendered_sections_share_one_hard_budget() {
         .map(|fragment| fragment.render())
         .collect::<Vec<_>>();
     assert_eq!(rendered, vec!["b".repeat(30_000)]);
-    assert_eq!(second_snapshot, world_state.snapshot());
+    assert_eq!(second_snapshot.into_value(), json!({
+        "large_0": {"value": 0}, "large_1": {"value": 1},
+        "_codex_extension_delivery": {
+            "large_0": {"role": "developer", "text": "a".repeat(30_000)},
+            "large_1": {"role": "developer", "text": "b".repeat(30_000)}
+        }
+    }));
 }
 
 #[test]
@@ -247,7 +255,9 @@ fn rejected_update_preserves_the_previously_delivered_value() {
     let (rejected, next) = state("B".repeat(50_000)).render_diff_with_snapshot(&accepted);
     assert!(rejected.is_empty());
     assert_eq!(next, accepted);
-    assert_eq!(next.into_value(), json!({"updated": {"value": "A"}}));
+    assert_eq!(next.into_value(), json!({"updated": {"value": "A"},
+        "_codex_extension_delivery": {"updated": {"role": "developer", "text": "A"}}
+    }));
 }
 
 #[test]

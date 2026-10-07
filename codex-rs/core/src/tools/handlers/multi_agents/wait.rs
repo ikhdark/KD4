@@ -110,7 +110,7 @@ impl Handler {
             .await;
         let (mut activity_rx, mut pending_activity) = session
             .input_queue
-            .subscribe_activity(turn_state.as_deref(), false)
+            .subscribe_agent_activity(turn_state.as_deref())
             .await;
 
         session

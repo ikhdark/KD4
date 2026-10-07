@@ -33,6 +33,7 @@ pub(crate) struct CellToolCall {
     pub(crate) kind: ToolKind,
     pub(crate) input: Option<JsonValue>,
     pub(crate) timeout: std::time::Duration,
+    pub(crate) buffered_output_bytes: usize,
     /// Absolute instant the wrapper timeout fires, set by `spawn_tool` at the
     /// point its own `sleep(timeout)` begins. `None` until then, so a handler
     /// downstream never sees a deadline the wrapper is not actually enforcing.
@@ -85,7 +86,7 @@ impl CellHandle {
 
     pub(crate) fn observe(&self, mode: ObserveMode) -> CellEventFuture {
         if !self.state.accepting_observations() {
-            return closed_event();
+            return self.state.terminal_event().map_or_else(closed_event, ready_event);
         }
         let (response_tx, response_rx) = oneshot::channel();
         if self
@@ -93,9 +94,15 @@ impl CellHandle {
             .send(CellCommand::Observe { mode, response_tx })
             .is_err()
         {
-            return closed_event();
+            return self.state.terminal_event().map_or_else(closed_event, ready_event);
         }
-        response_event(response_rx)
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            match response_event(response_rx).await {
+                Err(CellError::Closed) => state.terminal_event().ok_or(CellError::Closed),
+                result => result,
+            }
+        })
     }
 
     pub(crate) fn terminate(&self) -> CellEventFuture {
@@ -293,6 +300,15 @@ impl CellState {
         }
     }
 
+    /// Refine a receipt after owned I/O, but never rewrite a terminal outcome
+    /// already claimed by termination or delivered to an observer.
+    pub(crate) fn update_unclaimed_completion(&self, completed: CellEvent) {
+        let mut phase = self.phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let CellPhase::Completed { event, .. } = &mut *phase {
+            *event = completed;
+        }
+    }
+
     pub(crate) fn route_observation(
         &self,
         mode: ObserveMode,
@@ -443,7 +459,7 @@ impl CellState {
     }
 }
 
-fn prepend_initial_yield(
+pub(crate) fn prepend_initial_yield(
     event: CellEvent,
     pending_initial_yield_items: Option<Vec<OutputItem>>,
 ) -> CellEvent {

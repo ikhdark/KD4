@@ -201,8 +201,8 @@ async fn runtime_tool_suggest_disable_refreshes_active_thread() -> Result<()> {
     let contextual_user_message = request.message_input_texts("user").join("\n");
     assert_eq!(
         contextual_user_message.matches("<recommended_plugins>").count(),
-        recommendation_count,
-        "disabling suggestions must not inject another catalog or rewrite earlier history"
+        0,
+        "disabling suggestions must retire the stale catalog from model-visible context"
     );
     let request_body = request.body_json();
     let has_install_tool = request_body

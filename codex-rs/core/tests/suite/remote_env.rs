@@ -651,7 +651,9 @@ async fn deferred_executor_wait_reports_startup_failure() -> Result<()> {
     let failed_tools = tool_names(&requests[1].body_json());
     assert!(starting_tools.contains(&"wait_for_environment".to_string()));
     assert!(!starting_tools.contains(&"exec_command".to_string()));
-    assert!(!failed_tools.contains(&"wait_for_environment".to_string()));
+    // Failed startup futures stay addressable so an implicit operation cannot
+    // silently fall through to another environment.
+    assert!(failed_tools.contains(&"wait_for_environment".to_string()));
     assert!(!failed_tools.contains(&"exec_command".to_string()));
     let (wait_output, _) = requests[1]
         .function_call_output_content_and_success(wait_call_id)
@@ -754,7 +756,8 @@ async fn deferred_executor_compaction_replaces_stale_environment_context() -> Re
     test.codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id,
-            response: RequestUserInputResponse {
+            call_id: Some(request.call_id),
+            response: RequestUserInputResponse { disposition: None,
                 answers: HashMap::from([(
                     "continue".to_string(),
                     RequestUserInputAnswer {

@@ -143,6 +143,16 @@ async fn fresh_window_preserves_environment_and_cancellation_preserves_history()
     let turn = Arc::new(turn);
     let step = StepContext::for_test(Arc::clone(&turn));
     let world = Arc::new(session.build_world_state_for_step(&step).await);
+    let request = codex_protocol::models::ResponseItem::from(
+        codex_protocol::models::ResponseInputItem::Message {
+            role: "user".to_string(),
+            phase: None,
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: "Current accepted request: do not modify X.".to_string(),
+            }],
+        },
+    );
+    session.record_conversation_items(&turn, &[request]).await.unwrap();
     maybe_record(&session, &turn, Some(0), true).await.unwrap();
     let history_before = session.clone_history().await.raw_items().to_vec();
     let ids_before = session.state.lock().await.auto_compact_window_ids();
@@ -178,6 +188,7 @@ async fn fresh_window_preserves_environment_and_cancellation_preserves_history()
     assert_eq!(turn.cwd(), &cwd_before);
     let text = history_text(session.clone_history().await.raw_items());
     assert!(!text.contains("save notes now"));
+    assert!(text.contains("Current accepted request: do not modify X."));
     assert!(text.contains(&format!(
         "Current context window id: {}",
         ids_after.window_id

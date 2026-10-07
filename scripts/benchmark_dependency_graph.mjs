@@ -23,24 +23,28 @@ const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.len
 const scenarios = [
   {
     name: 'independent-queries',
+    expectedAnswer: 10,
     nodes: ['source', 'tests', 'policy', 'status'].map(id => ({ id, ms: 20 })),
     finalDeps: ['source', 'tests', 'policy', 'status'],
     baselineConcurrency: 1,
   },
   {
     name: 'branch-local-recovery',
+    expectedAnswer: 6,
     nodes: [{ id: 'discovery', ms: 60 }, { id: 'read', ms: 10 },
       { id: 'recover', ms: 40, deps: ['read'], baselineDeps: ['read', 'discovery'] }],
     finalDeps: ['discovery', 'recover'],
   },
   {
     name: 'validation-before-report',
+    expectedAnswer: 7,
     nodes: [{ id: 'edit', ms: 10 }, { id: 'report', ms: 40, deps: ['edit'] },
       { id: 'validate', ms: 80, deps: ['edit'], baselineDeps: ['edit', 'report'] }],
     finalDeps: ['report', 'validate'],
   },
   {
     name: 'independent-review-bypasses-target-wait',
+    expectedAnswer: 6,
     nodes: [
       { id: 'validate', ms: 60, resources: { read: ['repo'], write: ['cargo'] } },
       { id: 'same-target', ms: 10, resources: { write: ['cargo'] } },
@@ -50,6 +54,7 @@ const scenarios = [
   },
   {
     name: 'exclude-explicitly-optional-work',
+    expectedAnswer: 2,
     nodes: [{ id: 'optional', ms: 80 }, { id: 'proof', ms: 20 }],
     finalDeps: ['proof'],
     candidateTargets: ['final'],
@@ -66,12 +71,12 @@ function union(spans) {
   return total;
 }
 
-async function measure(scenario, candidate) {
+async function measure(scenario, candidate, corruptId = null) {
   const started = performance.now();
   const spans = [];
   let active = 0, peak = 0;
   const definitions = [...scenario.nodes, { id: 'final', ms: 0, deps: scenario.finalDeps }];
-  const nodes = definitions.map(def => ({
+  const nodes = definitions.map((def, index) => ({
     id: def.id,
     deps: (!candidate && def.baselineDeps) || def.deps || [],
     resources: def.resources,
@@ -82,8 +87,12 @@ async function measure(scenario, candidate) {
       try {
         assert(Object.isFrozen(dependencies));
         for (const value of Object.values(dependencies)) assert.equal(value.complete, true);
-        if (def.ms) await sleep(def.ms);
-        return { id: def.id, complete: true, source: 'fixed-synthetic-fixture' };
+        if (def.ms && !corruptId) await sleep(def.ms);
+        // False baseline barriers order work but are not semantic inputs.
+        const answer = (def.id === 'final' ? 0 : index + 1)
+          + (def.deps || []).reduce((sum, id) => sum + dependencies[id].answer, 0)
+          + Number(def.id === corruptId);
+        return { id: def.id, complete: true, answer };
       } finally {
         span.end_ms = performance.now() - started;
         --active;
@@ -98,6 +107,7 @@ async function measure(scenario, candidate) {
   const wall_ms = performance.now() - started;
   assert.equal(active, 0);
   assert.equal(results.final.status, 'fulfilled');
+  assert.equal(results.final.value.answer, scenario.expectedAnswer, 'prerequisite-derived answer');
   const selected = new Set(Object.keys(results));
   assert.deepEqual(Object.keys(results), definitions.filter(d => selected.has(d.id)).map(d => d.id));
   for (const node of nodes.filter(n => selected.has(n.id))) {
@@ -116,6 +126,8 @@ async function measure(scenario, candidate) {
 
 const measurements = [];
 for (const scenario of scenarios) {
+  // Corruption preserves scheduling/completion flags but must break correctness.
+  await assert.rejects(measure(scenario, true, scenario.finalDeps[0]), /prerequisite-derived answer/);
   const baseline = [], candidate = [];
   for (let i = 0; i < runs; ++i) {
     // Alternate order to avoid consistently favoring one side's warmup state.

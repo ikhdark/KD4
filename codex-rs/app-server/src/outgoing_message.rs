@@ -115,7 +115,7 @@ pub(crate) enum OutgoingEnvelope {
     ToConnection {
         connection_id: ConnectionId,
         message: OutgoingMessage,
-        write_complete_tx: Option<oneshot::Sender<()>>,
+        write_complete_tx: Option<oneshot::Sender<Instant>>,
     },
     Broadcast {
         message: OutgoingMessage,
@@ -268,7 +268,7 @@ enum TakeCallbackResult {
 
 struct PendingTurnDeliveryReceipt {
     connection_id: ConnectionId,
-    receiver: Option<oneshot::Receiver<()>>,
+    receiver: Option<oneshot::Receiver<Instant>>,
     immediate_outcome: Option<TurnDeliveryOutcomeKind>,
 }
 
@@ -1729,7 +1729,7 @@ impl OutgoingMessageSender {
             _ = self.delivery_shutdown.cancelled() => return,
             result = tokio::time::timeout(WRITER_ACKNOWLEDGEMENT_TIMEOUT, write_complete_rx) => result,
         } {
-            Ok(Ok(())) => {}
+            Ok(Ok(_delivered_at)) => {}
             Ok(Err(err)) => {
                 warn!(
                     ?connection_id,
@@ -1863,8 +1863,9 @@ async fn collect_turn_delivery_outcomes(
                 _ = delivery_shutdown.cancelled() => None,
             };
             match receipt_result {
-                Some(Ok(Ok(()))) => {
-                    let successful_elapsed_ms = elapsed_millis(dispatch_started);
+                Some(Ok(Ok(delivered_at))) => {
+                    let successful_elapsed_ms = u64::try_from(delivered_at
+                        .saturating_duration_since(dispatch_started).as_millis()).unwrap_or(u64::MAX);
                     TurnDeliveryOutcome {
                         connection_id: receipt.connection_id,
                         kind: TurnDeliveryOutcomeKind::Success,
@@ -1984,10 +1985,6 @@ fn aggregate_turn_delivery(
 
 fn count_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
-}
-
-fn elapsed_millis(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn clone_or_take_last<T: Clone>(value: &mut Option<T>, is_last: bool) -> Option<T> {
@@ -2501,7 +2498,7 @@ mod tests {
         assert!(matches!(message, OutgoingMessage::AppServerNotification(_)));
         write_complete_tx
             .expect("write completion sender should be attached")
-            .send(())
+            .send(Instant::now())
             .expect("receiver should still be waiting");
 
         timeout(Duration::from_secs(1), send_task)
@@ -2586,7 +2583,7 @@ mod tests {
             ));
             write_complete_tx
                 .expect("terminal dispatch must request a writer receipt")
-                .send(())
+                .send(Instant::now())
                 .expect("receipt collector should still be waiting");
         }
         assert!(
@@ -2637,7 +2634,7 @@ mod tests {
         assert_eq!(notification.turn.id, "current");
         write_complete_tx
             .expect("receipt")
-            .send(())
+            .send(Instant::now())
             .expect("collector waiting");
         outgoing.shutdown_delivery_tasks().await;
     }
@@ -2792,6 +2789,24 @@ mod tests {
         assert_eq!(fact.last_successful_elapsed_ms, Some(11));
         assert_eq!(fact.first_post_core_delivery_latency_ms, Some(17));
         assert_eq!(fact.last_post_core_delivery_latency_ms, Some(21));
+    }
+
+    #[tokio::test]
+    async fn receipt_latency_uses_writer_time_even_when_later_enqueue_delays_collection() {
+        let started = Instant::now();
+        let (first_tx, first_rx) = oneshot::channel();
+        first_tx.send(started + Duration::from_millis(2)).unwrap();
+        // Collection cannot begin until the later recipient's enqueue settles.
+        let (second_tx, second_rx) = oneshot::channel();
+        second_tx.send(started + Duration::from_millis(80)).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let outcomes = collect_turn_delivery_outcomes(vec![
+            PendingTurnDeliveryReceipt { connection_id: ConnectionId(1), receiver: Some(first_rx), immediate_outcome: None },
+            PendingTurnDeliveryReceipt { connection_id: ConnectionId(2), receiver: Some(second_rx), immediate_outcome: None },
+        ], started, tokio::time::Instant::now() + Duration::from_secs(1), Some(5), CancellationToken::new()).await;
+        assert_eq!(outcomes[0].successful_elapsed_ms, Some(2));
+        assert_eq!(outcomes[0].post_core_delivery_latency_ms, Some(7));
+        assert_eq!(outcomes[1].successful_elapsed_ms, Some(80));
     }
 
     #[tokio::test]

@@ -203,6 +203,47 @@ fn checklist(step: &str) -> codex_protocol::plan_tool::UpdatePlanArgs {
 }
 
 #[test]
+fn unsettled_recovery_uses_durable_results_and_redacts_invocations() {
+    let call = |id: &str| RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+        id: None, call_id: id.into(), name: "exec_command".into(), namespace: None,
+        arguments: json!({
+            "cmd": "SECRET_COMMAND", "token": "SECRET_TOKEN",
+            "environment_id": "remote-build", "workdir": "/workspace",
+            "target": "https://user:SECRET_PASSWORD@example.test/path?token=SECRET_QUERY"
+        }).to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let output = |id: &str, text: &str| RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None, call_id: id.into(),
+        output: FunctionCallOutputPayload::from_text(text.into()),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let mut items = vec![call("settled"), output("settled", "success"), call("lost"),
+        output("lost", "full result could not be preserved")];
+    for index in 0..9 { items.push(call(&format!("pending-{index}"))); }
+    let mut history = Vec::new();
+    super::rollout_reconstruction::append_unsettled_tool_recovery(&mut history, &items);
+    let text = serde_json::to_string(&history).unwrap();
+    assert!(!text.contains("SECRET"));
+    assert!(!text.contains("\"call_id\":\"settled\""));
+    let ResponseItem::Message { content, .. } = &history[0] else { panic!("recovery message"); };
+    let ContentItem::InputText { text } = &content[0] else { panic!("recovery text"); };
+    let summary: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(summary["unresolved_count"], 10);
+    assert_eq!(summary["omitted_count"], 2);
+    assert_eq!(summary["operations"].as_array().unwrap().len(), 8);
+    for operation in summary["operations"].as_array().unwrap() {
+        assert_eq!(operation["environment"], "remote-build");
+        assert_eq!(operation["cwd"], "/workspace");
+        assert_eq!(operation["target"], "https://example.test");
+    }
+    let mut history = Vec::new();
+    super::rollout_reconstruction::append_unsettled_tool_recovery(
+        &mut history, &[call("returned"), output("returned", "durable result")]);
+    assert!(history.is_empty());
+}
+
+#[test]
 fn compaction_preserves_resume_boundary_before_reused_live_handle() {
     use super::rollout_reconstruction::append_unified_exec_resume_invalidation;
     let call = |id: &str| ResponseItem::FunctionCall {
@@ -618,6 +659,7 @@ async fn plan_reconstruction_preserves_rollback_for_eventless_legacy_history() {
 async fn durability_regression_resume_invalidates_unified_exec_session() {
     let (session, _turn_context) = make_session_and_context().await;
     let original_output = crate::tools::context::ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -703,7 +745,8 @@ async fn durability_regression_resume_invalidates_unified_exec_session() {
     assert_eq!(invalidations.len(), 1);
     assert!(invalidations[0].contains("Newly returned session IDs are valid"));
     assert!(invalidations[0].contains("do not rerun completed commands"));
-    assert!(!invalidations[0].contains("1000"));
+    assert!(invalidations[0].contains("\"session_id\":1000"));
+    assert!(invalidations[0].contains("historical evidence, not a crash-time inventory"));
 }
 
 #[tokio::test]
@@ -767,6 +810,13 @@ fn resume_invalidates_nested_process_handles_without_losing_failure_evidence() {
         "raw_output_artifact_id": "retained-failure-output"
     }]);
     let bodies = [
+        json!({"nested_commands":[{"tool":"write_stdin", "process_exited":true,
+            "execution_state":"exited", "session_id":7, "session_capabilities":{"polling":true}}]}).to_string(),
+        "Script completed\n{\"session_id\":60964,\"execution_state\":\"running\"}".to_string(),
+        "Script completed\nRunning command session_id: 60964".to_string(),
+        "Script running with cell ID 47".to_string(),
+        // Real single-line process receipt captured from a code-mode rollout.
+        r#"{"streams_complete":false,"output_reduced":false,"exit_code":null,"execution_state":"running","session_id":84290,"session_capabilities":{"stdin":false,"interrupt":false,"cancellation":true,"polling":true},"process_exited":false,"output_complete":false,"output_lines":2}"#.to_string(),
         format!("Script completed\nassertion failed: expected 2, got 1\nNested command states (independent of script completion):\n{states}"),
         json!({"essential": {"nested_commands": states}, "output": "assertion failed: expected 2, got 1"}).to_string(),
     ];
@@ -801,16 +851,146 @@ fn resume_invalidates_nested_process_handles_without_losing_failure_evidence() {
             panic!("expected resume guidance");
         };
         assert!(text.contains("Do not poll those old sessions"));
+        assert!(text.contains("Only durably retained terminal receipts may be recoverable through wait"));
         assert!(text.contains("retain its recorded output and recovery references"));
         assert!(text.contains("does not establish"));
     }
 }
 
 #[test]
+fn resume_notice_lists_all_recorded_handles_and_preserves_artifact_references() {
+    let body = concat!(
+        "Script completed\n",
+        "{\"session_id\":7,\"process_exited\":false,\"raw_output_artifact_id\":\"first-output\"}\n",
+        "{\"session_id\":8,\"process_exited\":true,\"raw_output_artifact_id\":\"draining-output\"}\n",
+        "Nested command states (independent of script completion):\n",
+        "[{\"tool\":\"write_stdin\",\"polled_session_id\":9,\"process_exited\":false,\"raw_output_artifact_id\":\"nested-output\"},",
+        "{\"tool\":\"other\",\"session_id\":10,\"process_exited\":false}]",
+    );
+    let mut history = vec![
+        ResponseItem::CustomToolCall {
+            id: None, name: "exec".into(), namespace: None, input: "retained invocation".into(),
+            call_id: "nested".into(), status: None, internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::CustomToolCallOutput {
+            id: None, call_id: "nested".into(), output: FunctionCallOutputPayload::from_text(body.to_string()),
+            name: None, internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let original = history.clone();
+    super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
+    assert_eq!(&history[..2], original.as_slice());
+    let ResponseItem::Message { content, .. } = history.last().unwrap() else { panic!("missing notice") };
+    let [ContentItem::InputText { text }] = content.as_slice() else { panic!("missing text") };
+    let evidence: serde_json::Value = serde_json::from_str(text.lines()
+        .find(|line| line.starts_with('{')).unwrap()).unwrap();
+    assert_eq!(evidence, json!({
+        "recorded_process_handles": [
+            {"session_id":7,"raw_output_artifact_id":"first-output"},
+            {"session_id":8,"raw_output_artifact_id":"draining-output"},
+            {"session_id":9,"raw_output_artifact_id":"nested-output"},
+        ], "omitted_handle_count":0,
+    }));
+    assert!(text.contains("not a crash-time inventory"));
+}
+
+#[test]
+fn resume_notice_bounds_handle_evidence_and_reports_omissions() {
+    let states = (0..40).map(|id| json!({"tool":"exec_command", "session_id":id,
+        "raw_output_artifact_id":format!("output-{id}")})).collect::<Vec<_>>();
+    let mut history = vec![
+        ResponseItem::FunctionCall { id:None, name:"wait".into(), namespace:None,
+            arguments:"{}".into(), call_id:"many".into(), internal_chat_message_metadata_passthrough:None },
+        ResponseItem::FunctionCallOutput { id:None, call_id:"many".into(),
+            output:FunctionCallOutputPayload::from_text(json!({"nested_commands":states}).to_string()),
+            internal_chat_message_metadata_passthrough:None },
+    ];
+    super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
+    let ResponseItem::Message { content, .. } = history.last().unwrap() else { panic!("missing notice") };
+    let [ContentItem::InputText { text }] = content.as_slice() else { panic!("missing text") };
+    let evidence: serde_json::Value = serde_json::from_str(text.lines()
+        .find(|line| line.starts_with('{')).unwrap()).unwrap();
+    assert_eq!(evidence["recorded_process_handles"].as_array().unwrap().len(), 32);
+    assert_eq!(evidence["omitted_handle_count"], 8);
+}
+
+#[test]
+fn resume_ignores_explicit_unrelated_receipt_owners() {
+    for receipt in [
+        json!({"tool":"other", "session_id":10, "process_exited":false}),
+        json!({"tool":"exec_command", "namespace":"other", "session_id":10}),
+        json!({"namespace":"other", "session_id":10}),
+        json!({"tool":"write_stdin", "polled_session_id":10, "process_exited":true}),
+    ] {
+        for body in [receipt.to_string(), format!("Script completed\n{receipt}")] {
+            let mut history = vec![
+                ResponseItem::FunctionCall { id:None, name:"exec".into(), namespace:None,
+                    arguments:"{}".into(), call_id:"unrelated".into(), internal_chat_message_metadata_passthrough:None },
+                ResponseItem::FunctionCallOutput { id:None, call_id:"unrelated".into(),
+                    output:FunctionCallOutputPayload::from_text(body), internal_chat_message_metadata_passthrough:None },
+            ];
+            let original = history.clone();
+            super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
+            assert_eq!(history, original);
+        }
+    }
+}
+
+#[test]
+fn current_command_receipts_invalidate_live_and_draining_handles_on_resume() {
+    for exited in [false, true] {
+        let output = crate::tools::context::ExecCommandToolOutput {
+            output_ranges:None, process_output:None, error:None, validation:None,
+            event_call_id:"receipt".into(), chunk_id:"chunk".into(), wall_time:std::time::Duration::ZERO,
+            raw_output:b"retained evidence".to_vec(),
+            truncation_policy:codex_utils_output_truncation::TruncationPolicy::Tokens(1000),
+            max_output_tokens:Some(1000), process_id:Some(7), session_capabilities:None,
+            exit_code:exited.then_some(0), process_exited:exited, search_no_match:false,
+            original_token_count:None, hook_command:None, raw_output_artifact:None,
+            repair_notice:None, pending_deferred_completions:Vec::new(),
+        };
+        let mut history = vec![
+            ResponseItem::FunctionCall { id:None, name:"exec_command".into(), namespace:None,
+                arguments:"{}".into(), call_id:"receipt".into(), internal_chat_message_metadata_passthrough:None },
+            ResponseItem::FunctionCallOutput { id:None, call_id:"receipt".into(),
+                output:FunctionCallOutputPayload::from_text(output.response_text()),
+                internal_chat_message_metadata_passthrough:None },
+        ];
+        super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
+        assert_eq!(history.len(), 3);
+        assert!(is_unified_exec_resume_invalidation(&history[2]));
+    }
+}
+
+#[tokio::test]
+async fn reloaded_process_handles_are_excluded_from_allocation() {
+    let (session, _) = make_session_and_context().await;
+    let outputs = [
+        "Process running with session ID 1000; output pending",
+        "Script completed\n{\"session_id\": 1001,\"process_exited\":true}",
+        "{\"essential\":{\"nested_commands\":[{\"polled_session_id\":1002}]}}",
+        "Running command session_id: 1003",
+        "{\"session_id\":4294967296}",
+    ];
+    let items = outputs.into_iter().map(|text| RolloutItem::ResponseItem(
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call".into(),
+            output: FunctionCallOutputPayload::from_text(text.to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    )).collect::<Vec<_>>();
+    let ids = super::rollout_reconstruction::historical_process_ids(&items);
+    assert_eq!(ids, std::collections::HashSet::from([1000, 1001, 1002, 1003]));
+    session.services.unified_exec_manager.exclude_process_ids(ids).await;
+    assert_eq!(session.services.unified_exec_manager.allocate_process_id().await, 1004);
+}
+
+#[test]
 fn resume_does_not_invalidate_completed_or_unrelated_nested_results() {
     use super::rollout_reconstruction::append_unified_exec_resume_invalidation;
     for state in [
-        json!({"tool": "exec_command", "process_exited": true, "session_id": 1}),
+        json!({"tool": "exec_command", "process_exited": true, "polled_session_id": 1}),
         json!({"tool": "other", "process_exited": false, "session_id": 1}),
         json!({"tool": "exec_command", "process_exited": false}),
     ] {

@@ -265,6 +265,14 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         false
     }
 
+    /// Process control is effectful, not a read-only observation. It must be
+    /// able to stop a process that holds the workspace lease, so admission is
+    /// owned by the process manager rather than the repository gate. This does
+    /// not bypass tool authorization or the handler's capability checks.
+    fn controls_process(&self, _payload: &ToolPayload) -> bool {
+        false
+    }
+
     /// Native add-only operations whose exact destinations the runtime
     /// enforces. Admission still proves locality, absence and directory identity.
     /// This is never inferred from a public tool name or opaque shell text.
@@ -579,6 +587,13 @@ impl AnyToolResult {
         self.result.requires_canonical_artifact()
     }
 
+    /// Dispatcher-authenticated identity of retained canonical output. Storage
+    /// alone does not imply unread evidence; the cell compares delivered coverage.
+    pub(crate) fn canonical_delivery_artifact(&self) -> Option<(String, String, u64)> {
+        let candidate = self.model_projection.as_ref()?.candidate.as_ref()?;
+        Some((candidate.artifact_id.clone(), candidate.artifact_sha256.clone(), candidate.artifact_bytes))
+    }
+
     pub(crate) fn projected_source_dependencies(
         &self,
     ) -> Option<&std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>> {
@@ -687,6 +702,10 @@ impl AnyToolResult {
             payload, result, ..
         } = self;
         result.code_mode_result(&payload)
+    }
+
+    pub(crate) fn code_mode_result_with_budget(self, budget: usize) -> serde_json::Value {
+        self.result.code_mode_result_with_budget(&self.payload, budget)
     }
 
     pub(crate) fn code_mode_failure_is_error(&self) -> bool {
@@ -1013,6 +1032,10 @@ impl ToolOutput for PostToolUseFeedbackOutput {
     fn code_mode_result(&self, payload: &ToolPayload) -> Value {
         self.original.code_mode_result(payload)
     }
+
+    fn code_mode_result_with_budget(&self, payload: &ToolPayload, budget: usize) -> Value {
+        self.original.code_mode_result_with_budget(payload, budget)
+    }
 }
 
 struct UnavailableModelProjectionOutput {
@@ -1077,6 +1100,10 @@ impl ToolOutput for UnavailableModelProjectionOutput {
     fn code_mode_result(&self, payload: &ToolPayload) -> Value {
         self.original.code_mode_result(payload)
     }
+
+    fn code_mode_result_with_budget(&self, payload: &ToolPayload, budget: usize) -> Value {
+        self.original.code_mode_result_with_budget(payload, budget)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1109,6 +1136,7 @@ pub(crate) struct PostToolUsePayload {
 }
 
 pub(crate) struct RegisteredTool {
+    provider_authority: Option<String>,
     tool_name: ToolName,
     runtime: Arc<dyn CoreToolRuntime>,
     exposure: ToolExposure,
@@ -1145,6 +1173,7 @@ impl RegisteredTool {
         Self {
             tool_name,
             runtime,
+            provider_authority: None,
             exposure,
             authorization_class,
             external_mutation_intent:
@@ -1165,6 +1194,15 @@ impl RegisteredTool {
 
     pub(crate) fn runtime(&self) -> &Arc<dyn CoreToolRuntime> {
         &self.runtime
+    }
+
+    pub(crate) fn with_provider_authority(mut self, authority: String) -> Self {
+        self.provider_authority = Some(authority);
+        self
+    }
+
+    pub(crate) fn provider_authority(&self) -> Option<&str> {
+        self.provider_authority.as_deref()
     }
 
     pub(crate) fn tool_name(&self) -> &ToolName {
@@ -1191,13 +1229,13 @@ impl RegisteredTool {
 
     pub(crate) fn spec_mut(&mut self) -> &mut ToolSpec {
         self.canonical_spec_sha256.take();
+        self.code_mode_argument_preflight = Arc::new(CodeModeArgumentPreflight::default());
         &mut self.spec
     }
 
     pub(crate) fn canonical_spec_sha256(&self) -> &str {
         self.canonical_spec_sha256.get_or_init(|| {
-            let canonical_spec =
-                canonicalize_json(&serde_json::to_value(&self.spec).unwrap_or_default());
+            let canonical_spec = self.spec.callable_contract();
             format!(
                 "{:x}",
                 Sha256::digest(serde_json::to_vec(&canonical_spec).unwrap_or_default())
@@ -1407,9 +1445,9 @@ impl ToolRegistry {
             .is_some_and(|tool| tool.permits_shared_workspace_observation(payload))
     }
 
-    pub(crate) fn delegates_workspace_admission(&self, name: &ToolName) -> bool {
+    pub(crate) fn delegates_workspace_admission(&self, name: &ToolName, payload: &ToolPayload) -> bool {
         self.tool(name)
-            .is_some_and(|tool| tool.delegates_workspace_admission())
+            .is_some_and(|tool| tool.delegates_workspace_admission() || tool.controls_process(payload))
     }
 
     pub(crate) fn native_addition_paths(
@@ -1583,12 +1621,12 @@ impl ToolRegistry {
         }
         let dispatch_trace = ToolDispatchTrace::start(&invocation);
         dispatch_state.attach_trace(dispatch_trace.clone());
-        dispatch_trace.wait_for_start().await;
-        let (tool, tool_spec, code_mode_argument_preflight) = match self.tools.get(&tool_name) {
+        let (tool, tool_spec, code_mode_argument_preflight, external_tool) = match self.tools.get(&tool_name) {
             Some(registered) => (
                 Arc::clone(registered.runtime()),
                 registered.spec(),
                 Arc::clone(&registered.code_mode_argument_preflight),
+                registered.authorization_class() == TypedToolClass::DynamicExternal,
             ),
             None => {
                 let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
@@ -1650,12 +1688,15 @@ impl ToolRegistry {
             return Err(err);
         }
 
-        if matches!(invocation.source, ToolCallSource::CodeMode { .. })
+        let validate_arguments = external_tool
+            || matches!(invocation.source, ToolCallSource::CodeMode { .. });
+        if validate_arguments
             && let Err(message) = code_mode_argument_preflight.validate(
                 &tool_name,
                 tool_spec,
                 &invocation.payload,
                 parsed_function_arguments.as_ref(),
+                !external_tool,
             )
         {
             let log_payload = invocation.payload.log_payload();
@@ -1731,16 +1772,17 @@ impl ToolRegistry {
             .turn
             .record_dispatched_tool_name(tool_name_flat.as_ref());
 
-        // PreToolUse hooks may replace the arguments after the initial code-mode
+        // PreToolUse hooks may replace the arguments after the initial
         // admission check. Validate the final payload that will reach the
         // handler so a hook cannot turn a schema-valid call into an invalid one.
         if hook_rewrote_input
-            && matches!(invocation.source, ToolCallSource::CodeMode { .. })
+            && validate_arguments
             && let Err(message) = code_mode_argument_preflight.validate(
                 &tool_name,
                 tool_spec,
                 &invocation.payload,
                 parsed_function_arguments.as_ref(),
+                !external_tool,
             )
         {
             let log_payload = invocation.payload.log_payload();
@@ -2107,23 +2149,6 @@ async fn handle_any_tool(
     if !tool.prepares_during_workspace_baseline() {
         crate::tools::parallel::wait_for_workspace_baseline().await;
     }
-    let class = invocation.step_context.tool_router()
-        .map(|router| router.classify_tool_name(&invocation.step_context.turn, &invocation.tool_name))
-        .unwrap_or(TypedToolClass::Unknown);
-    let effect_receipt = if !invocation.step_context.turn.config.ephemeral
-        && !matches!(class, TypedToolClass::ReadSearch | TypedToolClass::CodeModeControl)
-        && !tool.permits_shared_workspace_observation(&invocation.payload)
-    {
-        Some(crate::tools::effect_journal::EffectReceipt::reserve(
-            invocation.step_context.turn.config.codex_home.join("effect-journal")
-                .join(invocation.session.thread_id.to_string()).to_path_buf(),
-            invocation.step_context.turn.sub_id.clone(),
-            invocation.call_id.clone(),
-            invocation.tool_name.to_string(),
-        ).await.map_err(FunctionCallError::RespondToModel)?)
-    } else {
-        None
-    };
     let _tool_execution_timing_guard =
         matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler).then(|| {
             invocation
@@ -2142,63 +2167,15 @@ async fn handle_any_tool(
     // Early argument failures must also settle capture before post-tool hooks.
     crate::tools::parallel::wait_for_workspace_baseline().await;
     mark_tool_handler_exit();
-    let mut persistence_warning = None;
-    if let Some(receipt) = effect_receipt {
-        let outcome = match &output {
-            Ok(output) => match output.outcome_for_logging() {
-                ToolOutputOutcome::Success => "success",
-                ToolOutputOutcome::Yielded => "yielded",
-                _ => "unsuccessful",
-            },
-            Err(_) => "handler_error",
-        };
-        if let Err(error) = receipt.returned(outcome).await {
-            persistence_warning = Some(format!(
-                "The handler returned, but its effect receipt could not be committed: {error}. Effects may already have occurred; do not replay this dispatch. Inspect the affected state."
-            ));
-        }
-    }
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            return Err(match persistence_warning {
-                Some(warning) => match error {
-                    FunctionCallError::RespondToModel(message) =>
-                        FunctionCallError::RespondToModel(format!("{message}\n{warning}")),
-                    FunctionCallError::DeniedToModel(message) =>
-                        FunctionCallError::DeniedToModel(format!("{message}\n{warning}")),
-                    FunctionCallError::RequiredOperationBlocked(message) =>
-                        FunctionCallError::RequiredOperationBlocked(format!("{message}\n{warning}")),
-                    FunctionCallError::Fatal(message) =>
-                        FunctionCallError::Fatal(format!("{message}\n{warning}")),
-                },
-                None => error,
-            });
-        }
-    };
-    let mut result = AnyToolResult {
+    let output = output?;
+    Ok(AnyToolResult {
         call_id: invocation.call_id,
         payload: invocation.payload,
         result: output,
         model_projection: None,
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
-    };
-    if let Some(warning) = persistence_warning {
-        // Keep the original result, including live process handles, available
-        // to code mode. The persistence failure must not turn a completed
-        // mutation into an apparently unexecuted, retryable dispatch.
-        let model_visible = FunctionToolOutput::from_text(
-            format!("{}\n{warning}", result.result.code_mode_result(&result.payload)),
-            None,
-        );
-        result.code_mode_feedback.extend(model_visible.body.clone());
-        result.result = Box::new(PostToolUseFeedbackOutput {
-            original: result.result,
-            model_visible,
-        });
-    }
-    Ok(result)
+    })
 }
 
 struct ModelProjectionInput {
@@ -2383,10 +2360,7 @@ async fn prepare_model_projection(
         .get("nested_commands")
         .and_then(Value::as_array)
         .is_some_and(|states| {
-            states.iter().any(|state| {
-                state.get("session_id").is_some()
-                    && state.get("process_exited") == Some(&Value::Bool(false))
-            })
+            states.iter().any(crate::tools::code_mode::command_owns_work)
         });
     if admit_code_mode_output
         && (metadata.outcome == ToolOutputOutcome::Yielded || has_running_nested_command)
@@ -3020,7 +2994,19 @@ fn select_typed_projection_fragments(
                 break;
             }
             remaining_budget = remaining_budget.saturating_sub(separator_tokens);
-            let bounded = if fragment.id.as_deref() == Some("output")
+            let bounded = if token_limit == usize::MAX {
+                fragment.text.clone()
+            } else if let Some(source) = &fragment.shell_output {
+                crate::tools::shell_output_summary::summarize_shell_output_for_model_with_streams(
+                    &fragment.text, source.exit_code, false,
+                    crate::tools::shell_output_summary::ShellOutputSummaryOptions {
+                        enabled: true, applied_token_limit: Some(remaining_budget),
+                        command_text: source.command_text.as_deref(),
+                    },
+                    source.streams.as_ref().map(|(stdout, stderr)| (stdout.as_str(), stderr.as_str())),
+                ).unwrap_or_else(|| codex_utils_output_truncation::truncate_text_with_line_markers(
+                    &fragment.text, remaining_budget))
+            } else if fragment.id.as_deref() == Some("output")
                 && fragment.kind == ToolOutputProjectionFragmentKind::ContextualSpillableText {
                 codex_utils_output_truncation::truncate_text_with_line_markers(&fragment.text, remaining_budget)
             } else {
@@ -3135,10 +3121,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         original_response,
         materialization,
     } = input;
-    let successful = !matches!(
-        &outcome,
-        ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut
-    );
+    let successful = matches!(&outcome, ToolOutputOutcome::Success);
     if !projection_eligible {
         return None;
     }
@@ -3275,22 +3258,30 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         .get(crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY)
         == Some(&Value::Bool(true));
     let admission_only_fallback = || {
+        let text = original_output_text.replace(
+            "artifact_id={cell_output_artifact_id}", "saved output unavailable",
+        );
+        let response = if text != original_output_text {
+            projected_response_item(original_response.clone(), text.clone(), true)
+        } else {
+            original_response.clone()
+        };
         let bounded = BoundedModelProjection::Fallback {
-            value: serde_json::from_str(&original_output_text)
-                .unwrap_or_else(|_| Value::String(original_output_text.clone())),
-            rendered: original_output_text.clone(),
+            value: serde_json::from_str(&text)
+                .unwrap_or_else(|_| Value::String(text.clone())),
+            rendered: text.clone(),
         };
         ModelToolProjection {
-            original_response: original_response.clone(),
+            original_response: response,
             bounded,
             passthrough_response: true,
             preserve_non_text_content: true,
             candidate: None,
-            projected_tokens: approx_token_count(&original_output_text)
+            projected_tokens: approx_token_count(&text)
                 .saturating_add(non_text_tokens) as u64,
             canonical_bytes: canonical.exact_bytes,
             canonical_tokens: canonical.approximate_tokens,
-            model_bytes: original_output_text.len().saturating_add(non_text_bytes) as u64,
+            model_bytes: text.len().saturating_add(non_text_bytes) as u64,
             artifact_created: false,
             artifact_reused: false,
             projection_truncated: visible_output_truncated,
@@ -3312,12 +3303,24 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         // dropped output, name the durable canonical artifact so the omitted
         // range is recoverable without rerunning the producer.
         let (original_response, original_output_text) = if visible_output_truncated {
+            let missing_selector = essential_inline.get("cell_output_recovery_selector");
+            let selector = missing_selector.cloned().unwrap_or_else(|| serde_json::json!({
+                "kind":"bytes", "start":0, "end":canonical.exact_bytes.min(4096)
+            }));
+            let qualified = original_output_text.replace(
+                "artifact_id={cell_output_artifact_id}", &format!("artifact_id={artifact_id}"),
+            );
             let text = format!(
-                "{original_output_text}\n{}",
+                "{qualified}\n{}",
                 serde_json::json!({
                     "output_truncated": true,
                     "artifact_id": artifact_id,
                     "recovery_tool": "read_tool_output",
+                    "recovery_scope": if missing_selector.is_some() { "omitted_output" } else { "prefix_discovery" },
+                    "recovery": {"tool":"read_tool_output", "arguments": {
+                        "artifact_id":artifact_id,
+                        "selectors":[selector]
+                    }},
                 })
             );
             (
@@ -4020,6 +4023,15 @@ fn serialize_projection_fragments(
                     ToolProjectionInclusion::Omitted
                 };
             }
+            if let Some(facts) = envelope.result.get_mut("selection") {
+                facts["mode"] = selection.mode.into();
+                facts["available_fragments"] = selection.available_fragments.into();
+                facts["selected_fragments"] = selection.selected_fragments.into();
+                facts["exact_duplicates_removed"] = selection.exact_duplicates_removed.into();
+                facts["selected_ids"] = serde_json::json!(selection.selected_ids);
+                facts["partial_ids"] = serde_json::json!(selection.partial_ids);
+                facts["omitted_inline_ids"] = serde_json::json!(selection.omitted_inline_ids);
+            }
             text
         };
         if retained != output {
@@ -4034,7 +4046,7 @@ fn serialize_projection_fragments(
                 .filter(|section| section.inclusion == ToolProjectionInclusion::Omitted)
                 .map(|section| section.id.clone())
                 .collect();
-            if let Some(selection) = envelope.result.get_mut("selection") {
+            if fragments.is_empty() && let Some(selection) = envelope.result.get_mut("selection") {
                 let selected = selection["selected_ids"].clone();
                 selection["partial_ids"] = selected.clone();
                 if retained.is_empty() {
@@ -4046,9 +4058,13 @@ fn serialize_projection_fragments(
                     selection["omitted_inline_ids"] = omitted.into();
                     selection["selected_ids"] = serde_json::json!([]);
                     selection["partial_ids"] = serde_json::json!([]);
+                    selection["selected_fragments"] = 0.into();
                 }
             }
         }
+        envelope.omitted_sections = envelope.sections.iter()
+            .filter(|section| section.inclusion == ToolProjectionInclusion::Omitted)
+            .map(|section| section.id.clone()).collect();
         envelope.result["selected_text"] = Value::String(retained);
         let rendered = render_projection_with_exact_metrics(&mut envelope)?;
         let rendered_tokens = approx_token_count(&rendered);
@@ -4089,21 +4105,16 @@ fn render_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Opti
         .as_object()
         .cloned()
         .unwrap_or_default();
-    // These facts remain in the canonical envelope and rollout, not the prompt.
+    // Remove transport bookkeeping, not typed outcome or completeness. Tiny
+    // budgets can remove every diagnostic line, leaving this as the only carrier.
     for key in [
         "chunk_id",
         "wall_time_seconds",
-        "execution_state",
-        "process_exited",
-        "output_complete",
-        "output_reduced",
         "original_token_count",
         "original_token_count_is_approximate",
         "success",
         "raw_output_artifact_bytes",
         "raw_output_artifact_id",
-        "raw_output_artifact_retention_limit_hit",
-        "raw_output_artifact_retention_limit_reason",
         "changes_count",
         "changes_exact",
         "environment_id",
@@ -4112,6 +4123,18 @@ fn render_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Opti
         fields.remove(key);
     }
     fields.retain(|_, value| !value.is_null());
+    let outcome_visible = fields.get("outcome").and_then(Value::as_str) == Some(envelope.outcome.as_str())
+        || (envelope.outcome == "success" && fields.get("exit_code").and_then(Value::as_i64) == Some(0))
+        || (envelope.outcome == "failure" && fields.get("exit_code").and_then(Value::as_i64).is_some_and(|code| code != 0));
+    if !outcome_visible {
+        fields.insert("outcome".into(), envelope.outcome.clone().into());
+    }
+    if !envelope.canonical_complete {
+        fields.insert("canonical_complete".into(), false.into());
+    }
+    if selected_text.len() < envelope.canonical_bytes as usize {
+        fields.insert("output_reduced".into(), true.into());
+    }
     if let Some(artifact_id) = envelope.artifact_id.as_ref()
         && (!envelope.omitted_sections.is_empty()
             || selected_text.is_empty()
@@ -4250,16 +4273,17 @@ impl CodeModeArgumentPreflight {
         spec: &ToolSpec,
         payload: &ToolPayload,
         parsed_function_arguments: Option<&ParsedFunctionArguments>,
+        native_compatibility: bool,
     ) -> Result<(), String> {
         let ToolPayload::Function { arguments } = payload else {
             return Ok(());
         };
-        if tool_name.namespace.is_none() && tool_name.name == "exec_command" {
+        if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "exec_command" {
             return crate::tools::handlers::validate_exec_command_arguments(arguments).map_err(
                 |message| format!("tool `{tool_name}` argument preflight failed: {message}"),
             );
         }
-        if tool_name.namespace.is_none() && tool_name.name == "read_file" {
+        if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "read_file" {
             return crate::tools::handlers::validate_read_file_arguments(arguments)
                 .map_err(|message| format!("tool `{tool_name}` argument preflight failed: {message}"));
         }

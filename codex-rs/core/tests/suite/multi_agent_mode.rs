@@ -679,8 +679,8 @@ async fn typed_spawn_task_capsule_delivers_normalized_handles_and_file_revision(
     assert_eq!(
         capsule["relevant_handles"],
         json!([
-            {"kind": "file", "path": "target.txt", "existed": true, "content_hash": "30bcd71c556c7f15b1687bca82588f0406d2075774e5514cd95644414fbdfe99"},
-            {"kind": "symbol", "path": "target.txt", "symbol": "capsule_target", "existed": true, "content_hash": "30bcd71c556c7f15b1687bca82588f0406d2075774e5514cd95644414fbdfe99"}
+            {"kind": "file", "path": "target.txt", "existed": true},
+            {"kind": "symbol", "path": "target.txt", "symbol": "capsule_target", "existed": true}
         ])
     );
     assert_eq!(

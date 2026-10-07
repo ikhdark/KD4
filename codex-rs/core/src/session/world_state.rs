@@ -51,14 +51,11 @@ impl Session {
 
         let previous_world_state = self.state.lock().await.history.world_state_baseline();
         let mut world_state = WorldState::default();
-        let effect_recovery = if turn_context.config.ephemeral {
-            None
-        } else {
-            self.services.command_execution.effect_recovery().await
-        };
         world_state.add_section(crate::context::world_state::TaskState::new(
             self.services.plan_store.snapshot_with_lineage().await,
-        ).with_effect_recovery(effect_recovery));
+        ).with_execution_suspended(
+            turn_context.collaboration_mode.mode == codex_protocol::config_types::ModeKind::Plan,
+        ));
         if turn_context.config.features.enabled(codex_features::Feature::TokenBudget) {
             let ids = self.state.lock().await.auto_compact_window_ids();
             world_state.add_section(crate::context::TokenBudgetContext::new(
@@ -166,7 +163,9 @@ impl Session {
                             .as_ref()
                             .and_then(|previous| previous.section(id))
                         {
-                            world_state.add_preserved_extension_section(id, snapshot.clone());
+                            let rendering = previous_world_state.as_ref()
+                                .and_then(|previous| previous.rendered_extension(id)).cloned();
+                            world_state.add_preserved_extension_section(id, snapshot.clone(), rendering);
                         }
                     }
                 }

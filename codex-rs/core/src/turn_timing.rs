@@ -200,6 +200,7 @@ enum CheckoutSnapshotCapture {
 }
 
 pub(crate) struct TurnTimingState {
+    live_phase: StdMutex<LiveTurnPhase>,
     checkout_snapshot: StdMutex<CheckoutSnapshotCapture>,
     clock: Arc<dyn TurnClock>,
     state: StdMutex<TurnTimingStateInner>,
@@ -214,6 +215,53 @@ pub(crate) struct TurnTimingState {
     /// persist only new or changed entries, so their size no longer grows with
     /// every prior request.
     checkpointed_entries: StdMutex<HashSet<[u8; 32]>>,
+}
+
+/// Only current wait counts and the existing event sink, not an execution history.
+#[derive(Default)]
+struct LiveTurnPhase {
+    sink: Option<(String, async_channel::Sender<codex_protocol::protocol::Event>)>,
+    gates: [u32; 4],
+    sampling: Option<NextSampleBlockReason>,
+    published: Vec<codex_protocol::protocol::HarnessPhase>,
+}
+
+impl LiveTurnPhase {
+    fn publish(&mut self) {
+        use codex_protocol::protocol::HarnessPhase;
+        let mut phases = [
+            HarnessPhase::ResourceResolution,
+            HarnessPhase::DiffTracker,
+            HarnessPhase::WorkspaceGate,
+            HarnessPhase::EvidenceTracker,
+        ].into_iter().zip(self.gates).filter_map(|(phase, count)| (count > 0).then_some(phase))
+            .collect::<Vec<_>>();
+        let sampling = match self.sampling {
+            Some(NextSampleBlockReason::WaitingForDelivery) => Some(HarnessPhase::Delivery),
+            Some(NextSampleBlockReason::WaitingForProcessCleanup) => Some(HarnessPhase::ProcessCleanup),
+            Some(NextSampleBlockReason::WaitingForGate) => Some(HarnessPhase::WorkspaceGate),
+            Some(NextSampleBlockReason::ReadyToSample) if phases.is_empty() => Some(HarnessPhase::ReadyToSample),
+            _ => None,
+        };
+        if let Some(phase) = sampling
+            && !phases.contains(&phase)
+        {
+            phases.push(phase);
+        }
+        if phases == self.published { return; }
+        self.published = phases.clone();
+        if let Some((turn_id, sender)) = &self.sink {
+            // The session event channel is unbounded. Closed means its consumer exited.
+            let _ = sender.try_send(codex_protocol::protocol::Event {
+                id: turn_id.clone(),
+                msg: codex_protocol::protocol::EventMsg::TurnPhaseChanged(
+                    codex_protocol::protocol::TurnPhaseChangedEvent {
+                        turn_id: turn_id.clone(), phases,
+                    },
+                ),
+            });
+        }
+    }
 }
 
 impl Default for TurnTimingState {
@@ -693,6 +741,7 @@ impl TurnTimingSnapshot {
         };
 
         TurnTiming {
+            completion_assessment: None,
             credit_delta: self.credit_delta.clone(),
             checkout_snapshot_sha256: self.checkout_snapshot_sha256.clone(),
             schema_version: profile.schema_version,
@@ -730,7 +779,7 @@ impl TurnTimingSnapshot {
 /// Reuse the authenticated, bounded artifact store instead of inventing a
 /// second side-file lifecycle. Keep inline evidence if durable retention fails.
 pub(crate) async fn retain_turn_timing_details(
-    mut timing: TurnTiming,
+    timing: TurnTiming,
     codex_home: &std::path::Path,
     thread_id: &str,
 ) -> TurnTiming {
@@ -742,12 +791,28 @@ pub(crate) async fn retain_turn_timing_details(
     let Ok(bytes) = serde_json::to_vec(&timing.tool_calls) else {
         return timing;
     };
-    let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-        codex_home, thread_id, &bytes,
-    ).await;
-    if let crate::tools::command_output_artifact::RawOutputArtifact::Stored {
+    let codex_home = codex_home.to_path_buf();
+    let thread_id = thread_id.to_string();
+    // Retain creation ownership if storage outlives terminal delivery. In
+    // particular, do not cancel between creating a file and retention cleanup.
+    let artifact = tokio::spawn(async move {
+        crate::tools::command_output_artifact::create_raw_output_artifact(
+            &codex_home, &thread_id, &bytes,
+        )
+        .await
+    });
+    retain_turn_timing_artifact(timing, artifact).await
+}
+
+const TURN_TIMING_STORAGE_TIMEOUT: Duration = Duration::from_millis(100);
+
+async fn retain_turn_timing_artifact(
+    mut timing: TurnTiming,
+    artifact: tokio::task::JoinHandle<crate::tools::command_output_artifact::RawOutputArtifact>,
+) -> TurnTiming {
+    if let Ok(Ok(crate::tools::command_output_artifact::RawOutputArtifact::Stored {
         id, truncated: false, ..
-    } = artifact {
+    })) = tokio::time::timeout(TURN_TIMING_STORAGE_TIMEOUT, artifact).await {
         timing.tool_call_details_artifact_id = Some(id.to_string());
         for call in &mut timing.tool_calls {
             call.lifecycle_events.clear();
@@ -1489,6 +1554,7 @@ impl TurnTimingState {
 
     fn new(clock: Arc<dyn TurnClock>) -> Self {
         Self {
+            live_phase: Default::default(),
             checkout_snapshot: Default::default(),
             clock,
             state: StdMutex::new(TurnTimingStateInner::default()),
@@ -1500,6 +1566,31 @@ impl TurnTimingState {
             tool_closure_changed: Notify::new(),
             checkpointed_entries: Default::default(),
         }
+    }
+
+    pub(crate) fn bind_live_phase_events(
+        &self,
+        turn_id: String,
+        sender: async_channel::Sender<codex_protocol::protocol::Event>,
+    ) {
+        self.live_phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner).sink =
+            Some((turn_id, sender));
+    }
+
+    pub(crate) fn adjust_live_gate(&self, gate: usize, entering: bool) {
+        let mut live = self.live_phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        live.gates[gate] = if entering {
+            live.gates[gate].saturating_add(1)
+        } else {
+            live.gates[gate].saturating_sub(1)
+        };
+        live.publish();
+    }
+
+    fn set_live_sampling_phase(&self, reason: Option<NextSampleBlockReason>) {
+        let mut live = self.live_phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        live.sampling = reason;
+        live.publish();
     }
 
     /// Returns a millisecond offset from the turn's sole monotonic clock.
@@ -1678,21 +1769,21 @@ impl TurnTimingState {
 
     /// Freeze an observation without terminalizing live timers or task state.
     ///
-    /// Scalar aggregates stay cumulative, but per-request, per-call, and
-    /// receipt entries already written unchanged by an earlier checkpoint of
-    /// this turn are omitted. A full snapshot on every request made checkpoint
-    /// size, and the work done before each dispatch, grow with the turn.
+    /// Scalar aggregates stay cumulative. Per-call details belong only to the
+    /// final turn timing; aborted-turn recovery retains their counters instead.
+    /// Request and receipt entries already written unchanged by an earlier
+    /// checkpoint of this turn are omitted.
     pub(crate) fn sampling_checkpoint(&self) -> codex_protocol::protocol::SamplingTimingCheckpoint {
         let mut observation = self.state().clone();
         let sample = self.clock.sample();
         let mut timing = observation.complete(sample).protocol_timing();
+        timing.tool_calls.clear();
         {
             let mut checkpointed = self
                 .checkpointed_entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             retain_new_checkpoint_entries(&mut timing.model_requests, &mut checkpointed);
-            retain_new_checkpoint_entries(&mut timing.tool_calls, &mut checkpointed);
             retain_new_checkpoint_entries(
                 &mut timing.deterministic_continuation_receipts,
                 &mut checkpointed,
@@ -2365,6 +2456,12 @@ impl TurnTimingState {
     }
 
     pub(crate) fn record_next_sample_block_reason(&self, reason: NextSampleBlockReason) {
+        self.set_live_sampling_phase(Some(reason));
+        self.record_tool_sample_block_reason(reason);
+    }
+
+    /// Per-tool observers may outlive model work and cannot author the turn's live phase.
+    pub(crate) fn record_tool_sample_block_reason(&self, reason: NextSampleBlockReason) {
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
@@ -3447,6 +3544,7 @@ impl TurnTimingState {
     }
 
     pub(crate) fn mark_model_request_dispatched(&self) {
+        self.set_live_sampling_phase(None);
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);

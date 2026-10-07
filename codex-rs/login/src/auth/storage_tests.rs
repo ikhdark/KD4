@@ -98,6 +98,7 @@ async fn file_storage_round_trips_registered_agent_identity_auth() -> anyhow::Re
     let codex_home = tempdir()?;
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
     let record = AgentIdentityAuthRecord {
+        issuer_origin: Some("https://auth.openai.com/api/accounts".into()),
         agent_runtime_id: "agent-runtime-id".to_string(),
         agent_private_key: "private-key".to_string(),
         account_id: "account-id".to_string(),
@@ -155,6 +156,7 @@ async fn file_storage_loads_empty_agent_identity_email_as_none() -> anyhow::Resu
             tokens: None,
             last_refresh: None,
             agent_identity: Some(AgentIdentityStorage::Record(AgentIdentityAuthRecord {
+                issuer_origin: None,
                 agent_runtime_id: "agent-runtime-id".to_string(),
                 agent_private_key: "private-key".to_string(),
                 account_id: "account-id".to_string(),
@@ -181,6 +183,7 @@ async fn file_storage_writes_missing_agent_identity_email_as_empty_string() -> a
         tokens: None,
         last_refresh: None,
         agent_identity: Some(AgentIdentityStorage::Record(AgentIdentityAuthRecord {
+            issuer_origin: None,
             agent_runtime_id: "agent-runtime-id".to_string(),
             agent_private_key: "private-key".to_string(),
             account_id: "account-id".to_string(),

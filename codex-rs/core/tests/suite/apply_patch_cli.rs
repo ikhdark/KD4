@@ -189,7 +189,14 @@ async fn apply_patch_cli_multiple_operations_integration() -> Result<()> {
 
     let out = harness.apply_patch_output(call_id).await;
 
-    assert_eq!(out, "Success. Updated the files.");
+    let changes = out.strip_prefix("Success. Updated the files.\nApplied changes (unified hunk +ranges are post-edit line numbers): ")
+        .expect("successful patch with applied changes");
+    let changes: Vec<serde_json::Value> = serde_json::from_str(changes)?;
+    assert_eq!(changes.len(), 3);
+    for (change, kind) in changes.iter().zip(["add", "delete", "update"]) {
+        assert_eq!(change["kind"], kind);
+        assert_eq!(change["diff_complete"], true);
+    }
 
     assert_eq!(harness.read_file_text("nested/new.txt").await?, "created\n");
     assert_eq!(
@@ -1267,13 +1274,13 @@ async fn apply_patch_clears_aggregated_diff_after_inexact_delta() -> Result<()> 
     )
     .await;
 
-    assert_eq!(
-        last_diff.as_deref(),
-        Some(""),
-        "inexact delta should clear the aggregate diff"
-    );
+    let diff = last_diff.expect("successful patch diff must survive a side-effect-free refusal");
+    assert!(diff.contains("partial/success.txt") && diff.contains("+ok"));
+    let failure = harness.custom_tool_call_output(call_inexact).await;
+    assert!(failure.contains("destination preimage is unreadable"), "{failure}");
     assert_eq!(harness.read_file_text("partial/success.txt").await?, "ok\n");
-    assert_eq!(harness.read_file_text("binary.dat").await?, "text\n");
+    let binary_path = PathUri::from_host_native_path(harness.path("binary.dat"))?;
+    assert_eq!(test.fs().read_file(&binary_path, None).await?, vec![0xff, 0xfe, 0xfd]);
     Ok(())
 }
 

@@ -51,7 +51,6 @@ use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
-use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::lagged_output_marker;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
@@ -121,7 +120,7 @@ pub(crate) const NESTED_POLL_MARGIN: Duration = Duration::from_millis(2_000);
 ///
 /// Never earlier than `now`: an already-exhausted budget yields immediately
 /// rather than producing a deadline in the past that reads as an error.
-fn nested_poll_bound(nested_deadline: Option<std::time::Instant>) -> Option<Instant> {
+pub(crate) fn nested_poll_bound(nested_deadline: Option<std::time::Instant>) -> Option<Instant> {
     let nested_deadline = Instant::from_std(nested_deadline?);
     let now = Instant::now();
     Some(
@@ -134,6 +133,7 @@ fn nested_poll_bound(nested_deadline: Option<std::time::Instant>) -> Option<Inst
 
 struct CollectedOutput {
     bytes: Vec<u8>,
+    ranges: Option<crate::unified_exec::head_tail_buffer::OutputChunkRanges>,
     wake_reason: ToolLifecycleWakeReason,
 }
 
@@ -533,8 +533,8 @@ impl Drop for PendingProcessRegistration {
 }
 
 fn pending_process_cleanup_sender()
--> Option<&'static std::sync::mpsc::Sender<Arc<PendingProcessCleanup>>> {
-    static SENDER: OnceLock<Option<std::sync::mpsc::Sender<Arc<PendingProcessCleanup>>>> =
+-> Option<&'static tokio::sync::mpsc::UnboundedSender<Arc<PendingProcessCleanup>>> {
+    static SENDER: OnceLock<Option<tokio::sync::mpsc::UnboundedSender<Arc<PendingProcessCleanup>>>> =
         OnceLock::new();
     SENDER
         .get_or_init(|| {
@@ -548,13 +548,11 @@ fn pending_process_cleanup_sender()
                     return None;
                 }
             };
-            let (sender, receiver) = std::sync::mpsc::channel::<Arc<PendingProcessCleanup>>();
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Arc<PendingProcessCleanup>>();
             match std::thread::Builder::new()
                 .name("codex-unified-exec-cleanup".to_string())
                 .spawn(move || {
-                    while let Ok(cleanup) = receiver.recv() {
-                        runtime.block_on(run_pending_process_cleanup(cleanup));
-                    }
+                    runtime.block_on(drain_pending_process_cleanups(receiver));
                 }) {
                 Ok(_handle) => Some(sender),
                 Err(error) => {
@@ -564,6 +562,27 @@ fn pending_process_cleanup_sender()
             }
         })
         .as_ref()
+}
+
+async fn drain_pending_process_cleanups(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<Arc<PendingProcessCleanup>>,
+) {
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut closed = false;
+    loop {
+        tokio::select! {
+            cleanup = receiver.recv(), if !closed && tasks.len() < 8 => match cleanup {
+                Some(cleanup) => { tasks.spawn(run_pending_process_cleanup(cleanup)); }
+                None => closed = true,
+            },
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    tracing::error!(%error, "process cleanup task failed; custody remains retained");
+                }
+            }
+            else => break,
+        }
+    }
 }
 
 async fn run_pending_process_cleanup(cleanup: Arc<PendingProcessCleanup>) {
@@ -756,7 +775,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
         return Ok(());
     }
 
-    emit_failed_exec_end_for_unified_exec(
+    emit_exec_end_for_unified_exec(
         Arc::clone(&context.session),
         Arc::clone(&context.turn),
         context.call_id.clone(),
@@ -766,11 +785,10 @@ async fn emit_failed_initial_exec_end_if_unstored(
         Some(request.process_id.to_string()),
         transcript,
         fallback_output,
-        match process {
-            Some(process) => Some(process.snapshot_completion_output().await),
-            None => None,
-        },
-        message,
+        process.map(Arc::as_ref),
+        request.tty,
+        false,
+        Some(message),
         false,
         wall_time,
         context.source.clone(),
@@ -878,6 +896,7 @@ async fn finish_exited_process_result(
                     .as_ref()
                     .ok()
                     .map(|response| response.event_call_id.clone()),
+                output: result.ok().map(Box::new),
             });
         }
     }
@@ -901,20 +920,7 @@ impl UnifiedExecProcessManager {
         };
         let message = process.failure_message().unwrap_or(message);
         let (message, cleanup_confirmed) = match process.fail_and_terminate(message.clone()).await {
-            Ok(()) => {
-                let removed = {
-                    let mut store = self.process_store.lock().await;
-                    let is_same_process = store
-                        .processes
-                        .get(&process_id)
-                        .is_some_and(|entry| Arc::ptr_eq(&entry.process, process));
-                    is_same_process.then(|| store.remove(process_id)).flatten()
-                };
-                if let Some(entry) = removed {
-                    unregister_network_approval_for_entry(&entry).await;
-                }
-                (message, true)
-            }
+            Ok(()) => (message, true),
             Err(error) => {
                 tracing::warn!(
                     process_id,
@@ -929,6 +935,7 @@ impl UnifiedExecProcessManager {
         raw_output.extend_from_slice(format!("\n{message}").as_bytes());
         let process_exited = process.has_exited();
         let output = ExecCommandToolOutput {
+            output_ranges: None,
             process_output: Some(snapshot),
             error: Some(message.clone()),
             validation: process.validation(),
@@ -949,6 +956,22 @@ impl UnifiedExecProcessManager {
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
         };
+        if cleanup_confirmed {
+            let removed = {
+                let mut store = self.process_store.lock().await;
+                let is_same_process = store.processes.get(&process_id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.process, process));
+                if is_same_process {
+                    store.remember_finished(process_id, &output);
+                    store.remove(process_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(entry) = removed {
+                unregister_network_approval_for_entry(&entry).await;
+            }
+        }
         UnifiedExecError::ProcessFailedWithOutput { message, output: Box::new(output) }
     }
 
@@ -966,21 +989,25 @@ impl UnifiedExecProcessManager {
             let process_id = if should_use_deterministic_process_ids() {
                 // test or deterministic mode
                 let Some(process_id) = (1_000..=u32::MAX)
-                    .find(|candidate| !store.reserved_process_ids.contains(candidate))
+                    .find(|candidate| !store.used_process_ids.contains_key(candidate)
+                        && !store.reserved_process_ids.contains(candidate))
                 else {
                     panic!("process id space exhausted");
                 };
                 process_id
             } else {
                 // production mode: random
-                rand::rng().random_range(1_000..100_000)
+                rand::rng().random_range(1_000..=u32::MAX)
             };
 
-            if store.reserved_process_ids.contains(&process_id) {
+            if store.reserved_process_ids.contains(&process_id)
+                || store.used_process_ids.contains_key(&process_id)
+            {
                 continue;
             }
 
             store.reserved_process_ids.insert(process_id);
+            store.used_process_ids.insert(process_id, None);
             return process_id;
         }
     }
@@ -991,19 +1018,68 @@ impl UnifiedExecProcessManager {
         let process_store = Arc::clone(&self.process_store);
         tokio::spawn(async move {
             if transfer_receiver.await.is_err() {
-                process_store
-                    .lock()
-                    .await
-                    .reserved_process_ids
-                    .remove(&process_id);
+                let mut store = process_store.lock().await;
+                store.reserved_process_ids.remove(&process_id);
+                store.reserved_process_slots.remove(&process_id);
             }
         });
         ProcessIdReservation::new(process_id, transfer_sender)
     }
 
+    pub(crate) async fn exclude_process_ids(&self, ids: impl IntoIterator<Item = u32>) {
+        let mut store = self.process_store.lock().await;
+        for id in ids { store.used_process_ids.entry(id).or_insert(None); }
+    }
+
+    async fn reserve_process_capacity(
+        &self,
+        reservation: &mut ProcessIdReservation,
+    ) -> Result<(), UnifiedExecError> {
+        if reservation.capacity_reserved {
+            return Ok(());
+        }
+        let pruned_entry = {
+            let mut store = self.process_store.lock().await;
+            let pruned_entry = Self::prune_processes_if_needed(&mut store);
+            if store.occupied_slots() >= MAX_UNIFIED_EXEC_PROCESSES {
+                return Err(UnifiedExecError::process_failed(format!(
+                    "unified exec process limit ({MAX_UNIFIED_EXEC_PROCESSES}) reached; all slots are active, reserved, or awaiting output recovery; command was not started"
+                )));
+            }
+            // Hold admission across approvals, launch, and the initial response.
+            // The existing reservation owns cancellation cleanup until transfer.
+            store.reserved_process_slots.insert(reservation.process_id());
+            reservation.capacity_reserved = true;
+            pruned_entry
+        };
+        // Never await a process/output owner while holding the global store.
+        if let Some(entry) = pruned_entry {
+            unregister_network_approval_for_entry(&entry).await;
+            if let Some(session) = entry.session.upgrade() {
+                session
+                    .services
+                    .command_execution
+                    .finish_running_process_with_execution_id(
+                        entry.process_id,
+                        entry.command_execution_id,
+                        &entry.parent_tool_execution_id,
+                        Some(entry.process.exit_code().unwrap_or(-1)),
+                    )
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn allocate_process_id(&self) -> u32 {
         self.allocate_process_id_value().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_process_reservations_for_test(&self) -> bool {
+        let store = self.process_store.lock().await;
+        !store.reserved_process_ids.is_empty() || !store.reserved_process_slots.is_empty()
     }
 
     pub(crate) async fn release_process_id(&self, process_id: u32) {
@@ -1041,6 +1117,7 @@ impl UnifiedExecProcessManager {
         // Disarm delayed cancellation cleanup before making the number reusable.
         reservation.transfer_to_store();
         store.reserved_process_ids.remove(&reservation.process_id());
+        store.reserved_process_slots.remove(&reservation.process_id());
     }
 
     pub(crate) async fn exec_command(
@@ -1159,6 +1236,7 @@ impl UnifiedExecProcessManager {
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
         let mut tool_history_error = None;
+        self.reserve_process_capacity(process_id_reservation).await?;
         let executor_started_at = Instant::now();
         let tool_execution_timing_guard = context
             .turn
@@ -1295,8 +1373,9 @@ impl UnifiedExecProcessManager {
             quiet_period,
             &mut stall_handoff,
         )
-        .await
-        .bytes;
+        .await;
+        let output_ranges = collected.ranges;
+        let collected = collected.bytes;
         if cancellation_token.is_cancelled() || process.has_exited() {
             mark_exec_process_exited();
         }
@@ -1358,6 +1437,7 @@ impl UnifiedExecProcessManager {
                 exit_code: -1,
                 duration: wall_time,
                 event_call_id: Some(context.call_id.clone()),
+                output: None,
             })?;
             return Err(process_error);
         }
@@ -1391,6 +1471,7 @@ impl UnifiedExecProcessManager {
                 exit_code: -1,
                 duration: wall_time,
                 event_call_id: Some(context.call_id.clone()),
+                output: None,
             })?;
             return Err(process_error);
         }
@@ -1420,7 +1501,7 @@ impl UnifiedExecProcessManager {
                             .await);
                     }
                     process.check_for_sandbox_denial_with_text(&text).await?;
-                    (None, exit_code, true)
+                    (Some(process_id), exit_code, true)
                 }
                 ProcessStatus::Unknown => {
                     return Err(UnifiedExecError::UnknownProcessId { process_id });
@@ -1458,11 +1539,11 @@ impl UnifiedExecProcessManager {
                     exit_code: -1,
                     duration: wall_time,
                     event_call_id: Some(context.call_id.clone()),
+                    output: None,
                 })?;
                 return Err(process_error);
             }
             let exit_code = process.exit_code();
-            let exit = exit_code.unwrap_or(-1);
             let event_delivery_guard = event_delivery.lock().await;
             tool_history_error = emit_exec_end_for_unified_exec(
                 Arc::clone(&context.session),
@@ -1474,8 +1555,11 @@ impl UnifiedExecProcessManager {
                 Some(process_id.to_string()),
                 Arc::clone(&transcript),
                 text.clone(),
-                Some(process.snapshot_completion_output().await),
-                exit,
+                Some(process.as_ref()),
+                request.tty,
+                request.attempt_key.is_search_no_match(exit_code)
+                    || (!validation_process && crate::tools::shell_output_summary::ends_with_native_search(&request.hook_command)),
+                None,
                 false,
                 wall_time,
                 context.source.clone(),
@@ -1507,6 +1591,7 @@ impl UnifiedExecProcessManager {
             chunk_id,
             wall_time,
             raw_output: collected,
+            output_ranges,
             truncation_policy: context.turn.model_info.truncation_policy.into(),
             max_output_tokens: request.max_output_tokens,
             process_id: response_process_id,
@@ -1555,6 +1640,7 @@ impl UnifiedExecProcessManager {
                 exit_code: response.exit_code.unwrap_or(-1),
                 duration: response.wall_time,
                 event_call_id: Some(response.event_call_id.clone()),
+                output: Some(Box::new(response)),
             });
         }
         let mut response =
@@ -1591,16 +1677,15 @@ impl UnifiedExecProcessManager {
         request: WriteStdinRequest<'_>,
         until_output: bool,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        let process = self
-            .process_store
-            .lock()
-            .await
-            .processes
-            .get(&request.process_id)
-            .map(|entry| Arc::clone(&entry.process))
-            .ok_or(UnifiedExecError::UnknownProcessId {
-                process_id: request.process_id,
-            })?;
+        let process = {
+            let store = self.process_store.lock().await;
+            if let Some(response) = store.finished_response(&request) {
+                return response;
+            }
+            store.processes.get(&request.process_id)
+                .map(|entry| Arc::clone(&entry.process))
+                .ok_or(UnifiedExecError::UnknownProcessId { process_id: request.process_id })?
+        };
         let started_at = Instant::now();
         let hard_deadline = nested_poll_bound(request.nested_deadline);
         let result = self.write_stdin_inner(request, &process, until_output).await;
@@ -1620,6 +1705,14 @@ impl UnifiedExecProcessManager {
         until_output: bool,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process_id = request.process_id;
+
+        // Capture stable controls before spending the interaction-queue budget.
+        // Timeout handback must not reacquire store or artifact readiness locks.
+        let prepared_handles = match self.prepare_process_handles(process_id, locked_process).await {
+            Ok(handles) => handles,
+            Err(error) => return self.process_store.lock().await
+                .finished_response(&request).unwrap_or(Err(error)),
+        };
 
         // Register polls before joining the FIFO lock queue. A writer first
         // joins that queue, then wakes registered polls; no notification can be
@@ -1660,9 +1753,7 @@ impl UnifiedExecProcessManager {
                         interaction_queue_wait_ms = queue_started_at.elapsed().as_millis(),
                         "unified exec interaction still queued at the nested budget"
                     );
-                    return self
-                        .still_queued_result(process_id, locked_process, &request)
-                        .await;
+                    return Ok(Self::still_queued_result(&prepared_handles, &request, queue_started_at.elapsed()));
                 }
             },
             None => guard.await,
@@ -1672,6 +1763,16 @@ impl UnifiedExecProcessManager {
             interaction_queue_wait_ms = queue_started_at.elapsed().as_millis(),
             "unified exec interaction admitted"
         );
+
+        // A preceding poll may have retired this process while we queued.
+        if let Some(response) = self.process_store.lock().await.finished_response(&request) {
+            return response;
+        }
+        if !request.input.is_empty() && locked_process.has_exited() {
+            return Err(UnifiedExecError::process_failed(format!(
+                "process {process_id} has exited; input was not delivered",
+            )));
+        }
 
         let PreparedProcessHandles {
             process,
@@ -1690,9 +1791,7 @@ impl UnifiedExecProcessManager {
             tty,
             validation_launch,
             ..
-        } = self
-            .prepare_process_handles(process_id, locked_process)
-            .await?;
+        } = prepared_handles;
         let mut status_after_write = None;
         let yield_time_ms = {
             // Empty polls use configurable background timeout bounds. Non-empty
@@ -1727,12 +1826,14 @@ impl UnifiedExecProcessManager {
             Some(bound) => (start + Duration::from_millis(yield_time_ms)).min(bound),
             None => start + Duration::from_millis(yield_time_ms),
         };
+        let effective_timeout_ms = u64::try_from(deadline.saturating_duration_since(start).as_millis())
+            .unwrap_or(u64::MAX);
         let mut wait = WriteStdinWait(ToolLifecycleTimerWait {
             wait_kind: "write_stdin_yield".to_string(),
             requested_timeout_ms: Some(request.yield_time_ms),
-            effective_timeout_ms: Some(yield_time_ms),
+            effective_timeout_ms: Some(effective_timeout_ms),
             deadline_at_ms: active_tool_dispatch_timing()
-                .and_then(|timing| timing.deadline_after_ms(yield_time_ms)),
+                .and_then(|timing| timing.deadline_after_ms(effective_timeout_ms)),
             wake_reason: ToolLifecycleWakeReason::Cancelled,
             sequence: 0,
         });
@@ -1802,6 +1903,7 @@ impl UnifiedExecProcessManager {
         )
         .await;
         wait.0.wake_reason = collected.wake_reason;
+        let output_ranges = collected.ranges;
         let collected = collected.bytes;
         let wall_time = Instant::now().saturating_duration_since(start);
 
@@ -1862,7 +1964,7 @@ impl UnifiedExecProcessManager {
                         .fail_process_with_message(request.process_id, &entry.process, message)
                         .await);
                 }
-                (None, exit_code, true, call_id)
+                (Some(request.process_id), exit_code, true, call_id)
             }
             ProcessStatus::Unknown => {
                 if process.has_exited() {
@@ -1889,6 +1991,7 @@ impl UnifiedExecProcessManager {
             chunk_id,
             wall_time,
             raw_output: collected,
+            output_ranges,
             truncation_policy: request.truncation_policy,
             max_output_tokens: request.max_output_tokens,
             process_id,
@@ -1949,10 +2052,7 @@ impl UnifiedExecProcessManager {
         buffer.acknowledge_pending_output();
         if response.process_exited
             && terminal_output.is_some()
-            && process.terminal_completion_is_ready()
-            && process.has_exited()
-            && process.output_is_closed()
-            && !buffer.has_unreported_output()
+            && Self::process_can_retire(process, &buffer)
             && let Some(id) = response.process_id
             && store
                 .processes
@@ -1963,6 +2063,7 @@ impl UnifiedExecProcessManager {
             response.process_id = None;
             response.session_capabilities = None;
             response.process_output = terminal_output;
+            store.remember_finished(id, response);
         }
     }
 
@@ -1977,7 +2078,7 @@ impl UnifiedExecProcessManager {
         let drained = if expected_process.has_exited() && expected_process.output_is_closed() {
             let handles = expected_process.output_handles();
             let buffer = handles.output_buffer.lock().await;
-            expected_process.output_is_closed() && !buffer.has_unreported_output()
+            Self::process_can_retire(expected_process, &buffer)
         } else {
             false
         };
@@ -1993,9 +2094,8 @@ impl UnifiedExecProcessManager {
         let process_id = entry.process_id;
 
         if drained {
-            let Some(entry) = store.remove(process_id) else {
-                return ProcessStatus::Unknown;
-            };
+            // Retirement and replay publication happen together in acknowledge_output.
+            let entry = entry.clone();
             ProcessStatus::Exited {
                 exit_code,
                 entry: Box::new(entry),
@@ -2022,45 +2122,43 @@ impl UnifiedExecProcessManager {
     /// handle, not a failure: the process is untouched and the caller can poll
     /// again. Reporting it as an error would strand a live process behind a
     /// cancelled call.
-    async fn still_queued_result(
-        &self,
-        process_id: u32,
-        locked_process: &Arc<UnifiedExecProcess>,
+    fn still_queued_result(
+        handles: &PreparedProcessHandles,
         request: &WriteStdinRequest<'_>,
-    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        let handles = self
-            .prepare_process_handles(process_id, locked_process)
-            .await?;
-        let notice = if request.input.is_empty() {
-            "The poll reached its deadline while another interaction held this session. \
-             The process is still running; poll again."
-                .to_string()
+        queue_time: Duration,
+    ) -> ExecCommandToolOutput {
+        let process_exited = handles.process.has_exited();
+        let exit_code = handles.process.exit_code();
+        let state = if process_exited { "Process exited; output or completion may remain pending." }
+            else { "Process was still running at observation." };
+        let input = if request.input.is_empty() {
+            "No input was requested. Poll the retained session; do not restart the command."
         } else {
-            "The session was busy with another interaction until this call's deadline. \
-             The input was not delivered and was not retried; send it again."
-                .to_string()
+            "Input was not delivered and was not retried."
         };
-        Ok(ExecCommandToolOutput {
+        let notice = format!("Interaction deadline expired after {:.3}s queued. {state} {input}", queue_time.as_secs_f64());
+        ExecCommandToolOutput {
+            output_ranges: None,
             process_output: None,
             error: None,
             validation: handles.process.validation(),
-            event_call_id: handles.call_id,
+            event_call_id: handles.call_id.clone(),
             chunk_id: generate_chunk_id(),
-            wall_time: Duration::ZERO,
+            wall_time: queue_time,
             raw_output: Vec::new(),
             truncation_policy: request.truncation_policy,
             max_output_tokens: request.max_output_tokens,
             process_id: Some(handles.process_id),
             session_capabilities: Some(handles.process.session_capabilities(handles.tty)),
-            exit_code: None,
-            process_exited: false,
-            search_no_match: false,
+            exit_code,
+            process_exited,
+            search_no_match: handles.search_exit_one_is_no_match && exit_code == Some(1),
             original_token_count: Some(0),
-            hook_command: Some(handles.hook_command),
-            raw_output_artifact: handles.process.raw_output_artifact().await,
+            hook_command: Some(handles.hook_command.clone()),
+            raw_output_artifact: handles.process.try_raw_output_artifact(),
             repair_notice: Some(notice),
             pending_deferred_completions: Vec::new(),
-        })
+        }
     }
 
     async fn prepare_process_handles(
@@ -2161,40 +2259,14 @@ impl UnifiedExecProcessManager {
             session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
-        let (pruned_entry, stored) = {
+        let classified_search = entry.search_exit_one_is_no_match;
+        {
             let mut store = self.process_store.lock().await;
-            let pruned_entry = Self::prune_processes_if_needed(&mut store);
-            let stored = store.processes.len() < MAX_UNIFIED_EXEC_PROCESSES;
-            if stored {
-                store.processes.insert(process_id, entry);
-                process_id_reservation.transfer_to_store();
-            }
-            (pruned_entry, stored)
-        };
-        // prune_processes_if_needed runs while holding process_store; do async
-        // network-approval cleanup only after dropping that lock.
-        if let Some(pruned_entry) = pruned_entry {
-            unregister_network_approval_for_entry(&pruned_entry).await;
-            let exit_code = pruned_entry.process.exit_code().unwrap_or(-1);
-            context
-                .session
-                .services
-                .command_execution
-                .finish_running_process_with_execution_id(
-                    pruned_entry.process_id,
-                    pruned_entry.command_execution_id,
-                    &pruned_entry.parent_tool_execution_id,
-                    Some(exit_code),
-                )
-                .await;
-            debug_assert!(pruned_entry.process.has_exited());
-        }
-
-        if !stored {
-            let _ = process.terminate_confirmed().await;
-            return Err(UnifiedExecError::process_failed(format!(
-                "unified exec process limit ({MAX_UNIFIED_EXEC_PROCESSES}) reached; all slots are still active"
-            )));
+            let reserved = store.reserved_process_slots.remove(&process_id);
+            debug_assert!(reserved, "process capacity must be reserved before launch");
+            store.used_process_ids.insert(process_id, Some(process.session_capabilities(tty).incarnation));
+            store.processes.insert(process_id, entry);
+            process_id_reservation.transfer_to_store();
         }
 
         if let Err(error) = context
@@ -2207,6 +2279,7 @@ impl UnifiedExecProcessManager {
                 process_id,
                 attempt_key,
                 raw_output_artifact.clone(),
+                process.session_capabilities(tty).incarnation,
             )
             .await
         {
@@ -2239,6 +2312,8 @@ impl UnifiedExecProcessManager {
             context.tracker.clone(),
             tool_dispatch_timing,
             network_approval,
+            tty,
+            classified_search,
             validation_started_at,
         );
         registration.commit().await;
@@ -2852,7 +2927,7 @@ impl UnifiedExecProcessManager {
                         .as_ref()
                         .and_then(|timing| timing.turn_timing_state())
                     {
-                        turn_timing.record_next_sample_block_reason(
+                        turn_timing.record_tool_sample_block_reason(
                             NextSampleBlockReason::WaitingForProcessCleanup,
                         );
                     }
@@ -2895,8 +2970,8 @@ impl UnifiedExecProcessManager {
                     .as_ref()
                     .and_then(|timing| timing.turn_timing_state())
                 {
-                    turn_timing.record_next_sample_block_reason(
-                        NextSampleBlockReason::WaitingForProcessCleanup,
+                    turn_timing.record_tool_sample_block_reason(
+                        NextSampleBlockReason::WaitingForTool,
                     );
                 }
                 let wake_reason = tokio::select! {
@@ -2961,19 +3036,22 @@ impl UnifiedExecProcessManager {
         // A handoff can win the select before the ordinary output drain. Include
         // its diagnostic and any bytes already committed by the producer.
         guard.collect_pending_output();
-        let output = guard
+        let lag_marker = guard
             .pending_output()
             .map(|collected| {
-                let lag_marker = if collected.lagged_chunks() > 0 {
+                if collected.lagged_chunks() > 0 {
                     lagged_output_marker(collected.lagged_chunks())
                 } else {
                     Vec::new()
-                };
-                collected.to_bytes_with_loss_notice(&lag_marker)
+                }
             })
             .unwrap_or_default();
+        let (output, ranges) = guard.projected_pending_output(
+            output_closed.load(Ordering::Acquire), &lag_marker,
+        );
         CollectedOutput {
             bytes: output,
+            ranges,
             wake_reason,
         }
     }
@@ -3031,8 +3109,15 @@ impl UnifiedExecProcessManager {
         std::future::pending::<()>().await;
     }
 
+    fn process_can_retire(process: &UnifiedExecProcess, buffer: &HeadTailBuffer) -> bool {
+        process.has_exited()
+            && process.output_is_closed()
+            && process.terminal_completion_is_ready()
+            && !buffer.has_unreported_output()
+    }
+
     fn prune_processes_if_needed(store: &mut ProcessStore) -> Option<ProcessEntry> {
-        if store.processes.len() < MAX_UNIFIED_EXEC_PROCESSES {
+        if store.occupied_slots() < MAX_UNIFIED_EXEC_PROCESSES {
             return None;
         }
 
@@ -3051,7 +3136,15 @@ impl UnifiedExecProcessManager {
                 .map(|entry| entry.process.interaction_lock())
                 && let Ok(_interaction_guard) = interaction_lock.try_lock_owned()
             {
-                return store.remove(process_id);
+                let process = Arc::clone(&store.processes[&process_id].process);
+                let handles = process.output_handles();
+                // Admission must not block on output collection. In particular,
+                // exit alone does not mean the final response is recoverable.
+                if let Ok(buffer) = handles.output_buffer.try_lock()
+                    && Self::process_can_retire(&process, &buffer)
+                {
+                    return store.remove(process_id);
+                }
             }
             meta.retain(|(id, _, _)| *id != process_id);
         }
@@ -3074,14 +3167,14 @@ impl UnifiedExecProcessManager {
 
     pub(crate) async fn terminate_all_processes(&self) {
         let processes: Vec<(u32, Arc<UnifiedExecProcess>)> = {
-            let mut processes = self.process_store.lock().await;
-            let entries = processes
+            let processes = self.process_store.lock().await;
+            // In-flight admissions retain their reservations until their own
+            // cancellation/transfer boundary; termination only owns stored entries.
+            processes
                 .processes
                 .iter()
                 .map(|(process_id, entry)| (*process_id, Arc::clone(&entry.process)))
-                .collect();
-            processes.reserved_process_ids.clear();
-            entries
+                .collect()
         };
 
         let termination_results = futures::future::join_all(processes.into_iter().map(
@@ -3223,8 +3316,54 @@ impl UnifiedExecProcessManager {
             .collect()
     }
 
+    /// Return the published handle without draining output or moving ownership.
+    /// Execution identity prevents a recycled transport ID from being reused.
+    pub(crate) async fn reuse_running_validation(
+        &self,
+        process_id: u32,
+        execution_id: crate::tools::command_execution::CommandExecutionId,
+        truncation_policy: codex_utils_output_truncation::TruncationPolicy,
+        max_output_tokens: Option<usize>,
+    ) -> Option<ExecCommandToolOutput> {
+        let entry = {
+            let store = self.process_store.lock().await;
+            let entry = store.processes.get(&process_id)?;
+            if entry.command_execution_id != execution_id || entry.process.has_exited()
+                || entry.initial_exec_command_active.load(std::sync::atomic::Ordering::Acquire)
+                || !entry.process.validation().is_some_and(|validation| validation.is_validation())
+            { return None; }
+            entry.clone()
+        };
+        Some(ExecCommandToolOutput {
+            output_ranges: None,
+            process_output: None, error: None,
+            validation: entry.process.validation(),
+            event_call_id: entry.call_id,
+            chunk_id: generate_chunk_id(), wall_time: Duration::ZERO,
+            raw_output: Vec::new(), truncation_policy, max_output_tokens,
+            process_id: Some(process_id),
+            session_capabilities: Some(entry.process.session_capabilities(entry.tty)),
+            exit_code: None, process_exited: false, search_no_match: false,
+            original_token_count: Some(0), hook_command: Some(entry.hook_command),
+            raw_output_artifact: entry.process.raw_output_artifact().await,
+            repair_notice: Some("Reusing the identical validation already running at the same workspace identity. No new process was launched and no output was consumed; resume this session.".into()),
+            pending_deferred_completions: Vec::new(),
+        })
+    }
+
     pub(crate) async fn terminate_process(&self, process_id: u32) -> bool {
         self.terminate_process_inner(process_id, false).await
+    }
+
+    pub(crate) async fn process_incarnation(&self, process_id: u32) -> Option<uuid::Uuid> {
+        let store = self.process_store.lock().await;
+        store.processes.get(&process_id)
+            .map(|entry| entry.process.session_capabilities(entry.tty).incarnation)
+            .or_else(|| {
+                store.finished.iter().any(|(id, _)| *id == process_id)
+                    .then(|| store.used_process_ids.get(&process_id).copied().flatten())
+                    .flatten()
+            })
     }
 
     /// Keep the output consumer alive so write_stdin can deliver the final bytes

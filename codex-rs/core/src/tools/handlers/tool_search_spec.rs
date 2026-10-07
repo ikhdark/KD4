@@ -1,15 +1,18 @@
 use codex_tools::JsonSchema;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
+use codex_tools::LoadableToolSpec;
+use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "query".to_string(),
             JsonSchema::string(Some(
-                "Short search terms or an exact name for deferred tools; omit unrelated task context. Must contain non-whitespace text and must not exceed 4,096 UTF-8 bytes."
+                "Short capability terms or exact tool names. +term requires a metadata match; source:<canonical namespace> restricts membership to that namespace (scope tokens appear in the source catalog; shared namespaces may contain several connectors). At most one scope; omit it for broad discovery. Unknown snake_case names fail in name-only lookups; mixed capability queries retain identifiers as task terms, not fuzzy callable aliases. Must contain capability terms and must not exceed 4,096 UTF-8 bytes."
                     .to_string(),
             )),
         ),
@@ -19,7 +22,7 @@ pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
                 minimum: Some(serde_json::Number::from(1_u64)),
                 maximum: Some(serde_json::Number::from(64_u64)),
                 ..JsonSchema::integer(Some(format!(
-                    "Maximum number of relevant tools to return and activate. Weak matches return names only, without activation; refine the query or resolve an exact name. Choose the smallest useful limit to avoid loading unrelated schemas. Must be an integer from 1 through 64. Defaults to {default_limit}."
+                    "Maximum number of relevant tools to return and activate. Weak matches return names only, without activation; refine the query or resolve an exact name. Must be an integer from 1 through 64. Defaults to {default_limit}, except an entire query uniquely identifying one callable defaults to that callable only. An explicit limit preserves broader requests."
                 )))
             },
         ),
@@ -42,7 +45,27 @@ pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
 pub(crate) fn render_tool_search_sources(
     searchable_sources: &[ToolSearchSourceInfo],
     has_unnamed_tools: bool,
+    search_infos: &[ToolSearchInfo],
 ) -> String {
+    let mut scopes = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut owners = BTreeMap::<&str, BTreeSet<Option<&str>>>::new();
+    for info in search_infos {
+        let scope = canonical_source(info);
+        let name = info.source_info.as_ref().map(|source| source.name.as_str());
+        scopes.entry(name.unwrap_or("")).or_default().insert(scope);
+        owners.entry(scope).or_default().insert(name);
+    }
+    let scope_label = |name: &str| {
+        let Some(tokens) = scopes.get(name) else { return String::new(); };
+        let mut bytes = 0;
+        let labels = tokens.iter().take(8).filter_map(|scope| {
+            let label = format!("source:{scope}{}", if owners[scope].len() > 1 { " (shared)" } else { "" });
+            bytes += label.len();
+            (bytes <= 512).then_some(label)
+        }).collect::<Vec<_>>();
+        let omitted = tokens.len() - labels.len();
+        format!(" [{}{}]", labels.join(", "), if omitted == 0 { String::new() } else { format!("; {omitted} more scopes") })
+    };
     let mut source_descriptions = BTreeMap::new();
     for source in searchable_sources {
         source_descriptions
@@ -57,8 +80,7 @@ pub(crate) fn render_tool_search_sources(
 
     if source_descriptions.is_empty() {
         if has_unnamed_tools {
-            "- Deferred built-in or extension tools (named source metadata is unavailable; these deferred tools remain searchable)."
-                .to_string()
+            format!("- Deferred built-in or extension tools{} (named source metadata is unavailable; these deferred tools remain searchable).", scope_label(""))
         } else {
             "None currently enabled.".to_string()
         }
@@ -66,12 +88,12 @@ pub(crate) fn render_tool_search_sources(
         let mut source_descriptions = source_descriptions
             .into_iter()
             .map(|(name, description)| match description {
-                Some(description) => format!("- {name}: {description}"),
-                None => format!("- {name}"),
+                Some(description) => format!("- {name}{}: {description}", scope_label(&name)),
+                None => format!("- {name}{}", scope_label(&name)),
             })
             .collect::<Vec<_>>();
         if has_unnamed_tools {
-            source_descriptions.push("- Deferred built-in or extension tools".to_string());
+            source_descriptions.push(format!("- Deferred built-in or extension tools{}", scope_label("")));
         }
         // Charge separators as well as prose so a large connector catalog
         // cannot grow this model-visible contribution beyond the shared cap.
@@ -83,10 +105,41 @@ pub(crate) fn render_tool_search_sources(
     }
 }
 
+pub(crate) fn canonical_source(info: &ToolSearchInfo) -> &str {
+    match info.entry.output.as_ref() {
+        LoadableToolSpec::Namespace(namespace) => &namespace.name,
+        LoadableToolSpec::Function(tool) => &tool.name,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn source_catalog_advertises_bounded_canonical_and_shared_scopes() {
+        let infos = (0..12).map(|index| {
+            let spec = ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+                name: if index < 2 { "shared".into() } else { format!("canonical_{index}") },
+                description: String::new(),
+                tools: vec![codex_tools::ResponsesApiNamespaceTool::Function(codex_tools::ResponsesApiTool {
+                    name: format!("tool_{index}"), description: String::new(), strict: false, defer_loading: None,
+                    parameters: JsonSchema::object(BTreeMap::new(), None, None), output_schema: None,
+                })],
+            });
+            ToolSearchInfo::from_tool_spec(&spec, Some(ToolSearchSourceInfo {
+                name: if index == 0 { "First app".into() } else { "Other app".into() }, description: None,
+            })).unwrap()
+        }).collect::<Vec<_>>();
+        let sources = infos.iter().filter_map(|info| info.source_info.clone()).collect::<Vec<_>>();
+        let catalog = render_tool_search_sources(&sources, false, &infos);
+        assert!(catalog.contains("First app [source:shared (shared)]"));
+        assert!(catalog.contains("source:canonical_"));
+        assert!(catalog.contains("3 more scopes"));
+        assert!(!catalog.contains("source:First app"));
+        assert!(catalog.len() < 2048);
+    }
 
     #[test]
     fn create_tool_search_tool_deduplicates_and_renders_enabled_sources() {
@@ -110,6 +163,7 @@ mod tests {
                     },
                 ],
                 /*has_unnamed_tools*/ false,
+                &[],
             ),
             "- Google Drive: Use Google Drive as the single entrypoint for Drive, Docs, Sheets, and Slides work.\n- docs"
         );
@@ -127,7 +181,7 @@ mod tests {
                 description: Some("Find small records.".to_string()),
             },
         ];
-        let catalog = render_tool_search_sources(&sources, false);
+        let catalog = render_tool_search_sources(&sources, false, &[]);
         assert!(catalog.len() <= 40_000);
         assert!(catalog.contains("- small: Find small records."));
         assert!(catalog.contains("context truncated"));
@@ -135,7 +189,7 @@ mod tests {
 
     #[test]
     fn create_tool_search_tool_describes_unnamed_deferred_tools() {
-        let description = render_tool_search_sources(&[], true);
+        let description = render_tool_search_sources(&[], true, &[]);
 
         assert!(description.contains("- Deferred built-in or extension tools"));
         assert!(description.contains("named source metadata is unavailable"));
@@ -166,6 +220,7 @@ mod tests {
                 description: Some("Search Drive files.".to_string()),
             }],
             /*has_unnamed_tools*/ true,
+            &[],
         );
 
         assert!(description.contains("- Google Drive: Search Drive files."));

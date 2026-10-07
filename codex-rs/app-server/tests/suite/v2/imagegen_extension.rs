@@ -300,7 +300,7 @@ async fn standalone_image_generation_is_exposed_in_code_mode_only() -> Result<()
                     "call-1",
                     "exec",
                     r#"
-const result = await tools.image_gen__imagegen({ prompt: "paint a blue whale" });
+const result = await resolve_tool("image_gen.imagegen")({ prompt: "paint a blue whale" });
 generatedImage(result);
 "#,
                 ),

@@ -122,11 +122,14 @@ pub enum RolloutRecorderParams {
 struct CapturedRolloutItem {
     captured_at: OffsetDateTime,
     item: RolloutItem,
+    // Shared batch admission follows canonical records from enqueue through
+    // persistence, including retries and in-place manifest compaction.
+    admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl CapturedRolloutItem {
     fn new(item: RolloutItem, captured_at: OffsetDateTime) -> Self {
-        Self { captured_at, item }
+        Self { captured_at, item, admission: None }
     }
 
     /// Keeps the original capture time while replacing the payload, for the
@@ -135,6 +138,7 @@ impl CapturedRolloutItem {
         Self {
             captured_at: self.captured_at,
             item,
+            admission: self.admission.clone(),
         }
     }
 }
@@ -172,6 +176,28 @@ struct RolloutWriterTask {
     /// Serializes the lifecycle check with command enqueue across recorder
     /// clones so no command can be accepted behind Shutdown.
     enqueue_gate: tokio::sync::Semaphore,
+    pending_bytes: Arc<tokio::sync::Semaphore>,
+}
+
+const MAX_PENDING_ROLLOUT_BYTES: usize = 64 * 1024 * 1024;
+
+fn rollout_admission_bytes(items: &[RolloutItem]) -> std::io::Result<u32> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len().saturating_mul(4));
+            if self.0 > MAX_PENDING_ROLLOUT_BYTES {
+                return Err(IoError::other("rollout batch exceeds pending byte budget; no items accepted"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    // Account for decoded structure as well as payload bytes. Count before
+    // cloning, without allocating a second serialized copy of the batch.
+    let mut counter = Counter(items.len().saturating_mul(std::mem::size_of::<CapturedRolloutItem>() + 256));
+    serde_json::to_writer(&mut counter, items).map_err(IoError::other)?;
+    Ok(counter.0 as u32)
 }
 
 const WRITER_ACTIVE: u8 = 0;
@@ -187,6 +213,7 @@ impl RolloutWriterTask {
             terminal_failure: Mutex::new(None),
             lifecycle: AtomicU8::new(WRITER_ACTIVE),
             enqueue_gate: tokio::sync::Semaphore::new(1),
+            pending_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_ROLLOUT_BYTES)),
         }
     }
 
@@ -843,6 +870,46 @@ impl RolloutRecorder {
         params: RolloutRecorderParams,
         known_repository_context: Option<Option<RepositoryContext>>,
     ) -> std::io::Result<Self> {
+        Self::new_with_resume_state(config, params, known_repository_context, None).await
+    }
+
+    /// Load canonical history and its manifest dictionary in one pass. The
+    /// existing append/write leases bind both to the same file snapshot until
+    /// the recorder has taken custody; externally supplied history uses `new`.
+    pub async fn resume_and_load(
+        config: &impl RolloutConfigView,
+        path: PathBuf,
+        expected_thread: ThreadId,
+    ) -> std::io::Result<(Self, Vec<RolloutItem>)> {
+        let (path, writer) = open_rollout_for_append(&path).await?;
+        let lock_path = path.clone();
+        let _snapshot = tokio::task::spawn_blocking(move || compression::lock_rollout_for_write_blocking(&lock_path))
+            .await.map_err(IoError::other)??;
+        let mut items = Vec::new();
+        let mut manifests = crate::ToolManifestDictionary::default();
+        let (thread_id, errors, partial_tail) = Self::for_each_rollout_item_with_integrity(&path, |item, _| {
+            if let RolloutItem::ToolManifest(manifest) = &item
+                && let Err(error) = manifests.apply(manifest)
+            {
+                warn!(%error, "failed to reconstruct persisted tool manifest");
+            }
+            items.push(item);
+        }).await?;
+        if thread_id != Some(expected_thread) {
+            return Err(IoError::other("resume rollout belongs to a different thread"));
+        }
+        Self::append_reconstruction_notice(&mut items, errors, partial_tail);
+        let recorder = Self::new_with_resume_state(config, RolloutRecorderParams::resume(path), None,
+            Some((writer, manifests))).await?;
+        Ok((recorder, items))
+    }
+
+    async fn new_with_resume_state(
+        config: &impl RolloutConfigView,
+        params: RolloutRecorderParams,
+        known_repository_context: Option<Option<RepositoryContext>>,
+        resumed: Option<(JsonlWriter, crate::ToolManifestDictionary)>,
+    ) -> std::io::Result<Self> {
         let (writer, deferred_log_file_info, rollout_path, meta, tool_manifests) = match params {
             RolloutRecorderParams::Create {
                 session_id,
@@ -910,8 +977,13 @@ impl RolloutRecorder {
                 )
             }
             RolloutRecorderParams::Resume { path } => {
-                let tool_manifests = Self::existing_tool_manifests(path.as_path()).await?;
-                let (path, writer) = open_rollout_for_append(path.as_path()).await?;
+                let (path, writer, tool_manifests) = if let Some((writer, manifests)) = resumed {
+                    (path, writer, manifests)
+                } else {
+                    let tool_manifests = Self::existing_tool_manifests(path.as_path()).await?;
+                    let (path, writer) = open_rollout_for_append(path.as_path()).await?;
+                    (path, writer, tool_manifests)
+                };
                 (Some(writer), None, path, None, tool_manifests)
             }
         };
@@ -1001,6 +1073,9 @@ impl RolloutRecorder {
         if items.is_empty() {
             return Ok(());
         }
+        let admission = Arc::new(Arc::clone(&self.writer_task.pending_bytes)
+            .try_acquire_many_owned(rollout_admission_bytes(items)?)
+            .map_err(|_| IoError::other("rollout pending byte budget exhausted; no items accepted; use an explicit persistence barrier to retry retained records"))?);
         let (accepted, acceptance) = if wait_for_acceptance {
             let (accepted, acceptance) = oneshot::channel();
             (Some(accepted), Some(acceptance))
@@ -1016,7 +1091,11 @@ impl RolloutRecorder {
                     let captured_at = OffsetDateTime::now_utc();
                     items
                         .iter()
-                        .map(|item| CapturedRolloutItem::new(item.clone(), captured_at))
+                        .map(|item| {
+                            let mut captured = CapturedRolloutItem::new(item.clone(), captured_at);
+                            captured.admission = Some(Arc::clone(&admission));
+                            captured
+                        })
                         .collect()
                 },
                 flush_if_materialized,
@@ -1109,19 +1188,43 @@ impl RolloutRecorder {
         })?
     }
 
+    /// Load valid records plus a bounded, synthetic reconstruction notice when
+    /// records were skipped. Keeping the notice in the existing history carrier
+    /// makes gaps visible even to consumers that discard the diagnostic count.
+    /// It is not written back to the source rollout by this read.
     pub async fn load_rollout_items(
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
         let mut items = Vec::new();
-        let (thread_id, parse_errors) =
-            Self::for_each_rollout_item(path, |item| items.push(item)).await?;
+        let (thread_id, parse_errors, trailing_partial_records) =
+            Self::for_each_rollout_item_with_integrity(path, |item, _| items.push(item)).await?;
         tracing::debug!(
             "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
             items.len(),
             thread_id,
             parse_errors,
         );
+        Self::append_reconstruction_notice(&mut items, parse_errors, trailing_partial_records);
         Ok((items, thread_id, parse_errors))
+    }
+
+    fn append_reconstruction_notice(items: &mut Vec<RolloutItem>, parse_errors: usize, trailing_partial_records: usize) {
+        if parse_errors > 0 {
+            let malformed_records = parse_errors.saturating_sub(trailing_partial_records);
+            items.push(RolloutItem::ResponseItem(
+                codex_protocol::models::ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![codex_protocol::models::ContentItem::InputText {
+                        text: format!(
+                            "<rollout_reconstruction_gap>\nHistory is incomplete: {parse_errors} malformed rollout records were skipped. Integrity: malformed_records={malformed_records}, trailing_partial_records={trailing_partial_records}, complete=false. A trailing partial record indicates an interrupted append; other gaps may omit interior tool results or rollback markers. Missing records may include user constraints, context, rollback markers, or tool results. Do not treat this reconstruction as complete evidence or assume external effects were undone; reconcile affected work before relying on it.\n</rollout_reconstruction_gap>"
+                        ),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ));
+        }
     }
 
     /// Visit each valid rollout item without retaining the full rollout in memory.
@@ -1139,14 +1242,26 @@ impl RolloutRecorder {
     /// Visit each valid rollout item together with its one-based non-empty record number.
     pub(crate) async fn for_each_rollout_item_with_record_number<F>(
         path: &Path,
-        mut visit: F,
+        visit: F,
     ) -> std::io::Result<(Option<ThreadId>, usize)>
+    where
+        F: FnMut(RolloutItem, usize),
+    {
+        let (thread_id, errors, _) = Self::for_each_rollout_item_with_integrity(path, visit).await?;
+        Ok((thread_id, errors))
+    }
+
+    async fn for_each_rollout_item_with_integrity<F>(
+        path: &Path,
+        mut visit: F,
+    ) -> std::io::Result<(Option<ThreadId>, usize, usize)>
     where
         F: FnMut(RolloutItem, usize),
     {
         trace!("Resuming rollout from {path:?}");
         let mut thread_id: Option<ThreadId> = None;
         let mut parse_errors = 0usize;
+        let mut last_record_partial = false;
         let mut reader = compression::open_rollout_line_reader(path).await?;
         let mut saw_non_empty_line = false;
         let mut record_number = 0usize;
@@ -1155,12 +1270,14 @@ impl RolloutRecorder {
                 continue;
             }
             saw_non_empty_line = true;
+            last_record_partial = false;
             record_number = record_number.saturating_add(1);
             let mut v: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("failed to parse line as JSON: {line:?}, error: {e}");
                     parse_errors = parse_errors.saturating_add(1);
+                    last_record_partial = !reader.last_line_terminated() && e.is_eof();
                     continue;
                 }
             };
@@ -1203,7 +1320,12 @@ impl RolloutRecorder {
             return Err(IoError::other("empty session file"));
         }
 
-        Ok((thread_id, parse_errors))
+        // A damaged metadata payload must not hide an otherwise usable rollout.
+        let thread_id = thread_id.or_else(|| {
+            let (_, id) = crate::list::parse_timestamp_uuid_from_filename(path.file_name()?.to_str()?)?;
+            ThreadId::from_string(&id.to_string()).ok()
+        });
+        Ok((thread_id, parse_errors, usize::from(last_record_partial)))
     }
 
     async fn existing_tool_manifests(
@@ -1899,7 +2021,9 @@ impl RolloutWriterState {
     }
 
     async fn flush_if_materialized(&mut self) {
-        if self.is_deferred() {
+        // One automatic recovery episode per degradation. New additions may
+        // consume bounded admission, but only an explicit barrier retries I/O.
+        if self.is_deferred() || self.last_logged_error.is_some() {
             return;
         }
         if let Err(err) = self.write_pending_with_recovery("record").await {
@@ -1920,6 +2044,7 @@ impl RolloutWriterState {
 
     async fn flush_durable(&mut self) -> std::io::Result<()> {
         self.flush().await?;
+        crate::payload_artifact::sync_payload_artifacts(&self.rollout_path).await?;
         if let Some(writer) = self.writer.as_ref() {
             writer.file.sync_data().await?;
         }
@@ -2226,8 +2351,16 @@ pub async fn append_rollout_item_to_path(
     rollout_path: &Path,
     item: &RolloutItem,
 ) -> std::io::Result<()> {
-    let (_rollout_path, mut writer) = open_rollout_for_append(rollout_path).await?;
-    writer.write_rollout_item(item).await
+    let rollout_path = rollout_path.to_path_buf();
+    let item = item.clone();
+    // The task, not the cancellable caller, owns the append locks and any
+    // partial-write reconciliation until all filesystem work has settled.
+    tokio::spawn(async move {
+        let (_rollout_path, mut writer) = open_rollout_for_append(&rollout_path).await?;
+        writer.write_rollout_item(&item).await
+    })
+    .await
+    .map_err(IoError::other)?
 }
 
 async fn open_rollout_for_append(path: &Path) -> std::io::Result<(PathBuf, JsonlWriter)> {

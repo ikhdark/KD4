@@ -237,6 +237,7 @@ async fn collect_process_output_from_events(
                 drop(session);
                 return Ok((stdout, stderr, exit_code, true));
             }
+            ExecProcessEvent::OutputGap { .. } => anyhow::bail!("unexpected output gap"),
             ExecProcessEvent::Failed(message) => {
                 anyhow::bail!("process failed before closed state: {message}");
             }
@@ -260,6 +261,7 @@ async fn collect_process_event_snapshots(
                 ProcessEventSnapshot::Exited { seq, exit_code }
             }
             ExecProcessEvent::Closed { seq, .. } => ProcessEventSnapshot::Closed { seq },
+            ExecProcessEvent::OutputGap { .. } => anyhow::bail!("unexpected output gap"),
             ExecProcessEvent::Failed(message) => {
                 anyhow::bail!("process failed before closed state: {message}");
             }
@@ -810,6 +812,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
             ExecProcessEvent::Failed(message) => {
                 anyhow::bail!("process recovery failed: {message}");
             }
+            ExecProcessEvent::OutputGap { .. } => anyhow::bail!("unexpected output gap"),
         }
     }
     assert_eq!(

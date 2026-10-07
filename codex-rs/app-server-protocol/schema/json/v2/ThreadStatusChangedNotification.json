@@ -4,7 +4,14 @@
     "ThreadActiveFlag": {
       "enum": [
         "waitingOnApproval",
-        "waitingOnUserInput"
+        "waitingOnUserInput",
+        "resolvingResources",
+        "waitingOnDiffTracker",
+        "waitingOnWorkspaceGate",
+        "waitingOnEvidenceTracker",
+        "waitingOnDelivery",
+        "waitingOnProcessCleanup",
+        "readyToSample"
       ],
       "type": "string"
     },

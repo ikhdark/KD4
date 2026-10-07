@@ -30,6 +30,24 @@ def record(run_id="run-1", **updates):
 
 
 class SummaryTest(unittest.TestCase):
+    def test_successful_validation_work_is_not_elapsed_time_to_proof(self):
+        failure = record(outcome="failed", lifecycle_seconds=60,
+                         finished_at="2026-10-04T10:01:00+00:00")
+        success = record("success", input_coverage="complete", input_digest="a" * 64,
+                         started_at="2026-10-04T10:02:00+00:00",
+                         finished_at="2026-10-04T10:02:10+00:00")
+        success["proof"].update(status="passed", freshness="current", coverage="verified",
+                                freshness_basis={"revision": "r1"})
+        report = metrics.summarize([failure, success])
+        self.assertNotIn("time_to_current_proof", report["work"])
+        self.assertEqual(report["work"]["successful_current_validation_lifecycle"]["seconds"], 10)
+        self.assertEqual(report["work"]["lifecycle"]["seconds"], 70)
+        overlap = copy.deepcopy(success)
+        overlap["run_id"] = "overlap"
+        report = metrics.summarize([success, overlap])
+        self.assertEqual(report["work"]["successful_current_validation_lifecycle"]["seconds"], 20)
+        self.assertTrue(any("turn timing" in text for text in report["limitations"]))
+
     def test_unknown_is_not_zero_or_current_proof(self):
         value = record()
         value["commands"] = [{"wall_seconds": 7, "reported_build_seconds": 5,

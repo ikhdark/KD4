@@ -19,10 +19,37 @@ pub(crate) fn tool_output_selector_schema() -> JsonSchema {
 }
 
 pub(crate) fn file_selector_schema() -> JsonSchema {
-    selector_schema(false)
+    let mut schema = selector_schema(true);
+    if let Some(variants) = &mut schema.one_of
+        && let Some(section) = variants.iter_mut().find(|variant| {
+            variant.properties.as_ref().and_then(|properties| properties.get("kind"))
+                .and_then(|kind| kind.enum_values.as_ref())
+                .is_some_and(|values| values == &[serde_json::json!("section")])
+        })
+        && let Some(id) = section.properties.as_mut().and_then(|properties| properties.get_mut("id"))
+    {
+        id.description = Some("Use outline for a paged Rust/Python item listing (names, signatures, lines, tests, explicit module paths, and unverified linked_path_candidates), then a returned item ID for exact source. Verify module candidates through the selected filesystem only when following them. IDs are source-hash-bound; read_tool_output preserves them on the original snapshot. Ordinary reads do not parse code.".to_string());
+    }
+    if let Some(variants) = &mut schema.one_of {
+        variants.push(selector_variant(
+            "symbol",
+            BTreeMap::from([("name".to_string(), JsonSchema::string(Some(
+                "Unique Rust/Python item name, optionally qualified (Type::method, <Type as Trait>::method, module::Type::method, or Class.method in Python). No macro expansion; incomplete neighboring syntax is tolerated.".to_string(),
+            )))]),
+            vec!["name"],
+        ));
+        variants.push(selector_variant(
+            "enclosing",
+            BTreeMap::from([("line".to_string(), bounded_integer(1, u64::MAX,
+                "One-based line in the smallest enclosing Rust/Python item. Returns complete source lines, including Rust docs/attributes or Python decorators.".to_string(),
+            ))]),
+            vec!["line"],
+        ));
+    }
+    schema
 }
 
-fn selector_schema(include_structured: bool) -> JsonSchema {
+fn selector_schema(include_sections: bool) -> JsonSchema {
     let mut variants = vec![
         selector_variant(
             "bytes",
@@ -53,30 +80,28 @@ fn selector_schema(include_structured: bool) -> JsonSchema {
             vec!["start", "end"],
         ),
     ];
-    if include_structured {
-        variants.extend([
-            selector_variant(
-                "section",
-                BTreeMap::from([(
-                    "id".to_string(),
-                    JsonSchema::string(Some(
-                        "Stable section ID advertised by the original projection.".to_string(),
-                    )),
-                )]),
-                vec!["id"],
-            ),
-            selector_variant(
-                "json_pointer",
-                BTreeMap::from([(
-                    "pointer".to_string(),
-                    JsonSchema::string(Some(
-                        "RFC 6901 pointer; the empty string selects the root.".to_string(),
-                    )),
-                )]),
-                vec!["pointer"],
-            ),
-        ]);
+    if include_sections {
+        variants.push(selector_variant(
+            "section",
+            BTreeMap::from([(
+                "id".to_string(),
+                JsonSchema::string(Some(
+                    "Stable section ID advertised by the original projection.".to_string(),
+                )),
+            )]),
+            vec!["id"],
+        ));
     }
+    variants.push(selector_variant(
+        "json_pointer",
+        BTreeMap::from([(
+            "pointer".to_string(),
+            JsonSchema::string(Some(
+                "RFC 6901 pointer; the empty string selects the root.".to_string(),
+            )),
+        )]),
+        vec!["pointer"],
+    ));
     variants.push(
             selector_variant(
                 "search",
@@ -90,6 +115,10 @@ fn selector_schema(include_structured: bool) -> JsonSchema {
                     (
                         "case_insensitive".to_string(),
                         JsonSchema::boolean(Some("Match ASCII letters without regard to case; defaults to false. Non-ASCII bytes remain exact.".to_string())),
+                    ),
+                    (
+                        "enclosing".to_string(),
+                        JsonSchema::boolean(Some("Also hydrate complete enclosing Rust/Python items for this bounded page; defaults to false. read_file retains parsed item sections and continuations preserve this option. Recovery uses only those immutable sections, never mutable source. Non-item hits retain ordinary context. Check enclosing_complete and selector errors; ordinary context is not proof of a complete item.".to_string())),
                     ),
                     (
                         "start_byte".to_string(),
@@ -185,6 +214,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
             "canonical_bytes": {"type": "integer", "minimum": 0},
             "retained_bytes": {"type": "integer", "minimum": 0},
             "complete": {"type": "boolean"},
+            "selection_status": {"type": "string", "enum": ["complete", "partial", "failed"], "description": "Requested-page delivery, not transport success or whole-file coverage. Partial and failed batches retain all successful siblings."},
             "retained_artifact_complete": {"type": "boolean", "description": "All original bytes are retained. This does not imply the requested selection was delivered."},
             "delivered_selection_complete": {"type": "boolean", "description": "All requested selectors were delivered completely; legacy complete has the same meaning."},
             "unavailable_ranges": {"type": "array", "items": {"$ref": "#/$defs/range"}},
@@ -250,10 +280,12 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                 "properties": {
                     "query": {"type": "string"},
                     "start_byte": {"type": "integer", "minimum": 0},
-                    "coverage_complete": {"type": "boolean"},
+                    "coverage_complete": {"type": "boolean", "description": "The original source is fully retained. False means zero matches cannot establish absence; counts describe only retained bytes from start_byte."},
                     "total_matches": {"type": "integer", "minimum": 0},
                     "matches_returned": {"type": "integer", "minimum": 0},
                     "remaining_match_count": {"type": "integer", "minimum": 0},
+                    "search_exhausted": {"type": "boolean", "description": "No matches remain after this page within retained source. Independent of requested-page complete and coverage_complete."},
+                    "enclosing_complete": {"type": "boolean", "description": "When enclosing was requested, all enclosing sections for returned hits were resolved and hydrated. False never claims ordinary context is a complete item."},
                     "matches": {
                         "type": "array",
                         "items": {

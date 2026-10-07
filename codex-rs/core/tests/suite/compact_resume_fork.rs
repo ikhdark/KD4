@@ -179,12 +179,13 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let summary_after_fork = extract_summary_user_text(&requests[4], SUMMARY_TEXT);
     assert_eq!(
         json_conversation_user_texts(&requests[2]),
-        vec![summary_after_compact, "AFTER_COMPACT".to_string()]
+        vec![summary_after_compact, "hello world".to_string(), "AFTER_COMPACT".to_string()]
     );
     assert_eq!(
         json_conversation_user_texts(&requests[3]),
         vec![
             summary_after_resume,
+            "hello world".to_string(),
             "AFTER_COMPACT".to_string(),
             "AFTER_RESUME".to_string(),
         ]
@@ -193,6 +194,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
         json_conversation_user_texts(&requests[4]),
         vec![
             summary_after_fork,
+            "hello world".to_string(),
             "AFTER_COMPACT".to_string(),
             "AFTER_FORK".to_string(),
         ]
@@ -261,9 +263,11 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
     let summary_after_second_compact =
         extract_summary_user_text(&requests[requests.len() - 2], SUMMARY_TEXT);
     let expected_after_second_compact_user_texts = vec![
+        summary_after_second_compact,
+        "hello world".to_string(),
+        "AFTER_COMPACT".to_string(),
         "AFTER_RESUME".to_string(),
         "AFTER_FORK".to_string(),
-        summary_after_second_compact,
         "AFTER_COMPACT_2".to_string(),
     ];
     assert_eq!(
@@ -282,7 +286,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Scenario: rolling back behind a pre-turn compaction should replay
 /// append-only history from the rollout file and keep the compaction summary
-/// visible without restoring source messages consumed by compaction.
+/// visible alongside exact task input retained by compaction.
 async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Result<()> {
     require_network!();
 
@@ -327,7 +331,7 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
     let requests = request_log.requests();
     assert_eq!(requests.len(), 4);
     assert!(requests[1].body_contains_text(SUMMARIZATION_PROMPT));
-    assert!(!requests[2].body_contains_text("hello world"));
+    assert!(requests[2].body_contains_text("hello world"));
     assert!(requests[2].body_contains_text(SUMMARY_TEXT));
     assert!(requests[2].body_contains_text(EDITED_AFTER_COMPACT));
     let after_rollback_user_texts = response_conversation_user_texts(&requests[3]);
@@ -336,8 +340,8 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
         .expect("post-rollback request missing user messages");
     assert_eq!(after_rollback_last, AFTER_ROLLBACK);
     assert!(
-        !requests[3].body_contains_text("hello world"),
-        "rollback must not restore source messages consumed by compaction",
+        requests[3].body_contains_text("hello world"),
+        "rollback must preserve the original task input retained by compaction",
     );
     assert!(
         !requests[3].body_contains_text(EDITED_AFTER_COMPACT),
@@ -611,7 +615,7 @@ async fn mount_second_compact_sequence(server: &MockServer) -> ResponseMock {
 async fn start_test_conversation(
     server: &MockServer,
     model: Option<&str>,
-) -> (Arc<TempDir>, Config, Arc<ThreadManager>, Arc<CodexThread>) {
+) -> ((Arc<TempDir>, Arc<TempDir>), Config, Arc<ThreadManager>, Arc<CodexThread>) {
     let base_url = format!("{}/v1", server.uri());
     let model = model.map(str::to_string);
     let mut builder = test_codex().with_config(move |config| {
@@ -625,8 +629,8 @@ async fn start_test_conversation(
     let test = Box::pin(builder.build(server))
         .await
         .expect("create conversation");
-    let (codex, thread_manager) = test.codex.into_parts();
-    (test.home, test.config, thread_manager, codex)
+    let (codex, thread_manager, cwd) = test.codex.into_parts();
+    ((test.home, cwd), test.config, thread_manager, codex)
 }
 
 async fn user_turn(conversation: &Arc<CodexThread>, text: &str) {

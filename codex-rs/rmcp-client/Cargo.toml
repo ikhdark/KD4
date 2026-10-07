@@ -27,6 +27,7 @@ codex-utils-pty = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true, default-features = false, features = ["std"] }
 http = { workspace = true }
+httpdate = { workspace = true }
 memchr = { workspace = true }
 oauth2 = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [

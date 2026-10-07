@@ -658,14 +658,35 @@ class CommandExecWriteResponse(BaseModel):
     )
 
 
-class CommandExecutionOutputDeltaNotification(BaseModel):
+class CommandExecutionOutputMetadata(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    delta: str
-    item_id: Annotated[str, Field(alias="itemId")]
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
+    aggregated_output_is_exact: bool
+    decoding_lossy: bool
+    display_reduced: bool
+    failure_cause: Annotated[
+        str | None,
+        Field(
+            description="Harness/observation failure, not a program exit status or stderr bytes."
+        ),
+    ] = None
+    output_drained: bool
+    process_exited: Annotated[
+        bool,
+        Field(description="Process termination and output drain are independent observations."),
+    ]
+    raw_output_artifact_id: Annotated[
+        str | None,
+        Field(description="Existing retained-output locator, when available at delivery time."),
+    ] = None
+    search_no_match: Annotated[
+        bool,
+        Field(
+            description="Conservative owner-classified search miss; the raw exit code remains 1."
+        ),
+    ]
+    streams_are_exact: bool
 
 
 class CommandExecutionSource(Enum):
@@ -1051,6 +1072,11 @@ class DynamicToolSpec(RootModel[FunctionDynamicToolSpec | NamespaceDynamicToolSp
         populate_by_name=True,
     )
     root: FunctionDynamicToolSpec | NamespaceDynamicToolSpec
+
+
+class ExecOutputStream(Enum):
+    stdout = "stdout"
+    stderr = "stderr"
 
 
 class ExperimentalFeatureConsumer(Enum):
@@ -2251,7 +2277,9 @@ class McpToolCallProgressNotification(BaseModel):
     )
     item_id: Annotated[str, Field(alias="itemId")]
     message: str
+    progress: float | None = None
     thread_id: Annotated[str, Field(alias="threadId")]
+    total: float | None = None
     turn_id: Annotated[str, Field(alias="turnId")]
 
 
@@ -3606,17 +3634,6 @@ class ProcessExitedServerNotification(BaseModel):
     params: ProcessExitedNotification
 
 
-class ItemCommandExecutionOutputDeltaServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[
-        Literal["item/commandExecution/outputDelta"],
-        Field(title="Item/commandExecution/outputDeltaNotificationMethod"),
-    ]
-    params: CommandExecutionOutputDeltaNotification
-
-
 class ItemMcpToolCallProgressServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4029,6 +4046,13 @@ class TextRange(BaseModel):
 class ThreadActiveFlag(Enum):
     waiting_on_approval = "waitingOnApproval"
     waiting_on_user_input = "waitingOnUserInput"
+    resolving_resources = "resolvingResources"
+    waiting_on_diff_tracker = "waitingOnDiffTracker"
+    waiting_on_workspace_gate = "waitingOnWorkspaceGate"
+    waiting_on_evidence_tracker = "waitingOnEvidenceTracker"
+    waiting_on_delivery = "waitingOnDelivery"
+    waiting_on_process_cleanup = "waitingOnProcessCleanup"
+    ready_to_sample = "readyToSample"
 
 
 class ThreadArchiveParams(BaseModel):
@@ -4252,6 +4276,9 @@ class CommandExecutionThreadItem(BaseModel):
         int | None, Field(alias="exitCode", description="The command's exit code.")
     ] = None
     id: str
+    output_metadata: Annotated[
+        CommandExecutionOutputMetadata | None, Field(alias="outputMetadata")
+    ] = None
     parent_call_id: Annotated[
         str | None,
         Field(
@@ -4282,6 +4309,8 @@ class CommandExecutionThreadItem(BaseModel):
     ] = None
     source: CommandExecutionSource | None = "agent"
     status: CommandExecutionStatus
+    stderr: str | None = None
+    stdout: str | None = None
     type: Annotated[Literal["commandExecution"], Field(title="CommandExecutionThreadItemType")]
 
 
@@ -4830,6 +4859,15 @@ class ToolLifecycleWakeReason(Enum):
     timeout = "timeout"
     cancelled = "cancelled"
     retry = "retry"
+
+
+class TurnCompletionAssessment(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    advisories: list[str]
+    failed_checks: Annotated[list[str], Field(alias="failedChecks")]
+    verification_gaps: Annotated[list[str], Field(alias="verificationGaps")]
 
 
 class TurnDiffUpdatedNotification(BaseModel):
@@ -6677,6 +6715,27 @@ class CommandExecResizeParams(BaseModel):
     size: Annotated[PtyTerminalSize, Field(description="New PTY size in character cells.")]
 
 
+class CommandExecutionOutputDeltaNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    decoding_lossy: Annotated[
+        bool | None,
+        Field(
+            alias="decodingLossy",
+            description="Whether invalid UTF-8 was replaced while decoding this delta.",
+        ),
+    ] = None
+    delta: str
+    item_id: Annotated[str, Field(alias="itemId")]
+    stream: Annotated[
+        ExecOutputStream | None,
+        Field(description="Origin of this delta; absent only for legacy producers."),
+    ] = None
+    thread_id: Annotated[str, Field(alias="threadId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
+
+
 class ConfigEdit(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7596,6 +7655,17 @@ class ProcessOutputDeltaServerNotification(BaseModel):
         Literal["process/outputDelta"], Field(title="Process/outputDeltaNotificationMethod")
     ]
     params: ProcessOutputDeltaNotification
+
+
+class ItemCommandExecutionOutputDeltaServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[
+        Literal["item/commandExecution/outputDelta"],
+        Field(title="Item/commandExecution/outputDeltaNotificationMethod"),
+    ]
+    params: CommandExecutionOutputDeltaNotification
 
 
 class ItemCommandExecutionTerminalInteractionServerNotification(BaseModel):
@@ -10003,6 +10073,13 @@ class TurnTiming(BaseModel):
     ] = None
     classification_complete: Annotated[bool, Field(alias="classificationComplete")]
     completed_at_unix_ms: Annotated[int | None, Field(alias="completedAtUnixMs")] = None
+    completion_assessment: Annotated[
+        TurnCompletionAssessment | None,
+        Field(
+            alias="completionAssessment",
+            description="Completion diagnostics captured at the terminal boundary. These are independent of execution status and timing validity; empty diagnostics are not proof that the user's entire task was verified.",
+        ),
+    ] = None
     counters: TurnTimingCounters
     credit_delta: Annotated[
         str | None,

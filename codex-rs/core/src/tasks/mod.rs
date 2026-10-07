@@ -78,6 +78,7 @@ const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 pub(crate) struct TurnTaskResult {
     pub(crate) last_agent_message: Option<String>,
     pub(crate) surfaced_result: Option<codex_protocol::protocol::SurfacedToolResult>,
+    pub(crate) completion_assessment: Option<codex_protocol::protocol::TurnCompletionAssessment>,
     pub(crate) required_tool_terminal: Option<RequiredToolTerminal>,
     /// Preserve already-accepted pending input for a fresh turn instead of folding it into a
     /// terminal turn that no longer has a model-generation budget.
@@ -1189,13 +1190,22 @@ impl Session {
         self.emit_worker_join_failure_before_terminal(finalization, turn_context.as_ref())
             .await;
 
-        if abort_reason == Some(TurnAbortReason::Interrupted)
-            && let Some(marker) = interrupted_turn_history_marker(
-                InterruptedTurnHistoryMarker::from_config_and_version(
-                    turn_context.config.as_ref(),
-                    turn_context.multi_agent_version,
-                ),
-            )
+        let history_marker = if abort_reason == Some(TurnAbortReason::Interrupted) {
+            let mode = InterruptedTurnHistoryMarker::from_config_and_version(
+                turn_context.config.as_ref(), turn_context.multi_agent_version,
+            );
+            if self.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                let history = self.clone_history().await;
+                let plan = self.services.plan_store.snapshot().await;
+                let guidance = crate::context::TurnAborted::shutdown_guidance(history.raw_items(), plan.as_ref());
+                turn_boundary_history_marker(mode, &guidance, &guidance)
+            } else {
+                interrupted_turn_history_marker(mode)
+            }
+        } else {
+            None
+        };
+        if let Some(marker) = history_marker
             && let Err(err) = self
                 .record_conversation_items_durable(&turn_context, std::slice::from_ref(&marker))
                 .await
@@ -1271,11 +1281,14 @@ impl Session {
                 .session_telemetry
                 .record_duration(TURN_E2E_DURATION_METRIC, duration, &[]);
         }
-        let timing = crate::turn_timing::retain_turn_timing_details(
+        let mut timing = crate::turn_timing::retain_turn_timing_details(
             timing_snapshot.protocol_timing(),
             &turn_context.config.codex_home,
             &self.thread_id.to_string(),
         ).await;
+        if let TurnTerminalOutcome::Completed { result } = &finalization.outcome {
+            timing.completion_assessment = result.completion_assessment.clone();
+        }
         if finalization
             .permit
             .as_ref()

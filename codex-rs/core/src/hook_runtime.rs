@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -733,10 +732,18 @@ async fn record_session_start_additional_contexts(
     turn_context: &Arc<TurnContext>,
     additional_contexts: Vec<String>,
 ) -> std::io::Result<()> {
-    // Compare original rendered contributions before spending the turn budget.
+    // The startup hook aggregate is one source. Its latest contribution, not
+    // every developer message ever delivered, is the effective value.
     let candidates = additional_contexts
         .into_iter()
-        .map(|text| ContextualUserFragment::into(HookAdditionalContext::new(text)))
+        .enumerate()
+        .map(|(index, text)| {
+            let mut item = ContextualUserFragment::into(HookAdditionalContext::new(text));
+            if let ResponseItem::Message { id, .. } = &mut item {
+                *id = Some(codex_protocol::ResponseItemId::with_suffix("msg_startup_context", index));
+            }
+            item
+        })
         .collect();
     let candidates = sess.dedupe_existing_developer_contexts(candidates).await;
     let contexts = candidates
@@ -744,7 +751,17 @@ async fn record_session_start_additional_contexts(
         .filter_map(single_developer_input_text)
         .map(str::to_owned)
         .collect();
-    let developer_messages = prepare_additional_context_items(sess, turn_context, contexts).await;
+    let mut developer_messages = prepare_additional_context_items(sess, turn_context, contexts).await;
+    let mut sources = candidates.iter();
+    for item in &mut developer_messages {
+        // Whole-item admission can skip an oversized source and admit a later
+        // one. Preserve attribution by matching its exact retained text, not
+        // its position in the shortened list. Omission notices have no owner.
+        let source = sources.find(|source| single_developer_input_text(source) == single_developer_input_text(item));
+        if let (ResponseItem::Message { id, .. }, Some(ResponseItem::Message { id: source_id, .. })) = (item, source) {
+            *id = source_id.clone();
+        }
+    }
     if developer_messages.is_empty() {
         return Ok(());
     }
@@ -756,25 +773,41 @@ pub(crate) fn dedupe_existing_developer_contexts(
     existing: &[ResponseItem],
     candidates: Vec<ResponseItem>,
 ) -> Vec<ResponseItem> {
-    let mut existing_text = existing
-        .iter()
-        .filter_map(|item| match item {
-            ResponseItem::Message { role, content, .. } if role == "developer" => Some(content),
+    let mut retained = Vec::new();
+    for candidate in candidates {
+        // A single hook snapshot can repeat a body at multiple positions. Do
+        // not charge that duplicate against the shared admission budget twice.
+        if single_developer_input_text(&candidate).is_some_and(|text| {
+            retained.iter().any(|item| single_developer_input_text(item) == Some(text))
+        }) {
+            continue;
+        }
+        let source = match &candidate {
+            ResponseItem::Message { id, .. } => id.as_ref(),
             _ => None,
-        })
-        .flatten()
-        .filter_map(|item| match item {
-            codex_protocol::models::ContentItem::InputText { text } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    candidates
-        .into_iter()
-        .filter(|candidate| {
-            single_developer_input_text(candidate)
-                .is_none_or(|text| existing_text.insert(text.to_owned()))
-        })
-        .collect()
+        };
+        let latest = existing.iter().chain(retained.iter()).rev().find(|item| {
+            matches!(item, ResponseItem::Message { role, id, .. }
+                if role == "developer" && source.is_none_or(|source| id.as_ref() == Some(source)))
+        }).or_else(|| {
+            // Older rollouts have no startup-source IDs and may group several
+            // fragments into one developer message. Only the newest legacy
+            // message is an effective fallback, never all historical bodies.
+            existing.iter().rev().find(|item| matches!(item,
+                ResponseItem::Message { role, id, .. }
+                    if role == "developer" && id.as_ref().is_none_or(|id|
+                        !id.as_str().starts_with("msg_startup_context_"))))
+        });
+        if single_developer_input_text(&candidate).is_none_or(|text| {
+            !matches!(latest, Some(ResponseItem::Message { content, .. })
+                if content.iter().any(|part| matches!(part,
+                    codex_protocol::models::ContentItem::InputText { text: existing }
+                        if existing == text)))
+        }) {
+            retained.push(candidate);
+        }
+    }
+    retained
 }
 
 fn single_developer_input_text(item: &ResponseItem) -> Option<&str> {
@@ -798,12 +831,10 @@ pub(crate) async fn prepare_additional_context_items(
     if additional_contexts.is_empty() {
         return Vec::new();
     }
-    let total = additional_contexts.len();
-    let messages = {
+    let (messages, omitted) = {
         let mut budget = turn_context.hook_context_budget.lock().await;
         additional_context_messages_with_budget(additional_contexts, &mut budget)
     };
-    let omitted = total - messages.len();
     if omitted > 0 {
         sess.send_event(
             turn_context,
@@ -820,25 +851,33 @@ pub(crate) async fn prepare_additional_context_items(
 
 #[cfg(test)]
 fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<ResponseItem> {
-    additional_context_messages_with_budget(additional_contexts, &mut ModelContextBudget::default())
+    additional_context_messages_with_budget(additional_contexts, &mut ModelContextBudget::default()).0
 }
 
 fn additional_context_messages_with_budget(
     additional_contexts: Vec<String>,
     budget: &mut ModelContextBudget,
-) -> Vec<ResponseItem> {
-    additional_contexts
+) -> (Vec<ResponseItem>, usize) {
+    let mut omitted = 0;
+    let mut messages = additional_contexts
         .into_iter()
         .map(HookAdditionalContext::new)
         .filter_map(|fragment| {
-            budget.take(&fragment.render()).map(|text| {
-                ContextualUserFragment::into(RenderedContextFragment::new(
-                    "developer",
-                    text.into_owned(),
-                ))
-            })
+            let text = fragment.render();
+            if !budget.try_take(&text) {
+                omitted += 1;
+                return None;
+            }
+            Some(ContextualUserFragment::into(RenderedContextFragment::new("developer", text)))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if omitted > 0 {
+        let notice = format!("Omitted {omitted} whole hook context fragment(s) due to the context budget; no partial instructions were admitted.");
+        if budget.try_take(&notice) {
+            messages.push(ContextualUserFragment::into(RenderedContextFragment::new("developer", notice)));
+        }
+    }
+    (messages, omitted)
 }
 
 async fn emit_hook_started_events(
@@ -1196,6 +1235,36 @@ mod tests {
     }
 
     #[test]
+    fn startup_context_reassertion_compares_only_latest_source_value() {
+        let item = |text: &str, source: &str| {
+            let mut item = additional_context_messages(vec![text.to_string()]).remove(0);
+            if let codex_protocol::models::ResponseItem::Message { id, .. } = &mut item {
+                *id = Some(codex_protocol::ResponseItemId::from_server(source.to_string()));
+            }
+            item
+        };
+        let a = item("A", "msg_startup_context_0");
+        let b = item("B", "msg_startup_context_0");
+        let other = item("A", "msg_startup_context_1");
+        assert_eq!(dedupe_existing_developer_contexts(&[a.clone(), b, other], vec![a.clone()]), vec![a.clone()]);
+        assert!(dedupe_existing_developer_contexts(&[a.clone()], vec![a]).is_empty());
+    }
+
+    #[test]
+    fn startup_context_legacy_fallback_uses_only_latest_message() {
+        let mut candidate = additional_context_messages(vec!["A".to_string()]).remove(0);
+        if let codex_protocol::models::ResponseItem::Message { id, .. } = &mut candidate {
+            *id = Some(codex_protocol::ResponseItemId::with_suffix("msg_startup_context", 0));
+        }
+        let legacy = additional_context_messages(vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            dedupe_existing_developer_contexts(&legacy, vec![candidate.clone()]),
+            vec![candidate.clone()]
+        );
+        assert!(dedupe_existing_developer_contexts(&legacy[..1], vec![candidate]).is_empty());
+    }
+
+    #[test]
     fn additional_context_messages_share_one_hard_budget() {
         let messages = additional_context_messages(vec!["a".repeat(30_000), "b".repeat(30_000)]);
         assert_eq!(messages.len(), 2);
@@ -1204,9 +1273,8 @@ mod tests {
             Some("a".repeat(30_000).as_str())
         );
         let second = super::single_developer_input_text(&messages[1]).expect("second context");
-        assert!(second.starts_with('b'));
-        assert!(second.ends_with('b'));
-        assert!(second.contains("[... context truncated ...]"));
+        assert!(second.starts_with("Omitted 1 whole hook context fragment"));
+        assert!(!second.contains("bbbb"));
         let rendered_bytes = messages
             .iter()
             .map(|message| match message {
@@ -1220,10 +1288,18 @@ mod tests {
                 _ => 0,
             })
             .sum::<usize>();
-        assert_eq!(
-            rendered_bytes,
-            codex_context_fragments::ModelContextBudget::default().remaining_bytes()
-        );
+        assert!(rendered_bytes <= codex_context_fragments::ModelContextBudget::default().remaining_bytes());
+    }
+
+    #[test]
+    fn oversized_hook_instructions_are_never_spliced() {
+        let instruction = format!("Perform the action. {} Except when unapproved, do not perform it. {} Proceed.", "x".repeat(30_000), "y".repeat(30_000));
+        let messages = additional_context_messages(vec![instruction]);
+        assert_eq!(messages.len(), 1);
+        let text = super::single_developer_input_text(&messages[0]).unwrap();
+        assert!(text.starts_with("Omitted 1 whole"));
+        assert!(!text.contains("Perform"));
+        assert!(!text.contains("Proceed"));
     }
 
     #[tokio::test]

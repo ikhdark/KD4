@@ -2353,7 +2353,7 @@ async fn user_shell_commands_do_not_inherit_managed_network_proxy() -> anyhow::R
     loop {
         let event = rx.recv().await.expect("channel open");
         if let EventMsg::ExecCommandEnd(event) = event.msg {
-            assert_eq!(event.exit_code, 0);
+            assert_eq!(event.exit_code, Some(0));
             assert_eq!(event.stdout.trim(), "not-set");
             break;
         }
@@ -3059,7 +3059,10 @@ async fn resumed_history_marks_a_turn_that_never_completed() {
 
     let history = session.state.lock().await.clone_history();
     let items = history.raw_items();
-    let last = items.last().expect("resumed history keeps the request");
+    let last = items.iter().find(|item| matches!(item,
+        ResponseItem::Message { content, .. } if content.iter().any(|part|
+            matches!(part, ContentItem::InputText { text } if text.contains("lost process, not a user interruption")))))
+        .expect("resumed history keeps the interruption marker");
     let ResponseItem::Message { role, content, .. } = last else {
         panic!("expected a turn boundary marker after the unfinished request, got {last:?}");
     };
@@ -3070,7 +3073,12 @@ async fn resumed_history_marks_a_turn_that_never_completed() {
             [ContentItem::InputText { text }, ContentItem::InputText { text: timing }]
                 if text.contains("lost process, not a user interruption")
                     && text.contains("2 tool call(s) and 1 tool result(s)")
-                    && text.contains("child commands may still be running")
+                    && if cfg!(windows) {
+                        text.contains("kill-on-close jobs were terminated")
+                            && text.contains("remote commands or deliberately detached/preserved descendants")
+                    } else {
+                        text.contains("child commands may still be running")
+                    }
                     && timing.contains("not a valid complete timing profile")
         ),
         "recovery must preserve recorded work without inventing completion: {content:?}"
@@ -4915,6 +4923,55 @@ async fn thread_rollback_drops_last_turn_from_history() {
 }
 
 #[tokio::test]
+async fn thread_rollback_append_failure_preserves_live_history_and_context() {
+    let (mut session, turn, _events) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+    let history = vec![user_message("retain request"), assistant_message("retain answer")];
+    session.record_conversation_items(&turn, &history).await.unwrap();
+    session.flush_rollout().await.unwrap();
+    let before = session.clone_history().await.into_raw_items();
+    session.state.lock().await.set_reference_context_item(Some(turn.to_turn_context_item()));
+    let reference = session.reference_context_item().await;
+    let bytes = tokio::fs::read(&rollout_path).await.unwrap();
+    session.live_thread().unwrap().shutdown().await.unwrap();
+    let rollback = EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 });
+    let replay = before.iter().cloned().map(RolloutItem::ResponseItem)
+        .chain(std::iter::once(RolloutItem::EventMsg(rollback.clone()))).collect();
+    session.commit_rollback_history(&turn, replay, rollback).await
+        .expect_err("the ordered append must fail before publication");
+    assert_eq!(session.clone_history().await.raw_items(), before);
+    assert_eq!(session.reference_context_item().await, reference);
+    assert_eq!(tokio::fs::read(&rollout_path).await.unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn thread_rollback_barrier_failure_fences_retry_before_publication() {
+    let (mut session, turn, _events) = make_session_and_context_with_rx().await;
+    let path = attach_thread_persistence_with_materialization(
+        Arc::get_mut(&mut session).unwrap(), false,
+    ).await;
+    let before = vec![user_message("retained request"), assistant_message("retained answer")];
+    session.replace_history(before.clone(), Some(turn.to_turn_context_item())).await;
+    tokio::fs::create_dir_all(&path).await.unwrap();
+    let rollback = EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 });
+    let replay = before.iter().cloned().map(RolloutItem::ResponseItem)
+        .chain(std::iter::once(RolloutItem::EventMsg(rollback.clone()))).collect::<Vec<_>>();
+    let error = session.commit_rollback_history(&turn, replay.clone(), rollback.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("unconfirmed"));
+    assert_eq!(session.clone_history().await.raw_items(), before);
+    assert!(session.durable_history_commit_gate.is_closed());
+    tokio::fs::remove_dir(&path).await.unwrap();
+    assert!(session.commit_rollback_history(&turn, replay, rollback).await.is_err());
+    // Repair may make the original queued marker durable, but never a second one.
+    session.live_thread().unwrap().flush_durable().await.unwrap();
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    assert_eq!(items.iter().filter(|item| matches!(item,
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)))).count(), 1);
+    assert_eq!(session.clone_history().await.raw_items(), before);
+}
+
+#[tokio::test]
 async fn thread_rollback_clears_history_when_num_turns_exceeds_existing_turns() {
     let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
     attach_thread_persistence(
@@ -5905,6 +5962,29 @@ async fn wait_for_thread_rollback_failed(rx: &async_channel::Receiver<Event>) ->
 
 pub(crate) async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
     attach_thread_persistence_with_materialization(session, true).await
+}
+
+#[tokio::test]
+async fn reconstruction_keeps_rollout_gap_after_compaction() {
+    let (mut session, turn, _events) = make_session_and_context_with_rx().await;
+    let path = attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+    session.record_conversation_items(&turn, &[user_message("original constraint")]).await.unwrap();
+    session.live_thread().unwrap().shutdown().await.unwrap();
+    let mut bytes = tokio::fs::read(&path).await.unwrap();
+    bytes.extend_from_slice(b"\nmalformed middle record\n");
+    let compacted = serde_json::json!({
+        "timestamp": "2026-10-07T00:00:00Z", "type": "compacted",
+        "payload": {"message": "summary", "replacement_history": []}
+    });
+    bytes.extend_from_slice(compacted.to_string().as_bytes());
+    bytes.push(b'\n');
+    tokio::fs::write(&path, &bytes).await.unwrap();
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 1);
+    let rebuilt = session.reconstruct_history_from_rollout(&turn, &items).await;
+    assert!(rebuilt.history.iter().any(|item| serde_json::to_string(item).unwrap()
+        .contains("1 malformed rollout records")));
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
 }
 
 async fn attach_thread_persistence_with_materialization(
@@ -9084,6 +9164,78 @@ async fn shutdown_continues_when_tool_history_persistence_stalls() {
 }
 
 #[tokio::test]
+async fn shutdown_deadline_retains_accepted_history_commit_and_reports_uncertainty() {
+    let (mut session, turn, events) = make_session_and_context_with_rx().await;
+    let store = Arc::new(codex_thread_store::InMemoryThreadStore::default());
+    let thread_store: Arc<dyn codex_thread_store::ThreadStore> = store.clone();
+    let config = session.get_config().await;
+    let live_thread = LiveThread::create(
+        Arc::clone(&thread_store),
+        CreateThreadParams {
+            session_id: session.session_id(),
+            thread_id: session.thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: Default::default(),
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(config.cwd.to_path_buf()),
+                model_provider: config.model_provider_id.clone(),
+            },
+        },
+    ).await.expect("create thread persistence");
+    let owned = Arc::get_mut(&mut session).expect("fixture owns session");
+    owned.services.thread_store = thread_store;
+    owned.services.live_thread = Some(live_thread);
+    session.spawn_task(
+        turn,
+        Vec::new(),
+        NeverEndingTask { kind: TaskKind::Regular, listen_to_cancellation_token: true },
+    ).await;
+    let accepted_commit = session.retain_tool_dispatch_commit();
+    tokio::time::pause();
+    assert!(tokio::time::timeout(
+        Duration::from_secs(15),
+        handlers::shutdown(&session, "held-history-shutdown".into()),
+    ).await.expect("accepted commit must not make shutdown wait indefinitely"));
+    assert!(!session.terminal_tasks.is_empty(), "finalizer keeps ownership of pending work");
+    assert_eq!(store.calls().await.shutdown_thread, 0, "writer must remain open for the accepted commit");
+    let mut uncertainty_reported = false;
+    loop {
+        let event = events.try_recv().expect("shutdown completion is queued");
+        if event.id != "held-history-shutdown" {
+            continue;
+        }
+        match event.msg {
+            EventMsg::Error(error) => {
+                uncertainty_reported |= error.message.contains("durability is unconfirmed");
+            }
+            EventMsg::ShutdownComplete => {
+                assert!(uncertainty_reported, "ShutdownComplete must not attest unsaved history");
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(accepted_commit);
+    tokio::time::timeout(Duration::from_secs(10), session.terminal_tasks.wait())
+        .await.expect("retained finalizer finishes once the accepted commit completes");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.calls().await.shutdown_thread == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.expect("owned writer shutdown follows the retained finalizer");
+}
+
+#[tokio::test]
 async fn completed_tool_consumption_does_not_wait_for_persistence() {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let (session, turn_context, _rx_event) = make_session_and_context_with_auth_config_home_and_rx(
@@ -10510,6 +10662,88 @@ fn compaction_test_replacement() -> (Vec<ResponseItem>, CompactedItem) {
 }
 
 #[tokio::test]
+async fn compacted_history_installs_application_policy_in_live_and_durable_history() {
+    let fixture = compaction_persistence_fixture(false).await;
+    let session = &fixture.session;
+    let values = indexmap::IndexMap::from([(
+        "policy".to_string(),
+        AdditionalContextEntry {
+            value: "Application sentinel: never modify X.".to_string(),
+            kind: codex_protocol::protocol::AdditionalContextKind::Application,
+        },
+    )]);
+    let input = session
+        .state
+        .lock()
+        .await
+        .additional_context
+        .merge(values.clone());
+    let original = input
+        .into_iter()
+        .map(ResponseItem::from)
+        .collect::<Vec<_>>();
+    session
+        .record_conversation_items_ordered(&fixture.turn_context, &original)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let (replacement, compacted_item) = compaction_test_replacement();
+        session
+            .replace_compacted_history(
+                &fixture.turn_context,
+                replacement,
+                None,
+                None,
+                Vec::new(),
+                compacted_item,
+            )
+            .await
+            .unwrap();
+        let history = session.clone_history().await.into_raw_items();
+        let ResponseItem::Message { role, content, .. } = &original[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| matches!(item,
+                    ResponseItem::Message { role: actual_role, content: actual_content, .. }
+                        if actual_role == role && actual_content == content
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            session
+                .state
+                .lock()
+                .await
+                .additional_context
+                .merge(values.clone())
+                .is_empty()
+        );
+        session
+            .flush_rollout_after_ordered_commits(&fixture.turn_context)
+            .await
+            .unwrap();
+        let (rollout, _, errors) = RolloutRecorder::load_rollout_items(&fixture.rollout_path)
+            .await.unwrap();
+        assert_eq!(errors, 0);
+        let installed = rollout
+            .into_iter()
+            .filter_map(|item| {
+                match item {
+                    RolloutItem::Compacted(item) => item.replacement_history,
+                    _ => None,
+                }
+            })
+            .last()
+            .unwrap();
+        assert_eq!(installed, history);
+    }
+}
+
+#[tokio::test]
 async fn compacted_history_rejects_failed_initial_drain_without_changing_history_or_protection() {
     let fixture = compaction_persistence_fixture(/*block_initial_persistence*/ true).await;
     let session = &fixture.session;
@@ -11910,7 +12144,7 @@ async fn build_initial_context_includes_prompt_fragments_from_extensions() {
         developer_messages
             .iter()
             .flatten()
-            .any(|text| *text == "prompt extension enabled"),
+            .any(|text| *text == crate::stable_context::turn_contribution_text(1, "prompt extension enabled")),
         "expected prompt extension developer text, got {developer_messages:?}"
     );
 }
@@ -11998,7 +12232,7 @@ async fn prepared_context_update_renders_full_world_only_when_required() {
         let texts = developer_input_texts(prepared.context_items());
         if current_phase == 1 {
             assert!(prepared.context_items().is_empty());
-        } else {
+        } else if current_phase != 3 {
             let revision = usize::from(current_phase >= 2);
             assert!(
                 texts
@@ -12031,8 +12265,8 @@ async fn prepared_context_update_renders_full_world_only_when_required() {
                 .is_some()
         );
     }
-    assert_eq!(full_renders.load(Ordering::SeqCst), 2);
-    assert_eq!(delta_renders.load(Ordering::SeqCst), 2);
+    assert_eq!(full_renders.load(Ordering::SeqCst), 1);
+    assert_eq!(delta_renders.load(Ordering::SeqCst), 3);
     let state = session.state.lock().await;
     assert_eq!(
         state
@@ -12079,7 +12313,7 @@ async fn prepared_context_update_polls_contributors_once_across_planning_and_com
     assert_eq!(world_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     let history = session.clone_history().await;
     let texts = developer_input_texts(history.raw_items());
-    assert!(texts.contains(&"prepared thread context"));
+    assert!(texts.contains(&crate::stable_context::turn_contribution_text(1, "prepared thread context").as_str()));
     assert!(texts.contains(
         &crate::stable_context::turn_contribution_text(0, "prepared turn context").as_str()
     ));
@@ -12177,6 +12411,64 @@ async fn prepared_context_update_replaces_and_removes_turn_fragments_without_sta
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn thread_contribution_timeout_replacement_and_removal_use_effective_state() {
+    struct Contributor(Arc<std::sync::atomic::AtomicUsize>);
+    impl codex_extension_api::ContextContributor for Contributor {
+        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData, _: &'a codex_extension_api::ExtensionData)
+            -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async move {
+                match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    1 => std::future::pending().await,
+                    4 => Vec::new(),
+                    3 => vec![codex_extension_api::PromptFragment::developer_policy("policy B")],
+                    _ => vec![codex_extension_api::PromptFragment::developer_policy("policy A: never modify X")],
+                }
+            })
+        }
+    }
+    let (mut session, turn) = make_session_and_context().await;
+    let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = codex_extension_api::ExtensionRegistryBuilder::new();
+    registry.prompt_contributor(Arc::new(Contributor(phase.clone())));
+    session.services.extensions = Arc::new(registry.build());
+    let session = Arc::new(session);
+    let step = StepContext::for_test(Arc::new(turn));
+    for next in 0..5 {
+        phase.store(next, std::sync::atomic::Ordering::SeqCst);
+        let before = session.clone_history().await.raw_items().len();
+        let prepared = session.prepare_context_update(&step).await;
+        session.compare_and_record_context_updates(prepared, session.services.planning_generation()).await.unwrap();
+        let history = session.clone_history().await;
+        let added = developer_input_texts(&history.raw_items()[before..]);
+        if matches!(next, 1 | 2) { assert!(added.is_empty(), "timeout and unchanged recovery must be silent: {added:?}"); }
+        if next == 3 { assert_eq!(added, vec![crate::stable_context::turn_contribution_text(1, "policy B").as_str()]); }
+        if next == 4 { assert_eq!(added, vec![crate::stable_context::turn_contribution_removal(1).as_str()]); }
+    }
+}
+
+#[tokio::test]
+async fn required_extension_policy_precedes_oversized_capabilities_whole() {
+    struct Contributor;
+    impl codex_extension_api::ContextContributor for Contributor {
+        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData, _: &'a codex_extension_api::ExtensionData)
+            -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async { vec![
+                codex_extension_api::PromptFragment::developer_capability("optional".repeat(30_000)),
+                codex_extension_api::PromptFragment::developer_policy(format!("{}Never modify X.{}", "a".repeat(5000), "b".repeat(5000))),
+            ] })
+        }
+    }
+    let (mut session, turn) = make_session_and_context().await;
+    let mut registry = codex_extension_api::ExtensionRegistryBuilder::new();
+    registry.prompt_contributor(Arc::new(Contributor));
+    session.services.extensions = Arc::new(registry.build());
+    let items = build_initial_context(&session, &Arc::new(turn)).await;
+    let text = developer_input_texts(&items).join("\n");
+    assert!(text.contains(&format!("{}Never modify X.{}", "a".repeat(5000), "b".repeat(5000))));
+    assert!(text.len() < 200_000, "optional capability text must yield: {} bytes", text.len());
+}
+
 #[tokio::test]
 async fn extension_prompt_budget_charges_message_envelopes_and_ignores_empty_separate_messages() {
     struct EnvelopeBudgetContributor;
@@ -12216,7 +12508,7 @@ async fn extension_prompt_budget_charges_message_envelopes_and_ignores_empty_sep
     assert!(
         developer_input_texts(&built.items).contains(
             &crate::stable_context::turn_contribution_text(
-                0,
+                context_contribution_index(0, 20_000, false),
                 "useful envelope-budget contribution"
             )
             .as_str()
@@ -12233,14 +12525,14 @@ async fn extension_prompt_budget_charges_message_envelopes_and_ignores_empty_sep
     )));
     assert_eq!(
         developer_input_texts(&built.turn_context_items)[0],
-        crate::stable_context::turn_contribution_text(0, "useful envelope-budget contribution")
+        crate::stable_context::turn_contribution_text(context_contribution_index(0, 20_000, false), "useful envelope-budget contribution")
     );
     assert!(
         developer_input_texts(&built.turn_context_items)[1..]
             .iter()
             .enumerate()
             .all(|(index, text)| *text
-                == crate::stable_context::turn_contribution_text(index + 1, "x"))
+                == crate::stable_context::turn_contribution_text(context_contribution_index(0, 20_001 + index, false), "x"))
     );
     let serialized_bytes: usize = built
         .turn_context_items
@@ -12315,12 +12607,12 @@ async fn extension_prompt_contributors_share_one_hard_budget() {
     assert!(
         contributed_texts
             .iter()
-            .any(|text| text.starts_with("extension-budget-first:"))
+            .all(|text| !text.contains("extension-budget-first:"))
     );
     assert!(
         contributed_texts
             .iter()
-            .all(|text| !text.contains("extension-budget-second"))
+            .any(|text| text.contains("extension-budget-second"))
     );
 }
 
@@ -12369,10 +12661,10 @@ async fn build_initial_context_polls_context_contributors_concurrently_and_appli
     assert_eq!(
         contributed_texts,
         vec![
-            "concurrent thread first".to_string(),
-            "concurrent thread second".to_string(),
+            crate::stable_context::turn_contribution_text(1, "concurrent thread first"),
+            crate::stable_context::turn_contribution_text(3, "concurrent thread second"),
             crate::stable_context::turn_contribution_text(0, "concurrent turn first"),
-            crate::stable_context::turn_contribution_text(1, "concurrent turn second"),
+            crate::stable_context::turn_contribution_text(2, "concurrent turn second"),
         ]
     );
 }
@@ -12415,6 +12707,128 @@ async fn turn_context_refresh_omits_stalled_contributors_after_shared_deadline()
         developer_input_texts(&context_items),
         vec!["ready turn context"]
     );
+}
+
+#[tokio::test]
+async fn contributor_sources_survive_timeout_update_and_removal_without_replaying_permissions() {
+    struct Contributor { first: bool, phase: Arc<std::sync::atomic::AtomicUsize> }
+    impl codex_extension_api::ContextContributor for Contributor {
+        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async move {
+                let phase = self.phase.load(std::sync::atomic::Ordering::SeqCst);
+                if self.first && phase == 1 { return std::future::pending().await; }
+                if self.first && phase == 3 { return Vec::new(); }
+                vec![codex_extension_api::PromptFragment::separate_developer(
+                    format!("custom {} version {}", if self.first { "first" } else { "second" }, phase.min(2)))]
+            })
+        }
+    }
+    let (mut session, mut turn) = make_session_and_context().await;
+    turn.developer_instructions = Some("stable permissions sentinel".into());
+    let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    for first in [true, false] { builder.prompt_contributor(Arc::new(Contributor { first, phase: Arc::clone(&phase) })); }
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let step = StepContext::for_test(Arc::new(turn));
+    for revision in 0..4 {
+        phase.store(revision, std::sync::atomic::Ordering::SeqCst);
+        let before = session.clone_history().await.raw_items().len();
+        let prepared = session.prepare_context_update(&step).await;
+        session.compare_and_record_context_updates(prepared, session.services.planning_generation()).await.unwrap().unwrap();
+        let history = session.clone_history().await;
+        let added = developer_input_texts(&history.raw_items()[before..]).join("\n");
+        if revision > 0 { assert!(!added.contains("stable permissions sentinel")); }
+        let first = context_contribution_index(0, 0, true);
+        let second = context_contribution_index(1, 0, true);
+        if revision == 1 {
+            // The prior accepted body is retained during timeout, not replayed
+            // or replaced with an unavailable notice.
+            assert!(!added.contains("custom first"));
+            assert!(!added.contains(&crate::stable_context::turn_contribution_removal(first)));
+            assert!(added.contains(&crate::stable_context::turn_contribution_text(second, "custom second version 1")));
+        }
+        if revision == 2 { assert!(added.contains(&crate::stable_context::turn_contribution_text(first, "custom first version 2"))); }
+        if revision == 3 { assert!(added.contains(&crate::stable_context::turn_contribution_removal(first))); }
+    }
+}
+
+#[tokio::test]
+async fn oversized_additional_context_recovers_middle_fact_without_changing_authority() {
+    use codex_protocol::protocol::{AdditionalContextEntry, AdditionalContextKind};
+    let (session, _) = make_session_and_context().await;
+    for kind in [AdditionalContextKind::Application, AdditionalContextKind::Untrusted] {
+        let count = if kind == AdditionalContextKind::Application { 2_000 } else { 20_000 };
+        let value = format!("{} MIDDLE-ONLY-FACT {}", "<x>".repeat(count), "tail".repeat(count));
+        let source = indexmap::IndexMap::from([("source".to_string(), AdditionalContextEntry { value: value.clone(), kind })]);
+        let prepared = session.recoverable_additional_context(source.clone()).await.unwrap();
+        assert_eq!(prepared["source"].kind, kind);
+        if kind == AdditionalContextKind::Application {
+            assert_eq!(prepared["source"].value, value, "application policy is delivered whole");
+            continue;
+        }
+        assert!(prepared["source"].value.contains("INCOMPLETE INLINE CONTEXT"));
+        let references = session.state.lock().await.tool_history_state().artifact_references();
+        let id = references.keys().find(|id| prepared["source"].value.contains(id.as_str())).unwrap();
+        let bytes = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
+            session.codex_home().await.as_path(), &session.thread_id().to_string(), id).await.unwrap();
+        let recovered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(recovered["items"][0]["value"], value);
+        assert_eq!(recovered["items"][0]["kind"], "untrusted");
+        assert_eq!(session.recoverable_additional_context(source).await.unwrap(), prepared);
+    }
+}
+
+#[test]
+fn policy_admission_never_cuts_a_negation_and_has_priority_over_capabilities() {
+    let mut budget = ModelContextBudget::new(100);
+    let policy = "Required: do not publish. Keep the investigation local.";
+    let admitted = take_prompt_fragment(codex_extension_api::PromptFragment::developer_policy(policy), &mut budget, "turn").unwrap();
+    assert_eq!(admitted.1, policy);
+    let remaining = budget.remaining_bytes();
+    assert!(take_prompt_fragment(codex_extension_api::PromptFragment::developer_policy("prohibition ".repeat(1_000)), &mut budget, "turn").is_none());
+    assert_eq!(budget.remaining_bytes(), remaining);
+    let capability = take_prompt_fragment(codex_extension_api::PromptFragment::developer_capability("catalog ".repeat(1_000)), &mut budget, "turn");
+    assert!(capability.is_none_or(|(_, text)| !text.contains(policy)));
+}
+
+#[tokio::test]
+async fn verified10_additional_context_has_no_four_kilobyte_recovery_cliff() {
+    use codex_protocol::protocol::{AdditionalContextEntry, AdditionalContextKind};
+    let (session, _) = make_session_and_context().await;
+    for value in ["a".repeat(3999), "a".repeat(4001), "<&>".repeat(1500)] {
+        let values = indexmap::IndexMap::from([("source".into(), AdditionalContextEntry {
+            value, kind: AdditionalContextKind::Untrusted,
+        })]);
+        let prepared = session.recoverable_additional_context(values.clone()).await.unwrap();
+        assert_eq!(prepared, values);
+        let admitted = crate::state::AdditionalContextStore::default().merge(prepared);
+        assert_eq!(admitted.len(), 1);
+        assert!(matches!(&admitted[0], ResponseInputItem::Message { role, .. } if role == "user"));
+    }
+    assert!(session.state.lock().await.tool_history_state().artifact_references().is_empty());
+}
+
+#[tokio::test]
+async fn capability_flood_registered_before_policy_cannot_displace_the_policy() {
+    struct Flood;
+    impl codex_extension_api::ContextContributor for Flood {
+        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async { vec![codex_extension_api::PromptFragment::developer_capability("catalog ".repeat(12_000))] })
+        }
+        fn contribute_turn_context<'a>(&'a self, _: codex_extension_api::TurnContextContributionInput<'a>)
+            -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async { vec![codex_extension_api::PromptFragment::developer_policy("Do not publish. Local investigation only.")] })
+        }
+    }
+    let (mut session, turn) = make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(Flood));
+    session.services.extensions = Arc::new(builder.build());
+    let items = build_initial_context(&session, &Arc::new(turn)).await;
+    assert!(developer_input_texts(&items).iter().any(|text| text.contains("Do not publish. Local investigation only.")));
 }
 
 #[tokio::test]
@@ -12648,6 +13062,21 @@ async fn world_state_timeout_preserves_last_success_and_unchanged_recovery_is_si
         assert!(fragments.is_empty());
         assert!(rollout_item.is_none());
     }
+
+    // Replacement during continued unavailability must reinstall the last accepted
+    // role/body, without another contributor invocation to retrieve that body.
+    let calls_before_render = calls.load(std::sync::atomic::Ordering::SeqCst);
+    let (replacement, replacement_snapshot) = timed_out_world_state.render_full_with_snapshot();
+    let replacement = crate::context_manager::updates::merge_contextual_fragments(replacement);
+    assert_eq!(developer_input_texts(&replacement).iter().filter(|text| text.contains(TIMEOUT_WORLD_STATE_BODY)).count(), 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), calls_before_render);
+    {
+        let mut state = session.state.lock().await;
+        state.history.replace(replacement);
+        state.history.set_world_state_baseline(replacement_snapshot);
+    }
+    let continued_timeout = session.build_world_state_for_step(&step_context).await;
+    assert!(session.state.lock().await.history.update_world_state(&continued_timeout).0.is_empty());
 
     stalled.store(false, std::sync::atomic::Ordering::SeqCst);
     let recovered_world_state = session.build_world_state_for_step(&step_context).await;
@@ -13895,7 +14324,7 @@ async fn user_shell_command_dispatches_foreign_primary_environment_to_exec_serve
     assert_eq!(started.source, ExecCommandSource::UserShell);
     let completed = completed.expect("command completion");
     assert_eq!(completed.cwd, foreign_cwd);
-    assert_eq!(completed.exit_code, -1);
+    assert_eq!(completed.exit_code, Some(-1));
     assert!(completed.stderr.contains("execution error:"));
 }
 
@@ -17061,6 +17490,10 @@ async fn steer_input_revokes_spawn_authorization_with_contracted_denial() {
         )
         .await
         .expect("steering should be accepted");
+        if text.starts_with("Use subagents") {
+            assert!(!super::multi_agents::spawn_is_authorized(&tc), "queue admission is not prompt-hook acceptance");
+            tc.update_multi_agent_spawn_authorization(&[UserInput::Text { text: text.to_string(), text_elements: Vec::new() }]);
+        }
         assert_eq!(
             super::multi_agents::spawn_is_authorized(&tc),
             expected_authorized,
@@ -17091,7 +17524,7 @@ async fn steer_input_revokes_spawn_authorization_with_contracted_denial() {
     assert_eq!(
         error,
         FunctionCallError::RespondToModel(
-            "spawn_agent: this turn is in explicit-request-only mode and the user did not explicitly authorize spawning agents"
+            "spawn_agent: spawning is not authorized for this turn. Explicit-request-only permission is checked per turn; an earlier turn's authorization is not carried forward."
                 .to_string(),
         )
     );
@@ -17156,6 +17589,10 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
         )
         .await
         .expect("baseline steering should be accepted");
+        assert!(!super::multi_agents::spawn_is_authorized(&tc));
+        tc.update_multi_agent_spawn_authorization(&[UserInput::Text {
+            text: "Use subagents to inspect the user's code".to_string(), text_elements: Vec::new(),
+        }]);
         assert!(super::multi_agents::spawn_is_authorized(&tc));
         let baseline_input = sess.input_queue.get_pending_input(&sess.active_turn).await;
         assert_eq!(baseline_input.len(), 2, "baseline context and user input");
@@ -17318,7 +17755,7 @@ async fn steer_input_commits_effects_only_after_queue_admission() {
         };
         assert_eq!(reset_role, "developer");
         assert!(matches!(reset_content.as_slice(), [ContentItem::InputText { text }]
-            if text.contains("__codex_additional_context_reset__")
+            if text.contains("stable-source")
                 && text.contains("previous_value_obsolete=\"true\"")));
         assert_eq!(role, "developer");
         assert_eq!(content, &vec![ContentItem::InputText {
@@ -18182,7 +18619,7 @@ async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampli
                     }
                     _ => None,
                 })
-                .flat_map(|notice| notice["notices"].as_array().cloned().unwrap_or_else(|| vec![notice]))
+                .flat_map(crate::tool_history::expand_workspace_notices)
                 .filter(|notice| notice["call_id"] == recovery_call_id)
                 .collect::<Vec<_>>();
             if expect_stale {
@@ -18789,7 +19226,7 @@ async fn cancelled_user_input_response_does_not_fence_the_turn() {
         let admission = terminal.acquire_sampling_admission().await.unwrap();
         let mut notification = Box::pin(session.notify_user_input_response(
             &turn_context.sub_id,
-            RequestUserInputResponse {
+            RequestUserInputResponse { disposition: None,
                 answers: Default::default(),
                 interrupted: true,
             },

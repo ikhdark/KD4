@@ -14,6 +14,108 @@ fn registry_error(status: http::StatusCode, code: Option<&str>) -> ExecServerErr
     }
 }
 
+#[tokio::test]
+async fn recovery_reads_healthy_process_while_another_reply_is_held() {
+    use codex_exec_server_protocol::JSONRPCMessage;
+    use codex_exec_server_protocol::JSONRPCResponse;
+    use crate::connection::JsonRpcConnection;
+    use crate::connection::JsonRpcConnectionEvent;
+    use crate::connection::JsonRpcTransport;
+
+    let (outgoing_tx, mut requests) = tokio::sync::mpsc::channel(16);
+    let (replies, incoming_rx) = tokio::sync::mpsc::channel(16);
+    let (_connected, disconnected_rx) = tokio::sync::watch::channel(false);
+    let connecting = ExecServerClient::connect(JsonRpcConnection {
+        outgoing_tx, incoming_rx, disconnected_rx,
+        task_handles: Vec::new(), transport: JsonRpcTransport::Plain,
+    }, super::super::ExecServerClientConnectOptions::default());
+    tokio::pin!(connecting);
+    assert!(futures::poll!(&mut connecting).is_pending());
+    let JSONRPCMessage::Request(initialize) = requests.recv().await.unwrap() else {
+        panic!("expected initialize request");
+    };
+    replies.send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(JSONRPCResponse {
+        id: initialize.id,
+        result: serde_json::json!({"sessionId": "concurrent-recovery"}),
+    }))).await.unwrap();
+    let client = connecting.await.unwrap();
+    assert!(matches!(requests.recv().await, Some(JSONRPCMessage::Notification(_))));
+
+    let mut observations = std::collections::HashMap::new();
+    for name in ["one", "two"] {
+        let state = Arc::new(SessionState::new(true));
+        observations.insert(name.to_string(), state.subscribe_events());
+        client.inner.insert_session(&crate::ProcessId::from(name.to_string()), state).unwrap();
+    }
+    let rpc = client.rpc_client_without_recovery().unwrap();
+    let recovery = client.inner.recover_processes(&rpc);
+    tokio::pin!(recovery);
+    assert!(futures::poll!(&mut recovery).is_pending());
+    let mut reads = Vec::new();
+    for _ in 0..2 {
+        let message = tokio::time::timeout(Duration::from_secs(1), requests.recv()).await
+            .expect("both recovery reads must dispatch before either reply").unwrap();
+        let JSONRPCMessage::Request(request) = message else { panic!("expected read request") };
+        assert_eq!(request.method, EXEC_READ_METHOD);
+        reads.push(request);
+    }
+    let held = reads.remove(0);
+    let healthy = reads.remove(0);
+    let params: ReadParams = serde_json::from_value(healthy.params.clone().unwrap()).unwrap();
+    assert_eq!(params.after_seq, Some(0));
+    let response = ReadResponse {
+        chunks: vec![ProcessOutputChunk { seq: 1, stream: ExecOutputStream::Stdout,
+            chunk: b"recovered".to_vec().into() }],
+        next_seq: 2, exited: false, exit_code: None, closed: false,
+        failure: None, output_gap: None, sandbox_denied: false,
+    };
+    replies.send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(JSONRPCResponse {
+        id: healthy.id, result: serde_json::to_value(&response).unwrap(),
+    }))).await.unwrap();
+    let events = observations.get_mut(&params.process_id.to_string()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            _ = &mut recovery => panic!("held reply must keep recovery open"),
+            event = events.recv() => assert!(matches!(event.unwrap(),
+                ExecProcessEvent::Output(chunk) if chunk.seq == 1 && chunk.chunk.0 == b"recovered")),
+        }
+    }).await.expect("healthy process publishes its prefix without waiting for held process");
+    replies.send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(JSONRPCResponse {
+        id: held.id, result: serde_json::to_value(response).unwrap(),
+    }))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), recovery).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn output_gap_recovers_live_suffix_and_authoritative_exit() {
+    let state = SessionState::new(true);
+    let mut events = state.subscribe_events();
+    assert!(!state.recover_events(ReadResponse {
+        chunks: vec![ProcessOutputChunk { seq: 5, stream: ExecOutputStream::Stdout,
+            chunk: b"suffix".to_vec().into() }],
+        next_seq: 6, exited: false, exit_code: None, closed: false, failure: None,
+        output_gap: Some(crate::protocol::ProcessOutputGap { through_seq: 4, exit_seq: None }),
+        sandbox_denied: false,
+    }).unwrap());
+    assert_eq!(events.recv().await.unwrap(), ExecProcessEvent::OutputGap { through_seq: 4 });
+    assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Output(chunk) if chunk.chunk.0 == b"suffix"));
+    assert!(state.recoverable.load(Ordering::Acquire));
+    assert!(state.failed_response().is_none());
+
+    assert!(state.recover_events(ReadResponse {
+        chunks: vec![ProcessOutputChunk { seq: 9, stream: ExecOutputStream::Stdout,
+            chunk: b"tail".to_vec().into() }],
+        next_seq: 11, exited: true, exit_code: Some(7), closed: true, failure: None,
+        output_gap: Some(crate::protocol::ProcessOutputGap { through_seq: 8, exit_seq: Some(7) }),
+        sandbox_denied: false,
+    }).unwrap());
+    assert_eq!(events.recv().await.unwrap(), ExecProcessEvent::OutputGap { through_seq: 6 });
+    assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Exited { seq: 7, exit_code: 7, .. }));
+    assert_eq!(events.recv().await.unwrap(), ExecProcessEvent::OutputGap { through_seq: 8 });
+    assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Output(chunk) if chunk.seq == 9));
+    assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Closed { seq: 10, .. }));
+}
+
 #[test]
 fn registry_recovery_retry_delay_exponentially_backs_off_and_caps() {
     let cases = [
@@ -147,6 +249,7 @@ fn recovery_handles_dense_tail_output_and_newer_notification() {
                 exit_code: Some(17),
                 closed: false,
                 failure: None,
+                output_gap: None,
                 sandbox_denied: false,
             })
             .expect("dense retained output should recover")
@@ -182,6 +285,7 @@ fn recovery_rejects_output_at_closed_sequence() {
             exit_code: None,
             closed: true,
             failure: None,
+            output_gap: None,
             sandbox_denied: false,
         })
         .expect_err("output should not occupy the closed sequence");
@@ -218,6 +322,7 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
             exit_code: Some(1),
             closed: false,
             failure: None,
+            output_gap: None,
             sandbox_denied: true,
         })
         .expect("recovery should publish the pending exit");
@@ -253,6 +358,7 @@ async fn recovery_rejects_ambiguous_gap_before_publishing_false_exit() {
             exit_code: Some(0),
             closed: true,
             failure: None,
+            output_gap: None,
             sandbox_denied: false,
         })
         .expect_err("multiple missing positions cannot identify an exit");

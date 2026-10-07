@@ -20,9 +20,8 @@ Scenario: First post-resume turn where pre-turn override sets model to rollout m
     [02] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
     [03] <SKILLS_INSTRUCTIONS>
 01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-02:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-03:message/user:seed resume history
-04:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
-05:message/assistant:recorded before resume
-06:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
-07:message/user:first resumed turn after model override
+02:message/user:seed resume history
+03:message/developer:<exhaustive_scope_feasibility>\nBefore committing to an exhaustive review or full-read request, ...
+04:message/assistant:recorded before resume
+05:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+06:message/user:first resumed turn after model override

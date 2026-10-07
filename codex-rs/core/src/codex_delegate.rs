@@ -395,12 +395,11 @@ async fn forward_events(
                         .await;
                     }
                     Event {
-                        id,
                         msg: EventMsg::RequestUserInput(event),
+                        ..
                     } => {
                         handle_request_user_input(
                             &codex,
-                            id,
                             &parent_session,
                             &parent_ctx,
                             event,
@@ -605,22 +604,24 @@ async fn handle_patch_approval(
 
 async fn handle_request_user_input(
     codex: &Codex,
-    id: String,
     parent_session: &Arc<Session>,
     parent_ctx: &Arc<TurnContext>,
     event: RequestUserInputEvent,
     cancel_token: &CancellationToken,
 ) {
+    let call_id = event.call_id;
+    let id = event.turn_id;
     let args = RequestUserInputArgs {
         questions: event.questions,
         auto_resolution_ms: event.auto_resolution_ms,
     };
     let response_fut =
-        parent_session.request_user_input(parent_ctx, parent_ctx.sub_id.clone(), args);
+        parent_session.request_user_input(parent_ctx, call_id.clone(), args);
     let response = await_user_input_with_cancel(
         response_fut,
         parent_session,
         &parent_ctx.sub_id,
+        &call_id,
         cancel_token,
     )
     .await;
@@ -628,7 +629,7 @@ async fn handle_request_user_input(
     // Bound admission so a stalled child cannot hold delegate shutdown indefinitely.
     let _ = timeout(
         Duration::from_millis(500),
-        codex.submit(Op::UserInputAnswer { id, response }),
+        codex.submit(Op::UserInputAnswer { id, call_id: Some(call_id), response }),
     )
     .await;
 }
@@ -734,6 +735,7 @@ async fn await_user_input_with_cancel<F>(
     fut: F,
     parent_session: &Session,
     sub_id: &str,
+    call_id: &str,
     cancel_token: &CancellationToken,
 ) -> RequestUserInputResponse
 where
@@ -743,15 +745,17 @@ where
         biased;
         _ = cancel_token.cancelled() => {
             let empty = RequestUserInputResponse {
+                disposition: Some(codex_protocol::request_user_input::RequestUserInputDisposition::Interrupted),
                 answers: HashMap::new(),
                 interrupted: true,
             };
             parent_session
-                .notify_user_input_response(sub_id, empty.clone())
+                .notify_user_input_response_for_request(sub_id, Some(call_id), empty.clone())
                 .await;
             empty
         }
         response = fut => response.unwrap_or_else(|| RequestUserInputResponse {
+            disposition: Some(codex_protocol::request_user_input::RequestUserInputDisposition::Interrupted),
             answers: HashMap::new(),
             interrupted: true,
         }),

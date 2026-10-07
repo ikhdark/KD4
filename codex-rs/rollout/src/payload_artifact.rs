@@ -10,6 +10,43 @@ const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const INLINE_BYTES: usize = 8 * 1024;
 const KIND: &str = "rollout_payload_artifact";
 
+#[derive(Default)]
+struct PendingSync {
+    sequence: u64,
+    paths: std::collections::BTreeMap<(PathBuf, PathBuf), u64>,
+}
+
+fn pending_sync() -> &'static std::sync::Mutex<PendingSync> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<PendingSync>> = std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+/// Sync payloads before their rollout references. Failed barriers retain their
+/// work; concurrent publications retain newer sequences for the next barrier.
+pub(crate) async fn sync_payload_artifacts(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    let directory = root(path);
+    let rollout = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let pending = pending_sync().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .paths.iter().filter(|((owner, _), _)| owner == &rollout)
+            .map(|(path, sequence)| (path.clone(), *sequence)).collect::<Vec<_>>();
+        if pending.is_empty() { return Ok(()); }
+        for ((_, path), _) in &pending {
+            std::fs::OpenOptions::new().read(true).write(true).open(path)?.sync_all()?;
+        }
+        #[cfg(unix)]
+        std::fs::File::open(&directory)?.sync_all()?;
+        let mut registry = pending_sync().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (path, sequence) in pending {
+            if registry.paths.get(&path) == Some(&sequence) {
+                registry.paths.remove(&path);
+            }
+        }
+        Ok(())
+    }).await.map_err(io::Error::other)?
+}
+
 pub(crate) fn root(path: &Path) -> PathBuf {
     for ancestor in path.ancestors().skip(1) {
         if ancestor.file_name().is_some_and(|name|
@@ -36,9 +73,8 @@ pub(crate) fn is_artifact_candidate(item: &RolloutItem) -> bool {
     }
 }
 
-/// Artifacts are immutable and atomically published before the referencing line.
-/// Per-record fsync is intentionally avoided; readers reject a missing or corrupt
-/// blob after power loss rather than accepting incomplete payload evidence.
+/// Artifacts are content-addressed and atomically published before the referencing line.
+/// Per-record fsync is deferred to the durable rollout barrier.
 /// Failures fall back to the original inline record at the writer boundary.
 /// The caller selects eligible items with `is_artifact_candidate`.
 pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
@@ -69,9 +105,18 @@ pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
     // A preexisting object or a concurrent writer that won admission is
     // verified: never reference a partial, corrupted, or substituted object,
     // including a preexisting symlink.
-    if !published_here {
-        read_payload(&directory, &sha256, bytes.len() as u64)?;
+    if !published_here && read_payload(&directory, &sha256, bytes.len() as u64).is_err() {
+        // Repair the shared directory entry atomically, without truncating it
+        // or following a substituted symlink.
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        temporary.write_all(&bytes)?;
+        temporary.persist(&destination).map_err(|error| error.error)?;
     }
+    let mut pending = pending_sync().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.sequence = pending.sequence.saturating_add(1);
+    let sequence = pending.sequence;
+    pending.paths.insert((path.to_path_buf(), destination), sequence);
+    drop(pending);
     let mut reference = serde_json::json!({
         "timestamp": timestamp, "format_version": format_version,
         "type": KIND, "payload": {"sha256": sha256, "bytes": bytes.len()}
@@ -126,6 +171,25 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn durable_barrier_rejects_missing_payload_and_retains_retry_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        let item = serde_json::json!({"type":"event_msg", "payload":{
+            "type":"patch_apply_end", "saved":"undo bytes".repeat(2000)
+        }});
+        let line = serde_json::to_vec(&item).unwrap();
+        let reference: serde_json::Value = serde_json::from_slice(&store_line(&path, &line).unwrap()).unwrap();
+        let blob = root(&path).join(format!("{}.json", reference["payload"]["sha256"].as_str().unwrap()));
+        let bytes = std::fs::read(&blob).unwrap();
+        // Fault between publication and the rollout durability barrier.
+        std::fs::remove_file(&blob).unwrap();
+        assert_eq!(sync_payload_artifacts(&path).await.unwrap_err().kind(), io::ErrorKind::NotFound);
+        std::fs::write(&blob, bytes).unwrap();
+        sync_payload_artifacts(&path).await.unwrap();
+        assert!(!pending_sync().lock().unwrap().paths.keys().any(|(owner, _)| owner == &path));
+    }
+
+    #[tokio::test]
     async fn shared_reader_restores_payloads_and_rejects_corrupted_undo_data() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("rollout.jsonl");
@@ -148,6 +212,12 @@ mod tests {
         let sha256 = reference["payload"]["sha256"].as_str().unwrap();
         std::fs::write(root(&path).join(format!("{sha256}.json")), b"corrupt").unwrap();
         let mut reader = crate::compression::open_rollout_line_reader(&path).await.unwrap();
-        assert!(reader.next_line().await.is_err());
+        let invalid = reader.next_line().await.unwrap().unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&invalid).is_err());
+        let repaired = store_line(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
+        let restored: serde_json::Value = serde_json::from_str(
+            &hydrate_line(&path, String::from_utf8(repaired).unwrap()).unwrap(),
+        ).unwrap();
+        assert_eq!(restored, item);
     }
 }

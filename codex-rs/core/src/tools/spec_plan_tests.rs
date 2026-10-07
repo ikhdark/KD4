@@ -58,6 +58,19 @@ use crate::tools::router::ToolSuggestPresentation;
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 
 #[test]
+fn conflicting_namespace_descriptions_are_quarantined_in_either_order() {
+    let specs = ["first instructions", "different instructions"].map(|description| {
+        ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: "conflict".into(), description: description.into(), tools: Vec::new(),
+        })
+    });
+    for specs in [specs.to_vec(), specs.into_iter().rev().collect()] {
+        assert_eq!(super::conflicting_namespace_metadata(specs.iter()), std::collections::BTreeSet::from(["conflict".into()]));
+        assert!(merge_into_namespaces(specs).is_empty());
+    }
+}
+
+#[test]
 fn merged_namespace_descriptions_share_one_hard_budget_in_stable_spec_order() {
     let specs = vec![
         ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
@@ -332,14 +345,10 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
 #[tokio::test]
 async fn removed_workspace_workers_are_not_exposed_or_registered() {
     let plan = probe(|turn| set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec])).await;
-    plan.assert_visible_contains(&["exec_command", "context_checkpoint"]);
-    plan.assert_registered_contains(&["exec_command", "context_checkpoint"]);
-    plan.assert_visible_lacks(&["semantic_context", "workspace_validation"]);
-    plan.assert_registered_lacks(&["semantic_context", "workspace_validation"]);
-    assert_eq!(
-        plan.authorization_class("context_checkpoint"),
-        TypedToolClass::OwnTask
-    );
+    plan.assert_visible_contains(&["exec_command"]);
+    plan.assert_registered_contains(&["exec_command"]);
+    plan.assert_visible_lacks(&["semantic_context", "workspace_validation", "context_checkpoint"]);
+    plan.assert_registered_lacks(&["semantic_context", "workspace_validation", "context_checkpoint"]);
 }
 
 #[tokio::test]
@@ -403,16 +412,17 @@ async fn read_file_is_available_without_an_execution_environment() {
 #[tokio::test]
 async fn planning_tools_keep_their_schemas_in_plan_mode() {
     let default_mode = probe(|_| {}).await;
-    default_mode.assert_visible_contains(&["update_plan", "context_checkpoint"]);
-    default_mode.assert_registered_contains(&["update_plan", "context_checkpoint"]);
+    default_mode.assert_visible_contains(&["update_plan"]);
+    default_mode.assert_registered_contains(&["update_plan"]);
 
     let plan_mode = probe(|turn| {
         turn.collaboration_mode.mode = ModeKind::Plan;
     })
     .await;
-    plan_mode.assert_visible_contains(&["update_plan", "context_checkpoint"]);
-    plan_mode.assert_registered_contains(&["update_plan", "context_checkpoint"]);
-    for name in ["update_plan", "context_checkpoint"] {
+    plan_mode.assert_visible_contains(&["update_plan"]);
+    plan_mode.assert_registered_contains(&["update_plan"]);
+    plan_mode.assert_registered_lacks(&["context_checkpoint"]);
+    for name in ["update_plan"] {
         assert_eq!(default_mode.visible_spec(name), plan_mode.visible_spec(name));
     }
 }
@@ -909,6 +919,7 @@ async fn wait_is_always_registered_when_code_mode_is_enabled() {
 #[tokio::test]
 async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvable() {
     let configure = |turn: &mut TurnContext, code_mode_only| {
+        turn.model_info.supports_search_tool = true;
         set_features(
             turn,
             &[
@@ -950,10 +961,13 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         };
         assert!(!description.is_empty());
         assert!(!mixed_exec.description.contains(description.trim()));
-        assert_eq!(
-            nested_exec.description.contains(description.trim()),
-            name != "apply_patch"
-        );
+        if name == "read_file" {
+            assert!(nested_exec.description.contains("Nested calls read current contents"));
+            let ToolSpec::Function(read) = spec else { panic!("read schema"); };
+            assert!(read.parameters.properties.as_ref().unwrap().contains_key("force_fresh"));
+        } else {
+            assert!(nested_exec.description.contains(description.trim()));
+        }
     }
     assert!(mixed_exec.description.contains("exec_command(args: unknown"));
     assert!(mixed_exec.description.contains("read_file(args: unknown"));
@@ -988,7 +1002,13 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         assert!(!exec.description.contains("curr_time(args:"));
         assert!(!exec.description.contains("Return the current time in UTC."));
         assert!(exec.description.contains("read_file(args:"));
-        assert!(!exec.description.contains("read_tool_output(args:"));
+        assert!(exec.description.contains("read_tool_output(args:"));
+        assert!(exec.description.contains("tool_search(args:"));
+        assert!(exec.description.contains("update_plan(args:"));
+        assert!(exec.description.contains("apply_patch(input: string"));
+        assert!(exec.description.contains("Nested apply_patch is available"));
+        assert!(exec.description.contains("Result fields: path, total_lines"));
+        assert!(exec.description.contains("Promise<unknown>"));
         assert!(!exec.description.contains("wall_time_seconds?:"));
         assert!(!exec.description.contains("raw_output_artifact_bytes?:"));
         assert!(exec.description.contains("retains the full contract when required"));
@@ -1253,8 +1273,8 @@ async fn shell_family_advertises_configured_background_wait_limit() {
             "Bounded empty polls default to {expected_default} ms and cap at {configured} ms"
         )));
         let validator = jsonschema::validator_for(&schema).unwrap();
-        assert!(validator.is_valid(&json!({"session_id": 1, "yield_time_ms": expected_max})));
-        assert!(!validator.is_valid(&json!({"session_id": 1, "yield_time_ms": expected_max + 1})));
+        assert!(validator.is_valid(&json!({"session_id": 1, "incarnation": "creation-1", "yield_time_ms": expected_max})));
+        assert!(!validator.is_valid(&json!({"session_id": 1, "incarnation": "creation-1", "yield_time_ms": expected_max + 1})));
     }
 }
 
@@ -1747,8 +1767,7 @@ async fn code_mode_schema_stays_fixed_when_discovery_sources_change() {
         let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
             panic!("expected exec contract");
         };
-        assert!(!exec.description.contains("tool_search(args:"));
-        assert!(exec.description.contains("resolve_tool(\"tool_search\")"));
+        assert!(exec.description.contains("tool_search(args:"));
     }
 }
 
@@ -1896,7 +1915,7 @@ async fn winning_registered_runtime_owns_its_external_mutation_intent() {
     assert_eq!(
         plan.external_mutation_intents
             .get(&ToolName::namespaced("mcp__shared", "lookup").to_string()),
-        Some(&ExternalMutationIntent::ProvenReadOnly)
+        Some(&ExternalMutationIntent::ProviderAssertedReadOnly)
     );
 
     let mut mutating = mcp_tool("writer", "mcp__shared", "lookup");
@@ -2109,8 +2128,8 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     else {
         panic!("expected first tool_search spec");
     };
-    assert!(first_plan.tool_search_sources.contains("- first: Tools from first."));
-    assert!(!first_plan.tool_search_sources.contains("- second: Tools from second."));
+    assert!(first_plan.tool_search_sources.contains("- first [source:mcp__first]: Tools from first."));
+    assert!(!first_plan.tool_search_sources.contains("source:mcp__second"));
 
     let ToolSpec::ToolSearch {
         description: second_description,
@@ -2119,8 +2138,8 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     else {
         panic!("expected second tool_search spec");
     };
-    assert!(second_plan.tool_search_sources.contains("- second: Tools from second."));
-    assert!(!second_plan.tool_search_sources.contains("- first: Tools from first."));
+    assert!(second_plan.tool_search_sources.contains("- second [source:mcp__second]: Tools from second."));
+    assert!(!second_plan.tool_search_sources.contains("source:mcp__first"));
     assert_eq!(first_description, second_description);
 
     let ToolSpec::ToolSearch {
@@ -2130,8 +2149,8 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     else {
         panic!("expected third tool_search spec");
     };
-    assert!(third_plan.tool_search_sources.contains("- first: Tools from first."));
-    assert!(!third_plan.tool_search_sources.contains("- second: Tools from second."));
+    assert!(third_plan.tool_search_sources.contains("- first [source:mcp__first]: Tools from first."));
+    assert!(!third_plan.tool_search_sources.contains("source:mcp__second"));
     assert_eq!(first_description, third_description);
 }
 
@@ -2148,6 +2167,48 @@ async fn invalid_mcp_tools_are_not_registered() {
 
     plan.assert_visible_lacks(&["mcp__invalid"]);
     plan.assert_registered_lacks(&[&ToolName::namespaced("mcp__invalid", "lookup").to_string()]);
+    assert_eq!(plan.warnings.len(), 1);
+    assert!(plan.warnings[0].contains("not callable"));
+    assert!(plan.tool_search_sources.contains(&plan.warnings[0]));
+    assert!(plan.tool_search_sources.contains("mcp__invalid"));
+}
+
+#[tokio::test]
+async fn rejected_dynamic_and_deferred_mcp_contracts_are_bounded_and_not_callable() {
+    let invalid = |namespace: Option<&str>| {
+        let mut spec = dynamic_tool(namespace, "rejected", true);
+        let tool = match &mut spec {
+            DynamicToolSpec::Function(tool) => tool,
+            DynamicToolSpec::Namespace(namespace) => {
+                let DynamicToolNamespaceTool::Function(tool) = &mut namespace.tools[0];
+                tool
+            }
+        };
+        tool.input_schema = json!({"type":"object", "not":{}});
+        spec
+    };
+    let plan = probe_with(|_| {}, ToolPlanInputs {
+        deferred_mcp_tools: Some(vec![invalid_mcp_tool("broken", "mcp__broken", "lookup")]),
+        dynamic_tools: vec![invalid(None), invalid(Some("dynamic"))],
+        ..ToolPlanInputs::default()
+    }).await;
+    plan.assert_registered_lacks(&["rejected",
+        &ToolName::namespaced("dynamic", "rejected").to_string(),
+        &ToolName::namespaced("mcp__broken", "lookup").to_string()]);
+    assert_eq!(plan.warnings.len(), 3);
+    for warning in &plan.warnings {
+        assert!(warning.contains("not callable"));
+        assert!(plan.tool_search_sources.contains(warning));
+    }
+    assert!(plan.tool_search_sources.contains("unsupported tool input schema assertion: not"));
+    let mut planned = super::PlannedTools::default();
+    for _ in 0..40 {
+        planned.reject_tool(&ToolName::plain("界".repeat(500)), &"é".repeat(1_000));
+    }
+    assert_eq!(planned.warnings.len(), 17);
+    assert!(planned.warnings.last().unwrap().contains("additional rejected tools omitted"));
+    assert!(planned.warnings.iter().all(|warning| warning.len() < 850));
+    assert!(planned.runtimes.is_empty());
 }
 
 #[tokio::test]
@@ -2927,7 +2988,7 @@ async fn v1_multi_agent_tools_defer_when_tool_search_available() {
         panic!("expected visible tool_search spec");
     };
     assert!(description.contains("<tool_search_sources>"));
-    assert!(plan.tool_search_sources.contains("- Multi-agent tools: Spawn and manage sub-agents."));
+    assert!(plan.tool_search_sources.contains(&format!("- Multi-agent tools [source:{MULTI_AGENT_V1_NAMESPACE}]: Spawn and manage sub-agents.")));
 }
 
 #[tokio::test]

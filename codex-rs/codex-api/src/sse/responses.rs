@@ -31,6 +31,53 @@ use crate::responses_stream::ResponsesStreamEvent;
 #[cfg(test)]
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
+const MAX_SSE_EVENT_BYTES: usize = 32 * 1024 * 1024;
+
+// Bound parser accumulation before UTF-8/JSON decoding. Count raw bytes since
+// the last empty SSE line, recognizing LF, CRLF and CR even across chunks.
+// This is deliberately not a response-lifetime limit.
+fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
+    let mut bytes = 0usize;
+    let mut line_has_data = false;
+    let mut after_cr = false;
+    let mut failed = false;
+    stream.scan((), move |_, chunk| {
+        let result = if failed {
+            None
+        } else {
+            Some(chunk.and_then(|chunk| {
+                for &byte in &chunk {
+                    if after_cr && byte == b'\n' {
+                        after_cr = false;
+                        if bytes != 0 { bytes = bytes.saturating_add(1); }
+                        if bytes > limit {
+                            failed = true;
+                            return Err(codex_client::TransportError::Network(format!("SSE event exceeds the {limit}-byte framing limit")));
+                        }
+                        continue;
+                    }
+                    after_cr = byte == b'\r';
+                    bytes = bytes.saturating_add(1);
+                    if bytes > limit {
+                        failed = true;
+                        return Err(codex_client::TransportError::Network(format!(
+                            "SSE event exceeds the {limit}-byte framing limit"
+                        )));
+                    }
+                    if matches!(byte, b'\r' | b'\n') {
+                        if !line_has_data { bytes = 0; }
+                        line_has_data = false;
+                    } else {
+                        line_has_data = true;
+                    }
+                }
+                Ok(chunk)
+            }))
+        };
+        futures::future::ready(result)
+    }).boxed()
+}
+
 pub fn spawn_response_stream(
     stream_response: StreamResponse,
     idle_timeout: Duration,
@@ -90,13 +137,18 @@ async fn process_sse_with_metadata(
     metadata: ResponsesStreamMetadata,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) {
-    let mut stream = stream.eventsource();
+    let mut stream = bound_sse_events(stream, MAX_SSE_EVENT_BYTES).eventsource();
     let mut interpreter = ResponsesEventInterpreter::new(&metadata, turn_state);
     let mut poll_ordinal = 0_u64;
     let mut received_events = 0_u64;
     let mut received_payload_bytes = 0_usize;
+    let mut progress_deadline = Instant::now() + idle_timeout;
 
     loop {
+        if Instant::now() >= progress_deadline {
+            let _ = tx_event.send(Err(ApiError::Stream("model progress timeout waiting for SSE".into()))).await;
+            return;
+        }
         let start = telemetry.as_ref().map(|_| Instant::now());
         let response = tokio::select! {
             _ = tx_event.closed() => {
@@ -105,7 +157,7 @@ async fn process_sse_with_metadata(
                 }
                 return;
             }
-            response = timeout(idle_timeout, stream.next()) => response,
+            response = tokio::time::timeout_at(progress_deadline.min(Instant::now() + idle_timeout), stream.next()) => response,
         };
         if let Some((t, start)) = telemetry.as_ref().zip(start) {
             let poll_duration = start.elapsed();
@@ -208,12 +260,16 @@ async fn process_sse_with_metadata(
         };
 
         for event in events {
+            let advances = event.advances_model_response();
             let is_completed = matches!(event, ResponseEvent::Completed { .. });
             if tx_event.send(Ok(event)).await.is_err() {
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(SseCleanupOutcome::ConsumerCancelled, start.elapsed());
                 }
                 return;
+            }
+            if advances {
+                progress_deadline = Instant::now() + idle_timeout;
             }
             if is_completed {
                 // Deliver completion immediately, then keep the carrier alive
@@ -251,6 +307,23 @@ async fn process_sse_with_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn sse_framing_bounds_unterminated_events_not_stream_lifetime() {
+        for separator in ["\n\n", "\r\r", "\r\n\r\n"] {
+            let valid = format!("data: x{separator}").repeat(1000);
+            for width in [1, 3, 64, valid.len()] {
+                let chunks = valid.as_bytes().chunks(width).map(|chunk| Ok(bytes::Bytes::copy_from_slice(chunk))).collect::<Vec<_>>();
+                let received = bound_sse_events(futures::stream::iter(chunks).boxed(), 32).try_collect::<Vec<_>>().await.unwrap();
+                assert_eq!(received.iter().map(|chunk| chunk.len()).sum::<usize>(), valid.len());
+            }
+        }
+        for payload in ["data: ".to_string() + &"x".repeat(33), "data:x\n".repeat(10)] {
+            let chunks = payload.bytes().map(|byte| Ok(bytes::Bytes::from(vec![byte]))).collect::<Vec<_>>();
+            let error = bound_sse_events(futures::stream::iter(chunks).boxed(), 32).try_collect::<Vec<_>>().await.unwrap_err();
+            assert!(error.to_string().contains("framing limit"));
+        }
+    }
+
     use crate::common::SafetyBuffering;
     use assert_matches::assert_matches;
     use bytes::Bytes;
@@ -298,6 +371,34 @@ mod tests {
             events.push(ev);
         }
         events
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_deadline_ignores_traffic_but_allows_productive_reasoning() {
+        for productive in [false, true] {
+            let source = stream::unfold(0, move |index| async move {
+                if index > 5 { return None; }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let payload = if index == 5 {
+                    json!({"type":"response.completed","response":{"id":"done"}})
+                } else if productive {
+                    json!({"type":"response.reasoning_text.delta","delta":"thinking","content_index":0})
+                } else {
+                    json!({"type":"response.created","response":{"id":"same"}})
+                };
+                Some((Ok(Bytes::from(format!("data: {payload}\n\n"))), index + 1))
+            });
+            let (tx, mut rx) = mpsc::channel(32);
+            process_sse(Box::pin(source), tx, Duration::from_millis(80), None).await;
+            let mut completed = false;
+            let mut failed = false;
+            while let Some(event) = rx.recv().await {
+                completed |= matches!(event, Ok(ResponseEvent::Completed { .. }));
+                failed |= event.is_err();
+            }
+            assert_eq!(completed, productive);
+            assert_eq!(failed, !productive);
+        }
     }
 
     async fn run_sse(events: Vec<serde_json::Value>) -> Vec<ResponseEvent> {

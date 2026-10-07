@@ -222,6 +222,9 @@ impl ToolDispatchTiming {
             retry_count: self.retry_count.load(Ordering::Acquire),
             reentry_count: self.reentry_count.load(Ordering::Acquire),
         });
+        if let Some((gate, entering)) = live_gate_boundary(boundary) {
+            turn_timing.adjust_live_gate(gate, entering);
+        }
         true
     }
 
@@ -403,6 +406,24 @@ impl ToolDispatchTiming {
 
     pub(crate) fn record_outcome(&self, outcome: &'static str) {
         let _ = self.outcome.set(outcome);
+        let open = {
+            let events = self.lifecycle_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut open = [false; 4];
+            for event in events.iter() {
+                if let Some((gate, entering)) = live_gate_boundary(event.boundary) {
+                    open[gate] = entering;
+                }
+            }
+            open
+        };
+        for (end, waiting) in [
+            ToolLifecycleBoundary::ResourceResolutionEnd,
+            ToolLifecycleBoundary::DiffTrackerWaitEnd,
+            ToolLifecycleBoundary::WorkspaceGateWaitEnd,
+            ToolLifecycleBoundary::EvidenceTrackerWaitEnd,
+        ].into_iter().zip(open) {
+            if waiting { self.record_boundary(end); }
+        }
     }
 
     pub(crate) fn record_exec_cleanup_state(
@@ -542,6 +563,38 @@ fn duration_ms(duration: Duration) -> Option<u64> {
     u64::try_from(duration.as_millis()).ok()
 }
 
+fn live_gate_boundary(boundary: ToolLifecycleBoundary) -> Option<(usize, bool)> {
+    use ToolLifecycleBoundary::*;
+    Some(match boundary {
+        ResourceResolutionStart => (0, true),
+        ResourceResolutionEnd => (0, false),
+        DiffTrackerWaitStart => (1, true),
+        DiffTrackerWaitEnd => (1, false),
+        WorkspaceGateWaitStart => (2, true),
+        WorkspaceGateWaitEnd => (2, false),
+        EvidenceTrackerWaitStart => (3, true),
+        EvidenceTrackerWaitEnd => (3, false),
+        _ => return None,
+    })
+}
+
+impl Drop for ToolDispatchTiming {
+    fn drop(&mut self) {
+        let Some(turn) = &self.turn_timing else { return; };
+        // A cancelled admission future may never reach its matching End boundary.
+        let events = self.lifecycle_events.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut outstanding = [false; 4];
+        for event in events {
+            if let Some((gate, entering)) = live_gate_boundary(event.boundary) {
+                outstanding[gate] = entering;
+            }
+        }
+        for (gate, waiting) in outstanding.into_iter().enumerate() {
+            if waiting { turn.adjust_live_gate(gate, false); }
+        }
+    }
+}
+
 pub(crate) async fn scope_tool_dispatch_timing<F>(
     timing: Arc<ToolDispatchTiming>,
     future: F,
@@ -674,6 +727,7 @@ impl ToolDispatchTrace {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_for_start(&self) {
         let _ = self.started_context().await;
     }
@@ -697,7 +751,7 @@ impl ToolDispatchTrace {
         payload: &ToolPayload,
         result: &dyn ToolOutput,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        let Some(state) = &self.state else {
+        let Some(_) = &self.state else {
             return Box::pin(async {});
         };
 
@@ -705,63 +759,41 @@ impl ToolDispatchTrace {
         else {
             return Box::pin(async {});
         };
-        let terminal_recording = Arc::clone(&state.terminal_recording);
         let status = execution_status_for_outcome(result.outcome_context());
-        let trace = self.clone();
-        let terminal_tasks = state.terminal_tasks.clone();
-        Box::pin(async move {
-            let Some(context) = trace.started_context().await else {
-                return;
-            };
-            defer_trace_recording(&terminal_tasks, move || {
-                terminal_recording.call_once(|| {
-                    context.record_completed(status, result_payload);
-                });
-            })
-            .await;
-        })
+        self.enqueue_terminal(move |context| context.record_completed(status, result_payload));
+        Box::pin(async {})
     }
 
     pub(crate) fn record_failed(
         &self,
         error: &FunctionCallError,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        let Some(state) = &self.state else {
-            return Box::pin(async {});
-        };
-        let trace = self.clone();
         let error = error.to_string();
-        let terminal_recording = Arc::clone(&state.terminal_recording);
-        let terminal_tasks = state.terminal_tasks.clone();
-        Box::pin(async move {
-            let Some(context) = trace.started_context().await else {
-                return;
-            };
-            defer_trace_recording(&terminal_tasks, move || {
-                terminal_recording.call_once(|| {
-                    context.record_failed(error);
-                });
-            })
-            .await;
-        })
+        self.enqueue_terminal(move |context| context.record_failed(error));
+        Box::pin(async {})
     }
 
     pub(crate) async fn record_cancelled(&self) {
+        self.enqueue_terminal(|context| {
+            context.record_cancelled("tool dispatch cancelled after runtime cleanup");
+        });
+    }
+
+    fn enqueue_terminal(&self, record: impl FnOnce(ToolDispatchTraceContext) + Send + 'static) {
         let Some(state) = &self.state else {
             return;
         };
-        let Some(context) = self.started_context().await else {
-            return;
-        };
-        let terminal_recording = Arc::clone(&state.terminal_recording);
-        defer_trace_recording(&state.terminal_tasks, move || {
-            // Elect inside the owned write. A competing terminal writer waits
-            // here for the accepted write to finish before cleanup can return.
-            terminal_recording.call_once(|| {
-                context.record_cancelled("tool dispatch cancelled after runtime cleanup");
-            });
-        })
-        .await;
+        // Elect and hand off synchronously. Neither cancellation of the caller
+        // nor a slow diagnostic disk can lose or reorder the accepted terminal.
+        state.terminal_recording.call_once(|| {
+            let trace = self.clone();
+            let tasks = state.terminal_tasks.clone();
+            drop(state.terminal_tasks.spawn(async move {
+                if let Some(context) = trace.started_context().await {
+                    defer_trace_recording(&tasks, move || record(context)).await;
+                }
+            }));
+        });
     }
 }
 

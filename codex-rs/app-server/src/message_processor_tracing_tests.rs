@@ -319,6 +319,57 @@ struct TracingHarness {
     tracing: &'static TestTracing,
 }
 
+#[tokio::test]
+#[serial(app_server_tracing)]
+async fn graceful_drain_rejects_new_turns_but_routes_interrupts() -> Result<()> {
+    let mut harness = TracingHarness::new().await?;
+    let thread = harness.start_thread(2, None).await.thread.id;
+    harness.processor.begin_drain();
+    for (id, method, params, rejected) in [
+        (3, "turn/start", serde_json::json!({"threadId":thread, "input":[]}), true),
+        (4, "thread/compact/start", serde_json::json!({"threadId":thread}), true),
+        (5, "turn/interrupt", serde_json::json!({"threadId":thread, "turnId":"not-running"}), false),
+        (6, "thread/shellCommand", serde_json::json!({"threadId":thread, "command":"echo blocked"}), true),
+    ] {
+        let request: JSONRPCRequest = serde_json::from_value(serde_json::json!({
+            "id": id, "method": method, "params": params,
+        }))?;
+        harness.processor.process_request(TEST_CONNECTION_ID, request, &AppServerTransport::Stdio,
+            harness.session.clone()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let envelope = harness.outgoing_rx.recv().await.unwrap();
+                let crate::outgoing_message::OutgoingEnvelope::ToConnection {
+                    connection_id,
+                    message,
+                    ..
+                } = envelope else {
+                    continue;
+                };
+                if connection_id != TEST_CONNECTION_ID {
+                    continue;
+                }
+                match message {
+                    crate::outgoing_message::OutgoingMessage::Error(error) if error.id == RequestId::Integer(id) => {
+                        let draining = error.error.data.as_ref().and_then(|data| data.get("kind"))
+                            == Some(&serde_json::json!("server_draining"));
+                        assert_eq!(draining, rejected, "{error:?}");
+                        if rejected { assert_eq!(error.error.data.unwrap()["retryable"], true); }
+                        break;
+                    }
+                    crate::outgoing_message::OutgoingMessage::Response(response) if response.id == RequestId::Integer(id) => {
+                        assert!(!rejected);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }).await?;
+    }
+    harness.shutdown().await;
+    Ok(())
+}
+
 impl TracingHarness {
     async fn new() -> Result<Self> {
         Self::new_with_thread_config_loader(Arc::new(codex_config::NoopThreadConfigLoader)).await
@@ -1904,7 +1955,7 @@ fn rollback_request_cancellation_releases_reservation_before_retry() -> Result<(
                         } => {
                             assert_eq!(connection_id, TEST_CONNECTION_ID);
                             if let Some(receipt) = write_complete_tx {
-                                receipt.send(()).expect("transport receipt receiver");
+                                receipt.send(std::time::Instant::now()).expect("transport receipt receiver");
                             }
                             message
                         }
@@ -2997,7 +3048,7 @@ mod resume_listener_generation_rpc_tests {
                         ..
                     } => {
                         if let Some(receipt) = write_complete_tx {
-                            let _ = receipt.send(());
+                            let _ = receipt.send(std::time::Instant::now());
                         }
                         message
                     }
@@ -4716,7 +4767,7 @@ fn interrupt_request_cancellation_releases_reservation_before_terminal() -> Resu
                         ..
                     } => {
                         if let Some(receipt) = write_complete_tx {
-                            let _ = receipt.send(());
+                            let _ = receipt.send(std::time::Instant::now());
                         }
                         message
                     }

@@ -110,7 +110,7 @@ impl ShellCommandHandler {
         })
     }
 
-    pub(super) fn effective_allow_login_shell(
+    pub(crate) fn effective_allow_login_shell(
         session_source: &codex_protocol::protocol::SessionSource,
         allow_login_shell: bool,
     ) -> bool {
@@ -193,7 +193,8 @@ impl ShellCommandHandler {
             expiration: params
                 .timeout_ms
                 .or_else(|| {
-                    looks_like_validation_command(&invocation.display_command()).then_some(300_000)
+                    looks_like_validation_command(&invocation.display_command())
+                        .then_some(super::VALIDATION_COMMAND_TIMEOUT_MS)
                 })
                 .into(),
             capture_policy: ExecCapturePolicy::ShellTool,
@@ -263,7 +264,9 @@ impl ShellCommandHandler {
         &self,
         mut invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let Some(turn_environment) = invocation.step_context.environments.primary().cloned() else {
+        let Some(turn_environment) = crate::tools::handlers::wait_for_tool_environment(
+            &invocation.step_context.environments, None, &invocation.cancellation_token,
+        ).await? else {
             return Err(FunctionCallError::RespondToModel(
                 "shell is unavailable in this session".to_string(),
             ));

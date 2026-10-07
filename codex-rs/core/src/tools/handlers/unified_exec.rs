@@ -22,6 +22,21 @@ pub use exec_command::ExecCommandHandler;
 pub(crate) use exec_command::ExecCommandHandlerOptions;
 pub use write_stdin::WriteStdinHandler;
 
+async fn preserve_durability_failure_output(
+    message: String,
+    output: Option<Box<crate::tools::context::ExecCommandToolOutput>>,
+    codex_home: &std::path::Path,
+    thread_id: &str,
+) -> String {
+    let Some(mut output) = output else { return message; };
+    // A zero display budget must not discard the only observed result when
+    // durable history failed. Keep this fatal diagnostic bounded and recoverable.
+    output.max_output_tokens = Some(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS);
+    output.prepare_recovery_artifact(codex_home, thread_id).await;
+    let observed = output.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
+    format!("{message}\nCommand result observed before durability failure (not successful persistence; do not rerun):\n{observed}")
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "RawExecCommandArgs")]
 pub(crate) struct ExecCommandArgs {

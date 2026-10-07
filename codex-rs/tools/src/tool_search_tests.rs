@@ -3,6 +3,19 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
 #[test]
+fn identifier_words_preserve_acronyms_and_camel_case_boundaries() {
+    for (name, expected) in [
+        ("_create_calendar_event", "create calendar event"),
+        ("createCalendarEvent", "create calendar event"),
+        ("getHTTPResponse", "get http response"),
+        ("read2DImage", "read2 d image"),
+        ("namespace__read-file", "namespace read file"),
+    ] {
+        assert_eq!(identifier_search_words(name), expected);
+    }
+}
+
+#[test]
 fn search_results_defer_functions_and_namespace_children_without_output_schemas() {
     let function = ResponsesApiTool {
         name: "lookup".to_string(),
@@ -103,10 +116,13 @@ fn default_search_text_uses_model_visible_namespace_metadata_once() {
 
     let search_info = ToolSearchInfo::from_tool_spec(&spec, /*source_info*/ None)
         .expect("namespace should be searchable");
+    let callable = crate::code_mode_name_for_tool_name(&crate::ToolName::namespaced(
+        "codex_app", "automation_update",
+    ));
 
     assert_eq!(
         search_info.entry.search_text,
-        "codex_app Manage Codex automations. codex_app__automation_update automation_update automation update Create or update automations. Automation options. mode Update mode. schedule Schedule settings. timezone IANA timezone."
+        format!("codex_app Manage Codex automations. {callable} automation_update automation update Create or update automations. Automation options. mode Update mode. schedule Schedule settings. timezone IANA timezone.")
     );
     assert_eq!(
         search_info.entry.tool_names,

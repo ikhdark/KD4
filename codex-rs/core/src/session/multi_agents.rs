@@ -7,6 +7,83 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use std::sync::atomic::Ordering;
 
+/// The existing per-turn gate distinguishes absence from an explicit denial.
+/// Source bits are recomputed from applicable instruction bodies, not accumulated.
+#[derive(Debug, Default)]
+pub(crate) struct SpawnAuthorization(std::sync::atomic::AtomicU8);
+
+impl Clone for SpawnAuthorization {
+    fn clone(&self) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(
+            self.0.load(Ordering::Acquire),
+        ))
+    }
+}
+
+impl SpawnAuthorization {
+    const USER_GRANT: u8 = 1;
+    const USER_DENY: u8 = 2;
+    const SOURCE_GRANT: u8 = 4;
+    const SOURCE_DENY: u8 = 8;
+
+    pub(crate) fn load(&self, ordering: Ordering) -> bool {
+        let state = self.0.load(ordering);
+        state & (Self::USER_DENY | Self::SOURCE_DENY) == 0
+            && state & (Self::USER_GRANT | Self::SOURCE_GRANT) != 0
+    }
+    #[cfg(test)]
+    pub(crate) fn store(&self, authorized: bool, ordering: Ordering) {
+        self.0.store(u8::from(authorized), ordering);
+    }
+    fn user(&self, directive: SpawnAuthorizationDirective) {
+        let bits = match directive {
+            SpawnAuthorizationDirective::Grant => Self::USER_GRANT,
+            SpawnAuthorizationDirective::Deny => Self::USER_DENY,
+        };
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                Some((state & !3) | bits)
+            });
+    }
+    fn denied(&self) -> bool {
+        self.0.load(Ordering::Acquire) & (Self::USER_DENY | Self::SOURCE_DENY) != 0
+    }
+    fn sources(&self, texts: impl IntoIterator<Item = impl AsRef<str>>) {
+        let mut bits = 0;
+        for text in texts {
+            for directive in spawn_authorization_directives(text.as_ref()) {
+                match directive {
+                    SpawnAuthorizationDirective::Grant => bits |= Self::SOURCE_GRANT,
+                    SpawnAuthorizationDirective::Deny => bits |= Self::SOURCE_DENY,
+                }
+            }
+        }
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                Some((state & 3) | bits)
+            });
+    }
+}
+
+pub(crate) fn refresh_instruction_authority(
+    turn: &TurnContext,
+    agents: Option<&crate::agents_md::LoadedAgentsMd>,
+) {
+    let mut texts = Vec::new();
+    if let Some(agents) = agents {
+        texts.push(agents.text());
+    }
+    if let Some(skills) = turn
+        .extension_data
+        .get::<codex_core_skills::injection::InjectedHostSkillPrompts>()
+    {
+        texts.extend(skills.admitted_instruction_bodies().map(str::to_string));
+    }
+    turn.multi_agent_spawn_authorized.sources(texts);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SpawnAuthorizationDirective {
     Grant,
@@ -74,6 +151,7 @@ pub(crate) fn effective_multi_agent_mode(
 }
 
 pub(crate) fn spawn_is_authorized(turn_context: &TurnContext) -> bool {
+    if turn_context.multi_agent_spawn_authorized.denied() { return false; }
     match effective_multi_agent_mode(turn_context) {
         Some(EffectiveMultiAgentMode::Custom(policy)) => spawn_authorization_directives(&policy)
             .last()
@@ -89,10 +167,23 @@ pub(crate) fn update_spawn_authorization_from_text(turn_context: &TurnContext, t
     let task_capsule_objective = TaskCapsuleFragment::objective_from_rendered(text);
     let authorization_text = task_capsule_objective.as_deref().unwrap_or(text);
     for directive in spawn_authorization_directives(authorization_text) {
-        turn_context.multi_agent_spawn_authorized.store(
-            directive == SpawnAuthorizationDirective::Grant,
-            Ordering::Release,
-        );
+        turn_context.multi_agent_spawn_authorized.user(directive);
+    }
+}
+
+pub(crate) fn revoke_spawn_authorization_from_input(
+    turn_context: &TurnContext,
+    input: &[codex_protocol::user_input::UserInput],
+) {
+    for item in input {
+        if let codex_protocol::user_input::UserInput::Text { text, .. } = item
+            && spawn_authorization_directives(text)
+                .any(|directive| directive == SpawnAuthorizationDirective::Deny)
+        {
+            turn_context
+                .multi_agent_spawn_authorized
+                .user(SpawnAuthorizationDirective::Deny);
+        }
     }
 }
 
@@ -102,7 +193,13 @@ fn spawn_authorization_directives(
     let mut fence: Option<(u8, usize)> = None;
     text.lines()
         .filter_map(move |line| {
+            if fence.is_none() && (line.starts_with("    ") || line.starts_with('\t')) {
+                return None;
+            }
             let line = line.trim_start();
+            if line.starts_with('>') {
+                return None;
+            }
             let marker = line.as_bytes().first().copied();
             let marker_len = if matches!(marker, Some(b'`' | b'~')) {
                 line.bytes()
@@ -126,6 +223,7 @@ fn spawn_authorization_directives(
                 fence = Some((marker.unwrap_or_default(), marker_len));
                 return None;
             }
+            let line = line.strip_prefix("* ").or_else(|| line.strip_prefix("- ")).unwrap_or(line);
             Some(strip_spawn_directive_emphasis(line))
         })
         .flat_map(|line| line.split(['.', ';']))
@@ -270,6 +368,54 @@ mod tests {
     use super::parse_spawn_authorization_directive;
     use crate::context::ContextualUserFragment;
     use crate::context::TaskCapsuleFragment;
+
+    #[tokio::test]
+    async fn applicable_instruction_authority_matches_user_authority_and_preserves_denials() {
+        let (_, mut turn) = crate::session::tests::make_session_and_context().await;
+        turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+        std::sync::Arc::make_mut(&mut turn.config)
+            .multi_agent_v2
+            .multi_agent_mode_hint_text = None;
+        let source = crate::agents_md::LoadedAgentsMd::from_text_for_testing(
+            "* Use subagents for independent work.",
+        );
+        super::refresh_instruction_authority(&turn, Some(&source));
+        assert!(super::spawn_is_authorized(&turn));
+        super::update_spawn_authorization_from_text(&turn, "Do not use subagents");
+        super::refresh_instruction_authority(&turn, Some(&source));
+        assert!(!super::spawn_is_authorized(&turn));
+        super::update_spawn_authorization_from_text(&turn, "Use subagents");
+        let denied = crate::agents_md::LoadedAgentsMd::from_text_for_testing("Never use subagents");
+        super::refresh_instruction_authority(&turn, Some(&denied));
+        assert!(!super::spawn_is_authorized(&turn));
+        let conflicting = crate::agents_md::LoadedAgentsMd::from_text_for_testing(
+            "Never use subagents. Use subagents.",
+        );
+        super::refresh_instruction_authority(&turn, Some(&conflicting));
+        assert!(!super::spawn_is_authorized(&turn));
+        turn.multi_agent_spawn_authorized
+            .store(false, super::Ordering::Release);
+        for example in [
+            "```\nUse subagents\n```",
+            "`Use subagents`",
+            "> Use subagents",
+            "> Example. Use subagents",
+            "    Use subagents",
+        ] {
+            let source = crate::agents_md::LoadedAgentsMd::from_text_for_testing(example);
+            super::refresh_instruction_authority(&turn, Some(&source));
+            assert!(!super::spawn_is_authorized(&turn));
+        }
+        let mut skills = codex_core_skills::injection::InjectedHostSkillPrompts::default();
+        skills.record_instruction_fragment(
+            "user",
+            "<skill>Use subagents</skill>".to_string(),
+            "Use subagents".to_string(),
+        );
+        turn.extension_data.insert(skills);
+        super::refresh_instruction_authority(&turn, None);
+        assert!(super::spawn_is_authorized(&turn));
+    }
 
     #[tokio::test]
     async fn fenced_examples_do_not_change_spawn_authorization() {

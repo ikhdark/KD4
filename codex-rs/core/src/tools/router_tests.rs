@@ -52,6 +52,22 @@ fn admitted_tool_dispatch_state() -> Arc<ToolDispatchState> {
 }
 
 #[tokio::test]
+async fn desktop_missing_tool_notice_uses_current_instructions_on_a_reused_router() {
+    let (_, turn) = make_session_and_context().await;
+    let step = StepContext::for_test(Arc::new(turn));
+    let router = ToolRouter::from_context(&step, ToolRouterParams {
+        tool_suggest_candidates: None, deferred_mcp_tools: None, mcp_tools: None,
+        extension_tool_executors: Vec::new(), dynamic_tools: &[], exposure_identity: Default::default(),
+    }, &Default::default());
+    let instructions = "<app-context>\n# Codex desktop context\n### Thread Coordination\nUse `list_threads` and `send_message_to_thread`.\n</app-context>";
+    let notice = router.tool_search_sources_for_instructions(Some(instructions));
+    assert!(notice.contains("Thread Coordination: list_threads, send_message_to_thread"));
+    assert!(notice.contains("absent from the current inventory"));
+    assert_eq!(router.tool_search_sources_for_instructions(None), router.tool_search_sources);
+    assert_eq!(router.tool_search_sources_for_instructions(Some("unknown envelope")), router.tool_search_sources);
+}
+
+#[tokio::test]
 async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Result<()> {
     use codex_features::Feature;
     use codex_protocol::openai_models::ToolMode;
@@ -125,10 +141,8 @@ async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Res
             continue;
         }
         let session = Arc::new(session);
-        let mut calls = vec![(
-            "context_checkpoint",
-            json!({"completed_call_ids":[],"summary":" \n", "active_work":"\t", "retained_evidence":[]}),
-        )];
+        assert!(!router.has_registered_tool(&ToolName::plain("context_checkpoint")));
+        let mut calls = Vec::new();
         if token_budget {
             calls.push(("get_context_remaining", json!({})));
         }
@@ -159,18 +173,13 @@ async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Res
                 panic!("expected JSON text");
             };
             let value: serde_json::Value = serde_json::from_str(&text)?;
-            if name == "context_checkpoint" {
-                assert_eq!(value["changed"], false);
-                assert_eq!(value["checkpoint_item_persisted"], false);
-            } else {
-                assert_eq!(value.as_object().unwrap().len(), 1);
-                assert!(value["tokens_left"].is_i64() || value["tokens_left"].is_null());
-            }
+            assert_eq!(value.as_object().unwrap().len(), 1);
+            assert!(value["tokens_left"].is_i64() || value["tokens_left"].is_null());
         }
         assert_eq!(
             session.clone_history().await.raw_items().len(),
             before,
-            "empty checkpoint must not persist notes"
+            "context inspection must not persist notes"
         );
     }
     Ok(())
@@ -314,6 +323,50 @@ async fn deferred_capability_revision_depends_only_on_provenance_and_schema() {
 
     assert_eq!(first, second);
     assert!(first.contains_key(&ToolName::plain("stable_deferred_revision")));
+}
+
+#[tokio::test]
+async fn deferred_revision_invalidates_identical_schema_from_another_authority() {
+    let handler = crate::tools::handlers::DynamicToolHandler::new(&DynamicToolFunctionSpec {
+        name: "authority_bound".into(), description: "test".into(),
+        input_schema: json!({"type":"object"}), defer_loading: true,
+    }).unwrap();
+    let runtime: Arc<dyn crate::tools::registry::CoreToolRuntime> = Arc::new(handler);
+    let revisions = |authority: &str| {
+        let registered = crate::tools::registry::RegisteredTool::with_exposure(
+            Arc::clone(&runtime), codex_tools::ToolExposure::Deferred, TypedToolClass::DynamicExternal,
+        ).with_provider_authority(authority.into());
+        ToolRouter::from_parts(ToolRegistry::from_unique_registered_tools(vec![registered]), vec![])
+            .deferred_tool_capability_revisions()
+    };
+    assert_eq!(revisions("account-a:endpoint-a"), revisions("account-a:endpoint-a"));
+    assert_ne!(revisions("account-a:endpoint-a"), revisions("account-b:endpoint-a"));
+    assert_ne!(revisions("account-a:endpoint-a"), revisions("account-a:endpoint-b"));
+}
+
+#[test]
+fn deferred_revision_includes_output_contract_but_wire_schema_does_not() {
+    let handler = crate::tools::handlers::DynamicToolHandler::new(&DynamicToolFunctionSpec {
+        name: "output_bound".into(), description: "test".into(),
+        input_schema: json!({"type":"object"}), defer_loading: true,
+    }).unwrap();
+    let runtime: Arc<dyn crate::tools::registry::CoreToolRuntime> = Arc::new(handler);
+    let revision = |output: serde_json::Value| {
+        let mut registered = crate::tools::registry::RegisteredTool::with_exposure(
+            Arc::clone(&runtime), codex_tools::ToolExposure::Deferred, TypedToolClass::DynamicExternal,
+        );
+        let ToolSpec::Function(tool) = registered.spec_mut() else { panic!("function") };
+        tool.output_schema = Some(output.into());
+        let wire = serde_json::to_vec(registered.spec()).unwrap();
+        let revision = ToolRouter::from_parts(ToolRegistry::from_unique_registered_tools(vec![registered]), vec![])
+            .deferred_tool_capability_revisions();
+        (wire, revision)
+    };
+    let a = revision(json!({"type":"string"}));
+    let b = revision(json!({"type":"boolean"}));
+    assert_eq!(a, revision(json!({"type":"string"})));
+    assert_eq!(a.0, b.0);
+    assert_ne!(a.1, b.1);
 }
 
 #[tokio::test]
@@ -1333,11 +1386,12 @@ impl codex_exec_server::ExecutorFileSystem for PatchReplyBarrierFileSystem {
                 .write_file(path, contents, sandbox)
                 .await?;
             if path == &self.first {
-                let _reply_lifetime = PatchReplyLifetime(Arc::clone(&self.reply_dropped));
-                if let Some(committed) = self.committed.lock().expect("commit signal").take() {
+                let committed = self.committed.lock().expect("commit signal").take();
+                if let Some(committed) = committed {
+                    let _reply_lifetime = PatchReplyLifetime(Arc::clone(&self.reply_dropped));
                     let _ = committed.send(());
+                    self.release.notified().await;
                 }
-                self.release.notified().await;
             }
             Ok(())
         })
@@ -1544,9 +1598,10 @@ async fn router_apply_patch_cancellation_settles_committed_write_and_skips_tail(
             gate.try_lock().is_ok(),
             "settled mutation releases the exact workspace gate"
         );
-        assert_eq!(std::fs::read_to_string(repo.join("first.txt"))?, "after\n");
+        assert_eq!(std::fs::read_to_string(repo.join("first.txt"))?,
+            if cancel { "before\n" } else { "after\n" });
         let expected_writes = if cancel {
-            vec![first.clone()]
+            vec![first.clone(), first.clone()]
         } else {
             vec![first.clone(), tail.clone()]
         };
@@ -1565,13 +1620,15 @@ async fn router_apply_patch_cancellation_settles_committed_write_and_skips_tail(
         let diff = tracker
             .lock()
             .await
-            .get_unified_diff()
-            .expect("committed patch must be visible in the turn diff");
-        assert!(
-            diff.contains("first.txt") && diff.contains("-before") && diff.contains("+after"),
-            "{diff}"
-        );
-        assert_eq!(diff.contains("tail.txt"), !cancel, "{diff}");
+            .get_unified_diff();
+        if cancel {
+            assert!(diff.as_deref().is_none_or(str::is_empty),
+                "successfully rolled back prefix must not remain in the turn diff: {diff:?}");
+        } else {
+            let diff = diff.expect("committed patch must be visible in the turn diff");
+            assert!(diff.contains("first.txt") && diff.contains("-before") && diff.contains("+after"), "{diff}");
+            assert!(diff.contains("tail.txt"), "{diff}");
+        }
         store.close().await;
     }
     Ok(())

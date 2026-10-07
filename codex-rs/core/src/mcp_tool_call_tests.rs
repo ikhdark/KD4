@@ -76,6 +76,23 @@ fn mcp_arguments_preserve_server_valid_values_before_execution() {
 }
 
 #[test]
+fn mcp_contract_comparison_ignores_callable_aliases_not_schema_or_annotations() {
+    let live: ToolInfo = serde_json::from_value(serde_json::json!({
+        "server_name": "docs", "tool_name": "read-file", "tool_namespace": "docs",
+        "tool": {"name": "read-file", "inputSchema": {"type": "object"}}
+    })).unwrap();
+    let mut sampled = live.clone();
+    sampled.callable_namespace = "mcp__docs".into();
+    sampled.callable_name = "read_file_collision_suffix".into();
+    assert!(mcp_contract_matches(&sampled, &live));
+    sampled.tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
+    assert!(!mcp_contract_matches(&sampled, &live));
+    sampled.tool.annotations = None;
+    sampled.tool.input_schema = Arc::new(serde_json::json!({"type":"object", "required":["path"]}).as_object().unwrap().clone());
+    assert!(!mcp_contract_matches(&sampled, &live));
+}
+
+#[test]
 fn mcp_argument_parser_keeps_empty_and_invalid_input_contracts() {
     assert_eq!(
         parse_mcp_tool_arguments_before_execution("  ").expect("empty arguments are valid"),
@@ -106,6 +123,8 @@ fn approval_metadata(
     tool_description: Option<&str>,
 ) -> McpToolApprovalMetadata {
     McpToolApprovalMetadata {
+        authority: Some("test-authority".into()),
+        persistent_authority: true,
         annotations: None,
         connector_id: connector_id.map(str::to_string),
         link_id: None,
@@ -623,7 +642,7 @@ async fn metadata_derivation_uses_the_supplied_live_tool_info() {
         plugin_display_names: Vec::new(),
     };
 
-    let metadata = mcp_tool_metadata_from_tool_info(manager.as_ref(), &tool_info).await;
+    let metadata = mcp_tool_metadata_from_tool_info(&session, manager.as_ref(), &tool_info).await;
 
     assert_eq!(metadata.connector_id.as_deref(), Some("snapshot-connector"));
     assert_eq!(metadata.connector_name.as_deref(), Some("Snapshot App"));
@@ -872,7 +891,7 @@ async fn sampled_mcp_tool_missing_from_live_catalog_skips_before_file_upload() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_tool_call_authorizes_and_reports_from_live_tool_metadata() {
+async fn mcp_tool_call_rejects_changed_contract_before_upload_or_execution() {
     let server = start_mock_server().await;
     AppsTestServer::mount(&server)
         .await
@@ -910,6 +929,11 @@ async fn mcp_tool_call_authorizes_and_reports_from_live_tool_metadata() {
         .unwrap_or_default();
     sampled_meta.insert("openai/fileParams".to_string(), serde_json::json!(["file"]));
     sampled_tool.tool.meta = Some(rmcp::model::Meta(sampled_meta));
+    // The sampled contract must admit the file argument so dispatch reaches
+    // the live-contract check rather than failing generic schema validation.
+    Arc::make_mut(&mut sampled_tool.tool.input_schema)
+        .get_mut("properties").unwrap().as_object_mut().unwrap()
+        .insert("file".into(), serde_json::json!({"type":"string"}));
     step_context.seed_mcp_tools_for_test(live_tools).await;
 
     let tool_name = sampled_tool.canonical_tool_name();
@@ -945,18 +969,13 @@ async fn mcp_tool_call_authorizes_and_reports_from_live_tool_metadata() {
     assert_eq!(started.app_name.as_deref(), Some("Calendar"));
     let (completed, request_user_input_count) = recv_mcp_item_completed(&rx_event, call_id).await;
     assert_eq!(request_user_input_count, 0);
-    assert_eq!(completed.status, McpToolCallStatus::Completed);
+    assert_eq!(completed.status, McpToolCallStatus::Failed);
+    assert!(completed.error.as_ref().unwrap().message.contains("contract changed"));
     assert_eq!(completed.connector_id.as_deref(), Some("calendar"));
     assert_eq!(completed.app_name.as_deref(), Some("Calendar"));
 
     let calls = recorded_apps_tool_calls(&server).await;
-    assert_eq!(calls.len(), 1);
-    assert_eq!(
-        calls[0]
-            .pointer("/params/arguments/file")
-            .and_then(serde_json::Value::as_str),
-        Some("must-not-upload.txt")
-    );
+    assert!(calls.is_empty());
     let requests = server
         .received_requests()
         .await
@@ -1051,6 +1070,33 @@ async fn sampled_mcp_tool_newly_hidden_from_model_skips_before_approval_or_execu
     startup_cancellation_token.cancel();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sampled_read_only_mcp_tool_cannot_dispatch_live_mutating_contract() {
+    let server = start_mock_server().await;
+    AppsTestServer::mount(&server).await.unwrap();
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    let (step, startup) = step_context_with_live_apps(&turn, &server.uri()).await;
+    let live = step.mcp.manager().list_all_tools().await;
+    let mut sampled = live.iter().find(|tool| tool.tool.name == "calendar_create_event").unwrap().clone();
+    assert_eq!(sampled.tool.annotations.as_ref().unwrap().read_only_hint, Some(false));
+    sampled.tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
+    step.seed_mcp_tools_for_test(live).await;
+    let name = sampled.canonical_tool_name();
+    let runtime = runtime_for_sampled_mcp_tool(Arc::clone(&session), step, sampled);
+    let call_id = "read-only-became-mutating";
+    tokio::time::timeout(Duration::from_secs(2), runtime.handle_tool_call(
+        ToolCall { tool_name: name, call_id: call_id.into(), payload: ToolPayload::Function {
+            arguments: serde_json::json!({"title":"test", "starts_at":"tomorrow"}).to_string(),
+        } }, CancellationToken::new(),
+    )).await.unwrap().unwrap();
+    let (completed, prompts) = recv_mcp_item_completed(&events, call_id).await;
+    assert_eq!(prompts, 0);
+    assert_eq!(completed.status, McpToolCallStatus::Failed);
+    assert!(completed.error.unwrap().message.contains("contract changed"));
+    assert!(recorded_apps_tool_calls(&server).await.is_empty());
+    startup.cancel();
+}
+
 #[test]
 fn openai_file_params_are_only_honored_for_codex_apps() {
     let meta = serde_json::json!({
@@ -1116,11 +1162,20 @@ fn writes_mode_requires_approval_for_non_read_only_tools() {
 
 #[test]
 fn writes_mode_does_not_require_approval_for_read_only_tools() {
-    let annotations = annotations(Some(true), Some(true), Some(true));
+    let annotations = annotations(Some(true), Some(false), Some(true));
     assert_eq!(
         requires_mcp_tool_approval_for_mode(Some(&annotations), AppToolApproval::Writes),
         false
     );
+}
+
+#[test]
+fn writes_mode_requires_approval_for_contradictory_read_only_hints() {
+    let annotations = annotations(Some(true), Some(true), Some(true));
+    assert!(requires_mcp_tool_approval_for_mode(
+        Some(&annotations),
+        AppToolApproval::Writes,
+    ));
 }
 
 #[test]
@@ -1578,6 +1633,7 @@ fn trusted_codex_apps_tool_question_offers_always_allow() {
 #[test]
 fn codex_apps_tool_question_without_elicitation_omits_always_allow() {
     let session_key = McpToolApprovalKey {
+        authority: "test-authority".into(),
         server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
         connector_id: Some("calendar".to_string()),
         tool_name: "run_action".to_string(),
@@ -1641,30 +1697,54 @@ fn custom_mcp_tool_question_offers_session_remember_and_always_allow() {
 }
 
 #[test]
-fn custom_servers_support_session_and_persistent_approval() {
+fn custom_servers_require_an_identified_authority_for_remembered_approval() {
     let invocation = McpInvocation {
         server: "custom_server".to_string(),
         tool: "run_action".to_string(),
         arguments: None,
     };
     let expected = McpToolApprovalKey {
+        authority: "test-authority".into(),
         server: "custom_server".to_string(),
         connector_id: None,
         tool_name: "run_action".to_string(),
     };
+    let metadata = approval_metadata(None, None, None, None, None);
 
     assert_eq!(
         session_mcp_tool_approval_key(&invocation, /*metadata*/ None, AppToolApproval::Auto),
+        None
+    );
+    assert_eq!(
+        session_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto),
         Some(expected.clone())
     );
     assert_eq!(
         persistent_mcp_tool_approval_key(
             &invocation,
-            /*metadata*/ None,
+            Some(&metadata),
             AppToolApproval::Auto
         ),
         Some(expected)
     );
+}
+
+#[tokio::test]
+async fn remembered_mcp_consent_is_scoped_to_authority_and_contract() {
+    let (session, _) = make_session_and_context().await;
+    let invocation = McpInvocation { server: "docs".into(), tool: "write".into(), arguments: None };
+    let mut metadata = approval_metadata(None, None, None, None, None);
+    let key = session_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto).unwrap();
+    remember_mcp_tool_approval(&session, key.clone()).await;
+    assert!(mcp_tool_approval_is_remembered(&session, &key).await);
+    for changed in ["replacement-endpoint", "other-account", "changed-contract"] {
+        metadata.authority = Some(changed.into());
+        let replacement = session_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto).unwrap();
+        assert_ne!(key.policy_key(), replacement.policy_key());
+        assert!(!mcp_tool_approval_is_remembered(&session, &replacement).await);
+    }
+    metadata.persistent_authority = false;
+    assert!(persistent_mcp_tool_approval_key(&invocation, Some(&metadata), AppToolApproval::Auto).is_none());
 }
 
 #[test]
@@ -1682,6 +1762,7 @@ fn codex_apps_connectors_support_persistent_approval() {
         /*tool_description*/ None,
     );
     let expected = McpToolApprovalKey {
+        authority: "test-authority".into(),
         server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
         connector_id: Some("calendar".to_string()),
         tool_name: "calendar/list_events".to_string(),
@@ -2062,6 +2143,8 @@ async fn codex_apps_tool_call_request_meta_includes_turn_metadata_and_codex_apps
         .current_meta_value_for_mcp_request(mcp_turn_metadata_context(&turn_context))
         .expect("turn metadata");
     let metadata = McpToolApprovalMetadata {
+        authority: Some("test-authority".into()),
+        persistent_authority: true,
         annotations: None,
         connector_id: Some("calendar".to_string()),
         link_id: None,
@@ -2421,7 +2504,7 @@ fn approval_answers_require_an_uninterrupted_response() {
         })));
         assert_eq!(
             response,
-            Some(RequestUserInputResponse {
+            Some(RequestUserInputResponse { disposition: None,
                 answers: HashMap::from([(
                     "approval".to_string(),
                     RequestUserInputAnswer {
@@ -2436,6 +2519,16 @@ fn approval_answers_require_an_uninterrupted_response() {
             expected
         );
         let mut interrupted = response.expect("approval answer converts to a response");
+        for disposition in [
+            codex_protocol::request_user_input::RequestUserInputDisposition::TimedOut,
+            codex_protocol::request_user_input::RequestUserInputDisposition::Skipped,
+            codex_protocol::request_user_input::RequestUserInputDisposition::Interrupted,
+            codex_protocol::request_user_input::RequestUserInputDisposition::TransportError,
+        ] {
+            let mut not_approved = interrupted.clone();
+            not_approved.disposition = Some(disposition);
+            assert_eq!(parse_mcp_tool_approval_response(Some(not_approved), "approval"), McpToolApprovalDecision::Cancel);
+        }
         interrupted.interrupted = true;
         assert_eq!(
             parse_mcp_tool_approval_response(Some(interrupted), "approval"),
@@ -2861,6 +2954,7 @@ async fn persistent_mcp_approval_failure_warns_and_limits_grant_to_session() {
     let config_path = session.codex_home().await.join(CONFIG_TOML_FILE);
     std::fs::create_dir_all(&config_path).expect("block config file with a directory");
     let key = McpToolApprovalKey {
+        authority: "test-authority".into(),
         server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
         connector_id: Some("calendar".to_string()),
         tool_name: "calendar/list_events".to_string(),
@@ -2895,6 +2989,7 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config() {
     let codex_home = session.codex_home().await;
     std::fs::create_dir_all(&codex_home).expect("create codex home");
     let key = McpToolApprovalKey {
+        authority: "test-authority".into(),
         server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
         connector_id: Some("calendar".to_string()),
         tool_name: "calendar/list_events".to_string(),
@@ -2903,6 +2998,11 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config() {
     maybe_persist_mcp_tool_approval(&session, &turn_context, key.clone()).await;
 
     let config = session.get_config().await;
+    let manager = session.services.latest_mcp_runtime().manager_arc();
+    assert!(scoped_mcp_approval_is_persisted(&config, manager.as_ref(), &key));
+    let mut other_provider = key.clone();
+    other_provider.authority = "different-provider".into();
+    assert!(!scoped_mcp_approval_is_persisted(&config, manager.as_ref(), &other_provider));
     let apps_toml = config
         .config_layer_stack
         .effective_config()
@@ -2915,7 +3015,7 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config() {
         .apps
         .get("calendar")
         .and_then(|app| app.tools.as_ref())
-        .and_then(|tools| tools.tools.get("calendar/list_events"))
+        .and_then(|tools| tools.tools.get(&key.policy_key()))
         .expect("calendar/list_events tool config exists");
 
     assert_eq!(
@@ -2945,6 +3045,7 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config_for_custom_serve
         .expect("load config");
     turn_context.config = Arc::new(config);
     let key = McpToolApprovalKey {
+        authority: "test-authority".into(),
         server: "docs".to_string(),
         connector_id: None,
         tool_name: "search".to_string(),
@@ -2964,7 +3065,7 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config_for_custom_serve
         .expect("deserialize MCP servers");
     let tool = mcp_servers
         .get("docs")
-        .and_then(|server| server.tools.get("search"))
+        .and_then(|server| server.tools.get(&key.policy_key()))
         .expect("docs/search tool config exists");
 
     assert_eq!(
@@ -3000,6 +3101,7 @@ enabled = true
     turn_context.config = Arc::new(config);
     session.services.plugins_manager.clear_cache();
     let key = McpToolApprovalKey {
+        authority: "test-authority".into(),
         server: "sample".to_string(),
         connector_id: None,
         tool_name: "search".to_string(),
@@ -3013,7 +3115,7 @@ enabled = true
         .plugins
         .get("sample@test")
         .and_then(|plugin| plugin.mcp_servers.get("sample"))
-        .and_then(|server| server.tools.get("search"))
+        .and_then(|server| server.tools.get(&key.policy_key()))
         .expect("sample/search tool config exists");
 
     assert_eq!(
@@ -3022,7 +3124,7 @@ enabled = true
             approval_mode: Some(AppToolApproval::Approve),
         }
     );
-    assert!(contents.contains(r#"[plugins."sample@test".mcp_servers.sample.tools.search]"#));
+    assert!(contents.contains(&key.policy_key()));
     assert_eq!(mcp_tool_approval_is_remembered(&session, &key).await, true);
 }
 
@@ -3055,6 +3157,7 @@ async fn maybe_persist_mcp_tool_approval_writes_project_config_for_project_serve
         .expect("load project config");
     turn_context.config = Arc::new(config);
     let key = McpToolApprovalKey {
+        authority: "test-authority".into(),
         server: "docs".to_string(),
         connector_id: None,
         tool_name: "search".to_string(),
@@ -3068,7 +3171,7 @@ async fn maybe_persist_mcp_tool_approval_writes_project_config_for_project_serve
     let tool = parsed
         .mcp_servers
         .get("docs")
-        .and_then(|server| server.tools.get("search"))
+        .and_then(|server| server.tools.get(&key.policy_key()))
         .expect("docs/search tool config exists");
 
     assert_eq!(
@@ -3077,7 +3180,7 @@ async fn maybe_persist_mcp_tool_approval_writes_project_config_for_project_serve
             approval_mode: Some(AppToolApproval::Approve),
         }
     );
-    assert!(contents.contains("[mcp_servers.docs.tools.search]"));
+    assert!(contents.contains(&key.policy_key()));
     assert_eq!(mcp_tool_approval_is_remembered(&session, &key).await, true);
 }
 
@@ -3133,6 +3236,7 @@ command = "docs-server"
     );
     turn_context.config = Arc::new(config);
     let key = McpToolApprovalKey {
+        authority: "test-authority".into(),
         server: "docs".to_string(),
         connector_id: None,
         tool_name: "search".to_string(),
@@ -3144,7 +3248,7 @@ command = "docs-server"
         .expect("read project config");
     let parsed: toml::Value = toml::from_str(&contents).expect("parse partial project config");
     assert_eq!(
-        parsed["mcp_servers"]["docs"]["tools"]["search"]["approval_mode"].as_str(),
+        parsed["mcp_servers"]["docs"]["tools"][key.policy_key().as_str()]["approval_mode"].as_str(),
         Some("approve")
     );
     assert_eq!(
@@ -3164,7 +3268,7 @@ command = "docs-server"
             .get("docs")
             .unwrap()
             .tools
-            .get("search")
+            .get(&key.policy_key())
             .unwrap()
             .approval_mode,
         Some(AppToolApproval::Approve)
@@ -3173,6 +3277,7 @@ command = "docs-server"
 }
 
 #[tokio::test]
+
 async fn approve_mode_skips_when_annotations_do_not_require_approval() {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
@@ -3183,6 +3288,8 @@ async fn approve_mode_skips_when_annotations_do_not_require_approval() {
         arguments: None,
     };
     let metadata = McpToolApprovalMetadata {
+        authority: Some("test-authority".into()),
+        persistent_authority: true,
         annotations: Some(annotations(
             Some(true),
             /*destructive*/ None,
@@ -3242,6 +3349,8 @@ async fn permission_request_hook_allows_mcp_tool_call() {
         })),
     };
     let metadata = McpToolApprovalMetadata {
+        authority: Some("test-authority".into()),
+        persistent_authority: true,
         annotations: Some(annotations(
             Some(false),
             Some(true),
@@ -3378,6 +3487,8 @@ async fn permission_request_hook_runs_after_remembered_mcp_approval() {
         arguments: Some(serde_json::json!({ "entities": [] })),
     };
     let metadata = McpToolApprovalMetadata {
+        authority: Some("test-authority".into()),
+        persistent_authority: true,
         annotations: Some(annotations(
             Some(false),
             Some(true),
@@ -3433,6 +3544,8 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
         arguments: None,
     };
     let metadata = McpToolApprovalMetadata {
+        authority: Some("test-authority".into()),
+        persistent_authority: true,
         annotations: Some(annotations(
             Some(true),
             /*destructive*/ None,
@@ -3494,6 +3607,8 @@ async fn full_access_mode_skips_mcp_tool_approval_for_all_approval_modes() {
         arguments: Some(serde_json::json!({ "id": 1 })),
     };
     let metadata = McpToolApprovalMetadata {
+        authority: Some("test-authority".into()),
+        persistent_authority: true,
         annotations: Some(annotations(Some(false), Some(true), Some(true))),
         connector_id: Some("calendar".to_string()),
         link_id: None,

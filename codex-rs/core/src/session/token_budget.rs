@@ -13,7 +13,7 @@ use codex_tools::ToolCall as ExtensionToolCall;
 use codex_tools::ToolExecutor;
 use codex_tools::ToolName;
 
-/// A fresh context window discards conversation items. Continuity then rests on
+/// A fresh context window retains bounded task input. Bulk evidence rests on
 /// these history-notes extension tools, which register only for a supported
 /// provider and auth mode.
 const RECOVERY_TOOLS: [(&str, &str); 2] = [("notes", "write_file"), ("history", "read_item")];
@@ -51,9 +51,22 @@ impl Session {
         world_state: std::sync::Arc<crate::context::world_state::WorldState>,
     ) -> codex_protocol::error::Result<()> {
         let turn = &step_context.turn;
-        let (items, snapshot, digests) = self
+        let history = self.clone_history().await;
+        let source = history.raw_items().iter().filter(|item| !matches!(item,
+            codex_protocol::models::ResponseItem::Message { id: Some(id), role, .. }
+                if role == "developer" && id.as_str().starts_with("msg_token_budget_")
+        )).cloned().collect::<Vec<_>>();
+        let (retained, _, omitted_text) = crate::compact::build_task_input_checkpoint(&source);
+        let recovery = crate::compact::persist_task_compaction_text_recovery(
+            self, &source, omitted_text,
+        ).await?;
+        let (mut items, snapshot, digests) = self
             .build_initial_context_with_world_state_and_provenance(turn, &world_state)
             .await;
+        items.extend(retained);
+        if let Some(text) = recovery {
+            items.push(crate::compact::compaction_context_message(text));
+        }
         self.replace_compacted_history(
             turn,
             items,
@@ -326,11 +339,12 @@ pub(super) async fn maybe_record(
             state.claim_token_budget_reminder()
         };
         if reminder_due {
-            let response_item =
+            let mut response_item =
                 ContextualUserFragment::into(crate::context::TokenBudgetReminder::new(
                     &config.reminder_message_template,
                     base_window_tokens_remaining,
                 ));
+            response_item.set_id(Some(codex_protocol::ResponseItemId::new("msg_token_budget")));
             if let Err(error) = sess
                 .record_conversation_items(turn_context, std::slice::from_ref(&response_item))
                 .await
@@ -359,8 +373,9 @@ pub(super) async fn maybe_record(
         return Ok(());
     }
 
-    let response_item =
+    let mut response_item =
         ContextualUserFragment::into(crate::context::AutoCompactFallbackPrompt::new(prompt));
+    response_item.set_id(Some(codex_protocol::ResponseItemId::new("msg_token_budget")));
     if let Err(error) = sess
         .record_conversation_items(turn_context, std::slice::from_ref(&response_item))
         .await

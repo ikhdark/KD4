@@ -175,6 +175,9 @@ mod tests {
 
     fn command_execution(call_id: &str) -> ThreadItem {
         ThreadItem::CommandExecution {
+            output_metadata: None,
+            stdout: None,
+            stderr: None,
             id: call_id.to_string(),
             command: "true".to_string(),
             cwd: AbsolutePathBuf::current_dir().expect("current dir").into(),

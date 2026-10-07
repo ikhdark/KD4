@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 fn settled() -> SamplingRequestSettledState {
     SamplingRequestSettledState {
         mutation_revision: 0,
+        attributed_mutation_revision: 0,
         tool_exposure_revision: 0,
     }
 }
@@ -63,14 +64,15 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
     let path = dir.path().join("report.json");
     let mut control = TurnExecutionControl::new();
     let baseline = control.baselines(0);
-    // Commands and output bytes differ; only the declared lineage decides.
+    let mut file_versions = std::collections::HashSet::new();
+    // Untrusted producer lineage cannot erase distinct command evidence.
     for (command, scope, identity, novel) in [
         ("tool scan", Some("query-1"), "snapshot-1", true),
-        ("tool render --retained", Some("query-1"), "snapshot-1", false),
+        ("tool render --retained", Some("query-1"), "snapshot-1", true),
         ("tool scan", Some("query-1"), "snapshot-2", true),
         ("tool scan", Some("query-2"), "snapshot-2", true),
         ("tool scan", None, "snapshot-3", true),
-        ("tool render --retained", None, "snapshot-3", false),
+        ("tool render --retained", None, "snapshot-3", true),
     ] {
         let mut lineage = json!({"source": "example_index", "identity": identity});
         if let Some(scope) = scope {
@@ -81,6 +83,7 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
             arguments: json!({"cmd": command}).to_string(),
         };
         let result = ExecCommandToolOutput {
+            output_ranges: None,
             process_output: None,
             error: None,
             validation: None,
@@ -125,13 +128,15 @@ async fn declared_lineage_projections_share_evidence_but_changed_sources_are_nov
                 document["evidence_lineage"] = file_lineage;
                 serde_json::to_vec(&document).unwrap()
             };
+            let file_is_novel = file_versions.insert(crate::tool_history::sha256(&bytes));
             std::fs::write(&path, bytes).unwrap();
             let call = invocation("read_file", json!({"path":path})).await;
             let read = ReadFileHandler.handle(call.clone()).await.unwrap();
             let collector = control.collector(&baseline);
             record(&collector, "read_file", &call.payload, read.as_ref(), "report");
-            assert!(!control.observe_progress(&baseline, &collector, &settled())
-                .contains(&TurnTimingProgressKind::NewSourceEvidence));
+            assert_eq!(control.observe_progress(&baseline, &collector, &settled())
+                .contains(&TurnTimingProgressKind::NewSourceEvidence), file_is_novel,
+                "producer attribution must not erase the native file identity");
             // Even a selected projection retains attribution, not a new source
             // identity. Byte coverage still belongs to the ordinary read result.
             let call = invocation("read_file", json!({"path":path,
@@ -189,6 +194,7 @@ async fn repository_runners_require_committed_declarations_and_supply_execution_
             let collector = control.collector(&baseline);
             let payload = ToolPayload::Function { arguments: json!({"cmd":command}).to_string() };
             let output = ExecCommandToolOutput {
+                output_ranges: None,
                 process_output: None, error: None, validation: Some(validation.clone()),
                 event_call_id: "runner".into(), chunk_id: "chunk".into(),
                 wall_time: std::time::Duration::ZERO, raw_output: receipt.to_string().into_bytes(),
@@ -362,6 +368,7 @@ fn evidence_reuse_live_stdout_resets_soft_pressure_without_source_credit() {
     let baseline = control.baselines(0);
     for text in ["", "working\n", "", "working\n"] {
         let output = ExecCommandToolOutput {
+            output_ranges: None,
             process_output: None,
             error: None,
             validation: None, event_call_id: "poll".into(), chunk_id: "chunk".into(),
@@ -513,13 +520,15 @@ async fn evidence_reuse_native_replay_tracks_paths_inputs_turns_and_freshness() 
     assert!(!restored_guard.is_fresh(2, &cache, None));
 }
 
-#[test_case::test_case(false; "explicit_ranges")]
-#[test_case::test_case(true; "complete_default_read")]
+#[test_case::test_case(false, 0; "explicit_ranges")]
+#[test_case::test_case(true, 0; "complete_default_read")]
+#[test_case::test_case(false, 16 * 1024; "large_explicit_ranges")]
+#[test_case::test_case(true, 16 * 1024; "large_complete_default_read")]
 #[tokio::test]
-async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_guards(default_read: bool) {
+async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_guards(default_read: bool, padding: usize) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("source.txt");
-    std::fs::write(&path, "first\nsecond\n").unwrap();
+    std::fs::write(&path, format!("first{}\nsecond\n", "x".repeat(padding))).unwrap();
     let selectors = json!([
         {"kind":"lines","start":1,"end":1},
         {"kind":"lines","start":2,"end":2},
@@ -576,6 +585,27 @@ async fn native_selector_reuse_preserves_authority_coverage_and_changed_input_gu
     assert_eq!(value["complete"], true);
     assert_eq!(value["file_complete"], false);
     assert!(value.get("criterion_evidence").is_none());
+    // Immutable replay candidates can be projected concurrently without holding
+    // the shared ledger through selection or response serialization. Discarded
+    // registrations leave the candidate usable for the next caller.
+    std::thread::scope(|scope| {
+        let workers = (0..8).map(|index| {
+            let collector = &collector;
+            let requested = &requested;
+            scope.spawn(move || {
+                let call_id = format!("parallel-replay-{index}");
+                let registration = collector.register_deterministic_tool_call(
+                    &ToolName::plain("read_file"), requested, &call_id,
+                );
+                let guard = registration.replayed_success.unwrap();
+                if index % 2 == 0 { drop(guard); return; }
+                let response = guard.response_for_call(&call_id).unwrap();
+                let output: Value = serde_json::from_str(&response_output_text(&response).unwrap()).unwrap();
+                assert_eq!(output["results"][0]["text"], "second\n");
+            })
+        }).collect::<Vec<_>>();
+        for worker in workers { worker.join().unwrap(); }
+    });
     for args in [
         json!({"path":path,"offset":1,"limit":3}), // extends past the delivered text
         json!({"path":path,"offset":2,"limit":1,"force_fresh":true}),
@@ -634,10 +664,7 @@ async fn default_read_reselection_matches_fresh_selector_engine_without_io() {
     std::fs::remove_file(&path).unwrap();
     for (arguments, fresh, script) in cases {
         let replay = crate::tools::handlers::reselect_read_file_output(previous, &arguments, &raw);
-        if fresh["results"] != script["results"] {
-            assert!(replay.is_none(), "consumer-specific ordering/hydration must not be replayed: {arguments}");
-            continue;
-        }
+        assert_eq!(fresh["results"], script["results"], "small selections fit both consumer budgets");
         let replay = replay.unwrap();
         for key in ["results", "complete", "file_complete", "source_sha256", "canonical_bytes"] {
             assert_eq!(replay[key], fresh[key], "{key}: {arguments}");
@@ -839,7 +866,7 @@ async fn recovery_failure_and_partial_success_reach_progress_accounting() {
         ),
         (
             json!([{"kind":"lines","start":1,"end":1},{"kind":"json_pointer","pointer":"/missing"}]),
-            true,
+            false,
             true,
         ),
         (json!([{"kind":"bytes","start":0,"end":6}]), true, false),
@@ -908,6 +935,7 @@ async fn command_result(
         call_id: "command".into(),
         payload,
         result: Box::new(ExecCommandToolOutput {
+            output_ranges: None,
             process_output: None,
             error: None,
             validation: None,

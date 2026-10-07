@@ -336,11 +336,23 @@ pub enum ToolOutputProjectionFragmentKind {
 
 /// A typed, handler-supplied fragment eligible for the bounded model projection.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ShellOutputProjectionSource {
+    pub exit_code: i32,
+    pub command_text: Option<String>,
+    /// Exact producer streams, only when they cover the same aggregate chunk.
+    pub streams: Option<(String, String)>,
+}
+
+/// A typed, handler-supplied fragment eligible for the bounded model projection.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ToolOutputProjectionFragment {
     /// Stable producer-owned identity for exact selection and recovery accounting.
     pub id: Option<String>,
     pub kind: ToolOutputProjectionFragmentKind,
     pub text: String,
+    /// Defer diagnostic selection until envelope/section overhead is known.
+    /// `text` remains canonical input, not an already-budgeted summary.
+    pub shell_output: Option<ShellOutputProjectionSource>,
 }
 
 impl ToolOutputProjectionFragment {
@@ -349,6 +361,7 @@ impl ToolOutputProjectionFragment {
             id: None,
             kind,
             text: text.into(),
+            shell_output: None,
         }
     }
 
@@ -518,6 +531,12 @@ pub trait ToolOutput: Send {
         response_input_to_code_mode_result(self.to_response_item("", payload))
     }
 
+    /// Display room left in the owning cell. Exact programmatic data remains
+    /// independent of this budget unless the output owner explicitly projects it.
+    fn code_mode_result_with_budget(&self, payload: &ToolPayload, _budget: usize) -> JsonValue {
+        self.code_mode_result(payload)
+    }
+
     /// Whether a Failure/TimedOut result rejects the JavaScript promise.
     /// A process exit status is returned data, even when it records failure;
     /// logging and continuation classification must still see that failure.
@@ -604,6 +623,10 @@ where
         (**self).code_mode_result(payload)
     }
 
+    fn code_mode_result_with_budget(&self, payload: &ToolPayload, budget: usize) -> JsonValue {
+        (**self).code_mode_result_with_budget(payload, budget)
+    }
+
     fn code_mode_failure_is_error(&self) -> bool {
         (**self).code_mode_failure_is_error()
     }
@@ -613,11 +636,13 @@ where
 pub struct JsonToolOutput {
     value: JsonValue,
     model_value: Option<JsonValue>,
+    canonical_artifact_required: bool,
     sampling_signal: Option<JsonValue>,
     success: Option<bool>,
     outcome: Option<ToolOutputOutcome>,
     skip_disposition: Option<ToolOutputSkipDisposition>,
     serialized: Arc<OnceLock<String>>,
+    code_mode_failure_as_data: bool,
 }
 
 impl std::fmt::Debug for JsonToolOutput {
@@ -626,10 +651,12 @@ impl std::fmt::Debug for JsonToolOutput {
             .debug_struct("JsonToolOutput")
             .field("value", &self.value)
             .field("model_value", &self.model_value)
+            .field("canonical_artifact_required", &self.canonical_artifact_required)
             .field("sampling_signal", &self.sampling_signal)
             .field("success", &self.success)
             .field("outcome", &self.outcome)
             .field("skip_disposition", &self.skip_disposition)
+            .field("code_mode_failure_as_data", &self.code_mode_failure_as_data)
             .finish()
     }
 }
@@ -638,10 +665,12 @@ impl PartialEq for JsonToolOutput {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
             && self.model_value == other.model_value
+            && self.canonical_artifact_required == other.canonical_artifact_required
             && self.sampling_signal == other.sampling_signal
             && self.success == other.success
             && self.outcome == other.outcome
             && self.skip_disposition == other.skip_disposition
+            && self.code_mode_failure_as_data == other.code_mode_failure_as_data
     }
 }
 
@@ -655,11 +684,13 @@ impl JsonToolOutput {
         Self {
             value,
             model_value: None,
+            canonical_artifact_required: false,
             sampling_signal: None,
             success: Some(true),
             outcome: None,
             skip_disposition: None,
             serialized: Arc::new(OnceLock::new()),
+            code_mode_failure_as_data: false,
         }
     }
 
@@ -667,11 +698,13 @@ impl JsonToolOutput {
         Self {
             value,
             model_value: None,
+            canonical_artifact_required: false,
             sampling_signal: None,
             success,
             outcome: None,
             skip_disposition: None,
             serialized: Arc::new(OnceLock::new()),
+            code_mode_failure_as_data: false,
         }
     }
 
@@ -679,11 +712,13 @@ impl JsonToolOutput {
         Self {
             value,
             model_value: None,
+            canonical_artifact_required: false,
             sampling_signal: None,
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: None,
             serialized: Arc::new(OnceLock::new()),
+            code_mode_failure_as_data: false,
         }
     }
 
@@ -694,12 +729,21 @@ impl JsonToolOutput {
         Self {
             value,
             model_value: None,
+            canonical_artifact_required: false,
             sampling_signal: None,
             success: Some(false),
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: Some(disposition),
             serialized: Arc::new(OnceLock::new()),
+            code_mode_failure_as_data: false,
         }
+    }
+
+    /// Return structured partial/failure data to JS without changing the logged
+    /// outcome or allowing it to certify successful final delivery.
+    pub fn with_code_mode_failure_as_data(mut self) -> Self {
+        self.code_mode_failure_as_data = true;
+        self
     }
 
     /// Override only model presentation; JS, hooks and canonical retention stay raw.
@@ -707,6 +751,12 @@ impl JsonToolOutput {
         self.model_value = Some(value);
         self.serialized = Arc::new(OnceLock::new());
         self
+    }
+
+    /// Keep omitted producer content recoverable even when its preview fits inline.
+    pub fn with_recoverable_model_value(mut self, value: JsonValue) -> Self {
+        self.canonical_artifact_required = value != self.value;
+        self.with_model_value(value)
     }
 
     /// Private evidence metadata, independent of presentation and artifact IDs.
@@ -769,26 +819,82 @@ impl ToolOutputProjectionMetadata {
 /// and wrapper conversion. Payload arrays and text remain spillable unless the
 /// producer gives them one of these explicit semantic identities.
 pub fn essential_projection_fields(value: &JsonValue) -> JsonValue {
+    // Producer-owned metadata is merged separately. Generic key heuristics
+    // are only a bounded fallback, never authority to pin application state.
+    essential_projection_fields_bounded(value, 0, &mut 8192)
+}
+
+fn small_control_value(value: &JsonValue, depth: usize, remaining: &mut usize) -> bool {
+    if depth > 4 || *remaining < 2 { return false; }
+    *remaining -= 2;
+    match value {
+        JsonValue::String(text) => {
+            let bytes = text.len().saturating_mul(6);
+            if bytes > *remaining { return false; }
+            *remaining -= bytes;
+            true
+        }
+        JsonValue::Array(values) => values.len() <= 16
+            && values.iter().all(|value| small_control_value(value, depth + 1, remaining)),
+        JsonValue::Object(fields) => fields.len() <= 16
+            && fields.iter().all(|(key, value)| {
+                let bytes = key.len().saturating_mul(6).saturating_add(4);
+                if bytes > *remaining { return false; }
+                *remaining -= bytes;
+                small_control_value(value, depth + 1, remaining)
+            }),
+        _ => {
+            let bytes = value.to_string().len();
+            if bytes > *remaining { return false; }
+            *remaining -= bytes;
+            true
+        }
+    }
+}
+
+fn essential_projection_fields_bounded(value: &JsonValue, depth: usize, remaining: &mut usize) -> JsonValue {
+    if depth > 16 || *remaining < 2 { return JsonValue::Null; }
+    *remaining -= 2;
     match value {
         JsonValue::Object(object) => JsonValue::Object(
             object
                 .iter()
                 .filter_map(|(key, value)| {
+                    let key_bytes = key.len().saturating_mul(6).saturating_add(4);
+                    if key_bytes > *remaining { return None; }
                     if is_essential_key(key) {
-                        return Some((key.clone(), value.clone()));
+                        if small_control_value(value, 0, &mut 2048) {
+                            let bytes = value.to_string().len();
+                            if bytes <= 2048 && bytes + key_bytes <= *remaining {
+                                *remaining -= bytes + key_bytes;
+                                return Some((key.clone(), value.clone()));
+                            }
+                        }
+                        return None;
                     }
-                    let nested = essential_projection_fields(value);
+                    *remaining -= key_bytes;
+                    let nested = essential_projection_fields_bounded(value, depth + 1, remaining);
                     (!is_empty_projection(&nested)).then(|| (key.clone(), nested))
                 })
                 .collect(),
         ),
-        JsonValue::Array(values) => JsonValue::Array(
-            values
+        JsonValue::Array(values) => {
+            // Null placeholders retain source indexes. If even placeholders
+            // cannot fit, leave the entire array in the canonical artifact.
+            let placeholders = values.len().saturating_mul(5);
+            if placeholders > *remaining { return JsonValue::Null; }
+            *remaining -= placeholders;
+            let projected = values
                 .iter()
-                .map(essential_projection_fields)
-                .filter(|value| !is_empty_projection(value))
-                .collect(),
-        ),
+                .map(|value| essential_projection_fields_bounded(value, depth + 1, remaining))
+                .map(|value| if is_empty_projection(&value) { JsonValue::Null } else { value })
+                .collect::<Vec<_>>();
+            if projected.iter().all(is_empty_projection) {
+                JsonValue::Null
+            } else {
+                JsonValue::Array(projected)
+            }
+        }
         _ => JsonValue::Null,
     }
 }
@@ -832,11 +938,14 @@ fn is_essential_key(key: &str) -> bool {
             "content_identity",
             "coverage_status",
             "cursor",
+            "effective_walk_options",
+            "error",
             "failure_signature",
             "gate",
             "gates",
             "index_status",
             "lease_state",
+            "limits_clamped",
             "matched_tests",
             "next_action",
             "next_cursor",
@@ -887,6 +996,14 @@ fn is_essential_key(key: &str) -> bool {
 }
 
 impl ToolOutput for JsonToolOutput {
+    fn code_mode_failure_is_error(&self) -> bool {
+        !self.code_mode_failure_as_data
+    }
+
+    fn requires_canonical_artifact(&self) -> bool {
+        self.canonical_artifact_required
+    }
+
     fn log_preview(&self) -> String {
         telemetry_preview(self.serialized())
     }
@@ -1463,6 +1580,19 @@ mod canonical_tests {
             .sampling_request_signal()
             .is_none()
         );
+    }
+
+    #[test]
+    fn structured_failure_as_data_keeps_failure_outcome_and_payload() {
+        let value = serde_json::json!({"complete":false,"results":[{"text":"kept"}]});
+        let output = JsonToolOutput::with_success(value.clone(), Some(false));
+        assert!(output.code_mode_failure_is_error());
+        let output = output.with_code_mode_failure_as_data();
+        assert!(!output.code_mode_failure_is_error());
+        assert!(!output.success_for_logging());
+        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+        assert_eq!(output.value(), &value);
+        assert_eq!(output.clone(), output);
     }
 
     #[test]

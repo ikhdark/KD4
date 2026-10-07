@@ -4,37 +4,36 @@ const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Stable built-in tool contracts
 pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JSON/Markdown; no Node/filesystem/network.
 - Nested tools live on the global `tools` object: `await tools.exec_command({cmd:"..."})`, `await tools.apply_patch(patchText)` if registered. Bare `exec(...)` / `exec_command(...)` alias `tools.exec_command`; `console.log(...)` aliases `text(...)`. Only `ALL_TOOL_NAMES` entries are callable.
 - Edit with `apply_patch`: nested if registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper.
-- `text(...)` emits values. On failure/no output the host retains up to two nested-tool results, each capped at 1024 bytes, and reports omissions. Emit needed evidence explicitly.
-- Reuse current schemas and results; resolve missing/stale schemas before calls. Eager output types may be omitted; resolution retains the full contract when required. Batch `tools.read_file({path})`; use selectors for multiple ranges. Store the entire settled batch before printing; check every result and `file_complete`/`complete`. Reuse fetched pages across turns unless dependencies changed. Bound display, never required coverage; no shell paging.
-- Nested tools: use a present schema; filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally; use `resolve_tool(name)` to obtain a missing schema and callable with `.name`/`.description`. Search only if local discovery fails.
-- Await `Promise.allSettled` for independent known calls in one exec; inspect every result. Use `await notify(...)` for useful early results, but await all work: unawaited work is discarded. Check prerequisites before dependents. Continue mechanical exit/path/existence checks in JS, not another model round.
-- Use `run_graph` for bounded fan-out (default 4). `deps` lists actual producers, not all-results barriers. Pipeline known discovery -> fetch -> completeness checks. Keep evidence/continuations in node values; stop for changed scope/arguments.
+- `text(...)` emits values. `text(format_tool_result(name, value))` explicitly reuses an enabled tool's display formatter for cloned/annotated/stored results; it does not certify provenance. On failure/no output the host retains up to two nested-tool results, each capped at 1024 bytes, and reports omissions. Emit needed evidence explicitly.
+- Unsafe JSON integers use exact `bigint` in tools/store/load; display uses `{$bigint:"decimal"}`. `JSON.stringify` needs a bigint replacer. Error display is bounded; scripts keep original errors.
+- Eager output types may be omitted; resolution retains the full contract when required.
+- Nested tools: use a present schema; filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally; use `resolve_tool(name)` to obtain a missing schema and callable with `.name`/`.description`. On a miss, `resolve_tool(name, {diagnostic:true})` returns a non-callable status and bounded canonical candidates, never fuzzy execution. Search only if local discovery fails.
+- Await all work: unawaited work is discarded. `Promise.allSettled` retains independent failures; `notify(...)` can emit early results.
 - For command output, prefer `text(result.output)` and inspect `result.exit_code` and `result.error`; the host preserves lifecycle/recovery controls. Parse exact `result.stdout` only if `streams_complete`; display `output` may mix/omit bytes. Whole-result printing omits exact stdout/stderr: emit required streams explicitly.
 - Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. Resume only an actually returned live session/cell ID; check the outcome before retrying uncertain effects. Retry only if unstarted, safely repeatable after stopping, or tool-approved.
 - `text(...)` buffers output while awaited work continues in the same awaited evaluation; `yield_control()` is only for a new model decision. Input and host deadlines can yield.
-- For a computable final answer, use first-line `// @exec: {"deliver": true}`; await/check all work and emit only that answer. When only known validation remains, prepare its conditional final answer in that cell; no progress output or success-only model turn. Success delivers exact text/supported images without a model call; required JSON is host-validated. Intermediate/unfinished work, errors, invalid JSON, unsafe media, output loss/overflow, unsettled/failed siblings, conflicting intents or new input require model review. Only empty yields retain intent; partial output, input, failures or schema changes invalidate it.
+- First-line `// @exec: {"deliver": true}` requests direct delivery of the emitted answer after all work settles. Success delivers exact text/supported images without a model call; required JSON is host-validated. Intermediate/unfinished work, errors, invalid JSON, unsafe media, output loss/overflow, unsettled/failed siblings, conflicting intents or new input require model review. Only empty yields retain intent; partial output, input, failures or schema changes invalidate it.
 - A resolved `exec_command` may return a live process. Resume cells with `wait(cell_id)`, processes with `write_stdin(session_id)` in this evaluation unless a decision is needed. Cell completion does not prove process completion. Lifecycle/recovery metadata survive text-only and zero-token output.
-- Quiet commands: `write_stdin({session_id, wait_for_output:true})` awaits output/exit. Loop through routine progress; preserve diagnostics before an empty exit packet. Stop for exit, pending_deferred_completions, input, cancellation, stalled progress or a decision. Never restart the producer. To overlap, use a short initial wait, do independent work, drain the same handle/check exit. Otherwise use the ordinary awaited default.
-- Propagate failures with `&&` or exit-code checks; never mask them with `|| true`.
-- Recover known missing ranges/continuations with bounded calls in this exec. Keep completeness/continuation controls. Reduce logs/inventories before printing: counts, ranked records, hashes and exact selectors. Apply known scope in code; reuse reports instead of rescanning. Digests do not replace required source content. Join contiguous byte ranges and verify coverage before parsing JSON. Stop on no progress, cancellation or a decision; never drain unrelated output or exceed the combined display budget.
-- Output defaults to 10000 tokens; first-line `// @exec: {"max_output_tokens": 40000}` raises this cell's budget (ceiling 40000). Raise it upfront when the pass carries known-bulk evidence - several files or a long log - instead of paging across model turns. Nested exec_command/write_stdin display results carry at most 8000 output tokens each. Omit per-call caps except intentional smaller displays; never divide the cell budget among calls. Use `store` to retain results; emit decision-relevant evidence. Read useful regions; after truncation, select only missing evidence from the retained artifact. Follow the unconsumed selector, not the original range; preserve completeness/continuations.
+- Quiet commands: `write_stdin({session_id, wait_for_output:true})` awaits output/exit. Preserve diagnostics before an empty exit packet. Stop for exit, pending_deferred_completions, input, cancellation or stalled progress. Never restart the producer.
+- Output defaults to 10000 tokens; first-line `// @exec: {"max_output_tokens": 40000}` raises the budget (ceiling 40000). Nested command display budgets scale with the cell's remaining output budget (buffered bytes plus envelope reserve); explicit smaller per-call caps are honored. Use `store` to retain results; after truncation, select only missing evidence from the retained artifact. Follow the unconsumed selector, not the original range; preserve completeness/continuations.
 
 Helpers:
 - `await read_files(paths, {concurrency?: number, full?: boolean})`: 1–32 exact paths, concurrency 4; exact duplicates share one batch observation. Returns ordered `{path,status,value?,reason?}` after all settle; store/check every result. Values keep `initial`, `pages`, `file_complete`, including successful siblings. full:false (default) reads once/path. full:true recovers contiguous bytes from the original snapshot, checking identity/coverage; stops on uncertainty, 64 recovery calls/file or 8 MiB aggregate scope. Recovery is not freshness or model-visible coverage; emit required source. Native read_file handles selectors/environments/force_fresh.
-- `await await_command(initial, {max_observations?: number, on_progress?: async result => boolean})`: drain an existing command result via passive waits, never restart. Returns `{terminal,observations}` on exit 0, retaining diagnostics. Default 256 observations, max 1024. Throws with `.evidence` on failure, changed/missing handles, deferred completion or bounds. on_progress must return true to continue. Normal cancellation/input apply. Process success is not task success or complete output; check observations/artifacts and task postconditions before direct delivery.
+- `await read_status(paths, {environment_id?, query?})`: 1–32 paths; saved byte coverage, newest observations first (legacy recency may be unknown). query.source_sha256 selects an exact historical hash; returned offsets page remaining coverage. Not freshness or semantic-read proof.
+- `await await_command(initial, {max_observations?: number, max_wait_ms?: number, on_progress?: async result => boolean})`: bounded empty polls; no restart. Defaults: 256 observations (max 1024), 300000 ms (5000–300000). Returns `{terminal,observations}` on success; errors retain `.evidence` and handle. Inspect before resuming after a stop. on_progress must return true to continue; notify shows progress, text buffers it. Check output and task completion separately.
 - `await run_graph([{id, deps?: string[], step_id?: string, requires?: string[], estimated_ms?: number, resources?: {read?: string[], write?: string[]}, run: async (dependencies) => value, accept: async (value) => boolean}], {concurrency?: number, targets?: string[]})`: cell-local DAG; 1–256 nodes, concurrency 1–16 (default 4). step_id links existing plan steps, never status/proof. requires must name ALL_TOOL_NAMES; missing capabilities/deps and cycles fail preflight. accept checks status/exit codes. Failed deps skip descendants; all started work settles before throwing `.results` (fulfilled/rejected/skipped); acceptance errors retain producer values. Success: `{status:"fulfilled",value,step_id?}` in definition order. No retries/rollback/crash resume/agent authorization; normal admission/cancellation apply. Simple chains need only awaits.
-- Graph scheduling: `estimated_ms` is finite 0–86400000 from comparable measurements. Longest downstream path first; ties use definition order, missing estimates zero. Start expensive validation before independent review once inputs are final. `resources`: canonical keys (including path aliases), shared reads/exclusive writes through accept. Claims are atomic/cell-local, not permissions/cross-cell locks; tool admission still applies. Unknown effects need conservative deps. Command nodes must drain live processes before settling/releasing claims.
-- `targets`: select nodes plus prerequisites before dispatch (default all); excluded nodes are still preflight-validated. Include all required validation, evidence/recovery and cleanup. Omit only explicitly optional work; never hide failures, detach started work or launch unnecessary work.
+- Graph scheduling: `estimated_ms` is finite 0–86400000. Longest downstream path first; ties use definition order, missing estimates zero. `resources`: canonical keys (including path aliases), shared reads/exclusive writes through accept. Claims are atomic/cell-local, not permissions/cross-cell locks; tool admission still applies. Unknown effects need conservative deps. Command nodes must drain live processes before settling/releasing claims.
+- `targets`: select nodes plus prerequisites before dispatch (default all). Structure is validated globally; required capabilities only for selected nodes.
 - Media: `{ type: "image" }` / `{ type: "audio" }` blocks.
 - `notify(value): Promise<void>` queues a model-visible message without yielding.
-- JS bindings reset per exec; `store(key, value)`/`load(key)` keep JSON values. First-line `// @exec: {"persist":true}` persists bounded completed values/terminal receipts for this chat. Opt in before storage and after restart. Observe saved cells; never resume JS or rerun tools. Interrupted effects stay unknown; no power-loss guarantee.
+- JS bindings reset per exec; `store(key, value)`/`load(key)` keep JSON values. `listKeys({after?,limit?})` lists sorted keys (default 32, max 64), with `next_after`; `deleteStored(key)` transactionally retires a key. First-line `// @exec: {"persist":true}` persists bounded completed values/terminal receipts. Late opt-in promotes quiescent memory only into a new snapshot; opt in again after restart. Observe saved cells; never rerun tools. Interrupted effects stay unknown; no power-loss guarantee.
 - `setTimeout(callback: () => void, delayMs?: number)` returns an ID; `clearTimeout(timeoutId?: number)` cancels it. Await a promise resolved by the callback to wait."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` buffers output while its awaited continuation runs. Use `wait` only after `exec` returns a genuinely live `Script running with cell ID ...` result, such as an explicit `yield_control()` or input interruption; a completed cell never needs `wait`.
 - `cell_id` identifies the running `exec` cell to resume.
 - `max_tokens` limits how much new output this wait call returns. Model projections default to 10000 tokens; explicit requests are capped at 40000 tokens.
 - `terminate: true` stops the running cell; false or omitted waits for output.
-- `wait` buffers output until an explicit yield, input activity, or final completion or termination. Silence alone does not cause a model handoff.
-- New user steering or mailbox input interrupts a held wait without terminating a still-valid cell.
+- `wait` buffers output until an explicit yield, input activity, final completion or termination, or 10 minutes without output or a nested-call completion. An idle handoff leaves the cell running; inspect before waiting again and do not restart uncertain work.
+- New user steering, internal completions, or agent messages with `trigger_turn: true` interrupt a held wait without terminating a still-valid cell. Informational agent messages (`trigger_turn: false`) do not interrupt `exec` or `wait`.
 - If the cell has already finished, `wait` returns the completed result and closes the cell. A retained explicit delivery intent can finish the turn only if the cell yielded no partial output and input and schema remain unchanged."#;
 
 pub fn build_exec_tool_description(
@@ -149,51 +148,16 @@ mod tests {
                 let description =
                     build_exec_tool_description(code_mode_only, has_deferred_tools, &[]);
                 for required in [
-                    "Check prerequisites before dependents.",
-                    "Continue mechanical exit/path/existence checks in JS, not another model round.",
-                    "Await `Promise.allSettled`",
-                    "independent known calls in one exec; inspect every result.",
-                    "Use `run_graph` for bounded fan-out (default 4)",
-                    "`deps` lists actual producers, not all-results barriers",
-                    "Pipeline known discovery -> fetch -> completeness checks",
-                    "Keep evidence/continuations in node values",
                     "ties use definition order, missing estimates zero",
-                    "Start expensive validation before independent review once inputs are final",
                     "Claims are atomic/cell-local, not permissions/cross-cell locks",
                     "Command nodes must drain live processes before settling/releasing claims",
-                    "Include all required validation, evidence/recovery and cleanup",
-                    "excluded nodes are still preflight-validated",
+                    "Structure is validated globally; required capabilities only for selected nodes",
                     "buffers output while awaited work continues in the same awaited evaluation;",
                     "`yield_control()` is only for a new model decision.",
-                    "await all work: unawaited work is discarded.",
-                    "Reuse current schemas and results;",
-                    "Batch `tools.read_file({path})`",
-                    "Store the entire settled batch before printing",
-                    "Reuse fetched pages across turns unless dependencies changed",
-                    "prepare its conditional final answer in that cell",
-                    "Loop through routine progress; preserve diagnostics before an empty exit packet",
-                    "Apply known scope in code; reuse reports instead of rescanning",
-                    "use selectors for multiple ranges",
-                    "check every result and `file_complete`/`complete`",
-                    "Bound display, never required coverage",
-                    "use a short initial wait, do independent work, drain the same handle/check exit",
-                    "Otherwise use the ordinary awaited default.",
+                    "unawaited work is discarded.",
                     "A resolved `exec_command` may return a live process",
                     "Cell completion does not prove process completion",
-                    "in this evaluation unless a decision is needed",
-                    "Omit per-call caps except intentional smaller displays",
-                    "never divide the cell budget among calls",
-                    "Use `store` to retain results",
-                    "select only missing evidence from the retained artifact",
                     "Follow the unconsumed selector, not the original range; preserve completeness/continuations",
-                    "Recover known missing ranges/continuations with bounded calls in this exec",
-                    "Reduce logs/inventories before printing",
-                    "hashes and exact selectors",
-                    "Digests do not replace required source content",
-                    "Join contiguous byte ranges and verify coverage before parsing JSON",
-                    "Stop on no progress, cancellation or a decision",
-                    "never drain unrelated output or exceed the combined display budget",
-                    "host-configured default deadline",
                     "Expiry cancels the nested call and may return only an error, without a live handle.",
                     "Resume only an actually returned live session/cell ID;",
                     "check the outcome before retrying uncertain effects",
@@ -201,7 +165,6 @@ mod tests {
                     "acceptance errors retain producer values",
                     "full:true recovers contiguous bytes from the original snapshot, checking identity/coverage",
                     "Recovery is not freshness or model-visible coverage",
-                    "Process success is not task success or complete output",
                     "64 recovery calls/file or 8 MiB aggregate scope",
                     "on_progress must return true to continue",
                     "all started work settles before throwing",
@@ -212,6 +175,10 @@ mod tests {
                     );
                 }
                 for retired in [
+                    "Start expensive validation before independent review",
+                    "Pipeline known discovery -> fetch -> completeness checks",
+                    "prepare its conditional final answer in that cell",
+                    "Reduce logs/inventories before printing",
                     "Keep plans aligned",
                     "Run required validation",
                     "Read the complete enclosing unit",

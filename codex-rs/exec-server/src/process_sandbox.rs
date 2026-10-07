@@ -47,6 +47,9 @@ struct PreparedWindowsSandbox {
 impl PreparedExecRequest {
     pub(crate) async fn spawn(self, tty: bool, pipe_stdin: bool) -> Result<SpawnedProcess, String> {
         let mut request = self;
+        // Sandbox preparation can add environment variables. Canonicalize the
+        // final map before either pipe, PTY, or sandbox launch consumes it.
+        codex_protocol::shell_environment::apply_env_overlay(&mut request.env, HashMap::new());
         if let Some(windows_sandbox) = request.windows_sandbox.take() {
             return spawn_windows_sandbox(request, windows_sandbox, tty, pipe_stdin).await;
         }

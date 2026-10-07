@@ -2,6 +2,26 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn concurrent_recovery_does_not_quarantine_the_replacement() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let home = temporary.path().join("sqlite");
+    std::fs::create_dir_all(&home)?;
+    let path = super::super::state_db_path(&home);
+    std::fs::write(&path, b"damaged original")?;
+    let (first, second) = tokio::join!(
+        super::super::StateRuntime::recover_for_fresh_start(path.clone(), "openai".into()),
+        super::super::StateRuntime::recover_for_fresh_start(path.clone(), "openai".into()),
+    );
+    let all = first?.into_iter().chain(second?).collect::<Vec<_>>();
+    let database_backups = all.iter().filter(|backup| backup.original_path == path).collect::<Vec<_>>();
+    assert_eq!(database_backups.len(), 1);
+    assert_eq!(std::fs::read(&database_backups[0].backup_path)?, b"damaged original");
+    let runtime = super::super::StateRuntime::init(home, "openai".into()).await?;
+    runtime.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn backup_moves_only_requested_runtime_db_files_to_backup_folder() -> std::io::Result<()> {
     let temp = tempfile::tempdir()?;
     let sqlite_home = temp.path().to_path_buf();

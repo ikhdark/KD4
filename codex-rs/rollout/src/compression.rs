@@ -75,15 +75,76 @@ pub(crate) struct RolloutAppendLock {
     _file: File,
 }
 
+/// Owns archive/unarchive decisions across both physical collections. Keep this
+/// guard through lookups and movement (or an artifact reclamation decision).
+pub async fn lock_rollout_moves(codex_home: &Path) -> io::Result<File> {
+    let home = codex_home.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = open_lock_file(&home.join("rollout-moves.lock"))?;
+        file.lock()?;
+        Ok(file)
+    }).await.map_err(io::Error::other)?
+}
+
+/// Reclamation is optional: skip it when another owner can change locations.
+pub async fn try_lock_rollout_moves(codex_home: &Path) -> io::Result<Option<File>> {
+    let home = codex_home.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = open_lock_file(&home.join("rollout-moves.lock"))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }).await.map_err(io::Error::other)?
+}
+
 /// Moves the current physical rollout representation while excluding compression.
-/// A shared lock permits archiving before the live append handle is shut down.
+/// Both locations are exclusively owned; callers must first close live writers.
 pub async fn move_rollout_to_directory(path: &Path, directory: &Path) -> io::Result<PathBuf> {
     let path = path.to_path_buf();
     let directory = directory.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        let home = path.ancestors().find(|ancestor| ancestor.file_name().is_some_and(|name|
+            name == crate::SESSIONS_SUBDIR || name == crate::ARCHIVED_SESSIONS_SUBDIR))
+            .and_then(Path::parent).ok_or_else(|| io::Error::new(
+                io::ErrorKind::InvalidInput, "rollout move source is outside session storage"))?;
+        // Owned by the blocking mover even when its async caller is cancelled.
+        let move_owner = open_lock_file(&home.join("rollout-moves.lock"))?;
+        move_owner.lock()?;
         let plain_path = plain_rollout_path(&path);
-        let lock_file = open_rollout_lock_file(&plain_path)?;
-        lock_file.lock_shared()?;
+        let parent = plain_path.parent().ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidInput, "rollout path has no parent"))?;
+        let plain_path = std::fs::canonicalize(parent)?.join(plain_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rollout path has no file name")
+        })?);
+        std::fs::create_dir_all(&directory)?;
+        let lock_directory = std::fs::canonicalize(&directory)?;
+        let plain_destination = lock_directory.join(plain_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rollout path has no file name")
+        })?);
+        if plain_path == plain_destination {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "rollout move has identical endpoints"));
+        }
+        // Stable ordering prevents inverse relocations from deadlocking.
+        let mut lock_paths = [&plain_path, &plain_destination];
+        lock_paths.sort();
+        let first_lock = open_rollout_lock_file(lock_paths[0])?;
+        first_lock.lock()?;
+        let second_lock = open_rollout_lock_file(lock_paths[1])?;
+        second_lock.lock()?;
+        let compressed_source = path::compressed_rollout_path(&plain_path);
+        let current_source = if plain_path.try_exists()? { &plain_path } else { &compressed_source };
+        let mut duplicate = None;
+        for destination in [&plain_destination, &path::compressed_rollout_path(&plain_destination)] {
+            if destination.try_exists()? {
+                if !rollouts_have_identical_bytes(current_source, destination)? {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                        format!("conflicting rollout destination: {}", destination.display())));
+                }
+                duplicate = Some(destination.clone());
+            }
+        }
         // The path resolved by discovery may have been compressed while we waited.
         let compressed_path = path::compressed_rollout_path(&plain_path);
         let source = if plain_path.is_file() {
@@ -98,16 +159,73 @@ pub async fn move_rollout_to_directory(path: &Path, directory: &Path) -> io::Res
         } else {
             compressed_path
         };
+        if let Some(destination) = duplicate {
+            std::fs::remove_file(source)?;
+            return Ok(destination);
+        }
         let file_name = source.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "rollout path has no file name")
         })?;
         std::fs::create_dir_all(&directory)?;
         let destination = directory.join(file_name);
-        std::fs::rename(source, &destination)?;
+        // Publish without clobbering a non-cooperating destination creation.
+        // Archive and active collections live on the same filesystem.
+        move_rollout_no_replace(&source, &destination)?;
         Ok(destination)
     })
     .await
     .map_err(io::Error::other)?
+}
+
+#[cfg(windows)]
+fn move_rollout_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    // No REPLACE_EXISTING or COPY_ALLOWED: an existing target or a sharing
+    // violation leaves both directory entries unchanged. A hard-link/unlink
+    // move would publish a duplicate before discovering a source delete denial.
+    let moved = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            source.as_ptr(), destination.as_ptr(), 0,
+        )
+    };
+    if moved == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+#[cfg(not(windows))]
+fn move_rollout_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::hard_link(source, destination)?;
+    std::fs::remove_file(source)
+}
+
+fn rollouts_have_identical_bytes(first: &Path, second: &Path) -> io::Result<bool> {
+    use std::io::BufRead;
+    fn reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "rollout duplicate is not an ordinary file; preserving both copies"));
+        }
+        let file = File::open(path)?;
+        if path.extension().is_some_and(|extension| extension == "zst") {
+            Ok(Box::new(std::io::BufReader::new(zstd::stream::read::Decoder::new(file)?)))
+        } else {
+            Ok(Box::new(std::io::BufReader::new(file)))
+        }
+    }
+    let mut first = reader(first)?;
+    let mut second = reader(second)?;
+    loop {
+        let a = first.fill_buf()?;
+        let b = second.fill_buf()?;
+        if a.is_empty() || b.is_empty() {
+            return Ok(a.is_empty() && b.is_empty());
+        }
+        let count = a.len().min(b.len());
+        if a[..count] != b[..count] { return Ok(false); }
+        first.consume(count);
+        second.consume(count);
+    }
 }
 
 /// Exclusive per-rollout lock held only while an append transaction can mutate the plain file.
@@ -375,6 +493,7 @@ impl RolloutFile {
 pub struct RolloutLineReader {
     inner: RolloutLineReaderInner,
     path: PathBuf,
+    last_line_terminated: bool,
 }
 
 enum RolloutLineReaderInner {
@@ -383,11 +502,15 @@ enum RolloutLineReaderInner {
 }
 
 struct BlockingRolloutLineReader {
-    receiver: tokio::sync::mpsc::Receiver<io::Result<String>>,
+    receiver: tokio::sync::mpsc::Receiver<io::Result<(String, bool)>>,
     task: Option<tokio::task::JoinHandle<io::Result<()>>>,
 }
 
 impl RolloutLineReader {
+    pub(crate) fn last_line_terminated(&self) -> bool {
+        self.last_line_terminated
+    }
+
     /// Reads the next JSONL record from the rollout.
     pub async fn next_line(&mut self) -> io::Result<Option<String>> {
         let line = match &mut self.inner {
@@ -396,7 +519,8 @@ impl RolloutLineReader {
                 if reader.read_until(b'\n', &mut line).await? == 0 {
                     return Ok(None);
                 }
-                Ok(Some(decode_rollout_line(line)))
+                let terminated = line.last() == Some(&b'\n');
+                Ok(Some((decode_rollout_line(line), terminated)))
             }
             RolloutLineReaderInner::Blocking(reader) => match reader.receiver.recv().await {
                 Some(line) => line.map(Some),
@@ -408,11 +532,21 @@ impl RolloutLineReader {
                 }
             },
         }?;
-        let Some(line) = line else { return Ok(None); };
+        let Some((line, terminated)) = line else { return Ok(None); };
+        self.last_line_terminated = terminated;
         if !line.contains("rollout_payload_artifact") { return Ok(Some(line)); }
         let path = self.path.clone();
-        tokio::task::spawn_blocking(move || crate::payload_artifact::hydrate_line(&path, line))
-            .await.map_err(io::Error::other)?.map(Some)
+        match tokio::task::spawn_blocking(move || crate::payload_artifact::hydrate_line(&path, line))
+            .await.map_err(io::Error::other)?
+        {
+            Ok(line) => Ok(Some(line)),
+            Err(error) => {
+                tracing::warn!(path = %self.path.display(), %error, "skipping unreadable rollout payload");
+                // Keep the record slot, like torn UTF-8/JSON: consumers continue
+                // and the recorder counts the malformed record.
+                Ok(Some("invalid rollout payload record".to_owned()))
+            }
+        }
     }
 }
 
@@ -1223,7 +1357,10 @@ mod reader {
                     let mut line = Vec::new();
                     let line = match reader.read_until(b'\n', &mut line) {
                         Ok(0) => break,
-                        Ok(_) => Ok(decode_rollout_line(line)),
+                        Ok(_) => {
+                            let terminated = line.last() == Some(&b'\n');
+                            Ok((decode_rollout_line(line), terminated))
+                        }
                         Err(error) => Err(error),
                     };
                     let failed = line.is_err();
@@ -1235,6 +1372,7 @@ mod reader {
             });
             return Ok(RolloutLineReader {
                 path: source_path,
+                last_line_terminated: true,
                 inner: RolloutLineReaderInner::Blocking(BlockingRolloutLineReader {
                     receiver,
                     task: Some(task),
@@ -1244,6 +1382,7 @@ mod reader {
         let file = tokio::fs::File::open(path).await?;
         Ok(RolloutLineReader {
             path: source_path,
+            last_line_terminated: true,
             inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file)),
         })
     }

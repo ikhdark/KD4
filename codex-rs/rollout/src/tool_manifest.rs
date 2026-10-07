@@ -321,7 +321,7 @@ fn apply_delta(
         .iter()
         .map(|entry| entry.collection.as_str())
         .chain(removed.iter().map(|entry| entry.collection.as_str()))
-        .collect::<HashSet<_>>();
+        .collect::<std::collections::BTreeSet<_>>();
 
     for collection in collections {
         let values = manifest
@@ -332,6 +332,16 @@ fn apply_delta(
             .into_iter()
             .map(|entry| entry.name)
             .collect::<Vec<_>>();
+        let unique_names = names.iter().collect::<HashSet<_>>();
+        if unique_names.len() != names.len() {
+            return Err(format!("ambiguous tool manifest identities in {collection}"));
+        }
+        let mut removal_ids = HashSet::new();
+        for entry in removed.iter().filter(|entry| entry.collection == collection) {
+            if !removal_ids.insert(&entry.name) || !unique_names.contains(&entry.name) {
+                return Err(format!("invalid tool manifest removal {collection}/{}", entry.name));
+            }
+        }
         let removed_names = removed
             .iter()
             .filter(|entry| entry.collection == collection)
@@ -349,7 +359,12 @@ fn apply_delta(
             .filter(|entry| entry.collection == collection)
             .collect::<Vec<_>>();
         additions.sort_by_key(|entry| entry.index);
-        for entry in additions {
+        let mut indices = HashSet::new();
+        let mut identities = HashSet::new();
+        for entry in &additions {
+            if !indices.insert(entry.index) || !identities.insert(&entry.name) {
+                return Err(format!("duplicate tool manifest addition in {collection}"));
+            }
             if entry.index > values.len() {
                 return Err(format!(
                     "tool manifest delta index {} exceeds collection {collection} length {}",
@@ -358,6 +373,13 @@ fn apply_delta(
                 ));
             }
             values.insert(entry.index, entry.value.clone());
+        }
+        let reconstructed = named_entries(&values);
+        let mut final_names = HashSet::new();
+        if reconstructed.iter().any(|entry| !final_names.insert(&entry.name))
+            || additions.iter().any(|entry| reconstructed[entry.index].name != entry.name)
+        {
+            return Err(format!("invalid tool manifest addition identity in {collection}"));
         }
         manifest.insert(collection.to_string(), Value::Array(values));
     }
@@ -412,6 +434,34 @@ mod tests {
         assert_eq!(reader.manifest("first"), Some(&first));
         assert_eq!(reader.manifest("second"), Some(&second));
         assert_eq!(reader.current_hash(), Some("second"));
+    }
+
+    #[test]
+    fn malformed_deltas_are_rejected_atomically() {
+        let base = manifest(&["a", "b"]);
+        let target = manifest(&["a", "c"]);
+        let (added, removed) = compute_delta(&base, &target).unwrap();
+        for corruption in 0..7 {
+            let mut added = added.clone();
+            let mut removed = removed.clone();
+            match corruption {
+                0 => removed[0].name = "missing".into(),
+                1 => removed.push(removed[0].clone()),
+                2 => added[0].name = "wrong".into(),
+                3 => added[0].index = usize::MAX,
+                4 => added.push(added[0].clone()),
+                5 => added[0].collection = "missing".into(),
+                _ => added[0].value["name"] = serde_json::json!("wrong"),
+            }
+            let mut dictionary = ToolManifestDictionary::default();
+            dictionary.encode("base".into(), base.clone()).unwrap();
+            let before = dictionary.clone();
+            let delta = ToolManifestItem::delta("target".into(), "base".into(), added, removed);
+            assert!(dictionary.apply(&delta).is_err());
+            assert_eq!(dictionary, before);
+            assert!(dictionary.encode_item(&delta).is_err());
+            assert_eq!(dictionary, before);
+        }
     }
 
     #[test]

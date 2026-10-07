@@ -63,14 +63,14 @@ pub fn create_read_mcp_resource_tool() -> ToolSpec {
         (
             "server".to_string(),
             JsonSchema::string(Some(
-                "MCP server name exactly as configured. Must match the 'server' field returned by either list_mcp_resources or list_mcp_resource_templates."
+                "MCP server name exactly as configured, supplied by the user, retained evidence, or resource discovery. Listing is not required for a known identity."
                     .to_string(),
             )),
         ),
         (
             "uri".to_string(),
             JsonSchema::string(Some(
-                "Resource URI to read. Use either a literal URI returned by list_mcp_resources or a concrete URI produced by filling every required variable in a uriTemplate returned by list_mcp_resource_templates."
+                "Resource URI supplied by the user, retained evidence, or resource discovery. For a known uriTemplate, fill every required variable to produce a concrete URI."
                     .to_string(),
             )),
         ),
@@ -79,7 +79,7 @@ pub fn create_read_mcp_resource_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "read_mcp_resource".to_string(),
         description:
-            "Read a specific resource from an MCP server using either a literal URI discovered by list_mcp_resources or a concrete URI instantiated from a uriTemplate discovered by list_mcp_resource_templates."
+            "Read a specific authorized MCP resource directly when its server and URI are known from the user or retained evidence. List resources or templates only when discovery is necessary; a known template must be instantiated with every required variable."
                 .to_string(),
         strict: false,
         defer_loading: None,

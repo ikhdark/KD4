@@ -1810,7 +1810,7 @@ async fn granular_inline_execution_approval(
                 item.status,
                 codex_protocol::items::CommandExecutionStatus::Declined
             );
-            assert_eq!(item.exit_code, Some(-1));
+            assert_eq!(item.exit_code, None);
             assert_eq!(
                 item.stderr.as_deref(),
                 Some("exec command rejected by user")

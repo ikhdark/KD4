@@ -196,6 +196,38 @@ async fn managed_clients_store_a_concrete_tool_timeout() {
     assert_eq!(timeout, DEFAULT_TOOL_TIMEOUT);
 }
 
+#[tokio::test]
+async fn approval_authority_tracks_provider_account_and_connection_reuse() {
+    let policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permissions = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionManager::new_uninitialized(&policy, &permissions, true);
+    let client = create_ready_async_managed_client(Vec::new()).await;
+    manager.clients.insert("docs".into(), client.clone());
+    manager.server_definitions.insert("docs".into(), EffectiveMcpServer::configured(test_stdio_server_config("docs")));
+    let original = manager.approval_authority("docs").unwrap();
+    assert!(!original.1, "unknown provider account may only be remembered for this connection");
+    manager.clients.insert("docs".into(), client);
+    assert_eq!(manager.approval_authority("docs").unwrap(), original);
+    manager.clients.insert("docs".into(), create_ready_async_managed_client(Vec::new()).await);
+    assert_ne!(manager.approval_authority("docs").unwrap(), original);
+
+    manager.server_definitions.insert("docs".into(), EffectiveMcpServer::configured(
+        crate::codex_apps_mcp_server_config("https://example.com", None, None),
+    ));
+    manager.client_reuse_context.codex_apps_tools_cache_key.account_id = Some("account-a".into());
+    let known = manager.approval_authority("docs").unwrap();
+    assert!(known.1);
+    manager.clients.insert("docs".into(), create_ready_async_managed_client(Vec::new()).await);
+    assert_eq!(manager.approval_authority("docs").unwrap(), known);
+    manager.client_reuse_context.codex_apps_tools_cache_key.account_id = Some("account-b".into());
+    assert_ne!(manager.approval_authority("docs").unwrap(), known);
+    manager.client_reuse_context.codex_apps_tools_cache_key.account_id = Some("account-a".into());
+    manager.server_definitions.insert("docs".into(), EffectiveMcpServer::configured(
+        crate::codex_apps_mcp_server_config("https://other.example.com", None, None),
+    ));
+    assert_ne!(manager.approval_authority("docs").unwrap(), known);
+}
+
 async fn create_ready_async_managed_client_with_resources(
     tools: Vec<ToolInfo>,
     server_supports_resources_capability: bool,
@@ -216,6 +248,7 @@ async fn create_ready_async_managed_client_with_resources(
         startup_reconnect: None,
         tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
         cancel_token: CancellationToken::new(),
+        approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
         manager_owners: Arc::new(AtomicUsize::new(1)),
     }
 }
@@ -321,6 +354,7 @@ async fn only_ready_unchanged_non_chatgpt_clients_are_reusable() {
             startup_reconnect: None,
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             cancel_token: CancellationToken::new(),
+            approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
         },
     );
@@ -585,6 +619,28 @@ async fn aggregate_resource_discovery_skips_servers_without_resources_capability
     assert!(resource_pages.results.is_empty());
     assert!(templates.results.is_empty());
     assert!(template_pages.results.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn resource_collection_keeps_prefix_and_cursor_under_one_budget() {
+    for fail in [false, true] {
+        let start = tokio::time::Instant::now();
+        let (items, cursor, meta) = collect_resource_pages(Duration::from_secs(1), |cursor, _remaining| async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            match cursor.as_deref() {
+                None => Ok((vec![1], Some("second".into()))),
+                Some("second") if fail => Err(anyhow!("late failure")),
+                Some("second") => Ok((vec![2], Some("third".into()))),
+                _ => Ok((vec![3], None)),
+            }
+        }).await.unwrap();
+        assert_eq!(items, if fail { vec![1] } else { vec![1, 2] });
+        assert_eq!(cursor.as_deref(), Some(if fail { "second" } else { "third" }));
+        let message = meta.unwrap().get("codex/collectionError").unwrap().as_str().unwrap().to_string();
+        assert!(message.contains("incomplete"));
+        assert!(message.contains(if fail { "late failure" } else { "deadline" }));
+        assert!(start.elapsed() <= Duration::from_secs(1));
+    }
 }
 
 #[tokio::test]
@@ -895,6 +951,7 @@ async fn create_test_manager_with_failed_apps_startup(
             ))),
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             cancel_token: CancellationToken::new(),
+            approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
         },
     );
@@ -1328,22 +1385,31 @@ fn test_normalize_tools_short_non_duplicated_names() {
 }
 
 #[test]
+fn test_normalize_tools_names_survive_catalog_growth_cache_and_reduction() {
+    let original = create_test_tool("basic-server", "read-file");
+    let other = create_test_tool("basic_server", "read_file");
+    let expected = normalize_tools_for_model_with_prefix([original.clone()], true);
+    let cached: ToolInfo = serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+    for catalog in [
+        vec![original.clone(), other.clone()], vec![other, original.clone()],
+        vec![cached], vec![original],
+    ] {
+        let normalized = normalize_tools_for_model_with_prefix(catalog, true);
+        let same = normalized.iter().find(|tool| tool.server_name == "basic-server").unwrap();
+        assert_eq!(same.canonical_tool_name(), expected[0].canonical_tool_name());
+        assert_eq!(same.tool, expected[0].tool);
+    }
+}
+
+#[test]
 fn test_normalize_tools_duplicated_names_skipped() {
     let first = create_test_tool("server1", "duplicate_tool");
     let mut second = first.clone();
     second.tool.description = Some("second duplicate".into());
-    let tools = vec![first.clone(), second];
-
-    let model_tools =
-        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true);
-
-    assert_eq!(model_tools.len(), 1);
-    assert_eq!(model_tools[0].tool.description, first.tool.description);
-    // Only the first tool should remain, the second is skipped
-    assert_eq!(
-        model_tool_names(&model_tools),
-        HashSet::from([ToolName::namespaced("mcp__server1", "duplicate_tool")])
-    );
+    assert_eq!(normalize_tools_for_model_with_prefix(vec![first.clone(), first.clone()], true).len(), 1);
+    for tools in [vec![first.clone(), second.clone()], vec![second, first]] {
+        assert!(normalize_tools_for_model_with_prefix(tools, true).is_empty());
+    }
 }
 
 #[test]
@@ -1390,10 +1456,8 @@ fn test_normalize_tools_sanitizes_invalid_characters() {
     assert_eq!(model_tools.len(), 1);
     let tool = model_tools.into_iter().next().expect("one tool");
     let model_name = tool.canonical_tool_name();
-    assert_eq!(
-        model_name,
-        ToolName::namespaced("mcp__server_one", "tool_two_three")
-    );
+    assert!(model_name.namespace.as_deref().unwrap().starts_with("mcp__server_one_"));
+    assert!(model_name.name.starts_with("tool_two_three_"));
     assert_eq!(
         ToolName::namespaced(tool.callable_namespace.clone(), tool.callable_name.clone()),
         model_name
@@ -1401,8 +1465,8 @@ fn test_normalize_tools_sanitizes_invalid_characters() {
     // The callable parts are sanitized for model-visible tool calls, but the raw
     // MCP name is preserved for the actual MCP call.
     assert_eq!(tool.server_name, "server.one");
-    assert_eq!(tool.callable_namespace, "mcp__server_one");
-    assert_eq!(tool.callable_name, "tool_two_three");
+    assert!(tool.callable_namespace.starts_with("mcp__server_one_"));
+    assert!(tool.callable_name.starts_with("tool_two_three_"));
     assert_eq!(tool.tool.name, "tool.two-three");
 
     assert!(
@@ -1420,15 +1484,10 @@ fn test_normalize_tools_keeps_hyphenated_mcp_tools_callable() {
 
     assert_eq!(model_tools.len(), 1);
     let tool = model_tools.into_iter().next().expect("one tool");
-    assert_eq!(
-        tool.canonical_tool_name(),
-        ToolName::namespaced("mcp__music_studio", "get_strudel_guide")
-    );
-    assert_eq!(tool.callable_namespace, "mcp__music_studio");
-    assert_eq!(tool.callable_name, "get_strudel_guide");
+    assert!(tool.callable_namespace.starts_with("mcp__music_studio_"));
+    assert!(tool.callable_name.starts_with("get_strudel_guide_"));
     assert_eq!(tool.tool.name, "get-strudel-guide");
 }
-
 #[test]
 fn test_normalize_tools_disambiguates_sanitized_namespace_collisions() {
     let tools = vec![
@@ -1596,6 +1655,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
             startup_reconnect: None,
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             cancel_token: CancellationToken::new(),
+            approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
         },
     );
@@ -1637,6 +1697,7 @@ async fn list_available_server_infos_uses_cache_while_client_is_pending() {
             startup_reconnect: None,
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             cancel_token: CancellationToken::new(),
+            approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
         },
     );
@@ -1739,6 +1800,7 @@ async fn list_all_tools_skips_pending_clients_without_cached_tools() {
             startup_reconnect: None,
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             cancel_token: CancellationToken::new(),
+            approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
         },
     );
@@ -1785,6 +1847,7 @@ async fn shutdown_cancels_pending_startup_without_blocking_tool_listing() {
             startup_reconnect: None,
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             cancel_token,
+            approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
         },
     );
@@ -1834,6 +1897,7 @@ async fn shutdown_continues_after_caller_is_aborted() {
             startup_reconnect: None,
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             cancel_token: CancellationToken::new(),
+            approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
         },
     );
@@ -1889,6 +1953,7 @@ async fn list_all_tools_does_not_block_when_shared_codex_apps_cache_is_empty() {
             startup_reconnect: None,
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             cancel_token: CancellationToken::new(),
+            approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
         },
     );
@@ -1942,6 +2007,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
             startup_reconnect: None,
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             cancel_token: CancellationToken::new(),
+            approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
         },
     );

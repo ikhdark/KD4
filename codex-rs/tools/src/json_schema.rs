@@ -40,16 +40,27 @@ pub enum JsonSchemaType {
 /// Generic JSON-Schema subset needed for our tool definitions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct JsonSchema {
+    #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
+    pub schema_dialect: Option<String>,
+    #[serde(rename = "$id", skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
+    #[serde(rename = "$anchor", skip_serializing_if = "Option::is_none")]
+    pub schema_anchor: Option<String>,
     #[serde(rename = "$ref", skip_serializing_if = "Option::is_none")]
     pub schema_ref: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none", serialize_with = "serialize_schema_type")]
     pub schema_type: Option<JsonSchemaType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Annotation only; the harness does not apply defaults to omitted arguments.
+    #[serde(default, deserialize_with = "deserialize_default_annotation", skip_serializing_if = "Option::is_none", serialize_with = "serialize_canonical_literal")]
+    pub default: Option<JsonValue>,
     /// Responses-only marker for reviewed encrypted tool parameters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted: Option<bool>,
-    #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "enum", skip_serializing_if = "Option::is_none", serialize_with = "serialize_canonical_literal")]
     pub enum_values: Option<Vec<JsonValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
@@ -75,7 +86,7 @@ pub struct JsonSchema {
     pub max_items: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<BTreeMap<String, JsonSchema>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "serialize_required")]
     pub required: Option<Vec<String>>,
     #[serde(
         rename = "additionalProperties",
@@ -92,6 +103,84 @@ pub struct JsonSchema {
     pub defs: Option<BTreeMap<String, JsonSchema>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definitions: Option<BTreeMap<String, JsonSchema>>,
+}
+
+fn deserialize_default_annotation<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<JsonValue>, D::Error> {
+    JsonValue::deserialize(deserializer).map(Some)
+}
+
+pub(crate) fn canonical_json(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => JsonValue::Object(
+            map.into_iter().map(|(key, value)| (key, canonical_json(value)))
+                .collect::<BTreeMap<_, _>>().into_iter().collect(),
+        ),
+        JsonValue::Array(values) => JsonValue::Array(values.into_iter().map(canonical_json).collect()),
+        other => other,
+    }
+}
+
+fn serialize_canonical_literal<T: Serialize, S: serde::Serializer>(value: &T, serializer: S) -> Result<S::Ok, S::Error> {
+    canonical_json(serde_json::to_value(value).map_err(serde::ser::Error::custom)?).serialize(serializer)
+}
+
+fn serialize_required<S: serde::Serializer>(value: &Option<Vec<String>>, serializer: S) -> Result<S::Ok, S::Error> {
+    let mut value = value.clone();
+    if let Some(values) = &mut value
+        && values.iter().collect::<BTreeSet<_>>().len() == values.len()
+    {
+        values.sort();
+    }
+    value.serialize(serializer)
+}
+
+fn serialize_schema_type<S: serde::Serializer>(value: &Option<JsonSchemaType>, serializer: S) -> Result<S::Ok, S::Error> {
+    let mut value = serde_json::to_value(value).map_err(serde::ser::Error::custom)?;
+    normalize_set_keyword(&mut value, true);
+    value.serialize(serializer)
+}
+
+fn normalize_set_keyword(value: &mut JsonValue, is_type: bool) {
+    if let JsonValue::Array(values) = value {
+        let valid = !is_type || !values.is_empty();
+        let names = values.iter().filter_map(JsonValue::as_str).collect::<BTreeSet<_>>();
+        if valid && names.len() == values.len()
+            && (!is_type || names.iter().all(|name| schema_type_from_str(name).is_some()))
+        {
+            values.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        }
+    }
+}
+
+/// Normalize schema keywords only at schema positions. Literal arrays and
+/// composition branch order remain authoritative.
+pub(crate) fn canonical_schema(mut value: JsonValue) -> JsonValue {
+    if let JsonValue::Object(map) = &mut value {
+        for keyword in ["required", "type"] {
+            if let Some(value) = map.get_mut(keyword) {
+                normalize_set_keyword(value, keyword == "type");
+            }
+        }
+        for keyword in ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"] {
+            if let Some(JsonValue::Object(children)) = map.get_mut(keyword) {
+                for child in children.values_mut() {
+                    *child = canonical_schema(std::mem::take(child));
+                }
+            }
+        }
+        for keyword in ["items", "prefixItems", "additionalProperties", "additionalItems", "anyOf", "oneOf", "allOf", "not", "if", "then", "else", "contains", "propertyNames", "unevaluatedProperties", "unevaluatedItems"] {
+            if let Some(child) = map.get_mut(keyword) {
+                if let JsonValue::Array(children) = child {
+                    for child in children {
+                        *child = canonical_schema(std::mem::take(child));
+                    }
+                } else {
+                    *child = canonical_schema(std::mem::take(child));
+                }
+            }
+        }
+    }
+    canonical_json(value)
 }
 
 impl JsonSchema {
@@ -214,12 +303,12 @@ pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, s
 pub(crate) fn parse_owned_tool_input_schema(
     input_schema: JsonValue,
 ) -> Result<JsonSchema, serde_json::Error> {
-    let mut schema = deserialize_tool_input_schema(prepare_tool_input_schema(input_schema)?)?;
-    compact_large_tool_schema(&mut schema);
-    Ok(schema)
+    // Descriptions carry restrictions validation cannot express. Bound their
+    // presentation at discovery/output boundaries, never the stored contract.
+    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema)?)
 }
 
-/// Parse a trusted tool `input_schema` without running large-schema compaction.
+/// Compatibility entry point; all parsing preserves authoritative guidance.
 pub fn parse_tool_input_schema_without_compaction(
     input_schema: &JsonValue,
 ) -> Result<JsonSchema, serde_json::Error> {
@@ -227,6 +316,18 @@ pub fn parse_tool_input_schema_without_compaction(
 }
 
 fn prepare_tool_input_schema(mut input_schema: JsonValue) -> Result<JsonValue, serde_json::Error> {
+    // Compatibility is limited to the callable argument envelope. Nested
+    // applicators constrain their own instance types, not all JSON values.
+    if let Some(map) = input_schema.as_object_mut()
+        && !map.contains_key("type")
+        && !map.contains_key("$ref")
+        && !map.contains_key("enum")
+        && !map.contains_key("const")
+        && !has_composition_keyword(map)
+        && ["properties", "required", "additionalProperties"].iter().any(|key| map.contains_key(*key))
+    {
+        map.insert("type".into(), json!("object"));
+    }
     sanitize_json_schema(&mut input_schema);
     prune_unreachable_definitions(&mut input_schema);
     reject_unsupported_assertions(&input_schema)?;
@@ -263,6 +364,8 @@ fn reject_unsupported_assertions(value: &JsonValue) -> Result<(), serde_json::Er
                 "unevaluatedProperties",
                 "$dynamicRef",
                 "$recursiveRef",
+                "$dynamicAnchor",
+                "$recursiveAnchor",
             ] {
                 if map.contains_key(key) {
                     return Err(<serde_json::Error as serde::de::Error>::custom(format!(
@@ -292,64 +395,6 @@ fn deserialize_tool_input_schema(input_schema: JsonValue) -> Result<JsonSchema, 
         return Err(singleton_null_schema_error());
     }
     Ok(schema)
-}
-
-// Use compact normalized JSON bytes as a cheap local proxy for the 1k-token
-// schema budget.
-const MAX_COMPACT_TOOL_SCHEMA_BYTES: usize = 5_000;
-
-/// Shrink unusually large tool schemas while preserving the top-level argument
-/// surface. Compaction is best-effort rather than a hard cap: it runs only
-/// after schema sanitization/pruning and removes only non-validation metadata.
-/// It is deliberately best-effort: validation keywords and reachable schema
-/// structure take precedence over the compact byte target.
-fn compact_large_tool_schema(value: &mut JsonSchema) {
-    let mut compact_bytes = compact_schema_bytes(value);
-    for pass in LARGE_SCHEMA_COMPACTION_PASSES {
-        if compact_bytes.is_some_and(|bytes| bytes <= MAX_COMPACT_TOOL_SCHEMA_BYTES) {
-            return;
-        }
-        pass(value);
-        compact_bytes = compact_schema_bytes(value);
-    }
-    if let Some(bytes) = compact_bytes
-        && bytes > MAX_COMPACT_TOOL_SCHEMA_BYTES
-    {
-        tracing::debug!(
-            compact_bytes = bytes,
-            budget_bytes = MAX_COMPACT_TOOL_SCHEMA_BYTES,
-            "tool schema exceeds best-effort compaction budget; preserving validation constraints"
-        );
-    }
-}
-
-type LargeSchemaCompactionPass = fn(&mut JsonSchema);
-
-const MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES: usize = 512;
-const SCHEMA_DESCRIPTION_TRUNCATION_MARKER: &str = " [... truncated ...]";
-const LARGE_SCHEMA_COMPACTION_PASSES: &[LargeSchemaCompactionPass] = &[
-    strip_root_schema_description,
-    truncate_long_schema_descriptions,
-];
-
-fn compact_schema_bytes(value: &JsonSchema) -> Option<usize> {
-    #[derive(Default)]
-    struct ByteCounter(usize);
-
-    impl std::io::Write for ByteCounter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut counter = ByteCounter::default();
-    serde_json::to_writer(&mut counter, value).ok()?;
-    Some(counter.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,47 +438,6 @@ fn for_each_schema_child(
                 }
             }
         }
-    }
-}
-
-fn strip_root_schema_description(value: &mut JsonSchema) {
-    value.description = None;
-}
-
-fn truncate_long_schema_descriptions(schema: &mut JsonSchema) {
-    if let Some(description) = &mut schema.description
-        && description.len() > MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
-    {
-        let prefix_budget = MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
-            .saturating_sub(SCHEMA_DESCRIPTION_TRUNCATION_MARKER.len());
-        description.truncate(description.floor_char_boundary(prefix_budget));
-        description.push_str(SCHEMA_DESCRIPTION_TRUNCATION_MARKER);
-    }
-    for table in [
-        &mut schema.properties,
-        &mut schema.defs,
-        &mut schema.definitions,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for child in table.values_mut() {
-            truncate_long_schema_descriptions(child);
-        }
-    }
-    for variants in [&mut schema.any_of, &mut schema.one_of, &mut schema.all_of]
-        .into_iter()
-        .flatten()
-    {
-        for child in variants {
-            truncate_long_schema_descriptions(child);
-        }
-    }
-    if let Some(items) = &mut schema.items {
-        truncate_long_schema_descriptions(items);
-    }
-    if let Some(AdditionalProperties::Schema(child)) = &mut schema.additional_properties {
-        truncate_long_schema_descriptions(child);
     }
 }
 
@@ -507,38 +511,10 @@ fn sanitize_json_schema(value: &mut JsonValue) {
                 }
             }
 
-            let mut schema_types = normalized_schema_types(map);
-
-            if schema_types.is_empty()
-                && (map.contains_key("$ref")
-                    || has_composition_keyword(map)
-                    || map.contains_key("enum"))
-            {
+            let schema_types = normalized_schema_types(map);
+            if schema_types.is_empty() {
                 map.remove("type");
                 return;
-            }
-
-            if schema_types.is_empty() {
-                if map.contains_key("properties")
-                    || map.contains_key("required")
-                    || map.contains_key("additionalProperties")
-                {
-                    schema_types.push(JsonSchemaPrimitiveType::Object);
-                } else if map.contains_key("items") || map.contains_key("prefixItems") {
-                    schema_types.push(JsonSchemaPrimitiveType::Array);
-                } else if map.contains_key("format") {
-                    schema_types.push(JsonSchemaPrimitiveType::String);
-                } else if map.contains_key("minimum")
-                    || map.contains_key("maximum")
-                    || map.contains_key("exclusiveMinimum")
-                    || map.contains_key("exclusiveMaximum")
-                    || map.contains_key("multipleOf")
-                {
-                    schema_types.push(JsonSchemaPrimitiveType::Number);
-                } else {
-                    map.remove("type");
-                    return;
-                }
             }
 
             write_schema_types(map, &schema_types);
@@ -667,6 +643,11 @@ fn collect_refs(
             .iter()
             .all(|value| collect_refs(value, refs, definition_traversal)),
         JsonValue::Object(map) => {
+            // Resource-local references cannot be resolved against the outer
+            // definition table. Keep it intact rather than guessing reachability.
+            if map.contains_key("$id") {
+                return false;
+            }
             if let Some(JsonValue::String(schema_ref)) = map.get("$ref") {
                 if let Some(pointer) = parse_local_definition_ref(schema_ref) {
                     refs.push(pointer);

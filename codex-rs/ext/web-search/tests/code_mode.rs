@@ -75,7 +75,7 @@ async fn assert_code_mode_standalone_web_search(
                 "call-1",
                 "exec",
                 r#"
-const result = await tools.web__run({
+const result = await resolve_tool("web.run")({
   search_query: [{ q: "standalone web search" }],
 });
 text(result);

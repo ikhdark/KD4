@@ -43,7 +43,7 @@ impl PlanToolOutput {
         serde_json::json!(PlanToolResponse {
             obligations: self.lineage.obligation_summary(&self.current_plan),
             completion_authority: crate::plan_store::checklist_completion_authority(),
-            lineage: self.lineage.clone(),
+            lineage: self.lineage.compact_for_plan(&self.current_plan),
             revision: crate::plan_store::plan_revision_with_lineage(Some(&self.current_plan), &self.lineage),
             step_ids: self.current_plan.plan.iter()
                 .map(|item| self.lineage.step_id(&item.step)).collect(),
@@ -132,8 +132,8 @@ impl ToolOutput for PlanToolOutput {
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
-        // Every effect carries the committed plan so the turn controller never
-        // keeps a stale checklist; it counts only structural changes as revisions.
+        // Preserve the tool-outcome bookkeeping signal. Turn settlement reads
+        // authoritative revision and obligations directly from the plan owner.
         Some(serde_json::json!({
             "kind": "plan_update",
             "plan": self.current_plan,
@@ -254,45 +254,61 @@ impl PlanHandler {
             }
             requested_args.resolved_workflow = Some(resolved);
         }
-        #[cfg(test)]
-        pause_at_plan_commit_boundary(&_call_id, &cancellation_token).await;
-
-        let update = session
-            .services
-            .plan_store
-            .update_tool(requested_args)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-        match update.effect {
-            PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
-            PlanUpdateEffect::StructuralRevision => {
-                turn.turn_timing_state.record_plan_revision_generation()
+        // Own the accepted publication through cancellation or a dropped caller,
+        // just like ordered history commits. Check cancellation again after lock
+        // admission; nothing is published until persistence succeeds.
+        let publication_tasks = session.terminal_tasks.clone();
+        publication_tasks.spawn(async move {
+            let staged = session
+                .services
+                .plan_store
+                .stage_tool(requested_args)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+            if cancellation_token.is_cancelled() {
+                return Err(FunctionCallError::RespondToModel(
+                    "update_plan was cancelled before durable publication; no changes were made".into(),
+                ));
             }
-            PlanUpdateEffect::StatusOnly | PlanUpdateEffect::NoOp => {}
-        }
-        let output = PlanToolOutput {
-            current_plan: update.current,
-            effect: update.effect,
-            lineage: update.lineage,
-        };
-        let response = output.response_result();
-        // Even a no-op may retry an earlier failed publication or migrate a
-        // legacy snapshot that had no requirement lineage.
-        session
-            .persist_rollout_items_durable(&[
-                codex_protocol::protocol::RolloutItem::ResponseItem(
-                    crate::plan_store::plan_snapshot_item(&response),
-                ),
-            ])
-            .await
-            .map_err(|error| FunctionCallError::RespondToModel(format!(
-                "plan committed in memory but durable publication failed: {error}. Do not blindly replay this update. Committed state: {response}"
-            )))?;
-        session
-            .send_event(turn.as_ref(), EventMsg::PlanUpdate(output.current_plan.clone()))
-            .await;
+            let output = PlanToolOutput {
+                current_plan: staged.update.current.clone(),
+                effect: staged.update.effect,
+                lineage: staged.update.lineage.clone(),
+            };
+            if !staged.needs_publication() {
+                return Ok(boxed_tool_output(output));
+            }
+            let response = output.response_result();
+            // Even a no-op may retry an earlier failed publication or migrate a
+            // legacy snapshot that had no requirement lineage.
+            session
+                .persist_rollout_items_durable(&[
+                    codex_protocol::protocol::RolloutItem::ResponseItem(
+                        crate::plan_store::plan_snapshot_item(&response),
+                    ),
+                ])
+                .await
+                .map_err(|error| FunctionCallError::RespondToModel(format!(
+                    "durable plan publication failed: {error}; the previous plan and revision are unchanged"
+                )))?;
+            #[cfg(test)]
+            pause_at_plan_commit_boundary(&_call_id, &cancellation_token).await;
+            let update = staged.commit_published();
+            match update.effect {
+                PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
+                PlanUpdateEffect::StructuralRevision => {
+                    turn.turn_timing_state.record_plan_revision_generation()
+                }
+                PlanUpdateEffect::StatusOnly | PlanUpdateEffect::NoOp => {}
+            }
+            session
+                .send_event(turn.as_ref(), EventMsg::PlanUpdate(output.current_plan.clone()))
+                .await;
 
-        Ok(boxed_tool_output(output))
+            Ok(boxed_tool_output(output))
+        }).await.map_err(|error| FunctionCallError::RespondToModel(format!(
+            "plan publication task failed: {error}"
+        )))?
     }
 }
 

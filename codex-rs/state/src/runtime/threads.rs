@@ -642,6 +642,40 @@ ON CONFLICT(child_thread_id) DO NOTHING
         Ok(())
     }
 
+    /// Apply a metadata patch to the current row under the SQLite writer
+    /// reservation. The fallback is used only if no row exists at admission.
+    pub async fn patch_thread_metadata(
+        &self,
+        fallback: &crate::ThreadMetadata,
+        patch: impl FnOnce(&mut crate::ThreadMetadata) -> Result<(), String> + Send,
+    ) -> anyhow::Result<crate::ThreadMetadata> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut metadata = Self::get_thread_on_connection(&mut tx, fallback.id)
+            .await?
+            .unwrap_or_else(|| fallback.clone());
+        patch(&mut metadata).map_err(anyhow::Error::msg)?;
+        if let Some(id) = metadata.project_id.as_deref() {
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id = ?")
+                .bind(id).fetch_one(&mut *tx).await?;
+            anyhow::ensure!(exists != 0, "project not found: {id}");
+        }
+        self.upsert_thread_on_connection(&mut tx, &metadata, true).await?;
+        // Explicit patches can clear Git/project fields; rollout upserts instead
+        // deliberately preserve those fields. Both writes share this transaction.
+        sqlx::query("UPDATE threads SET git_sha = ?, git_branch = ?, git_origin_url = ?, project_id = ? WHERE id = ?")
+            .bind(metadata.git_sha.as_deref())
+            .bind(metadata.git_branch.as_deref())
+            .bind(metadata.git_origin_url.as_deref())
+            .bind(metadata.project_id.as_deref())
+            .bind(metadata.id.to_string())
+            .execute(&mut *tx).await?;
+        let metadata = Self::get_thread_on_connection(&mut tx, metadata.id)
+            .await?.ok_or_else(|| anyhow::anyhow!("thread metadata disappeared during patch"))?;
+        tx.commit().await?;
+        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str()).await?;
+        Ok(metadata)
+    }
+
     /// Insert rollout metadata without changing its persisted file timestamps.
     pub async fn upsert_thread_preserving_timestamps(
         &self,
@@ -1622,6 +1656,29 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn metadata_patches_merge_against_current_row_not_stale_fallback() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let id = ThreadId::new();
+        let fallback = test_thread_metadata(home.path(), id, home.path().to_path_buf());
+        runtime.upsert_thread(&fallback).await?;
+        let (title, model) = tokio::join!(
+            runtime.patch_thread_metadata(&fallback, |current| {
+                current.title = "new title".into(); Ok(())
+            }),
+            runtime.patch_thread_metadata(&fallback, |current| {
+                current.model = Some("new model".into()); Ok(())
+            }),
+        );
+        title?;
+        model?;
+        let current = runtime.get_thread(id).await?.unwrap();
+        assert_eq!(current.title, "new title");
+        assert_eq!(current.model.as_deref(), Some("new model"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn batch_thread_titles_preserve_values_and_ignore_missing_ids() -> Result<()> {
@@ -3372,7 +3429,11 @@ END
             .upsert_thread_spawn_edge(parent, child, DirectionalThreadSpawnEdgeStatus::Closed)
             .await?;
 
+        // Establish the WAL reader before taking the writer lock: opening a
+        // new connection itself applies initialization pragmas that can write.
+        let reader = runtime.pool.acquire().await?;
         let writer = runtime.pool.begin_with("BEGIN IMMEDIATE").await?;
+        drop(reader);
         tokio::time::timeout(
             Duration::from_secs(1),
             runtime.insert_thread_spawn_edge_if_absent(other_parent, child),

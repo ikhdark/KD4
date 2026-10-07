@@ -312,6 +312,7 @@ fn client_to_host_v1_variants_are_pinned() {
             HostRequest::Wait {
                 session_id: session_id(),
                 request: WireWaitRequest {
+                    recovery: None,
                     cell_id: cell_id("cell-1"),
                     yield_time_ms: 50,
                 },
@@ -575,6 +576,7 @@ fn host_to_client_v1_variants_are_pinned() {
                     input: Some(json!({ "value": 1 })),
                     deadline_shared_monotonic_nanos: None,
                     remaining_ms_at_send: None,
+                    buffered_output_bytes: 0,
                 },
             },
         },
@@ -588,6 +590,7 @@ fn host_to_client_v1_variants_are_pinned() {
                     "cell_id": "cell-1",
                     "parent_tool_call_id": "outer-call-1",
                     "runtime_tool_call_id": "runtime-call-1",
+                    "buffered_output_bytes": 0,
                     "tool_name": {
                         "name": "freeform_tool",
                         "namespace": "mcp__sample__",

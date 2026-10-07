@@ -223,6 +223,9 @@ async fn exec_end_without_begin_uses_event_command() {
     handle_exec_end(
         &mut chat,
         AppServerThreadItem::CommandExecution {
+            output_metadata: None,
+            stdout: None,
+            stderr: None,
             id: "call-orphan".to_string(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),

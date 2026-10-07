@@ -189,6 +189,7 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
         ToolName::plain("shell"),
     );
     let output = crate::tools::context::ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -318,6 +319,7 @@ async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
             .map(|line| format!("error: exact evidence {line:03}\n"))
             .collect::<String>();
         let output = crate::tools::context::ExecCommandToolOutput {
+            output_ranges: None,
             process_output: None,
             error: None,
             validation: None,
@@ -343,13 +345,10 @@ async fn fitting_command_output_does_not_execute_preset_artifact_recovery() {
             pending_deferred_completions: Vec::new(),
         };
         if exit_code == 1 && line_count == 300 {
-            assert!(
-                !output
-                    .projection_metadata()
-                    .unwrap()
-                    .predetermined_ranges
-                    .is_empty()
-            );
+            let metadata = output.projection_metadata().unwrap();
+            assert!(metadata.predetermined_ranges.is_empty());
+            assert!(metadata.fragments.iter().any(|fragment| fragment.shell_output.is_some()),
+                "the owning projection defers diagnostic selection until it knows the budget");
         }
         let mut result = AnyToolResult {
             call_id: invocation.call_id.clone(),
@@ -642,7 +641,7 @@ fn typed_preflight_rejects_invalid_hook_rewritten_code_mode_arguments() {
     let preflight = CodeModeArgumentPreflight::default();
 
     assert_eq!(
-        preflight.validate(&name, &spec, &valid_payload, valid_arguments.as_ref(),),
+        preflight.validate(&name, &spec, &valid_payload, valid_arguments.as_ref(), false),
         Ok(())
     );
     // This represents the final payload after a PreToolUse hook rewrites the
@@ -652,7 +651,7 @@ fn typed_preflight_rejects_invalid_hook_rewritten_code_mode_arguments() {
     };
     let invalid_arguments = ParsedFunctionArguments::from_payload(&invalid_payload);
     let error = preflight
-        .validate(&name, &spec, &invalid_payload, invalid_arguments.as_ref())
+        .validate(&name, &spec, &invalid_payload, invalid_arguments.as_ref(), false)
         .expect_err("invalid typed arguments must be rejected before dispatch");
     assert!(error.contains("argument preflight failed"));
     assert!(error.contains("/path") || error.contains("additional"));
@@ -679,7 +678,7 @@ fn exec_command_code_mode_preflight_preserves_prescriptive_boundary_errors() {
     };
     let arguments = ParsedFunctionArguments::from_payload(&payload);
     let error = CodeModeArgumentPreflight::default()
-        .validate(&name, &spec, &payload, arguments.as_ref())
+        .validate(&name, &spec, &payload, arguments.as_ref(), true)
         .expect_err("mixed branches must fail before Code Mode dispatch");
 
     assert!(error.contains("argument preflight failed"), "{error}");
@@ -693,8 +692,29 @@ fn exec_command_code_mode_preflight_preserves_prescriptive_boundary_errors() {
     };
     let parsed = ParsedFunctionArguments::from_payload(&compatible);
     CodeModeArgumentPreflight::default()
-        .validate(&name, &spec, &compatible, parsed.as_ref())
+        .validate(&name, &spec, &compatible, parsed.as_ref(), true)
         .expect("the handler owns ignored fields and adjusted bounds in code mode too");
+}
+
+#[test]
+fn verified10_external_names_do_not_inherit_native_argument_exemptions() {
+    for name in ["read_file", "exec_command"] {
+        let name = ToolName::plain(name);
+        let spec = ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: name.name.clone(), description: "External contract".into(), strict: false,
+            defer_loading: None, output_schema: None,
+            parameters: codex_tools::parse_tool_input_schema(&serde_json::json!({
+                "type":"object", "required":["external_id"], "properties":{"external_id":{"type":"string"}},
+            })).unwrap(),
+        });
+        let payload = ToolPayload::Function { arguments: if name.name == "read_file" {
+            r#"{"path":"native.txt"}"#.into()
+        } else { r#"{"cmd":"echo native"}"#.into() } };
+        let parsed = ParsedFunctionArguments::from_payload(&payload);
+        let error = CodeModeArgumentPreflight::default()
+            .validate(&name, &spec, &payload, parsed.as_ref(), false).unwrap_err();
+        assert!(error.contains("external_id"), "{error}");
+    }
 }
 
 #[tokio::test]
@@ -802,7 +822,7 @@ fn complete_projection_envelope_respects_applied_limit() {
     );
     let (header, selected_text) = model_projection_parts(rendered);
     assert_eq!(envelope.outcome, "success");
-    assert!(header.get("outcome").is_none());
+    assert_eq!(header["outcome"], "success");
     assert_eq!(
         selected_text,
         envelope.result["selected_text"]
@@ -1277,7 +1297,7 @@ async fn structured_projection_artifact_recovers_original_bytes() {
     assert!(rendered.len() < full_output.len());
     assert!(!rendered.contains("remaining coverage: integration tests"));
     let (header, _) = model_projection_parts(rendered);
-    assert!(header.get("outcome").is_none());
+    assert_eq!(header["outcome"], "failure");
     assert_eq!(header["coverage_status"], "partial");
     assert!(header.get("canonical_complete").is_none());
     let artifact_id = header["artifact_id"]
@@ -3016,6 +3036,98 @@ impl ToolExecutor<ToolInvocation> for IndependentNameHandler {
 impl CoreToolRuntime for IndependentNameHandler {}
 
 #[test]
+fn verified10_output_only_changes_invalidate_capability_fingerprint() {
+    for namespaced in [false, true] {
+        let function = codex_tools::ResponsesApiTool {
+            name: "contract".into(), description: "Contract".into(), strict: false,
+            defer_loading: Some(true), parameters: codex_tools::JsonSchema::default(),
+            output_schema: Some(serde_json::json!({"type":"string"}).into()),
+        };
+        let spec = if namespaced {
+            ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+                name: "provider".into(), description: "Provider".into(),
+                tools: vec![codex_tools::ResponsesApiNamespaceTool::Function(function)],
+            })
+        } else { ToolSpec::Function(function) };
+        let mut registered = RegisteredTool::new(Arc::new(RecoveryFormatHandler {
+            spec, calls: Arc::new(AtomicUsize::new(0)),
+        }), TypedToolClass::DynamicExternal);
+        let wire = serde_json::to_value(registered.spec()).unwrap();
+        let before = registered.canonical_spec_sha256().to_string();
+        let function = match registered.spec_mut() {
+            ToolSpec::Function(tool) => tool,
+            ToolSpec::Namespace(namespace) => {
+                let codex_tools::ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
+                tool
+            }
+            _ => unreachable!(),
+        };
+        function.output_schema = Some(serde_json::json!({"type":"number"}).into());
+        assert_eq!(serde_json::to_value(registered.spec()).unwrap(), wire);
+        assert_ne!(registered.canonical_spec_sha256(), before);
+    }
+}
+
+#[tokio::test]
+async fn verified10_external_dispatch_rejects_invalid_and_hook_rewritten_arguments() {
+    let mut errors = Vec::new();
+    for rewrite in [false, true] {
+        for nested in [false, true] {
+            let (session, turn) = crate::session::tests::make_session_and_context().await;
+            if rewrite {
+                let layer = serde_json::from_value(serde_json::json!({"hooks":{"PreToolUse":[{
+                    "matcher":"typed_helper", "hooks":[{
+                        "type":"command",
+                        "command":"python3 -c \"import json; print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow', 'updatedInput': {'path': 7}}}))\"",
+                        "commandWindows":"python -c \"import json; print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow', 'updatedInput': {'path': 7}}}))\""
+                    }]
+                }]}})).unwrap();
+                let stack = codex_config::ConfigLayerStack::new(
+                    vec![codex_config::ConfigLayerEntry::new(codex_config::ConfigLayerSource::User {
+                        file: turn.config.codex_home.join("config.toml"), profile: None,
+                    }, layer)], Default::default(), Default::default(),
+                ).unwrap();
+                session.services.hooks.store(Arc::new(codex_hooks::Hooks::new(codex_hooks::HooksConfig {
+                    feature_enabled: true, bypass_hook_trust: true,
+                    config_layer_stack: Some(stack), ..Default::default()
+                })));
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let name = ToolName::plain("typed_helper");
+            let registry = ToolRegistry::from_tools([Arc::new(RecoveryFormatHandler {
+                spec: ToolSpec::Function(codex_tools::ResponsesApiTool {
+                    name: name.name.clone(), description: "Typed helper".into(), strict: false,
+                    defer_loading: None, output_schema: None,
+                    parameters: codex_tools::parse_tool_input_schema(&serde_json::json!({
+                        "type":"object", "properties":{"path":{"type":"string"}},
+                        "required":["path"], "additionalProperties":false,
+                    })).unwrap(),
+                }), calls: Arc::clone(&calls),
+            }) as Arc<dyn CoreToolRuntime>]);
+            let mut invocation = test_invocation(Arc::new(session), Arc::new(turn), "invalid-external", name.clone());
+            invocation.payload = ToolPayload::Function {
+                arguments: if rewrite { r#"{"path":"valid"}"# } else { r#"{"path":7}"# }.into(),
+            };
+            if nested {
+                invocation.source = ToolCallSource::CodeMode {
+                    cell_id: "cell".into(), parent_call_id: None, runtime_tool_call_id: "nested".into(),
+                    nested_deadline: None, cancellation_cause: None,
+                };
+            }
+            let error = match registry.dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state()).await {
+                Err(FunctionCallError::RespondToModel(error)) => error,
+                _ => panic!("invalid external arguments must be rejected"),
+            };
+            assert!(error.contains("argument preflight failed"), "{error}");
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(registry.code_mode_argument_preflight_counts(&name), Some((1, if rewrite { 2 } else { 1 })));
+            errors.push(error);
+        }
+    }
+    assert!(errors.windows(2).all(|pair| pair[0] == pair[1]), "{errors:?}");
+}
+
+#[test]
 fn registry_caches_each_runtime_spec_once() {
     let tool_name = ToolName::plain("counted_spec");
     let spec_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3040,6 +3152,41 @@ fn registry_caches_each_runtime_spec_once() {
         second[0].canonical_spec_sha256()
     ));
     assert_eq!(spec_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+
+#[tokio::test]
+async fn callable_alias_executes_same_identity_after_catalog_growth() {
+    struct IdentityDelegate;
+    impl codex_code_mode::CodeModeSessionDelegate for IdentityDelegate {
+        fn invoke_tool<'a>(&'a self, call: codex_code_mode::CodeModeNestedToolCall,
+            _: codex_code_mode::NestedCancellation) -> codex_code_mode::ToolInvocationFuture<'a> {
+            Box::pin(async move { Ok(serde_json::json!({"target":call.tool_name.to_string()})) })
+        }
+        fn notify<'a>(&'a self, _: String, _: codex_code_mode::CellId, _: String,
+            _: tokio_util::sync::CancellationToken) -> codex_code_mode::NotificationFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+        fn cell_closed(&self, _: &codex_code_mode::CellId) {}
+    }
+    let service = codex_code_mode::InProcessCodeModeSession::with_delegate(Arc::new(IdentityDelegate));
+    let specs = [test_spec(&ToolName::plain("read_file")), test_spec(&ToolName::plain("read-file"))];
+    for count in [1, 2] {
+        let response = service.execute(codex_code_mode::ExecuteRequest {
+            state_path: None,
+            tool_call_id: format!("alias-{count}"),
+            enabled_tools: codex_tools::collect_code_mode_tool_definitions(&specs[..count]).into(),
+            source: "text(await tools.read_file({}));".into(),
+            yield_time_ms: Some(60_000), max_output_tokens: None, default_tool_timeout_ms: None,
+        }).await.unwrap().initial_response().await.unwrap();
+        let codex_code_mode::RuntimeResponse::Result { error_text: None, content_items, .. } = response else {
+            panic!("alias execution failed: {response:?}");
+        };
+        assert!(content_items.iter().any(|item| matches!(item,
+            codex_code_mode::FunctionCallOutputContentItem::InputText { text }
+                if text == "{\"target\":\"read_file\"}")), "{content_items:?}");
+    }
+    service.shutdown().await.unwrap();
 }
 
 #[test]
@@ -4081,62 +4228,74 @@ fn admission_fallback_does_not_retype_structured_tool_search_output() {
 #[tokio::test]
 async fn admission_only_projection_preserves_original_response_and_registers_candidate() {
     let temp = tempfile::tempdir().expect("temporary Codex home");
-    let output = "ordinary inline result\n".repeat(1_000);
-    let canonical = CanonicalToolResult::text(output.clone());
-    let original_response = ResponseInputItem::FunctionCallOutput {
-        call_id: "ordinary-call".to_string(),
-        output: FunctionCallOutputPayload::from_text(output.clone()),
-    };
-    let invocation_sha256 = crate::tool_history::sha256(b"normalized invocation");
-    let projection = project_model_output(ModelProjectionInput {
-        fragments: Vec::new(),
-        spillable_text: output.clone(),
-        outcome: ToolOutputOutcome::Success,
-        essential_inline: serde_json::json!({}),
-        origin_call_id: "ordinary-call".to_string(),
-        selection_facts: ProjectionSelectionFacts {
-            mode: "generic_fallback",
-            available_fragments: 0,
-            selected_fragments: 0,
-            exact_duplicates_removed: 0,
-            selected_ids: Vec::new(),
-            omitted_inline_ids: Vec::new(),
-            partial_ids: Vec::new(),
-        },
-        applied_token_limit: 10_000,
-        projected_text: output.clone(),
-        preserved_content: Vec::new(),
-        codex_home: temp.path().to_path_buf(),
-        thread_id: "ordinary-thread".to_string(),
-        tool_name: "ordinary_tool".to_string(),
-        original_output_sha256: canonical.sha256.clone(),
-        original_output_tokens: canonical.approximate_tokens,
-        original_output_text: output.clone(),
-        invocation_sha256: Some(invocation_sha256.clone()),
-        canonical,
-        semantic_class: "tool_output".to_string(),
-        source_dependencies: std::collections::BTreeSet::new(),
-        projection_eligible: true,
-        projection_truncated: false,
-        canonical_artifact_required: false,
-        predetermined_ranges: Vec::new(),
-        predetermined_json_pointers: Vec::new(),
-        original_response: original_response.clone(),
-        materialization: ProjectionMaterialization::AdmissionOnly,
-    })
-    .await
-    .expect("admission-only projection");
+    let mut history = crate::tool_history::ToolHistoryState::default();
+    for (ordinal, outcome) in [ToolOutputOutcome::Failure, ToolOutputOutcome::Skipped,
+        ToolOutputOutcome::Yielded, ToolOutputOutcome::TimedOut, ToolOutputOutcome::Success].into_iter().enumerate() {
+        let call_id = format!("outcome-{ordinal}");
+        let output = "ordinary inline result\n".repeat(1_000);
+        let canonical = CanonicalToolResult::text(output.clone());
+        let original_response = ResponseInputItem::FunctionCallOutput {
+            call_id: "ordinary-call".to_string(),
+            output: FunctionCallOutputPayload::from_text(output.clone()),
+        };
+        let invocation_sha256 = crate::tool_history::sha256(b"normalized invocation");
+        let projection = project_model_output(ModelProjectionInput {
+            fragments: Vec::new(),
+            spillable_text: output.clone(),
+            outcome,
+            essential_inline: serde_json::json!({}),
+            origin_call_id: call_id,
+            selection_facts: ProjectionSelectionFacts {
+                mode: "generic_fallback",
+                available_fragments: 0,
+                selected_fragments: 0,
+                exact_duplicates_removed: 0,
+                selected_ids: Vec::new(),
+                omitted_inline_ids: Vec::new(),
+                partial_ids: Vec::new(),
+            },
+            applied_token_limit: 10_000,
+            projected_text: output.clone(),
+            preserved_content: Vec::new(),
+            codex_home: temp.path().to_path_buf(),
+            thread_id: "ordinary-thread".to_string(),
+            tool_name: "ordinary_tool".to_string(),
+            original_output_sha256: canonical.sha256.clone(),
+            original_output_tokens: canonical.approximate_tokens,
+            original_output_text: output.clone(),
+            invocation_sha256: Some(invocation_sha256.clone()),
+            canonical,
+            semantic_class: "tool_output".to_string(),
+            source_dependencies: std::collections::BTreeSet::new(),
+            projection_eligible: true,
+            projection_truncated: false,
+            canonical_artifact_required: false,
+            predetermined_ranges: Vec::new(),
+            predetermined_json_pointers: Vec::new(),
+            original_response: original_response.clone(),
+            materialization: ProjectionMaterialization::AdmissionOnly,
+        })
+        .await
+        .expect("admission-only projection");
 
-    assert_eq!(projection.response(), original_response);
-    assert!(!projection.projection_truncated);
-    let candidate = projection.candidate.expect("admission candidate");
-    assert_eq!(candidate.bounded_model_output, output);
-    assert_eq!(candidate.preserved_non_text_tokens, Some(0));
-    assert!(
-        candidate
-            .supersession_identity
-            .is_some_and(|identity| identity.contains(&invocation_sha256))
-    );
+        assert_eq!(projection.response(), original_response);
+        assert!(!projection.projection_truncated);
+        let mut candidate = projection.candidate.expect("admission candidate");
+        assert_eq!(candidate.successful, outcome == ToolOutputOutcome::Success);
+        assert_eq!(candidate.bounded_model_output, output);
+        assert_eq!(candidate.preserved_non_text_tokens, Some(0));
+        assert!(
+            candidate
+                .supersession_identity
+                .as_ref().is_some_and(|identity| identity.contains(&invocation_sha256))
+        );
+        candidate.consumed_by_generation = Some(crate::tool_history::ModelGenerationId {
+            turn_id: "turn".into(), ordinal: ordinal as u32,
+        });
+        history.register(candidate);
+        assert_eq!(history.phase_checkpoint_receipts(&["outcome-0".into()]).is_ok(),
+            outcome == ToolOutputOutcome::Success, "skipped/yielded must not resolve a failure");
+    }
 }
 
 #[tokio::test]
@@ -4153,7 +4312,7 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let visible = "line 0\nWarning: truncated output (4000 tokens)\nline 399".to_string();
+    let visible = "line 0\n[omitted lines 2-399 of 400; artifact_id={cell_output_artifact_id}]\nline 399".to_string();
     let canonical = CanonicalToolResult::text(canonical_text.clone());
     let original_response = ResponseInputItem::CustomToolCallOutput {
         call_id: "exec-call".to_string(),
@@ -4162,6 +4321,7 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
     };
     let mut essential_inline = serde_json::json!({"success": true});
     essential_inline[crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY] = Value::Bool(true);
+    essential_inline["cell_output_recovery_selector"] = serde_json::json!({"kind":"lines","start":2,"end":201});
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
         spillable_text: canonical_text.clone(),
@@ -4207,12 +4367,16 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
     };
     let rendered = output.body.to_text().expect("exec text");
     let (shown, notice) = rendered.rsplit_once('\n').expect("recovery notice line");
-    assert_eq!(shown, visible, "the bounded packet itself is unchanged");
     let notice: Value = serde_json::from_str(notice).expect("notice is JSON");
     let candidate = projection.candidate.expect("admission candidate");
+    assert_eq!(shown, visible.replace("{cell_output_artifact_id}", &candidate.artifact_id));
     assert_eq!(notice["output_truncated"], true);
     assert_eq!(notice["recovery_tool"], "read_tool_output");
     assert_eq!(notice["artifact_id"], candidate.artifact_id.as_str());
+    assert_eq!(notice["recovery"]["tool"], "read_tool_output");
+    assert_eq!(notice["recovery"]["arguments"]["artifact_id"], candidate.artifact_id);
+    assert_eq!(notice["recovery_scope"], "omitted_output");
+    assert_eq!(notice["recovery"]["arguments"]["selectors"][0], serde_json::json!({"kind":"lines","start":2,"end":201}));
     assert_eq!(
         candidate.bounded_model_output, rendered,
         "history must track exactly the text the model received"
@@ -4224,7 +4388,7 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
         &candidate.artifact_id,
         vec![
             crate::tools::command_output_artifact::ToolOutputSelector::Lines {
-                start: 201,
+                start: 2,
                 end: 201,
             },
         ],
@@ -4233,10 +4397,11 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
     .await
     .expect("named artifact is recoverable");
     assert_eq!(
-        recovered.results[0].text.as_deref().map(str::trim_end),
+        recovered.results[0].text.as_deref().and_then(|text| text.lines().last()),
         Some(sentinel),
         "the named artifact must hold the output omitted from the visible packet"
     );
+    assert!(recovered.results[0].text.as_deref().unwrap().starts_with("line 1\n"));
 }
 
 #[tokio::test]
@@ -4348,6 +4513,94 @@ fn final_envelope_fitting_revokes_complete_fragment_inclusion() {
     );
 }
 
+#[test]
+fn verified_evidence_minimal_projection_keeps_outcome_and_completeness() {
+    for outcome in ["failure", "timed_out", "skipped", "success"] {
+        for budget in [0, 1, 10] {
+            let envelope = ToolProjectionV1 {
+                version:1, tool:"fixture".into(), outcome:outcome.into(),
+                canonical_sha256:"hash".into(), canonical_bytes:10_000,
+                canonical_approximate_tokens:2500, canonical_complete:false,
+                model_bytes:0, model_approximate_tokens:0, artifact_id:Some("retained".into()),
+                sections:vec![], omitted_sections:vec![],
+                result:serde_json::json!({"essential":{"output_complete":false,"process_exited":true}}),
+            };
+            let projection = serialize_projection_with_limit(envelope, &"diagnostic ".repeat(1000), budget).unwrap();
+            let header: serde_json::Value = serde_json::from_str(projection.rendered().lines().next().unwrap()).unwrap();
+            assert_eq!(header["outcome"], outcome);
+            assert_eq!(header["output_complete"], false);
+            assert_eq!(header["canonical_complete"], false);
+            assert_eq!(header["process_exited"], true);
+        }
+    }
+}
+
+#[test]
+fn fitted_fragment_metadata_describes_only_delivered_fragments() {
+    let fragments = vec![
+        ToolOutputProjectionFragment::new(ToolOutputProjectionFragmentKind::ErrorOrDiagnostic, "FIRST complete").with_id("first"),
+        ToolOutputProjectionFragment::new(ToolOutputProjectionFragmentKind::ErrorOrDiagnostic, "SECOND diagnostic ".repeat(1000)).with_id("second"),
+        ToolOutputProjectionFragment::new(ToolOutputProjectionFragmentKind::ErrorOrDiagnostic, "THIRD omitted").with_id("third"),
+    ];
+    let (output, _) = select_typed_projection_fragments(&fragments, 20_000);
+    for budget in [128, 256, 512] {
+        let envelope = ToolProjectionV1 {
+            version:1, tool:"fixture".into(), outcome:"success".into(),
+            canonical_sha256:"hash".into(), canonical_bytes:output.len() as u64,
+            canonical_approximate_tokens:approx_token_count(&output) as u64, canonical_complete:true,
+            model_bytes:0, model_approximate_tokens:0, artifact_id:Some("retained".into()),
+            sections:fragments.iter().map(|fragment| omitted_projection_section(
+                fragment.id.clone().unwrap(), CanonicalByteRange::new(0, 1))).collect(),
+            omitted_sections:vec![],
+            result:serde_json::json!({"selection":{"origin_call_id":"original", "selected_ids":["stale"]}}),
+        };
+        let fitted = serialize_projection_fragments(envelope, &output, &fragments, budget).unwrap();
+        let envelope = fitted.envelope().unwrap();
+        let text = envelope.result["selected_text"].as_str().unwrap();
+        assert!(text.contains("FIRST complete") && text.contains("SECOND"));
+        assert!(!text.contains("THIRD"));
+        let facts = &envelope.result["selection"];
+        assert_eq!(facts["selected_ids"], serde_json::json!(["first","second"]));
+        assert_eq!(facts["partial_ids"], serde_json::json!(["second"]));
+        assert_eq!(facts["omitted_inline_ids"], serde_json::json!(["third"]));
+        assert_eq!(facts["selected_fragments"], 2);
+        assert_eq!(facts["available_fragments"], 3);
+        assert_eq!(facts["origin_call_id"], "original");
+        assert_eq!(envelope.omitted_sections, vec!["second", "third"]);
+    }
+}
+
+#[test]
+fn compact_projection_distinguishes_display_reduction_from_unavailable_bytes() {
+    for retention_limit in [false, true] {
+        for budget in [0, 1, 128] {
+            let envelope = ToolProjectionV1 {
+                version: 1, tool: "fixture".into(), outcome: "success".into(),
+                canonical_sha256: "hash".into(), canonical_bytes: 10_000,
+                canonical_approximate_tokens: 2500, canonical_complete: true,
+                model_bytes: 0, model_approximate_tokens: 0, artifact_id: Some("retained".into()),
+                sections: vec![], omitted_sections: vec![],
+                result: serde_json::json!({"essential": {
+                    "output_complete": !retention_limit,
+                    "streams_complete": !retention_limit,
+                    "output_reduced": true,
+                    "raw_output_artifact_retention_limit_hit": retention_limit,
+                    "raw_output_artifact_retention_limit_reason": if retention_limit { Some("byte_limit") } else { None },
+                }}),
+            };
+            let projection = serialize_projection_with_limit(envelope, &"data ".repeat(2000), budget).unwrap();
+            let header: Value = serde_json::from_str(projection.rendered().lines().next().unwrap()).unwrap();
+            assert_eq!(header["output_reduced"], true);
+            assert_eq!(header["output_complete"], !retention_limit);
+            assert_eq!(header["streams_complete"], !retention_limit);
+            assert_eq!(header["raw_output_artifact_retention_limit_hit"], retention_limit);
+            if retention_limit {
+                assert_eq!(header["raw_output_artifact_retention_limit_reason"], "byte_limit");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn disabled_history_projection_skips_artifacts_for_complete_inline_results() {
     for enabled in [false, true] {
@@ -4445,5 +4698,72 @@ async fn direct_read_file_page_keeps_original_snapshot_and_complete_json() {
         }
         assert_eq!(result.response(), original);
         assert_eq!(result.code_mode_result(), value);
+    }
+}
+#[test]
+fn verified10_final_registry_budget_preserves_compiler_json_and_central_fix() {
+    use crate::tools::context::ExecCommandToolOutput;
+    use codex_utils_output_truncation::TruncationPolicy;
+    let raw = (0..21).map(|index| serde_json::json!({
+        "reason":"compiler-message", "message":{
+            "level":if index == 10 {"error"} else {"warning"},
+            "message":if index == 10 {"UNIQUE_ACTIONABLE_MIDDLE"} else {"advisory"},
+            "spans":[{"file_name":"src/λ.rs", "line_start":17, "column_start":3,
+                "suggested_replacement":"required.into()", "suggestion_applicability":"MachineApplicable"}],
+            "children":[], "rendered":"redundant prose ".repeat(1000)
+        }
+    }).to_string()).collect::<Vec<_>>().join("\r\n");
+    let command = ExecCommandToolOutput {
+        output_ranges:None, process_output:None, error:None, validation:None,
+        event_call_id:String::new(), chunk_id:String::new(), wall_time:std::time::Duration::ZERO,
+        raw_output:raw.as_bytes().to_vec(), truncation_policy:TruncationPolicy::Tokens(2000),
+        max_output_tokens:Some(2000), process_id:None, session_capabilities:None,
+        exit_code:Some(1), process_exited:true, search_no_match:false, original_token_count:None,
+        hook_command:Some("cargo check --message-format=json".into()), raw_output_artifact:None,
+        repair_notice:None, pending_deferred_completions:Vec::new(),
+    };
+    let (_, metadata) = command.to_response_item_with_projection_metadata("compiler", &ToolPayload::Function {arguments:"{}".into()});
+    let fragments = metadata.unwrap().fragments;
+    assert!(fragments.iter().any(|fragment| fragment.shell_output.is_some() && fragment.text == raw));
+    let (text, _) = select_typed_projection_fragments(&fragments, usize::MAX);
+    for budget in [1400, 1800, 2000] {
+        let envelope = ToolProjectionV1 {
+            version:1, tool:"exec_command".into(), outcome:"failure".into(),
+            canonical_sha256:"revision".into(), canonical_bytes:raw.len() as u64,
+            canonical_approximate_tokens:approx_token_count(&raw) as u64, canonical_complete:true,
+            model_bytes:0, model_approximate_tokens:0, artifact_id:Some("retained".into()),
+            sections:vec![omitted_projection_section("output".into(), CanonicalByteRange::new(0, raw.len() as u64))],
+            omitted_sections:vec![], result:serde_json::json!({"essential":{"exit_code":1}, "selection":{}}),
+        };
+        let projected = serialize_projection_fragments(envelope, &text, &fragments, budget).unwrap();
+        assert!(approx_token_count(projected.rendered()) <= budget);
+        let selected = projected.envelope().unwrap().result["selected_text"].as_str().unwrap();
+        let summary: Value = selected.lines().find_map(|line| serde_json::from_str::<Value>(line).ok()
+            .filter(|value| value["format"] == "compiler_diagnostics")).expect("complete compiler JSON");
+        let error = summary["diagnostics"].as_array().unwrap().iter().find(|item|
+            item["diagnostic"]["level"] == "error").expect("central error");
+        assert_eq!(error["diagnostic"]["message"], "UNIQUE_ACTIONABLE_MIDDLE");
+        assert_eq!(error["diagnostic"]["spans"][0]["suggested_replacement"], "required.into()");
+    }
+}
+
+#[tokio::test]
+async fn verified10_undrained_exited_command_is_not_admitted_for_retirement() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let invocation = test_invocation(Arc::new(session), Arc::new(turn), "undrained", ToolName::plain("exec"));
+    for (exited, complete, owns_work) in [(false, false, true), (true, false, true), (true, true, false)] {
+        let state = serde_json::json!({"session_id":42, "process_exited":exited, "output_complete":complete,
+            "session_capabilities":{"polling":true,"incarnation":"owned"}});
+        assert_eq!(crate::tools::code_mode::command_owns_work(&state), owns_work);
+        let mut output = crate::tools::context::FunctionToolOutput::from_text("pending pipe evidence".repeat(100), Some(true));
+        output.essential_inline.insert("nested_commands".into(), serde_json::json!([state]));
+        let mut result = AnyToolResult {
+            call_id:invocation.call_id.clone(), payload:invocation.payload.clone(), result:Box::new(output),
+            model_projection:None, source_dependencies:None, code_mode_feedback:Vec::new(),
+        };
+        let input = prepare_model_projection(&invocation, &mut result, None, None, false, true).await;
+        assert_eq!(input.is_none(), owns_work);
+        let response = result.result.to_response_item(&invocation.call_id, &invocation.payload);
+        assert!(consolidated_history_output_text(&response).contains("pending pipe evidence"));
     }
 }

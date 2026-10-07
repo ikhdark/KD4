@@ -757,8 +757,10 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     McpServerStatusSnapshot {
         server_infos,
         tools_by_server,
-        resources: convert_mcp_resources(resources.results),
-        resource_templates: convert_mcp_resource_templates(resource_templates.results),
+        resources: convert_mcp_resources(resources.results.into_iter()
+            .map(|(server, page)| (server, page.resources)).collect()),
+        resource_templates: convert_mcp_resource_templates(resource_templates.results.into_iter()
+            .map(|(server, page)| (server, page.resource_templates)).collect()),
         resource_errors: resources
             .errors
             .into_iter()

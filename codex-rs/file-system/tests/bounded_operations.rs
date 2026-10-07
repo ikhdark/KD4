@@ -36,7 +36,78 @@ fn options(max_entries: usize) -> WalkOptions {
         max_entries,
         follow_directory_symlinks: false,
         prune_hidden_directories: false,
+        filters: Default::default(),
     }
+}
+
+#[test]
+fn filtered_walk_preserves_requested_file_coverage_and_prunes_only_explicit_directories() {
+    let fs = TestFileSystem {
+        batches: Mutex::new(VecDeque::from([
+            ReadDirectoryOutcome {
+                entries: ["dir", ".hidden", "a.rs", "b.rs", "a.txt", "λ.rs"].into_iter().map(entry).collect(),
+                entries_examined: 6, limit_reached: false,
+            },
+            ReadDirectoryOutcome { entries: vec![entry("c.rs")], entries_examined: 1, limit_reached: false },
+        ])), ..Default::default()
+    };
+    let mut opts = options(20);
+    opts.filters = WalkFilters {
+        include: vec!["?.rs".into()], exclude: vec!["b*".into()], exclude_directories: vec!["dir".into()],
+    };
+    let outcome = block_on(fs.walk(&root(), opts.clone(), None)).unwrap();
+    assert_eq!(outcome.applied_filters, Some(opts.filters));
+    assert!(!outcome.truncated);
+    assert!(outcome.errors.is_empty());
+    assert_eq!(outcome.entries.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>(),
+        [".hidden", "a.rs", "λ.rs", ".hidden/c.rs"].map(|name| root().join(name).unwrap()));
+    assert_eq!(fs.limits.lock().unwrap().iter().map(|(path, _)| path.clone()).collect::<Vec<_>>(),
+        [root(), root().join(".hidden").unwrap()]);
+}
+
+#[test]
+fn filters_do_not_hide_budget_cutoffs_or_exclude_the_selected_root() {
+    for limited in [false, true] {
+        let fs = TestFileSystem {
+            batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
+                entries: vec![entry("other.txt")], entries_examined: 1, limit_reached: limited,
+            }])), ..Default::default()
+        };
+        let mut opts = options(2);
+        opts.filters.include = vec!["*.rs".into()];
+        opts.filters.exclude_directories = vec!["fixture".into()];
+        let outcome = block_on(fs.walk(&root(), opts, None)).unwrap();
+        assert!(outcome.entries.is_empty());
+        assert_eq!(outcome.truncated, limited);
+        assert_eq!(fs.limits.lock().unwrap().len(), 1);
+        if limited { assert_eq!(outcome.unexplored[0].reason, "entry_limit"); }
+    }
+}
+
+#[test]
+fn filters_are_bounded_and_invalid_scope_fails_before_enumeration() {
+    for include in [vec!["".into()], vec!["src/*.rs".into()], vec!["a\\b".into()],
+        vec!["x".repeat(257)], vec!["x".into(); 65]] {
+        let fs = TestFileSystem::default();
+        let mut opts = options(20);
+        opts.filters.include = include;
+        assert_eq!(block_on(fs.walk(&root(), opts, None)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(fs.limits.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn response_byte_cutoff_reports_its_effective_bound() {
+    let fs = TestFileSystem {
+        batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
+            entries: vec![entry(&"x".repeat(MAX_WALK_RESPONSE_BYTES))], entries_examined: 1, limit_reached: false,
+        }])), ..Default::default()
+    };
+    let outcome = block_on(fs.walk(&root(), options(20), None)).unwrap();
+    assert!(outcome.truncated);
+    assert!(outcome.entries.is_empty());
+    assert_eq!(outcome.unexplored[0].reason, "response_bytes");
+    assert_eq!(outcome.unexplored[0].effective_limit, MAX_WALK_RESPONSE_BYTES);
 }
 
 fn entry(name: &str) -> ReadDirectoryEntry {
@@ -462,4 +533,30 @@ fn walk_preserves_producer_truncation_without_returned_entries() {
     assert!(outcome.entries.is_empty());
     assert!(outcome.errors.is_empty());
     assert_eq!(*fs.limits.lock().unwrap(), [(root(), 2)]);
+    assert_eq!(outcome.unexplored, vec![WalkStop { path:root(), reason:"entry_limit".into(),
+        effective_limit:2, partially_examined:true }]);
+}
+
+#[test]
+fn walk_frontier_is_bounded_without_losing_unexplored_scope() {
+    let fs = TestFileSystem {
+        metadata_batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
+            entries: (0..100).map(|index| WalkDirectoryEntry { file_name:format!("dir-{index:03}"),
+                metadata:Some(WalkEntryMetadata { is_directory:true, is_file:false, is_symlink:false }) }).collect(),
+            entries_examined:100, limit_reached:false,
+        }])), ..Default::default()
+    };
+    let mut limits = options(200);
+    limits.max_depth = 0;
+    let outcome = block_on(fs.walk(&root(), limits, None)).unwrap();
+    assert_eq!(outcome.entries.len(), 100);
+    assert_eq!(outcome.unexplored.len(), 64);
+    assert_eq!(outcome.unexplored[0].reason, "depth_limit");
+    assert_eq!(outcome.unexplored[0].effective_limit, 0);
+    assert!(!outcome.unexplored[0].partially_examined);
+    let fallback = outcome.unexplored.last().unwrap();
+    assert_eq!(fallback.path, root());
+    assert_eq!(fallback.reason, "frontier_limit");
+    assert!(fallback.partially_examined);
+    assert_eq!(*fs.limits.lock().unwrap(), [(root(), 200)]);
 }

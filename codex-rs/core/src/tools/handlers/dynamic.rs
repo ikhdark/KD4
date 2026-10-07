@@ -99,13 +99,17 @@ impl ToolExecutor<ToolInvocation> for DynamicToolHandler {
         &self,
         registered_spec: &ToolSpec,
     ) -> Option<ToolSearchInfo> {
-        ToolSearchInfo::from_tool_spec(
-            registered_spec,
-            Some(ToolSearchSourceInfo {
+        let source = match registered_spec {
+            ToolSpec::Namespace(namespace) => ToolSearchSourceInfo {
+                name: namespace.name.clone(),
+                description: Some(namespace.description.clone()),
+            },
+            _ => ToolSearchSourceInfo {
                 name: "Dynamic tools".to_string(),
                 description: Some("Tools provided by the current Codex thread.".to_string()),
-            }),
-        )
+            },
+        };
+        ToolSearchInfo::from_tool_spec(registered_spec, Some(source))
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
@@ -192,8 +196,11 @@ async fn request_dynamic_tool(
         let mut active = session.active_turn.lock().await;
         match active.as_mut() {
             Some(at) => {
+                if crate::session::active_turn_has_other_id(at, &turn_context.sub_id) {
+                    return Err("dynamic tool originating turn is no longer active".to_string());
+                }
                 let mut ts = at.turn_state.lock().await;
-                ts.try_insert_pending_dynamic_tool(call_id.clone(), tx_response)
+                ts.try_insert_pending_dynamic_tool(call_id.clone(), turn_context.sub_id.clone(), tx_response)
                     .ok()
                     .map(|()| Arc::clone(&at.turn_state))
             }
@@ -254,6 +261,11 @@ async fn request_dynamic_tool(
         }
     };
 
+    let missing_response = if delivered {
+        "dynamic tool call was cancelled or disconnected after dispatch; completion unknown; inspect before retrying"
+    } else {
+        "dynamic tool call was cancelled before dispatch; not dispatched"
+    };
     let item = match &response {
         Some(response) => DynamicToolCallItem {
             id: call_id,
@@ -278,7 +290,7 @@ async fn request_dynamic_tool(
             status: DynamicToolCallStatus::Failed,
             content_items: Some(Vec::new()),
             success: Some(false),
-            error: Some("dynamic tool call was cancelled before receiving a response".to_string()),
+            error: Some(missing_response.to_string()),
             duration: Some(started_at.elapsed()),
         },
     };
@@ -304,8 +316,7 @@ async fn request_dynamic_tool(
         _ = cancellation_token.cancelled() => {},
     }
 
-    response
-        .ok_or_else(|| "dynamic tool call was cancelled before receiving a response".to_string())
+    response.ok_or_else(|| missing_response.to_string())
 }
 
 #[cfg(test)]
@@ -315,6 +326,24 @@ mod tests {
     use crate::state::ActiveTurn;
 
     #[test]
+    fn dynamic_search_preserves_namespace_sources() {
+        let handler = DynamicToolHandler::new(&DynamicToolFunctionSpec {
+            name: "lookup".into(), description: "Look up a record".into(),
+            input_schema: serde_json::json!({"type":"object"}), defer_loading: true,
+        }).unwrap();
+        for name in ["calendar", "documents"] {
+            let ToolSpec::Function(tool) = handler.spec() else { panic!("function") };
+            let registered = ToolSpec::Namespace(ResponsesApiNamespace {
+                name: name.into(), description: format!("Manage {name}"),
+                tools: vec![ResponsesApiNamespaceTool::Function(tool)],
+            });
+            let source = handler.search_info_for_registered_spec(&registered).unwrap().source_info.unwrap();
+            assert_eq!(source.name, name);
+            assert_eq!(source.description, Some(format!("Manage {name}")));
+        }
+    }
+
+    #[test]
     fn duplicate_pending_dynamic_tool_ids_are_rejected_without_replacing_the_owner() {
         let mut state = crate::state::TurnState::default();
         let (first_tx, first_rx) = oneshot::channel();
@@ -322,17 +351,17 @@ mod tests {
 
         assert!(
             state
-                .try_insert_pending_dynamic_tool("duplicate".to_string(), first_tx)
+                .try_insert_pending_dynamic_tool("duplicate".to_string(), "turn".into(), first_tx)
                 .is_ok()
         );
         assert!(
             state
-                .try_insert_pending_dynamic_tool("duplicate".to_string(), second_tx)
+                .try_insert_pending_dynamic_tool("duplicate".to_string(), "turn".into(), second_tx)
                 .is_err()
         );
 
         state
-            .remove_pending_dynamic_tool("duplicate")
+            .remove_pending_dynamic_tool("duplicate", "turn")
             .expect("first sender remains registered")
             .send(DynamicToolResponse {
                 content_items: Vec::new(),
@@ -376,7 +405,7 @@ mod tests {
                 .await
                 .expect("cancellation must not wait for start delivery")
                 .unwrap_err()
-                .contains("cancelled")
+                .contains("not dispatched")
         );
         assert_eq!(events.recv().await.unwrap().id, "occupied");
         while let Ok(event) = events.try_recv() {
@@ -420,6 +449,8 @@ mod tests {
             .expect("request task joins")
             .expect_err("cancelled request fails");
         assert!(error.contains("cancelled"));
+        assert!(error.contains("completion unknown; inspect before retrying"));
+        assert!(!error.contains("not dispatched"));
 
         let turn_state = {
             let mut active = session.active_turn.lock().await;
@@ -430,7 +461,7 @@ mod tests {
             turn_state
                 .lock()
                 .await
-                .remove_pending_dynamic_tool("cancelled-dynamic-call")
+                .remove_pending_dynamic_tool("cancelled-dynamic-call", &turn.sub_id)
                 .is_none(),
             "cancellation must remove the pending sender"
         );
@@ -570,9 +601,11 @@ mod tests {
         assert!(futures::poll!(&mut first).is_pending());
         while events.try_recv().is_ok() {}
         *session.active_turn.lock().await = Some(ActiveTurn::default());
+        let (_, mut replacement_turn, _) = make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut replacement_turn).unwrap().sub_id = "replacement-turn".into();
         let mut replacement = Box::pin(request_dynamic_tool(
             &session,
-            &turn,
+            &replacement_turn,
             "same-dynamic".into(),
             ToolName::plain("dynamic_cleanup"),
             serde_json::json!({}),
@@ -599,7 +632,11 @@ mod tests {
             }],
         };
         session
-            .notify_dynamic_tool_response("same-dynamic", expected.clone())
+            .notify_dynamic_tool_response(&turn.sub_id, "same-dynamic", expected.clone())
+            .await;
+        assert!(futures::poll!(&mut replacement).is_pending(), "old-turn reply must not consume the replacement waiter");
+        session
+            .notify_dynamic_tool_response(&replacement_turn.sub_id, "same-dynamic", expected.clone())
             .await;
         assert_eq!(
             replacement

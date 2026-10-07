@@ -750,6 +750,9 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
         WsError::ConnectionClosed | WsError::AlreadyClosed => {
             ApiError::Stream("websocket closed".to_string())
         }
+        WsError::Tls(error) if codex_http_client::is_permanent_connection_error(&error) => ApiError::Transport(TransportError::Build(format!(
+            "permanent websocket TLS configuration failure: {error}"
+        ))),
         WsError::Io(err) => ApiError::Transport(TransportError::Network(err.to_string())),
         other => ApiError::Transport(TransportError::Network(other.to_string())),
     }
@@ -838,14 +841,18 @@ async fn run_websocket_response_stream(
     turn_state: Option<Arc<OnceLock<String>>>,
 ) -> Result<(), ApiError> {
     let mut interpreter = ResponsesEventInterpreter::new(&metadata, turn_state);
+    let mut progress_deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
+        if tokio::time::Instant::now() >= progress_deadline {
+            return Err(ApiError::Stream("model progress timeout waiting for websocket".into()));
+        }
         let poll_start = Instant::now();
         let response = tokio::select! {
             biased;
             _ = tx_event.closed() => return Err(ApiError::Stream(
                 "response event consumer dropped".to_string(),
             )),
-            response = tokio::time::timeout(idle_timeout, ws_stream.next()) => response,
+            response = tokio::time::timeout_at(progress_deadline, ws_stream.next()) => response,
         }
         .map_err(|_| {
             ApiError::Stream(format!(
@@ -897,11 +904,15 @@ async fn run_websocket_response_stream(
                     Err(ResponsesEventError::Api(error)) => return Err(error),
                 };
                 for event in events {
+                    let advances = event.advances_model_response();
                     let is_completed = matches!(event, ResponseEvent::Completed { .. });
                     if tx_event.send(Ok(event)).await.is_err() {
                         return Err(ApiError::Stream(
                             "response event consumer dropped".to_string(),
                         ));
+                    }
+                    if advances {
+                        progress_deadline = tokio::time::Instant::now() + idle_timeout;
                     }
                     if is_completed {
                         return Ok(());
@@ -991,6 +1002,37 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+
+    #[tokio::test(start_paused = true)]
+    async fn websocket_progress_deadline_ignores_metadata_and_pings() {
+        for productive in [false, true] {
+            let (tx_command, _commands) = mpsc::channel(1);
+            let (tx_message, rx_message) = ws_ingress_channel(16, 8192);
+            let producer = tokio::spawn(async move {
+                for index in 0..6 {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let payload = if index == 5 {
+                        json!({"type":"response.completed","response":{"id":"done"}})
+                    } else if productive {
+                        json!({"type":"response.reasoning_text.delta","delta":"thinking","content_index":0})
+                    } else {
+                        json!({"type":"response.created","response":{"id":"same"}})
+                    };
+                    let _ = tx_message.try_send(Message::Text(payload.to_string().into()));
+                    let _ = tx_message.try_send(Message::Ping(Vec::new().into()));
+                }
+            });
+            let mut ws_stream = WsStream {
+                tx_command, rx_message, rx_failure: None, pending_failure: None,
+                pump_task: tokio::spawn(std::future::pending()),
+            };
+            let (tx, _rx) = mpsc::channel(32);
+            let result = run_websocket_response_stream(&mut ws_stream, tx, Duration::from_millis(80),
+                None, ResponsesStreamMetadata::default(), None).await;
+            assert_eq!(result.is_ok(), productive, "{result:?}");
+            producer.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn responses_connect_and_probe_reject_auth_before_network() {

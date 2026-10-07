@@ -53,6 +53,39 @@ const IPC_CHANNEL_CAPACITY: usize = 128;
 // connection, so it must not fill below that bound.
 const OUTGOING_FRAME_CAPACITY: usize = 2 * MAX_IN_FLIGHT_REQUESTS + MAX_PENDING_DELEGATE_REQUESTS;
 const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const OPEN_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
+mod control_deadline_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn live_host_without_shutdown_ack_is_retired_with_uncertain_effects() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+        let connection = Connection {
+            command_tx, execute_claim_tx, alive: Arc::new(AtomicBool::new(true)),
+            failure: Arc::new(std::sync::Mutex::new(None)),
+            cancellation: CancellationToken::new(),
+        };
+        let session = RemoteSession {
+            id: codex_code_mode_protocol::host::SessionId::new("no-ack".to_string()).unwrap(),
+            generation: 1,
+        };
+        let shutdown = connection.shutdown_session(session);
+        tokio::pin!(shutdown);
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        let _accepted = command_rx.recv().await.unwrap(); // retain the reply sender, like an open pipe
+        let started = tokio::time::Instant::now();
+        let error = shutdown.await.unwrap_err();
+        assert_eq!(started.elapsed(), SHUTDOWN_SESSION_TIMEOUT);
+        assert!(error.contains("effects are uncertain"));
+        assert!(!connection.is_alive());
+        assert!(connection.cancellation.is_cancelled());
+    }
+}
 
 pub(super) struct Connection {
     command_tx: mpsc::Sender<DriverCommand>,
@@ -170,11 +203,14 @@ impl Connection {
             let state_capability = codex_code_mode_protocol::host::Capability::new(
                 codex_code_mode_protocol::host::NAMED_STATE_CAPABILITY,
             ).map_err(|error| error.to_string())?;
+            let receipt_capability = codex_code_mode_protocol::host::Capability::new(
+                codex_code_mode_protocol::host::RECEIPT_RECOVERY_CAPABILITY,
+            ).map_err(|error| error.to_string())?;
             let hello = ClientHello::new(
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
                     .map_err(|err| err.to_string())?,
                 CapabilitySet::empty(),
-                CapabilitySet::try_new([catalog_capability.clone(), state_capability.clone()])
+                CapabilitySet::try_new([catalog_capability.clone(), state_capability.clone(), receipt_capability.clone()])
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|err| err.to_string())?;
@@ -193,6 +229,7 @@ impl Connection {
                     Ok((
                         hello.capabilities().contains(&catalog_capability),
                         hello.capabilities().contains(&state_capability),
+                        hello.capabilities().contains(&receipt_capability),
                     ))
                 }
                 Some(HostToClient::HandshakeRejected { reason }) => {
@@ -211,7 +248,7 @@ impl Connection {
                 return Err("timed out negotiating with the code-mode host".to_string());
             }
         };
-        let (tool_catalog_references, named_state_snapshots) = match handshake_result {
+        let (tool_catalog_references, named_state_snapshots, receipt_recovery) = match handshake_result {
             Ok(enabled) => enabled,
             Err(err) => {
                 kill_and_reap(&mut child, &managed).await;
@@ -263,6 +300,7 @@ impl Connection {
         );
         driver.tool_catalog_references = tool_catalog_references;
         driver.named_state_snapshots = named_state_snapshots;
+        driver.receipt_recovery = receipt_recovery;
         let driver_task = tokio::spawn(driver.run());
         tokio::spawn(
             ConnectionSupervisor {
@@ -307,15 +345,18 @@ impl Connection {
         let cleanup = SessionCleanup::new();
         let cancellation = CallerCancellation::new();
         let (response_tx, response_rx) = oneshot::channel();
-        self.send(DriverCommand::OpenSession {
-            session,
-            delegate,
-            cleanup: cleanup.clone(),
-            caller_cancellation: cancellation.token(),
-            response_tx,
-        })
-        .await?;
-        let result = self.receive(response_rx).await;
+        let result = self.control_request(
+            "open session",
+            OPEN_SESSION_TIMEOUT,
+            DriverCommand::OpenSession {
+                session,
+                delegate,
+                cleanup: cleanup.clone(),
+                caller_cancellation: cancellation.token(),
+                response_tx,
+            },
+            response_rx,
+        ).await;
         cancellation.disarm();
         result?;
         Ok(cleanup)
@@ -374,23 +415,47 @@ impl Connection {
         cell_id: CellId,
     ) -> Result<WaitOutcome, String> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.send(DriverCommand::Terminate {
-            session,
-            cell_id,
-            response_tx,
-        })
-        .await?;
-        self.receive(response_rx).await
+        self.control_request(
+            "terminate cell",
+            TERMINATE_TIMEOUT,
+            DriverCommand::Terminate { session, cell_id, response_tx },
+            response_rx,
+        ).await
     }
 
     pub(super) async fn shutdown_session(&self, session: RemoteSession) -> Result<(), String> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.send(DriverCommand::ShutdownSession {
-            session,
-            response_tx,
-        })
-        .await?;
-        self.receive(response_rx).await
+        self.control_request(
+            "shutdown session",
+            SHUTDOWN_SESSION_TIMEOUT,
+            DriverCommand::ShutdownSession { session, response_tx },
+            response_rx,
+        ).await
+    }
+
+    async fn control_request<T>(
+        &self,
+        operation: &str,
+        timeout: Duration,
+        command: DriverCommand,
+        response_rx: oneshot::Receiver<Result<T, String>>,
+    ) -> Result<T, String> {
+        match tokio::time::timeout(timeout, async {
+            self.send(command).await?;
+            self.receive(response_rx).await
+        }).await {
+            Ok(result) => result,
+            Err(_) => {
+                let reason = format!(
+                    "timed out waiting for code-mode host to {operation}; effects are uncertain; closing the unresponsive host connection"
+                );
+                // The supervisor retains process custody. Do not leave an
+                // unacknowledged control operation on a reusable connection.
+                mark_connection_dead(&self.alive, &self.failure, reason.clone());
+                self.cancellation.cancel();
+                Err(reason)
+            }
+        }
     }
 
     async fn send(&self, command: DriverCommand) -> Result<(), String> {
@@ -497,4 +562,61 @@ async fn kill_and_reap(child: &mut Child, managed: &ManagedRootProcess) {
 
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ack_deadline_fails_live_unresponsive_connection() {
+        let (command_tx, mut commands) = mpsc::channel(1);
+        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+        let connection = Connection {
+            command_tx,
+            execute_claim_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            failure: Arc::new(std::sync::Mutex::new(None)),
+            cancellation: CancellationToken::new(),
+        };
+        let shutdown = connection.shutdown_session(RemoteSession {
+            id: codex_code_mode_protocol::host::SessionId::new("held-host").unwrap(),
+            generation: 1,
+        });
+        tokio::pin!(shutdown);
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        // Keep both the command channel and host reply sender open.
+        let DriverCommand::ShutdownSession { response_tx, .. } = commands.recv().await.unwrap() else {
+            panic!("expected shutdown command");
+        };
+        let started = tokio::time::Instant::now();
+        let error = shutdown.await.unwrap_err();
+        assert_eq!(started.elapsed(), SHUTDOWN_SESSION_TIMEOUT);
+        assert!(error.contains("effects are uncertain"));
+        assert!(!connection.is_alive());
+        assert!(connection.cancellation.is_cancelled());
+        assert!(response_tx.send(Ok(())).is_err(), "late ack cannot report success");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execution_observation_has_no_control_plane_deadline() {
+        let (command_tx, _commands) = mpsc::channel(1);
+        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+        let connection = Connection {
+            command_tx,
+            execute_claim_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            failure: Arc::new(std::sync::Mutex::new(None)),
+            cancellation: CancellationToken::new(),
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        let result = connection.receive(response_rx);
+        tokio::pin!(result);
+        assert!(futures::poll!(&mut result).is_pending());
+        tokio::time::advance(SHUTDOWN_SESSION_TIMEOUT * 2).await;
+        assert!(futures::poll!(&mut result).is_pending());
+        response_tx.send(Ok(42)).unwrap();
+        assert_eq!(result.await, Ok(42));
+        assert!(connection.is_alive());
+    }
 }

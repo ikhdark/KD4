@@ -298,6 +298,9 @@ pub(crate) struct TurnRequestProcessor {
 
 fn steer_input_error(err: SteerInputError) -> (JSONRPCErrorError, Option<AnalyticsJsonRpcError>) {
     let (message, data, error_type) = match err {
+        SteerInputError::AdditionalContextUnavailable { message } => {
+            return (internal_error(message), None);
+        }
         SteerInputError::NoActiveTurn(_) => (
             "no active turn to steer".to_string(),
             Some(serde_json::json!({"reason": "noActiveTurn"})),

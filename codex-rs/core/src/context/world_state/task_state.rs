@@ -26,6 +26,7 @@ impl TaskState {
                 "step_ids": plan.plan.iter().map(|step| lineage.step_id(&step.step)).collect::<Vec<_>>(),
                 "obligations": lineage.obligation_summary(&plan),
                 "current_plan": plan,
+                "lineage": lineage.active_for_plan(&plan),
             }),
             None => serde_json::json!({"has_plan": false}),
         };
@@ -33,10 +34,9 @@ impl TaskState {
         Self(state)
     }
 
-    pub(crate) fn with_effect_recovery(mut self, recovery: Option<Value>) -> Self {
-        if let Some(mut recovery) = recovery {
-            super::remove_null_object_fields(&mut recovery);
-            self.0["effect_recovery"] = recovery;
+    pub(crate) fn with_execution_suspended(mut self, suspended: bool) -> Self {
+        if self.0["has_plan"] == true {
+            self.0["execution_suspended"] = suspended.into();
         }
         self
     }
@@ -76,8 +76,7 @@ impl WorldStateSection for TaskState {
     ) -> Option<Box<dyn ContextualUserFragment>> {
         match previous {
             PreviousSectionState::Known(previous) if previous.state == self.0 => None,
-            PreviousSectionState::Absent if self.0["has_plan"] == false
-                && self.0.get("effect_recovery").is_none() => None,
+            PreviousSectionState::Absent if self.0["has_plan"] == false => None,
             _ => Some(Box::new(self.clone())),
         }
     }
@@ -97,7 +96,7 @@ impl ContextualUserFragment for TaskState {
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
-        let mut body = "\nCurrent stored task state; replaces earlier task-state snapshots. This is a checklist and obligation ledger, not proof of completion or permission to narrow the user's request. Later user instructions remain authoritative.\n".to_string();
+        let mut body = "\nCurrent stored task state; replaces earlier task-state snapshots. This is a checklist and obligation ledger, not proof of completion or permission to narrow the user's request. Later user instructions remain authoritative. When execution_suspended is true, this is retained implementation state, not debt of the current planning deliverable; do not repair or complete it in Plan Mode. Retired requirement details remain in durable plan history.\n".to_string();
         push_xml_escaped_text(&mut body, &self.0.to_string());
         body.push('\n');
         body.into()
@@ -111,6 +110,28 @@ mod tests {
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
 
+    #[tokio::test]
+    async fn suspended_execution_context_retains_unresolved_work_not_retired_details() {
+        let store = crate::plan_store::PlanStore::default();
+        let plan = UpdatePlanArgs { explanation: None, plan: vec![PlanItemArg {
+            step: "implementation".into(), status: StepStatus::Pending,
+        }] };
+        let mut lineage = PlanLineage::default();
+        lineage.requirements.insert("retired".into(), crate::plan_store::PlanRequirement {
+            text: "historical completed detail".into(), status: StepStatus::Completed, superseded_reason: None,
+        });
+        lineage.requirements.insert("orphan".into(), crate::plan_store::PlanRequirement {
+            text: "still required".into(), status: StepStatus::Pending, superseded_reason: None,
+        });
+        store.restore_with_lineage(Some(plan), Some(lineage)).await;
+        let state = TaskState::new(store.snapshot_with_lineage().await).with_execution_suspended(true);
+        assert_eq!(state.0["execution_suspended"], true);
+        assert!(state.0["lineage"]["requirements"].get("retired").is_none());
+        assert_eq!(state.0["obligations"]["unresolved"].as_array().unwrap().len(), 2);
+        assert!(state.body().contains("not debt of the current planning deliverable"));
+        assert!(store.snapshot_with_lineage().await.unwrap().1.requirements.contains_key("retired"));
+    }
+
     #[test]
     fn task_state_is_context_not_a_new_request_and_survives_delivery_metadata() {
         let state = TaskState::new(Some((UpdatePlanArgs {
@@ -122,7 +143,7 @@ mod tests {
         }, PlanLineage::default())));
         let fragment = state.render_diff(PreviousSectionState::Absent).unwrap().render();
         assert_eq!(state.0["obligations"]["completed"], 0);
-        assert!(state.0.get("lineage").is_none());
+        assert!(state.0["lineage"]["requirements"].as_object().unwrap().is_empty());
         assert_eq!(state.0["obligations"]["unresolved"].as_array().unwrap().len(), 1);
         assert!(fragment.contains("&lt;/codex_task_state&gt;"));
         assert!(crate::context::is_contextual_user_fragment(&ContentItem::InputText {

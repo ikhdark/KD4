@@ -82,6 +82,27 @@ async fn replace_history_clears_auto_compact_window_prefill() {
 }
 
 #[tokio::test]
+async fn replace_history_reconciles_additional_context_delivery() {
+    use codex_protocol::protocol::AdditionalContextEntry;
+    use codex_protocol::protocol::AdditionalContextKind;
+    use indexmap::IndexMap;
+
+    let mut state = SessionState::new(make_session_configuration_for_tests().await);
+    let values = IndexMap::from([("constraint".to_string(), AdditionalContextEntry {
+        value: "Do not publish this project.".to_string(),
+        kind: AdditionalContextKind::Application,
+    })]);
+    let first = state.additional_context.merge(values.clone());
+    let retained = first.iter().cloned().map(ResponseItem::from).collect();
+    state.replace_history(retained, None);
+    assert!(state.additional_context.merge(values.clone()).is_empty());
+
+    state.replace_history(Vec::new(), None);
+    assert_eq!(state.additional_context.merge(values.clone()), first);
+    assert!(state.additional_context.merge(values).is_empty());
+}
+
+#[tokio::test]
 async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_bucket() {
     let session_configuration = make_session_configuration_for_tests().await;
     let mut state = SessionState::new(session_configuration);

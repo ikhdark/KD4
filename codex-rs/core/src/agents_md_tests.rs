@@ -782,7 +782,7 @@ async fn project_doc_truncation_trims_split_multibyte_code_points() {
         };
         let limit = PREFIX.len() + 1;
 
-        let project_docs = read_discovered_project_docs(
+        let (project_docs, failed_sources) = read_discovered_project_docs(
             &filesystem,
             vec![ProjectDocCandidate {
                 path: source_uri.clone(),
@@ -791,8 +791,8 @@ async fn project_doc_truncation_trims_split_multibyte_code_points() {
             limit,
             /*prefetch_utf8_boundary_slack*/ false,
         )
-        .await
-        .expect("project doc read");
+        .await;
+        assert!(failed_sources.is_empty(), "project doc read failed");
 
         assert_eq!(
             project_docs[0].read.retained_data,
@@ -824,7 +824,7 @@ async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
         metadata_calls: Arc::clone(&stream_counts),
     };
 
-    let project_docs = read_discovered_project_docs(
+    let (project_docs, failed_sources) = read_discovered_project_docs(
         &filesystem,
         vec![ProjectDocCandidate {
             path: source_uri.clone(),
@@ -833,8 +833,8 @@ async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
         LIMIT,
         /*prefetch_utf8_boundary_slack*/ false,
     )
-    .await
-    .expect("project doc read");
+    .await;
+    assert!(failed_sources.is_empty(), "project doc read failed");
 
     assert_eq!(project_docs[0].read.retained_data, b"\xC3");
     assert_eq!(
@@ -914,8 +914,39 @@ async fn rendered_project_doc_overhead_uses_a_bounded_aggregate_omission_notice(
     }));
     assert!(text.contains("Project docs omitted:"));
     assert!(text.contains("manifest_sha256="));
-    assert!(text.contains("rediscover AGENTS/override files"));
+    assert!(text.contains("read these exact paths"));
+    assert!(text.contains("\"environment_id\":\"local\""));
     assert!(text.len() <= project_doc_rendered_max_bytes(SOURCE_LIMIT));
+}
+
+#[tokio::test]
+async fn omitted_multi_environment_paths_are_exact_and_overflow_is_recoverable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = make_config(&tmp, 1, None).await;
+    let mut documents = vec![
+        ProjectDocOmission { environment_id:"local".into(), cwd:"C:/work".into(), path:"C:/work/AGENTS.md".into(), source_bytes:20 },
+        ProjectDocOmission { environment_id:"remote".into(), cwd:"/work".into(), path:"/work/AGENTS.override.md".into(), source_bytes:30 },
+    ];
+    let owner = ProjectDocOmissionRecovery::new("instructions-test".into());
+    let inline = owner.notice(&config, &documents).await;
+    for document in &documents {
+        assert!(inline.contains(&document.path));
+        assert!(inline.contains(&document.environment_id));
+    }
+    assert!(owner.cached.lock().await.is_none(), "inline lists must not create artifacts");
+    documents.extend((0..12).map(|i| ProjectDocOmission {
+        environment_id:format!("remote-{i}"), cwd:"/work".into(), path:format!("/work/{i}/AGENTS.md"), source_bytes:1,
+    }));
+    let notice = owner.notice(&config, &documents).await;
+    assert!(notice.len() + 2 <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
+    let call: serde_json::Value = serde_json::from_str(notice.split("read_tool_output: ").nth(1).unwrap()).unwrap();
+    let (result, _) = crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse(
+        config.codex_home.as_path(), "instructions-test", call["artifact_id"].as_str().unwrap(),
+        serde_json::from_value(call["selectors"].clone()).unwrap(),
+    ).await.unwrap();
+    assert!(result.complete);
+    assert_eq!(result.results[0].value.as_ref().unwrap(), &serde_json::to_value(&documents).unwrap());
+    assert_eq!(owner.notice(&config, &documents).await, notice, "unchanged manifest reuses its artifact and prompt identity");
 }
 
 #[test]
@@ -948,8 +979,8 @@ fn long_project_doc_provenance_retains_a_bounded_scope_manifest() {
     assert_eq!(rendered.omitted_documents[0].source_bytes, 2);
     let notice = aggregate_project_doc_omission_notice(&rendered.omitted_documents);
     assert!(notice.contains("manifest_sha256="));
-    assert!(notice.contains("scope=local@"));
-    assert!(notice.contains("rediscover AGENTS/override files"));
+    assert!(notice.contains("Additional omitted paths: 1"));
+    assert!(!notice.contains("rediscover"));
     assert!(notice.len().saturating_add(2) <= PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
 }
 
@@ -1034,7 +1065,8 @@ async fn read_agents_md_propagates_read_errors() {
         .await
         .expect_err("read error");
 
-    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+    assert_eq!(err.to_string(), "instruction source read failed");
 }
 
 #[tokio::test]
@@ -1053,7 +1085,8 @@ async fn read_agents_md_reports_files_removed_after_discovery() {
         .await
         .expect_err("removed discovered file must make the snapshot incomplete");
 
-    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+    assert_eq!(err.to_string(), "instruction source read failed");
 }
 
 #[tokio::test]
@@ -2414,8 +2447,8 @@ fn create_skill(codex_home: PathBuf, name: &str, description: &str) {
     fs::write(skill_dir.join("SKILL.md"), content).unwrap();
 }
 
-#[test]
-fn nested_instruction_notice_lists_existing_files_below_cwd() {
+#[tokio::test]
+async fn nested_instruction_notice_lists_existing_files_below_cwd() {
     let repo = tempfile::tempdir().expect("temp repo");
     let git = |args: &[&str]| {
         let status = std::process::Command::new("git")
@@ -2430,7 +2463,7 @@ fn nested_instruction_notice_lists_existing_files_below_cwd() {
     git(&["init", "-q"]);
     std::fs::write(repo.path().join("AGENTS.md"), "root").expect("root instructions");
     git(&["add", "AGENTS.md"]);
-    let none = nested_instruction_notice(repo.path()).expect("git checkout");
+    let none = nested_instruction_notice(repo.path()).await.expect("git checkout");
     assert!(
         none.starts_with("No non-ignored AGENTS.md or AGENTS.override.md files exist below"),
         "{none}"
@@ -2445,14 +2478,49 @@ fn nested_instruction_notice_lists_existing_files_below_cwd() {
         "nested",
     )
     .expect("nested instructions");
-    let listed = nested_instruction_notice(repo.path()).expect("git checkout");
+    let listed = nested_instruction_notice(repo.path()).await.expect("git checkout");
     assert!(listed.contains("sub/deeper/AGENTS.override.md"), "{listed}");
     assert!(!listed.contains(": AGENTS.md"), "{listed}");
     git(&["add", "sub/deeper/AGENTS.override.md"]);
     std::fs::remove_file(repo.path().join("sub/deeper/AGENTS.override.md")).unwrap();
-    let deleted = nested_instruction_notice(repo.path()).unwrap();
+    let deleted = nested_instruction_notice(repo.path()).await.unwrap();
     assert!(!deleted.contains("sub/deeper/AGENTS.override.md"), "{deleted}");
 
     let plain = tempfile::tempdir().expect("plain dir");
-    assert_eq!(nested_instruction_notice(plain.path()), None);
+    assert_eq!(nested_instruction_notice(plain.path()).await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_nested_inventory_does_not_delay_applicable_instruction_loading() {
+    struct Cancelled(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Cancelled {
+        fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::SeqCst); }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("AGENTS.md");
+    fs::write(&path, "Readable primary policy: never modify X").unwrap();
+    let cwd = AbsolutePathBuf::try_from(root.path().to_path_buf()).unwrap();
+    let config = ConfigBuilder::default().codex_home(root.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides { cwd: Some(cwd.clone().into_path_buf()), ..Default::default() })
+        .build().await.unwrap();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = Cancelled(cancelled.clone());
+    let nested_notice = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let _guard = guard;
+        std::future::pending::<Option<String>>().await
+    }));
+    let discovery = ProjectInstructionsDiscovery {
+        environments: vec![EnvironmentProjectInstructionsDiscovery {
+            environment_id: "local".to_string(), cwd: PathUri::from_abs_path(&cwd),
+            filesystem: Arc::clone(&LOCAL_FS),
+            result: Ok(vec![ProjectDocCandidate { path: PathUri::from_abs_path(&AbsolutePathBuf::try_from(path).unwrap()), size: 42 }]),
+            nested_notice: Some(nested_notice),
+        }],
+        config_identity: 0,
+    };
+    let loaded = tokio::time::timeout(std::time::Duration::from_millis(100),
+        load_project_instructions_from_discovery(&config, None, discovery, None)).await.unwrap();
+    assert!(loaded.loaded.unwrap().text().contains("Readable primary policy: never modify X"));
+    tokio::task::yield_now().await;
+    assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
 }

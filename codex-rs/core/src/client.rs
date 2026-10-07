@@ -2555,18 +2555,10 @@ impl ModelClient {
         }
     }
 
-    fn prompt_cache_key(&self, prompt: &Prompt, model: &str) -> String {
-        // Route identical stable prefixes to the same provider cache across
-        // chats. History and session IDs are deliberately not part of the key;
-        // the provider still requires an exact prefix match for cache reuse.
-        let mut hash = Sha256::new();
-        hash.update(b"codex-prompt-prefix-v1\0");
-        for part in [model.as_bytes(), prompt.base_instructions.text.as_bytes()] {
-            hash.update((part.len() as u64).to_be_bytes());
-            hash.update(part);
-        }
-        hash.update(prompt.tools.digest());
-        format!("{:x}", hash.finalize())
+    fn prompt_cache_key(&self) -> String {
+        // Keep each conversation on its own cache route, including child agents
+        // with identical instructions and tools but different history prefixes.
+        self.state.thread_id.to_string()
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -2936,7 +2928,7 @@ impl ModelClient {
         } else {
             Vec::new()
         };
-        let prompt_cache_key = Some(self.prompt_cache_key(prompt, &model_info.slug));
+        let prompt_cache_key = Some(self.prompt_cache_key());
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
@@ -4522,7 +4514,10 @@ impl ModelClientSession {
                         == prompt.stable_context_manifest.fingerprint()
                 });
             let ResponsesWsRequest::ResponseCreate(final_payload) = &mut ws_request;
-            if final_payload.previous_response_id.is_some() && !inherited_stable_context_matches {
+            if final_payload.previous_response_id.is_some()
+                && !inherited_stable_context_matches
+                && verified_history.is_none()
+            {
                 trace!("discarding unproven provider inheritance before stable-context dispatch");
                 self.invalidate_incremental_history("stable context inheritance unproven");
                 final_payload.previous_response_id = None;

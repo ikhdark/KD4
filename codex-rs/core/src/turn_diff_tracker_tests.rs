@@ -83,6 +83,31 @@ fn changed_diff_emission_deduplicates_and_preserves_clear_transition() {
     assert_eq!(tracker.take_unified_diff_if_changed(), None);
 }
 
+#[tokio::test]
+async fn model_snapshot_preserves_exact_partial_unavailable_and_client_publication() {
+    let dir = tempdir().unwrap();
+    let mut tracker = tracker_with_root(dir.path());
+    let delta = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Add File: a.txt\n+one\n*** Add File: b.txt\n+two\n*** End Patch").await;
+    tracker.track_delta("", &delta);
+    let rendered = tracker.rendered_diff_count.get();
+    let exact = tracker.model_snapshot();
+    assert_eq!(exact["status"], "exact");
+    assert!(exact["unified_diff"].as_str().unwrap().contains("+one"));
+    assert_eq!(Some(exact["unified_diff"].as_str().unwrap().to_string()), tracker.take_unified_diff_if_changed());
+    assert_eq!(tracker.model_snapshot(), exact);
+    assert_eq!(tracker.rendered_diff_count.get(), rendered);
+    tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", Some(dir.path()),
+        CommandMutation::KnownMutation { paths: Some(BTreeSet::from([dir.path().join("a.txt")])) });
+    let partial = tracker.model_snapshot();
+    assert_eq!(partial["status"], "partial");
+    assert!(partial["unified_diff"].as_str().unwrap().contains("+two"));
+    assert!(!partial["unified_diff"].as_str().unwrap().contains("+one"));
+    assert!(!partial["unavailable_paths"].as_array().unwrap().is_empty());
+    tracker.record_unknown_mutation();
+    assert_eq!(tracker.model_snapshot()["status"], "unavailable");
+    assert!(tracker.model_snapshot()["unified_diff"].is_null());
+}
+
 #[test]
 fn invalidation_reports_unknown_changes_even_without_a_published_diff() {
     for published in [false, true] {
@@ -102,15 +127,36 @@ fn invalidation_reports_unknown_changes_even_without_a_published_diff() {
             tracker.take_unified_diff_if_changed(),
             published.then(String::new)
         );
-        assert_eq!(
-            tracker.take_invalidation_warning(),
-            Some(
-                "The turn diff is unavailable because command effects or workspace changes could not be tracked exactly. Do not claim that no files changed without fresh workspace verification."
-            )
-        );
+        let warning = tracker.take_invalidation_warning().unwrap();
+        assert!(warning.starts_with("The turn diff is unavailable"));
+        assert!(warning.contains("unknown_mutation"));
+        assert!(warning.contains("Do not claim that no files changed"));
         assert_eq!(tracker.take_invalidation_warning(), None);
         assert_eq!(tracker.take_unified_diff_if_changed(), None);
     }
+}
+
+#[test]
+fn invalidation_retains_first_command_cause_in_warning_and_snapshot() {
+    let mut tracker = TurnDiffTracker::new();
+    let command = vec!["python".to_string(), "λ".repeat(300)];
+    tracker.record_command_invalidation_cause(
+        Some("call-1"), "exec_command", &command, &CommandMutation::Uncertain,
+    );
+    tracker.record_exec_command_end_with_mutation_at(
+        &command, 1, false, "", None, CommandMutation::Uncertain,
+    );
+    let first = tracker.model_snapshot()["first_invalidation_cause"].clone();
+    assert_eq!(first["call_id"], "call-1");
+    assert_eq!(first["tool"], "exec_command");
+    assert_eq!(first["mutation_class"], "uncertain");
+    assert_eq!(first["command_prefix"].as_str().unwrap().chars().count(), 240);
+    tracker.record_unknown_mutation();
+    assert_eq!(tracker.model_snapshot()["first_invalidation_cause"], first);
+    let warning = tracker.take_invalidation_warning().unwrap();
+    assert!(warning.contains(&first.to_string()));
+    assert!(tracker.take_invalidation_warning().is_none());
+    assert_eq!(tracker.model_snapshot()["first_invalidation_cause"], first);
 }
 
 #[test]
@@ -501,6 +547,28 @@ fn mutation_classification_separates_known_mutators_from_uncertain_commands() {
 }
 
 #[test]
+#[cfg(windows)]
+fn summary_and_turn_diff_share_command_mutation_classification() {
+    for (script, read_only) in [
+        ("Get-Command unknown-module-command", false),
+        ("git branch", true),
+        ("git branch -D topic", false),
+        ("Get-FileHash README.md", true),
+        ("Get-ChildItem | Where-Object { $_.Name -match 'test' }", true),
+        ("Get-ChildItem | ForEach-Object { $_.Name }", true),
+        ("Get-ChildItem | ForEach-Object { $_.Delete() }", false),
+        ("Get-ChildItem | ForEach-Object -MemberName Delete", false),
+        ("git diff --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", true),
+        ("git diff; if ($LASTEXITCODE -ne 0) { Remove-Item a; exit 1 }", false),
+        ("Write-Output \"$(Remove-Item a)\"", false),
+    ] {
+        let command = ["pwsh", "-NoProfile", "-Command", script].map(str::to_owned);
+        assert_eq!(command_mutation(&command, None) == CommandMutation::ReadOnly, read_only, "{script}");
+        assert_eq!(crate::tools::shell_output_summary::is_read_only_command(script), read_only, "{script}");
+    }
+}
+
+#[test]
 fn unchanged_uncertain_command_does_not_advance_mutation_revision() {
     let mut tracker = TurnDiffTracker::new();
     tracker.record_exec_command_end_with_mutation_at(
@@ -699,6 +767,38 @@ index {ZERO_OID}..{right_oid}
 }
 
 #[tokio::test]
+async fn uncertain_changes_recheck_only_patch_paths_and_preserve_exact_siblings() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("deleted.txt"), "old\n").unwrap();
+    fs::write(dir.path().join("renamed.txt"), "old\n").unwrap();
+    let mut tracker = tracker_with_root(dir.path());
+    let delta = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Add File: a.txt\n+one\n*** Add File: b.txt\n+two\n*** Delete File: deleted.txt\n*** Update File: renamed.txt\n*** Move to: destination.txt\n@@\n-old\n+new\n*** End Patch").await;
+    tracker.track_delta("", &delta);
+    let original = tracker.get_unified_diff();
+    let changed_paths = tracker.exact_changed_paths();
+    fs::write(dir.path().join("validation.log"), "unrelated").unwrap();
+    let mutation = tracker.reconcile_command_mutation("", CommandMutation::UnattributedWorkspaceChange, Some(LOCAL_FS.as_ref())).await;
+    tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", None, mutation);
+    assert_eq!(tracker.get_unified_diff(), original);
+    assert_eq!(tracker.exact_changed_paths(), changed_paths);
+    assert_eq!(tracker.model_snapshot()["status"], "exact");
+
+    fs::write(dir.path().join("b.txt"), "external edit").unwrap();
+    fs::write(dir.path().join("deleted.txt"), "recreated").unwrap();
+    fs::write(dir.path().join("destination.txt"), "external rename edit").unwrap();
+    let mutation = tracker.reconcile_command_mutation("", CommandMutation::Uncertain, Some(LOCAL_FS.as_ref())).await;
+    tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", None, mutation);
+    let partial = tracker.get_unified_diff().unwrap();
+    assert!(partial.contains("+one"));
+    assert!(!partial.contains("+two"));
+    assert!(partial.contains("b.txt: changed, diff unavailable"));
+    assert!(partial.contains("deleted.txt: changed, diff unavailable"));
+    assert!(partial.contains("renamed.txt: changed, diff unavailable"));
+    assert!(partial.contains("destination.txt: changed, diff unavailable"));
+    assert_eq!(tracker.model_snapshot()["status"], "partial");
+}
+
+#[tokio::test]
 async fn known_command_paths_preserve_other_diffs_until_unknown_invalidation() {
     let dir = tempdir().expect("tempdir");
     let mut tracker = tracker_with_root(dir.path());
@@ -719,8 +819,13 @@ async fn known_command_paths_preserve_other_diffs_until_unknown_invalidation() {
     assert!(partial.contains("diff --git a/a.txt b/a.txt"));
     assert!(!partial.contains("diff --git a/b.txt b/b.txt"));
     assert!(partial.contains("b.txt: changed, diff unavailable"));
-    assert!(tracker.exact_changed_paths().is_none());
+    assert_eq!(tracker.exact_changed_paths(), Some(vec![("".into(), dir.path().join("a.txt"))]));
+    assert!(tracker.has_untracked_changes());
     tracker.invalidate();
+
+    assert_eq!(tracker.changed_paths(), vec![
+        ("".into(), dir.path().join("a.txt")), ("".into(), dir.path().join("b.txt")),
+    ]);
 
     assert_eq!(tracker.get_unified_diff(), None);
     tracker.record_exec_command_end_at(

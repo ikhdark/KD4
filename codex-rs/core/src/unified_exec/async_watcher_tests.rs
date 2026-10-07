@@ -49,6 +49,7 @@ async fn process_exit_before_async_watcher_registration_is_observed_once() {
             73,
             CommandAttemptKey::new("exec_command", "local", "C:/repo", &["exit".to_string()]),
             RawOutputArtifact::unavailable("late watcher fixture"),
+            uuid::Uuid::new_v4(),
         )
         .await
         .expect("track running process");
@@ -478,6 +479,7 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> any
                 73,
                 CommandAttemptKey::new("exec_command", "local", "fixture", &command),
                 RawOutputArtifact::unavailable("watcher fixture"),
+                process.session_capabilities(true).incarnation,
             )
             .await
             .expect("tracked execution");
@@ -500,6 +502,8 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> any
             None,
             None,
             Some(deferred.clone()),
+            false,
+            false,
             None,
         );
         process.signal_exit_for_test(Some(0));
@@ -549,11 +553,13 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> any
             }
         }
         assert_eq!(terminal_events.len(), 1);
-        assert_eq!(terminal_events[0].exit_code, if denied { -1 } else { 0 });
+        assert_eq!(terminal_events[0].exit_code, Some(0));
+        assert_eq!(terminal_events[0].aggregated_output, "immutable\n");
         if denied {
             assert!(
                 terminal_events[0]
-                    .aggregated_output
+                    .output_metadata.as_ref().expect("completion metadata")
+                    .failure_cause.as_deref().expect("denial cause")
                     .contains("denied.example")
             );
             assert!(
@@ -567,6 +573,107 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> any
             assert_eq!(process.failure_message(), None);
         }
         assert!(ledger.running_process(73).await.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_preserves_exit_capture_and_search_facts() -> anyhow::Result<()> {
+    use codex_protocol::items::CommandExecutionStatus;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::protocol::EventMsg;
+
+    for case in 0..10 {
+        let (session, turn, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let process = crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+        )
+        .await;
+        let exit_code = match case {
+            2 | 3 => None,
+            4 | 6 | 7 => Some(1),
+            5 => Some(2),
+            _ => Some(0),
+        };
+        if case == 3 {
+            process.terminate_confirmed().await?;
+        } else {
+            process.signal_exit_for_test(exit_code);
+        }
+        let handles = process.output_handles();
+        let drained = case != 6;
+        handles.output_closed.store(drained, Ordering::Release);
+        // Relay completion alone must not claim reader EOF.
+        process.output_drained_token().cancel();
+        if case == 7 {
+            handles.stderr_buffer.lock().await.record_lagged_chunks(1);
+        }
+        if case == 8 {
+            let mut output = handles.completion_output_buffer.lock().await;
+            *output = HeadTailBuffer::new(2);
+            output.push_chunk(b"omitted");
+        }
+        if case == 9 {
+            handles.stdout_buffer.lock().await.push_chunk(&[0xff]);
+        }
+        let failure = (case == 1).then(|| "late harness failure".to_string());
+        super::emit_exec_end_for_unified_exec(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "receipt".to_string(),
+            vec!["rg".to_string(), "needle".to_string()],
+            turn.cwd().clone().into(),
+            "local".to_string(),
+            None,
+            Arc::new(Mutex::new(HeadTailBuffer::default())),
+            String::new(),
+            Some(&process),
+            false,
+            (4..=7).contains(&case),
+            failure.clone(),
+            false,
+            Duration::ZERO,
+            crate::tools::context::ToolCallSource::Direct,
+            None,
+        )
+        .await?;
+        let mut canonical = None;
+        let mut legacy = None;
+        while let Ok(event) = events.try_recv() {
+            match event.msg {
+                EventMsg::ItemCompleted(event) => {
+                    if let TurnItem::CommandExecution(item) = event.item {
+                        canonical = Some(item);
+                    }
+                }
+                EventMsg::ExecCommandEnd(event) => legacy = Some(event),
+                _ => {}
+            }
+        }
+        let item = canonical.expect("canonical completion");
+        let legacy = legacy.expect("legacy completion");
+        let metadata = item.output_metadata.as_ref().expect("capture facts");
+        assert_eq!(item.exit_code, exit_code, "case {case}");
+        assert_eq!(legacy.exit_code, exit_code, "case {case}");
+        assert_eq!(legacy.output_metadata.as_ref(), Some(metadata));
+        assert!(metadata.process_exited);
+        assert_eq!(metadata.output_drained, drained);
+        assert_eq!(metadata.failure_cause, failure);
+        assert_eq!(metadata.search_no_match, case == 4);
+        assert_eq!(metadata.aggregated_output_is_exact, case != 8);
+        assert_eq!(metadata.streams_are_exact, case != 7);
+        assert_eq!(metadata.decoding_lossy, case == 9);
+        assert_eq!(
+            item.status,
+            if matches!(case, 0 | 4 | 8 | 9) {
+                CommandExecutionStatus::Completed
+            } else {
+                CommandExecutionStatus::Failed
+            },
+            "case {case}",
+        );
     }
     Ok(())
 }

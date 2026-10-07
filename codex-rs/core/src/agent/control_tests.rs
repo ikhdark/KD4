@@ -1011,7 +1011,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
                 .codex
                 .session
                 .input_queue
-                .has_pending_input(&thread.codex.session.active_turn)
+                .has_pending_mailbox_items()
                 .await
             {
                 break;
@@ -1021,6 +1021,9 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
     })
     .await
     .expect("inter-agent communication should stay pending");
+    assert!(!thread.codex.session.input_queue
+        .has_pending_input(&thread.codex.session.active_turn).await,
+        "non-triggering mail must not request a new turn");
 
     let history_items = thread
         .codex
@@ -3750,6 +3753,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
         AgentPath::root(),
         tester_path.clone(),
         &AgentStatus::Completed(Some("done".to_string())),
+        None,
     )
     .expect("completed status renders");
     assert!(!history_contains_assistant_inter_agent_communication(
@@ -3820,6 +3824,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         worker_path.clone(),
         tester_path.clone(),
         &AgentStatus::Completed(Some("done".to_string())),
+        None,
     )
     .expect("completed status should render");
     let expected = (

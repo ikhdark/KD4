@@ -103,6 +103,7 @@ async fn auth_manager_with_agent_identity_business_plan() -> Arc<AuthManager> {
     AuthManager::from_auth_for_testing(CodexAuth::AgentIdentity(
         AgentIdentityAuth::from_record(
             AgentIdentityAuthRecord {
+                issuer_origin: Some("https://auth.openai.com/api/accounts".into()),
                 agent_runtime_id: "agent-runtime-123".to_string(),
                 agent_private_key: key_material.private_key_pkcs8_base64,
                 account_id: "account-12345".to_string(),

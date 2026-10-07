@@ -63,6 +63,8 @@ pub(crate) struct PlanExecutionNode {
 pub(crate) struct PlanRequirement {
     pub(crate) text: String,
     pub(crate) status: StepStatus,
+    /// Model-proposed retirement, not accepted user authorization. Kept under
+    /// the historical field name for replay compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) superseded_reason: Option<String>,
 }
@@ -86,7 +88,10 @@ impl PlanLineage {
         let mut summary = PlanObligationSummary::default();
         for (id, requirement) in &self.requirements {
             if requirement.superseded_reason.is_some() {
-                summary.superseded += 1;
+                // This format records a model proposal, not an accepted user
+                // instruction. Keep it unresolved until original scope is
+                // explicitly accounted for; explanatory prose is not authority.
+                summary.unresolved.push(id.clone());
             } else if requirement.status == StepStatus::Completed {
                 summary.completed += 1;
             } else {
@@ -98,11 +103,55 @@ impl PlanLineage {
 
     pub(crate) fn step_id(&self, text: &str) -> String {
         let key = plan_step_id(text);
-        self.step_identities.get(&key).cloned().unwrap_or(key)
+        // Preserve IDs published by older builds, including renamed steps.
+        let legacy = format!("{:x}", Sha256::digest(text.as_bytes()));
+        self.step_identities.get(&key)
+            .or_else(|| self.step_identities.get(&legacy)).cloned()
+            .or_else(|| self.step_requirements.contains_key(&legacy).then_some(legacy))
+            .unwrap_or(key)
     }
 
     fn is_empty(&self) -> bool {
-        self.requirements.is_empty()
+        self.requirements.is_empty() && self.step_requirements.is_empty()
+            && self.step_identities.is_empty() && self.workflow.is_empty()
+    }
+
+    /// The checklist already carries these exact entries. Replay reconstructs
+    /// them; preserve splits, renames, supersessions and legacy identities.
+    pub(crate) fn compact_for_plan(&self, plan: &UpdatePlanArgs) -> Self {
+        let mut compact = self.clone();
+        for step in &plan.plan {
+            let id = self.step_id(&step.step);
+            if id == plan_step_id(&step.step)
+                && self.step_requirements.get(&id).is_some_and(|ids| ids == &[id.clone()])
+                && self.step_requirements.values().filter(|ids| ids.contains(&id)).count() == 1
+                && self.requirements.get(&id).is_some_and(|requirement| {
+                    requirement.text == step.step && requirement.status == step.status
+                        && requirement.superseded_reason.is_none()
+                })
+            {
+                compact.requirements.remove(&id);
+                compact.step_requirements.remove(&id);
+            }
+        }
+        compact
+    }
+
+    /// Prompt projection only. Durable snapshots retain the full audit history.
+    pub(crate) fn active_for_plan(&self, plan: &UpdatePlanArgs) -> Self {
+        let mut active = self.compact_for_plan(plan);
+        active.requirements.retain(|id, requirement| {
+            (requirement.status != StepStatus::Completed || requirement.superseded_reason.is_some())
+                || active.step_requirements.values().any(|ids| ids.contains(id))
+        });
+        active
+    }
+
+    fn orphan(&self, id: &str) -> Option<&PlanRequirement> {
+        self.requirements.get(id).filter(|requirement| {
+            (requirement.status != StepStatus::Completed || requirement.superseded_reason.is_some())
+                && !self.step_requirements.values().any(|ids| ids.iter().any(|mapped| mapped == id))
+        })
     }
 
     fn revise(&mut self, previous_plan: Option<&UpdatePlanArgs>, steps: &[PlanStepArg], superseded: &[SupersededStep]) {
@@ -129,8 +178,9 @@ impl PlanLineage {
             let mut step_id = previous_ids.get(step.step.as_str()).cloned()
                 .or_else(|| continued_id.cloned())
                 .unwrap_or_else(|| text_id.clone());
-            if !previous_ids.contains_key(step.step.as_str()) && continued_id.is_none()
-                && (previous.contains_key(&step_id) || self.step_requirements.contains_key(&step_id))
+            if !previous_ids.contains_key(step.step.as_str())
+                && !continued_id.is_some_and(|id| previous.contains_key(id))
+                && previous_plan.is_some()
             {
                 step_id = uuid::Uuid::now_v7().to_string();
             }
@@ -140,6 +190,9 @@ impl PlanLineage {
             let mut ids = previous.get(&step_id).cloned().unwrap_or_default();
             for source in &step.continues {
                 ids.extend(previous.get(source).into_iter().flatten().cloned());
+                if !previous.contains_key(source) && self.requirements.contains_key(source) {
+                    ids.push(source.clone());
+                }
             }
             ids.sort();
             ids.dedup();
@@ -165,7 +218,9 @@ impl PlanLineage {
         }
         self.workflow.retain(|step_id, _| self.step_requirements.contains_key(step_id));
         for dropped in superseded {
-            for id in previous.get(&dropped.step_id).into_iter().flatten() {
+            let ids = previous.get(&dropped.step_id).cloned()
+                .unwrap_or_else(|| vec![dropped.step_id.clone()]);
+            for id in &ids {
                 // A split requirement may still be represented by another step.
                 if !self.step_requirements.values().any(|ids| ids.contains(id))
                     && let Some(requirement) = self.requirements.get_mut(id)
@@ -177,7 +232,7 @@ impl PlanLineage {
     }
 
     fn update_statuses(&mut self, plan: &UpdatePlanArgs) {
-        let steps = plan.plan.iter().map(|step| (self.step_id(&step.step), step.status)).collect::<Vec<_>>();
+        let steps = plan.plan.iter().map(|step| (self.step_id(&step.step), step)).collect::<Vec<_>>();
         for (id, requirement) in &mut self.requirements {
             let statuses = steps.iter()
                 .filter(|(step_id, _)| {
@@ -185,10 +240,20 @@ impl PlanLineage {
                         .get(step_id)
                         .is_some_and(|ids| ids.contains(id))
                 })
-                .map(|(_, status)| *status)
+                // A continuation preserves lineage, not equivalent acceptance
+                // scope. The descendant checklist can complete atomically, but
+                // cannot declare differently worded original scope complete.
+                .map(|(_, step)| {
+                    if step.status == StepStatus::Completed && step.step != requirement.text {
+                        StepStatus::InProgress
+                    } else {
+                        step.status
+                    }
+                })
                 .collect::<Vec<_>>();
             if !statuses.is_empty() {
                 requirement.status = if statuses.iter().all(|status| *status == StepStatus::Completed) {
+                    requirement.superseded_reason = None;
                     StepStatus::Completed
                 } else if statuses.contains(&StepStatus::InProgress) {
                     StepStatus::InProgress
@@ -244,10 +309,28 @@ impl PlanLineage {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct PlanState {
     plan: Option<UpdatePlanArgs>,
     lineage: PlanLineage,
+    durably_published: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanExecutionSnapshot {
+    pub(crate) revision: String,
+    pub(crate) obligations: PlanObligationSummary,
+    pub(crate) has_steps: bool,
+}
+
+impl PlanExecutionSnapshot {
+    pub(crate) fn new(plan: &UpdatePlanArgs, lineage: &PlanLineage) -> Self {
+        Self {
+            revision: plan_revision_with_lineage(Some(plan), lineage),
+            obligations: lineage.obligation_summary(plan),
+            has_steps: !plan.plan.is_empty(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,7 +419,7 @@ pub(crate) fn plan_revision_with_lineage(
 }
 
 pub(crate) fn plan_step_id(step: &str) -> String {
-    format!("{:x}", Sha256::digest(step.as_bytes()))
+    format!("{:x}", Sha256::digest(step.as_bytes()))[..16].to_string()
 }
 
 pub(crate) fn plan_response_from_tool_output(
@@ -390,15 +473,45 @@ pub(crate) struct PlanStore {
     current: Mutex<PlanState>,
 }
 
+/// Holds the existing plan lock across publication so revision validation and
+/// the durable snapshot refer to the same update. Dropping it changes nothing.
+pub(crate) struct StagedPlanUpdate<'a> {
+    current: tokio::sync::MutexGuard<'a, PlanState>,
+    next: PlanState,
+    pub(crate) update: PlanStoreUpdate,
+}
+
+impl StagedPlanUpdate<'_> {
+    pub(crate) fn needs_publication(&self) -> bool {
+        self.update.effect != PlanUpdateEffect::NoOp || !self.current.durably_published
+    }
+
+    pub(crate) fn commit_published(mut self) -> PlanStoreUpdate {
+        self.next.durably_published = true;
+        self.commit()
+    }
+
+    pub(crate) fn commit(mut self) -> PlanStoreUpdate {
+        *self.current = self.next;
+        self.update
+    }
+}
+
 impl PlanStore {
+    #[cfg(test)]
     pub(crate) async fn active_requirement_count(&self) -> usize {
         self.current.lock().await.lineage.requirements.values().filter(|requirement| {
-            requirement.status != StepStatus::Completed && requirement.superseded_reason.is_none()
+            requirement.status != StepStatus::Completed || requirement.superseded_reason.is_some()
         }).count()
     }
 
     pub(crate) async fn snapshot(&self) -> Option<UpdatePlanArgs> {
         self.current.lock().await.plan.clone()
+    }
+
+    pub(crate) async fn execution_snapshot(&self) -> Option<PlanExecutionSnapshot> {
+        let current = self.current.lock().await;
+        Some(PlanExecutionSnapshot::new(current.plan.as_ref()?, &current.lineage))
     }
 
     pub(crate) async fn snapshot_with_lineage(&self) -> Option<(UpdatePlanArgs, PlanLineage)> {
@@ -410,7 +523,7 @@ impl PlanStore {
         let update_call_ids = items
             .iter()
             .filter_map(|item| match item {
-                ResponseItem::FunctionCall { name, call_id, .. } if name == "update_plan" => {
+                ResponseItem::FunctionCall { name, namespace: None, call_id, .. } if name == "update_plan" => {
                     Some(call_id.as_str())
                 }
                 _ => None,
@@ -433,7 +546,7 @@ impl PlanStore {
         *current = restored
             .map(|response| {
                 let lineage = response.lineage.reconcile_restored(Some(&response.current_plan));
-                PlanState { plan: Some(response.current_plan), lineage }
+                PlanState { plan: Some(response.current_plan), lineage, durably_published: false }
             })
             .unwrap_or_default();
         found
@@ -453,6 +566,7 @@ impl PlanStore {
         *current = PlanState {
             lineage: lineage.unwrap_or_default().reconcile_restored(plan.as_ref()),
             plan,
+            durably_published: false,
         };
     }
 
@@ -463,8 +577,13 @@ impl PlanStore {
         Self::commit(&mut current, next)
     }
 
-    /// Update the checklist atomically.
+    #[cfg(test)]
     pub(crate) async fn update_tool(&self, args: PlanToolArgs) -> Result<PlanStoreUpdate, String> {
+        Ok(self.stage_tool(args).await?.commit())
+    }
+
+    /// Prepare an update without publishing the plan or its revision.
+    pub(crate) async fn stage_tool(&self, args: PlanToolArgs) -> Result<StagedPlanUpdate<'_>, String> {
         let PlanToolArgs {
             explanation,
             expected_revision,
@@ -474,16 +593,23 @@ impl PlanStore {
             workflow,
             resolved_workflow,
         } = args;
-        let mut current = self.current.lock().await;
+        let guard = self.current.lock().await;
+        let mut current = guard.clone();
         let mut lineage = current.lineage.clone();
         let revision = plan_revision_with_lineage(current.plan.as_ref(), &current.lineage);
-        if let Some(expected) = expected_revision.as_deref()
-            && expected != revision
-        {
-            return Err(format!(
-                "stale plan revision; current revision is {}. Reconcile the current plan before retrying; no changes were made.",
-                revision
-            ));
+        let missing_revision = plan.is_some() && current.plan.is_some() && expected_revision.is_none();
+        if missing_revision || expected_revision.as_deref().is_some_and(|expected| expected != revision) {
+            let reconciliation = serde_json::json!({
+                "revision": revision,
+                "current_plan": current.plan,
+                "step_ids": current.plan.iter().flat_map(|plan| &plan.plan)
+                    .map(|step| lineage.step_id(&step.step)).collect::<Vec<_>>(),
+                "lineage": current.plan.as_ref().map(|plan| lineage.active_for_plan(plan)),
+                "obligations": current.plan.as_ref().map(|plan| lineage.obligation_summary(plan)),
+                "completion_authority": checklist_completion_authority(),
+            });
+            let reason = if missing_revision { "plan replacements require expected_revision" } else { "stale plan revision" };
+            return Err(format!("{reason}; no changes were made. Reconcile against: {reconciliation}"));
         }
         let next = if let Some(plan) = plan {
             let mut steps = HashSet::new();
@@ -547,7 +673,7 @@ impl PlanStore {
         if lineage_changed && update.effect == PlanUpdateEffect::NoOp {
             update.effect = PlanUpdateEffect::StructuralRevision;
         }
-        Ok(update)
+        Ok(StagedPlanUpdate { current: guard, next: current, update })
     }
 
     fn status_plan(
@@ -578,10 +704,18 @@ impl PlanStore {
                 (Some(index), None) => index,
                 (None, Some(id)) => {
                     let matches = next.plan.iter().enumerate()
-                        .filter(|(_, item)| lineage.step_id(&item.step) == id)
+                        .filter(|(_, item)| {
+                            let current_id = lineage.step_id(&item.step);
+                            current_id == id || (id.len() >= 8 && current_id.starts_with(id))
+                        })
                         .map(|(index, _)| index).collect::<Vec<_>>();
                     if matches.len() != 1 {
-                        return Err(format!("unknown or ambiguous plan step ID {id}"));
+                        let valid = next.plan.iter().map(|item| {
+                            format!("{}: {}", lineage.step_id(&item.step), quoted_step(&item.step))
+                        }).collect::<Vec<_>>().join("\n");
+                        return Err(format!(
+                            "unknown, too short, or ambiguous plan step ID {id}; use a full ID or a unique prefix of at least 8 characters. Current steps:\n{valid}\nNo changes were made."
+                        ));
                     }
                     matches[0]
                 }
@@ -619,6 +753,9 @@ impl PlanStore {
             Some(_) => PlanUpdateEffect::StructuralRevision,
         };
         current.lineage.update_statuses(&next);
+        if effect != PlanUpdateEffect::NoOp {
+            current.durably_published = false;
+        }
         current.plan = Some(next.clone());
         PlanStoreUpdate {
             current: next,
@@ -675,17 +812,10 @@ fn account_for_removed_steps(
     let mut continued = HashSet::new();
     for item in next {
         for id in &item.continues {
-            let Some(original) = previous_by_id.get(id.as_str()) else {
+            if !previous_by_id.contains_key(id.as_str()) && lineage.orphan(id).is_none() {
                 return Err(format!(
-                    "step {} continues unknown step ID {id}; use step_ids from the previous result. No changes were made.",
+                    "step {} continues unknown step or unresolved orphan ID {id}; use step_ids or lineage from the previous result. No changes were made.",
                     quoted_step(&item.step)
-                ));
-            };
-            if original.status != StepStatus::Completed && item.status == StepStatus::Completed {
-                return Err(format!(
-                    "step {} continues unfinished step {} and cannot be completed in the same revision; mark it completed with a later status update once those obligations are met. No changes were made.",
-                    quoted_step(&item.step),
-                    quoted_step(&original.step)
                 ));
             }
             continued.insert(id.as_str());
@@ -694,6 +824,16 @@ fn account_for_removed_steps(
     let mut dropped = HashSet::new();
     let mut records = Vec::new();
     for entry in superseded {
+        if let Some(orphan) = lineage.orphan(&entry.step_id) {
+            let reason = entry.reason.trim();
+            if reason.is_empty() || !dropped.insert(entry.step_id.as_str())
+                || continued.contains(entry.step_id.as_str())
+            {
+                return Err("an orphan must be continued or superseded with one non-empty reason, not both; no changes were made".into());
+            }
+            records.push(format!("Proposed supersession (unverified) {}: {reason}", quoted_step(&orphan.text)));
+            continue;
+        }
         let Some(original) = previous_by_id.get(entry.step_id.as_str()) else {
             return Err(format!(
                 "superseded names unknown step ID {}; no changes were made",
@@ -713,7 +853,7 @@ fn account_for_removed_steps(
                 entry.step_id
             ));
         }
-        records.push(format!("Superseded {}: {reason}", quoted_step(&original.step)));
+        records.push(format!("Proposed supersession (unverified) {}: {reason}", quoted_step(&original.step)));
     }
     let unaccounted = previous_steps
         .iter()
@@ -769,6 +909,166 @@ mod tests {
                 status,
             }],
         }
+    }
+
+    async fn replace(store: &PlanStore, plan: Vec<PlanStepArg>) -> PlanStoreUpdate {
+        let expected_revision = store.execution_snapshot().await.map(|snapshot| snapshot.revision);
+        store.update_tool(PlanToolArgs { plan: Some(plan), expected_revision, ..Default::default() })
+            .await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn retired_step_identity_cannot_complete_reintroduced_work() {
+        let store = PlanStore::default();
+        let step = |status| PlanStepArg { step: "same work".into(), status, continues: vec![] };
+        let original = replace(&store, vec![step(StepStatus::Completed)]).await;
+        let old_id = original.lineage.step_id("same work");
+        replace(&store, vec![]).await;
+        let recreated = replace(&store, vec![step(StepStatus::Pending)]).await;
+        let new_id = recreated.lineage.step_id("same work");
+        assert_ne!(new_id, old_id);
+        assert!(store.update_tool(PlanToolArgs {
+            set: Some(vec![PlanStatusUpdate { index: None, step_id: Some(old_id.clone()), status: StepStatus::Completed }]),
+            ..Default::default()
+        }).await.is_err());
+        assert_eq!(store.snapshot().await, Some(recreated.current.clone()));
+        assert_eq!(recreated.lineage.requirements[&old_id].status, StepStatus::Completed);
+        store.restore_with_lineage(Some(recreated.current), Some(recreated.lineage)).await;
+        assert_eq!(store.snapshot_with_lineage().await.unwrap().1.step_id("same work"), new_id);
+    }
+
+    #[tokio::test]
+    async fn replacement_conflicts_return_reconciliation_without_reopening_work() {
+        let store = PlanStore::default();
+        let original = plan("work", StepStatus::Pending);
+        store.update(original.clone()).await;
+        let stale = store.execution_snapshot().await.unwrap().revision;
+        store.update_tool(PlanToolArgs {
+            set: Some(vec![PlanStatusUpdate { index: None, step_id: Some(plan_step_id("work")), status: StepStatus::Completed }]),
+            ..Default::default()
+        }).await.unwrap();
+        let current = store.execution_snapshot().await.unwrap();
+        for expected_revision in [None, Some(stale)] {
+            let error = store.update_tool(PlanToolArgs {
+                expected_revision,
+                plan: Some(vec![PlanStepArg { step: "work".into(), status: StepStatus::Pending, continues: vec![] }]),
+                ..Default::default()
+            }).await.unwrap_err();
+            let reconciliation: serde_json::Value = serde_json::from_str(error.split_once("Reconcile against: ").unwrap().1).unwrap();
+            assert_eq!(reconciliation["revision"], current.revision);
+            assert_eq!(reconciliation["current_plan"]["plan"][0]["status"], "completed");
+            assert_eq!(reconciliation["step_ids"][0], plan_step_id("work"));
+            assert_eq!(store.execution_snapshot().await, Some(current.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_and_completion_are_atomic_and_keep_original_obligations() {
+        let store = PlanStore::default();
+        store.update(plan("original", StepStatus::Pending)).await;
+        let id = plan_step_id("original");
+        let update = replace(&store, vec![PlanStepArg {
+            step: "finished work".into(), status: StepStatus::Completed, continues: vec![id.clone()],
+        }]).await;
+        assert_eq!(update.lineage.step_id("finished work"), id);
+        assert_eq!(update.lineage.requirements[&id].text, "original");
+        assert_eq!(update.current.plan[0].status, StepStatus::Completed);
+        assert_eq!(update.lineage.obligation_summary(&update.current).unresolved, vec![id.clone()]);
+
+        let two_calls = PlanStore::default();
+        two_calls.update(plan("original", StepStatus::Pending)).await;
+        replace(&two_calls, vec![PlanStepArg {
+            step: "finished work".into(), status: StepStatus::InProgress, continues: vec![id.clone()],
+        }]).await;
+        let second = two_calls.update_tool(PlanToolArgs {
+            set: Some(vec![PlanStatusUpdate { index: None, step_id: Some(id.clone()), status: StepStatus::Completed }]),
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(second.lineage, update.lineage, "a second call adds no authority");
+        let restored = update.lineage.compact_for_plan(&update.current).reconcile_restored(Some(&update.current));
+        assert_eq!(restored.requirements[&id].status, StepStatus::InProgress);
+        assert!(restored.active_for_plan(&update.current).requirements.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn active_projection_does_not_grow_with_retired_history_and_restore_is_exact() {
+        let store = PlanStore::default();
+        for index in 0..40 {
+            replace(&store, vec![PlanStepArg {
+                step: format!("finished {index}"), status: StepStatus::Completed, continues: vec![],
+            }]).await;
+        }
+        let update = replace(&store, vec![PlanStepArg {
+            step: "current".into(), status: StepStatus::Pending, continues: vec![],
+        }]).await;
+        assert_eq!(update.lineage.requirements.len(), 41);
+        let active = update.lineage.active_for_plan(&update.current);
+        assert_eq!(active.requirements.len(), 1);
+        let durable = update.lineage.compact_for_plan(&update.current);
+        let restored = durable.reconcile_restored(Some(&update.current));
+        assert_eq!(restored, update.lineage);
+        assert_eq!(active.obligation_summary(&update.current).unresolved,
+            restored.obligation_summary(&update.current).unresolved);
+    }
+
+    #[tokio::test]
+    async fn status_step_prefixes_are_unique_and_atomic() {
+        let store = PlanStore::default();
+        let original = plan("inspect", StepStatus::Pending);
+        store.update(original.clone()).await;
+        let id = plan_step_id("inspect");
+        let update = |ids: Vec<String>| PlanToolArgs {
+            set: Some(ids.into_iter().map(|step_id| PlanStatusUpdate {
+                index: None, step_id: Some(step_id), status: StepStatus::Completed,
+            }).collect()),
+            ..Default::default()
+        };
+        for bad in [id[..7].to_string(), "not-a-step".to_string()] {
+            let error = store.update_tool(update(vec![id[..8].to_string(), bad])).await.unwrap_err();
+            assert!(error.contains(&id));
+            assert!(error.contains("inspect"));
+            assert_eq!(store.snapshot().await, Some(original.clone()));
+        }
+        assert!(store.update_tool(update(vec![id.clone(), id[..8].to_string()])).await.is_err());
+        assert_eq!(store.snapshot().await, Some(original));
+        let result = store.update_tool(update(vec![id[..8].to_string()])).await.unwrap();
+        assert_eq!(result.current.plan[0].status, StepStatus::Completed);
+
+        let current = UpdatePlanArgs {
+            explanation: None,
+            plan: vec![
+                PlanItemArg { step: "one".into(), status: StepStatus::Pending },
+                PlanItemArg { step: "two".into(), status: StepStatus::Pending },
+            ],
+        };
+        let mut lineage = PlanLineage::default();
+        lineage.step_identities.insert(plan_step_id("one"), "12345678aaaa".into());
+        lineage.step_identities.insert(plan_step_id("two"), "12345678bbbb".into());
+        let error = PlanStore::status_plan(&Some(current), &lineage,
+            update(vec!["12345678".into()]).set.unwrap(), None, false, "revision").unwrap_err();
+        assert!(error.contains("12345678aaaa: \"one\""));
+        assert!(error.contains("12345678bbbb: \"two\""));
+    }
+
+    #[test]
+    fn compact_lineage_and_short_ids_preserve_resume_and_legacy_identity() {
+        let current = plan("inspect", StepStatus::Pending);
+        let full = PlanLineage::from_plan(Some(&current));
+        assert_eq!(full.step_id("inspect").len(), 16);
+        let compact = full.compact_for_plan(&current);
+        assert!(compact.is_empty());
+        assert_eq!(compact.reconcile_restored(Some(&current)), full);
+
+        let legacy_id = format!("{:x}", Sha256::digest(b"inspect"));
+        let mut legacy = PlanLineage::default();
+        legacy.requirements.insert(legacy_id.clone(), PlanRequirement {
+            text: "inspect".into(), status: StepStatus::Pending, superseded_reason: None,
+        });
+        legacy.step_requirements.insert(legacy_id.clone(), vec![legacy_id.clone()]);
+        let restored = legacy.reconcile_restored(Some(&current));
+        assert_eq!(restored.step_id("inspect"), legacy_id);
+        assert_eq!(restored.requirements.len(), 1);
+        assert!(!restored.compact_for_plan(&current).is_empty());
     }
 
     #[tokio::test]
@@ -831,14 +1131,15 @@ mod tests {
         });
         let summary = lineage.obligation_summary(&current);
         assert_eq!(summary.completed, 1);
-        assert_eq!(summary.superseded, 1);
-        assert_eq!(summary.unresolved, vec![plan_step_id("required check")]);
+        assert_eq!(summary.superseded, 0);
+        assert_eq!(summary.unresolved, vec![plan_step_id("required check"), "retired".into()]);
         assert_eq!(PlanLineage::default().obligation_summary(&current).unresolved,
-            summary.unresolved, "legacy checklist is not an empty obligation set");
+            vec![plan_step_id("required check")], "legacy checklist is not an empty obligation set");
         lineage.update_statuses(&plan("required check", StepStatus::Completed));
         let summary = lineage.obligation_summary(&current);
         assert_eq!(summary.completed, 2);
-        assert!(summary.unresolved.is_empty());
+        assert_eq!(summary.unresolved, vec!["retired"]);
+        assert!(lineage.active_for_plan(&current).requirements.contains_key("retired"));
     }
 
     #[tokio::test]
@@ -908,8 +1209,9 @@ mod tests {
                 }
                 let (restored, repaired) = store.snapshot_with_lineage().await.unwrap();
                 assert_eq!(restored, current);
-                assert_eq!(store.active_requirement_count().await, 2, "{mode}");
-                assert_eq!(repaired.obligation_summary(&restored).unresolved.len(), 2);
+                let unresolved = 2 + usize::from(mode == "retired-reference");
+                assert_eq!(store.active_requirement_count().await, unresolved, "{mode}");
+                assert_eq!(repaired.obligation_summary(&restored).unresolved.len(), unresolved);
                 assert_eq!(repaired.requirements["unmapped-open"].status, StepStatus::InProgress);
                 let revision = plan_revision_with_lineage(Some(&restored), &repaired);
                 store.restore_with_lineage(Some(restored.clone()), Some(repaired)).await;
@@ -919,8 +1221,10 @@ mod tests {
                     set: Some(vec![PlanStatusUpdate { index: None, step_id: Some(id), status: StepStatus::Completed }]),
                     ..Default::default()
                 }).await.unwrap();
-                assert_eq!(closed.lineage.obligation_summary(&closed.current).unresolved, vec!["unmapped-open"]);
-                assert_eq!(store.active_requirement_count().await, 1);
+                let outstanding = closed.lineage.obligation_summary(&closed.current).unresolved;
+                assert!(outstanding.contains(&"unmapped-open".to_string()));
+                assert_eq!(outstanding.len(), unresolved - 1);
+                assert_eq!(store.active_requirement_count().await, unresolved - 1);
             }
         }
     }
@@ -946,6 +1250,7 @@ mod tests {
         };
         let revise = |plan, superseded: Vec<(&str, &str)>, explanation: Option<&str>| PlanToolArgs {
             plan: Some(plan),
+            expected_revision: Some(plan_revision(Some(&original))),
             superseded: superseded
                 .into_iter()
                 .map(|(step_id, reason)| SupersededStep { step_id: step_id.into(), reason: reason.into() })
@@ -953,19 +1258,13 @@ mod tests {
             explanation: explanation.map(str::to_string),
             ..Default::default()
         };
-        // A narrower rewording cannot retire obligations, even with a prose
-        // explanation, and a carried step cannot claim them completed at once.
+        // A narrower rewording cannot retire obligations, even with a prose explanation.
         for rejected in [
             revise(vec![step("Inventory warnings", StepStatus::Completed, &[])], vec![], None),
             revise(
                 vec![step("Inventory warnings", StepStatus::Completed, &[])],
                 vec![],
                 Some("The user requested only an inventory."),
-            ),
-            revise(
-                vec![step("Inventory warnings", StepStatus::Completed, &[review_id.as_str(), fix_id.as_str()])],
-                vec![],
-                None,
             ),
             revise(
                 vec![step("Inventory warnings", StepStatus::InProgress, &[review_id.as_str()])],
@@ -992,7 +1291,7 @@ mod tests {
         assert_eq!(revised.effect, PlanUpdateEffect::StructuralRevision);
         assert_eq!(
             revised.current.explanation.as_deref(),
-            Some("Narrowed review scope.\nSuperseded \"Fix confirmed warnings\": The user will fix warnings separately.")
+            Some("Narrowed review scope.\nProposed supersession (unverified) \"Fix confirmed warnings\": The user will fix warnings separately.")
         );
         assert_eq!(revised.lineage.step_id("Review warnings in core only"), review_id);
         let resumed = PlanStore::default();
@@ -1008,7 +1307,8 @@ mod tests {
         }).await.expect("the pre-rename identity survives persistence");
         assert_eq!(completed.current.plan[0].status, StepStatus::Completed);
         assert_eq!(completed.lineage.requirements[&review_id].text, review);
-        assert_eq!(completed.lineage.requirements[&review_id].status, StepStatus::Completed);
+        assert_eq!(completed.lineage.requirements[&review_id].status, StepStatus::InProgress);
+        assert_eq!(completed.lineage.obligation_summary(&completed.current).unresolved.len(), 2);
     }
 
     #[tokio::test]
@@ -1086,6 +1386,21 @@ mod tests {
 
         assert!(store.restore_from_history(&history).await);
         assert_eq!(store.update(expected).await.effect, PlanUpdateEffect::NoOp);
+    }
+
+    #[tokio::test]
+    async fn namespaced_update_plan_cannot_restore_builtin_plan_state() {
+        let mut history = vec![
+            ResponseItem::FunctionCall { id:None, name:"update_plan".into(), namespace:Some("vendor".into()),
+                arguments:"{}".into(), call_id:"vendor".into(), internal_chat_message_metadata_passthrough:None },
+            ResponseItem::FunctionCallOutput { id:None, call_id:"vendor".into(),
+                output:FunctionCallOutputPayload::from_text(serde_json::json!({"current_plan":plan("vendor", StepStatus::Pending)}).to_string()),
+                internal_chat_message_metadata_passthrough:None },
+        ];
+        let store = PlanStore::default();
+        assert!(!store.restore_from_history(&history).await);
+        if let ResponseItem::FunctionCall { namespace, .. } = &mut history[0] { *namespace = None; }
+        assert!(store.restore_from_history(&history).await);
     }
 
     #[tokio::test]

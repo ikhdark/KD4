@@ -2,7 +2,6 @@ use codex_utils_absolute_path as path_utils;
 use std::cmp::Reverse;
 use std::ffi::OsStr;
 use std::io;
-use std::num::NonZero;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,10 +15,10 @@ use uuid::Uuid;
 use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
 use super::compression;
+use crate::RolloutRecorder;
 use crate::metadata::RolloutMetadataAccumulator;
 use crate::protocol::EventMsg;
 use crate::state_integration;
-use codex_file_search as file_search;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::persisted_thread_settings::PersistedThreadSettingsReducer;
@@ -998,8 +997,11 @@ async fn build_thread_item(
     {
         return None;
     }
-    // Apply filters: must have session meta and a discoverable preview.
-    if summary.saw_session_meta && summary.preview.is_some() {
+    // A damaged metadata payload can still leave a filename identity and
+    // useful history. Do not fabricate missing creation-only metadata.
+    if (summary.saw_session_meta && summary.preview.is_some())
+        || (!summary.saw_session_meta && summary.thread_id.is_some())
+    {
         let HeadTailSummary {
             saw_session_meta: _,
             thread_id,
@@ -1331,7 +1333,7 @@ async fn read_head_summary(
     let extraction_cache_guard =
         crate::metadata::extraction_cache_guard(path, default_provider).await;
 
-    let (_thread_id, parse_errors) =
+    let (thread_id, parse_errors) =
         crate::recorder::RolloutRecorder::for_each_rollout_item_with_record_number(
             path,
             |item, record_number| {
@@ -1415,6 +1417,12 @@ async fn read_head_summary(
         )
         .await?;
 
+    if !summary.saw_session_meta && parse_errors > 0 {
+        summary.thread_id = thread_id;
+        summary.created_at = path.file_name().and_then(|name| name.to_str())
+            .and_then(parse_timestamp_uuid_from_filename)
+            .and_then(|(created_at, _)| format_rfc3339(created_at));
+    }
     let settings = settings_reducer.into_settings();
     if let Some(model_provider) = settings.model_provider_id {
         summary.model_provider = Some(model_provider);
@@ -1519,7 +1527,7 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             };
         }
     }
-    Err(io::Error::other(format!(
+    Err(io::Error::new(io::ErrorKind::NotFound, format!(
         "rollout at {} has no session metadata",
         path.display()
     )))
@@ -1559,7 +1567,6 @@ async fn find_thread_path_by_id_str_in_subdir(
         _ => None,
     };
     let thread_id = ThreadId::from_string(id_str).ok();
-    let mut unverified_db_path = None;
     let mut fallback_reason = state_db_ctx.is_none().then_some("db_unavailable");
     if let Some(state_db_ctx) = state_db_ctx
         && let Some(thread_id) = thread_id
@@ -1572,14 +1579,14 @@ async fn find_thread_path_by_id_str_in_subdir(
                 if let Some(existing_db_path) =
                     compression::existing_rollout_path(db_path.as_path()).await
                 {
-                    match read_session_meta_line(&existing_db_path).await {
-                        Ok(meta_line) if meta_line.meta.id == thread_id => {
+                    match verified_rollout_thread_id(&existing_db_path).await {
+                        Ok(id) if id == thread_id => {
                             return Ok(Some(existing_db_path));
                         }
-                        Ok(meta_line) => {
+                        Ok(id) => {
                             tracing::error!(
                                 "state db returned rollout path for thread {id_str} but file belongs to thread {}: {}",
-                                meta_line.meta.id,
+                                id,
                                 existing_db_path.display()
                             );
                             tracing::warn!(
@@ -1596,7 +1603,6 @@ async fn find_thread_path_by_id_str_in_subdir(
                                 "state db returned rollout path for thread {id_str} that could not be verified: {}: {err}",
                                 existing_db_path.display()
                             );
-                            unverified_db_path = Some(existing_db_path);
                         }
                     }
                 } else {
@@ -1627,59 +1633,9 @@ async fn find_thread_path_by_id_str_in_subdir(
     let mut root = codex_home.to_path_buf();
     root.push(subdir);
     if !tokio::fs::try_exists(&root).await? {
-        return Ok(unverified_db_path);
+        return Ok(None);
     }
-    let (filename_match, filename_scan_error) = match find_rollout_path_by_id_from_filenames(
-        root.as_path(),
-        id_str,
-    )
-    .await
-    {
-        Ok(path) => (path, None),
-        Err(err) => {
-            tracing::warn!(
-                "rollout filename lookup failed during find_thread_path_by_id_str_in_subdir: {err}"
-            );
-            (None, Some(err))
-        }
-    };
-
-    let found = match filename_match {
-        Some(path) => Some(path),
-        None => {
-            // This is safe because we know the values are valid.
-            #[allow(clippy::unwrap_used)]
-            let limit = NonZero::new(1).unwrap();
-            let options = file_search::FileSearchOptions {
-                limit,
-                compute_indices: false,
-                respect_gitignore: false,
-                ..Default::default()
-            };
-
-            let query = id_str.to_string();
-            let results = tokio::task::spawn_blocking(move || {
-                file_search::run(&query, vec![root], options, /*cancel_flag*/ None)
-            })
-            .await
-            .map_err(io::Error::other)?
-            .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
-
-            let found = results
-                .matches
-                .into_iter()
-                .map(|m| m.full_path())
-                .find_map(compression::RolloutFile::from_path)
-                .map(compression::RolloutFile::into_path);
-
-            if found.is_none()
-                && let Some(err) = filename_scan_error
-            {
-                return Err(err);
-            }
-            found
-        }
-    };
+    let found = find_rollout_path_by_id_from_filenames(root.as_path(), id_str).await?;
     if let Some(found_path) = found.as_ref() {
         tracing::debug!("state db missing rollout path for thread {id_str}");
         tracing::warn!(
@@ -1701,7 +1657,27 @@ async fn find_thread_path_by_id_str_in_subdir(
         .await;
     }
 
-    Ok(found.or(unverified_db_path))
+    Ok(found)
+}
+
+// Damaged payloads remain recoverable through the canonical reader, but a
+// filename alone (including an empty file) must never establish ownership.
+async fn verified_rollout_thread_id(path: &Path) -> io::Result<ThreadId> {
+    match read_session_meta_line(path).await {
+        Ok(meta) => Ok(meta.meta.id),
+        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) => {
+            let mut has_valid_item = false;
+            let (id, parse_errors) = RolloutRecorder::for_each_rollout_item(path, |_| {
+                has_valid_item = true;
+            }).await?;
+            if has_valid_item && parse_errors > 0 && let Some(id) = id {
+                Ok(id)
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn find_rollout_path_by_id_from_filenames(
@@ -1712,6 +1688,7 @@ async fn find_rollout_path_by_id_from_filenames(
         return Ok(None);
     };
     let mut stack = vec![root.to_path_buf()];
+    let mut found: Option<PathBuf> = None;
     while let Some(dir) = stack.pop() {
         let mut read_dir = match tokio::fs::read_dir(dir.as_path()).await {
             Ok(read_dir) => read_dir,
@@ -1731,17 +1708,28 @@ async fn find_rollout_path_by_id_from_filenames(
             let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
                 continue;
             };
-            let Some((_ts, id)) =
-                parse_timestamp_uuid_from_filename(rollout_file.plain_file_name())
-            else {
+            // Legacy names may use a custom timestamp/prefix, but the UUID
+            // must be a complete final component, never a fuzzy subsequence.
+            let stem = rollout_file.plain_file_name().strip_suffix(".jsonl").unwrap_or_default();
+            let id = parse_timestamp_uuid_from_filename(rollout_file.plain_file_name())
+                .map(|(_, id)| id)
+                .or_else(|| stem.char_indices().filter(|(_, c)| *c == '-')
+                    .find_map(|(i, _)| Uuid::parse_str(&stem[i + 1..]).ok()));
+            if id != Some(target) {
+                continue;
+            }
+            let Some(path) = compression::existing_rollout_path(&rollout_file.into_path()).await else {
                 continue;
             };
-            if id == target {
-                return Ok(Some(rollout_file.into_path()));
+            if verified_rollout_thread_id(&path).await.ok()
+                .is_some_and(|id| id.to_string() == target.to_string())
+                && found.as_ref().is_none_or(|current| path < *current)
+            {
+                found = Some(path);
             }
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Locate a recorded thread rollout file by its UUID string using the existing
@@ -1848,7 +1836,21 @@ mod tests {
             let directory = home.path().join(subdir).join("legacy");
             tokio::fs::create_dir_all(&directory).await?;
             let path = directory.join(format!("rollout-custom-{id}{suffix}"));
-            tokio::fs::write(&path, b"stored rollout").await?;
+            let content = serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id, "timestamp": "2026-01-01T00:00:00Z",
+                    "cwd": ".", "originator": "test", "cli_version": "test",
+                    "source": "cli"
+                }
+            }).to_string() + "\n";
+            let bytes = if suffix.ends_with(".zst") {
+                zstd::stream::encode_all(content.as_bytes(), 0)?
+            } else {
+                content.as_bytes().to_vec()
+            };
+            tokio::fs::write(&path, &bytes).await?;
             assert!(
                 parse_timestamp_uuid_from_filename(&format!("rollout-custom-{id}.jsonl")).is_none()
             );
@@ -1858,7 +1860,21 @@ mod tests {
                 find_archived_thread_path_by_id_str(home.path(), &id, None).await?
             };
             assert_eq!(found, Some(path.clone()));
-            assert_eq!(tokio::fs::read(path).await?, b"stored rollout");
+            assert_eq!(tokio::fs::read(&path).await?, bytes);
+            // Plain is authoritative even if the compressed sibling was
+            // created first. A misleading authoritative sibling must not be
+            // bypassed by selecting the compressed file.
+            if suffix.ends_with(".zst") {
+                let plain = directory.join(format!("rollout-custom-{id}.jsonl"));
+                tokio::fs::write(&plain, &content).await?;
+                assert_eq!(find_archived_thread_path_by_id_str(home.path(), &id, None).await?, Some(plain.clone()));
+                tokio::fs::write(&plain, content.replace(&id, &Uuid::nil().to_string())).await?;
+                assert_eq!(find_archived_thread_path_by_id_str(home.path(), &id, None).await?, None);
+            }
+            let wrong_id = Uuid::nil().to_string();
+            let misleading = directory.join(format!("rollout-custom-{wrong_id}.jsonl"));
+            tokio::fs::write(&misleading, &content).await?;
+            assert_eq!(find_rollout_path_by_id_from_filenames(&directory, &wrong_id).await?, None);
         }
         let missing_id = Uuid::from_u128(0xffffffffffffffffffffffffffffffff).to_string();
         assert_eq!(

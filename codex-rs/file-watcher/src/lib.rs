@@ -1245,6 +1245,15 @@ impl FileWatcher {
                 if !rescan {
                     relevant_paths.extend(changes.paths.iter().filter(|event_path| {
                         event_may_affect_watch(subscriber_watch, subscriber_watch_state, event_path)
+                            // A shared ancestor watch can report the directory's
+                            // own timestamp on Windows. A stable watch rooted
+                            // there watches its contents, not that timestamp.
+                            // Keep structural events and all descendant events.
+                            && !(changes.root_metadata_paths.contains(*event_path)
+                                && subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
+                                && (**event_path == subscriber_watch_state.matched.path
+                                    || **event_path == subscriber_watch.requested.path)
+                                && event_path.is_dir())
                     }));
                     if relevant_paths.is_empty() {
                         continue;
@@ -1521,6 +1530,10 @@ fn event_may_drop_watch_root(event: &Event) -> bool {
 struct ObservedChanges {
     /// Changed paths reported by the backend.
     paths: Vec<PathBuf>,
+    /// Windows directory metadata reports from a shared ancestor watch must
+    /// not broaden a stable directory-rooted subscription to its own metadata.
+    root_metadata_paths: HashSet<PathBuf>,
+    structural_paths: HashSet<PathBuf>,
     /// Paths whose previous object was removed or renamed away, or that a
     /// backend error named; a backend watch rooted there may be gone.
     lost_watch_roots: Vec<PathBuf>,
@@ -1535,6 +1548,11 @@ impl ObservedChanges {
             Ok(event) => {
                 if !is_mutating_event(&event) || event.paths.is_empty() {
                     return;
+                }
+                if cfg!(windows) && event.kind == EventKind::Modify(ModifyKind::Any) {
+                    self.root_metadata_paths.extend(event.paths.iter().cloned());
+                } else {
+                    self.structural_paths.extend(event.paths.iter().cloned());
                 }
                 if event_may_drop_watch_root(&event) {
                     self.lost_watch_roots.extend(event.paths.iter().cloned());
@@ -1555,6 +1573,7 @@ impl ObservedChanges {
     }
 
     fn normalize(&mut self) {
+        self.root_metadata_paths.retain(|path| !self.structural_paths.contains(path));
         self.paths.sort_unstable();
         self.paths.dedup();
         self.lost_watch_roots.sort_unstable();

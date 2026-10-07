@@ -229,7 +229,8 @@ async fn prompt_stop_hook_runs_before_context_planning_or_publication() {
     use codex_config::ConfigLayerStack;
     use codex_config::ConfigRequirements;
     use codex_config::ConfigRequirementsToml;
-    let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let (session, mut turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut turn).unwrap().multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
     let layer = serde_json::from_value(serde_json::json!({"hooks": {
         "UserPromptSubmit": [{"hooks": [{
             "type": "command",
@@ -270,7 +271,7 @@ async fn prompt_stop_hook_runs_before_context_planning_or_publication() {
             Arc::new(ExtensionData::new(turn.sub_id.clone())),
             vec![TurnInput::UserInput {
                 content: vec![UserInput::Text {
-                    text: "blocked prompt".to_string(),
+                    text: "Use subagents to perform the blocked prompt".to_string(),
                     text_elements: Vec::new(),
                 }],
                 client_id: None,
@@ -300,6 +301,13 @@ async fn prompt_stop_hook_runs_before_context_planning_or_publication() {
         }
     }
     assert!(stopped, "the real hook must have blocked the prompt");
+    assert!(!crate::session::multi_agents::spawn_is_authorized(&turn));
+    let continuing = run_hooks_and_record_inputs_detailed(&session, &turn, &[
+        TurnInput::ResponseItem(crate::compact::compaction_context_message("Accepted ongoing context".to_string())),
+        TurnInput::UserInput { content: vec![UserInput::Text { text: "Use subagents".to_string(), text_elements: Vec::new() }], client_id: None },
+    ]).await.unwrap();
+    assert!(!continuing.should_stop);
+    assert!(!crate::session::multi_agents::spawn_is_authorized(&turn));
 }
 
 #[tokio::test]
@@ -1989,7 +1997,7 @@ fn compaction_rebases_but_preserves_a_terminal_completion_request() {
 }
 
 #[test]
-fn verified_turn_contract_after_agent_abort_preserves_completed_output_metadata() {
+fn verified_turn_contract_after_agent_abort_revokes_delivery_authority() {
     let surfaced_result = SurfacedToolResult {
         adapter: "code_mode_cell".to_string(),
         value: serde_json::json!({"answer": 42}),
@@ -2006,7 +2014,7 @@ fn verified_turn_contract_after_agent_abort_preserves_completed_output_metadata(
         result.last_agent_message.as_deref(),
         Some("completed answer")
     );
-    assert_eq!(result.surfaced_result, Some(surfaced_result));
+    assert_eq!(result.surfaced_result, None);
     assert!(result.required_tool_terminal.is_none());
     assert!(result.defer_pending_input);
 }
@@ -2031,19 +2039,18 @@ fn logical_generation_budget_allows_bounded_regular_and_one_terminal_generation(
 }
 
 #[test]
-fn productive_work_and_owned_polling_preserve_generation_capacity() {
+fn retained_evidence_analysis_and_owned_polling_preserve_generation_capacity() {
     let mut budget = LogicalGenerationBudget::default();
-    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+    for _ in 0..32 {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
     }
-    budget.observe_progress(true, false);
     for _ in 0..256 {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
-        budget.observe_progress(false, true);
+        budget.observe_progress(true);
     }
-    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+    for _ in 32..MAX_REGULAR_LOGICAL_GENERATIONS {
         assert_eq!(budget.admit(false), LogicalGenerationAdmission::Regular);
-        budget.observe_progress(false, false);
+        budget.observe_progress(false);
     }
     assert_eq!(
         budget.admit(false),
@@ -2062,7 +2069,8 @@ fn validation_failure_at_generation_limit_keeps_repair_tools_available() -> Resu
 async fn validation_failure_at_generation_limit_keeps_repair_tools_available_impl() -> Result<()> {
     core_test_support::require_network!();
     let server = responses::start_mock_server().await;
-    let mut sequence = (0..MAX_REGULAR_LOGICAL_GENERATIONS - 1)
+    // The former 16-generation novelty cutoff must not suppress repair tools.
+    let mut sequence = (0..15)
         .map(|index| {
             let mut completed = responses::ev_completed(&format!("thinking-{index}"));
             completed["response"]["end_turn"] = serde_json::json!(false);
@@ -2117,7 +2125,7 @@ async fn validation_failure_at_generation_limit_keeps_repair_tools_available_imp
         Some("Repair validated.")
     );
     let sent = requests.requests();
-    let limit = MAX_REGULAR_LOGICAL_GENERATIONS as usize;
+    let limit = 16;
     assert_eq!(sent.len(), limit + 3);
     assert!(
         sent[limit]
@@ -2163,7 +2171,7 @@ async fn forced_terminal_budget_boundary_warns_without_changing_history() {
     .expect("forced-terminal boundary emits a warning");
     assert_eq!(
         warning.message,
-        format!("This turn reached {MAX_REGULAR_LOGICAL_GENERATIONS} generations without new evidence. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume.")
+        format!("This turn reached its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume.")
     );
 }
 
@@ -2222,7 +2230,7 @@ async fn batching_advisory_is_delivered_once_without_loop_or_generation_accounti
         collector.record_child_runtime(100);
         control.observe_progress(
             &baselines, &collector,
-            &SamplingRequestSettledState { mutation_revision: 0, tool_exposure_revision: 0 },
+            &SamplingRequestSettledState { mutation_revision: 0, attributed_mutation_revision: 0, tool_exposure_revision: 0 },
         );
     }
     let before = session.clone_history().await;
@@ -2234,7 +2242,7 @@ async fn batching_advisory_is_delivered_once_without_loop_or_generation_accounti
     assert_eq!(after.raw_items().len(), before.raw_items().len() + 1);
     assert!(matches!(after.raw_items().last(), Some(ResponseItem::Message { role, content, .. })
         if role == "developer" && content.iter().any(|item| matches!(item,
-            ContentItem::InputText { text } if text.starts_with("Execution-efficiency advisory:")))));
+            ContentItem::InputText { text } if text.contains("Execution-efficiency advisory:") && text.contains("expires when that task ends")))));
     let counters = turn_context.turn_timing_state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.logical_generation_count, 0);
     assert_eq!(counters.no_progress_directive_count, 0);
@@ -2278,6 +2286,7 @@ async fn soft_convergence_records_one_instruction_without_requesting_a_generatio
             &SamplingRequestSignalCollector::default(),
             &SamplingRequestSettledState {
                 mutation_revision: 0,
+                attributed_mutation_revision: 0,
                 tool_exposure_revision: 0,
             },
         ));
@@ -2294,7 +2303,7 @@ async fn soft_convergence_records_one_instruction_without_requesting_a_generatio
         matches!(history.raw_items().last(), Some(ResponseItem::Message { role, content, .. })
         if role == "developer" && content.iter().any(|item| matches!(item,
             ContentItem::InputText { text }
-                if text.starts_with("Soft convergence intervention:")
+                if text.contains("Soft convergence intervention:")
                     && text.contains("complete required implementation or validation")
                     && text.contains("does not interrupt an in-flight request"))))
     );
@@ -2345,14 +2354,14 @@ async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
         .await
         .unwrap();
     assert_eq!(session.clone_history().await.raw_items().iter().filter(|item| {
-        matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text == "Try a different method.")))
+        matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text.ends_with("\nTry a different method."))))
     }).count(), 1, "separate decisions must not accumulate identical advice");
     let mut next_turn = TurnExecutionControl::new();
     repeated_advisory.directive = Some("Try a different method.".to_string());
     record_convergence_decision(&session, &turn_context, &mut next_turn, Some(&mut repeated_advisory))
         .await.unwrap();
     assert_eq!(session.clone_history().await.raw_items().iter().filter(|item| {
-        matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text == "Try a different method.")))
+        matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text.ends_with("\nTry a different method."))))
     }).count(), 2, "a later turn must receive its own warning");
     let mut warnings = Vec::new();
     while let Ok(event) = events.try_recv() {
@@ -2610,7 +2619,7 @@ async fn generation_budget_exhaustion_emits_one_status_affecting_error() {
     };
     assert_eq!(
         error.message,
-        format!("This turn exhausted its allowance of {MAX_REGULAR_LOGICAL_GENERATIONS} generations without new evidence and one final summary. Work is suspended before all requested work completed. Send another message to resume.")
+        format!("This turn exhausted its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations and one final summary. Work is suspended before all requested work completed. Send another message to resume.")
     );
     assert!(error.affects_turn_status());
     assert_eq!(
@@ -3248,12 +3257,13 @@ fn legacy_explicit_skill_items_share_one_hard_budget() {
     let max_bytes = codex_utils_string::approx_bytes_for_tokens(
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
     );
+    let skill = |name: &str, contents: String| codex_core_skills::injection::SkillInjection {
+        name: name.to_string(), path: format!("/skills/{name}/SKILL.md"), contents,
+        scope: codex_protocol::protocol::SkillScope::User,
+    };
     let items = build_bounded_skill_context_items(&[
-        RenderedContextFragment::new(
-            "user",
-            format!("legacy-skill-budget-first:{}", "x".repeat(max_bytes)),
-        ),
-        RenderedContextFragment::new("user", "legacy-skill-budget-second".to_string()),
+        skill("first", format!("{} DO NOT PUBLISH {}", "x".repeat(max_bytes / 2), "y".repeat(max_bytes / 2))),
+        skill("second", "legacy-skill-budget-second".to_string()),
     ]);
     let texts = response_input_texts(&items);
 
@@ -3261,12 +3271,12 @@ fn legacy_explicit_skill_items_share_one_hard_budget() {
     assert!(
         texts
             .iter()
-            .any(|text| text.starts_with("legacy-skill-budget-first:"))
+            .any(|text| text.contains("INCOMPLETE MODEL DELIVERY") && text.contains("/skills/first/SKILL.md"))
     );
     assert!(
         texts
             .iter()
-            .all(|text| !text.contains("legacy-skill-budget-second"))
+            .any(|text| text.contains("legacy-skill-budget-second"))
     );
 }
 
@@ -3281,7 +3291,7 @@ fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
         contents,
         scope: codex_protocol::protocol::SkillScope::User,
     };
-    // Leave the second skill room for its markers but not its whole body.
+    // Reserve the later recovery notice before admitting earlier instructions.
     let first_overhead = skill("first", String::new()).render().len();
     let first = skill("first", "x".repeat(max_bytes - first_overhead - 20));
     let second = skill("second", "second skill instructions".to_string());
@@ -3289,6 +3299,7 @@ fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
     let items = build_bounded_skill_context_items([&first, &second]);
 
     assert_eq!(items.len(), 2);
+    assert!(response_input_texts(&items).iter().any(|text| text.contains("INCOMPLETE MODEL DELIVERY")));
     assert!(
         response_input_texts(&items)
             .iter()
@@ -3336,12 +3347,12 @@ async fn extension_turn_input_contributors_share_one_hard_budget() {
     assert!(
         texts
             .iter()
-            .any(|text| text.starts_with("turn-input-budget-first:"))
+            .any(|text| text.contains("INCOMPLETE MODEL DELIVERY") && text.contains("artifact_id"))
     );
     assert!(
         texts
             .iter()
-            .all(|text| !text.contains("turn-input-budget-second"))
+            .any(|text| text.contains("turn-input-budget-second"))
     );
 }
 
@@ -3534,7 +3545,8 @@ fn new_context_tool_installs_fresh_window_before_next_generation() -> Result<()>
                 "request flag is consumed once, without a compaction generation"
             );
             assert!(sent[0].body_contains_text("old-conversation-sentinel"));
-            assert!(!sent[1].body_contains_text("old-conversation-sentinel"));
+            assert!(sent[1].body_contains_text("old-conversation-sentinel"),
+                "a fresh context window must preserve the unresolved original request");
             let context = |index: usize| {
                 [
                     sent[index].message_input_texts("user"),
@@ -3703,135 +3715,6 @@ fn first_turn_dispatch_aborts_never_completing_prewarm() -> Result<()> {
     )
 }
 
-#[test]
-fn checkpoint_lifecycle_reaches_next_model_request_without_reexecution() -> Result<()> {
-    run_turn_multi_thread_test_with_stack(
-        "checkpoint_lifecycle_reaches_next_model_request_without_reexecution",
-        || async {
-            let server = responses::start_mock_server().await;
-            let requests = responses::mount_sse_sequence(&server, vec![
-            responses::sse(vec![
-                responses::ev_function_call("completed-source", "read_file", r#"{"path":"completed.txt"}"#),
-                responses::ev_function_call("active-source", "read_file", r#"{"path":"active.txt"}"#),
-                responses::ev_completed("read"),
-            ]),
-            responses::sse(vec![responses::ev_function_call("checkpoint", "context_checkpoint", r#"{"completed_call_ids":["completed-source"],"retained_evidence":["active-source"],"summary":"Completed source consumed; active source still needed.","active_work":"Use active evidence.","answered_questions":[{"question":"What does completed.txt contain?","answer":"Repeated completed source evidence."}]}"#),responses::ev_completed("checkpoint")]),
-            responses::sse(vec![responses::ev_assistant_message("answer","Evidence retained."),responses::ev_completed("done")]),
-        ]).await;
-            let test = test_codex()
-                .with_config(|config| {
-                    config.features.enable(Feature::Kd4Runtime).unwrap();
-                    config.features.disable(Feature::CodeModeHost).unwrap();
-                    config.model_auto_compact_token_limit = Some(i64::MAX);
-                })
-                .build(&server)
-                .await?;
-            let source = "completed source evidence\n".repeat(500);
-            let active = "active unresolved evidence\n".repeat(500);
-            fs::write(test.workspace_path("completed.txt"), &source)?;
-            fs::write(test.workspace_path("active.txt"), &active)?;
-            let completion = test
-                .submit_turn_and_capture_completion(
-                    "Read both sources and checkpoint only the completed source.",
-                )
-                .await?;
-            assert!(completion.error.is_none(), "{completion:?}");
-            let sent = requests.requests();
-            assert_eq!(sent.len(), 3);
-            let result: serde_json::Value =
-                serde_json::from_str(&sent[2].function_call_output_text("checkpoint").unwrap())?;
-            assert_eq!(result["checkpointed_call_count"], 1);
-            let pin: serde_json::Value = serde_json::from_str(
-                &sent[2]
-                    .function_call_output_text("completed-source")
-                    .unwrap(),
-            )?;
-            assert_eq!(pin["kind"], "tool_history_artifact_pin");
-            assert_eq!(
-                sent[1].function_call_output_text("active-source"),
-                sent[2].function_call_output_text("active-source")
-            );
-            assert!(
-                sent[2]
-                    .function_call_output_text("completed-source")
-                    .unwrap()
-                    .len()
-                    < sent[1]
-                        .function_call_output_text("completed-source")
-                        .unwrap()
-                        .len()
-            );
-            let rollout_path = test.codex.rollout_path().expect("physical rollout");
-            let initial =
-                crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path)
-                    .await?;
-            let persisted = serde_json::to_string(initial.get_rollout_items())?;
-            assert!(persisted.contains("completed_phase_checkpoint"));
-            let calls = initial.get_rollout_items().iter().filter(|item| matches!(item,
-            codex_protocol::protocol::RolloutItem::ResponseItem(ResponseItem::FunctionCall {name, ..}) if name == "read_file")).count();
-            assert_eq!(calls, 2, "checkpoint must not re-run either producer");
-            let recovered = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
-                test.codex_home_path(),
-                &test.session_configured.session_id.to_string(),
-                pin["artifact_id"].as_str().unwrap(),
-            )
-            .await
-            .expect("checkpoint artifact remains recoverable");
-            assert!(String::from_utf8(recovered)?.contains("completed source evidence"));
-            let checkpoint = sent[2]
-                .message_input_texts("developer")
-                .into_iter()
-                .find_map(|text| {
-                    let body = text
-                        .strip_prefix("<completed_phase_checkpoint>\n")?
-                        .strip_suffix("\n</completed_phase_checkpoint>")?;
-                    serde_json::from_str::<serde_json::Value>(body).ok()
-                })
-                .expect("next request contains the persisted checkpoint");
-            assert_eq!(checkpoint["active_work"], "Use active evidence.");
-            assert_eq!(
-                checkpoint["answered_questions"],
-                serde_json::json!([{
-                    "question": "What does completed.txt contain?",
-                    "answer": "Repeated completed source evidence.",
-                }])
-            );
-            assert!(sent[2].message_input_texts("developer").iter().any(|text| {
-                text.contains("not host-verified facts")
-                    && text.contains("when required verification remains")
-            }));
-            assert!(
-                initial.get_rollout_items().iter().any(|item| {
-                    let codex_protocol::protocol::RolloutItem::ResponseItem(
-                        ResponseItem::Message { role, content, .. },
-                    ) = item else {
-                        return false;
-                    };
-                    role == "developer" && content.iter().any(|part| {
-                        let codex_protocol::models::ContentItem::InputText { text } = part else {
-                            return false;
-                        };
-                        text.strip_prefix("<completed_phase_checkpoint>\n")
-                            .and_then(|text| text.strip_suffix("\n</completed_phase_checkpoint>"))
-                            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-                            .is_some_and(|persisted| persisted == checkpoint)
-                    })
-                }),
-                "answered state and remaining obligations must be durable"
-            );
-            let retained = &checkpoint["retained_evidence"]["active-source"];
-            let recovered = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
-                test.codex_home_path(),
-                &test.session_configured.session_id.to_string(),
-                retained["artifact_id"].as_str().unwrap(),
-            )
-            .await
-            .expect("unresolved retained evidence remains recoverable");
-            assert!(String::from_utf8(recovered)?.contains("active unresolved evidence"));
-            Ok(())
-        },
-    )
-}
 
 #[test]
 fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()> {
@@ -3845,7 +3728,7 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
             let ready = scratch.path().join("ready");
             let release = scratch.path().join("release");
             let command = serde_json::json!({
-                "program":"cargo", "args":["test","--offline","--target-dir",scratch.path().join("target")],
+                "program":"cargo", "args":["test","--offline","-p","freshness_fixture","--target-dir",scratch.path().join("target")],
                 "yield_time_ms":300000, "max_output_tokens":2000,
             })
             .to_string();
@@ -5030,6 +4913,7 @@ async fn registered_tool_completion_survives_worker_abort_before_history_commit_
     let exact_output = "completed external result: 7 * 6 = 42";
     thread
         .submit(Op::DynamicToolResponse {
+            turn_id: turn.sub_id.clone(),
             id: "owned-result".to_string(),
             response: DynamicToolResponse {
                 content_items: vec![DynamicToolCallOutputContentItem::InputText {
@@ -8530,6 +8414,195 @@ fn audit_stop_hook_unchanged_failure_stops_after_one_repair() -> Result<()> {
             .await?;
         assert!(completion.error.is_some(), "{completion:?}");
         assert_eq!(requests.requests().len(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn completion_boundary_hook_repairs_compare_the_rejected_answer() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("completion_boundary_hook_repairs", || async {
+        core_test_support::require_network!();
+        for unrelated_read in [false, true] {
+            let server = responses::start_mock_server().await;
+            let answer = |id: &str, text: &str| responses::sse(vec![
+                responses::ev_assistant_message(id, text), responses::ev_completed(id),
+            ]);
+            let middle = if unrelated_read {
+                responses::sse(vec![responses::ev_function_call("unrelated", "read_file", r#"{"path":"unrelated.txt"}"#), responses::ev_completed("read")])
+            } else { answer("changed", "changed draft") };
+            let requests = responses::mount_sse_sequence(&server, vec![
+                answer("first", "draft"), middle,
+                answer("repeat", if unrelated_read { "draft" } else { "changed draft" }),
+            ]).await;
+            let test = test_codex().with_pre_build_hook(|home| {
+                let script = home.join("block_completion.py");
+                fs::write(&script, "import json,sys\njson.load(sys.stdin)\nprint(json.dumps({'decision':'block','reason':'same required repair'}))\n").unwrap();
+                fs::write(home.join("hooks.json"), serde_json::json!({"hooks":{"Stop":[{"hooks":[{
+                    "type":"command", "command":format!("python3 \"{}\"", script.display()),
+                    "commandWindows":format!("python \"{}\"", script.display())
+                }]}]}}).to_string()).unwrap();
+            }).with_config(trust_discovered_hooks).build(&server).await?;
+            fs::write(test.workspace_path("unrelated.txt"), "unrelated evidence")?;
+            let completion = test.submit_turn_and_capture_completion("Finish the answer").await?;
+            assert!(completion.error.is_some(), "{completion:?}");
+            assert_eq!(requests.requests().len(), 3, "unrelated_read={unrelated_read}");
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn completion_boundary_rejected_direct_answers_are_never_published() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("completion_boundary_direct_hooks", || async {
+        core_test_support::require_network!();
+        for mode in ["repair-model", "repair-direct", "abort"] {
+            let server = responses::start_mock_server().await;
+            let direct = |id: &str, text: &str| responses::sse(vec![
+                responses::ev_custom_tool_call(id, "exec", &format!("// @exec: {{\"deliver\":true}}\ntext('{}');", text)),
+                responses::ev_completed(id),
+            ]);
+            let mut sequence = vec![direct("candidate-a", "rejected A")];
+            if mode == "repair-direct" { sequence.push(direct("candidate-b", "accepted B")); }
+            if mode == "repair-model" { sequence.push(responses::sse(vec![
+                responses::ev_assistant_message("candidate-b", "accepted B"), responses::ev_completed("accepted"),
+            ])); }
+            let requests = responses::mount_sse_sequence(&server, sequence).await;
+            let test = test_codex().with_pre_build_hook(move |home| {
+                if mode != "abort" { write_one_shot_stop_hook(home).unwrap(); }
+            }).with_config(move |config| {
+                if mode != "abort" { trust_discovered_hooks(config); }
+                config.features.enable(Feature::CodeMode).unwrap();
+                config.features.enable(Feature::Kd4Runtime).unwrap();
+                if mode == "abort" {
+                    config.after_agent_policy = AfterAgentPolicy::MutatingFinalizer;
+                    config.notify = Some(vec![if cfg!(windows) { "python" } else { "python3" }.into(),
+                        "-c".into(), "import sys; sys.exit(1)".into()]);
+                }
+            }).build(&server).await?;
+            let completion = test.submit_turn_and_capture_completion("Finish the answer").await?;
+            assert_eq!(completion.error.is_some(), mode == "abort");
+            assert_eq!(completion.surfaced_result.is_some(), mode == "repair-direct");
+            if mode != "abort" { assert_eq!(completion.last_agent_message.as_deref(), Some("accepted B")); }
+            test.codex.flush_rollout().await?;
+            let (items, _, errors) = crate::rollout::recorder::RolloutRecorder::load_rollout_items(
+                &test.codex.rollout_path().unwrap(),
+            ).await?;
+            assert_eq!(errors, 0);
+            let answers = items.iter().filter_map(|item| match item {
+                codex_protocol::protocol::RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
+                    if role == "assistant" => Some(content),
+                _ => None,
+            }).collect::<Vec<_>>();
+            if mode == "abort" { assert!(answers.is_empty()); } else {
+                assert_eq!(answers, vec![&vec![ContentItem::OutputText { text:"accepted B".into() }]]);
+            }
+            assert_eq!(requests.requests().len(), if mode == "abort" { 1 } else { 2 });
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn audit_stop_hook_alternating_feedback_stops_when_a_repair_repeats() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("audit_stop_hook_alternating_feedback", || async {
+        core_test_support::require_network!();
+        let server = responses::start_mock_server().await;
+        let requests = responses::mount_sse_sequence(&server, (0..3).map(|index| {
+            responses::sse(vec![
+                responses::ev_assistant_message(&format!("draft-{index}"), "draft answer"),
+                responses::ev_completed(&format!("response-{index}")),
+            ])
+        }).collect()).await;
+        let test = test_codex().with_pre_build_hook(|home| {
+            let script = home.join("alternate_block.py");
+            fs::write(&script, "import json,sys,pathlib\njson.load(sys.stdin)\np=pathlib.Path(__file__).with_suffix('.count')\nn=int(p.read_text()) if p.exists() else 0\np.write_text(str(n+1))\nprint(json.dumps({'decision':'block','reason':['required A','required B'][n%2]}))\n").unwrap();
+            fs::write(home.join("hooks.json"), serde_json::json!({"hooks":{"Stop":[{"hooks":[{
+                "type":"command", "command":format!("python3 \"{}\"", script.display()),
+                "commandWindows":format!("python \"{}\"", script.display())
+            }]}]}}).to_string()).unwrap();
+        }).with_config(trust_discovered_hooks).build(&server).await?;
+        let completion = test.submit_turn_and_capture_completion("Finish the answer").await?;
+        assert!(completion.error.is_some(), "{completion:?}");
+        assert_eq!(requests.requests().len(), 3);
+        Ok(())
+    })
+}
+
+#[test]
+fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("post_validation_finalizer_boundary", || async {
+        core_test_support::require_network!();
+        let server = responses::start_mock_server().await;
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let command = serde_json::json!({
+            "program": python, "args": ["-B", "-m", "unittest", "test_fixture"],
+            "yield_time_ms": 300000,
+        }).to_string();
+        let requests = responses::mount_sse_sequence(&server, vec![
+            responses::sse(vec![responses::ev_function_call("validate", "exec_command", &command), responses::ev_completed("validated")]),
+            responses::sse(vec![responses::ev_assistant_message("answer", "The check passed."), responses::ev_completed("done")]),
+            responses::sse(vec![responses::ev_function_call("revalidate", "exec_command", &command), responses::ev_completed("revalidated")]),
+            responses::sse(vec![responses::ev_assistant_message("limitation", "The final-state validation failed; the final workspace is not verified."), responses::ev_completed("final")]),
+        ]).await;
+        let test = test_codex().with_config(move |config| {
+            config.features.enable(Feature::Kd4Runtime).unwrap();
+            config.features.enable(Feature::UnifiedExec).unwrap();
+            config.features.disable(Feature::CodeModeHost).unwrap();
+            config.after_agent_policy = AfterAgentPolicy::MutatingFinalizer;
+            config.notify = Some(vec![python.into(), "-c".into(),
+                "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text('changed'); c=p.with_suffix('.count'); c.write_text(c.read_text()+'1' if c.exists() else '1')".into(),
+                config.cwd.join("source.txt").to_string_lossy().into_owned(),
+            ]);
+        }).build(&server).await?;
+        fs::write(test.workspace_path("source.txt"), "original")?;
+        fs::write(test.workspace_path("test_fixture.py"), "import pathlib,unittest\nclass Check(unittest.TestCase):\n def test_source(self):\n  self.assertEqual(pathlib.Path('source.txt').read_text(), 'original')\n")?;
+        // Uncertain commands require a repository baseline to prove that
+        // validation did not mutate the finalizer's workspace.
+        let initialized = tokio::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(test.workspace_path("."))
+            .status().await?;
+        assert!(initialized.success());
+        test.codex.submit(Op::UserInput {
+            items: vec![UserInput::Text { text: "Run the check and finish.".into(), text_elements: Vec::new() }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        }).await?;
+        let mut boundary_reported = false;
+        let mut observed_events = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let event = test.codex.next_event().await.unwrap().msg;
+                observed_events.push(format!("{event:?}"));
+                match event {
+                    EventMsg::ExecApprovalRequest(approval) => {
+                        test.codex.submit(Op::ExecApproval {
+                            id: approval.approval_id.unwrap_or(approval.call_id),
+                            turn_id: Some(approval.turn_id),
+                            decision: codex_protocol::protocol::ReviewDecision::Approved,
+                        }).await.unwrap();
+                    }
+                    EventMsg::Warning(warning) => boundary_reported |= warning.message.contains("validation check(s) failed"),
+                    EventMsg::TurnComplete(completion) => {
+                        assert!(completion.error.is_none(), "{completion:?}");
+                        assert_eq!(completion.last_agent_message.as_deref(), Some("The final-state validation failed; the final workspace is not verified."));
+                        assert!(!completion.timing.unwrap().completion_assessment.unwrap().failed_checks.is_empty());
+                        break;
+                    }
+                    EventMsg::TurnAborted(event) => panic!("unexpected abort: {event:?}"),
+                    _ => {}
+                }
+            }
+        }).await.unwrap_or_else(|error| panic!("validation and finalizer complete: {error}; requests={}; events={observed_events:?}", requests.requests().len()));
+        assert!(boundary_reported);
+        assert_eq!(fs::read_to_string(test.workspace_path("source.txt"))?, "changed");
+        assert_eq!(fs::read_to_string(test.workspace_path("source.count"))?, "1");
+        let sent = requests.requests();
+        assert_eq!(sent.len(), 4);
+        assert!(sent[1].function_call_output_text("validate").unwrap().contains("OK"));
+        assert!(sent[3].function_call_output_text("revalidate").unwrap().contains("FAILED"));
         Ok(())
     })
 }

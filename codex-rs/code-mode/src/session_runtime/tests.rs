@@ -16,7 +16,250 @@ use crate::cell_actor::CompletionCommit;
 
 struct RecordingDelegate;
 
+#[test]
+fn terminal_accounting_charges_empty_items_and_escaping_and_spills_exactly() {
+    for text in ["", "\u{0000}\"\\\n"] {
+        let event = CellEvent::Completed { content_items: (0..200_000).map(|_| OutputItem::Text { text: text.into() }).collect(), error_text: None, output_loss: None };
+        assert!(cell_event_bytes(&event) >= serde_json::to_vec(&event).unwrap().len());
+        assert!(cell_event_bytes(&event) > TERMINAL_CELL_CACHE_MAX_BYTES);
+        let (cached, retained) = CachedCellEvent::new(event.clone());
+        assert_eq!(retained, 0);
+        assert_eq!(cached.read().unwrap(), event);
+    }
+}
+
+#[tokio::test]
+async fn terminal_replay_holds_admission_until_handoff_or_cancellation() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let event = CellEvent::Completed { content_items: vec![OutputItem::Text { text: "x".repeat(9 * 1024 * 1024) }], error_text: None, output_loss: None };
+    let bytes = cell_event_bytes(&event);
+    let id = CellId::new("cached");
+    runtime.inner.terminal_cells.lock().unwrap().insert(id.clone(), event.clone());
+    let withheld = Arc::clone(&runtime.inner.replay_bytes).acquire_many_owned((TERMINAL_REPLAY_MAX_BYTES - bytes) as u32).await.unwrap();
+    let first = runtime.begin_observe(&id, ObserveMode::Decision).await.unwrap();
+    let second = runtime.begin_observe(&id, ObserveMode::Decision);
+    tokio::pin!(second);
+    assert!(futures::poll!(&mut second).is_pending());
+    assert_eq!(runtime.inner.replay_bytes.available_permits(), 0);
+    assert_eq!(first.event().await.unwrap(), event);
+    let second = second.await.unwrap();
+    assert_eq!(runtime.inner.replay_bytes.available_permits(), 0);
+    drop(second);
+    assert_eq!(runtime.inner.replay_bytes.available_permits(), bytes);
+    drop(withheld);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn immutable_catalog_reuse_preserves_revision_identity_and_short_cell_results() {
+    use codex_code_mode_protocol::{ToolDefinition, CodeModeToolKind};
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let definitions: Arc<[ToolDefinition]> = (0..300).map(|index| ToolDefinition {
+        name: format!("tool_{index}"), tool_name: codex_protocol::ToolName::plain(format!("tool_{index}")),
+        description: "description of arguments and return shape ".repeat(80).into(),
+        kind: CodeModeToolKind::Function, input_schema: None, output_schema: None, default_timeout_ms: None,
+    }).collect();
+    let mut durations = [std::time::Duration::ZERO; 2];
+    // Warm the runtime first, then alternate order to avoid attributing V8
+    // startup or monotonic host load to immutable-catalog reuse.
+    let warm = runtime.execute(execute_request("text('warm');"), ObserveMode::Decision).await.unwrap();
+    warm.initial_event().await.unwrap();
+    for reuse in [false, true, true, false, false, true] {
+        let start = std::time::Instant::now();
+        for _ in 0..30 {
+            let mut request = execute_request("text('ok');");
+            request.enabled_tools = if reuse { Arc::clone(&definitions) } else { definitions.iter().cloned().collect() };
+            let cell = runtime.execute(request, ObserveMode::Decision).await.unwrap();
+            let event = cell.initial_event().await.unwrap();
+            assert!(matches!(event, CellEvent::Completed { error_text: None, .. }));
+            while runtime.inner.active_cell_permits.available_permits() != runtime.inner.active_cell_capacity {
+                tokio::task::yield_now().await;
+            }
+        }
+        durations[usize::from(reuse)] += start.elapsed();
+    }
+    eprintln!("short cells: rebuilt catalog {:?}; shared catalog {:?}; cells=90 each; tools=300", durations[0], durations[1]);
+    let cached = runtime.inner.catalog.lock().unwrap();
+    assert!(Arc::ptr_eq(&cached.as_ref().unwrap().0, &definitions));
+    assert!(cached.as_ref().unwrap().1.input_bytes() > 300 * 80 * 30);
+    drop(cached);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_completion_retains_unobserved_initial_yield() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    runtime.restore_durable_state(Some(&path)).await.unwrap();
+    let host = RuntimeCellHost {
+        cell_id: CellId::new("1"), parent_tool_call_id: "yielded".into(),
+        snapshot: HashMap::new(), inner: runtime.inner.clone(), cell_permit: Mutex::new(None),
+    };
+    let event = CellEvent::Completed {
+        content_items: vec![OutputItem::Text { text: "after".into() }],
+        error_text: None, output_loss: None,
+    };
+    let pending = Some(vec![OutputItem::Text { text: "before".into() }]);
+    let expected = crate::cell_actor::prepend_initial_yield(event.clone(), pending.clone());
+    assert_eq!(host.commit_completion(HashMap::new(), event, pending,
+        Arc::new(CellState::new(CancellationToken::new()))).await, CompletionCommit::Committed);
+    runtime.shutdown().await.unwrap();
+    drop(host);
+    drop(runtime);
+    let restored = SessionRuntime::new(Arc::new(RecordingDelegate));
+    restored.restore_durable_state(Some(&path)).await.unwrap();
+    assert_eq!(restored.cached_terminal_event(&CellId::new("1")).await.unwrap(), expected);
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn slow_snapshot_io_does_not_hold_readers_or_hide_late_publication() {
+    for publishing in [false, true] {
+        let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        runtime.restore_durable_state(Some(&path)).await.unwrap();
+        let durable = runtime.inner.durable_state.get().unwrap().clone();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let gate = Arc::new(StorageTestGate { entered: tokio::sync::Notify::new(), release: StdMutex::new(receiver) });
+        *durable.io_gate.lock().unwrap() = Some((publishing, gate.clone()));
+        let state = Arc::new(CellState::new(CancellationToken::new()));
+        let host = Arc::new(RuntimeCellHost {
+            cell_id: CellId::new("1"), parent_tool_call_id: "writer".into(),
+            snapshot: HashMap::new(), inner: runtime.inner.clone(), cell_permit: Mutex::new(None),
+        });
+        let event = CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None };
+        let commit = tokio::spawn({
+            let state = state.clone();
+            let event = event.clone();
+            async move { host.commit_completion(HashMap::from([("key".into(), StoredValue::new("key", JsonValue::Bool(true)))]),
+                event, None, state).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()).await.unwrap();
+        let values = tokio::time::timeout(Duration::from_millis(100), runtime.inner.stored_values.lock()).await
+            .expect("filesystem must not lock shared values");
+        assert_eq!(values.contains_key("key"), publishing);
+        drop(values);
+        let termination = state.request_termination();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), commit).await.unwrap().unwrap();
+        if publishing {
+            assert_eq!(outcome, CompletionCommit::Committed);
+            let completed = termination.await.unwrap();
+            assert!(matches!(&completed, CellEvent::Completed { error_text: Some(error), .. }
+                if error.contains("unconfirmed")));
+            runtime.inner.terminal_cells.lock().unwrap()
+                .insert(CellId::new("1"), completed);
+        } else {
+            assert_eq!(outcome, CompletionCommit::Rejected(event));
+            state.finish_termination(CellEvent::Terminated { content_items: Vec::new() });
+            assert!(matches!(termination.await.unwrap(), CellEvent::Terminated { .. }));
+        }
+        release.send(()).unwrap();
+        // The owned transaction retains this gate until all late I/O has settled.
+        let _settled = runtime.inner.commit_gate.lock().await;
+        let disk: JsonValue = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["values"].get("key").is_some(), publishing,
+            "rejected staging cannot publish late; admitted publication remains real");
+        if publishing {
+            let confirmed = runtime.begin_observe(&CellId::new("1"), ObserveMode::Decision)
+                .await.unwrap().event().await.unwrap();
+            assert_eq!(confirmed, CellEvent::Completed {
+                content_items: Vec::new(), error_text: None, output_loss: None,
+            }, "late publication must refine the cached receipt without a runtime restart");
+        }
+    }
+}
+
 struct PanickingClosedDelegate;
+
+#[tokio::test]
+async fn snapshot_staging_overlap_measures_complete_independent_cell_work() {
+    let mut totals = [Duration::ZERO; 2];
+    for baseline in [true, false] {
+        for _ in 0..3 {
+            let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state.json");
+            runtime.restore_durable_state(Some(&path)).await.unwrap();
+            let durable = runtime.inner.durable_state.get().unwrap().clone();
+            let (release, receiver) = std::sync::mpsc::channel();
+            let gate = Arc::new(StorageTestGate {
+                entered: tokio::sync::Notify::new(), release: StdMutex::new(receiver),
+            });
+            *durable.io_gate.lock().unwrap() = Some((false, gate.clone()));
+            let host = RuntimeCellHost {
+                cell_id: CellId::new("writer"), parent_tool_call_id: "writer".into(),
+                snapshot: HashMap::new(), inner: runtime.inner.clone(), cell_permit: Mutex::new(None),
+            };
+            let commit = tokio::spawn(async move {
+                host.commit_completion(
+                    HashMap::from([("writer".into(), StoredValue::new("writer", JsonValue::Bool(true)))]),
+                    CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None },
+                    None, Arc::new(CellState::new(CancellationToken::new())),
+                ).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()).await.unwrap();
+            // Emulate only the former lock lifetime, with identical staging,
+            // publication, independent work and receipt checks in both modes.
+            let old_read_lock = if baseline { Some(runtime.inner.stored_values.lock().await) } else { None };
+            let started = std::time::Instant::now();
+            let release_io = async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                *durable.io_gate.lock().unwrap() = None;
+                drop(old_read_lock);
+                release.send(()).unwrap();
+            };
+            let independent = async {
+                let cell = runtime.execute(execute_request(
+                    "await new Promise(resolve => setTimeout(resolve, 150)); store('independent', true); text('done');"
+                ), ObserveMode::Decision).await.unwrap();
+                let id = cell.cell_id.clone();
+                let event = cell.initial_event().await.unwrap();
+                assert!(matches!(event, CellEvent::Completed { error_text: None, .. }), "{event:?}");
+                id
+            };
+            let (_, id, committed) = tokio::join!(release_io, independent, commit);
+            assert_eq!(committed.unwrap(), CompletionCommit::Committed);
+            totals[usize::from(!baseline)] += started.elapsed();
+            let disk: JsonValue = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(disk["values"].get("writer").is_some());
+            assert!(disk["values"].get("independent").is_some());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while runtime.inner.active_cell_permits.available_permits() != runtime.inner.active_cell_capacity {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            assert!(runtime.cached_terminal_event(&id).await.is_ok());
+            runtime.shutdown().await.unwrap();
+        }
+    }
+    eprintln!("snapshot+independent-cell completion, 3 runs: old lock {:?}; unlocked {:?}; staging delay=150ms; independent work=150ms; retries=0", totals[0], totals[1]);
+    assert!(totals[1] < totals[0], "retain only a net critical-path improvement in this controlled fixture");
+}
+
+#[tokio::test]
+async fn held_terminal_spill_releases_execution_capacity_and_keeps_inline_receipt() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let (release, receiver) = std::sync::mpsc::channel();
+    let gate = Arc::new(StorageTestGate { entered: tokio::sync::Notify::new(), release: StdMutex::new(receiver) });
+    *runtime.inner.spill_gate.lock().unwrap() = Some(gate.clone());
+    let cell = runtime.execute(execute_request("for (let i = 0; i < 9; i++) text('x'.repeat(1024 * 1024));"),
+        ObserveMode::YieldAfter(Duration::from_secs(10))).await.unwrap();
+    let id = cell.cell_id.clone();
+    let initial = cell.initial_event().await.unwrap();
+    assert!(matches!(initial, CellEvent::Completed { error_text: None, .. }), "{initial:?}");
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()).await.unwrap();
+    assert_eq!(runtime.inner.active_cell_permits.available_permits(), runtime.inner.active_cell_capacity);
+    let receipt = runtime.cached_terminal_event(&id).await.unwrap();
+    assert!(matches!(receipt, CellEvent::Completed { content_items, error_text: None, .. }
+        if content_items.len() == 9 && content_items.iter().all(|item|
+            matches!(item, OutputItem::Text { text } if text.len() == 1024 * 1024))));
+    let next = runtime.execute(execute_request("text('next');"), ObserveMode::YieldAfter(Duration::from_secs(1))).await.unwrap();
+    assert!(matches!(next.initial_event().await.unwrap(), CellEvent::Completed { error_text: None, .. }));
+    tokio::time::timeout(Duration::from_secs(1), runtime.shutdown()).await.unwrap().unwrap();
+    release.send(()).unwrap();
+}
 
 impl SessionRuntimeDelegate for RecordingDelegate {
     async fn invoke_tool(
@@ -156,7 +399,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
             CreateCellRequest {
                 state_path: None,
                 tool_call_id: "reader".to_string(),
-                enabled_tools: Vec::new(),
+                enabled_tools: Vec::new().into(),
                 source: r#"text(String(load("candidate")));"#.to_string(),
                 default_tool_timeout_ms: 60_000,
             },
@@ -229,7 +472,7 @@ fn execute_request(source: &str) -> CreateCellRequest {
     CreateCellRequest {
         state_path: None,
         tool_call_id: "call-1".to_string(),
-        enabled_tools: Vec::new(),
+        enabled_tools: Vec::new().into(),
         source: source.to_string(),
         default_tool_timeout_ms: 60_000,
     }
@@ -287,12 +530,23 @@ async fn concurrent_store_conflict_preserves_winner_and_rejects_entire_write_set
         );
         let mut output = StoredValue::new("derived", JsonValue::from(0));
         output.read_dependencies = Some(Arc::new(std::collections::HashSet::from(["input".into()])));
-        host.commit_completion(
+        let state = Arc::new(CellState::new(CancellationToken::new()));
+        let commit = host.commit_completion(
             HashMap::from([("derived".into(), output)]),
             CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None },
             None,
-            Arc::new(CellState::new(CancellationToken::new())),
+            Arc::clone(&state),
         ).await;
+        assert_eq!(commit, CompletionCommit::Committed);
+        let CellEvent::Completed { error_text: Some(error), .. } = state.request_termination().await.unwrap() else {
+            panic!("expected a rejected transaction receipt");
+        };
+        let receipt: JsonValue = serde_json::from_str(&error).unwrap();
+        assert_eq!(receipt["conflicting_keys"], serde_json::json!([
+            {"key":"input", "key_truncated":false, "read":true, "write":false}
+        ]));
+        assert_eq!(receipt["external_effects_rolled_back"], false);
+        assert_eq!(receipt["automatic_replay_allowed"], false);
         let values = runtime.inner.stored_values.lock().await;
         assert_eq!(values["input"].value.as_ref(), &JsonValue::from(1));
         assert!(!values.contains_key("derived"), "stale reads cannot authorize derived writes");
@@ -334,6 +588,33 @@ async fn terminal_result_remains_observable_after_active_cell_removal() {
         .await;
     assert_eq!(observed, Ok(completed.clone()));
     assert_eq!(runtime.terminate(&cell_id).await, Ok(completed));
+}
+
+#[test]
+fn expired_terminal_evidence_is_bounded_and_never_inferred_from_ids() {
+    let mut cache = TerminalCellCache::default();
+    cache.insert(CellId::new("completed"), CellEvent::Completed {
+        content_items: Vec::new(), error_text: None, output_loss: None,
+    });
+    cache.insert(CellId::new("interrupted"), CellEvent::Terminated { content_items: Vec::new() });
+    for id in 0..TERMINAL_CELL_CACHE_CAPACITY {
+        cache.insert(CellId::new(id.to_string()), CellEvent::Completed {
+            content_items: Vec::new(), error_text: None, output_loss: None,
+        });
+    }
+    assert!(matches!(cache.lookup(&CellId::new("completed")), Err(Error::ExpiredResult { completed: true, .. })));
+    assert!(matches!(cache.lookup(&CellId::new("interrupted")), Err(Error::ExpiredResult { completed: false, .. })));
+    for id in ["reserved-but-unstarted", "never-allocated"] {
+        assert!(matches!(cache.lookup(&CellId::new(id)), Err(Error::MissingCell(_))));
+    }
+    for id in TERMINAL_CELL_CACHE_CAPACITY..3 * TERMINAL_CELL_CACHE_CAPACITY {
+        cache.insert(CellId::new(id.to_string()), CellEvent::Completed {
+            content_items: Vec::new(), error_text: None, output_loss: None,
+        });
+    }
+    assert_eq!(cache.expired.len(), TERMINAL_CELL_CACHE_CAPACITY);
+    assert!(matches!(cache.lookup(&CellId::new("completed")), Err(Error::MissingCell(_))),
+        "once lifecycle evidence expires, completion is unknown rather than inferred");
 }
 
 #[tokio::test]
@@ -378,6 +659,9 @@ async fn late_persistence_opt_in_runs_cell_without_replacing_live_state() {
         let permit = if active_cell {
             Some(Arc::clone(&runtime.inner.active_cell_permits).acquire_owned().await.unwrap())
         } else {
+            // A genuine collision remains memory-only; promotion is tested below.
+            let (existing, _) = snapshot::DurableState::open(path.clone()).unwrap();
+            drop(existing);
             runtime.inner.stored_values.lock().await.insert(
                 "existing".into(), StoredValue::new("existing", JsonValue::from("kept")),
             );
@@ -394,7 +678,7 @@ async fn late_persistence_opt_in_runs_cell_without_replacing_live_state() {
         assert!(matches!(&content_items[0], OutputItem::Text { text } if text.contains("in-memory state only")));
         assert!(matches!(&content_items[1], OutputItem::Text { text } if text == "executed"));
         assert!(runtime.inner.durable_state.get().is_none());
-        assert!(!path.exists(), "late opt-in must not modify the durable snapshot");
+        assert_eq!(path.exists(), !active_cell);
         let values = runtime.inner.stored_values.lock().await;
         assert_eq!(values["ran"].value.as_ref(), &JsonValue::Bool(true));
         if !active_cell {
@@ -415,7 +699,7 @@ fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
         error_text: None,
         output_loss: None,
     };
-    let half = TERMINAL_CELL_CACHE_MAX_BYTES / 2;
+    let half = TERMINAL_CELL_CACHE_MAX_BYTES / 2 - cell_event_bytes(&completed(0));
     let mut cache = TerminalCellCache::default();
     cache.insert(CellId::new("1"), completed(half));
     cache.insert(CellId::new("2"), completed(half));
@@ -435,8 +719,8 @@ fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
     cache.insert(CellId::new("4"), oversized.clone());
     assert_eq!(cache.get(&CellId::new("4")), Some(oversized));
     assert_eq!(cache.order.len(), 3);
-    assert_eq!(cache.retained_bytes, half + 1);
-    assert!(matches!(cache.entry(&CellId::new("4")).as_deref(), Some(CachedCellEvent::Spilled(_))));
+    assert_eq!(cache.retained_bytes, cell_event_bytes(&completed(half)) + cell_event_bytes(&completed(1)));
+    assert!(matches!(cache.entry(&CellId::new("4")).as_deref(), Some(CachedCellEvent::Spilled(..))));
 
     for index in 0..TERMINAL_CELL_CACHE_CAPACITY + 10 {
         cache.insert(CellId::new(format!("small-{index}")), completed(0));
@@ -444,7 +728,66 @@ fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
     assert_eq!(cache.order.len(), TERMINAL_CELL_CACHE_CAPACITY);
     assert_eq!(cache.events.len(), TERMINAL_CELL_CACHE_CAPACITY);
     assert_eq!(cache.get(&CellId::new("4")), None);
-    assert_eq!(cache.retained_bytes, 0);
+    assert_eq!(cache.retained_bytes, TERMINAL_CELL_CACHE_CAPACITY * cell_event_bytes(&completed(0)));
+}
+
+#[tokio::test]
+async fn named_state_promotes_discovers_and_retires_without_reexecuting_producers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let event = runtime.execute(execute_request(
+        r#"for (let i=0;i<256;i++) store('batch-'+String(i).padStart(3,'0'), {evidence:i});"#,
+    ), ObserveMode::Decision).await.unwrap().initial_event().await.unwrap();
+    assert!(matches!(event, CellEvent::Completed { error_text: None, .. }));
+    // Wait for the completed actor to release its admission permit.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.inner.active_cell_permits.available_permits() != runtime.inner.active_cell_capacity {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let mut request = execute_request(r#"
+        let keys=[], after;
+        do { const page=listKeys({after,limit:7}); keys.push(...page.keys); after=page.next_after; } while(after);
+        if(keys.length!==256 || load(keys[0]).evidence!==0) throw Error('discovery');
+        if(!deleteStored(keys[0]) || load(keys[0])!==undefined) throw Error('retirement');
+        store('replacement', {evidence:'retained'});
+    "#);
+    request.state_path = Some(path.clone());
+    let event = runtime.execute(request, ObserveMode::Decision).await.unwrap().initial_event().await.unwrap();
+    assert!(matches!(event, CellEvent::Completed { error_text: None, .. }), "{event:?}");
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let restored = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let mut request = execute_request(r#"
+        if(load('batch-000')!==undefined || load('replacement').evidence!=='retained' ||
+            load('batch-255').evidence!==255) throw Error('durability');
+    "#);
+    request.state_path = Some(path);
+    let event = restored.execute(request, ObserveMode::Decision).await.unwrap().initial_event().await.unwrap();
+    assert!(matches!(event, CellEvent::Completed { error_text: None, .. }), "{event:?}");
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn named_state_deletion_rejects_concurrent_replacement() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let original = StoredValue::new("key", JsonValue::from(1));
+    let host = RuntimeCellHost {
+        cell_id: CellId::new("delete"),
+        parent_tool_call_id: "parent".into(),
+        snapshot: HashMap::from([("key".into(), original)]),
+        inner: Arc::clone(&runtime.inner),
+        cell_permit: Mutex::new(None),
+    };
+    runtime.inner.stored_values.lock().await.insert("key".into(), StoredValue::new("key", JsonValue::from(2)));
+    let state = Arc::new(CellState::new(CancellationToken::new()));
+    host.commit_completion(HashMap::from([("key".into(), StoredValue::deletion("key"))]),
+        CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None },
+        None, Arc::clone(&state)).await;
+    assert!(matches!(state.request_termination().await.unwrap(), CellEvent::Completed { error_text: Some(_), .. }));
+    assert_eq!(*runtime.inner.stored_values.lock().await["key"].value, JsonValue::from(2));
+    runtime.shutdown().await.unwrap();
 }
 
 #[test]
@@ -555,7 +898,7 @@ fn buffered_spill_read_preserves_receipts_and_rejects_corruption() {
             None => {}
         }
         std::fs::write(file.path(), payload).unwrap();
-        let cached = CachedCellEvent::Spilled(file);
+        let cached = CachedCellEvent::Spilled(file, cell_event_bytes(&event));
         let result = cached.read();
         if suffix == Some(b"!".as_slice()) || suffix == Some(b"".as_slice()) {
             let error = result.unwrap_err().to_string();
@@ -583,7 +926,7 @@ async fn capacity_rejects_until_a_terminal_cell_releases_its_permit() {
         }
         let started = runtime
             .execute(
-                execute_request("await new Promise(() => {});"),
+                execute_request("await new Promise(resolve => setTimeout(resolve, 600_000));"),
                 ObserveMode::YieldAfter(Duration::from_millis(1)),
             )
             .await

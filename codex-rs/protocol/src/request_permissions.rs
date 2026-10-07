@@ -31,7 +31,7 @@ impl RequestPermissionProfile {
 }
 
 /// URI-preserving permission overlay granted by `request_permissions`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema, TS)]
 pub struct UriAdditionalPermissionProfile {
     pub network: Option<NetworkPermissions>,
     pub file_system: Option<FileSystemPermissions<PathUri>>,

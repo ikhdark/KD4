@@ -301,7 +301,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update or durable typed-task progress. Omit cursor to receive new assignment, workspace-epoch, gate, receipt, lease, and progress deltas using the caller's automatically retained position. Set an explicit cursor only to replay from that position. Does not return the content; returns either a summary of which agents have updates (if any), typed-task deltas, an interruption summary, or a timeout summary. The wait also ends early when new user input is steered into the active turn."
+        description: "Wait for a mailbox update or durable typed-task progress. Omit cursor to receive new assignment, gate, receipt, lease, and progress deltas using the caller's automatically retained position. These updates do not establish current workspace freshness. Set an explicit cursor only to replay from that position. Does not return the content; returns either a summary of which agents have updates (if any), typed-task deltas, an interruption summary, or a timeout summary. The wait also ends early when new user input is steered into the active turn."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -538,7 +538,7 @@ fn list_agents_output_schema() -> Value {
                     "type": "object",
                     "additionalProperties": true
                 },
-                "description": "Durable typed-task status including workspace epoch, progress, lease, pending gates, stale reason, and next action."
+                "description": "Durable typed-task status including workspace identity and strategy, progress, lease, pending gates, stale reason, and next action. Workspace freshness is not tracked; legacy epoch values do not establish freshness."
             }
         },
         "required": ["agents", "typed_tasks"],
@@ -1001,7 +1001,7 @@ fn typed_assignment_schema() -> JsonSchema {
         Some(false.into()),
     );
     schema.description = Some(
-        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit built-in agent_type: architect, explorer, worker, reviewer, verifier, or integrator. With omitted or `none` fork_turns, one structured TaskCapsule replaces the plaintext typed bootstrap message and is the sole initial task input."
+        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit built-in agent_type: architect, explorer, worker, reviewer, verifier, or integrator. Role requirements: architect/explorer need non-empty read_scope and empty required_evidence; worker needs non-empty write_scope and required_evidence; reviewer needs empty required_evidence; verifier/integrator need non-empty required_evidence. With omitted or `none` fork_turns, one structured TaskCapsule replaces the plaintext typed bootstrap message and is the sole initial task input."
             .to_string(),
     );
     schema

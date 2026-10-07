@@ -98,7 +98,10 @@ pub(super) fn spawn_tool<H: CellHost>(
         let mut invocation = invocation;
         let id = invocation.id.clone();
         let tool_name = invocation.name.name.clone();
-        let timeout_tool_name = tool_name.clone();
+        let timeout_tool_name = match &invocation.name.namespace {
+            Some(namespace) => format!("{namespace}__{tool_name}"),
+            None => tool_name.clone(),
+        };
         let timeout = invocation.timeout;
         let timeout_cancellation = cancellation.clone();
         // Publish the same instant the wrapper enforces, so every stage before
@@ -194,23 +197,29 @@ pub(super) async fn finish_callbacks(
     // The cell is going away, so every call still running under it is stopped
     // by the runtime rather than by the user. A call that already recorded its
     // own cause keeps it.
-    if matches!(completion, CallbackCompletion::Cancel) {
-        tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
-        // Both groups now have independent cleanup work. Give notifications
-        // their delivery grace without adding it to cancelled tools' grace.
-        tokio::join!(
-            async {
-                drain_tasks_bounded(notification_tasks, "notification", task_failure_handler).await;
-                notification_cancellation_token.cancel();
-            },
-            drain_tasks_bounded(tool_tasks, "tool", task_failure_handler),
-        );
-        return;
-    }
-    drain_tasks_bounded(notification_tasks, "notification", task_failure_handler).await;
-    notification_cancellation_token.cancel();
     tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
-    drain_tasks_bounded(tool_tasks, "tool", task_failure_handler).await;
+    // Completion abandons tools immediately, even while accepted notification
+    // delivery is held. Ordinary completion preserves each notification's
+    // delivery deadline; explicit cancellation retains its shorter grace.
+    tokio::join!(
+        async {
+            match completion {
+                CallbackCompletion::DrainNotifications => {
+                    tokio::select! {
+                        _ = drain_tasks(notification_tasks, "notification", task_failure_handler) => {}
+                        _ = notification_cancellation_token.cancelled() => {
+                            drain_tasks_bounded(notification_tasks, "notification", task_failure_handler).await;
+                        }
+                    }
+                }
+                CallbackCompletion::Cancel => {
+                    drain_tasks_bounded(notification_tasks, "notification", task_failure_handler).await;
+                }
+            }
+            notification_cancellation_token.cancel();
+        },
+        drain_tasks_bounded(tool_tasks, "tool", task_failure_handler),
+    );
 }
 
 pub(super) fn report_task_result(

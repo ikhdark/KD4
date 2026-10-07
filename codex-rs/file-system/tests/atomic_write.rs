@@ -1,6 +1,12 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+// Compile the private staging fault-injection test in this existing integration
+// target; the library intentionally disables its standalone unit-test target.
+#[allow(dead_code)]
+#[path = "../src/atomic_write.rs"]
+mod atomic_write;
+
 #[test]
 fn resolution_preserves_metadata_errors() {
     let error = codex_file_system::resolve_symlink_write_paths(Path::new("invalid\0path"))
@@ -65,6 +71,18 @@ fn atomically_replaces_existing_contents_with_bytes() {
 }
 
 #[test]
+fn replacement_detaches_only_the_addressed_hardlink() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("target");
+    let alias = directory.path().join("alias");
+    std::fs::write(&destination, b"old").unwrap();
+    std::fs::hard_link(&destination, &alias).unwrap();
+    codex_file_system::write_bytes_atomically_without_sync(&destination, b"new").unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+    assert_eq!(std::fs::read(&alias).unwrap(), b"old");
+}
+
+#[test]
 fn failed_replacement_preserves_destination_and_removes_staging_file() {
     let temp = tempfile::tempdir().unwrap();
     // A file cannot replace a non-empty directory, so publication fails after staging.
@@ -92,4 +110,50 @@ fn missing_target_can_be_created_after_resolution() {
     assert_eq!(paths.write_path, target);
     codex_file_system::write_atomically(&paths.write_path, "enabled = true").unwrap();
     assert_eq!(std::fs::read_to_string(target).unwrap(), "enabled = true");
+}
+
+#[test]
+fn unsynced_write_preserves_read_only_and_missing_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("readonly.txt");
+    std::fs::write(&target, "before").unwrap();
+    let original_permissions = std::fs::metadata(&target).unwrap().permissions();
+    let mut readonly = original_permissions.clone();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&target, readonly).unwrap();
+    let result = codex_file_system::write_bytes_atomically_without_sync(&target, b"after");
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"before");
+    assert!(std::fs::metadata(&target).unwrap().permissions().readonly());
+    std::fs::set_permissions(&target, original_permissions).unwrap();
+    let missing = temp.path().join("missing/child.txt");
+    assert!(codex_file_system::write_bytes_atomically_without_sync(&missing, b"after").is_err());
+    assert!(!missing.parent().unwrap().exists());
+}
+
+#[test]
+fn unsynced_write_preserves_original_without_delete_sharing() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("open.txt");
+    std::fs::write(&target, "before").unwrap();
+    let _reader = std::fs::OpenOptions::new().read(true).share_mode(3).open(&target).unwrap();
+    codex_file_system::write_bytes_atomically_without_sync(&target, b"after")
+        .expect_err("publication must not fall back to truncation");
+    assert_eq!(std::fs::read(&target).unwrap(), b"before");
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn unsynced_failed_write_does_not_truncate_or_leak_staging() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("locked.txt");
+    std::fs::write(&target, "before").unwrap();
+    let _reader = std::fs::OpenOptions::new().read(true).share_mode(1).open(&target).unwrap();
+    let error = codex_file_system::write_bytes_atomically_without_sync(&target, b"after").unwrap_err();
+    // Replacement can report access denied or sharing violation on Windows.
+    assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"before");
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
 }

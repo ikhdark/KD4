@@ -56,6 +56,7 @@ struct SelectedTurnEnvironmentState {
 #[derive(Clone)]
 pub(crate) struct StartingTurnEnvironment {
     pub(crate) selection: TurnEnvironmentSelection,
+    pub(crate) selection_index: usize,
     resolution: TurnEnvironmentResolution,
     _lifecycle: Option<Arc<TurnEnvironmentLifecycle>>,
 }
@@ -71,6 +72,10 @@ impl fmt::Debug for StartingTurnEnvironment {
 }
 
 impl StartingTurnEnvironment {
+    pub(crate) fn has_failed(&self) -> bool {
+        self.resolution.peek().is_some_and(Result::is_err)
+    }
+
     pub(crate) async fn wait_until_ready(&self) -> TurnEnvironmentResult {
         self.resolution.clone().await
     }
@@ -94,7 +99,8 @@ impl ThreadEnvironments {
         current: TurnEnvironmentSnapshot,
         non_blocking_snapshots: bool,
     ) -> Self {
-        // Reuse only attached environments from the supplied snapshot; drop starting entries.
+        // Preserve the selected order and shared startup ownership when inheriting.
+        let selections = current.to_selections();
         let generation = current.generation;
         // Retain inherited trackers even if their selections are later replaced:
         // an already-released remote snapshot can still be awaiting deletion.
@@ -106,7 +112,7 @@ impl ThreadEnvironments {
                     .filter_map(|environment| environment.shell_snapshot_tasks.clone()),
             )
             .collect();
-        let environments: Vec<SelectedTurnEnvironment> = current
+        let mut environments: Vec<SelectedTurnEnvironment> = current
             .turn_environments
             .into_iter()
             .map(|environment| {
@@ -120,7 +126,15 @@ impl ThreadEnvironments {
                     lifecycle,
                 }
             })
+            .chain(current.starting.into_iter().map(|environment| SelectedTurnEnvironment {
+                selection: environment.selection,
+                resolution: environment.resolution,
+                lifecycle: environment._lifecycle,
+            }))
             .collect();
+        environments.sort_by_key(|environment| {
+            selections.iter().position(|selection| selection == &environment.selection)
+        });
         let lifecycles = environments
             .iter()
             .filter_map(|environment| environment.lifecycle.as_ref().map(Arc::downgrade))
@@ -278,7 +292,7 @@ impl ThreadEnvironments {
         let current = self.environments.load_full();
         let mut turn_environments = Vec::with_capacity(current.environments.len());
         let mut starting = Vec::new();
-        for environment in &current.environments {
+        for (selection_index, environment) in current.environments.iter().enumerate() {
             let resolved = if wait_for_ready {
                 Some(environment.resolution.clone().await)
             } else {
@@ -286,12 +300,11 @@ impl ThreadEnvironments {
             };
             match resolved {
                 Some(Ok(turn_environment)) => turn_environments.push(turn_environment),
-                Some(Err(err)) => tracing::debug!(
-                    environment_id = %environment.selection.environment_id,
-                    "skipping failed turn environment: {err}"
-                ),
-                None => starting.push(StartingTurnEnvironment {
+                // Retain failures as resolved startup futures too: a failed primary
+                // must report its failure, not redirect an implicit operation.
+                Some(Err(_)) | None => starting.push(StartingTurnEnvironment {
                     selection: environment.selection.clone(),
+                    selection_index,
                     resolution: environment.resolution.clone(),
                     _lifecycle: environment.lifecycle.clone(),
                 }),
@@ -381,6 +394,9 @@ impl TurnEnvironmentSnapshot {
     }
 
     pub(crate) fn primary(&self) -> Option<&TurnEnvironment> {
+        if self.starting.iter().any(|environment| environment.selection_index == 0) {
+            return None;
+        }
         self.turn_environments.first()
     }
 
@@ -391,10 +407,14 @@ impl TurnEnvironmentSnapshot {
     }
 
     pub(crate) fn to_selections(&self) -> Vec<TurnEnvironmentSelection> {
-        self.turn_environments
+        let mut selections: Vec<_> = self.turn_environments
             .iter()
             .map(TurnEnvironment::selection)
-            .collect()
+            .collect();
+        for environment in &self.starting {
+            selections.insert(environment.selection_index, environment.selection.clone());
+        }
+        selections
     }
 
     pub(crate) fn primary_filesystem(&self) -> Option<Arc<dyn ExecutorFileSystem>> {
@@ -826,17 +846,23 @@ url = "ws://127.0.0.1:8765"
                 .collect::<Vec<_>>(),
             vec![remote.clone()]
         );
-        assert_eq!(starting.to_selections(), vec![local.clone()]);
+        assert_eq!(starting.to_selections(), vec![remote.clone(), local.clone()]);
+        assert!(starting.primary().is_none());
         assert!(starting.single_local_environment().is_none());
 
+        let cancellation = CancellationToken::new();
+        let pending_dispatch = crate::tools::handlers::wait_for_tool_environment(
+            &starting, None, &cancellation,
+        );
+        tokio::pin!(pending_dispatch);
+        assert!(timeout(Duration::from_millis(20), &mut pending_dispatch).await.is_err());
         let server = tokio::spawn(serve_environment_info(listener));
-        timeout(
-            std::time::Duration::from_secs(5),
-            starting.starting[0].resolution.clone(),
-        )
+        let selected = timeout(Duration::from_secs(5), pending_dispatch)
         .await
         .expect("environment resolution should finish")
-        .expect("environment resolution should succeed");
+        .expect("environment resolution should succeed")
+        .expect("selected primary");
+        assert_eq!(selected.environment_id, remote.environment_id);
         let attached = turn_environments.snapshot().await;
 
         assert!(attached.starting.is_empty());

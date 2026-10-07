@@ -529,11 +529,17 @@ impl TestCodexBuilder {
             new_conversation.thread.request_raw_response_items();
         }
 
+        let codex = TestCodexThread::new(
+            new_conversation.thread,
+            Arc::clone(&thread_manager),
+            Arc::clone(&cwd),
+            Arc::clone(&home),
+        );
         Ok(TestCodex {
             home,
             cwd,
             config,
-            codex: TestCodexThread::new(new_conversation.thread, Arc::clone(&thread_manager)),
+            codex,
             session_configured: new_conversation.session_configured,
             thread_manager,
             _test_env: test_env,
@@ -638,13 +644,22 @@ fn ensure_test_model_catalog(config: &mut Config) -> Result<()> {
 pub struct TestCodexThread {
     codex: Arc<CodexThread>,
     _thread_manager: Arc<ThreadManager>,
+    _cwd: Arc<TempDir>,
+    _home: Arc<TempDir>,
 }
 
 impl TestCodexThread {
-    fn new(codex: Arc<CodexThread>, thread_manager: Arc<ThreadManager>) -> Self {
+    fn new(
+        codex: Arc<CodexThread>,
+        thread_manager: Arc<ThreadManager>,
+        cwd: Arc<TempDir>,
+        home: Arc<TempDir>,
+    ) -> Self {
         Self {
             codex,
             _thread_manager: thread_manager,
+            _cwd: cwd,
+            _home: home,
         }
     }
 
@@ -652,8 +667,8 @@ impl TestCodexThread {
         self.codex = codex;
     }
 
-    pub fn into_parts(self) -> (Arc<CodexThread>, Arc<ThreadManager>) {
-        (self.codex, self._thread_manager)
+    pub fn into_parts(self) -> (Arc<CodexThread>, Arc<ThreadManager>, Arc<TempDir>) {
+        (self.codex, self._thread_manager, self._cwd)
     }
 }
 

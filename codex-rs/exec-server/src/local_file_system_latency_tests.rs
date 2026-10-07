@@ -225,9 +225,10 @@ async fn native_walk_metadata_preserves_link_kinds_and_raw_budgets() -> anyhow::
         max_entries: 10,
         follow_directory_symlinks: false,
         prune_hidden_directories: false,
+        filters: Default::default(),
     };
     let fs = LocalFileSystem::unsandboxed();
-    let walk = fs.walk(&uri, options, None).await?;
+    let walk = fs.walk(&uri, options.clone(), None).await?;
     assert_eq!(
         walk.entries
             .iter()

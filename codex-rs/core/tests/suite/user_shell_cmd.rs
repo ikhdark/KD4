@@ -76,7 +76,7 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
     else {
         unreachable!()
     };
-    assert_eq!(exit_code, 0);
+    assert_eq!(exit_code, Some(0));
     assert!(
         stdout.contains(file_name),
         "ls output should include {file_name}, got: {stdout:?}"
@@ -108,7 +108,7 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
     else {
         unreachable!()
     };
-    assert_eq!(exit_code, 0);
+    assert_eq!(exit_code, Some(0));
     {
         // Windows shells emit CRLF line endings; normalize so the assertion remains portable.
         stdout = stdout.replace("\r\n", "\n");
@@ -363,7 +363,7 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
         _ => None,
     })
     .await;
-    assert_eq!(end_event.exit_code, 0);
+    assert_eq!(end_event.exit_code, Some(0));
     assert_eq!(end_event.stdout.trim(), "not-set");
 
     let _ = wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -431,7 +431,7 @@ async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Re
     };
 
     assert_eq!(
-        exit_code, 0,
+        exit_code, Some(0),
         "shell command should execute successfully. stdout=`{stdout}`, stderr=`{stderr}`",
     );
     assert_eq!(stdout.trim(), "not-set");

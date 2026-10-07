@@ -669,6 +669,10 @@ impl ApplyPatchHandler {
                             crate::tools::runtimes::apply_patch::patch_failure_kind(&parse_error),
                         )],
                     );
+                    let mismatch = match &parse_error {
+                        codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) => Some(mismatch),
+                        _ => None,
+                    };
                     let observed_source = match &parse_error {
                         codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) => Some(serde_json::json!({
                             "path": mismatch.canonical_path, "sha256": mismatch.current_content_sha256,
@@ -683,7 +687,7 @@ impl ApplyPatchHandler {
                     Ok(boxed_tool_output(ApplyPatchToolOutput::from_delta(
                         format!("apply_patch verification failed: {parse_error}"), false,
                         &Default::default(), Some(turn_environment.environment_id.clone()),
-                    ).with_retry(retry)))
+                    ).with_retry(retry).with_patch_mismatch(mismatch)))
                 }
                 codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
                     tracing::trace!("Failed to parse apply_patch input, {error:?}");
@@ -832,9 +836,15 @@ impl CoreToolRuntime for ApplyPatchHandler {
                     "retained patch working directory changed".into(),
                 ));
             }
-            retained
-                .consume(&retry.id)
+            let receipt = retained
+                .replace_after_hook(&retry.id, patch, &invocation.call_id)
                 .map_err(FunctionCallError::RespondToModel)?;
+            let id = receipt["patch_id"].as_str().expect("retained replacement id");
+            invocation.payload = ToolPayload::Custom {
+                input: format!("*** Begin Patch\n*** Retry Patch: {id}\n*** End Patch"),
+            };
+            drop(retained);
+            return Ok(invocation);
         }
         invocation.payload = match invocation.payload {
             ToolPayload::Custom { .. } => ToolPayload::Custom {
@@ -1036,7 +1046,7 @@ async fn run_owned_patch(
                     runtime.committed_delta(),
                     Some(req.turn_environment.environment_id.clone()),
                 )
-                .with_retry(retry))
+                .with_retry(retry).with_patch_mismatch(runtime.patch_mismatch()))
             }
             Err(error) => Err(error),
         };

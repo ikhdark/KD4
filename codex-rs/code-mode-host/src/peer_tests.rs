@@ -25,6 +25,40 @@ use tokio_util::sync::CancellationToken;
 use super::HostPeer;
 
 #[tokio::test]
+async fn outgoing_bytes_remain_charged_until_delivery_with_reserved_control() {
+    let (tx, mut rx) = mpsc::channel(super::super::OUTGOING_FRAME_CAPACITY);
+    let mut peer = HostPeer::new(tx);
+    peer.outgoing_bytes = Arc::new(Semaphore::new(1024));
+    peer.failure_bytes = Arc::new(Semaphore::new(256));
+    let message = || HostToClient::DelegateRequest {
+        id: codex_code_mode_protocol::host::DelegateRequestId::new(1),
+        session_id: session_id("s"),
+        request: DelegateRequest::Notify { call_id: "call".into(), cell_id: CellId::new("cell".into()).into(), text: "x".repeat(256) },
+    };
+    assert!(peer.send(message()).is_ok());
+    assert!(peer.send(message()).is_err());
+    assert!(!peer.is_disconnected());
+    let frame = rx.recv().await.unwrap();
+    assert!(peer.outgoing_bytes.available_permits() < 1024);
+    // Dequeue alone must not release bytes while the transport is stalled.
+    assert!(peer.send(message()).is_err());
+    let failure = || HostToClient::Response {
+        id: RequestId::new(1),
+        result: codex_code_mode_protocol::host::WireResult::Err { message: "busy".into() },
+    };
+    assert!(peer.send(failure()).is_ok());
+    assert!(peer.send(failure()).is_err());
+    assert_eq!(peer.control_bytes.available_permits(), super::OUTGOING_CONTROL_BYTES);
+    assert!(peer.send(HostToClient::CancelDelegateRequest {
+        id: codex_code_mode_protocol::host::DelegateRequestId::new(1), cause: None,
+    }).is_ok());
+    assert!(peer.send(HostToClient::CellClosed { session_id: session_id("s"), cell_id: CellId::new("cell".into()).into() }).is_ok());
+    drop(frame);
+    assert_eq!(peer.outgoing_bytes.available_permits(), 1024);
+    assert!(peer.send(message()).is_ok());
+}
+
+#[tokio::test]
 async fn revoked_callback_after_cell_closure_does_not_recreate_route() {
     tokio::time::timeout(Duration::from_secs(1), async {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);

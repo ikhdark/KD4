@@ -222,7 +222,7 @@ async fn stall_timeout_exec_command_preserves_session_between_polls() {
         tool_name: codex_tools::ToolName::plain("write_stdin"),
         source: ToolCallSource::Direct,
         payload: ToolPayload::Function {
-            arguments: serde_json::json!({"session_id": process_id, "yield_time_ms": 1000}).to_string(),
+            arguments: serde_json::json!({"session_id": process_id, "incarnation":result["session_capabilities"]["incarnation"], "yield_time_ms": 1000}).to_string(),
         },
         cancellation_token: tokio_util::sync::CancellationToken::new(),
     };
@@ -232,13 +232,13 @@ async fn stall_timeout_exec_command_preserves_session_between_polls() {
         .expect("stalled command returns its live session");
     assert_eq!(output.outcome_for_logging(), codex_tools::ToolOutputOutcome::Yielded);
     let result = output.code_mode_result(&payload);
-    assert!(result["output"].as_str().unwrap().contains("command stalled after 3500 milliseconds"));
+    assert!(result["output"].as_str().unwrap().contains("no output observed for 3500 milliseconds"));
     assert_eq!(result["execution_state"], "running");
     assert_eq!(result["process_exited"], false);
     assert_eq!(result["session_id"], process_id);
     assert!(format!("{initial_output}{}", result["output"].as_str().unwrap()).contains("ready"));
     let wait_payload = ToolPayload::Function {
-        arguments: serde_json::json!({"session_id":process_id, "wait_for_output":true}).to_string(),
+        arguments: serde_json::json!({"session_id":process_id, "incarnation":result["session_capabilities"]["incarnation"], "wait_for_output":true}).to_string(),
     };
     let completed = WriteStdinHandler::default().handle(ToolInvocation {
         session, step_context, tracker,
@@ -284,6 +284,48 @@ fn exec_command_boundary_reports_branch_field_and_bound_errors() {
     .unwrap();
     assert_eq!(adjusted.yield_time_ms, 250);
     assert!(adjusted.argument_notices.iter().any(|notice| notice.contains("250")));
+}
+
+#[tokio::test]
+async fn nested_exec_command_preserves_explicit_output_caps() {
+    for (nested, cap, reduced) in [
+        (false, Some(32), true),
+        (true, Some(32), true),
+        (true, Some(0), true),
+        (true, None, false),
+        (true, Some(10_000), false),
+    ] {
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "program": "python",
+                "args": ["-c", "print('output line\\n' * 1000, end='')"],
+                "yield_time_ms": 30000,
+                "max_output_tokens": cap,
+            }).to_string(),
+        };
+        let mut invocation = invocation_for_payload_without_sandbox(
+            "exec_command", "nested-output-cap", payload.clone(),
+        ).await;
+        if nested {
+            invocation.source = ToolCallSource::CodeMode {
+                cell_id: "output-cap-cell".into(),
+                parent_call_id: None,
+                runtime_tool_call_id: "output-cap-tool".into(),
+                nested_deadline: None,
+                cancellation_cause: None,
+            };
+        }
+        let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+        let result = output.code_mode_result(&payload);
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(result["output_reduced"], reduced, "nested={nested}, cap={cap:?}");
+        if !reduced {
+            assert_eq!(result["output"].as_str().unwrap().lines().count(), 1000);
+        }
+        if cap == Some(0) {
+            assert_eq!(result["output"], "");
+        }
+    }
 }
 
 #[tokio::test]
@@ -513,14 +555,15 @@ async fn exec_command_cancellation_waits_for_confirmed_process_cleanup() {
         .allocate_process_id()
         .await;
     assert_eq!(
-        process_id, 1000,
-        "the cancelled reservation must be released"
+        process_id, 1001,
+        "a published process identity must never be reused"
     );
     session
         .services
         .unified_exec_manager
         .release_process_id(process_id)
         .await;
+    assert!(!session.services.unified_exec_manager.has_process_reservations_for_test().await);
 }
 
 #[tokio::test]
@@ -603,6 +646,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
     let raw_output = b"ParserError: Unexpected token 'foo'".to_vec();
     let existing_repair_notice = "Preflight repaired the command.";
     let mut output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -690,6 +734,7 @@ fn terminal_powershell_nonterminating_error_exposes_recovery_hint_after_success(
     assert!(String::from_utf8_lossy(&result.stderr).contains("PositionalParameterNotFound"));
     let raw_output = [result.stdout, result.stderr].concat();
     let mut output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -786,6 +831,7 @@ async fn passive_nested_write_stdin_preserves_wrapper_return_margin() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
             "session_id": process_id, "wait_for_output": true,
+            "incarnation": started["session_capabilities"]["incarnation"],
         }).to_string(),
     };
     let started_at = tokio::time::Instant::now();
@@ -859,6 +905,7 @@ async fn write_stdin_terminates_non_pty_process_and_retains_output() {
         let ready_payload = ToolPayload::Function {
             arguments: serde_json::json!({
                 "session_id": process_id, "wait_for_output": true,
+                "incarnation": started["session_capabilities"]["incarnation"],
             }).to_string(),
         };
         let ready = WriteStdinHandler::default().handle(ToolInvocation {
@@ -873,10 +920,32 @@ async fn write_stdin_terminates_non_pty_process_and_retains_output() {
         }).await.unwrap().code_mode_result(&ready_payload);
         assert!(ready["output"].as_str().unwrap().contains("termination-output"));
     }
+    let mut reviewer_step = (*step_context).clone();
+    let mut reviewer_turn = step_context.turn.with_model(
+        step_context.turn.model_info.slug.clone(),
+        &session.services.models_manager,
+    ).await;
+    reviewer_turn.session_source =
+        codex_protocol::protocol::SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::Review);
+    reviewer_step.turn = Arc::new(reviewer_turn);
+    let rejected = WriteStdinHandler::default().handle(ToolInvocation {
+        session: Arc::clone(&session), step_context: Arc::new(reviewer_step),
+        tracker: Arc::clone(&tracker), call_id: "reviewer-termination".into(),
+        tool_name: codex_tools::ToolName::plain("write_stdin"), source: ToolCallSource::Direct,
+        payload: ToolPayload::Function { arguments: serde_json::json!({
+            "session_id": process_id, "terminate": true,
+            "incarnation": started["session_capabilities"]["incarnation"],
+        }).to_string() },
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+    }).await;
+    assert!(matches!(rejected, Err(crate::FunctionCallError::RespondToModel(ref text))
+        if text.contains("independent reviewers may only poll")));
+    assert!(!session.services.unified_exec_manager.list_processes().await.is_empty());
     for chars in ["must-not-be-written", ""] {
         let payload = ToolPayload::Function {
             arguments: serde_json::json!({
                 "session_id": process_id, "terminate": true, "chars": chars,
+                "incarnation": started["session_capabilities"]["incarnation"],
             }).to_string(),
         };
         let result = WriteStdinHandler::default().handle(ToolInvocation {
@@ -1007,6 +1076,7 @@ async fn repeated_rg_miss_uses_workspace_identity_across_epoch_advance() {
             "program": "rg",
             "args": [
                 "-n",
+                "--no-config", "--no-ignore-global", "--no-ignore-parent",
                 "__codex_negative_cache_unmatched_probe__",
                 search_target,
             ],
@@ -1104,6 +1174,9 @@ async fn command_handlers_normalize_status_and_distinguish_search_misses_from_er
             ),
             ("rg", vec!["missing-needle", "fixture.txt"], true, false, ""),
         ] {
+            let args = if program == "rg" {
+                [vec!["--no-config", "--no-ignore-global", "--no-ignore-parent"], args].concat()
+            } else { args };
             let mut arguments = serde_json::json!({
                 "kind": "argv", "program": program, "args": args,
                 "workdir": repository.path(),
@@ -1137,7 +1210,7 @@ async fn command_handlers_normalize_status_and_distinguish_search_misses_from_er
             assert_eq!(
                 output.success_for_logging(),
                 expected_success,
-                "{tool}: {args:?}"
+                "{tool}: {args:?}: {}", output.log_preview()
             );
             let signal = output
                 .sampling_request_signal()
@@ -1799,7 +1872,7 @@ async fn read_only_preflight_repair_executes_and_releases_process_id() {
         .unified_exec_manager
         .allocate_process_id()
         .await;
-    assert_eq!(process_id, 1000);
+    assert_eq!(process_id, 1001);
     session
         .services
         .unified_exec_manager
@@ -1875,6 +1948,27 @@ async fn missing_rg_path_advisory_reaches_the_model_without_hiding_results_or_er
 }
 
 #[tokio::test]
+async fn rg_code_items_reach_model_without_changing_search_output() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("sample.rs"), "fn needle() {\n needle();\n}\n").unwrap();
+    let payload = ToolPayload::Function { arguments: serde_json::json!({
+        "program": "rg", "args": ["--no-config", "-n", "needle", "sample.rs"],
+        "workdir": fixture.path(), "yield_time_ms": 10_000,
+    }).to_string() };
+    let invocation = invocation_for_payload_without_sandbox("exec_command", "rg-code-items", payload.clone()).await;
+    let output = ExecCommandHandler::default().handle(invocation).await.unwrap();
+    let result = output.code_mode_result(&payload);
+    assert_eq!(result["exit_code"], 0);
+    let text = result["output"].as_str().unwrap();
+    assert!(text.contains("1:fn needle() {"), "{result}");
+    assert!(!text.contains("code:"));
+    assert!(text.contains("2: needle();"), "{result}");
+    // Command output stays exact; structural selectors belong to read_file,
+    // rather than an automatic source pass attached to every search.
+    assert!(result.get("repair").is_none(), "{result}");
+}
+
+#[tokio::test]
 async fn ignored_deadlines_execute_once_and_report_the_adjustment() {
     let temp = tempfile::tempdir().expect("deadline rejection directory");
     let marker = temp.path().join("executed");
@@ -1942,12 +2036,13 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_remains_retryab
             .unified_exec_manager
             .allocate_process_id()
             .await;
-        assert_eq!(process_id, 1000);
+        assert_eq!(process_id, 1000 + attempt);
         session
             .services
             .unified_exec_manager
             .release_process_id(process_id)
             .await;
+        assert!(!session.services.unified_exec_manager.has_process_reservations_for_test().await);
     }
 
     let payload_with_output_only_change = ToolPayload::Function {
@@ -2635,6 +2730,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         arguments: serde_json::json!({ "cmd": "echo three", "tty": false }).to_string(),
     };
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -2674,6 +2770,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         arguments: serde_json::json!({ "cmd": "echo three", "tty": true }).to_string(),
     };
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -2714,6 +2811,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         arguments: serde_json::json!({ "cmd": "echo three", "tty": false }).to_string(),
     };
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -2749,6 +2847,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         .to_string(),
     };
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -2819,6 +2918,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         arguments: serde_json::json!({ "session_id": 45, "chars": "" }).to_string(),
     };
     let output_a = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -2840,6 +2940,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         pending_deferred_completions: Vec::new(),
     };
     let output_b = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -3011,7 +3112,7 @@ async fn assert_completed_exec_reports_tool_history_failure(background: bool) {
             tool_name: codex_tools::ToolName::plain("write_stdin"),
             source: ToolCallSource::Direct,
             payload: ToolPayload::Function {
-                arguments: serde_json::json!({"session_id": process_id, "chars": "finish\n", "yield_time_ms": 1000}).to_string(),
+                arguments: serde_json::json!({"session_id": process_id, "incarnation": output.code_mode_result(&payload)["session_capabilities"]["incarnation"], "chars": "finish\n", "yield_time_ms": 1000}).to_string(),
             },
         })).await.expect("exited process must finish terminal persistence and cleanup")
     } else {
@@ -3022,6 +3123,8 @@ async fn assert_completed_exec_reports_tool_history_failure(background: bool) {
         Err(error) => error,
     };
     assert!(matches!(error, crate::FunctionCallError::Fatal(_)));
+    assert!(error.to_string().contains("MUTATION_FINISHED"),
+        "fatal durability failure must retain already-observed command output: {error}");
     assert_eq!(
         tokio::fs::read_to_string(&changed_path).await.unwrap(),
         "after"
@@ -3070,9 +3173,9 @@ async fn assert_completed_exec_reports_tool_history_failure(background: bool) {
         .unified_exec_manager
         .allocate_process_id()
         .await;
-    assert_eq!(
+    assert_ne!(
         next_id, process_id,
-        "completed command must release the reserved process slot"
+        "retired process handles must not alias later commands"
     );
     session
         .services
@@ -3186,7 +3289,7 @@ async fn stdin_completion_prepares_recovery_notice_for_both_output_consumers() {
                 .handle(invoke(
                     "write_stdin",
                     serde_json::json!({
-                        "session_id": session_id, "chars": chars,
+                        "session_id": session_id, "incarnation": start_json["session_capabilities"]["incarnation"], "chars": chars,
                         "yield_time_ms": 1000, "max_output_tokens": 100
                     }),
                 ))
@@ -3544,7 +3647,7 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
                                 tool_name: codex_tools::ToolName::plain("write_stdin"),
                                 call_id: "uri-grant-poll".into(),
                                 payload: ToolPayload::Function {
-                                    arguments: json!({"session_id": id, "chars": "", "yield_time_ms": 1000}).to_string(),
+                                    arguments: json!({"session_id": id, "incarnation": result["session_capabilities"]["incarnation"], "chars": "", "yield_time_ms": 1000}).to_string(),
                                 },
                             },
                             tokio_util::sync::CancellationToken::new(),
@@ -3616,11 +3719,12 @@ fn registered_shell_analysis_yields_and_preserves_search_results() {
         .expect("single-worker tool runtime");
     runtime.block_on(async {
         for tool_name in ["shell_command", "exec_command"] {
-            for scenario in ["original", "repaired", "denied", "mutating", "script_typo"] {
+            for scenario in ["original", "repaired", "denied", "mutating", "script_typo", "opaque_argv"] {
                 let repaired = scenario == "repaired";
                 let denied = scenario == "denied";
                 let mutating = scenario == "mutating";
                 let script_typo = scenario == "script_typo";
+                let opaque_argv = scenario == "opaque_argv";
                 let workspace = tempfile::tempdir().expect("selected command cwd");
                 std::fs::write(
                     workspace.path().join("input.txt"),
@@ -3640,7 +3744,7 @@ fn registered_shell_analysis_yields_and_preserves_search_results() {
                 let mut config = (*turn_mut.config).clone();
                 config.features.enable(codex_features::Feature::UnifiedExec).unwrap();
                 config.features.disable(codex_features::Feature::DirectRuntime).unwrap();
-                config.permissions.allow_login_shell = false;
+                config.permissions.allow_login_shell = true;
                 config.permissions.approval_policy = crate::config::Constrained::allow_any(
                     codex_protocol::protocol::AskForApproval::Never,
                 );
@@ -3682,7 +3786,13 @@ fn registered_shell_analysis_yields_and_preserves_search_results() {
                     "rg --ignore-case --color never -n needle input.txt".to_string()
                 };
                 // Only direct argv has the execution-safe equivalent repair contract.
-                let arguments = if repaired {
+                let arguments = if opaque_argv {
+                    serde_json::json!({
+                        "program": "powershell.exe",
+                        "args": ["-NoProfile", "-Command", "Get-Content input.txt"],
+                        "workdir": workspace.path(), "login": false,
+                    })
+                } else if repaired {
                     serde_json::json!({
                         "kind": "argv", "program": "rg",
                         "args": ["--ignorecase", "--color", "never", "-n", "needle", "input.txt"],
@@ -3694,6 +3804,8 @@ fn registered_shell_analysis_yields_and_preserves_search_results() {
                         "workdir": workspace.path(), "login": false,
                     })
                 };
+                let mut arguments = arguments;
+                if !mutating { arguments.as_object_mut().unwrap().remove("login"); }
                 let payload = ToolPayload::Function { arguments: arguments.to_string() };
                 let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
                 let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -3734,7 +3846,7 @@ fn registered_shell_analysis_yields_and_preserves_search_results() {
                     panic!("registered shell tool must return a function result");
                 };
                 let text = output.body.to_text().expect("command output");
-                if denied || script_typo {
+                if denied || script_typo || opaque_argv {
                     assert_eq!(output.success, Some(false));
                     let expected_error = if script_typo {
                         "known_flag_typo"
@@ -3849,7 +3961,7 @@ async fn registered_exec_declared_validation_survives_yield_and_stdin_completion
                 tool_name: codex_tools::ToolName::plain("write_stdin"),
                 call_id: "declared-validation-poll".into(),
                 payload: ToolPayload::Function {
-                    arguments: json!({"session_id": id, "chars": "", "yield_time_ms": 10000})
+                    arguments: json!({"session_id": id, "incarnation": result["session_capabilities"]["incarnation"], "chars": "", "yield_time_ms": 10000})
                         .to_string(),
                 },
             },

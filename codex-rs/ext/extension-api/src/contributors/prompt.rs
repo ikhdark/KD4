@@ -12,6 +12,7 @@ pub enum PromptSlot {
 pub struct PromptFragment {
     slot: PromptSlot,
     text: String,
+    unavailable: bool,
 }
 
 impl PromptFragment {
@@ -20,6 +21,7 @@ impl PromptFragment {
         Self {
             slot,
             text: text.into(),
+            unavailable: false,
         }
     }
 
@@ -47,4 +49,12 @@ impl PromptFragment {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    /// The producer could not obtain an authoritative snapshot. This is not an
+    /// empty successful contribution and must not revoke its previous values.
+    pub fn unavailable() -> Self {
+        Self { slot: PromptSlot::SeparateDeveloper, text: String::new(), unavailable: true }
+    }
+
+    pub fn is_unavailable(&self) -> bool { self.unavailable }
 }

@@ -33,6 +33,7 @@ async fn nested_tool_input_presence_survives_the_host_transport() {
             tool_kind: CodeModeToolKind::Function,
             input,
             nested_deadline: None,
+            buffered_output_bytes: 321,
         };
         let runtime_json = serde_json::to_value(&expected).expect("encode runtime invocation");
         assert_eq!(runtime_json.get("input"), expected.input.as_ref());
@@ -98,6 +99,7 @@ mod nested_deadline_transport {
             tool_kind: CodeModeToolKind::Function,
             input: None,
             nested_deadline,
+            buffered_output_bytes: 321,
         }
     }
 

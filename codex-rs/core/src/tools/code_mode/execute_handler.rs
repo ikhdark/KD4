@@ -34,7 +34,7 @@ struct TimeoutCatalog {
     tools: Arc<[codex_code_mode::ToolDefinition]>,
 }
 
-fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usize) -> Option<String> {
+fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usize) -> Result<String, serde_json::Value> {
     use codex_code_mode::FunctionCallOutputContentItem;
     let codex_code_mode::RuntimeResponse::Result {
         content_items,
@@ -43,7 +43,13 @@ fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usiz
         ..
     } = response
     else {
-        return None;
+        let category = match response {
+            codex_code_mode::RuntimeResponse::Result { error_text: Some(_), .. } => "runtime_error",
+            codex_code_mode::RuntimeResponse::Result { output_loss: Some(_), .. } => "output_loss",
+            codex_code_mode::RuntimeResponse::Terminated { .. } => "terminated",
+            _ => "cell_running",
+        };
+        return Err(serde_json::json!({"category":category}));
     };
     let mut parts = Vec::with_capacity(content_items.len());
     for item in content_items {
@@ -62,47 +68,68 @@ fn direct_delivery_text(response: &codex_code_mode::RuntimeResponse, limit: usiz
                 if image_url.chars().any(|ch| ch.is_control() || matches!(ch, '<' | '>'))
                     || !supported
                 {
-                    return None;
+                    return Err(serde_json::json!({"category":"unsupported_media"}));
                 }
                 parts.push(format!("![image](<{image_url}>)"));
             }
         }
     }
     let message = parts.join("\n");
-    (!message.trim().is_empty()
-        && codex_utils_output_truncation::model_token_count(&message) <= limit)
-        .then_some(message)
+    if message.trim().is_empty() { return Err(serde_json::json!({"category":"empty_output"})); }
+    if codex_utils_output_truncation::model_token_count(&message) > limit {
+        return Err(serde_json::json!({"category":"output_budget", "limit":limit}));
+    }
+    Ok(message)
 }
 
 pub(super) fn schema_validated_delivery(
     response: &codex_code_mode::RuntimeResponse,
     limit: usize,
     schema: Option<&serde_json::Value>,
-) -> Option<String> {
+) -> Result<String, serde_json::Value> {
     let text = direct_delivery_text(response, limit)?;
     if let Some(schema) = schema {
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let validator = jsonschema::validator_for(schema).ok()?;
-        if !validator.is_valid(&value) {
-            return None;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error|
+            serde_json::json!({"category":"invalid_json", "line":error.line(), "column":error.column()}))?;
+        let validator = jsonschema::validator_for(schema).map_err(|_|
+            serde_json::json!({"category":"invalid_schema"}))?;
+        if let Err(error) = validator.validate(&value) {
+            let pointer = error.instance_path().as_str().chars().take(512).collect::<String>();
+            return Err(serde_json::json!({"category":"schema_mismatch", "instance_pointer":pointer}));
         }
     }
-    Some(text)
+    Ok(text)
+}
+
+pub(super) fn attach_delivery_decision(output: &mut FunctionToolOutput, decision: Result<Option<String>, serde_json::Value>) {
+    let refusal = match decision {
+        Ok(None) => return,
+        Err(refusal) => refusal,
+        Ok(Some(message)) => {
+            if output.success != Some(true) {
+                serde_json::json!({"category":"failed_output"})
+            } else if output.essential_inline.contains_key(super::VISIBLE_OUTPUT_TRUNCATED_KEY) {
+                serde_json::json!({"category":"output_truncated"})
+            } else if let Some(signal) = output.sampling_request_signal.as_mut().and_then(serde_json::Value::as_object_mut) {
+                signal.insert("explicit_completion_message".into(), message.into());
+                return;
+            } else { serde_json::json!({"category":"completion_signal_unavailable"}) }
+        }
+    };
+    output.essential_inline.insert("delivery_refused".into(), refusal.clone());
+    let item = codex_protocol::models::FunctionCallOutputContentItem::InputText {
+        text: serde_json::json!({"delivery_refused":refusal}).to_string(),
+    };
+    output.body.push(item.clone());
+    if let Some(canonical) = &mut output.canonical_body { canonical.push(item); }
 }
 
 /// Headroom added to the longest wait a nested tool can be asked to perform, so
 /// dispatch, hooks, transport, and lock queueing cannot turn a full-length
 /// cooperative yield into a guaranteed hard-timeout failure.
-const NESTED_TOOL_TIMEOUT_GRACE_MS: u64 = 15_000;
-
 /// Allow a tool-owned long poll or transport timeout to finish before its host deadline.
 fn extended_nested_tool_timeout_ms(tool_timeout_ms: u64) -> u64 {
-    tool_timeout_ms
-        .saturating_add(NESTED_TOOL_TIMEOUT_GRACE_MS)
-        .clamp(
-            codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS,
-            codex_code_mode::MAX_TOOL_TIMEOUT_MS,
-        )
+    codex_code_mode::tool_owned_timeout_with_grace(tool_timeout_ms)
 }
 
 fn nested_tool_timeout_override(
@@ -117,6 +144,10 @@ fn nested_tool_timeout_override(
             ))
         } else if tool == &ToolName::plain("write_stdin") {
             Some(extended_nested_tool_timeout_ms(terminal_poll_ms))
+        } else if tool == &ToolName::plain("shell_command") {
+            Some(extended_nested_tool_timeout_ms(
+                crate::tools::handlers::VALIDATION_COMMAND_TIMEOUT_MS,
+            ))
         } else {
             None
         }
@@ -331,6 +362,15 @@ impl CodeModeExecuteHandler {
         );
         // Establish cleanup ownership before queuing trace work.
         let dispatch_lease = CellDispatchLease::new(Arc::clone(&exec.session), cell_id.clone());
+        emit_failed_code_mode_cell_item(
+            &exec,
+            &call_id,
+            &codex_code_mode::RuntimeResponse::Yielded {
+                cell_id: cell_id.clone(),
+                content_items: Vec::new(),
+            },
+            started_at,
+        ).await;
         let trace_enabled = exec.session.services.rollout_thread_trace.is_enabled();
         let code_cell_trace = exec
             .session
@@ -358,7 +398,7 @@ impl CodeModeExecuteHandler {
         let (activity_rx, pending_activity) = exec
             .session
             .input_queue
-            .subscribe_activity(turn_state.as_deref(), false)
+            .subscribe_code_mode_activity(turn_state.as_deref(), false)
             .await;
         if args.deliver && pending_activity.is_none() {
             exec.session.services.code_mode_service.record_delivery_intent(
@@ -371,8 +411,8 @@ impl CodeModeExecuteHandler {
         let mut initial_response = tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                terminate_interrupted_cell(&exec, &cell_id, dispatch_lease.clone()).await;
-                return Err(FunctionCallError::RespondToModel("exec cancelled".to_string()));
+                terminate_interrupted_cell(&exec, &cell_id).await
+                    .map_err(FunctionCallError::RespondToModel)?.into()
             }
             response = started_cell.initial_response() => {
                 response.map_err(FunctionCallError::RespondToModel)?
@@ -397,19 +437,23 @@ impl CodeModeExecuteHandler {
                         .wait_for_decision(cell_id.clone())
                 },
                 &cancellation_token,
-                activity_rx,
-                pending_activity,
+                super::wait_handler::queued_input_activity(&exec, turn_state.as_deref(), activity_rx),
                 "exec cancelled",
             )
             .await;
             let held = match held {
                 Ok(held) => held,
-                Err(mut error) => {
-                    error.drained_observations = error.drained_observations.saturating_add(1);
-                    record_internally_drained_waits(&exec, error.drained_observations);
-                    if cancellation_token.is_cancelled() {
-                        terminate_interrupted_cell(&exec, &cell_id, dispatch_lease.clone()).await;
+                Err(error) if cancellation_token.is_cancelled() => {
+                    super::wait_handler::OwnerHeldCodeModeWait {
+                        exit: OwnerHeldCodeModeExit::Runtime(
+                            terminate_interrupted_cell(&exec, &cell_id).await
+                                .map_err(FunctionCallError::RespondToModel)?,
+                        ),
+                        drained_observations: error.drained_observations,
                     }
+                }
+                Err(error) => {
+                    record_internally_drained_waits(&exec, error.drained_observations.saturating_add(1));
                     return Err(FunctionCallError::RespondToModel(error.message));
                 }
             };
@@ -458,27 +502,20 @@ impl CodeModeExecuteHandler {
                     .record_initial_response(&traced_response, live_cell && !keep_dispatch_open);
             });
         }
-        exec.session.services.elicitations.wait_until_clear().await;
+        // Preserve the captured response while allowing cancellation to finish
+        // delivery and dispatch cleanup despite an unrelated open dialog.
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {}
+            _ = exec.session.services.elicitations.wait_until_clear() => {}
+        }
         emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
         let delivery = exec.session.services.code_mode_service.delivery_for_response(
             &cell_id, &exec.turn, &response,
         );
         let mut output = handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .map_err(FunctionCallError::RespondToModel)?;
-        if output.success == Some(true)
-            && !output
-                .essential_inline
-                .contains_key(super::VISIBLE_OUTPUT_TRUNCATED_KEY)
-            && let Some(message) = delivery
-            && let Some(signal) = output
-                .sampling_request_signal
-                .as_mut()
-                .and_then(serde_json::Value::as_object_mut)
-        {
-            // Private host signal, never read from child stdout or persisted as
-            // instructions. The turn owner still runs normal completion hooks.
-            signal.insert("explicit_completion_message".to_string(), message.into());
-        }
+        attach_delivery_decision(&mut output, delivery);
         if keep_dispatch_open {
             dispatch_lease.keep_open();
         }
@@ -560,6 +597,86 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn completed_code_cell_cancellation_bypasses_unrelated_elicitation() {
+        for use_wait in [false, true] {
+            let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+            session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
+                codex_code_mode::InProcessCodeModeSessionProvider,
+            ));
+            let session = Arc::new(session);
+            let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
+            let leases = crate::elicitation::OutOfBandElicitationLeases::new(
+                session.services.elicitations.clone(),
+            );
+            let lease = crate::elicitation::OutOfBandElicitationLeaseId::new(1, "unrelated".into());
+            leases.acquire(lease.clone()).unwrap();
+            assert!(!session.services.elicitations.has_waiters_for_test());
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let pending = tokio::spawn({
+                let session = Arc::clone(&session);
+                let cancellation = cancellation.clone();
+                async move {
+                    if use_wait {
+                        let started = session.services.code_mode_service.execute(
+                            codex_code_mode::ExecuteRequest {
+                                state_path: None,
+                                tool_call_id: "outer".into(),
+                                enabled_tools: Vec::new().into(),
+                                source: "await yield_control(); text('captured result');".into(),
+                                yield_time_ms: None,
+                                max_output_tokens: None,
+                                default_tool_timeout_ms: None,
+                            },
+                        ).await.unwrap();
+                        let cell = started.cell_id.clone();
+                        session.services.code_mode_service.record_cell_parent_call_id(&cell, "outer");
+                        session.services.code_mode_service.mark_cell_ready_for_dispatch(&cell);
+                        assert!(matches!(started.initial_response().await.unwrap(),
+                            codex_code_mode::RuntimeResponse::ExplicitYield { .. }));
+                        super::super::wait_handler::CodeModeWaitHandler.handle(ToolInvocation {
+                            session,
+                            step_context: step,
+                            cancellation_token: cancellation,
+                            tracker: Arc::new(tokio::sync::Mutex::new(
+                                crate::turn_diff_tracker::TurnDiffTracker::new(),
+                            )),
+                            call_id: "wait".into(),
+                            tool_name: ToolName::plain(super::super::WAIT_TOOL_NAME),
+                            source: crate::tools::router::ToolCallSource::Direct,
+                            payload: ToolPayload::Function {
+                                arguments: serde_json::json!({"cell_id": cell.as_str()}).to_string(),
+                            },
+                        }).await.unwrap().log_preview()
+                    } else {
+                        let handler = CodeModeExecuteHandler::new(
+                            super::super::execute_spec::create_code_mode_tool(true, false, &[], &[]),
+                            Vec::new(), Vec::new(),
+                        ).unwrap();
+                        let output = handler.execute(session, step, "exec".into(),
+                            "text('captured result');".into(), cancellation).await.unwrap();
+                        boxed_tool_output(output).log_preview()
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !session.services.elicitations.has_waiters_for_test() {
+                    assert!(!pending.is_finished(), "handler must reach the final delivery gate");
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("completed cell reaches elicitation gate");
+            assert!(!pending.is_finished());
+            cancellation.cancel();
+            let output = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+                .await.expect("cancellation releases delivery").unwrap();
+            assert!(output.contains("captured result"), "{output}");
+            assert_eq!(leases.active_count(), 1, "cancellation must not close the dialog");
+            assert!(!session.services.code_mode_service.dispatch_broker.has_waitable_cells());
+            leases.release(&lease);
+            session.services.code_mode_service.shutdown().await.unwrap();
+        }
+    }
+
     #[test]
     fn direct_delivery_validates_final_schema_and_preserves_media() {
         use codex_code_mode::FunctionCallOutputContentItem;
@@ -571,18 +688,29 @@ mod tests {
         };
         let schema = serde_json::json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false});
         let json = response(vec![FunctionCallOutputContentItem::InputText { text: r#"{"count":2}"#.into() }]);
-        assert_eq!(schema_validated_delivery(&json, 100, Some(&schema)).as_deref(), Some(r#"{"count":2}"#));
-        assert!(schema_validated_delivery(&json, 100, Some(&serde_json::json!({"type":"array"}))).is_none());
+        assert_eq!(schema_validated_delivery(&json, 100, Some(&schema)).as_deref(), Ok(r#"{"count":2}"#));
+        assert_eq!(schema_validated_delivery(&json, 100, Some(&serde_json::json!({"type":"array"}))).unwrap_err()["category"], "schema_mismatch");
         let image = response(vec![FunctionCallOutputContentItem::InputImage {
             image_url: "https://example.com/result.png".into(), detail: None,
         }]);
-        assert_eq!(schema_validated_delivery(&image, 100, None).as_deref(), Some("![image](<https://example.com/result.png>)"));
-        assert!(schema_validated_delivery(&image, 100, Some(&schema)).is_none());
+        assert_eq!(schema_validated_delivery(&image, 100, None).as_deref(), Ok("![image](<https://example.com/result.png>)"));
+        assert_eq!(schema_validated_delivery(&image, 100, Some(&schema)).unwrap_err()["category"], "invalid_json");
+        assert_eq!(schema_validated_delivery(&json, 0, None).unwrap_err()["category"], "output_budget");
+        assert_eq!(schema_validated_delivery(&response(Vec::new()), 100, None).unwrap_err()["category"], "empty_output");
+        let bad = response(vec![FunctionCallOutputContentItem::InputText { text:r#"{"count":"bad"}"#.into() }]);
+        assert_eq!(schema_validated_delivery(&bad, 100, Some(&schema)).unwrap_err()["instance_pointer"], "/count");
+        let mut output = FunctionToolOutput::from_text("partial".into(), Some(true))
+            .with_sampling_request_signal(serde_json::json!({}));
+        output.essential_inline.insert(super::super::VISIBLE_OUTPUT_TRUNCATED_KEY.into(), true.into());
+        attach_delivery_decision(&mut output, Ok(Some("must not deliver".into())));
+        assert_eq!(output.essential_inline["delivery_refused"]["category"], "output_truncated");
+        assert!(output.sampling_request_signal.unwrap().get("explicit_completion_message").is_none());
     }
 
     #[test]
     fn long_poll_timeout_does_not_extend_ordinary_nested_tools() {
         let timeouts = HashMap::from([(ToolName::plain("mcp_test"), 123_000)]);
+        assert_eq!(nested_tool_timeout_override(&ToolName::plain("shell_command"), &timeouts, 5_000), Some(315_000));
         assert_eq!(
             nested_tool_timeout_override(&ToolName::plain("read_file"), &timeouts, 300_000),
             None
@@ -617,6 +745,7 @@ mod tests {
         assert!(definition.input_schema.is_none());
         assert!(definition.output_schema.is_none());
         assert!(definition.description.contains("exec tool declaration:"));
+        assert!(!definition.description.contains("Authoritative input_schema"));
         let first = handler.catalog_with_timeouts(&HashMap::new(), 60_000);
         let same = handler.catalog_with_timeouts(&HashMap::new(), 60_000);
         assert!(Arc::ptr_eq(&first, &same));
@@ -624,6 +753,23 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &changed));
         assert_eq!(first[0].default_timeout_ms, Some(75_000));
         assert_eq!(changed[0].default_timeout_ms, Some(315_000));
+    }
+
+    #[test]
+    fn cached_runtime_catalog_retains_contract_when_projection_fails() {
+        let mut nested = crate::tools::handlers::shell_spec::create_write_stdin_tool();
+        let ToolSpec::Function(tool) = &mut nested else { panic!("function tool"); };
+        tool.parameters.properties.as_mut().unwrap().get_mut("chars").unwrap().description =
+            Some(format!("{}Only use an authorized handle.", "x".repeat(150_000)));
+        let authoritative = serde_json::to_string(&tool.parameters).unwrap();
+        let handler = CodeModeExecuteHandler::new(nested.clone(), vec![nested], Vec::new()).unwrap();
+        let definition = &handler.enabled_tools[0];
+        assert!(definition.input_schema.is_none());
+        assert!(definition.description.contains("Authoritative input_schema"));
+        // Value serialization uses a sorted map; compare JSON rather than order.
+        let raw = definition.description.split_once("```json\n").unwrap().1.split_once("\n```").unwrap().0;
+        assert_eq!(serde_json::from_str::<serde_json::Value>(raw).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&authoritative).unwrap());
     }
 
     #[tokio::test]
@@ -782,7 +928,7 @@ mod tests {
             ),
             (
                 "terminated",
-                "text('first'); await yield_control(); await new Promise(() => {});",
+                "text('first'); await yield_control(); await new Promise(resolve => setTimeout(resolve, 60_000));",
                 CodeCellRuntimeStatus::Terminated,
                 "",
             ),

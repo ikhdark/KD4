@@ -34,7 +34,8 @@ pub(crate) enum ObserveMode {
     /// empty observations.
     StateChange,
     /// Buffer output while the script owns its continuation. Explicit yields
-    /// and terminal outcomes still release the observer.
+    /// and terminal outcomes still release the observer, as does ten minutes
+    /// without output or a nested-call completion. The cell remains resumable.
     Decision,
 }
 
@@ -87,18 +88,9 @@ pub(crate) enum ImageDetail {
 pub(crate) struct CreateCellRequest {
     pub(crate) state_path: Option<std::path::PathBuf>,
     pub(crate) tool_call_id: String,
-    pub(crate) enabled_tools: Vec<ToolDefinition>,
+    pub(crate) enabled_tools: std::sync::Arc<[codex_code_mode_protocol::ToolDefinition]>,
     pub(crate) source: String,
     pub(crate) default_tool_timeout_ms: u64,
-}
-
-/// Tool metadata exposed to code running inside a cell.
-pub(crate) struct ToolDefinition {
-    pub(crate) name: String,
-    pub(crate) tool_name: ToolName,
-    pub(crate) description: std::sync::Arc<str>,
-    pub(crate) kind: ToolKind,
-    pub(crate) default_timeout_ms: Option<u64>,
 }
 
 /// A tool name with an optional namespace.
@@ -120,6 +112,7 @@ pub(crate) struct NestedToolCall {
     pub(crate) cell_id: CellId,
     pub(crate) parent_tool_call_id: String,
     pub(crate) runtime_tool_call_id: String,
+    pub(crate) buffered_output_bytes: usize,
     pub(crate) tool_name: ToolName,
     pub(crate) tool_kind: ToolKind,
     pub(crate) input: Option<JsonValue>,
@@ -158,6 +151,7 @@ pub(crate) enum Error {
     CellIdSpaceExhausted,
     DuplicateCell(CellId),
     MissingCell(CellId),
+    ExpiredResult { cell_id: CellId, completed: bool },
     BusyObserver(CellId),
     AlreadyTerminating(CellId),
     ClosedCell(CellId),
@@ -191,6 +185,15 @@ impl fmt::Display for Error {
             }
             Self::DuplicateCell(cell_id) => write!(formatter, "exec cell {cell_id} already exists"),
             Self::MissingCell(cell_id) => write!(formatter, "exec cell {cell_id} not found"),
+            Self::ExpiredResult { cell_id, completed } => write!(formatter, "{}", serde_json::json!({
+                "kind": "exec_result_unavailable",
+                "cell_id": cell_id.as_str(),
+                "status": "expired_result",
+                "terminal_state": if *completed { "completed" } else { "interrupted" },
+                "recovery": null,
+                "automatic_replay_allowed": false,
+                "message": "The terminal result was evicted. No retained result locator is known; inspect previously retained tool receipts and do not replay effects blindly.",
+            })),
             Self::BusyObserver(cell_id) => {
                 write!(
                     formatter,

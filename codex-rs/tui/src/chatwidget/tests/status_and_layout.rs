@@ -1797,8 +1797,9 @@ async fn request_user_input_interrupt_pauses_active_goal_turn() {
             rx.try_recv(),
             Ok(AppEvent::CodexOp(Op::UserInputAnswer {
                 id,
+                call_id,
                 response,
-            })) if id == "turn-1" && response.interrupted
+            })) if id == "turn-1" && call_id == "call-1" && response.interrupted
         );
         assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
         assert_goal_paused_event(&mut rx, thread_id);
@@ -4257,6 +4258,9 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
     handle_exec_begin(
         &mut chat,
         AppServerThreadItem::CommandExecution {
+            output_metadata: None,
+            stdout: None,
+            stderr: None,
             id: "c1".into(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.clone().into(),
@@ -4276,6 +4280,9 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
     handle_exec_end(
         &mut chat,
         AppServerThreadItem::CommandExecution {
+            output_metadata: None,
+            stdout: None,
+            stderr: None,
             id: "c1".into(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),

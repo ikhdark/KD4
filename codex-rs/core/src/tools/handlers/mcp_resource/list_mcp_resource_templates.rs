@@ -9,7 +9,6 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
 use rmcp::model::ListResourceTemplatesResult;
-use rmcp::model::ResourceTemplate;
 
 use super::ListResourceTemplatesArgs;
 use super::ListResourceTemplatesPayload;
@@ -29,25 +28,9 @@ use super::take_server_result;
 pub struct ListMcpResourceTemplatesHandler;
 
 fn exhaustive_resource_template_pages(
-    collection: McpServerCollection<Vec<ResourceTemplate>>,
+    collection: McpServerCollection<ListResourceTemplatesResult>,
 ) -> McpServerCollection<ListResourceTemplatesResult> {
-    McpServerCollection {
-        results: collection
-            .results
-            .into_iter()
-            .map(|(server, resource_templates)| {
-                (
-                    server,
-                    ListResourceTemplatesResult {
-                        meta: None,
-                        next_cursor: None,
-                        resource_templates,
-                    },
-                )
-            })
-            .collect(),
-        errors: collection.errors,
-    }
+    collection
 }
 
 impl ToolExecutor<ToolInvocation> for ListMcpResourceTemplatesHandler {

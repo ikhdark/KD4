@@ -16,6 +16,25 @@ pub enum ValidationOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationCommandDescriptor {
     pub operation: ValidationOperation,
+    pub mode: ValidationExecutionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationExecutionMode {
+    Execution,
+    Listing,
+    CompilationOnly,
+    Mutation,
+    Checking,
+    DryRun,
+    Unknown,
+}
+
+impl ValidationExecutionMode {
+    pub fn can_prove_validation(self) -> bool {
+        matches!(self, Self::Execution | Self::Checking)
+    }
 }
 
 /// Repository-owned entrypoints. These declarations must be loaded from trusted
@@ -460,7 +479,7 @@ fn classify_argv_at_depth(
             };
             return classify_argv_at_depth(program, arguments, depth + 1, runners);
         }
-        return classification_from_operations(runner.operations.clone(), false);
+        return classification_from_operations(runner.operations.clone(), false, &binary, args);
     }
 
     if matches!(binary.as_str(), "npm" | "pnpm" | "yarn")
@@ -529,12 +548,14 @@ fn classify_argv_at_depth(
     }
 
     let (operations, has_unclassified_targets) = recognize_operations(&binary, args);
-    classification_from_operations(operations, has_unclassified_targets)
+    classification_from_operations(operations, has_unclassified_targets, &binary, args)
 }
 
 fn classification_from_operations(
     operations: Vec<ValidationOperation>,
     has_unclassified_targets: bool,
+    binary: &str,
+    args: &[String],
 ) -> ValidationClassification {
     if operations.is_empty() {
         if has_unclassified_targets {
@@ -546,11 +567,81 @@ fn classification_from_operations(
         ValidationClassification::Validation {
             leaves: operations
                 .into_iter()
-                .map(|operation| ValidationCommandDescriptor { operation })
+                .map(|operation| ValidationCommandDescriptor {
+                    operation,
+                    mode: execution_mode(binary, args, operation),
+                })
                 .collect(),
             has_unclassified_targets,
             exit_code_is_authoritative: !has_unclassified_targets,
         }
+    }
+}
+
+fn execution_mode(binary: &str, args: &[String], operation: ValidationOperation) -> ValidationExecutionMode {
+    use ValidationExecutionMode as Mode;
+    let has = |flags: &[&str]| args.iter().any(|arg| flags.contains(&arg.as_str()));
+    if has(&["--dry-run", "--dry", "--dryrun"])
+        || matches!(binary, "just" | "make" | "task") && has(&["-n"])
+        || matches!(binary, "gradle" | "gradlew") && has(&["-m"])
+        || matches!(binary, "mvn" | "mvnw") && has(&["-DskipTests", "-DskipTests=true", "-Dmaven.test.skip=true"])
+    {
+        return Mode::DryRun;
+    }
+    if has(&["--list", "--list-tests", "--listTests", "--collect-only", "--co", "--summary"]) {
+        return Mode::Listing;
+    }
+    if has(&["--no-run"]) || binary == "go" && has(&["-c"]) {
+        return Mode::CompilationOnly;
+    }
+    if binary == "cargo" && let Ok(Some(index)) = cargo_subcommand_index(args) {
+        match args[index].as_str() {
+            "fmt" => return if has(&["--check"]) { Mode::Checking } else { Mode::Mutation },
+            "clippy" if has(&["--fix"]) => return Mode::Mutation,
+            "nextest" if args.get(index + 1).is_some_and(|arg| arg == "list") => return Mode::Listing,
+            "fuzz" => return match args.get(index + 1).map(String::as_str) {
+                Some("run") => Mode::Execution,
+                Some("list") => Mode::Listing,
+                Some("build") => Mode::CompilationOnly,
+                Some("init" | "add" | "cmin" | "tmin" | "fmt") => Mode::Mutation,
+                _ => Mode::Unknown,
+            },
+            _ => {}
+        }
+    }
+    if matches!(operation, ValidationOperation::Check | ValidationOperation::Lint) {
+        Mode::Checking
+    } else {
+        Mode::Execution
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn execution_modes_do_not_promote_listing_compilation_or_mutation_to_proof() {
+    for (argv, expected) in [
+        (vec!["cargo","bench","--no-run"], ValidationExecutionMode::CompilationOnly),
+        (vec!["cargo","fuzz","list"], ValidationExecutionMode::Listing),
+        (vec!["cargo","fuzz","build"], ValidationExecutionMode::CompilationOnly),
+        (vec!["cargo","fuzz","run","target"], ValidationExecutionMode::Execution),
+        (vec!["cargo","fmt"], ValidationExecutionMode::Mutation),
+        (vec!["cargo","fmt","--check"], ValidationExecutionMode::Checking),
+        (vec!["cargo","+nightly","fmt","--","--check"], ValidationExecutionMode::Checking),
+        (vec!["cargo","clippy","--fix"], ValidationExecutionMode::Mutation),
+        (vec!["just","--dry-run","test"], ValidationExecutionMode::DryRun),
+        (vec!["make","-n","test"], ValidationExecutionMode::DryRun),
+        (vec!["task","--summary","test"], ValidationExecutionMode::Listing),
+        (vec!["cargo","nextest","list"], ValidationExecutionMode::Listing),
+        (vec!["cargo","test","--","--list"], ValidationExecutionMode::Listing),
+        (vec!["pytest","--collect-only"], ValidationExecutionMode::Listing),
+        (vec!["go","test","-c"], ValidationExecutionMode::CompilationOnly),
+        (vec!["dotnet","test","--list-tests"], ValidationExecutionMode::Listing),
+    ] {
+        let args = argv[1..].iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+        let ValidationClassification::Validation { leaves, .. } = classify_argv(argv[0], &args)
+            else { panic!("expected classified operation for {argv:?}"); };
+        assert_eq!(leaves.len(), 1, "{argv:?}");
+        assert_eq!(leaves[0].mode, expected, "{argv:?}");
     }
 }
 
@@ -654,7 +745,7 @@ fn cargo_operations(args: &[String]) -> (Vec<ValidationOperation>, bool) {
     let subcommand = args[subcommand_index].to_ascii_lowercase();
     let operation = if subcommand == "nextest" {
         args.get(subcommand_index + 1)
-            .filter(|argument| argument.eq_ignore_ascii_case("run"))
+            .filter(|argument| argument.eq_ignore_ascii_case("run") || argument.eq_ignore_ascii_case("list"))
             .map(|_| ValidationOperation::Test)
     } else {
         cargo_operation(&subcommand)
@@ -1159,6 +1250,23 @@ mod tests {
     }
 
     #[test]
+    fn repository_admission_option_preserves_trusted_validation() {
+        for subcommand in ["run-target", "run-gate"] {
+            let baseline = repository_argv("python", &["scripts/rust_test_runner.py", subcommand, "example"]);
+            for options in [vec!["--admission-timeout-seconds", "30"], vec!["--admission-timeout-seconds=30"]] {
+                let mut args = vec!["scripts/rust_test_runner.py"];
+                args.extend(options);
+                args.extend([subcommand, "example"]);
+                assert_eq!(repository_argv("python", &args), baseline);
+                let config: serde_json::Value = serde_json::from_str(include_str!("../../../.codex/test-runners.json")).unwrap();
+                let runners: Vec<RepositoryRunner> = serde_json::from_value(config["runners"].clone()).unwrap();
+                assert!(runners.iter().any(|runner| runner.receipt_runner.as_deref() == Some("rust_test_runner")
+                    && runner.matches("python", &args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>())));
+            }
+        }
+    }
+
+    #[test]
     fn repository_lane_passthrough_preserves_child_classification() {
         for child in ["test", "check", "clippy"] {
             assert!(is_validation(&repository_argv("python", &[
@@ -1387,7 +1495,7 @@ mod tests {
                     leaves,
                     has_unclassified_targets: false,
                     exit_code_is_authoritative: true,
-                } if leaves == vec![ValidationCommandDescriptor { operation: ValidationOperation::Test }]
+                } if leaves == vec![ValidationCommandDescriptor { operation: ValidationOperation::Test, mode: ValidationExecutionMode::Execution }]
             ), "{args:?}");
         }
     }
@@ -1401,10 +1509,19 @@ mod tests {
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
             assert!(is_build_or_discovery("cargo", &args));
-            assert_eq!(
-                classify_argv("cargo", &args),
-                ValidationClassification::NonValidation
-            );
+            let classification = classify_argv("cargo", &args);
+            if args == ["nextest", "list"] {
+                let ValidationClassification::Validation { leaves, .. } = classification else {
+                    panic!("nextest discovery must retain its listing mode");
+                };
+                assert_eq!(leaves, vec![ValidationCommandDescriptor {
+                    operation: ValidationOperation::Test,
+                    mode: ValidationExecutionMode::Listing,
+                }]);
+                assert!(leaves.iter().all(|leaf| !leaf.mode.can_prove_validation()));
+            } else {
+                assert_eq!(classification, ValidationClassification::NonValidation);
+            }
             assert!(!is_build_or_discovery("echo", &args));
         }
         for script in [
@@ -1437,7 +1554,7 @@ mod tests {
             assert!(
                 matches!(argv("just", &[recipe, "codex-check", "--lib"]),
                 ValidationClassification::Validation { ref leaves, has_unclassified_targets: false, .. }
-                if leaves == &[ValidationCommandDescriptor { operation: ValidationOperation::Test }]),
+                if leaves == &[ValidationCommandDescriptor { operation: ValidationOperation::Test, mode: ValidationExecutionMode::Execution }]),
                 "{recipe}"
             );
         }

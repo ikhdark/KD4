@@ -7,5 +7,6 @@ pub(crate) use history::PreparedPromptInput;
 pub(crate) use history::completed_turn_boundary;
 pub(crate) use history::estimate_item_token_count;
 pub(crate) use history::is_user_turn_boundary;
+pub(crate) use history::retire_expired_turn_advice;
 pub(crate) use history::truncate_function_output_payload;
 pub(crate) use normalize::missing_call_outputs;

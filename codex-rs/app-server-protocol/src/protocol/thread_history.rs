@@ -1608,6 +1608,7 @@ fn replace_turn_item(existing: &mut ThreadItem, mut item: ThreadItem) {
     // must not erase identities already supplied by a first-class item event.
     if let (
         ThreadItem::CommandExecution {
+            output_metadata,
             parent_call_id,
             parent_cell_id,
             runtime_tool_call_id,
@@ -1615,6 +1616,7 @@ fn replace_turn_item(existing: &mut ThreadItem, mut item: ThreadItem) {
             ..
         },
         ThreadItem::CommandExecution {
+            output_metadata: previous_metadata,
             parent_call_id: previous_parent,
             parent_cell_id: previous_cell,
             runtime_tool_call_id: previous_runtime,
@@ -1623,6 +1625,9 @@ fn replace_turn_item(existing: &mut ThreadItem, mut item: ThreadItem) {
         },
     ) = (&mut item, &mut *existing)
     {
+        if output_metadata.is_none() {
+            *output_metadata = previous_metadata.take();
+        }
         if parent_call_id.is_none() {
             *parent_call_id = previous_parent.take();
         }
@@ -2373,6 +2378,7 @@ mod tests {
         let turn_id = "turn-1";
         let thread_id = ThreadId::new();
         let command_item = CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
+            output_metadata: None,
             id: "exec-1".to_string(),
             process_id: Some("pid-1".to_string()),
             parent_call_id: None,
@@ -2430,6 +2436,9 @@ mod tests {
         assert_eq!(
             turns[0].items,
             vec![ThreadItem::CommandExecution {
+                output_metadata: None,
+                stdout: Some("hello world\n".to_string()),
+                stderr: Some(String::new()),
                 id: "exec-1".to_string(),
                 command: "echo 'hello world'".to_string(),
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -2976,6 +2985,7 @@ mod tests {
                 },
             }),
             EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                output_metadata: None,
                 call_id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
                 turn_id: "turn-1".into(),
@@ -2990,7 +3000,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 aggregated_output: "hello world\n".into(),
-                exit_code: 0,
+                exit_code: Some(0),
                 duration: Duration::from_millis(12),
                 formatted_output: String::new(),
                 status: CoreExecCommandStatus::Completed,
@@ -3035,6 +3045,9 @@ mod tests {
         assert_eq!(
             turns[0].items[2],
             ThreadItem::CommandExecution {
+                output_metadata: None,
+                stdout: Some(String::new()),
+                stderr: Some(String::new()),
                 id: "exec-1".into(),
                 command: "echo 'hello world'".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -3240,6 +3253,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                output_metadata: None,
                 call_id: "exec-declined".into(),
                 process_id: Some("pid-2".into()),
                 turn_id: "turn-1".into(),
@@ -3252,7 +3266,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: "exec command rejected by user".into(),
                 aggregated_output: "exec command rejected by user".into(),
-                exit_code: -1,
+                exit_code: Some(-1),
                 duration: Duration::ZERO,
                 formatted_output: String::new(),
                 status: CoreExecCommandStatus::Declined,
@@ -3285,6 +3299,9 @@ mod tests {
         assert_eq!(
             turns[0].items[1],
             ThreadItem::CommandExecution {
+                output_metadata: None,
+                stdout: Some(String::new()),
+                stderr: Some("exec command rejected by user".into()),
                 id: "exec-declined".into(),
                 command: "ls".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -3361,6 +3378,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                output_metadata: None,
                 call_id: "exec-late".into(),
                 process_id: Some("pid-42".into()),
                 turn_id: "turn-a".into(),
@@ -3375,7 +3393,7 @@ mod tests {
                 stdout: "done\n".into(),
                 stderr: String::new(),
                 aggregated_output: "done\n".into(),
-                exit_code: 0,
+                exit_code: Some(0),
                 duration: Duration::from_millis(5),
                 formatted_output: "done\n".into(),
                 status: CoreExecCommandStatus::Completed,
@@ -3405,6 +3423,9 @@ mod tests {
         assert_eq!(
             turns[0].items[1],
             ThreadItem::CommandExecution {
+                output_metadata: None,
+                stdout: Some("done\n".into()),
+                stderr: Some(String::new()),
                 id: "exec-late".into(),
                 command: "echo done".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -3469,6 +3490,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                output_metadata: None,
                 call_id: "exec-unknown-turn".into(),
                 process_id: Some("pid-42".into()),
                 turn_id: "turn-missing".into(),
@@ -3483,7 +3505,7 @@ mod tests {
                 stdout: "done\n".into(),
                 stderr: String::new(),
                 aggregated_output: "done\n".into(),
-                exit_code: 0,
+                exit_code: Some(0),
                 duration: Duration::from_millis(5),
                 formatted_output: "done\n".into(),
                 status: CoreExecCommandStatus::Completed,
@@ -4303,6 +4325,11 @@ mod tests {
             canonical_message: None,
         };
         let timing = TurnTiming {
+            completion_assessment: Some(codex_protocol::protocol::TurnCompletionAssessment {
+                failed_checks: vec!["validation failed; limitation reported".into()],
+                verification_gaps: vec!["final workspace not verified".into()],
+                advisories: Vec::new(),
+            }),
             schema_version: 7,
             profile_valid: true,
             classification_complete: true,
@@ -4340,6 +4367,8 @@ mod tests {
             })),
         ];
 
+        let persisted = serde_json::to_string(&items).expect("serialize terminal diagnostics");
+        let items: Vec<RolloutItem> = serde_json::from_str(&persisted).expect("resume terminal diagnostics");
         let turns = build_turns_from_rollout_items(&items);
         let turn = turns.first().expect("materialized turn");
         assert_eq!(turn.status, TurnStatus::Completed);
@@ -5345,13 +5374,40 @@ mod tests {
     #[test]
     fn modern_command_relationships_survive_legacy_updates() {
         use codex_protocol::items::CommandExecutionItem;
+        use codex_protocol::items::CommandExecutionOutputMetadata;
         use codex_protocol::items::CommandExecutionStatus as CoreCommandStatus;
         use codex_protocol::protocol::HasLegacyEvent;
 
-        for late_completion in [false, true] {
+        for (late_completion, case) in [false, true]
+            .into_iter()
+            .flat_map(|late| (0..6).map(move |case| (late, case)))
+        {
+            let observed_exit = match case {
+                1 | 3 => Some(1),
+                2 => Some(2),
+                5 => None,
+                _ => Some(0),
+            };
+            let expected_status = if matches!(case, 0 | 1 | 4) {
+                CoreCommandStatus::Completed
+            } else {
+                CoreCommandStatus::Failed
+            };
+            let metadata = CommandExecutionOutputMetadata {
+                process_exited: true,
+                output_drained: case != 3,
+                aggregated_output_is_exact: case != 4,
+                streams_are_exact: case != 4,
+                decoding_lossy: false,
+                display_reduced: case == 4,
+                search_no_match: case == 1,
+                failure_cause: (case == 5).then(|| "transport lost".into()),
+                raw_output_artifact_id: (case == 4).then(|| "retained-output".into()),
+            };
             let mut builder = ThreadHistoryBuilder::new();
             wait_history_test_start_turn(&mut builder, "command-turn");
             let command = CommandExecutionItem {
+                output_metadata: None,
                 id: "command".into(),
                 process_id: Some("process".into()),
                 parent_call_id: Some("parent".into()),
@@ -5387,17 +5443,25 @@ mod tests {
                 thread_id: wait_history_test_thread_id(),
                 turn_id: "command-turn".into(),
                 item: CoreTurnItem::CommandExecution(CommandExecutionItem {
-                    status: CoreCommandStatus::Completed,
+                    status: expected_status,
+                    output_metadata: Some(metadata.clone()),
                     stdout: Some("hello".into()),
                     stderr: Some(String::new()),
                     aggregated_output: Some("hello".into()),
-                    exit_code: Some(0),
+                    exit_code: observed_exit,
                     duration: Some(std::time::Duration::from_millis(20)),
                     formatted_output: Some("hello".into()),
                     ..command
                 }),
                 completed_at_ms: 2,
             });
+            let crate::protocol::common::ServerNotification::ItemCompleted(live) =
+                crate::protocol::event_mapping::item_event_to_server_notification(
+                    completed.clone(), "thread", "command-turn",
+                )
+            else {
+                panic!("live completion");
+            };
             if late_completion {
                 wait_history_test_start_turn(&mut builder, "new-turn");
             }
@@ -5406,6 +5470,7 @@ mod tests {
                 builder.handle_event(&legacy);
             }
             let turns = builder.finish();
+            assert_eq!(turns[0].items[0], live.item);
             let ThreadItem::CommandExecution {
                 parent_call_id,
                 parent_cell_id,
@@ -5415,6 +5480,9 @@ mod tests {
                 aggregated_output,
                 exit_code,
                 duration_ms,
+                output_metadata,
+                stdout,
+                stderr,
                 ..
             } = &turns[0].items[0]
             else {
@@ -5424,9 +5492,19 @@ mod tests {
             assert_eq!(parent_cell_id.as_deref(), Some("cell"));
             assert_eq!(runtime_tool_call_id.as_deref(), Some("runtime"));
             assert_eq!(execution_id.as_deref(), Some("execution"));
-            assert_eq!(*status, CommandExecutionStatus::Completed);
+            assert_eq!(
+                *status,
+                if matches!(case, 0 | 1 | 4) {
+                    CommandExecutionStatus::Completed
+                } else {
+                    CommandExecutionStatus::Failed
+                },
+            );
             assert_eq!(aggregated_output.as_deref(), Some("hello"));
-            assert_eq!(*exit_code, Some(0));
+            assert_eq!(*exit_code, observed_exit);
+            assert_eq!(output_metadata.as_ref(), Some(&metadata));
+            assert_eq!(stdout.as_deref(), Some("hello"));
+            assert_eq!(stderr.as_deref(), Some(""));
             assert_eq!(*duration_ms, Some(20));
             if late_completion {
                 assert!(turns[1].items.is_empty());
@@ -5548,6 +5626,7 @@ mod tests {
                     interaction_input: None,
                 }),
                 EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                    output_metadata: None,
                     call_id: "exec".into(),
                     process_id: None,
                     turn_id: owner.into(),
@@ -5560,7 +5639,7 @@ mod tests {
                     stdout: String::new(),
                     stderr: String::new(),
                     aggregated_output: String::new(),
-                    exit_code: 0,
+                    exit_code: Some(0),
                     duration: Duration::from_millis(1),
                     formatted_output: String::new(),
                     status: CoreExecCommandStatus::Completed,

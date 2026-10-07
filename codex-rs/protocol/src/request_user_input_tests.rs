@@ -248,3 +248,14 @@ fn option_json(count: usize) -> Vec<Value> {
         })
         .collect()
 }
+
+#[test]
+fn clarification_dispositions_are_optional_and_round_trip_without_implying_approval() {
+    let legacy: RequestUserInputResponse = serde_json::from_value(json!({"answers": {}})).unwrap();
+    assert_eq!(legacy.disposition, None);
+    for disposition in ["answered", "timed_out", "skipped", "interrupted", "transport_error"] {
+        let value = json!({"answers": {}, "interrupted": false, "disposition": disposition});
+        let response: RequestUserInputResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), value);
+    }
+}

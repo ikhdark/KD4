@@ -136,8 +136,17 @@ impl WorldStateSection for AgentsMdState {
         if matches!(previous, PreviousSectionState::Known(previous)
             if previous.directory == current.directory
                 && previous.text.is_none() == current.text.is_none()
-                && instruction_body(previous) == instruction_body(&current)) {
-            return None;
+                && instruction_body(previous) == instruction_body(&current))
+        {
+            let PreviousSectionState::Known(previous) = previous else {
+                unreachable!()
+            };
+            return (previous.freshness != current.freshness).then(|| Box::new(
+                codex_context_fragments::RenderedContextFragment::new("developer", format!(
+                    "AGENTS.md observation changed: {} The previously provided instruction body is unchanged; this is not an instruction removal. No automatic retry is requested.",
+                    current.freshness.model_visible_description(),
+                )),
+            ) as Box<dyn ContextualUserFragment>);
         }
 
         let previous_may_contain_instructions = match previous {
@@ -155,6 +164,17 @@ impl WorldStateSection for AgentsMdState {
                 directory: None,
                 text: Self::REMOVAL_NOTICE.to_string(),
             },
+            (None, false) if self.freshness != AgentsMdFreshness::Refreshed => {
+                return Some(Box::new(
+                    codex_context_fragments::RenderedContextFragment::new(
+                        "developer",
+                        format!(
+                            "AGENTS.md observation unavailable: {} An empty result does not confirm that no instructions apply.",
+                            self.freshness.model_visible_description()
+                        ),
+                    ),
+                ));
+            }
             (None, false) => return None,
         };
         Some(Box::new(instructions))

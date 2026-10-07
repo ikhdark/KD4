@@ -26,9 +26,27 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 const CELL_MESSAGE_CAPACITY: usize = 128;
+const OUTGOING_DATA_BYTES: usize = 128 * 1024 * 1024 + 1024;
+const OUTGOING_FAILURE_BYTES: usize = 1024 * 1024;
+const OUTGOING_CONTROL_BYTES: usize = 1024 * 1024;
+
+pub(super) struct OutgoingFrame {
+    pub(super) frame: EncodedFrame,
+    _bytes: OwnedSemaphorePermit,
+    _slot: Option<OwnedSemaphorePermit>,
+}
+
+impl std::ops::Deref for OutgoingFrame {
+    type Target = EncodedFrame;
+    fn deref(&self) -> &Self::Target { &self.frame }
+}
 
 pub(super) struct HostPeer {
-    outgoing_tx: mpsc::Sender<EncodedFrame>,
+    outgoing_tx: mpsc::Sender<OutgoingFrame>,
+    outgoing_bytes: Arc<Semaphore>,
+    failure_bytes: Arc<Semaphore>,
+    control_bytes: Arc<Semaphore>,
+    outgoing_slots: Arc<Semaphore>,
     pending: StdMutex<HashMap<DelegateRequestId, PendingDelegate>>,
     delegate_permits: Arc<Semaphore>,
     cell_routes: StdMutex<HashMap<(SessionId, CellId), CellRoute>>,
@@ -106,9 +124,13 @@ enum CellMessage {
 }
 
 impl HostPeer {
-    pub(super) fn new(outgoing_tx: mpsc::Sender<EncodedFrame>) -> Self {
+    pub(super) fn new(outgoing_tx: mpsc::Sender<OutgoingFrame>) -> Self {
         Self {
             outgoing_tx,
+            outgoing_bytes: Arc::new(Semaphore::new(OUTGOING_DATA_BYTES)),
+            failure_bytes: Arc::new(Semaphore::new(OUTGOING_FAILURE_BYTES)),
+            control_bytes: Arc::new(Semaphore::new(OUTGOING_CONTROL_BYTES)),
+            outgoing_slots: Arc::new(Semaphore::new(super::OUTGOING_FRAME_CAPACITY - MAX_PENDING_DELEGATE_REQUESTS - super::MAX_ACTIVE_CELLS)),
             pending: StdMutex::new(HashMap::new()),
             delegate_permits: Arc::new(Semaphore::new(MAX_PENDING_DELEGATE_REQUESTS)),
             cell_routes: StdMutex::new(HashMap::new()),
@@ -120,9 +142,37 @@ impl HostPeer {
     }
 
     pub(super) fn send(&self, message: HostToClient) -> Result<(), PeerSendError> {
-        let frame = EncodedFrame::encode(&message)
-            .map_err(|err| PeerSendError::Payload(err.to_string()))?;
+        let frame = self.prepare_frame(&message)?;
         self.send_frame(frame)
+    }
+
+    fn prepare_frame(&self, message: &HostToClient) -> Result<OutgoingFrame, PeerSendError> {
+        let control = matches!(message,
+            HostToClient::CancelDelegateRequest { .. } | HostToClient::CellClosed { .. });
+        let failure = matches!(message,
+            HostToClient::Response { result: WireResult::Err { .. }, .. }
+            | HostToClient::InitialResponse { result: WireResult::Err { .. }, .. });
+        let bytes = EncodedFrame::encoded_len(message)
+            .map_err(|err| PeerSendError::Payload(err.to_string()))?;
+        // Vec growth may retain up to twice the encoded length. Admission is
+        // held through physical delivery (also for a stalled current frame).
+        // Overload receipts have a separate small byte budget, but still use
+        // ordinary frame slots. They cannot exhaust cancellation/closure room.
+        let budget = if control {
+            &self.control_bytes
+        } else if failure {
+            &self.failure_bytes
+        } else {
+            &self.outgoing_bytes
+        };
+        let permit = Arc::clone(budget).try_acquire_many_owned(bytes.saturating_mul(2).max(256) as u32)
+            .map_err(|_| PeerSendError::Payload("outgoing IPC byte budget exhausted; result was not delivered".into()))?;
+        let slot = if control { None } else {
+            Some(Arc::clone(&self.outgoing_slots).try_acquire_owned()
+                .map_err(|_| PeerSendError::Payload("outgoing IPC data slots exhausted".into()))?)
+        };
+        let frame = EncodedFrame::encode(message).map_err(|err| PeerSendError::Payload(err.to_string()))?;
+        Ok(OutgoingFrame { frame, _bytes: permit, _slot: slot })
     }
 
     pub(super) fn respond(
@@ -135,12 +185,14 @@ impl HostPeer {
             result: WireResult::from_result(result),
         };
         if let Err(PeerSendError::Payload(err)) = self.send(message) {
-            let _ = self.send(HostToClient::Response {
+            if let Err(error) = self.send(HostToClient::Response {
                 id,
                 result: WireResult::Err {
                     message: format!("code-mode host response exceeds the IPC frame limit: {err}"),
                 },
-            });
+            }) {
+                self.fail(format!("cannot deliver code-mode response failure: {error}"));
+            }
         }
     }
 
@@ -154,14 +206,16 @@ impl HostPeer {
             result: WireResult::from_result(result),
         };
         if let Err(PeerSendError::Payload(err)) = self.send(message) {
-            let _ = self.send(HostToClient::InitialResponse {
+            if let Err(error) = self.send(HostToClient::InitialResponse {
                 id,
                 result: WireResult::Err {
                     message: format!(
                         "code-mode initial response exceeds the IPC frame limit: {err}"
                     ),
                 },
-            });
+            }) {
+                self.fail(format!("cannot deliver code-mode initial response failure: {error}"));
+            }
         }
     }
 
@@ -387,12 +441,11 @@ impl HostPeer {
         dispatched_tx: oneshot::Sender<Result<(), String>>,
     ) {
         // Prepare large frames without holding the shared pending-call lock.
-        let frame = EncodedFrame::encode(&HostToClient::DelegateRequest {
+        let frame = self.prepare_frame(&HostToClient::DelegateRequest {
             id,
             session_id,
             request,
-        })
-        .map_err(|error| PeerSendError::Payload(error.to_string()));
+        });
         let result = {
             let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(pending) = pending.get_mut(&id) else {
@@ -502,7 +555,7 @@ impl HostPeer {
         });
     }
 
-    fn send_frame(&self, frame: EncodedFrame) -> Result<(), PeerSendError> {
+    fn send_frame(&self, frame: OutgoingFrame) -> Result<(), PeerSendError> {
         match self.outgoing_tx.try_send(frame) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {

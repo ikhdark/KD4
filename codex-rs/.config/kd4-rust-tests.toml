@@ -320,6 +320,11 @@ helpers = []
 [targets.app_server_lib]
 package = "codex-app-server"
 lib = true
+helpers = ["codex-code-mode-host"]
+
+[targets.exec_server_lib]
+package = "codex-exec-server"
+lib = true
 helpers = []
 
 [targets.exec_server_file_system_windows]
@@ -368,9 +373,44 @@ package = "codex-http-client"
 lib = true
 helpers = []
 
+[targets.codex_api_lib]
+package = "codex-api"
+lib = true
+helpers = []
+
+[targets.rmcp_client_lib]
+package = "codex-rmcp-client"
+lib = true
+helpers = []
+
+[targets.codex_mcp_lib]
+package = "codex-mcp"
+lib = true
+helpers = []
+
 [targets.rollout_lib]
 package = "codex-rollout"
 lib = true
+helpers = []
+
+[targets.thread_store_lib]
+package = "codex-thread-store"
+lib = true
+helpers = []
+
+[targets.state_lib]
+package = "codex-state"
+lib = true
+helpers = []
+
+[targets.apply_patch_lib]
+package = "codex-apply-patch"
+lib = true
+helpers = []
+
+[targets.file_system_atomic_write]
+package = "codex-file-system"
+test = "atomic_write"
 helpers = []
 
 [targets.code_mode_lib]
@@ -380,6 +420,21 @@ helpers = []
 
 [targets.code_mode_protocol_lib]
 package = "codex-code-mode-protocol"
+lib = true
+helpers = []
+
+[targets.tools_lib]
+package = "codex-tools"
+lib = true
+helpers = []
+
+[targets.code_mode_host_stdio]
+package = "codex-code-mode-host"
+test = "stdio"
+helpers = ["codex-code-mode-host"]
+
+[targets.output_truncation_lib]
+package = "codex-utils-output-truncation"
 lib = true
 helpers = []
 
@@ -424,6 +479,21 @@ helpers = []
 
 [targets.history_notes_lib]
 package = "codex-history-notes-extension"
+lib = true
+helpers = []
+
+[targets.core_skills_lib]
+package = "codex-core-skills"
+lib = true
+helpers = []
+
+[targets.skills_extension_lib]
+package = "codex-skills-extension"
+lib = true
+helpers = []
+
+[targets.context_fragments_lib]
+package = "codex-context-fragments"
 lib = true
 helpers = []
 

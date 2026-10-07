@@ -256,7 +256,7 @@ async fn flattened_tool_identifier_collisions_are_rejected_before_cell_start() {
     };
     assert_eq!(
         error,
-        "code mode tool identifier collision: `acme__lookup` and `acmelookup` both normalize to `acme__lookup`"
+        "code mode tool identifier collision: `acme__lookup` and `acme__lookup` both normalize to `acme__lookup`"
     );
 }
 
@@ -291,6 +291,7 @@ async fn yields_and_resumes() {
     assert_eq!(
         service
             .wait(WaitRequest {
+                recovery: None,
                 cell_id: cell_id("1"),
                 yield_time_ms: 60_000,
             })
@@ -331,6 +332,7 @@ async fn yields_again_after_the_previous_yield_was_observed() {
     assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
 
     let mut waiting = Box::pin(service.wait(WaitRequest {
+        recovery: None,
         cell_id: cell_id("1"),
         yield_time_ms: 60_000,
     }));
@@ -426,6 +428,34 @@ text(outcome);
             error_text: None,
         }
     );
+}
+
+#[tokio::test]
+async fn tool_owned_deadline_survives_service_conversion_and_explicit_options() {
+    for explicit in [false, true] {
+        let (delegate, mut events_rx) = BlockingDelegate::new();
+        let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+        let mut tool = blocking_tool();
+        tool.default_timeout_ms = Some(0);
+        let options = if explicit { ", {timeout_ms:10}" } else { "" };
+        let cell = service.execute(ExecuteRequest {
+            enabled_tools: vec![tool].into(),
+            source: format!("await tools.block({{}}{options});"),
+            yield_time_ms: Some(60_000), default_tool_timeout_ms: Some(5),
+            ..execute_request("")
+        }).await.unwrap();
+        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
+        if !explicit {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(events_rx.try_recv().is_err());
+            delegate.tool_release.notify_one();
+        }
+        let RuntimeResponse::Result { error_text, .. } = cell.initial_response().await.unwrap() else {
+            panic!("terminal result");
+        };
+        assert_eq!(error_text.is_some(), explicit);
+        service.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -823,7 +853,7 @@ async fn repeated_termination_is_rejected_while_callback_cleanup_is_pending() {
 async fn second_observer_is_rejected_without_displacing_the_first() {
     let service = InProcessCodeModeSession::new();
     let cell = service
-        .execute(execute_request("await new Promise(() => {});"))
+        .execute(execute_request("await new Promise(resolve => setTimeout(resolve, 600_000));"))
         .await
         .unwrap();
 
@@ -837,6 +867,7 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
 
     let first_observer = service
         .begin_wait(WaitRequest {
+            recovery: None,
             cell_id: cell_id("1"),
             yield_time_ms: 60_000,
         })
@@ -844,6 +875,7 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
     assert_eq!(
         service
             .wait(WaitRequest {
+                recovery: None,
                 cell_id: cell_id("1"),
                 yield_time_ms: 60_000,
             })
@@ -870,7 +902,7 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
 async fn dropped_wait_observer_leaves_the_cell_available() {
     let service = InProcessCodeModeSession::new();
     let cell = service
-        .execute(execute_request("await new Promise(() => {});"))
+        .execute(execute_request("await new Promise(resolve => setTimeout(resolve, 600_000));"))
         .await
         .unwrap();
     assert!(matches!(
@@ -880,6 +912,7 @@ async fn dropped_wait_observer_leaves_the_cell_available() {
 
     let suspended = service
         .begin_wait(WaitRequest {
+            recovery: None,
             cell_id: cell_id("1"),
             yield_time_ms: 60_000,
         })
@@ -889,6 +922,7 @@ async fn dropped_wait_observer_leaves_the_cell_available() {
     assert_eq!(
         service
             .wait(WaitRequest {
+                recovery: None,
                 cell_id: cell_id("1"),
                 yield_time_ms: 0,
             })

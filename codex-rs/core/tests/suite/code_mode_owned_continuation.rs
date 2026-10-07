@@ -84,7 +84,7 @@ async fn printed_process_receipts_do_not_interrupt_a_predetermined_drain() -> Re
 let r = await tools.exec_command({{cmd:{command:?}, yield_time_ms:1000, max_output_tokens:1000}});
 text(r);
 while (r.session_id && r.exit_code == null) {{
-    r = await tools.write_stdin({{session_id:r.session_id, chars:"", yield_time_ms:1000, max_output_tokens:1000}});
+    r = await tools.write_stdin({{session_id:r.session_id,incarnation:r.session_capabilities.incarnation, chars:"", yield_time_ms:1000, max_output_tokens:1000}});
     text(r);
 }}
 text({{drain_complete:true, exit_code:r.exit_code}});

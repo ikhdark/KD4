@@ -18,6 +18,30 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 #[test]
+fn canonical_contracts_and_wire_bytes_preserve_only_semantic_order() {
+    let spec = |input: &str, output: serde_json::Value| ToolSpec::Function(ResponsesApiTool {
+        name: "canonical".into(), description: String::new(), strict: false, defer_loading: None,
+        parameters: serde_json::from_str(input).unwrap(), output_schema: Some(output.into()),
+    });
+    let a = spec(r#"{"type":["object","null"],"required":["b","a"],"default":{"z":1,"a":{"y":2,"b":3}},"enum":[{"z":1,"a":2},[2,1]]}"#,
+        json!({"type":["string","null"]}));
+    let b = spec(r#"{"enum":[{"a":2,"z":1},[2,1]],"default":{"a":{"b":3,"y":2},"z":1},"required":["a","b"],"type":["null","object"]}"#,
+        json!({"type":["null","string"]}));
+    assert_eq!(a.callable_contract(), b.callable_contract());
+    assert_eq!(serde_json::to_vec(&a).unwrap(), serde_json::to_vec(&b).unwrap());
+    assert_eq!(serde_json::to_vec(&[a.clone()]).unwrap(),
+        serde_json::to_vec(&create_tools_json_for_responses_api(&[b.clone()]).unwrap()).unwrap());
+    let mut changed = b.clone();
+    let ToolSpec::Function(tool) = &mut changed else { unreachable!() };
+    tool.output_schema = Some(json!({"type":"boolean"}).into());
+    assert_ne!(a.callable_contract(), changed.callable_contract());
+    assert_eq!(serde_json::to_vec(&a).unwrap(), serde_json::to_vec(&changed).unwrap());
+    let ToolSpec::Function(tool) = &mut changed else { unreachable!() };
+    tool.parameters.enum_values.as_mut().unwrap().reverse();
+    assert_ne!(serde_json::to_vec(&a).unwrap(), serde_json::to_vec(&changed).unwrap());
+}
+
+#[test]
 fn tool_spec_name_covers_all_variants() {
     assert_eq!(
         ToolSpec::Function(ResponsesApiTool {

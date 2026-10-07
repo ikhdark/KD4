@@ -230,7 +230,18 @@ async fn thread_archive_move_failure_preserves_loaded_thread() -> Result<()> {
     );
     assert!(rollout_path.exists());
 
-    send_turn_and_wait(&mut mcp, &thread.id, "still loaded").await?;
+    // Archive must quiesce the writer before moving its rollout. A failed
+    // move leaves the durable thread active and resumable, not a live writer.
+    drop(_rollout_lock);
+    let resume_id = mcp.send_thread_resume_request(ThreadResumeParams {
+        thread_id: thread.id.clone(),
+        ..Default::default()
+    }).await?;
+    let response = timeout(DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id))).await??;
+    let resumed: ThreadResumeResponse = to_response(response)?;
+    assert_eq!(resumed.thread.id, thread.id);
+    send_turn_and_wait(&mut mcp, &thread.id, "still resumable").await?;
 
     Ok(())
 }

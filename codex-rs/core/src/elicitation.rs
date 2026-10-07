@@ -110,6 +110,11 @@ impl ElicitationService {
         let _ = paused.wait_for(|paused| !*paused).await;
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_waiters_for_test(&self) -> bool {
+        self.inner.paused.receiver_count() > 0
+    }
+
     fn decrement(&self) {
         let mut state = self
             .inner

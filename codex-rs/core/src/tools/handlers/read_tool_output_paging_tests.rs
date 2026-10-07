@@ -1,6 +1,45 @@
 use super::*;
 
 #[tokio::test]
+async fn small_source_byte_budgets_make_exact_progress_across_utf8_boundaries() {
+    let home = tempfile::tempdir().unwrap();
+    let text = "aλ🦀z".repeat(12);
+    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        home.path(), "small-bytes", &CanonicalToolResult::text(&text),
+    ).await;
+    let snapshot = load_tool_output_snapshot(home.path(), "small-bytes", &artifact.artifact_id().unwrap()).await.unwrap();
+    for budget in 1..=64 {
+        let mut cursor = 0;
+        let mut recovered = Vec::new();
+        while cursor < text.len() as u64 {
+            let page = drain_recovery_snapshot_with_byte_limit(
+                &snapshot, vec![ToolOutputSelector::Bytes { start: cursor, end: text.len() as u64 }],
+                8_000, budget, &CancellationToken::new(),
+            ).await.unwrap();
+            let ranges = page.output.delivered_ranges();
+            assert_eq!(ranges.len(), 1, "budget {budget}");
+            assert_eq!(ranges[0].0, cursor);
+            assert!(ranges[0].1 > cursor && ranges[0].1 - cursor <= budget as u64);
+            for result in &page.output.results {
+                if result.status != ToolOutputSelectorStatus::Ok { continue; }
+                if let Some(text) = &result.text { recovered.extend_from_slice(text.as_bytes()); }
+                if let Some(encoded) = &result.data_base64 {
+                    recovered.extend(base64::engine::general_purpose::STANDARD.decode(encoded).unwrap());
+                }
+            }
+            cursor = ranges[0].1;
+            if cursor < text.len() as u64 {
+                let stop = page.continuation_stop.as_ref().unwrap();
+                assert_eq!(stop.reason, ContinuationStopReason::Budget);
+                assert!(recovery_call_succeeded(&page.output, Some(stop)));
+                assert_eq!(stop.selector, Some(ToolOutputSelector::Bytes { start: cursor, end: text.len() as u64 }));
+            } else { assert!(page.output.complete); }
+        }
+        assert_eq!(recovered, text.as_bytes(), "budget {budget}");
+    }
+}
+
+#[tokio::test]
 async fn script_recovery_payload_cap_preserves_exact_prefix_and_remainder() {
     let home = tempfile::tempdir().unwrap();
     // Escaping must count toward the serialized cap, not only source bytes.

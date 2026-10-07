@@ -501,6 +501,41 @@ fn independent_review_powershell_safety_args_disable_profiles() {
 
     assert!(safety_command.iter().any(|arg| arg == "-NoProfile"));
     assert!(is_known_safe_command(&safety_command));
+    let args: crate::tools::handlers::unified_exec::ExecCommandArgs = serde_json::from_value(
+        serde_json::json!({"script_body":"Get-Content -LiteralPath Cargo.toml"}),
+    ).unwrap();
+    let unified = crate::tools::handlers::unified_exec::get_command(
+        &args, Arc::new(shell),
+        ShellCommandHandler::effective_allow_login_shell(&reviewer, true), false,
+    ).unwrap();
+    assert_eq!(unified.safety_command, safety_command);
+    assert!(unified.command.iter().any(|arg| arg == "-NoProfile"));
+}
+
+#[cfg(unix)]
+#[test]
+fn independent_review_shell_surfaces_skip_login_profile_side_effects() {
+    let Some(shell) = crate::shell::get_shell(ShellType::Zsh, None) else { return; };
+    let home = tempfile::tempdir().unwrap();
+    let marker = home.path().join("startup");
+    std::fs::write(home.path().join(".zprofile"), "print startup > \"$ZDOTDIR/startup\"\n").unwrap();
+    let run = |argv: Vec<String>| {
+        let output = std::process::Command::new(&argv[0]).args(&argv[1..])
+            .env("ZDOTDIR", home.path()).output().unwrap();
+        assert!(output.status.success());
+    };
+    run(ShellCommandHandler::base_command(&shell, "printf command-proof", true));
+    assert!(marker.exists(), "fixture must prove profile startup has an effect");
+    std::fs::remove_file(&marker).unwrap();
+    let reviewer = codex_protocol::protocol::SessionSource::SubAgent(
+        codex_protocol::protocol::SubAgentSource::Review,
+    );
+    let policy = ShellCommandHandler::effective_allow_login_shell(&reviewer, true);
+    run(ShellCommandHandler::base_command(&shell, "printf command-proof", policy));
+    assert!(!marker.exists());
+    let args = serde_json::from_value(serde_json::json!({"cmd":"printf command-proof"})).unwrap();
+    run(crate::tools::handlers::unified_exec::get_command(&args, Arc::new(shell), policy, false).unwrap().command);
+    assert!(!marker.exists());
 }
 
 /// The logic for is_known_safe_command() has heuristics for known shells,

@@ -80,6 +80,24 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
             projected.remove("stderr");
             projected.remove("streams_complete");
         }
+        // Compatibility booleans remain script-visible. Presentation names the
+        // scope rather than conflating this poll with the cumulative transcript.
+        if let Some(reduced) = object.get("output_reduced").and_then(Value::as_bool) {
+            projected.insert("current_chunk_display_complete".into(), Value::Bool(!reduced));
+            projected.remove("output_reduced");
+        }
+        if let Some(complete) = object.get("streams_complete").and_then(Value::as_bool) {
+            projected.insert("cumulative_streams_complete".into(), Value::Bool(complete));
+            projected.remove("streams_complete");
+        }
+        if object.get("raw_output_artifact_id").is_some_and(Value::is_string) {
+            let complete = object.get("process_exited") == Some(&Value::Bool(true))
+                && object.get("session_id").is_none_or(Value::is_null)
+                && object.get("raw_output_artifact_error").is_none_or(Value::is_null)
+                && object.get("raw_output_artifact_retention_limit_hit") == Some(&Value::Bool(false));
+            projected.insert("retained_artifact_complete".into(), Value::Bool(complete));
+        }
+        projected.remove("output_complete");
     } else if tool.namespace.is_none()
         && matches!(tool.name.as_str(), "read_file" | "read_tool_output")
     {
@@ -336,7 +354,8 @@ mod tests {
         let compact = model_visible_tool_result(&ToolName::plain("exec_command"), &raw).unwrap();
         assert_eq!(compact, json!({"output":"progress", "session_id":7,
             "execution_state":"running", "exit_code":null,
-            "raw_output_artifact_id":"retained", "output_complete":false}));
+            "raw_output_artifact_id":"retained", "cumulative_streams_complete":true,
+            "retained_artifact_complete":false}));
         // Execution values, including the separate streams, remain untouched.
         assert_eq!(raw["stdout"], "progress");
         let terminal = json!({"output":"done", "execution_state":"exited",
@@ -346,9 +365,11 @@ mod tests {
             "raw_output_artifact_id":"retained", "raw_output_artifact_bytes":4});
         let mut expected = terminal.clone();
         for key in ["process_exited", "output_reduced", "raw_output_artifact_id",
-            "raw_output_artifact_bytes"] {
+            "raw_output_artifact_bytes", "output_complete"] {
             expected.as_object_mut().unwrap().remove(key);
         }
+        expected["current_chunk_display_complete"] = json!(true);
+        expected["retained_artifact_complete"] = json!(false);
         println!("projection_audit terminal_controls before_bytes={} after_bytes={}", terminal.to_string().len(), expected.to_string().len());
         assert_eq!(model_visible_tool_result(&ToolName::plain("write_stdin"), &terminal), Some(expected));
         // A reduced result keeps the locator and selector that recover its gap.
@@ -356,13 +377,36 @@ mod tests {
             "execution_state":"exited", "exit_code":0, "output_complete":false,
             "output_reduced":true, "raw_output_artifact_id":"retained",
             "raw_output_artifact_bytes":90, "recovery_selector":{"kind":"lines","start":2,"end":9}});
-        assert_eq!(model_visible_tool_result(&ToolName::plain("exec_command"), &reduced), Some(reduced));
+        let mut expected = reduced.clone();
+        expected.as_object_mut().unwrap().remove("output_complete");
+        expected.as_object_mut().unwrap().remove("output_reduced");
+        expected["current_chunk_display_complete"] = json!(false);
+        expected["retained_artifact_complete"] = json!(false);
+        assert_eq!(model_visible_tool_result(&ToolName::plain("exec_command"), &reduced), Some(expected));
         // Exited processes may still have output to drain. Keep the handle and
         // all mismatching state, including a producer's contradictory flags.
         let inconsistent = json!({"output":"diagnostic", "execution_state":"running",
             "process_exited":true, "exit_code":null, "output_complete":false,
             "output_reduced":false, "session_id":7, "error":"cleanup failed"});
-        assert_eq!(model_visible_tool_result(&ToolName::plain("exec_command"), &inconsistent), Some(inconsistent));
+        let mut expected = inconsistent.clone();
+        expected.as_object_mut().unwrap().remove("output_complete");
+        expected.as_object_mut().unwrap().remove("output_reduced");
+        expected["current_chunk_display_complete"] = json!(true);
+        assert_eq!(model_visible_tool_result(&ToolName::plain("exec_command"), &inconsistent), Some(expected));
+    }
+
+    #[test]
+    fn verified10_empty_terminal_chunk_names_each_completeness_scope() {
+        let raw = json!({"output":"", "stdout":"prior output", "stderr":"", "streams_complete":true,
+            "output_complete":false, "output_reduced":false, "process_exited":true,
+            "execution_state":"exited", "raw_output_artifact_id":"transcript",
+            "raw_output_artifact_retention_limit_hit":false});
+        let projected = model_visible_tool_result(&ToolName::plain("write_stdin"), &raw).unwrap();
+        assert_eq!(projected["current_chunk_display_complete"], true);
+        assert_eq!(projected["cumulative_streams_complete"], true);
+        assert_eq!(projected["retained_artifact_complete"], true);
+        assert!(projected.get("output_complete").is_none());
+        assert_eq!(raw["output_complete"], false);
     }
 
     #[test]

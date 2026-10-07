@@ -22,6 +22,49 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell_snapshot::ShellSnapshot;
 
 #[tokio::test]
+async fn verified_capture_path_deltas_preserve_unrelated_dirty_files() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    std::fs::write(repo.join("README.md"), "dirty before\n").unwrap();
+    std::fs::write(repo.join("other.txt"), "unchanged dirty\n").unwrap();
+    let before = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
+    std::fs::write(repo.join("README.md"), "changed after\n").unwrap();
+    let after = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
+    assert_eq!(after.changed_paths_since(&before), Some(BTreeSet::from([repo.join("README.md").to_path_buf()])));
+    run_git(repo.as_path(), &["add", "README.md"]).await;
+    let staged = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
+    assert_eq!(staged.changed_paths_since(&after), Some(BTreeSet::from([repo.join("README.md").to_path_buf()])));
+    run_git(repo.as_path(), &["mv", "README.md", "renamed.md"]).await;
+    let renamed = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
+    assert_eq!(renamed.changed_paths_since(&staged), Some(BTreeSet::from([
+        repo.join("README.md").to_path_buf(), repo.join("renamed.md").to_path_buf(),
+    ])));
+    std::fs::remove_file(repo.join("other.txt")).unwrap();
+    let deleted = capture_workspace_evidence_identity(repo.as_path()).await.unwrap();
+    assert_eq!(deleted.changed_paths_since(&renamed), Some(BTreeSet::from([repo.join("other.txt").to_path_buf()])));
+    let restored: WorkspaceEvidenceIdentity = serde_json::from_value(serde_json::to_value(&deleted).unwrap()).unwrap();
+    assert_eq!(restored, deleted, "capture-local details do not change durable identity");
+    assert!(restored.changed_paths_since(&renamed).is_none());
+    assert!(deleted.changed_paths_since(&WorkspaceEvidenceIdentity::unavailable(Some(repo.as_path()))).is_none());
+}
+
+#[tokio::test]
+async fn verified_validation_paths_exclude_only_ignored_and_external_local_files() {
+    let (temp, repo) = create_clean_git_repo().await;
+    std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+    std::fs::write(repo.join("ignored.txt"), "output").unwrap();
+    let external = temp.path().parent().unwrap().join("outside-report.txt");
+    let paths = vec![("local".into(), repo.join("README.md").to_path_buf()),
+        ("local".into(), repo.join("ignored.txt").to_path_buf()),
+        ("local".into(), external.clone()), ("remote".into(), external)];
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let filtered = cache.validation_relevant_paths(repo.as_path(), paths.clone()).await;
+    assert_eq!(filtered, vec![paths[0].clone(), paths[3].clone()]);
+    run_git(repo.as_path(), &["add", "-f", "ignored.txt"]).await;
+    assert_eq!(cache.validation_relevant_paths(repo.as_path(), paths.clone()).await,
+        vec![paths[0].clone(), paths[1].clone(), paths[3].clone()]);
+}
+
+#[tokio::test]
 async fn checkout_content_snapshot_covers_clean_tracked_and_untracked_files() {
     let (_temp, repo) = create_clean_git_repo().await;
     std::fs::write(repo.join("tracked.txt"), b"one").unwrap();
@@ -36,6 +79,23 @@ async fn checkout_content_snapshot_covers_clean_tracked_and_untracked_files() {
     std::fs::write(repo.join("new.txt"), b"new").unwrap();
     let untracked_change = capture_checkout_snapshot(repo.as_path()).await.unwrap();
     assert_ne!(tracked_change, untracked_change);
+}
+
+#[tokio::test]
+async fn completion_boundary_batched_ignores_match_single_path_attribution() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    std::fs::write(repo.join(".gitignore"), "ignored/\n*.out\n").unwrap();
+    std::fs::create_dir(repo.join("ignored")).unwrap();
+    std::fs::write(repo.join("ignored/tracked.out"), "tracked").unwrap();
+    run_git(repo.as_path(), &["add", "-f", "ignored/tracked.out"]).await;
+    let mut paths = (0..80).map(|index| repo.join(format!("result-{index}.out")).to_path_buf()).collect::<Vec<_>>();
+    paths.extend([repo.join("ignored").to_path_buf(), repo.join("ignored/tracked.out").to_path_buf(), repo.join("README.md").to_path_buf()]);
+    let ignored = git_ignored_validation_paths(repo.as_path(), &paths).await;
+    for path in &paths {
+        assert_eq!(ignored.contains(path), git_ignores_all_changed_paths(repo.as_path(), std::slice::from_ref(path)).await, "{}", path.display());
+    }
+    assert_eq!(ignored.len(), 80);
+    assert!(git_ignored_validation_paths(repo.join("missing-root").as_path(), &paths).await.is_empty());
 }
 
 #[tokio::test]
@@ -1615,6 +1675,56 @@ async fn source_path_batch_establishes_one_watch_and_preserves_path_scopes() {
 }
 
 #[tokio::test]
+async fn source_path_alias_retarget_invalidates_internal_and_external_targets() {
+    for external in [false, true] {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target_root = if external { outside.path() } else { root.path() };
+        let first = target_root.join("first");
+        let second = target_root.join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(first.join("input.rs"), "first").unwrap();
+        std::fs::write(second.join("input.rs"), "second").unwrap();
+        let alias = root.path().join("alias");
+        let link = |target: &Path| {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &alias).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir(target, &alias).unwrap();
+        };
+        link(&first);
+        let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::new().unwrap())));
+        let observation = cache.begin_source_path_change_observation(
+            root.path(), &alias.join("input.rs"), false,
+        ).await.unwrap();
+        assert_eq!(observation.source_dependency(),
+            crate::tool_history::SourceDependencyV1::new(&alias.join("input.rs"), false));
+        cache.note_host_workspace_mutation_paths(root.path(), &["unrelated.md".into()]).await;
+        assert!(cache.source_path_change_observation_is_current(&observation));
+        #[cfg(unix)]
+        std::fs::remove_file(&alias).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(&alias).unwrap();
+        link(&second);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cache.source_path_change_observation_is_current(&observation) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("native watch must observe alias retargeting");
+        assert_eq!(std::fs::read_to_string(first.join("input.rs")).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(alias.join("input.rs")).unwrap(), "second");
+        // Explicit mutation publication must retain the alias as well, even
+        // though resolving it now yields a different target.
+        let current = cache.begin_source_path_change_observation(
+            root.path(), &alias.join("input.rs"), false,
+        ).await.unwrap();
+        cache.note_host_workspace_mutation_paths(root.path(), &["alias".into()]).await;
+        assert!(!cache.source_path_change_observation_is_current(&current));
+    }
+}
+
+#[tokio::test]
 async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
     let root = TempDir::new().expect("source observation root");
     let source = root.path().join("src").join("lib.rs");
@@ -1630,11 +1740,13 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
         .note_host_workspace_mutation_paths(root.path(), &["README.md".to_string()])
         .await;
     assert!(cache.source_path_change_observation_is_current(&observation));
+    assert_eq!(cache.source_path_freshness(&observation), SourceFreshness::Current);
 
     cache
         .note_host_workspace_mutation_paths(root.path(), &["src/lib.rs".to_string()])
         .await;
     assert!(!cache.source_path_change_observation_is_current(&observation));
+    assert_eq!(cache.source_path_freshness(&observation), SourceFreshness::Changed);
 
     let uncertain = cache
         .begin_source_path_change_observation(root.path(), &source, false)
@@ -1642,6 +1754,7 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
         .expect("refreshed path observation");
     cache.note_host_workspace_mutation();
     assert!(!cache.source_path_change_observation_is_current(&uncertain));
+    assert_eq!(cache.source_path_freshness(&uncertain), SourceFreshness::Unknown);
 
     let overflowed = cache
         .begin_source_path_change_observation(root.path(), &source, false)
@@ -1653,6 +1766,7 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
             .await;
     }
     assert!(!cache.source_path_change_observation_is_current(&overflowed));
+    assert_eq!(cache.source_path_freshness(&overflowed), SourceFreshness::Unknown);
 }
 
 #[tokio::test]

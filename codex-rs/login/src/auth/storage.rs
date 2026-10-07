@@ -88,6 +88,10 @@ impl AgentIdentityStorage {
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentIdentityAuthRecord {
+    /// Auth-service base URL that issued this signing identity. Legacy records
+    /// remain readable, but managed bootstrap must register again before reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_origin: Option<String>,
     pub agent_runtime_id: String,
     pub agent_private_key: String,
     pub account_id: String,
@@ -135,6 +139,7 @@ impl From<AgentIdentityJwtClaims> for AgentIdentityAuthRecord {
     fn from(claims: AgentIdentityJwtClaims) -> Self {
         Self {
             agent_runtime_id: claims.agent_runtime_id,
+            issuer_origin: None,
             agent_private_key: claims.agent_private_key,
             account_id: claims.account_id,
             chatgpt_user_id: claims.chatgpt_user_id,

@@ -1269,7 +1269,8 @@ async fn external_agent_config_import_compacts_huge_session_before_first_follow_
         codex_home.path(),
         &server.uri(),
         &BTreeMap::default(),
-        /*auto_compact_limit*/ 30_000,
+        // Leave room for the bounded user checkpoint plus current tool schemas.
+        /*auto_compact_limit*/ 60_000,
         /*requires_openai_auth*/ None,
         "mock_provider",
         "Summarize the conversation.",
@@ -1281,8 +1282,8 @@ async fn external_agent_config_import_compacts_huge_session_before_first_follow_
     let session_path = session_dir.join("session.jsonl");
     std::fs::create_dir_all(&project_root)?;
     std::fs::create_dir_all(&session_dir)?;
-    let huge_user = "u".repeat(80_000);
-    let huge_assistant = "a".repeat(80_000);
+    let huge_user = "u".repeat(160_000);
+    let huge_assistant = "a".repeat(160_000);
     std::fs::write(
         &session_path,
         [

@@ -180,7 +180,7 @@ impl StateRuntime {
     /// keeping logs in a dedicated file to reduce lock contention with the
     /// rest of the state store.
     pub async fn init(codex_home: PathBuf, default_provider: String) -> anyhow::Result<Arc<Self>> {
-        Self::init_inner(
+        Self::init_serialized(
             codex_home,
             default_provider,
             /*telemetry_override*/ None,
@@ -194,7 +194,51 @@ impl StateRuntime {
         default_provider: String,
         telemetry_override: DbTelemetryHandle,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::init_inner(codex_home, default_provider, Some(telemetry_override)).await
+        Self::init_serialized(codex_home, default_provider, Some(telemetry_override)).await
+    }
+
+    async fn init_serialized(
+        codex_home: PathBuf,
+        default_provider: String,
+        telemetry_override: Option<DbTelemetryHandle>,
+    ) -> anyhow::Result<Arc<Self>> {
+        // The owned task retains exclusion through pool cleanup even if its
+        // caller stops waiting during a migration.
+        tokio::spawn(async move {
+            let _owners = recovery::lock_runtime_initialization(&codex_home).await?;
+            Self::init_inner(codex_home, default_provider, telemetry_override).await
+        }).await?
+    }
+
+    /// Recheck damage after admission, quarantine only damaged databases, and
+    /// retain ownership until replacement initialization has completed.
+    pub async fn recover_for_fresh_start(
+        database_path: PathBuf,
+        default_provider: String,
+    ) -> anyhow::Result<Vec<RuntimeDbBackup>> {
+        tokio::spawn(async move {
+            let home = database_path.parent().ok_or_else(|| anyhow::anyhow!("database has no parent"))?.to_path_buf();
+            let _owners = recovery::lock_runtime_initialization(&home).await?;
+            let mut backups = Vec::new();
+            let mut attempted = BTreeSet::new();
+            loop {
+                let error = match Self::init_inner(home.clone(), default_provider.clone(), None).await {
+                    Ok(runtime) => {
+                        runtime.close().await;
+                        return Ok(backups);
+                    }
+                    Err(error) => error,
+                };
+                let blocking_home = tokio::fs::metadata(&home).await.is_ok_and(|metadata| metadata.is_file());
+                let path = match runtime_db_path_for_corruption_error(&error) {
+                    Some(path) => path,
+                    None if blocking_home => database_path.clone(),
+                    None => return Err(error),
+                };
+                if !attempted.insert(path.clone()) { return Err(error); }
+                backups.extend(recovery::backup_runtime_db_owned(&path).await?);
+            }
+        }).await?
     }
 
     async fn init_inner(

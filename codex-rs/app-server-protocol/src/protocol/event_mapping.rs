@@ -445,6 +445,7 @@ pub fn item_event_to_server_notification(
         }
         EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event) => {
             let item_id = exec_command_output_delta_event.call_id;
+            let decoding_lossy = std::str::from_utf8(&exec_command_output_delta_event.chunk).is_err();
             let delta =
                 String::from_utf8_lossy(&exec_command_output_delta_event.chunk).into_owned();
             ServerNotification::CommandExecutionOutputDelta(
@@ -453,6 +454,8 @@ pub fn item_event_to_server_notification(
                     turn_id,
                     item_id,
                     delta,
+                    stream: Some(exec_command_output_delta_event.stream),
+                    decoding_lossy: Some(decoding_lossy),
                 },
             )
         }
@@ -660,7 +663,31 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 item_id: "call-1".to_string(),
                 delta: "hello".to_string(),
+                stream: Some(ExecOutputStream::Stdout),
+                decoding_lossy: Some(false),
             },
         );
+    }
+
+    #[test]
+    fn interleaved_output_preserves_stream_and_decoding_provenance() {
+        for (stream, chunk, lossy) in [
+            (ExecOutputStream::Stdout, b"out".to_vec(), false),
+            (ExecOutputStream::Stderr, vec![0xff], true),
+            (ExecOutputStream::Stdout, b"next".to_vec(), false),
+        ] {
+            let notification = item_event_to_server_notification(
+                EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                    call_id: "command".into(), stream: stream.clone(), chunk: chunk.clone(),
+                }), "thread", "turn",
+            );
+            let ServerNotification::CommandExecutionOutputDelta(delta) = notification else {
+                panic!("expected exactly one output notification");
+            };
+            assert_eq!(delta.stream, Some(stream));
+            assert_eq!(delta.decoding_lossy, Some(lossy));
+            assert_eq!(delta.delta, String::from_utf8_lossy(&chunk));
+            assert_eq!(delta.item_id, "command");
+        }
     }
 }

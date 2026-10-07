@@ -739,7 +739,7 @@ async fn multi_agent_v2_spawn_requires_explicit_turn_authorization() {
     assert_eq!(
         error,
         FunctionCallError::RespondToModel(
-            "spawn_agent: this turn is in explicit-request-only mode and the user did not explicitly authorize spawning agents"
+            "spawn_agent: spawning is not authorized for this turn. Explicit-request-only permission is checked per turn; an earlier turn's authorization is not carried forward."
                 .to_string(),
         )
     );

@@ -70,15 +70,15 @@ pub(super) async fn update_thread_metadata(
         reject_paginated_history_mode(thread.history_mode)?;
     }
     let require_sqlite_write = sqlite_write_failure_should_block(&patch);
-    let updated = apply_metadata_update(
-        store,
-        thread_id,
-        patch.clone(),
-        params.include_archived,
-        require_sqlite_write,
-    )
-    .await?;
     if !needs_rollout_compat {
+        let updated = apply_metadata_update(
+            store,
+            thread_id,
+            patch.clone(),
+            params.include_archived,
+            require_sqlite_write,
+        )
+        .await?;
         if let Some(metadata) = updated {
             return read_thread::stored_thread_from_sqlite_metadata(store, metadata).await;
         }
@@ -104,22 +104,25 @@ pub(super) async fn update_thread_metadata(
     )
     .await?
     .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-    let name = patch.name;
-    let git_info = patch.git_info;
+    let name = patch.name.clone();
+    let git_info = patch.git_info.clone();
 
     let state_db_ctx = store.state_db().await;
-    codex_rollout::state_integration::reconcile_rollout(
-        state_db_ctx.as_deref(),
-        resolved_rollout_path.path.as_path(),
-        store.config.default_model_provider_id.as_str(),
-        /*builder*/ None,
-        &[],
-        /*archived_only*/ resolved_rollout_path.archived.then_some(true),
-    )
-    .await;
-
-    if let Some(name) = name {
-        apply_thread_name(store, thread_id, name.unwrap_or_default()).await?;
+    // Reconciliation establishes only a missing baseline. Never reload older
+    // rollout facts over an existing explicit SQLite patch.
+    if let Some(state_db) = state_db_ctx.as_ref()
+        && state_db.get_thread(thread_id).await.map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read thread metadata for {thread_id}: {err}"),
+        })?.is_none()
+    {
+        codex_rollout::state_integration::reconcile_rollout(
+            Some(state_db.as_ref()),
+            resolved_rollout_path.path.as_path(),
+            store.config.default_model_provider_id.as_str(),
+            None,
+            &[],
+            resolved_rollout_path.archived.then_some(true),
+        ).await;
     }
 
     let resolved_git_info = match git_info {
@@ -171,9 +174,24 @@ pub(super) async fn update_thread_metadata(
         )
         .await?;
         refresh_resolved_rollout_path(&mut resolved_rollout_path).await;
-        apply_thread_git_info(store, thread_id, sha, branch, origin_url).await?;
     }
 
+    let updated = apply_metadata_update(
+        store,
+        thread_id,
+        patch.clone(),
+        params.include_archived,
+        require_sqlite_write,
+    )
+    .await?;
+    if let Some(name) = name {
+        apply_thread_name(store, thread_id, name.unwrap_or_default(), updated.is_some()).await?;
+    }
+    // Prefer the committed projection; reading compatibility state must not
+    // reapply an older rollout snapshot after the explicit patch.
+    if let Some(metadata) = updated {
+        return read_thread::stored_thread_from_sqlite_metadata(store, metadata).await;
+    }
     let mut thread = match read_thread::read_thread(
         store,
         ReadThreadParams {
@@ -274,102 +292,103 @@ async fn apply_metadata_update(
                     message: format!("thread {thread_id} is archived"),
                 });
             }
-            if let Some(rollout_path) = rollout_path {
-                metadata.rollout_path = rollout_path;
-            }
-            if let Some(preview) = patch.preview {
-                metadata.preview = Some(preview);
-            }
-            if let Some(name) = patch.name {
-                metadata.title = name.unwrap_or_default();
-            }
-            if let Some(title) = patch.title {
-                metadata.title = title;
-            }
-            if let Some(model_provider) = patch.model_provider {
-                metadata.model_provider = model_provider;
-            }
-            if let Some(model) = patch.model {
-                metadata.model = Some(model);
-            }
-            if let Some(reasoning_effort) = patch.reasoning_effort {
-                metadata.reasoning_effort = reasoning_effort;
-            }
-            if let Some(created_at) = patch.created_at {
-                metadata.created_at = created_at;
-            }
-            if let Some(updated_at) = patch.updated_at {
-                metadata.updated_at = updated_at;
-            }
-            if existing.is_none()
-                && let Some(recency_at) = advance_recency_at
-            {
-                metadata.recency_at = recency_at;
-            }
-            if let Some(source) = patch.source {
-                metadata.source = enum_to_string(&source);
-            }
-            if let Some(thread_source) = patch.thread_source {
-                metadata.thread_source = thread_source;
-            }
-            if let Some(agent_nickname) = patch.agent_nickname {
-                metadata.agent_nickname = agent_nickname;
-            }
-            if let Some(agent_role) = patch.agent_role {
-                metadata.agent_role = agent_role;
-            }
-            if let Some(agent_path) = patch.agent_path {
-                metadata.agent_path = agent_path;
-            }
-            if let Some(cwd) = patch.cwd {
-                metadata.cwd = normalize_cwd(cwd);
-            }
-            if let Some(cli_version) = patch.cli_version {
-                metadata.cli_version = cli_version;
-            }
-            if let Some(approval_mode) = patch.approval_mode {
-                metadata.approval_mode = enum_to_string(&approval_mode);
-            }
-            if let Some(permission_profile) = patch.permission_profile {
-                metadata.sandbox_policy = permission_profile_to_metadata_value(&permission_profile);
-            }
-            if let Some(token_usage) = patch.token_usage {
-                metadata.tokens_used = token_usage.total_tokens.max(0);
-            }
-            if let Some(first_user_message) = patch.first_user_message {
-                metadata.first_user_message = Some(first_user_message);
-            }
-            if let Some(git_info) = patch.git_info {
-                let existing_git_info = git_info_from_parts(
-                    metadata.git_sha.clone(),
-                    metadata.git_branch.clone(),
-                    metadata.git_origin_url.clone(),
-                );
-                let (sha, branch, origin_url) = resolve_git_info_patch(existing_git_info, git_info);
-                metadata.git_sha = sha;
-                metadata.git_branch = branch;
-                metadata.git_origin_url = origin_url;
-            }
-            if let Some(project_id) = patch.project_id {
-                metadata.project_id = project_id;
-                state_db
-                    .upsert_thread_with_project(&metadata, metadata.project_id.as_deref())
-                    .await
-                    .map_err(|err| {
-                        let message = err.to_string();
-                        if message.contains("project not found") {
-                            ThreadStoreError::InvalidRequest { message }
-                        } else {
-                            ThreadStoreError::Internal { message }
-                        }
-                    })?;
-            } else {
-                state_db.upsert_thread(&metadata).await.map_err(|err| {
-                    ThreadStoreError::Internal {
-                        message: format!("failed to update thread metadata for {thread_id}: {err}"),
-                    }
-                })?;
-            }
+            let fallback = metadata;
+            let name_update = patch.name.is_some();
+            let mut metadata = state_db.patch_thread_metadata(&fallback, |metadata| {
+                if !include_archived && metadata.archived_at.is_some() {
+                    return Err(format!("thread {thread_id} is archived"));
+                }
+                if let Some(rollout_path) = rollout_path {
+                    metadata.rollout_path = rollout_path;
+                }
+                if let Some(preview) = patch.preview {
+                    metadata.preview = Some(preview);
+                }
+                if let Some(name) = patch.name {
+                    metadata.title = name.unwrap_or_default();
+                }
+                if let Some(title) = patch.title {
+                    metadata.title = title;
+                }
+                if let Some(model_provider) = patch.model_provider {
+                    metadata.model_provider = model_provider;
+                }
+                if let Some(model) = patch.model {
+                    metadata.model = Some(model);
+                }
+                if let Some(reasoning_effort) = patch.reasoning_effort {
+                    metadata.reasoning_effort = reasoning_effort;
+                }
+                if let Some(created_at) = patch.created_at {
+                    metadata.created_at = created_at;
+                }
+                if let Some(updated_at) = patch.updated_at {
+                    metadata.updated_at = updated_at;
+                }
+                if existing.is_none()
+                    && let Some(recency_at) = advance_recency_at
+                {
+                    metadata.recency_at = recency_at;
+                }
+                if let Some(source) = patch.source {
+                    metadata.source = enum_to_string(&source);
+                }
+                if let Some(thread_source) = patch.thread_source {
+                    metadata.thread_source = thread_source;
+                }
+                if let Some(agent_nickname) = patch.agent_nickname {
+                    metadata.agent_nickname = agent_nickname;
+                }
+                if let Some(agent_role) = patch.agent_role {
+                    metadata.agent_role = agent_role;
+                }
+                if let Some(agent_path) = patch.agent_path {
+                    metadata.agent_path = agent_path;
+                }
+                if let Some(cwd) = patch.cwd {
+                    metadata.cwd = normalize_cwd(cwd);
+                }
+                if let Some(cli_version) = patch.cli_version {
+                    metadata.cli_version = cli_version;
+                }
+                if let Some(approval_mode) = patch.approval_mode {
+                    metadata.approval_mode = enum_to_string(&approval_mode);
+                }
+                if let Some(permission_profile) = patch.permission_profile {
+                    metadata.sandbox_policy = permission_profile_to_metadata_value(&permission_profile);
+                }
+                if let Some(token_usage) = patch.token_usage {
+                    metadata.tokens_used = token_usage.total_tokens.max(0);
+                }
+                if let Some(first_user_message) = patch.first_user_message {
+                    metadata.first_user_message = Some(first_user_message);
+                }
+                if let Some(git_info) = patch.git_info {
+                    let existing_git_info = git_info_from_parts(
+                        metadata.git_sha.clone(),
+                        metadata.git_branch.clone(),
+                        metadata.git_origin_url.clone(),
+                    );
+                    let (sha, branch, origin_url) = resolve_git_info_patch(existing_git_info, git_info);
+                    metadata.git_sha = sha;
+                    metadata.git_branch = branch;
+                    metadata.git_origin_url = origin_url;
+                }
+                if let Some(project_id) = patch.project_id {
+                    metadata.project_id = project_id;
+                }
+    
+                Ok(())
+            }).await.map_err(|err| {
+                let message = err.to_string();
+                if message.contains("project not found") || message.contains("is archived") {
+                    ThreadStoreError::InvalidRequest { message }
+                } else if name_update {
+                    ThreadStoreError::Internal { message: format!("failed to set thread name: {message}") }
+                } else {
+                    ThreadStoreError::Internal { message }
+                }
+            })?;
             if existing.is_some()
                 && let Some(recency_at) = advance_recency_at
             {
@@ -549,7 +568,7 @@ fn sqlite_write_failure_should_block(patch: &ThreadMetadataPatch) -> bool {
     // look broken. Explicit git-only updates still require SQLite because partial git patches need
     // the existing SQLite value to preserve unspecified fields. Name compatibility writes still
     // require their targeted SQLite update to succeed before writing the legacy name index.
-    patch.project_id.is_some() || (patch.git_info.is_some() && !has_observed_metadata_facts(patch))
+    patch.name.is_some() || patch.project_id.is_some() || (patch.git_info.is_some() && !has_observed_metadata_facts(patch))
 }
 
 fn sqlite_write_error_is_best_effort(err: &ThreadStoreError) -> bool {
@@ -587,38 +606,6 @@ fn enum_to_string<T: serde::Serialize>(value: &T) -> String {
 
 fn normalize_cwd(cwd: PathBuf) -> PathBuf {
     codex_utils_absolute_path::normalize_for_path_comparison(cwd.as_path()).unwrap_or(cwd)
-}
-
-async fn apply_thread_git_info(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-    sha: &Option<String>,
-    branch: &Option<String>,
-    origin_url: &Option<String>,
-) -> ThreadStoreResult<()> {
-    let Some(state_db) = store.state_db().await else {
-        return Err(ThreadStoreError::Internal {
-            message: format!("sqlite state db unavailable for thread {thread_id}"),
-        });
-    };
-    let updated = state_db
-        .update_thread_git_info(
-            thread_id,
-            Some(sha.as_deref()),
-            Some(branch.as_deref()),
-            Some(origin_url.as_deref()),
-        )
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to update git metadata for thread {thread_id}: {err}"),
-        })?;
-    if updated {
-        Ok(())
-    } else {
-        Err(ThreadStoreError::Internal {
-            message: format!("thread metadata disappeared before update completed: {thread_id}"),
-        })
-    }
 }
 
 fn resolve_git_info_patch(
@@ -677,26 +664,18 @@ async fn apply_thread_name(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     name: String,
+    committed: bool,
 ) -> ThreadStoreResult<()> {
-    if let Some(state_db) = store.state_db().await {
-        let updated = state_db
-            .update_thread_title(thread_id, &name)
-            .await
-            .map_err(|err| ThreadStoreError::Internal {
-                message: format!("failed to set thread name: {err}"),
-            })?;
-        if !updated {
-            return Err(ThreadStoreError::Internal {
-                message: format!("thread metadata unavailable before name update: {thread_id}"),
-            });
+    match append_thread_name(store.config.codex_home.as_path(), thread_id, &name).await {
+        Ok(()) => Ok(()),
+        Err(err) if committed => {
+            warn!(%thread_id, %err, "thread name committed; compatibility name index update failed; no retry required");
+            Ok(())
         }
-    }
-
-    append_thread_name(store.config.codex_home.as_path(), thread_id, &name)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
+        Err(err) => Err(ThreadStoreError::Internal {
             message: format!("failed to index thread name: {err}"),
-        })
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -725,6 +704,53 @@ mod tests {
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
     use crate::local::test_support::write_session_file_with_history_mode;
+
+    #[tokio::test]
+    async fn explicit_name_and_model_patch_survives_reopen() {
+        let home = TempDir::new().unwrap();
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(home.path().to_path_buf(), config.default_model_provider_id.clone()).await.unwrap();
+        let store = LocalThreadStore::new(config.clone(), Some(runtime));
+        let uuid = Uuid::from_u128(9997);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        write_session_file(home.path(), "2025-02-04T16-00-00", uuid).unwrap();
+        let updated = store.update_thread_metadata(UpdateThreadMetadataParams {
+            thread_id, include_archived: false,
+            patch: ThreadMetadataPatch { name: Some(Some("explicit name".into())), model: Some("explicit model".into()), ..Default::default() },
+        }).await.unwrap();
+        assert_eq!(updated.model.as_deref(), Some("explicit model"));
+        drop(store);
+        let runtime = codex_state::StateRuntime::init(home.path().to_path_buf(), config.default_model_provider_id.clone()).await.unwrap();
+        let reopened = LocalThreadStore::new(config, Some(runtime));
+        let thread = reopened.read_thread(ReadThreadParams { thread_id, include_archived: false, include_history: false }).await.unwrap();
+        assert_eq!(thread.name.as_deref(), Some("explicit name"));
+        assert_eq!(thread.model.as_deref(), Some("explicit model"));
+    }
+
+    #[tokio::test]
+    async fn initially_absent_git_patch_rebuilds_from_rollout() {
+        let home = TempDir::new().unwrap();
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(home.path().to_path_buf(), config.default_model_provider_id.clone()).await.unwrap();
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let uuid = Uuid::from_u128(9998);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        let path = write_session_file(home.path(), "2025-02-04T16-00-00", uuid).unwrap();
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        let mut lines = bytes.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
+        lines[0]["payload"]["git"] = Value::Null;
+        std::fs::write(&path, lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+        store.update_thread_metadata(UpdateThreadMetadataParams {
+            thread_id, include_archived: false,
+            patch: ThreadMetadataPatch { git_info: Some(GitInfoPatch { sha: Some(Some("new-sha".into())), ..Default::default() }), ..Default::default() },
+        }).await.unwrap();
+        assert_eq!(last_rollout_item(&path)["payload"]["git"]["commit_hash"], "new-sha");
+        runtime.delete_thread(thread_id).await.unwrap();
+        assert!(codex_rollout::state_integration::reconcile_rollout(
+            Some(runtime.as_ref()), &path, "test-provider", None, &[], None,
+        ).await);
+        assert_eq!(runtime.get_thread(thread_id).await.unwrap().unwrap().git_sha.as_deref(), Some("new-sha"));
+    }
 
     #[tokio::test]
     async fn missing_sqlite_row_preserves_canonical_session_metadata() {
@@ -825,7 +851,7 @@ mod tests {
         std::fs::create_dir(home.path().join("session_index.jsonl"))
             .expect("block session index file creation");
 
-        let err = store
+        let committed = store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id,
                 patch: ThreadMetadataPatch {
@@ -835,9 +861,9 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect_err("index write should fail");
+            .expect("committed name must be reported as success despite compatibility warning");
 
-        assert!(err.to_string().contains("failed to index thread name"));
+        assert_eq!(committed.name.as_deref(), Some("Committed name"));
         let metadata = runtime
             .get_thread(thread_id)
             .await
@@ -1337,9 +1363,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            ThreadStoreError::InvalidRequest { message } if message == format!(
-                "rollout session metadata id mismatch: expected {filename_uuid}, found {metadata_uuid}"
-            )
+            ThreadStoreError::ThreadNotFound { thread_id: missing } if missing == thread_id
         ));
         assert_eq!(
             std::fs::read_to_string(&path).expect("read rejected rollout"),
@@ -1394,8 +1418,8 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_failures_are_best_effort_for_legacy_rollout_compat_updates() {
-        assert!(!sqlite_write_failure_should_block(&ThreadMetadataPatch {
+    fn sqlite_failures_block_before_compatibility_name_index_updates() {
+        assert!(sqlite_write_failure_should_block(&ThreadMetadataPatch {
             name: Some(Some("User chosen name".to_string())),
             ..Default::default()
         }));

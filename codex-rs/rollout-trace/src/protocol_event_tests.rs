@@ -72,6 +72,8 @@ fn mcp_tool_call_progress_is_not_a_trace_boundary_or_wrapped_event() {
     let event = EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
         call_id: "call-mcp".to_string(),
         message: "still working".to_string(),
+        progress: None,
+        total: None,
     });
 
     assert!(tool_runtime_trace_event(&event).is_none());
@@ -94,6 +96,7 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
         interaction_input: None,
     });
     let end = EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+        output_metadata: None,
         call_id: "call-end".to_string(),
         process_id: None,
         turn_id: "turn-1".to_string(),
@@ -106,7 +109,7 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
         stdout: "output".to_string(),
         stderr: String::new(),
         aggregated_output: "output".to_string(),
-        exit_code: 0,
+        exit_code: Some(0),
         duration: Duration::from_millis(250),
         formatted_output: "output".to_string(),
         status: ExecCommandStatus::Completed,

@@ -176,7 +176,7 @@ impl GitWorkspaceMetadata {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct WorkspaceEvidenceIdentity {
     /// Repository discovery or capture failed. Unlike a proven non-Git `None`, this
     /// value never authorizes reuse, even when two failed captures are equal.
@@ -187,7 +187,22 @@ pub(crate) struct WorkspaceEvidenceIdentity {
     pub(crate) head_identity: Option<String>,
     pub(crate) index_identity: Option<String>,
     pub(crate) worktree_identity: Option<String>,
+    /// Capture-local detail, never serialized into model history or cache keys.
+    #[serde(skip)]
+    pub(crate) path_fingerprints: Option<BTreeMap<String, String>>,
 }
+
+impl PartialEq for WorkspaceEvidenceIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.unavailable == other.unavailable
+            && self.repository_root == other.repository_root
+            && self.head_identity == other.head_identity
+            && self.index_identity == other.index_identity
+            && self.worktree_identity == other.worktree_identity
+    }
+}
+
+impl Eq for WorkspaceEvidenceIdentity {}
 
 impl WorkspaceEvidenceIdentity {
     fn unavailable(repository_root: Option<&Path>) -> Self {
@@ -197,7 +212,23 @@ impl WorkspaceEvidenceIdentity {
             head_identity: None,
             index_identity: None,
             worktree_identity: None,
+            path_fingerprints: None,
         }
+    }
+
+    pub(crate) fn changed_paths_since(&self, before: &Self) -> Option<BTreeSet<PathBuf>> {
+        if self.unavailable || before.unavailable
+            || self.repository_root != before.repository_root
+            || self.head_identity != before.head_identity
+        {
+            return None;
+        }
+        let root = Path::new(self.repository_root.as_deref()?);
+        let before = before.path_fingerprints.as_ref()?;
+        let after = self.path_fingerprints.as_ref()?;
+        Some(before.keys().chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .map(|path| root.join(path)).collect())
     }
 }
 
@@ -446,7 +477,70 @@ impl WorkspaceRootCache {
     }
 }
 
-async fn git_ignores_all_changed_paths(root: &Path, paths: &[PathBuf]) -> bool {
+/// Classify one bounded batch, not one subprocess pair per changed path.
+/// A failed/oversized query proves no exclusions. Tracked descendants keep an
+/// ignored directory relevant, just like the single-path watcher check.
+async fn git_ignored_validation_paths(root: &Path, paths: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    let mut ignored_paths = std::collections::BTreeSet::new();
+    let mut offset = 0;
+    while offset < paths.len() {
+        let mut input = Vec::new();
+        let mut batch = Vec::new();
+        while offset < paths.len() {
+            let path = &paths[offset];
+            let Some(relative) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
+                offset += 1;
+                continue;
+            };
+            if relative.len() + 1 > 8 * 1024 {
+                offset += 1;
+                continue;
+            }
+            if input.len() + relative.len() + 1 > 8 * 1024 { break; }
+            input.extend_from_slice(relative.as_bytes());
+            input.push(0);
+            batch.push((path.clone(), relative.to_string()));
+            offset += 1;
+        }
+        if batch.is_empty() { continue; }
+        let excluded = timeout(Duration::from_secs(2), async {
+            let mut tracked = Command::new(codex_git_utils::git_executable_async().await)
+                .args(["--literal-pathspecs", "ls-files", "--cached", "-z", "--"])
+                .args(batch.iter().map(|(_, relative)| relative))
+                .current_dir(root).stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+                .kill_on_drop(true).spawn().ok()?;
+            let mut bytes = Vec::new();
+            tracked.stdout.take()?.take(1024 * 1024 + 1).read_to_end(&mut bytes).await.ok()?;
+            if bytes.len() > 1024 * 1024 || !tracked.wait().await.ok()?.success() { return None; }
+            let tracked = std::str::from_utf8(&bytes).ok()?.split('\0')
+                .filter(|path| !path.is_empty()).map(|path| root.join(path)).collect::<Vec<_>>();
+            let mut query = Command::new(codex_git_utils::git_executable_async().await)
+                .args(["check-ignore", "-z", "--stdin"]).current_dir(root)
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null()).kill_on_drop(true).spawn().ok()?;
+            let mut stdin = query.stdin.take()?;
+            let (written, output) = tokio::join!(async move {
+                stdin.write_all(&input).await?;
+                stdin.shutdown().await
+            }, query.wait_with_output());
+            written.ok()?;
+            let output = output.ok()?;
+            if !matches!(output.status.code(), Some(0 | 1)) { return None; }
+            let ignored = std::str::from_utf8(&output.stdout).ok()?.split('\0')
+                .filter(|path| !path.is_empty()).collect::<std::collections::BTreeSet<_>>();
+            Some(batch.iter().filter(|(path, relative)| ignored.contains(relative.as_str())
+                && !tracked.iter().any(|tracked| path_is_same_or_descendant(tracked, path)))
+                .map(|(path, _)| path.clone()).collect::<Vec<_>>())
+        }).await.ok().flatten();
+        ignored_paths.extend(excluded.unwrap_or_default());
+    }
+    ignored_paths
+}
+
+pub(crate) async fn git_ignores_all_changed_paths(root: &Path, paths: &[PathBuf]) -> bool {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     if paths.is_empty() {
@@ -642,6 +736,7 @@ async fn capture_remote_workspace_evidence(
         head_identity,
         index_identity: Some(format!("{:x}", index.finalize())),
         worktree_identity: Some(format!("{:x}", worktree.finalize())),
+        path_fingerprints: None,
     }))
 }
 
@@ -690,6 +785,13 @@ async fn capture_workspace_generation_marker(
     worktree_hasher.update(&status);
     worktree_hasher.update(&metadata.manifest);
 
+    let mut reader = WorkspaceStatusReader::new();
+    reader.push(&status)?;
+    let mut path_fingerprints = reader.path_status;
+    for (path, content) in metadata.path_fingerprints {
+        path_fingerprints.entry(path).or_default().push_str(&content);
+    }
+
     Some(WorkspaceEvidenceIdentity {
         unavailable: false,
         // Both capture entry points obtain this canonical root from the
@@ -698,6 +800,7 @@ async fn capture_workspace_generation_marker(
         head_identity,
         index_identity: Some(format!("{:x}", index_hasher.finalize())),
         worktree_identity: Some(format!("{:x}", worktree_hasher.finalize())),
+        path_fingerprints: Some(path_fingerprints),
     })
 }
 
@@ -714,6 +817,7 @@ struct WorkspaceStatusReader {
     record_start: usize,
     rename_source: bool,
     paths: BTreeMap<String, bool>,
+    path_status: BTreeMap<String, String>,
 }
 
 impl WorkspaceStatusReader {
@@ -725,6 +829,7 @@ impl WorkspaceStatusReader {
             record_start: 0,
             rename_source: false,
             paths: BTreeMap::new(),
+            path_status: BTreeMap::new(),
         }
     }
 
@@ -748,6 +853,7 @@ impl WorkspaceStatusReader {
             self.record_start = end + 1;
             if self.rename_source {
                 self.rename_source = false;
+                self.path_status.insert(std::str::from_utf8(record).ok()?.to_owned(), "rename_source".into());
                 continue;
             }
             let (path, deleted) = match record.first().copied()? {
@@ -776,6 +882,7 @@ impl WorkspaceStatusReader {
             if path.is_empty() {
                 return None;
             }
+            self.path_status.insert(path.to_owned(), format!("{:x}", Sha256::digest(record)));
             if let Some(previous) = self.paths.insert(path.to_owned(), deleted)
                 && previous != deleted
             {
@@ -877,6 +984,7 @@ fn workspace_head_identity(status: &[u8]) -> Option<Option<String>> {
 
 struct WorkspaceGenerationMetadata {
     manifest: Vec<u8>,
+    path_fingerprints: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -1055,8 +1163,11 @@ async fn capture_workspace_metadata_cached(
         }).await.ok()? }
     })).buffered(hashing_concurrency).collect::<Vec<_>>().await;
     let mut deletions = Vec::new();
+    let mut path_fingerprints = BTreeMap::new();
     for result in results {
         let (entry, deletion) = result?;
+        let path = std::str::from_utf8(entry.split(|byte| *byte == 0).next()?).ok()?.to_owned();
+        path_fingerprints.insert(path, format!("{:x}", Sha256::digest(&entry)));
         manifest.extend(entry);
         deletions.extend(deletion);
     }
@@ -1066,7 +1177,7 @@ async fn capture_workspace_metadata_cached(
                 return None;
             }
         }
-        control.active().then_some(WorkspaceGenerationMetadata { manifest })
+        control.active().then_some(WorkspaceGenerationMetadata { manifest, path_fingerprints })
     }).await.ok()?
 }
 
@@ -1624,12 +1735,25 @@ pub(crate) struct SourcePathChangeObservation {
     path: PathBuf,
     #[serde(default)]
     recursive: bool,
+    // The pathname used by the caller is a dependency too: replacing a link
+    // changes the read without touching its previously resolved target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<Box<SourcePathChangeObservation>>,
 }
 
 impl SourcePathChangeObservation {
     pub(crate) fn source_dependency(&self) -> crate::tool_history::SourceDependencyV1 {
-        crate::tool_history::SourceDependencyV1::new(&self.path, self.recursive)
+        let path = self.alias.as_ref().map_or(&self.path, |alias| &alias.path);
+        crate::tool_history::SourceDependencyV1::new(path, self.recursive)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceFreshness {
+    Current,
+    Changed,
+    Unknown,
 }
 
 #[derive(Clone, Debug)]
@@ -2012,6 +2136,26 @@ impl GitWorkspaceCache {
         let cwd = cwd.to_path_buf();
         tokio::task::spawn_blocking(move || roots.resolve(&cwd))
             .await.map_err(std::io::Error::other)?
+    }
+
+    /// Exclude only proven irrelevant local paths. Discovery/ignore failures and
+    /// remote environments remain conservatively attributable.
+    pub(crate) async fn validation_relevant_paths(
+        &self,
+        cwd: &Path,
+        paths: Vec<(String, PathBuf)>,
+    ) -> Vec<(String, PathBuf)> {
+        if paths.is_empty() { return paths; }
+        let Ok(Some(root)) = self.resolve_workspace_root(cwd).await else { return paths; };
+        let local = |environment: &str| environment.is_empty()
+            || environment == codex_exec_server::LOCAL_ENVIRONMENT_ID;
+        let candidates = paths.iter().filter(|(environment, path)|
+            local(environment) && path_is_same_or_descendant(path, &root))
+            .map(|(_, path)| path.clone()).collect::<Vec<_>>();
+        let ignored = git_ignored_validation_paths(&root, &candidates).await;
+        paths.into_iter().filter(|(environment, path)| !local(environment)
+            || (path_is_same_or_descendant(path, &root) && !ignored.contains(path)))
+            .collect()
     }
 
     pub(crate) async fn workspace_evidence_identity_with_attribution(
@@ -2590,10 +2734,31 @@ impl GitWorkspaceCache {
         let paths = paths.to_vec();
         let paths = tokio::task::spawn_blocking(move || {
             let repo_root = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
+            let same_path = |left: &Path, right: &Path| {
+                if cfg!(windows) {
+                    source_change_path_key(left) == source_change_path_key(right)
+                } else {
+                    left == right
+                }
+            };
             paths
                 .into_iter()
                 .map(|(path, recursive)| {
-                    let path = dunce::canonicalize(&path).unwrap_or(path);
+                    let resolved = dunce::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    let alias = (!same_path(&resolved, &path)).then(|| {
+                        // Watch above the link, not through it. External aliases
+                        // need the nearest stable ancestor so retargeting itself
+                        // remains observable.
+                        let root = if path_is_same_or_descendant(&path, &repo_root) {
+                            repo_root.clone()
+                        } else {
+                            path.ancestors().skip(1).find(|ancestor|
+                                dunce::canonicalize(ancestor).is_ok_and(|resolved| same_path(&resolved, ancestor)))
+                                .unwrap_or(&path).to_path_buf()
+                        };
+                        (root, path)
+                    });
+                    let path = resolved;
                     let watch_root = if path_is_same_or_descendant(&path, &repo_root) {
                         repo_root.clone()
                     } else {
@@ -2601,30 +2766,53 @@ impl GitWorkspaceCache {
                         // recursively watching their entire parent directory.
                         path.clone()
                     };
-                    (watch_root, path, recursive)
+                    (watch_root, path, recursive, alias)
                 })
                 .collect::<Vec<_>>()
         })
         .await
         .ok()?;
         let mut registrations = BTreeMap::new();
-        for (watch_root, _, _) in &paths {
-            if !registrations.contains_key(watch_root) {
-                let generation = self.retain_source_watch(watch_root).await?;
-                registrations.insert(watch_root.clone(), generation);
+        for (watch_root, _, _, alias) in &paths {
+            for root in std::iter::once(watch_root).chain(alias.as_ref().map(|(root, _)| root)) {
+                if !registrations.contains_key(root) {
+                    let generation = self.retain_source_watch(root).await?;
+                    registrations.insert(root.clone(), generation);
+                }
             }
         }
         let watcher_generation = self.reliable_source_watcher_generation()?;
+        // Resolution preceded watch registration. Reject a link that changed
+        // in that gap; later changes are covered by the captured generation.
+        let aliases = paths.iter().filter_map(|(_, target, _, alias)|
+            alias.as_ref().map(|(_, path)| (path.clone(), target.clone())))
+            .collect::<Vec<_>>();
+        if !aliases.is_empty()
+            && !tokio::task::spawn_blocking(move || aliases.into_iter().all(|(path, target)|
+                dunce::canonicalize(path).is_ok_and(|resolved| resolved == target)))
+                .await.ok()?
+        {
+            return None;
+        }
         Some(
             paths
                 .into_iter()
-                .map(|(watch_root, path, recursive)| SourcePathChangeObservation {
+                .map(|(watch_root, path, recursive, alias)| SourcePathChangeObservation {
                     watcher_epoch: self.watcher_epoch,
                     watcher_generation,
                     registration_generation: registrations[&watch_root],
                     repo_root: watch_root,
                     path,
                     recursive,
+                    alias: alias.map(|(repo_root, path)| Box::new(SourcePathChangeObservation {
+                        watcher_epoch: self.watcher_epoch,
+                        watcher_generation,
+                        registration_generation: registrations[&repo_root],
+                        repo_root,
+                        path,
+                        recursive,
+                        alias: None,
+                    })),
                 })
                 .collect(),
         )
@@ -2691,17 +2879,32 @@ impl GitWorkspaceCache {
         &self,
         observation: &SourcePathChangeObservation,
     ) -> bool {
+        self.source_path_freshness(observation) == SourceFreshness::Current
+    }
+
+    pub(crate) fn source_observation_is_from_prior_watcher(&self, observation: &SourcePathChangeObservation) -> bool {
+        observation.watcher_epoch != self.watcher_epoch
+    }
+
+    pub(crate) fn source_path_freshness(
+        &self,
+        observation: &SourcePathChangeObservation,
+    ) -> SourceFreshness {
+        if let Some(alias) = &observation.alias {
+            let freshness = self.source_path_freshness(alias);
+            if freshness != SourceFreshness::Current { return freshness; }
+        }
         if observation.watcher_epoch != self.watcher_epoch
             || is_generated_codex_eval_path(&observation.path)
             || !path_is_same_or_descendant(&observation.path, &observation.repo_root)
         {
-            return false;
+            return SourceFreshness::Unknown;
         }
         let Some(current_generation) = self.reliable_source_watcher_generation() else {
-            return false;
+            return SourceFreshness::Unknown;
         };
         if current_generation < observation.watcher_generation {
-            return false;
+            return SourceFreshness::Unknown;
         }
         {
             let mut retention = self
@@ -2715,7 +2918,7 @@ impl GitWorkspaceCache {
                     registration.generation == observation.registration_generation
                 });
             if !registration_is_current {
-                return false;
+                return SourceFreshness::Unknown;
             }
             retention.touch(&observation.repo_root);
         }
@@ -2725,10 +2928,11 @@ impl GitWorkspaceCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if (journal.retained_floor != 0 && observation.watcher_generation <= journal.retained_floor)
             || journal.latest_generation != current_generation
+            || journal.coarse_generations.back().is_some_and(|generation| *generation > observation.watcher_generation)
         {
-            return false;
+            return SourceFreshness::Unknown;
         }
-        !journal.path_changed_since(observation)
+        if journal.path_changed_since(observation) { SourceFreshness::Changed } else { SourceFreshness::Current }
     }
 
     #[cfg(test)]
@@ -2780,14 +2984,16 @@ impl GitWorkspaceCache {
         let repo_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let paths = changed_paths
             .iter()
-            .map(|path| {
+            .flat_map(|path| {
                 let path = Path::new(path);
                 let absolute = if path.is_absolute() {
                     path.to_path_buf()
                 } else {
                     repo_root.join(path)
                 };
-                dunce::canonicalize(&absolute).unwrap_or(absolute)
+                let resolved = dunce::canonicalize(&absolute).unwrap_or_else(|_| absolute.clone());
+                let alias = (resolved != absolute).then_some(absolute);
+                std::iter::once(resolved).chain(alias)
             })
             .filter(|path| !is_generated_codex_eval_path(path))
             .collect::<Vec<_>>();

@@ -553,9 +553,10 @@ impl Drop for TurnTerminalPermit {
 pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_request_permissions: HashMap<String, PendingRequestPermissions>,
-    pending_user_input: HashMap<String, oneshot::Sender<RequestUserInputResponse>>,
+    pending_user_input: HashMap<String, (String, oneshot::Sender<RequestUserInputResponse>)>,
+    user_input_request_counts: HashMap<String, usize>,
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
-    pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
+    pending_dynamic_tools: HashMap<String, (String, oneshot::Sender<DynamicToolResponse>)>,
     pub(crate) pending_input: TurnInputQueue,
     mailbox_delivery_phase: MailboxDeliveryPhase,
     granted_permissions_by_approval_scope_id: HashMap<String, UriAdditionalPermissionProfile>,
@@ -648,23 +649,39 @@ impl TurnState {
     pub(crate) fn insert_pending_user_input(
         &mut self,
         key: String,
+        call_id: String,
         tx: oneshot::Sender<RequestUserInputResponse>,
     ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
-        self.pending_user_input.insert(key, tx)
+        let count = self.user_input_request_counts.entry(key.clone()).or_default();
+        *count = count.saturating_add(1);
+        self.pending_user_input.insert(key, (call_id, tx)).map(|(_, tx)| tx)
     }
 
     pub(crate) fn remove_pending_user_input(
         &mut self,
         key: &str,
     ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
-        self.pending_user_input.remove(key)
+        self.pending_user_input.remove(key).map(|(_, tx)| tx)
+    }
+
+    pub(crate) fn remove_matching_user_input(
+        &mut self,
+        key: &str,
+        call_id: Option<&str>,
+    ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
+        let (pending_id, _) = self.pending_user_input.get(key)?;
+        let matches = match call_id {
+            Some(call_id) => call_id == pending_id,
+            None => self.user_input_request_counts.get(key) == Some(&1),
+        };
+        if matches { self.remove_pending_user_input(key) } else { None }
     }
 
     pub(crate) fn remove_closed_pending_user_input(&mut self, key: &str) {
         if self
             .pending_user_input
             .get(key)
-            .is_some_and(oneshot::Sender::is_closed)
+            .is_some_and(|(_, tx)| tx.is_closed())
         {
             self.pending_user_input.remove(key);
         }
@@ -722,11 +739,12 @@ impl TurnState {
     pub(crate) fn try_insert_pending_dynamic_tool(
         &mut self,
         key: String,
+        turn_id: String,
         tx: oneshot::Sender<DynamicToolResponse>,
     ) -> Result<(), oneshot::Sender<DynamicToolResponse>> {
         match self.pending_dynamic_tools.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(tx);
+                entry.insert((turn_id, tx));
                 Ok(())
             }
             std::collections::hash_map::Entry::Occupied(_) => Err(tx),
@@ -736,15 +754,20 @@ impl TurnState {
     pub(crate) fn remove_pending_dynamic_tool(
         &mut self,
         key: &str,
+        turn_id: &str,
     ) -> Option<oneshot::Sender<DynamicToolResponse>> {
-        self.pending_dynamic_tools.remove(key)
+        if self.pending_dynamic_tools.get(key).is_some_and(|(owner, _)| owner == turn_id) {
+            self.pending_dynamic_tools.remove(key).map(|(_, sender)| sender)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn remove_closed_pending_dynamic_tool(&mut self, key: &str) {
         if self
             .pending_dynamic_tools
             .get(key)
-            .is_some_and(oneshot::Sender::is_closed)
+            .is_some_and(|(_, sender)| sender.is_closed())
         {
             self.pending_dynamic_tools.remove(key);
         }

@@ -1491,6 +1491,8 @@ mod tests {
                 turn_id: "turn".to_string(),
                 item_id: "item".to_string(),
                 delta: delta.to_string(),
+                stream: None,
+                decoding_lossy: None,
             },
         )
     }
@@ -3371,6 +3373,8 @@ mod tests {
                         turn_id: "turn".to_string(),
                         item_id: "item".to_string(),
                         delta: "stdout".to_string(),
+                        stream: None,
+                        decoding_lossy: None,
                     }
                 )
             )

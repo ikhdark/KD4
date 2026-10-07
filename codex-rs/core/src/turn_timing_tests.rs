@@ -51,6 +51,34 @@ use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NS_PER_MS: u128 = 1_000_000;
 
+#[tokio::test(start_paused = true)]
+async fn timing_storage_deadline_preserves_inline_details_and_creation_owner() {
+    let timing = TurnTiming {
+        tool_calls: vec![codex_protocol::protocol::TurnTimingToolCall {
+            lifecycle_events: vec![TurnTimingToolLifecycleEvent {
+                boundary: ToolLifecycleBoundary::ProcessExit,
+                at_ms: 123,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (release, held) = tokio::sync::oneshot::channel();
+    let (finished, done) = tokio::sync::oneshot::channel();
+    let artifact = tokio::spawn(async move {
+        held.await.unwrap();
+        finished.send(()).unwrap();
+        crate::tools::command_output_artifact::RawOutputArtifact::unavailable("test storage unavailable")
+    });
+    let started = tokio::time::Instant::now();
+    let fallback = super::retain_turn_timing_artifact(timing.clone(), artifact).await;
+    assert_eq!(fallback, timing);
+    assert_eq!(started.elapsed(), super::TURN_TIMING_STORAGE_TIMEOUT);
+    release.send(()).expect("storage still owns its transaction");
+    done.await.unwrap();
+}
+
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 async fn timing_details_are_recoverable_without_repeating_them_in_the_rollout() {
@@ -549,6 +577,36 @@ fn rolling_checkpoint_does_not_complete_the_live_turn() {
 }
 
 #[test]
+fn sampling_checkpoints_keep_tool_counters_but_leave_call_details_to_final_timing() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    for index in 1..=3 {
+        clock.set_ms(index);
+        state.record_tool_call("exec_command");
+        state.record_tool_dispatch_timing(
+            &format!("call-{index}"),
+            "exec_command",
+            TurnTimingToolCallSource::Direct,
+            ToolCallTimingLineage::default(),
+            ToolDispatchTimingSnapshot::default(),
+        );
+        let checkpoint = state.sampling_checkpoint();
+        assert_eq!(checkpoint.timing.counters.tool_call_count, index as u32);
+        assert!(checkpoint.timing.tool_calls.is_empty());
+        assert!(state.state().completed_snapshot.is_none());
+        // Unsettled-call identities may occur in the closure checkpoint. They
+        // are recovery state, not the per-call timing records excluded above.
+        assert_eq!(serde_json::to_value(&checkpoint.timing.tool_calls).unwrap(), serde_json::json!([]));
+    }
+    let final_timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(final_timing.counters.tool_call_count, 3);
+    assert_eq!(
+        final_timing.tool_calls.iter().map(|call| call.call_id.as_str()).collect::<Vec<_>>(),
+        vec!["call-1", "call-2", "call-3"]
+    );
+}
+
+#[test]
 fn sampling_checkpoints_write_only_changed_entries_and_recovery_merges_them() {
     let (clock, state) = timing();
     state.mark_turn_started();
@@ -608,6 +666,41 @@ async fn turn_timing_state_uses_one_wall_and_monotonic_start_sample() {
     let snapshot = state.complete_snapshot();
     assert_eq!(snapshot.duration_ms, Some(25));
     assert_eq!(snapshot.completed_at_unix_secs, Some(987));
+}
+
+#[test]
+fn lost_turn_recovery_lists_nested_in_flight_calls_from_merged_checkpoints() {
+    use codex_protocol::protocol::{RolloutItem, SamplingBoundaryItem, SamplingTimingCheckpoint, TurnTimingToolCall};
+    let boundary = |calls, incremental| RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+        sampling_request_id: "sampling".into(), physical_attempt_id: "attempt".into(),
+        turn_id: None, unresolved_context: false,
+        timing_checkpoint: Some(SamplingTimingCheckpoint {
+            observed_at_unix_ms: 100, tail_unknown: true, incremental,
+            runtime_identity: Default::default(), harness_build: None,
+            timing: codex_protocol::protocol::TurnTiming { tool_calls: calls, ..Default::default() },
+        }),
+    });
+    let active = TurnTimingToolCall {
+        call_id: "nested-process".into(), tool_name: "exec_command".into(),
+        parent_call_id: Some("outer".into()), parent_cell_id: Some("cell".into()),
+        handler_entry_at_ms: Some(1), handler_exit_at_ms: Some(2),
+        process_spawned_at_ms: Some(1), ..Default::default()
+    };
+    let mut completed = TurnTimingToolCall {
+        call_id: "settled".into(), tool_name: "read_file".into(),
+        handler_entry_at_ms: Some(1), ..Default::default()
+    };
+    let first = boundary(vec![active, completed.clone()], false);
+    completed.handler_exit_at_ms = Some(3);
+    let (notice, timing) = crate::context::lost_turn_recovery(&[first, boundary(vec![completed], true)]);
+    assert!(notice.contains("nested-process"));
+    assert!(notice.contains("exec_command"));
+    assert!(notice.contains("outer"));
+    assert!(!notice.contains("settled"));
+    assert!(notice.contains("final step"));
+    assert!(notice.contains("not a crash-time inventory"));
+    assert!(!timing.profile_valid);
+    assert!(timing.completed_at_unix_ms.is_none());
 }
 
 #[test]

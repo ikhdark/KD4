@@ -114,6 +114,19 @@ mod tests {
         args.iter().map(ToString::to_string).collect()
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn native_exit_guards_do_not_hide_mutations_or_stale_loop_bindings() {
+        for (script, expected) in [
+            ("git diff --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", true),
+            ("git diff; if ($LASTEXITCODE -ne 0) { Remove-Item a; exit 1 }", false),
+            ("$x='--list'; foreach ($x in @('-D')) { $x }; git branch $x main", false),
+            ("Get-ChildItem | ForEach-Object { $_.Delete() }", false),
+        ] {
+            assert_eq!(is_safe_command_windows(&vec_str(&["powershell.exe", "-NoProfile", "-Command", script])), expected, "{script}");
+        }
+    }
+
     fn windows_powershell_path() -> Option<String> {
         Some(
             std::path::PathBuf::from(std::env::var_os("SystemRoot")?)

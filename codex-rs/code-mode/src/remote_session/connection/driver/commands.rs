@@ -201,13 +201,22 @@ impl ConnectionDriver {
     fn wait(
         &mut self,
         session: RemoteSession,
-        request: WaitRequest,
+        mut request: WaitRequest,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     ) -> bool {
         if let Err(err) = self.sessions.require_ready(&session) {
             let _ = response_tx.send(Err(err));
             return true;
+        }
+        if !self.receipt_recovery {
+            if request.recovery.as_ref().is_some_and(|recovery| recovery.terminal_only) {
+                let _ = response_tx.send(Err("code-mode host does not support terminal receipt recovery".into()));
+                return true;
+            }
+            // Retain the legacy V1 request shape. The normal generation fence
+            // still rejects stale IDs when receipt recovery is unsupported.
+            request.recovery = None;
         }
         let request = match remote_wait_request(&session, request) {
             Ok(request) => request,
@@ -236,6 +245,7 @@ impl ConnectionDriver {
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     ) -> bool {
         let cell_id = request.cell_id.clone();
+        let terminal_only = request.recovery.as_ref().is_some_and(|recovery| recovery.terminal_only);
         self.send_request(
             HostRequest::Wait {
                 session_id: session.id.clone(),
@@ -244,6 +254,7 @@ impl ConnectionDriver {
             PendingRequest::Wait {
                 session,
                 cell_id,
+                terminal_only,
                 cancellation: CancellableRequest::new(caller_cancellation),
                 response_tx,
             },

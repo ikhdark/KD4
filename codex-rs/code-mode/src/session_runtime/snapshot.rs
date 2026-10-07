@@ -24,13 +24,16 @@ const MAX_SNAPSHOT_BYTES: usize =
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Snapshot<V> {
+#[serde(bound(deserialize = "V: Deserialize<'de>, E: Deserialize<'de>"))]
+struct Snapshot<V, E = CellEvent> {
     version: u32,
     revision: u64,
     completed_call_id: String,
     values: BTreeMap<String, V>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    presentations: BTreeMap<String, Value>,
     #[serde(default)]
-    completed_cells: BTreeMap<String, CellEvent>,
+    completed_cells: BTreeMap<String, E>,
     #[serde(default)]
     next_cell_id: u64,
 }
@@ -41,19 +44,46 @@ pub(super) struct DurableState {
     pub(super) path: PathBuf,
     _lease: File,
     revision: AtomicU64,
-    completed_cells: Mutex<BTreeMap<String, CellEvent>>,
+    completed_cells: Mutex<BTreeMap<String, Arc<CompletedSnapshotEvent>>>,
     pub(super) first_cell_id: u64,
     pub(super) cell_id_limit: u64,
+    #[cfg(test)]
+    pub(super) io_gate: Mutex<Option<(bool, Arc<super::StorageTestGate>)>>,
 }
 
 pub(super) struct StagedSnapshot {
     file: NamedTempFile,
     revision: u64,
-    completed_cells: BTreeMap<String, CellEvent>,
+    completed_cells: BTreeMap<String, Arc<CompletedSnapshotEvent>>,
+}
+
+// Immutable terminal payloads belong to this snapshot owner. Staging another
+// cell shares their wire bytes rather than cloning and serializing every old
+// receipt again. Publication still atomically replaces one complete snapshot.
+struct CompletedSnapshotEvent {
+    event: CellEvent,
+    serialized: Arc<serde_json::value::RawValue>,
+    bytes: usize,
+}
+
+impl CompletedSnapshotEvent {
+    fn new(event: CellEvent) -> Result<Arc<Self>, String> {
+        let serialized = serde_json::value::to_raw_value(&event).map_err(|error| error.to_string())?;
+        let bytes = super::cell_event_bytes(&event);
+        Ok(Arc::new(Self { event, serialized: Arc::from(serialized), bytes }))
+    }
 }
 
 impl DurableState {
     pub(super) fn open(path: PathBuf) -> Result<(Self, HashMap<String, StoredValue>), String> {
+        Self::open_with_values(path, HashMap::new(), 1)
+    }
+
+    pub(super) fn open_with_values(
+        path: PathBuf,
+        initial_values: HashMap<String, StoredValue>,
+        minimum_cell_id: u64,
+    ) -> Result<(Self, HashMap<String, StoredValue>), String> {
         if !path.is_absolute() {
             return Err("named-state snapshot path must be host-selected and absolute".into());
         }
@@ -65,6 +95,9 @@ impl DurableState {
             .map_err(|error| format!("named-state snapshot is owned by another runtime: {error}"))?;
         let snapshot = match File::open(&path) {
             Ok(file) => {
+                if !initial_values.is_empty() {
+                    return Err("existing named-state snapshot cannot replace in-memory values".into());
+                }
                 let mut bytes = Vec::new();
                 file.take((MAX_SNAPSHOT_BYTES + 1) as u64).read_to_end(&mut bytes)
                     .map_err(|error| error.to_string())?;
@@ -73,13 +106,13 @@ impl DurableState {
                 }
                 let snapshot: Snapshot<Value> = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("named-state snapshot is invalid; no cell started: {error}"))?;
-                if !matches!(snapshot.version, 1..=3) {
+                if !matches!(snapshot.version, 1..=5) {
                     return Err("unsupported named-state snapshot version; no cell started".into());
                 }
                 if snapshot.completed_cells.len() > super::TERMINAL_CELL_CACHE_CAPACITY
                     || snapshot.completed_cells.iter().any(|(id, event)| {
                         id.parse::<u64>().is_err()
-                            || !matches!(event, CellEvent::Completed { .. })
+                            || !matches!(event, CellEvent::Completed { .. } | CellEvent::Terminated { .. })
                     })
                 {
                     return Err("invalid completed-cell snapshot; no cell started".into());
@@ -91,22 +124,25 @@ impl DurableState {
                 revision: 0,
                 completed_call_id: String::new(),
                 values: BTreeMap::new(),
+                presentations: BTreeMap::new(),
                 completed_cells: BTreeMap::new(),
                 next_cell_id: 1,
             },
             Err(error) => return Err(error.to_string()),
         };
-        let values = snapshot.values.into_iter().map(|(key, value)| {
-            let stored = StoredValue::new(&key, value);
+        let mut values = snapshot.values.into_iter().map(|(key, value)| {
+            let stored = StoredValue::new(&key, value)
+                .with_presentation(snapshot.presentations.get(&key).cloned());
             (key, stored)
         }).collect::<HashMap<_, _>>();
+        values.extend(initial_values);
         if !stored_values_with_writes_within_limits(&HashMap::new(), &values) {
             return Err("named-state snapshot exceeds the session storage limit".into());
         }
         let first_cell_id = snapshot.completed_cells.keys()
             .filter_map(|id| id.parse::<u64>().ok()).max().unwrap_or(0)
             .checked_add(1).ok_or("durable cell ID space exhausted")?
-            .max(snapshot.next_cell_id);
+            .max(snapshot.next_cell_id).max(minimum_cell_id);
         // Reserve a disjoint range before any cell starts. Interrupted cells
         // have uncertain effects and must never alias a new cell after restart.
         let cell_id_limit = first_cell_id.checked_add(1u64 << 32)
@@ -115,19 +151,30 @@ impl DurableState {
             path,
             _lease: lease,
             revision: AtomicU64::new(snapshot.revision),
-            completed_cells: Mutex::new(snapshot.completed_cells),
+            completed_cells: Mutex::new(snapshot.completed_cells.into_iter().map(|(id, event)| {
+                CompletedSnapshotEvent::new(event).map(|event| (id, event))
+            }).collect::<Result<_, _>>()?),
             first_cell_id,
             cell_id_limit,
+            #[cfg(test)]
+            io_gate: Mutex::new(None),
         };
         let reservation = state.stage_state(
-            snapshot.completed_call_id, values.clone(), state.completed_cells(),
+            snapshot.completed_call_id, values.clone(), state.completed_cells.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
         )?;
         state.publish(reservation)?;
         Ok((state, values))
     }
 
     pub(super) fn completed_cells(&self) -> BTreeMap<String, CellEvent> {
-        self.completed_cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.completed_cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter().map(|(id, event)| (id.clone(), event.event.clone())).collect()
+    }
+
+    pub(super) fn completed_cell(&self, cell_id: &str) -> Option<CellEvent> {
+        self.completed_cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(cell_id).map(|event| event.event.clone())
     }
 
     /// Serialize and synchronize off the async runtime, before entering the
@@ -139,13 +186,16 @@ impl DurableState {
         cell_id: String,
         event: CellEvent,
     ) -> Result<StagedSnapshot, String> {
-        let mut completed_cells = self.completed_cells();
-        completed_cells.insert(cell_id.clone(), event);
+        #[cfg(test)]
+        self.wait_for_test_io(false);
+        let mut completed_cells = self.completed_cells.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        completed_cells.insert(cell_id.clone(), CompletedSnapshotEvent::new(event)?);
         // Preserve the newest result exactly, including its artifact references.
         // Evict older receipts rather than truncating recovery information.
         while completed_cells.len() > super::TERMINAL_CELL_CACHE_CAPACITY
             || (completed_cells.len() > 1
-                && completed_cells.values().map(super::cell_event_bytes).sum::<usize>()
+                && completed_cells.values().map(|event| event.bytes).sum::<usize>()
                     > super::TERMINAL_CELL_CACHE_MAX_BYTES)
         {
             let oldest = completed_cells.keys().filter(|id| id.as_str() != cell_id.as_str())
@@ -163,17 +213,22 @@ impl DurableState {
         &self,
         completed_call_id: String,
         values: HashMap<String, StoredValue>,
-        completed_cells: BTreeMap<String, CellEvent>,
+        completed_cells: BTreeMap<String, Arc<CompletedSnapshotEvent>>,
     ) -> Result<StagedSnapshot, String> {
         let revision = self.revision.load(Ordering::Acquire).checked_add(1)
             .ok_or("named-state revision exhausted")?;
         let snapshot = Snapshot {
-            version: 3,
+            version: 5,
             revision,
             completed_call_id,
-            values: values.into_iter().map(|(key, value)| (key, Arc::clone(&value.value)))
-                .collect::<BTreeMap<_, _>>(),
-            completed_cells: completed_cells.clone(),
+            presentations: values.iter().filter_map(|(key, value)|
+                value.presentation.as_ref().map(|metadata| (key.clone(), (**metadata).clone()))).collect(),
+            values: values.into_iter().map(|(key, value)| {
+                value.serialized.map(|json| (key, json))
+                    .ok_or_else(|| "stored value has no serialized representation".to_string())
+            }).collect::<Result<BTreeMap<_, _>, _>>()?,
+            completed_cells: completed_cells.iter().map(|(id, event)|
+                (id.clone(), Arc::clone(&event.serialized))).collect(),
             next_cell_id: self.cell_id_limit,
         };
         let mut file = NamedTempFile::new_in(self.path.parent().ok_or("snapshot has no parent")?)
@@ -186,14 +241,27 @@ impl DurableState {
         Ok(StagedSnapshot { file, revision, completed_cells })
     }
 
-    /// Called at the same linearization point as the in-memory commit. This is
-    /// process-crash recovery, not a promise of power-loss durability on every OS.
+    /// The owned blocking transaction publishes after the atomic in-memory
+    /// decision. Until this succeeds, callers must report uncertain durability.
+    /// This is process-crash recovery, not guaranteed power-loss durability.
     pub(super) fn publish(&self, staged: StagedSnapshot) -> Result<(), String> {
+        #[cfg(test)]
+        self.wait_for_test_io(true);
         let StagedSnapshot { file, revision, completed_cells } = staged;
         file.persist(&self.path).map_err(|error| error.to_string())?;
         *self.completed_cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             completed_cells;
         self.revision.store(revision, Ordering::Release);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_for_test_io(&self, publishing: bool) {
+        let gate = self.io_gate.lock().unwrap().clone();
+        if let Some((phase, gate)) = gate
+            && phase == publishing
+        {
+            gate.wait();
+        }
     }
 }

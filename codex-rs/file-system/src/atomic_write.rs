@@ -106,22 +106,70 @@ pub fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
 /// Parent-directory synchronization is best-effort on Windows. An error after
 /// replacement does not imply that the old contents remain installed.
 pub fn write_bytes_atomically(write_path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_bytes_atomically_impl(write_path, contents, true)
+}
+
+/// Same-directory replacement without durability barriers or parent creation.
+/// Preserves existing permissions. Sharing/access failures leave the original
+/// intact; never fall back to truncating an existing file.
+/// The caller resolves symlinks first. Replacement changes only the addressed
+/// directory entry: other hardlinks deliberately retain the original bytes.
+pub fn write_bytes_atomically_without_sync(write_path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_bytes_atomically_impl(write_path, contents, false)
+}
+
+fn write_bytes_atomically_impl(write_path: &Path, contents: &[u8], sync: bool) -> io::Result<()> {
+    stage_and_replace(write_path, sync, |temporary| temporary.write_all(contents))
+}
+
+fn stage_and_replace(
+    write_path: &Path,
+    sync: bool,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
     let parent = write_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("path {} has no parent directory", write_path.display()),
         )
     })?;
-    std::fs::create_dir_all(parent)?;
+    if sync {
+        std::fs::create_dir_all(parent)?;
+    }
+    let permissions = if sync {
+        None
+    } else {
+        match std::fs::metadata(write_path) {
+            Ok(metadata) => {
+                if metadata.permissions().readonly() {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "destination is read-only"));
+                }
+                Some(metadata.permissions())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        }
+    };
     let mut temporary = NamedTempFile::new_in(parent)?;
-    temporary.write_all(contents)?;
+    if permissions.is_some() {
+        copy_file_security(write_path, temporary.path())?;
+    }
+    write(temporary.as_file_mut())?;
     temporary.flush()?;
-    temporary.as_file().sync_all()?;
+    if let Some(permissions) = permissions {
+        temporary.as_file().set_permissions(permissions)?;
+    }
+    if sync {
+        temporary.as_file().sync_all()?;
+    }
     // Clear Windows temporary attributes, then retain cleanup on rename failure.
     let (_file, path) = temporary.keep().map_err(|error| error.error)?;
     let path = tempfile::TempPath::try_from_path(path)?;
     // std's Windows rename supports replacing a file held by an open reader.
     std::fs::rename(&path, write_path)?;
+    if !sync {
+        return Ok(());
+    }
     sync_parent_directory(parent).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -131,6 +179,94 @@ pub fn write_bytes_atomically(write_path: &Path, contents: &[u8]) -> io::Result<
             ),
         )
     })?;
+    Ok(())
+}
+
+// std::fs::Permissions carries only the read-only flag on Windows. Preserve
+// ownership and the DACL too, before any replacement can make the new file live.
+// Inability to read or install the descriptor is a failure, not permission to
+// replace a protected file with a differently secured temporary file.
+fn copy_file_security(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::GROUP_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::GetFileSecurityW;
+    use windows_sys::Win32::Security::GetSecurityDescriptorControl;
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::SE_DACL_PROTECTED;
+    use windows_sys::Win32::Security::SetFileSecurityW;
+    use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain([0]).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain([0]).collect();
+    let information =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut needed = 0;
+    // SAFETY: both paths are NUL-terminated and the size output is writable.
+    let result = unsafe {
+        GetFileSecurityW(
+            source.as_ptr(),
+            information,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if result == 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return Err(error);
+        }
+    }
+    if needed == 0 {
+        return Err(io::Error::other("empty destination security descriptor"));
+    }
+    // A self-relative security descriptor requires DWORD alignment.
+    let mut descriptor = vec![0_u32; (needed as usize).div_ceil(size_of::<u32>())];
+    // SAFETY: the buffer is aligned, live, and at least `needed` bytes long.
+    if unsafe {
+        GetFileSecurityW(
+            source.as_ptr(),
+            information,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: GetFileSecurityW initialized the descriptor and outputs are valid.
+    if unsafe {
+        GetSecurityDescriptorControl(
+            descriptor.as_mut_ptr().cast(),
+            &mut control,
+            &mut revision,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let protection = if control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // SAFETY: the destination path and initialized descriptor remain live.
+    if unsafe {
+        SetFileSecurityW(
+            destination.as_ptr(),
+            information | protection,
+            descriptor.as_mut_ptr().cast(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -155,5 +291,24 @@ fn sync_parent_directory(parent: &Path) -> io::Result<()> {
             Ok(())
         }
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_staged_write_failure_preserves_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("target");
+        std::fs::write(&destination, b"entire old contents").unwrap();
+        let error = stage_and_replace(&destination, false, |file| {
+            file.write_all(b"partial new contents")?;
+            Err(io::Error::other("injected mid-write failure"))
+        }).unwrap_err();
+        assert!(error.to_string().contains("injected mid-write"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"entire old contents");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

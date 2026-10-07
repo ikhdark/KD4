@@ -142,7 +142,15 @@ pub(crate) fn classify_rg_search_with_repository(
             // classified target paths, so those searches remain retryable.
             can_record_miss: commands.len() == 1
                 && rg_commands.len() == 1
-                && !rg_commands.iter().any(|(_, roles)| roles.follows_links),
+                && rg_commands.iter().all(|(argv, roles)| {
+                    // Repository snapshots do not prove the effective default
+                    // global Git excludes or ignores above the repository root.
+                    // Nor can they prove the output of an external preprocessor.
+                    !roles.follows_links
+                        && roles.no_ignore_global
+                        && roles.no_ignore_parent
+                        && codex_shell_command::is_safe_command::is_known_safe_direct_argv(argv)
+                }),
         },
     )))
 }
@@ -601,8 +609,39 @@ pub(crate) fn rg_search_path_indices(argv: &[String]) -> Option<Vec<usize>> {
     roles.searches.then_some(roles.path_indices)
 }
 
+/// Bounded advisory candidates only; no search results are inferred from this
+/// directory walk. The caller excludes Git-ignored candidates separately.
+pub(crate) fn skipped_hidden_rg_directories(script: &str, cwd: &Path) -> Vec<PathBuf> {
+    let Some(argv) = codex_shell_command::validation::standalone_argv(script) else { return Vec::new() };
+    if !argv.first().is_some_and(|program| is_rg_program(program)) { return Vec::new(); }
+    let roles = RgArgumentRoles::parse(&argv);
+    if !roles.searches || roles.hidden { return Vec::new(); }
+    let roots = if roles.path_indices.is_empty() { vec![cwd.to_path_buf()] } else {
+        roles.path_indices.iter().map(|index| cwd.join(&argv[*index])).collect()
+    };
+    let mut found = std::collections::BTreeSet::new();
+    let mut inspected = 0;
+    for root in roots.into_iter().filter(|root| root.is_dir()) {
+        let mut walk = walkdir::WalkDir::new(&root).follow_links(false).sort_by_file_name().into_iter();
+        while let Some(entry) = walk.next() {
+            inspected += 1;
+            if inspected > 2048 || found.len() >= 16 { return found.into_iter().collect(); }
+            let Ok(entry) = entry else { continue };
+            if entry.depth() == 0 || !entry.file_type().is_dir() { continue; }
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                walk.skip_current_dir();
+                if entry.file_name() != ".git" { found.insert(entry.into_path()); }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
 const MAX_MISSING_PATH_NOTES: usize = 3;
+
 const MAX_PATH_SUGGESTIONS: usize = 3;
+
+
 const MAX_SUGGESTION_DEPTH: usize = 3;
 const MAX_SUGGESTION_ENTRIES: usize = 4_000;
 const MAX_SUGGESTION_CLIMBS: usize = 2;
@@ -612,12 +651,20 @@ const MAX_SUGGESTION_CLIMBS: usize = 2;
 /// another search, so name the closest existing paths. Advisory only: the
 /// command and its results are unchanged.
 pub(crate) fn missing_rg_path_advisory(output: &str, cwd: &Path) -> Option<String> {
+    missing_rg_path_advisory_with_cancellation(output, cwd, CancellationToken::new())
+}
+
+pub(crate) fn missing_rg_path_advisory_with_cancellation(
+    output: &str, cwd: &Path, cancellation: CancellationToken,
+) -> Option<String> {
+    let mut budget = suggestion_budget(cancellation);
     static MISSING_PATH: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
         regex_lite::Regex::new(r"(?m)^rg: (.+?): [^\r\n]*\(os error [23]\)\r?$")
             .expect("valid rg missing-path regex")
     });
     let mut reported = Vec::<&str>::new();
     for capture in MISSING_PATH.captures_iter(output) {
+        if budget.check().is_err() { break; }
         let path = capture.get(1).map_or("", |path| path.as_str()).trim();
         if !path.is_empty() && !reported.contains(&path) {
             reported.push(path);
@@ -631,7 +678,7 @@ pub(crate) fn missing_rg_path_advisory(output: &str, cwd: &Path) -> Option<Strin
             if missing.exists() {
                 return None;
             }
-            let suggestions = nearest_existing_paths(&missing, cwd);
+            let suggestions = nearest_existing_paths_with_budget(&missing, cwd, &mut budget);
             (!suggestions.is_empty()).then(|| {
                 let suggestions = suggestions
                     .iter()
@@ -654,6 +701,20 @@ pub(crate) fn missing_rg_path_advisory(output: &str, cwd: &Path) -> Option<Strin
 /// Search below the deepest existing ancestor, climbing at most two levels and
 /// never above the working directory for a path requested inside it.
 pub(super) fn nearest_existing_paths(missing: &Path, cwd: &Path) -> Vec<PathBuf> {
+    nearest_existing_paths_with_budget(missing, cwd, &mut suggestion_budget(CancellationToken::new()))
+}
+
+fn suggestion_budget(cancellation: CancellationToken) -> SearchSnapshotBudget {
+    SearchSnapshotBudget {
+        remaining: MAX_SUGGESTION_ENTRIES,
+        deadline: Instant::now() + Duration::from_millis(25),
+        cancellation,
+    }
+}
+
+fn nearest_existing_paths_with_budget(
+    missing: &Path, cwd: &Path, budget: &mut SearchSnapshotBudget,
+) -> Vec<PathBuf> {
     let Some(name) = missing
         .file_name()
         .and_then(|name| name.to_str())
@@ -668,12 +729,14 @@ pub(super) fn nearest_existing_paths(missing: &Path, cwd: &Path) -> Vec<PathBuf>
         .to_string();
     let mut base = missing.parent();
     while let Some(directory) = base.filter(|directory| !directory.is_dir()) {
+        if budget.check().is_err() { return Vec::new(); }
         base = directory.parent();
     }
     let within_cwd = missing.starts_with(cwd);
     let mut climbs = 0;
     while let Some(directory) = base {
-        let mut candidates = suggestion_candidates(directory, &name, &stem);
+        if budget.check().is_err() { break; }
+        let mut candidates = suggestion_candidates(directory, &name, &stem, budget);
         if !candidates.is_empty() {
             candidates.sort();
             return candidates
@@ -697,21 +760,23 @@ fn suggestion_candidates(
     base: &Path,
     name: &str,
     stem: &str,
+    budget: &mut SearchSnapshotBudget,
 ) -> Vec<(std::cmp::Reverse<u8>, usize, usize, PathBuf)> {
     let mut candidates = Vec::new();
     let mut pending = std::collections::VecDeque::from([(base.to_path_buf(), 1)]);
-    let mut visited = 0;
     while let Some((directory, depth)) = pending.pop_front() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
+        if budget.check().is_err() { break; }
+        let Ok(mut entries) = std::fs::read_dir(&directory) else {
             continue;
         };
-        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            visited += 1;
-            if visited > MAX_SUGGESTION_ENTRIES {
+        // Charge before advancing the iterator. Sorting an unbounded read_dir
+        // first defeats the advisory budget on very large directories.
+        loop {
+            if budget.check().is_err() {
                 return candidates;
             }
+            let Some(entry) = entries.next() else { break; };
+            let Ok(entry) = entry else { continue; };
             let Some(entry_name) = entry.file_name().to_str().map(str::to_ascii_lowercase) else {
                 continue;
             };
@@ -773,10 +838,14 @@ fn display_suggestion(path: &Path, cwd: &Path) -> String {
 }
 
 struct RgArgumentRoles<'a> {
+    hidden: bool,
+    unrestricted: usize,
     path_indices: Vec<usize>,
     input_files: Vec<&'a str>,
     searches: bool,
     follows_links: bool,
+    no_ignore_global: bool,
+    no_ignore_parent: bool,
     files_mode: bool,
     explicit_pattern: bool,
 }
@@ -784,6 +853,26 @@ struct RgArgumentRoles<'a> {
 impl<'a> RgArgumentRoles<'a> {
     fn option(&mut self, flag: &str, value: Option<&'a str>) {
         match flag {
+            "--hidden" => self.hidden = true,
+            "--no-hidden" => self.hidden = false,
+            "-u" | "--unrestricted" => {
+                self.unrestricted += 1;
+                self.no_ignore_global = true;
+                self.no_ignore_parent = true;
+                if self.unrestricted >= 2 { self.hidden = true; }
+            }
+            "--no-ignore" => {
+                self.no_ignore_global = true;
+                self.no_ignore_parent = true;
+            }
+            "--ignore" => {
+                self.no_ignore_global = false;
+                self.no_ignore_parent = false;
+            }
+            "--no-ignore-global" => self.no_ignore_global = true,
+            "--ignore-global" => self.no_ignore_global = false,
+            "--no-ignore-parent" => self.no_ignore_parent = true,
+            "--ignore-parent" => self.no_ignore_parent = false,
             "--files" => self.files_mode = true,
             "-e" | "--regexp" => self.explicit_pattern = true,
             "-f" | "--file" | "--ignore-file" => {
@@ -799,10 +888,14 @@ impl<'a> RgArgumentRoles<'a> {
 
     fn parse(argv: &'a [String]) -> Self {
         let mut roles = Self {
+            hidden: false,
+            unrestricted: 0,
             path_indices: Vec::new(),
             input_files: Vec::new(),
             searches: true,
             follows_links: false,
+            no_ignore_global: false,
+            no_ignore_parent: false,
             files_mode: false,
             explicit_pattern: false,
         };
@@ -853,6 +946,20 @@ impl<'a> RgArgumentRoles<'a> {
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    #[test]
+    fn hidden_rg_advisory_respects_operands_and_hidden_flags() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/.config")).unwrap();
+        std::fs::create_dir_all(root.path().join("src/.git")).unwrap();
+        std::fs::create_dir_all(root.path().join("elsewhere/.secret")).unwrap();
+        assert_eq!(skipped_hidden_rg_directories("rg needle src --glob '*.toml'", root.path()),
+            vec![root.path().join("src/.config")]);
+        for command in ["rg --hidden needle src", "rg -uu needle src", "rg -uuu needle src",
+            "rg --help", "echo rg needle src", "rg needle src; echo done"] {
+            assert!(skipped_hidden_rg_directories(command, root.path()).is_empty(), "{command}");
+        }
+    }
 
     #[test]
     fn linked_worktree_snapshot_tracks_shared_exclude_and_gitdir_redirects() {
@@ -941,7 +1048,7 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn timed_out_worker_keeps_admission_until_it_exits() {
-        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let command = ["rg", "--no-ignore-global", "--no-ignore-parent", "needle", "src"].map(str::to_string).to_vec();
         let mut search = classify_rg_search_narrowing(
             &command,
             None,
@@ -1055,7 +1162,7 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn slow_scope_observation_releases_the_request_and_discards_late_evidence() {
-        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let command = ["rg", "--no-ignore-global", "--no-ignore-parent", "needle", "src"].map(str::to_string).to_vec();
         let mut search = classify_rg_search_narrowing(
             &command,
             None,
@@ -1106,6 +1213,23 @@ mod deadline_tests {
 #[cfg(test)]
 mod missing_path_tests {
     use super::*;
+
+    #[test]
+    fn suggestion_enumeration_stops_at_budget_and_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..100 {
+            std::fs::write(root.path().join(format!("candidate_{index}.rs")), "").unwrap();
+        }
+        let mut budget = suggestion_budget(CancellationToken::new());
+        budget.remaining = 3;
+        let candidates = suggestion_candidates(root.path(), "candidate.rs", "candidate", &mut budget);
+        assert!(candidates.len() <= 2);
+        assert_eq!(budget.remaining, 0);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(suggestion_candidates(root.path(), "candidate.rs", "candidate",
+            &mut suggestion_budget(cancellation)).is_empty());
+    }
 
     #[test]
     fn missing_rg_paths_name_the_nearest_existing_paths() {

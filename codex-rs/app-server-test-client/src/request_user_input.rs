@@ -141,7 +141,7 @@ fn prompt_for_answers_with(
         );
     }
 
-    Ok(ToolRequestUserInputResponse {
+    Ok(ToolRequestUserInputResponse { disposition: None,
         answers,
         interrupted: false,
     })

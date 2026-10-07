@@ -25,7 +25,6 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::TestCodex;
@@ -38,6 +37,33 @@ use serde_json::json;
 use tokio::time::Duration;
 
 const UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn mount_sse_sequence(
+    server: &wiremock::MockServer, bodies: Vec<String>,
+) -> core_test_support::responses::ResponseMock {
+    core_test_support::responses::mount_sse_sequence_with_request(server, bodies, |request, body| {
+        body.lines().map(|line| {
+            let Some(data) = line.strip_prefix("data: ") else { return line.to_string() };
+            let Ok(mut event) = serde_json::from_str::<Value>(data) else { return line.to_string() };
+            let item = &mut event["item"];
+            if item["type"] == "function_call" && item["name"] == "write_stdin" {
+                let mut args: Value = serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap();
+                if args.get("incarnation").is_none() {
+                    let incarnation = request["input"].as_array().unwrap().iter().rev()
+                        .filter(|item| item["type"] == "function_call_output")
+                        .filter_map(extract_output_text)
+                        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+                        .find(|output| output["session_id"] == args["session_id"])
+                        .expect("poll must consume a prior live process handle");
+                    args["incarnation"] = incarnation["session_capabilities"]["incarnation"].clone();
+                    assert!(args["incarnation"].is_string());
+                    item["arguments"] = args.to_string().into();
+                }
+            }
+            format!("data: {event}")
+        }).collect::<Vec<_>>().join("\n") + "\n"
+    }).await
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cargo_validation_failure_then_current_pass_without_workspace_tools() -> Result<()> {
@@ -154,7 +180,7 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
                 .parse::<u32>()?;
             tool = "write_stdin";
             args =
-                json!({"session_id": session_id, "yield_time_ms": 1000, "max_output_tokens": 2000});
+                json!({"session_id": session_id, "incarnation": result.incarnation, "yield_time_ms": 1000, "max_output_tokens": 2000});
         }
         let exit = terminal_exit.context("validation must finish, not leave a live process")?;
         assert_eq!(exit == 0, expected_success, "exit {exit}: {output}");
@@ -198,6 +224,7 @@ struct ParsedUnifiedExecOutput {
     chunk_id: Option<String>,
     wall_time_seconds: f64,
     process_id: Option<String>,
+    incarnation: Option<String>,
     exit_code: Option<i32>,
     original_token_count: Option<usize>,
     output: String,
@@ -209,6 +236,8 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
         struct CompactOutput {
             exit_code: Option<i32>,
             session_id: Option<u32>,
+            #[serde(default)]
+            session_capabilities: Value,
             output: String,
         }
         let parsed: CompactOutput = serde_json::from_str(raw)?;
@@ -216,6 +245,7 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
             chunk_id: None,
             wall_time_seconds: 0.0,
             process_id: parsed.session_id.map(|id| id.to_string()),
+            incarnation: parsed.session_capabilities["incarnation"].as_str().map(str::to_owned),
             exit_code: parsed.exit_code,
             original_token_count: None,
             output: parsed.output,
@@ -293,6 +323,7 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
         chunk_id,
         wall_time_seconds,
         process_id,
+        incarnation: None,
         exit_code,
         original_token_count,
         output,

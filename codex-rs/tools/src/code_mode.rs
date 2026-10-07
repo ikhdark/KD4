@@ -3,9 +3,9 @@ use crate::ToolName;
 use crate::ToolSpec;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
-use std::collections::HashSet;
+use sha2::Digest;
 
-const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count. A returned namespace tool is callable as `resolve_tool(\"<namespace>.<name>\")`.";
+const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count. `activated_omitted_tools` lists callable names activated without a returned schema; use `resolve_tool(name)` rather than repeating the search. A returned namespace tool is callable as `resolve_tool(\"<namespace>.<name>\")`.";
 
 pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
     serde_json::json!({
@@ -17,6 +17,11 @@ pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
             },
             "execution": { "const": "client" },
             "tools": { "type": "array" },
+            "activated_omitted_tools": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Activated callable names whose schemas were omitted. Resolve these names without repeating the search."
+            },
             "unactivated_matches": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -25,6 +30,30 @@ pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
             "omitted_result_count": {
                 "type": ["integer", "null"],
                 "minimum": 0
+            },
+            "unmatched_identifiers": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Query identifiers that are not callable names; these did not restrict the search to a provider."
+            },
+            "resolution": {
+                "type": "object",
+                "properties": {
+                    "helper": { "const": "resolve_tool" },
+                    "argument": { "const": "exact activated_omitted_tools name" }
+                },
+                "required": ["helper", "argument"],
+                "additionalProperties": false
+            },
+            "exact_name_ambiguity": {
+                "type": "object",
+                "properties": {
+                    "match_count": { "type": "integer", "minimum": 2 },
+                    "omitted_alternative_count": { "type": "integer", "minimum": 0 },
+                    "qualified_alternatives": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["match_count", "omitted_alternative_count", "qualified_alternatives"],
+                "additionalProperties": false
             }
         },
         "required": ["status", "execution", "tools", "omitted_result_count"],
@@ -113,30 +142,6 @@ pub fn collect_code_mode_tool_definitions<'a>(
             .then_with(|| left.tool_name.cmp(&right.tool_name))
     });
 
-    let mut used_names = HashSet::with_capacity(tool_definitions.len());
-    for definition in &mut tool_definitions {
-        let normalized = codex_code_mode::normalize_code_mode_identifier(&definition.name);
-        if used_names.insert(normalized) {
-            continue;
-        }
-
-        let kind = if definition.tool_name.namespace.is_some() {
-            "namespaced"
-        } else {
-            "plain"
-        };
-        let base = format!("{}__{kind}", definition.name);
-        let normalized_base = codex_code_mode::normalize_code_mode_identifier(&base);
-        let mut candidate = base.clone();
-        let mut normalized_candidate = normalized_base.clone();
-        let mut sequence = 2usize;
-        while !used_names.insert(normalized_candidate) {
-            candidate = format!("{base}_{sequence}");
-            normalized_candidate = format!("{normalized_base}_{sequence}");
-            sequence = sequence.saturating_add(1);
-        }
-        definition.name = candidate;
-    }
 
     tool_definitions
         .into_iter()
@@ -161,7 +166,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
     match spec {
         ToolSpec::Function(tool) => {
             let tool_name = ToolName::plain(tool.name.clone());
-            let name = tool_name.name.clone();
+            let name = code_mode_name_for_tool_name(&tool_name);
             vec![CodeModeToolDefinition {
                 tool_name,
                 name,
@@ -174,7 +179,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
         }
         ToolSpec::Freeform(tool) => {
             let tool_name = ToolName::plain(tool.name.clone());
-            let name = tool_name.name.clone();
+            let name = code_mode_name_for_tool_name(&tool_name);
             vec![CodeModeToolDefinition {
                 tool_name,
                 name,
@@ -222,13 +227,16 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
 }
 
 pub fn code_mode_name_for_tool_name(tool_name: &ToolName) -> String {
-    match tool_name.namespace.as_deref() {
-        Some(namespace) if namespace.ends_with('_') || tool_name.name.starts_with('_') => {
-            format!("{namespace}{}", tool_name.name)
-        }
+    let raw = match tool_name.namespace.as_deref() {
         Some(namespace) => format!("{namespace}__{}", tool_name.name),
         None => tool_name.name.clone(),
+    };
+    let normalized = codex_code_mode::normalize_code_mode_identifier(&raw);
+    if tool_name.namespace.is_none() && normalized == raw {
+        return raw;
     }
+    let identity = serde_json::to_vec(tool_name).expect("tool identity serializes");
+    format!("{normalized}__{:x}", sha2::Sha256::digest(identity))
 }
 
 #[cfg(test)]

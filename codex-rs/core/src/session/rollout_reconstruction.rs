@@ -10,6 +10,123 @@ use uuid::Uuid;
 const UNIFIED_EXEC_RESUME_INVALIDATION_START: &str = "<unified_exec_resume_invalidated>";
 const UNIFIED_EXEC_SESSION_ID_PREFIX: &str = "Process running with session ID ";
 
+/// Recovery is derived from the existing durable invocation/result stream, not
+/// handler-return notifications. A crash after effects but before result append
+/// therefore leaves an unresolved invocation visible on resume.
+pub(super) fn append_unsettled_tool_recovery(history: &mut Vec<ResponseItem>, items: &[RolloutItem]) {
+    use std::collections::BTreeMap;
+    use sha2::Digest;
+    let mut pending = BTreeMap::new();
+    let mut turn = String::new();
+    let mut cwd = String::new();
+    let bounded = |value: &str| value.chars().take(240).collect::<String>();
+    let redacted_path = |value: &str| {
+        if value.contains("://") {
+            url::Url::parse(value).ok()
+                .map(|url| format!("{}://{}", url.scheme(), url.host_str().unwrap_or("[redacted]")))
+                .unwrap_or_else(|| "[redacted URI]".into())
+        } else { bounded(value) }
+    };
+    for item in items {
+        let response = match item {
+            RolloutItem::TurnContext(context) => {
+                turn = context.turn_id.clone().unwrap_or_default();
+                cwd = context.cwd.to_string_lossy().to_string();
+                continue;
+            }
+            RolloutItem::ResponseItem(response) => response,
+            _ => continue,
+        };
+        match response {
+            ResponseItem::FunctionCall { call_id, name, namespace, arguments, .. }
+            | ResponseItem::CustomToolCall { call_id, name, namespace, input: arguments, .. } => {
+                let args = (arguments.len() <= 16 * 1024)
+                    .then(|| serde_json::from_str::<serde_json::Value>(arguments).ok()).flatten()
+                    .unwrap_or(serde_json::Value::Null);
+                let field = |keys: &[&str]| keys.iter().find_map(|key| args.get(*key).and_then(serde_json::Value::as_str));
+                // Never echo command text, scripts, headers, arguments or tokens.
+                // The digest distinguishes operations without disclosing them.
+                let target = field(&["path", "file_path", "target"]).map(redacted_path);
+                pending.insert((turn.clone(), call_id.clone()), serde_json::json!({
+                    "turn_id": bounded(&turn), "call_id": bounded(call_id),
+                    "tool": bounded(&namespace.as_ref().map(|namespace| format!("{namespace}.{name}")).unwrap_or_else(|| name.clone())),
+                    "environment": field(&["environment_id"]).map(bounded),
+                    "cwd": redacted_path(field(&["workdir", "cwd"]).unwrap_or(&cwd)),
+                    "target": target,
+                    "invocation_sha256": format!("{:x}", sha2::Sha256::digest(arguments.as_bytes())),
+                    "status": "result_not_durably_available_effects_unknown",
+                }));
+            }
+            ResponseItem::FunctionCallOutput { call_id, output, .. }
+            | ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
+                let unavailable = output.body.to_text().is_some_and(|text|
+                    text.contains("full result could not be preserved"));
+                if !unavailable { pending.remove(&(turn.clone(), call_id.clone())); }
+            }
+            _ => {}
+        }
+    }
+    if pending.is_empty() { return; }
+    let count = pending.len();
+    let operations = pending.into_values().rev().take(8).collect::<Vec<_>>();
+    history.push(ResponseItem::Message {
+        id: None, role: "developer".into(), phase: None,
+        internal_chat_message_metadata_passthrough: None,
+        content: vec![ContentItem::InputText { text: format!(
+            "<unsettled_tool_recovery>\n{}\nHandler return is not durable result delivery. These retained invocations have no available durable result; they may or may not have executed. Inspect affected targets before retrying. Null environment means the resolved environment was not recorded. Arguments are deliberately redacted.\n</unsettled_tool_recovery>",
+            serde_json::json!({"operations":operations,"unresolved_count":count,"omitted_count":count.saturating_sub(8)})
+        ) }],
+    });
+}
+
+/// Reserve handles from the entire reloaded rollout, including compacted and
+/// rolled-back spans. Those handles may still be present in retained receipts.
+pub(super) fn historical_process_ids(items: &[RolloutItem]) -> HashSet<u32> {
+    fn text_ids(text: &str, ids: &mut HashSet<u32>) {
+        for prefix in [UNIFIED_EXEC_SESSION_ID_PREFIX, "Running command session_id: ",
+            "\"session_id\"", "\"polled_session_id\"", "\"process_id\""] {
+            for (offset, _) in text.match_indices(prefix) {
+                let mut suffix = text[offset + prefix.len()..].trim_start();
+                if prefix.ends_with('"') {
+                    let Some(value) = suffix.strip_prefix(':') else { continue };
+                    suffix = value.trim_start().trim_start_matches('"');
+                }
+                let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+                if let Ok(id) = suffix[..digits].parse() {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    fn response_ids(item: &ResponseItem, ids: &mut HashSet<u32>) {
+        match item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                if let Some(text) = output.body.to_text() { text_ids(&text, ids); }
+            }
+            ResponseItem::FunctionCall { arguments, .. } => text_ids(arguments, ids),
+            ResponseItem::CustomToolCall { input, .. } => text_ids(input, ids),
+            _ => {}
+        }
+    }
+    let mut ids = HashSet::new();
+    for item in items {
+        let id = match item {
+            RolloutItem::EventMsg(EventMsg::ExecCommandBegin(event)) => event.process_id.as_deref(),
+            RolloutItem::EventMsg(EventMsg::ExecCommandEnd(event)) => event.process_id.as_deref(),
+            RolloutItem::EventMsg(EventMsg::TerminalInteraction(event)) => Some(event.process_id.as_str()),
+            RolloutItem::ResponseItem(item) => { response_ids(item, &mut ids); None }
+            RolloutItem::Compacted(item) => {
+                for item in item.replacement_history.iter().flatten() { response_ids(item, &mut ids); }
+                None
+            }
+            _ => None,
+        };
+        if let Some(id) = id.and_then(|id| id.parse().ok()) { ids.insert(id); }
+    }
+    ids
+}
+
 pub(crate) fn is_unified_exec_resume_invalidation(item: &ResponseItem) -> bool {
     matches!(item, ResponseItem::Message { role, content, .. }
         if role == "developer" && matches!(content.as_slice(),
@@ -64,18 +181,14 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
             _ => None,
         })
         .collect::<HashSet<_>>();
-    let has_old_sessions = history.iter().any(|item| match item {
+    let mut handles = std::collections::BTreeMap::new();
+    let has_old_sessions = history.iter().fold(false, |found, item| {
+        let current = match item {
         ResponseItem::FunctionCallOutput {
             call_id, output, ..
         } if unified_exec_call_ids.contains(call_id.as_str()) => {
             output.body.to_text().is_some_and(|output| {
-                output.lines().any(|line| {
-                    line.strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)
-                        .is_some_and(|status| {
-                            let id = status.split_once(';').map_or(status, |(id, _)| id);
-                            id.trim().parse::<u32>().is_ok()
-                        })
-                })
+                collect_resume_handles(&output, false, &mut handles)
             })
         }
         ResponseItem::CustomToolCallOutput {
@@ -86,11 +199,13 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
         } if code_mode_call_ids.contains(call_id.as_str()) => output
             .body
             .to_text()
-            .is_some_and(|text| has_live_nested_command(&text)),
+            .is_some_and(|text| collect_resume_handles(&text, true, &mut handles)),
         _ => false,
+        };
+        found || current
     });
     // Replace earlier runtime notices so this notice scopes invalidation to the
-    // current resume boundary, including when a numeric process ID is reused.
+    // current resume boundary. Historical process IDs are excluded at admission.
     let mut had_notice = false;
     history.retain(|item| {
         let is_notice = is_unified_exec_resume_invalidation(item);
@@ -100,15 +215,25 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
     if !has_old_sessions && !had_notice {
         return;
     }
+    let omitted = handles.len().saturating_sub(32);
+    let recorded_handles = handles.into_iter().take(32).map(|(session_id, artifact_id)| {
+        serde_json::json!({"session_id": session_id, "raw_output_artifact_id": artifact_id})
+    }).collect::<Vec<_>>();
+    let evidence = serde_json::json!({"recorded_process_handles": recorded_handles,
+        "omitted_handle_count": omitted});
     let text = format!(
         "{UNIFIED_EXEC_RESUME_INVALIDATION_START}\n\
 Process session IDs in the pre-resume history are no longer live. Do not poll those old sessions. \
-Newly returned session IDs are valid, even when a number is reused. \
-This includes sessions in nested code-mode command receipts. Invalidation does not establish \
+Newly returned session IDs are valid and do not reuse recorded process IDs. \
+This includes sessions in nested code-mode command receipts. Pre-resume live cell execution \
+cannot be resumed. Only durably retained terminal receipts may be recoverable through wait; \
+do not restart work to recreate evidence. Invalidation does not establish \
 whether a command completed or was terminated; retain its recorded output and recovery references, \
 and re-establish uncertain effects before repeating it. \
 Start another process only when the current task still requires execution; \
 do not rerun completed commands merely because this conversation resumed.\n\
+Recorded process handles and saved output references (historical evidence, not a crash-time inventory):\n\
+{evidence}\n\
 </unified_exec_resume_invalidated>"
     );
     history.push(ResponseItem::Message {
@@ -120,42 +245,89 @@ do not rerun completed commands merely because this conversation resumed.\n\
     });
 }
 
-fn has_live_nested_command(text: &str) -> bool {
-    fn live(states: &serde_json::Value) -> bool {
+fn collect_command_receipt_handle(
+    value: &serde_json::Value,
+    handles: &mut std::collections::BTreeMap<u32, Option<String>>,
+) -> bool {
+    // Raw command receipts omit these fields. Explicitly different owners are
+    // not process handles, even when their JSON happens to contain session_id.
+    if value.get("tool").is_some_and(|tool|
+        !matches!(tool.as_str(), Some("exec_command" | "write_stdin")))
+        || value.get("namespace").is_some_and(|namespace| !namespace.is_null())
+    {
+        return false;
+    }
+    let valid_id = |id: &serde_json::Value| id.as_u64().and_then(|id| u32::try_from(id).ok());
+    // A returned handle is live even after process exit while pipes drain.
+    // A historical polled handle alone is live only without terminal exit.
+    let id = value.get("session_id").and_then(valid_id).or_else(|| {
+        (value["process_exited"].as_bool() == Some(false))
+            .then(|| value.get("polled_session_id").and_then(valid_id)).flatten()
+    });
+    let Some(id) = id else { return false; };
+    let artifact = value["raw_output_artifact_id"].as_str()
+        .filter(|id| id.len() <= 160).map(str::to_string);
+    let retained = handles.entry(id).or_default();
+    if artifact.is_some() { *retained = artifact; }
+    true
+}
+
+fn collect_resume_handles(
+    text: &str,
+    nested: bool,
+    handles: &mut std::collections::BTreeMap<u32, Option<String>>,
+) -> bool {
+    fn live(states: &serde_json::Value, handles: &mut std::collections::BTreeMap<u32, Option<String>>) -> bool {
         states.as_array().is_some_and(|states| {
-            states.iter().any(|state| {
-                matches!(state["tool"].as_str(), Some("exec_command" | "write_stdin"))
-                    && state["process_exited"].as_bool() == Some(false)
-                    && state
-                        .get("session_id")
-                        .filter(|id| !id.is_null())
-                        .or_else(|| state.get("polled_session_id"))
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some_and(|id| u32::try_from(id).is_ok())
+            states.iter().fold(false, |found, state| {
+                let current = matches!(state["tool"].as_str(), Some("exec_command" | "write_stdin"))
+                    && collect_command_receipt_handle(state, handles);
+                found || current
             })
         })
     }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
-        && [
+    let mut found = false;
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        found |= collect_command_receipt_handle(&value, handles);
+        if nested {
+            for pointer in [
             "/nested_commands",
             "/essential/nested_commands",
             "/result/essential/nested_commands",
-        ]
-        .iter()
-        .any(|pointer| value.pointer(pointer).is_some_and(live))
-    {
-        return true;
-    }
-    let marker = "Nested command states (independent of script completion):\n";
-    text.match_indices(marker).any(|(index, _)| {
-        if index != 0 && !text[..index].ends_with('\n') {
-            return false;
+            ] {
+                found |= value.pointer(pointer).is_some_and(|states| live(states, handles));
+            }
         }
-        serde_json::Deserializer::from_str(&text[index + marker.len()..])
+    }
+    // Current code-mode packets print each process receipt as its own JSON line.
+    for line in text.lines() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            found |= collect_command_receipt_handle(&value, handles);
+        }
+        let status = line.strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)
+            .or_else(|| nested.then(|| line.strip_prefix("Running command session_id: ")).flatten());
+        if let Some(status) = status {
+            let id = status.split_once(';').map_or(status, |(id, _)| id);
+            if let Ok(id) = id.trim().parse::<u32>() {
+                handles.entry(id).or_default();
+                found = true;
+            }
+        }
+        found |= nested && line.strip_prefix("Script running with cell ID ")
+            .is_some_and(|id| !id.trim().is_empty());
+    }
+    if !nested { return found; }
+    let marker = "Nested command states (independent of script completion):\n";
+    for (index, _) in text.match_indices(marker) {
+        if index != 0 && !text[..index].ends_with('\n') {
+            continue;
+        }
+        found |= serde_json::Deserializer::from_str(&text[index + marker.len()..])
             .into_iter::<serde_json::Value>()
             .next()
-            .is_some_and(|value| value.as_ref().is_ok_and(live))
-    })
+            .is_some_and(|value| value.as_ref().is_ok_and(|states| live(states, handles)));
+    }
+    found
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -342,7 +514,7 @@ impl Session {
                 .iter()
                 .filter_map(|item| match item {
                     RolloutItem::ResponseItem(ResponseItem::FunctionCall {
-                        name, call_id, ..
+                        name, namespace: None, call_id, ..
                     }) if name == "update_plan" => Some(call_id.as_str()),
                     _ => None,
                 })

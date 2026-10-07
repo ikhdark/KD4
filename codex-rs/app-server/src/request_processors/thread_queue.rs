@@ -22,6 +22,9 @@ use std::sync::Mutex as StdMutex;
 
 const MAX_QUEUE_ENTRIES: usize = 100;
 const MAX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+// Retry identities survive consumption for the latest 100 accepted submissions,
+// further bounded by MAX_QUEUE_BYTES. Pending submissions are never evicted.
+const MAX_ACCEPTED_SUBMISSIONS: usize = 100;
 
 /// Separate from the wire DTO: this payload is versioned and includes admission
 /// recovery state. A pending start keeps the prompt until core accepts it.
@@ -33,12 +36,21 @@ struct Queue {
     submissions: Vec<QueuedSubmission>,
     paused: bool,
     pending_start: Option<PendingStart>,
+    #[serde(default)]
+    accepted: Vec<AcceptedSubmission>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingStart {
     submission_id: String,
+    turn_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceptedSubmission {
+    submission: QueuedSubmission,
     turn_id: String,
 }
 
@@ -50,16 +62,18 @@ impl Default for Queue {
             submissions: Vec::new(),
             paused: false,
             pending_start: None,
+            accepted: Vec::new(),
         }
     }
 }
 
 impl Queue {
-    fn add(&mut self, params: ThreadQueueAddParams) -> Result<QueuedSubmission, JSONRPCErrorError> {
+    fn add(&mut self, params: ThreadQueueAddParams) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
         if let Some(client_id) = &params.client_user_message_id
             && let Some(existing) = self
                 .submissions
                 .iter()
+                .chain(self.accepted.iter().map(|accepted| &accepted.submission))
                 .find(|item| item.client_user_message_id.as_ref() == Some(client_id))
         {
             if existing.input != params.input {
@@ -67,7 +81,7 @@ impl Queue {
                     "clientUserMessageId already has different queued input",
                 ));
             }
-            return Ok(existing.clone());
+            return Ok((existing.clone(), false));
         }
         if self.submissions.len() >= MAX_QUEUE_ENTRIES {
             return Err(invalid_params("thread queue is full"));
@@ -78,10 +92,10 @@ impl Queue {
             input: params.input,
         };
         self.submissions.push(submission.clone());
-        Ok(submission)
+        Ok((submission, true))
     }
 
-    fn reorder(&mut self, ids: &[String]) -> Result<(), JSONRPCErrorError> {
+    fn reorder(&mut self, ids: &[String]) -> Result<bool, JSONRPCErrorError> {
         let mut seen = HashSet::new();
         for id in ids {
             if !seen.insert(id) || !self.submissions.iter().any(|item| &item.id == id) {
@@ -90,12 +104,13 @@ impl Queue {
                 ));
             }
         }
+        let before = self.submissions.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
         self.submissions.sort_by_key(|item| {
             ids.iter()
                 .position(|id| id == &item.id)
                 .unwrap_or(ids.len())
         });
-        Ok(())
+        Ok(self.submissions.iter().map(|item| &item.id).ne(before.iter()))
     }
 
     fn page(
@@ -148,7 +163,7 @@ pub(crate) struct ThreadQueueRequestProcessor {
     turn_processor: TurnRequestProcessor,
     background_tasks: TaskTracker,
     // Connection capabilities are never persisted or reused across restarts.
-    origins: Arc<StdMutex<HashMap<ThreadId, QueueOrigin>>>,
+    origins: Arc<StdMutex<HashMap<(ThreadId, String), QueueOrigin>>>,
 }
 
 impl ThreadQueueRequestProcessor {
@@ -215,7 +230,11 @@ impl ThreadQueueRequestProcessor {
             .revision
             .checked_add(1)
             .ok_or_else(|| internal_error("queue revision overflow"))?;
-        let payload = serde_json::to_string(queue).map_err(queue_error)?;
+        let mut payload = serde_json::to_string(queue).map_err(queue_error)?;
+        while payload.len() > MAX_QUEUE_BYTES && !queue.accepted.is_empty() {
+            queue.accepted.remove(0);
+            payload = serde_json::to_string(queue).map_err(queue_error)?;
+        }
         if payload.len() > MAX_QUEUE_BYTES {
             return Err(invalid_params("thread queue exceeds its storage limit"));
         }
@@ -282,49 +301,58 @@ impl ThreadQueueRequestProcessor {
     }
 
     async fn recover(&self, id: ThreadId, queue: &mut Queue) -> Result<(), JSONRPCErrorError> {
-        let Some(pending) = &queue.pending_start else {
-            return Ok(());
-        };
-        // No other queue admission can still own this attempt: we hold its OS lock.
-        // Consult both live and persisted history before restoring an unaccepted prompt.
+        let Some(pending) = &queue.pending_start else { return Ok(()) };
         let live = self.thread_state_manager.thread_state(id).await;
-        let active = live.lock().await.in_progress_turn_id().map(str::to_owned);
-        let history = self
-            .thread_store
-            .read_thread(codex_thread_store::ReadThreadParams {
-                thread_id: id,
-                include_archived: false,
-                include_history: true,
-            })
-            .await
-            .map_err(queue_error)?;
-        let accepted = active.as_deref() == Some(&pending.turn_id)
-            || history.history.as_ref().is_some_and(|history| history.items.iter().any(|item| {
-                matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(event)) if event.turn_id == pending.turn_id)
-            }));
-        if accepted {
-            queue
-                .submissions
-                .retain(|item| item.id != pending.submission_id);
+        if live.lock().await.in_progress_turn_id() == Some(pending.turn_id.as_str()) {
+            return Ok(());
         }
-        queue.pending_start = None;
-        // Recovery never silently executes a prompt after a process failure.
-        queue.paused = true;
-        self.save(id, queue).await
+        // Worker installation is not durable input acceptance. Leave custody in
+        // the queue while the worker can still be starting or recording input.
+        if let Ok(thread) = self.thread_manager.get_thread(id).await {
+            if matches!(thread.agent_status().await, AgentStatus::Running) {
+                return Ok(());
+            }
+            thread.flush_rollout().await.map_err(queue_error)?;
+        }
+        let history = self.thread_store.read_thread(codex_thread_store::ReadThreadParams {
+            thread_id: id, include_archived: false, include_history: true,
+        }).await.map_err(queue_error)?;
+        let accepted = history.history.as_ref().is_some_and(|history|
+            pending_input_recorded(&history.items, &pending.turn_id));
+        let origin_present = self.origins.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&(id, pending.submission_id.clone()));
+        let pending = queue.pending_start.take().expect("pending start");
+        if accepted {
+            if let Some(index) = queue.submissions.iter().position(|item| item.id == pending.submission_id) {
+                let submission = queue.submissions.remove(index);
+                queue.accepted.push(AcceptedSubmission { submission, turn_id: pending.turn_id });
+                if queue.accepted.len() > MAX_ACCEPTED_SUBMISSIONS {
+                    queue.accepted.remove(0);
+                }
+            }
+            self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&(id, pending.submission_id));
+        }
+        // Never silently replay an unaccepted start or resume after process death.
+        queue.paused |= !accepted || !origin_present;
+        self.save(id, queue).await?;
+        self.changed(id).await;
+        Ok(())
     }
 
     async fn mutate<R>(
         &self,
         id: ThreadId,
-        mutation: impl FnOnce(&mut Queue) -> Result<R, JSONRPCErrorError>,
+        mutation: impl FnOnce(&mut Queue) -> Result<(R, bool), JSONRPCErrorError>,
     ) -> Result<R, JSONRPCErrorError> {
         let guard = self.lock(id).await?;
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
-        let result = mutation(&mut queue)?;
-        self.save(id, &mut queue).await?;
+        let (result, changed) = mutation(&mut queue)?;
+        if changed { self.save(id, &mut queue).await?; }
         drop(guard);
-        self.changed(id).await;
+        if changed { self.changed(id).await; }
         Ok(result)
     }
 
@@ -346,11 +374,15 @@ impl ThreadQueueRequestProcessor {
     ) -> Result<(), JSONRPCErrorError> {
         TurnRequestProcessor::validate_queue_input(&params.input)?;
         let id = parse_thread_id_for_request(&params.thread_id)?;
-        let queued_submission = self.mutate(id, |queue| queue.add(params)).await?;
-        self.origins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, origin.clone());
+        let (queued_submission, added) = self.mutate(id, |queue| {
+            queue.add(params).map(|(item, changed)| ((item, changed), changed))
+        }).await?;
+        if added {
+            self.origins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((id, queued_submission.id.clone()), origin.clone());
+        }
         // The client must see acceptance before a fast automatic start removes the entry.
         self.outgoing
             .send_response(
@@ -374,13 +406,17 @@ impl ThreadQueueRequestProcessor {
         let id = parse_thread_id_for_request(&params.thread_id)?;
         let queued_submission = self
             .mutate(id, |queue| {
+                if queue.pending_start.as_ref().is_some_and(|pending| pending.submission_id == params.queued_submission_id) {
+                    return Err(invalid_request("queued submission is starting; input is still owned by the queue"));
+                }
                 let item = queue
                     .submissions
                     .iter_mut()
                     .find(|item| item.id == params.queued_submission_id)
                     .ok_or_else(|| invalid_params("queued submission not found"))?;
+                let changed = item.input != params.input;
                 item.input = params.input;
-                Ok(item.clone())
+                Ok((item.clone(), changed))
             })
             .await?;
         Ok(ThreadQueueUpdateResponse { queued_submission })
@@ -393,13 +429,21 @@ impl ThreadQueueRequestProcessor {
         let id = parse_thread_id_for_request(&params.thread_id)?;
         let deleted = self
             .mutate(id, |queue| {
+                if queue.pending_start.as_ref().is_some_and(|pending| pending.submission_id == params.queued_submission_id) {
+                    return Err(invalid_request("queued submission is starting; input is still owned by the queue"));
+                }
                 let before = queue.submissions.len();
                 queue
                     .submissions
                     .retain(|item| item.id != params.queued_submission_id);
-                Ok(before != queue.submissions.len())
+                let deleted = before != queue.submissions.len();
+                Ok((deleted, deleted))
             })
             .await?;
+        if deleted {
+            self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&(id, params.queued_submission_id));
+        }
         Ok(ThreadQueueDeleteResponse { deleted })
     }
 
@@ -408,7 +452,7 @@ impl ThreadQueueRequestProcessor {
         params: ThreadQueueReorderParams,
     ) -> Result<ThreadQueueReorderResponse, JSONRPCErrorError> {
         let id = parse_thread_id_for_request(&params.thread_id)?;
-        self.mutate(id, |queue| queue.reorder(&params.queued_submission_ids))
+        self.mutate(id, |queue| queue.reorder(&params.queued_submission_ids).map(|changed| ((), changed)))
             .await?;
         Ok(ThreadQueueReorderResponse {})
     }
@@ -419,16 +463,12 @@ impl ThreadQueueRequestProcessor {
         origin: QueueOrigin,
     ) -> Result<ThreadQueueStartResponse, JSONRPCErrorError> {
         let id = parse_thread_id_for_request(&params.thread_id)?;
-        self.origins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, origin.clone());
         let processor = self.clone();
         // Own the entire durable claim -> submit -> consume sequence on disconnect.
         self.background_tasks
             .spawn(async move {
                 processor
-                    .start_inner(id, Some(&params.queued_submission_id), origin)
+                    .start_inner(id, Some(&params.queued_submission_id), Some(origin))
                     .await?
                     .ok_or_else(|| invalid_params("queued submission not found"))
             })
@@ -440,11 +480,14 @@ impl ThreadQueueRequestProcessor {
         &self,
         id: ThreadId,
         selected: Option<&str>,
-        origin: QueueOrigin,
+        origin: Option<QueueOrigin>,
     ) -> Result<Option<ThreadQueueStartResponse>, JSONRPCErrorError> {
         let guard = self.lock(id).await?;
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
+        if queue.pending_start.is_some() {
+            return Err(invalid_request("a queued submission is still starting"));
+        }
         if selected.is_none() && queue.paused {
             return Ok(None);
         }
@@ -453,18 +496,30 @@ impl ThreadQueueRequestProcessor {
             None => queue.submissions.first(),
         };
         let Some(item) = item.cloned() else {
-            self.origins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id);
             return Ok(None);
         };
+        // An explicit starter owns only this submission. Automatic starts use
+        // its original connection, never the last client to touch the thread.
+        let mut origin = match origin.or_else(|| self.origins.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(id, item.id.clone())).cloned()) {
+            Some(origin) => origin,
+            None => return Ok(None),
+        };
+        let connections = self.thread_state_manager.subscribed_connection_ids(id).await;
+        if selected.is_none() && !connections.contains(&origin.request_id.connection_id) { return Ok(None); }
+        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((id, item.id.clone()), origin.clone());
+        if selected.is_none() {
+            origin.request_id.request_id = RequestId::String(format!("thread-queue-{}", uuid::Uuid::new_v4()));
+        }
         let thread = self
             .thread_manager
             .get_thread(id)
             .await
             .map_err(queue_error)?;
         let turn_id = thread.reserve_turn_id();
+        queue.paused = false;
         queue.pending_start = Some(PendingStart {
             submission_id: item.id.clone(),
             turn_id: turn_id.clone(),
@@ -488,10 +543,8 @@ impl ThreadQueueRequestProcessor {
             .await;
         match result {
             Ok(response) => {
-                queue.submissions.retain(|entry| entry.id != item.id);
-                queue.pending_start = None;
-                queue.paused = false;
-                self.save(id, &mut queue).await?;
+                // Keep pending_start and its input until persisted history takes
+                // custody. Completion's existing kick performs that handoff.
                 drop(guard);
                 self.changed(id).await;
                 Ok(Some(ThreadQueueStartResponse {
@@ -499,8 +552,8 @@ impl ThreadQueueRequestProcessor {
                 }))
             }
             Err(error) => {
-                queue.pending_start = None;
-                self.save(id, &mut queue).await?;
+                // The acknowledgement can fail after installation. Recovery,
+                // not a blind retry, decides whether input was actually recorded.
                 Err(error)
             }
         }
@@ -518,7 +571,7 @@ impl ThreadQueueRequestProcessor {
         self.origins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
+            .retain(|(thread_id, _), _| *thread_id != id);
         // This runs before the listener forwards every interrupted or failed
         // turn. Without queued prompts there is nothing to protect: skip the
         // lock file, queue write, and change notification.
@@ -536,8 +589,9 @@ impl ThreadQueueRequestProcessor {
         }
         if let Err(error) = self
             .mutate(id, |queue| {
+                let changed = !queue.paused;
                 queue.paused = true;
-                Ok(())
+                Ok(((), changed))
             })
             .await
         {
@@ -546,13 +600,8 @@ impl ThreadQueueRequestProcessor {
     }
 
     pub(super) fn kick(&self, id: ThreadId) {
-        let origin = self
-            .origins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)
-            .cloned();
-        let Some(mut origin) = origin else { return };
+        if !self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys().any(|(thread_id, _)| *thread_id == id) { return; }
         let processor = self.clone();
         self.background_tasks.spawn(async move {
             let Ok(thread) = processor.thread_manager.get_thread(id).await else {
@@ -578,20 +627,24 @@ impl ThreadQueueRequestProcessor {
             ) {
                 return;
             }
-            let connections = processor
-                .thread_state_manager
-                .subscribed_connection_ids(id)
-                .await;
-            if !connections.contains(&origin.request_id.connection_id) {
-                return;
-            }
-            origin.request_id.request_id =
-                RequestId::String(format!("thread-queue-{}", uuid::Uuid::new_v4()));
-            if let Err(error) = processor.start_inner(id, None, origin).await {
+            if let Err(error) = processor.start_inner(id, None, None).await {
                 tracing::warn!(%id, error = %error.message, "queued follow-up was not started");
             }
         });
     }
+}
+
+// A TurnStarted record alone says nothing about recoverable input ownership.
+fn pending_input_recorded(items: &[RolloutItem], turn_id: &str) -> bool {
+    let mut in_turn = false;
+    for item in items {
+        match item {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => in_turn = event.turn_id == turn_id,
+            RolloutItem::EventMsg(EventMsg::UserMessage(_)) if in_turn => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn queue_error(error: impl std::fmt::Display) -> JSONRPCErrorError {
@@ -616,7 +669,7 @@ mod tests {
                 client_user_message_id: Some(text.to_string()),
                 input: input(text),
             })
-            .expect("queue add")
+            .expect("queue add").0
     }
 
     #[test]
@@ -635,6 +688,55 @@ mod tests {
                 .is_err()
         );
         assert_eq!(queue.submissions, vec![first]);
+    }
+
+    #[test]
+    fn consumed_submission_retry_preserves_identity_and_rejects_different_input() {
+        let mut queue = Queue::default();
+        let first = add(&mut queue, "first");
+        queue.accepted.push(AcceptedSubmission {
+            submission: queue.submissions.remove(0), turn_id: "accepted-turn".into(),
+        });
+        let mut restored: Queue = serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+        let params = ThreadQueueAddParams {
+            thread_id: "unused".into(), client_user_message_id: Some("first".into()), input: input("first"),
+        };
+        let (retry, changed) = restored.add(params.clone()).unwrap();
+        assert_eq!(retry, first);
+        assert!(!changed);
+        assert!(restored.submissions.is_empty());
+        assert!(restored.add(ThreadQueueAddParams { input: input("different"), ..params }).is_err());
+    }
+
+    #[test]
+    fn queue_noops_preserve_pagination_revision() {
+        let mut queue = Queue::default();
+        let first = add(&mut queue, "first");
+        add(&mut queue, "second");
+        let mut params = ThreadQueueListParams { thread_id: "unused".into(), cursor: None, limit: Some(1) };
+        params.cursor = queue.page(&params).unwrap().next_cursor;
+        let (_, changed) = queue.add(ThreadQueueAddParams {
+            thread_id: "unused".into(), client_user_message_id: Some("first".into()), input: input("first"),
+        }).unwrap();
+        assert!(!changed);
+        assert!(!queue.reorder(&[first.id]).unwrap());
+        assert!(queue.page(&params).is_ok());
+    }
+
+    #[test]
+    fn queue_ownership_requires_input_not_just_worker_start() {
+        let start = |id: &str| RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: id.into(), trace_id: None, started_at: None,
+                model_context_window: None, collaboration_mode_kind: Default::default(),
+            }
+        ));
+        let input = RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent { message: "prompt".into(), ..Default::default() }
+        ));
+        assert!(!pending_input_recorded(&[start("turn")], "turn"));
+        assert!(!pending_input_recorded(&[start("turn"), start("other"), input.clone()], "turn"));
+        assert!(pending_input_recorded(&[start("turn"), input], "turn"));
     }
 
     #[test]

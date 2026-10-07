@@ -120,6 +120,24 @@ pub struct UnifiedExecRequest {
     pub exec_approval_requirement: ExecApprovalRequirement,
 }
 
+impl UnifiedExecRequest {
+    fn canonical_additional_permissions(&self) -> Option<UriAdditionalPermissionProfile> {
+        self.additional_permissions_uri.clone()
+            .or_else(|| self.additional_permissions.clone().map(Into::into))
+    }
+}
+
+fn unified_exec_approval_reason(
+    reason: Option<String>,
+    permissions: Option<&UriAdditionalPermissionProfile>,
+) -> Option<String> {
+    let Some(permissions) = permissions else { return reason; };
+    let profile = serde_json::to_string(permissions)
+        .expect("URI permission profiles are JSON serializable");
+    Some(format!("{}Additional permissions (canonical URI profile): {profile}",
+        reason.map(|reason| format!("{reason}\n")).unwrap_or_default()))
+}
+
 /// Cache key for approval decisions that can be reused across equivalent
 /// unified-exec launches.
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -130,7 +148,7 @@ pub struct UnifiedExecApprovalKey {
     pub cwd: PathUri,
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
-    pub additional_permissions: Option<AdditionalPermissionProfile>,
+    pub additional_permissions: Option<UriAdditionalPermissionProfile>,
 }
 
 /// Runtime adapter that keeps policy and sandbox orchestration on the
@@ -216,7 +234,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
             cwd: req.cwd.clone(),
             tty: req.tty,
             sandbox_permissions: req.sandbox_permissions,
-            additional_permissions: req.additional_permissions.clone(),
+            additional_permissions: req.canonical_additional_permissions(),
         }]
     }
 
@@ -235,9 +253,15 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
             .retry_reason
             .clone()
             .or_else(|| req.justification.clone());
+        let permissions = req.canonical_additional_permissions();
+        // Legacy structured approvals are host-native. The existing reason is
+        // preserved by all clients and must show every URI grant, including foreign paths.
+        let reason = unified_exec_approval_reason(reason, permissions.as_ref());
         Box::pin(async move {
             with_cached_approval(&session.services, "unified_exec", keys, || async move {
-                let available_decisions = None;
+                let available_decisions = permissions.as_ref().map(|_| {
+                    vec![ReviewDecision::Approved, ReviewDecision::Abort]
+                });
                 session
                     .request_command_approval(
                         turn,
@@ -425,12 +449,13 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             shell_snapshot_location.as_deref(),
             attempt.sandbox,
         );
+        let permissions = req.canonical_additional_permissions();
         let command = build_unified_exec_sandbox_command(
             &command,
             &req.cwd,
             &env,
             managed_network_context,
-            req.additional_permissions.clone(),
+            permissions.clone().and_then(|permissions| AdditionalPermissionProfile::try_from(permissions).ok()),
         )
         .map_err(|error| match error {
             ToolError::Rejected(_) => {
@@ -447,7 +472,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 command,
                 additional_read_roots,
                 options,
-                req.additional_permissions_uri.as_ref(),
+                permissions.as_ref(),
                 attempt,
                 managed_network,
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
@@ -605,6 +630,27 @@ mod tests {
             keys[0].command,
             canonicalize_command_for_approval(&request.command)
         );
+    }
+
+    #[tokio::test]
+    async fn approval_key_and_prompt_preserve_mixed_uri_permissions() {
+        let manager = UnifiedExecProcessManager::default();
+        let runtime = UnifiedExecRuntime::new(&manager);
+        let mut request = test_request(
+            SandboxPermissions::UseDefault,
+            ExecApprovalRequirement::Skip { bypass_sandbox: false, proposed_execpolicy_amendment: None },
+        );
+        let native = PathUri::from_abs_path(&AbsolutePathBuf::current_dir().unwrap()).to_string();
+        let profile = |foreign: &str| serde_json::from_value::<UriAdditionalPermissionProfile>(
+            serde_json::json!({"file_system": {"read": [native, foreign]}}),
+        ).unwrap();
+        request.additional_permissions_uri = Some(profile("file:///foreign/a"));
+        let first = runtime.approval_keys(&request);
+        request.additional_permissions_uri = Some(profile("file:///foreign/b"));
+        assert_ne!(first, runtime.approval_keys(&request));
+        let reason = unified_exec_approval_reason(Some("reason".into()), request.additional_permissions_uri.as_ref()).unwrap();
+        assert!(reason.contains("file:///foreign/b"));
+        assert!(reason.contains(&native));
     }
 
     #[tokio::test]

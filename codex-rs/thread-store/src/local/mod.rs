@@ -77,6 +77,7 @@ pub struct LocalThreadStore {
     live_recorders: Arc<Mutex<HashMap<ThreadId, LiveRecorderEntry>>>,
     projections: Arc<Mutex<HashMap<ThreadId, projection::SharedLocalThreadProjection>>>,
     state_db: Option<StateDbHandle>,
+    deletion_recovery: Arc<tokio::sync::OnceCell<()>>,
 }
 
 struct LiveRecorderEntry {
@@ -125,11 +126,17 @@ impl LocalThreadStore {
             live_recorders: Arc::new(Mutex::new(HashMap::new())),
             projections: Arc::new(Mutex::new(HashMap::new())),
             state_db,
+            deletion_recovery: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
     /// Return the state DB handle used by local rollout writers.
     pub async fn state_db(&self) -> Option<StateDbHandle> {
+        if let Err(err) = self.deletion_recovery.get_or_try_init(|| async {
+            delete_thread::recover_staged_deletes(self).await
+        }).await {
+            tracing::warn!(%err, "staged deletion recovery incomplete; unresolved files retained for retry");
+        }
         self.state_db.clone()
     }
 

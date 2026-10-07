@@ -498,8 +498,8 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
         .filter(|text| text.contains("<personality_spec>") && text.contains(PERSONALITY_RESET_TEXT))
         .count();
     assert_eq!(
-        friendly_updates, 1,
-        "the historical friendly instruction must remain in the cached prefix"
+        friendly_updates, 0,
+        "the reset supersedes the historical personality slot"
     );
     assert_eq!(
         reset_updates, 1,

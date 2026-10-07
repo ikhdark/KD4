@@ -3,13 +3,18 @@ Compare against the latest effective checkpoint, including all previously
 appended updates. Explicitly retire resolved blockers and superseded next actions.
 Produce only a concise incremental update containing task-relevant information
 that became true, changed, or remains newly unresolved after that checkpoint.
-Do not repeat unchanged facts from the earlier summary. The runtime will append
+Do not repeat unchanged facts from the earlier summary unless the request names
+sections to rebase. For each requested rebase, provide the complete current state,
+including unchanged unresolved obligations and indispensable evidence; that body
+replaces ALL prior updates for its section. For other sections, the runtime appends
 your update to the existing checkpoint, so the output must stand alone as an
 addendum and must not include the checkpoint preamble.
-Include at least one applicable heading with a non-empty body.
+Always include `## Next action` with the single current immediate action (or
+state that no action remains). This is a complete replacement, not an action log,
+even when unchanged. Other sections remain additive unless explicitly rebased.
 Use only the applicable standard checkpoint headings: `## Goal`,
 `## Current state`, `## Completed work`, `## Unresolved work`, `## Evidence`,
-and `## Next action`. Omit unchanged sections. Prefer the latest observed state
+and `## Next action`. Omit unchanged sections other than Next action unless rebasing them. Prefer the latest observed state
 and explicitly invalidate superseded evidence.
 If the user changes the goal or constraints, include `## Goal` with the complete
 current goal and explicitly retire the superseded goal or constraints. The latest

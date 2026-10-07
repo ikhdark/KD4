@@ -67,7 +67,7 @@ pub(super) async fn resume_thread(
             store,
             rollout_path,
             params.include_archived,
-            params.history.is_none(),
+            false,
         )
         .await?
     } else {
@@ -76,7 +76,7 @@ pub(super) async fn resume_thread(
             ReadThreadParams {
                 thread_id: params.thread_id,
                 include_archived: params.include_archived,
-                include_history: params.history.is_none(),
+                include_history: false,
             },
         )
         .await?
@@ -88,43 +88,47 @@ pub(super) async fn resume_thread(
     }
     let history_mode = thread.history_mode;
     reject_paginated_history_mode(history_mode)?;
-    let history = match params.history {
-        Some(history) => history,
-        None => Arc::new(
-            thread
-                .history
-                .ok_or_else(|| ThreadStoreError::Internal {
-                    message: format!("failed to load history for thread {}", params.thread_id),
-                })?
-                .items,
-        ),
-    };
-    reject_paginated_history_mode(canonical_history_mode_from_rollout_items(&history))?;
-    if let Some(RolloutItem::SessionMeta(meta)) = history
-        .iter()
-        .find(|item| matches!(item, RolloutItem::SessionMeta(_)))
-        && meta.meta.id != params.thread_id
-    {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: "resume history belongs to a different thread".to_string(),
-        });
-    }
-    let rollout_path = thread
-        .rollout_path
-        .ok_or_else(|| ThreadStoreError::Internal {
-            message: format!("thread {} does not have a rollout path", params.thread_id),
-        })?;
+    let rollout_path = thread.rollout_path.ok_or_else(|| ThreadStoreError::Internal {
+        message: format!("thread {} does not have a rollout path", params.thread_id),
+    })?;
     let config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
         sqlite_home: store.config.sqlite_home.clone(),
         cwd,
         model_provider_id: params.metadata.model_provider.clone(),
     };
-    let recorder = RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path))
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to resume local thread recorder: {err}"),
-        })?;
+    let validate_history = |history: &[RolloutItem]| -> ThreadStoreResult<()> {
+        reject_paginated_history_mode(canonical_history_mode_from_rollout_items(history))?;
+        if let Some(RolloutItem::SessionMeta(meta)) = history
+            .iter()
+            .find(|item| matches!(item, RolloutItem::SessionMeta(_)))
+            && meta.meta.id != params.thread_id
+        {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "resume history belongs to a different thread".to_string(),
+            });
+        }
+        Ok(())
+    };
+    let (recorder, history) = match params.history {
+        Some(history) => {
+            // Reject supplied history before opening or materializing a writer.
+            validate_history(&history)?;
+            let recorder = RolloutRecorder::new(
+                &config,
+                RolloutRecorderParams::resume(rollout_path),
+            )
+            .await
+            .map_err(thread_store_io_error)?;
+            (recorder, history)
+        }
+        None => {
+            let (recorder, history) = RolloutRecorder::resume_and_load(&config, rollout_path, params.thread_id)
+                .await.map_err(thread_store_io_error)?;
+            validate_history(&history)?;
+            (recorder, Arc::new(history))
+        }
+    };
     store
         .insert_live_recorder(params.thread_id, recorder, history_mode)
         .await?;

@@ -12,7 +12,7 @@ fn search_info_uses_mcp_tool_metadata_and_parameter_names() {
 
     assert_eq!(
         search_info.entry.search_text,
-        "mcp__calendar___create_event _create_event createEvent codex-apps Create event Create a calendar event. Calendar Plan events. Calendar plugin attendees start_time"
+        "mcp__calendar___create_event _create_event createEvent codex-apps create event Create event Create a calendar event. Calendar Plan events. Calendar plugin attendees start_time"
     );
     assert_eq!(
         search_info.source_info,

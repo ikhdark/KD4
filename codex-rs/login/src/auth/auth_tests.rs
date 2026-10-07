@@ -619,6 +619,14 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         .expect("identity should persist");
     assert_eq!(persisted.agent_runtime_id, "agent-runtime-123");
     assert_eq!(persisted.task_id.as_deref(), Some("task-123"));
+    assert_eq!(persisted.issuer_origin.as_deref(), Some(server.uri().as_str()));
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let mut current = storage.load()?.unwrap();
+    let AgentIdentityStorage::Record(stale) = current.agent_identity.as_mut().unwrap() else { panic!("record"); };
+    stale.email = Some("stale@example.com".into());
+    stale.plan_type = AccountPlanType::Free;
+    stale.chatgpt_account_is_fedramp = true;
+    storage.save(&current)?;
 
     let reloaded = super::load_auth(
         codex_home.path(),
@@ -648,6 +656,10 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         "agent-runtime-123"
     );
     assert_eq!(reloaded_agent_auth.run_task_id(), "task-123");
+    assert_eq!(reloaded_agent_auth.record().agent_private_key, persisted.agent_private_key);
+    assert_eq!(reloaded_agent_auth.plan_type(), AccountPlanType::Pro);
+    assert_eq!(reloaded_agent_auth.email(), agent_auth.email());
+    assert_eq!(reloaded_agent_auth.is_fedramp_account(), agent_auth.is_fedramp_account());
     Ok(())
 }
 
@@ -775,6 +787,7 @@ async fn chatgpt_auth_registration_retry_exhaustion_is_fallback_eligible() -> an
 #[serial(codex_auth_env)]
 async fn chatgpt_auth_task_registration_retry_exhaustion_is_fallback_eligible() -> anyhow::Result<()>
 {
+    let server = MockServer::start().await;
     let codex_home = tempdir()?;
     write_auth_file(
         AuthFileParams {
@@ -785,6 +798,7 @@ async fn chatgpt_auth_task_registration_retry_exhaustion_is_fallback_eligible() 
         codex_home.path(),
     )?;
     let mut record = agent_identity_record("account-123");
+    record.issuer_origin = Some(server.uri());
     record.chatgpt_user_id = "user-12345".to_string();
     record.email = Some("user@example.com".to_string());
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
@@ -806,7 +820,6 @@ async fn chatgpt_auth_task_registration_retry_exhaustion_is_fallback_eligible() 
     .await?
     .expect("auth should load");
 
-    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!(
             "/v1/agent/{}/task/register",
@@ -1837,6 +1850,7 @@ async fn load_auth_reads_access_token_from_env() {
         .mount(&server)
         .await;
     expected_record.task_id = Some("task-123".to_string());
+    expected_record.issuer_origin = Some(server.uri());
     let _access_token_guard = EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, &agent_identity);
 
     let authapi_base_url = server.uri();
@@ -2369,11 +2383,15 @@ async fn enforce_login_restrictions_allows_matching_workspace() {
         codex_home.path(),
     )
     .expect("failed to write auth file");
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let mut current = storage.load().unwrap().unwrap();
+    current.tokens.as_mut().unwrap().account_id = Some("selected-workspace".into());
+    storage.save(&current).unwrap();
 
     let config = build_config(
         codex_home.path(),
         /*forced_login_method*/ None,
-        Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
+        Some(vec!["selected-workspace".to_string()]),
     )
     .await;
 
@@ -2540,10 +2558,63 @@ async fn enforce_login_restrictions_blocks_env_api_key_when_chatgpt_required() {
     );
 }
 
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn identity_runtime_is_persisted_before_task_failure_and_resumed() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(AuthFileParams {
+        openai_api_key: None, chatgpt_plan_type: Some("pro".into()),
+        chatgpt_account_id: Some("account-123".into()),
+    }, home.path())?;
+    let storage: Arc<dyn AuthStorageBackend> = Arc::new(FileAuthStorage::new(home.path().into()));
+    let auth = CodexAuth::from_auth_dot_json(home.path(), storage.load()?.unwrap(),
+        AuthCredentialsStoreMode::File, None, AuthKeyringBackendKind::Direct, None,
+        &crate::test_support::transport_default_auth_route_config()).await?;
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/agent/register"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"agent_runtime_id":"stage-one"})))
+        .expect(1).mount(&server).await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST")).and(path("/v1/agent/stage-one/task/register"))
+        .respond_with(move |_: &wiremock::Request| {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 3 { ResponseTemplate::new(503) }
+            else { ResponseTemplate::new(200).set_body_json(json!({"task_id":"resumed"})) }
+        }).expect(4).mount(&server).await;
+    let route = crate::test_support::transport_default_auth_route_config();
+    assert!(auth.ensure_managed_chatgpt_agent_identity(&server.uri(), None, &route, SessionSource::Cli).await.is_err());
+    let partial = storage.load()?.unwrap().agent_identity.unwrap();
+    assert_eq!(partial.as_record().unwrap().agent_runtime_id, "stage-one");
+    assert_eq!(partial.as_record().unwrap().task_id, None);
+    let resumed = auth.ensure_managed_chatgpt_agent_identity(&server.uri(), None, &route, SessionSource::Cli).await?;
+    assert_eq!(resumed.run_task_id(), "resumed");
+
+    // An account change during HTTP must not overwrite the replacement credentials.
+    let expected = auth.get_token_data()?;
+    let mut replacement = storage.load()?.unwrap();
+    replacement.tokens.as_mut().unwrap().account_id = Some("other".into());
+    replacement.agent_identity = None;
+    storage.save(&replacement)?;
+    assert!(auth.persist_managed_chatgpt_agent_identity_record(resumed.record().clone(), &expected).is_err());
+    assert_eq!(storage.load()?.unwrap(), replacement);
+    Ok(())
+}
+
+#[tokio::test]
+async fn identities_reject_unknown_and_different_issuers_without_network() {
+    let mut record = agent_identity_record("account");
+    record.task_id = Some("already-registered".into());
+    let route = crate::test_support::transport_default_auth_route_config();
+    assert!(AgentIdentityAuth::from_record(record.clone(), "https://staging.example", &route).await.is_err());
+    record.issuer_origin = Some("https://production.example".into());
+    assert!(AgentIdentityAuth::from_record(record.clone(), "https://staging.example", &route).await.is_err());
+    assert!(AgentIdentityAuth::from_record(record, "https://production.example/", &route).await.is_ok());
+}
+
 fn agent_identity_record(account_id: &str) -> AgentIdentityAuthRecord {
     let key_material =
         codex_agent_identity::generate_agent_key_material().expect("generate agent key material");
     AgentIdentityAuthRecord {
+        issuer_origin: None,
         agent_runtime_id: "agent-runtime-id".to_string(),
         agent_private_key: key_material.private_key_pkcs8_base64,
         account_id: account_id.to_string(),

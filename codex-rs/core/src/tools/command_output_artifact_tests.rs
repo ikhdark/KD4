@@ -2,15 +2,139 @@ use super::*;
 use codex_utils_string::approx_token_count;
 use std::time::Duration;
 
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn verified10_text_json_indexes_once_per_recovery_transaction() {
+    let home = tempfile::tempdir().unwrap();
+    let canonical = CanonicalToolResult::text(format!("{{\"name\":\"{}\",\"small\":7}}", "evidence ".repeat(20_000)));
+    let artifact = create_canonical_output_artifact(home.path(), "thread", &canonical).await;
+    let id = artifact.artifact_id().unwrap();
+    let snapshot = load_tool_output_snapshot(home.path(), "thread", &id).await.unwrap();
+    snapshot.select(vec![ToolOutputSelector::Lines { start: 1, end: 1 }], 512).await.unwrap();
+    assert!(snapshot.indexed_metadata.get().is_none());
+    let selectors = vec![ToolOutputSelector::JsonPointer { pointer: "/name".into() }];
+    let first = snapshot.select(selectors.clone(), 512).await.unwrap();
+    assert!(!first.complete);
+    let index = snapshot.indexed_metadata.get().unwrap() as *const _;
+    let repeat = snapshot.select(selectors, 512).await.unwrap();
+    assert_eq!(first, repeat);
+    snapshot.select(vec![ToolOutputSelector::JsonPointer { pointer: "/name".into() }], 256).await.unwrap();
+    assert_eq!(snapshot.indexed_metadata.get().unwrap() as *const _, index);
+    let small = snapshot.select(vec![ToolOutputSelector::JsonPointer { pointer: "/small".into() }], 2_000).await.unwrap();
+    assert_eq!(small.results[0].value, Some(serde_json::json!(7)));
+    assert!(small.complete);
+    assert!(load_tool_output_snapshot(home.path(), "thread", &id).await.unwrap().indexed_metadata.get().is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn verified10_unchanged_attachment_preserves_metadata_and_rejects_corruption() {
+    let home = tempfile::tempdir().unwrap();
+    let canonical = CanonicalToolResult::text("unchanged source\n");
+    let artifact = create_canonical_output_artifact(home.path(), "thread", &canonical).await;
+    let id = artifact.artifact_id().unwrap();
+    let path = home.path().join("tool-output/thread").join(format!("{id}.log"));
+    let metadata = logical_metadata_path(&path);
+    let stamp = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    std::fs::File::options().write(true).open(&metadata).unwrap().set_modified(stamp).unwrap();
+    let before = std::fs::read(&metadata).unwrap();
+    let attached = attach_canonical_output_artifact(home.path(), "thread", &id, &canonical).await;
+    assert!(attached.complete, "{:?}", attached.error);
+    assert_eq!(std::fs::metadata(&metadata).unwrap().modified().unwrap(), stamp);
+    assert_eq!(std::fs::read(&metadata).unwrap(), before);
+    assert!(!logical_transaction_path(&path).exists());
+    let mut incompatible = canonical.clone();
+    incompatible.json_pointers.insert("/fake".into(), CanonicalJsonPointer {
+        range: CanonicalByteRange::new(0, 1), exact_bytes: 1,
+        direct_children: Vec::new(), recovery_chunk_bytes: None,
+    });
+    let mut original: LogicalArtifactMetadata = serde_json::from_slice(&before).unwrap();
+    original.json_pointers = incompatible.json_pointers;
+    std::fs::write(&metadata, serde_json::to_vec(&original).unwrap()).unwrap();
+    assert!(!attach_canonical_output_artifact(home.path(), "thread", &id, &canonical).await.complete);
+    std::fs::write(&metadata, b"broken metadata").unwrap();
+    assert!(verify_tool_history_artifact(home.path(), "thread", &id, canonical.exact_bytes, &canonical.sha256).await.is_err());
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn verified10_batch_protection_keeps_healthy_siblings() {
+    let home = tempfile::tempdir().unwrap();
+    let canonical = CanonicalToolResult::text("healthy");
+    let artifact = create_canonical_output_artifact(home.path(), "thread", &canonical).await;
+    let id = artifact.artifact_id().unwrap();
+    let references = BTreeMap::from([
+        (id.clone(), (canonical.exact_bytes, canonical.sha256)),
+        ("invalid-id".into(), (7, "0".repeat(64))),
+        (uuid::Uuid::now_v7().to_string(), (7, "0".repeat(64))),
+    ]);
+    assert_eq!(protect_retrievable_tool_history_artifacts(home.path(), "thread", references).await,
+        BTreeSet::from([id]));
+}
+
+#[test]
+fn selector_response_cost_matches_serialization_at_every_boundary() {
+    let canonical = CanonicalToolResult::text("λ😀\u{0000}\"\\\n".repeat(100));
+    let mut metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string());
+    metadata.unavailable_ranges.push(CanonicalByteRange::new(7, 11));
+    let mut response = ReadToolOutputResult {
+        artifact_id: metadata.artifact_id.clone(),
+        canonical_sha256: metadata.canonical_sha256.clone(),
+        canonical_bytes: metadata.canonical_bytes,
+        retained_bytes: metadata.retained_bytes,
+        complete: false,
+        unavailable_ranges: metadata.unavailable_ranges.clone(),
+        results: Vec::new(),
+    };
+    let mut cost = SelectorResponseCost::new(&metadata, &[]);
+    for index in 0..64 {
+        let mut selected = successful_byte_selector_result(
+            CanonicalByteRange::new(0, canonical.exact_bytes), &canonical.bytes,
+        );
+        if index % 3 == 0 {
+            selected.text = None;
+            selected.value = Some(serde_json::json!({"hydrated_ranges":[{
+                "text":"λ😀\u{0000}\"\\\n".repeat(index), "shared":false,
+                "canonical_range":{"start":0,"end":index}
+            }]}));
+        }
+        let next = selector_serialized_cost(&selected);
+        response.results.push(selected);
+        for complete in [false, true] {
+            response.complete = complete;
+            let exact = approx_token_count(&serde_json::to_string(&response).unwrap());
+            assert_eq!(cost.with_next(next, complete).tokens(), exact);
+            assert!(response_fits_recovery_token_ceiling(&response, exact));
+            assert!(!response_fits_recovery_token_ceiling(&response, exact - 1));
+        }
+        cost.push(next);
+    }
+    // Tail compaction changes costs without rescanning or losing earlier owners.
+    for index in (0..response.results.len()).rev() {
+        response.results[index] = ToolOutputSelectorResult::state(
+            response.results[index].selector.clone(), ToolOutputSelectorStatus::AggregateOmitted,
+        );
+        cost.replace(index, selector_serialized_cost(&response.results[index]));
+        for complete in [false, true] {
+            response.complete = complete;
+            assert_eq!(cost.size(complete).tokens(),
+                approx_token_count(&serde_json::to_string(&response).unwrap()));
+        }
+    }
+}
+
 #[test]
 fn script_selector_sizing_reuses_prefix_without_changing_admission() {
     // Reference the old full-envelope measurement, including escaping, overflow
     // metadata and repeated selections. Different source bytes must recompute it.
-    for text in ["a".repeat(20_000), "\"\\\n".repeat(20_000)] {
-        let canonical = CanonicalToolResult::text(text);
+    for text in ["a".repeat(20_000), "\"\\\n".repeat(20_000), "λ😀\u{0000}\"\\\n".repeat(10_000)] {
+        // Keep selections disjoint so normalization does not collapse this
+        // aggregate-admission fixture to one fully covered range.
+        let stride = text.len() + 3;
+        let canonical = CanonicalToolResult::text(format!("{text}gap").repeat(64));
         let selectors = (0..64).map(|index| ToolOutputSelector::Bytes {
-            start: index,
-            end: canonical.exact_bytes,
+            start: (index * stride) as u64,
+            end: (index * stride + text.len()) as u64,
         }).collect::<Vec<_>>();
         let metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string());
         let (mut expected, _) = select_file_snapshot_for_script(&canonical, Some(Vec::new())).unwrap();
@@ -18,17 +142,27 @@ fn script_selector_sizing_reuses_prefix_without_changing_admission() {
             let selected = select_logical_artifact(
                 &metadata, &canonical.bytes, selector.clone(), usize::MAX, usize::MAX,
                 &expected.results,
+                None,
             );
             expected.results.push(selected.clone());
             if serde_json::to_vec(&expected).unwrap().len() > 1024 * 1024 - 128 * 1024 {
                 expected.results.pop();
-                let mut omitted = ToolOutputSelectorResult::state(
+                let mut omitted = selected.canonical_range.map(|range| {
+                    too_large_result(selector.clone(), range, Vec::new(), &metadata,
+                        &canonical.bytes, RECOVERY_AGGREGATE_TOKEN_CEILING)
+                }).unwrap_or_else(|| ToolOutputSelectorResult::state(
                     selector.clone(), ToolOutputSelectorStatus::AggregateOmitted,
-                );
+                ));
+                omitted.status = ToolOutputSelectorStatus::AggregateOmitted;
                 omitted.exact_bytes = selected.exact_bytes;
                 omitted.canonical_range = selected.canonical_range;
-                omitted.continuation = Some(selector.clone());
-                omitted.message = Some("Selection exceeds the 1 MiB script payload cap; request smaller ranges.".into());
+                if let (Some(range), Some(ToolOutputSelector::Bytes { end, .. })) =
+                    (selected.canonical_range, omitted.child_selectors.first())
+                    && *end < range.end
+                {
+                    omitted.child_selectors.push(ToolOutputSelector::Bytes { start: *end, end: range.end });
+                }
+                omitted.message = Some("Selection exceeds the 1 MiB script payload cap; recover the exact range through continuation or child_selectors, not the original selector.".into());
                 expected.results.push(omitted);
             }
         }
@@ -86,6 +220,18 @@ async fn raw_command_json_supports_pointer_recovery_without_rewriting_bytes() {
     let body = format!(" {{ \"z\": \"{}\", \"a/b\": [{{\"~key\": \"λ evidence\"}}] }}\n", "padding".repeat(3200));
     let artifact = create_raw_output_artifact(temp.path(), "thread", body.as_bytes()).await;
     let id = artifact.artifact_id().unwrap().to_string();
+    let snapshot = load_tool_output_snapshot(temp.path(), "thread", &id).await.unwrap();
+    assert!(snapshot.indexed_metadata.get().is_none());
+    assert!(snapshot.metadata.json_pointers.is_empty());
+    for selector in [
+        ToolOutputSelector::Bytes { start: 0, end: body.len() as u64 },
+        ToolOutputSelector::Lines { start: 1, end: 1 },
+    ] {
+        let recovered = snapshot.select(vec![selector], 32_000).await.unwrap();
+        assert_eq!(recovered.results[0].text.as_deref(), Some(body.as_str()));
+        assert!(recovered.complete);
+        assert!(snapshot.metadata.json_pointers.is_empty());
+    }
     let result = read_tool_output_selectors(temp.path(), "thread", &id, vec![
         ToolOutputSelector::JsonPointer { pointer: "/a~1b/0/~0key".into() },
     ]).await.unwrap();
@@ -102,7 +248,7 @@ async fn recovery_searches_share_remaining_capacity_and_keep_exact_evidence() {
         ["ALPHA", "BETA", "GAMMA"][i / 60], "exact evidence ".repeat(12))).collect::<String>();
     let temp = tempfile::tempdir().unwrap();
     let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
-    let selectors = ["ALPHA", "BETA", "GAMMA"].map(|query| ToolOutputSelector::Search { case_insensitive: false,
+    let selectors = ["ALPHA", "BETA", "GAMMA"].map(|query| ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
         query: query.into(), start_byte: 0, max_results: 60, context_lines: 0,
     });
     let result = select_tool_output_snapshot(&metadata, &snapshot, selectors.to_vec(), 4_000).unwrap();
@@ -188,7 +334,7 @@ async fn shared_search_hydration_preserves_evidence_and_independent_recovery() {
         "λ verified signed value -7; ".repeat(25)
     );
     let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
-    let selectors = ["ALPHA", "BETA"].map(|query| ToolOutputSelector::Search { case_insensitive: false,
+    let selectors = ["ALPHA", "BETA"].map(|query| ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
         query: query.into(),
         start_byte: 0,
         max_results: 100,
@@ -255,7 +401,7 @@ fn shared_search_hydration_rejects_missing_tiny_or_non_saving_evidence() {
     let mut hydrated = reference.clone();
     hydrated["text"] = serde_json::json!("verified evidence ".repeat(30));
     let mut previous = ToolOutputSelectorResult::state(
-        ToolOutputSelector::Search { case_insensitive: false,
+        ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
             query: "first".into(),
             start_byte: 0,
             max_results: 1,
@@ -322,6 +468,7 @@ async fn overlapping_search_hydration_reduces_input_with_identical_evidence() {
         let temp = tempfile::tempdir().unwrap();
         let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
         let selectors = [20, 24, 28].map(|line| ToolOutputSelector::Search {
+            enclosing: false,
             query: format!("candidate_{line:02}"), case_insensitive: false,
             start_byte: 0, max_results: 1, context_lines: 10,
         });
@@ -330,7 +477,7 @@ async fn overlapping_search_hydration_reduces_input_with_identical_evidence() {
         ).unwrap();
         let mut independent = result.clone();
         independent.results = selectors.iter().map(|selector| search_logical_artifact(
-            &metadata, &snapshot, selector.clone(), 30_000, &[],
+            &metadata, &snapshot, selector.clone(), SearchBudget::ResponseTokens(30_000), &[], None,
         )).collect();
         assert!(result.complete);
         assert_eq!(result.delivered_evidence(), independent.delivered_evidence());
@@ -394,7 +541,7 @@ fn overlapping_search_hydration_preserves_binary_edges_and_rejects_non_evidence(
         "data_base64": BASE64_STANDARD.encode(&snapshot),
     });
     let mut previous = ToolOutputSelectorResult::state(
-        ToolOutputSelector::Search { query:"candidate".into(), case_insensitive:false,
+        ToolOutputSelector::Search { query:"candidate".into(), enclosing:false, case_insensitive:false,
             start_byte:0, max_results:1, context_lines:0 }, ToolOutputSelectorStatus::Ok,
     );
     previous.value = Some(serde_json::json!({"hydrated_ranges":[{
@@ -477,6 +624,7 @@ async fn adjacent_fitting_selectors_are_not_merged_into_one_that_no_longer_fits(
             RECOVERY_FRAGMENT_TOKEN_CEILING,
             RECOVERY_AGGREGATE_TOKEN_CEILING,
             &[],
+            None,
         );
         let readable = selected.status == ToolOutputSelectorStatus::Ok
             || internally_drain_exact_subdivisions(&metadata, &snapshot, &selected).is_some();
@@ -1489,7 +1637,7 @@ async fn artifact_recovery_search_returns_batched_exact_selectors_and_continuati
     );
     let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
     let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
-    let search = ToolOutputSelector::Search { case_insensitive: false,
+    let search = ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
         query: "needle".to_string(),
         start_byte: 0,
         max_results: 2,
@@ -1501,7 +1649,7 @@ async fn artifact_recovery_search_returns_batched_exact_selectors_and_continuati
         .expect("search canonical artifact");
     let result = &indexed.results[0];
     assert_eq!(result.status, ToolOutputSelectorStatus::Ok);
-    assert!(!result.complete);
+    assert!(result.complete, "requested bounded page is delivered even when more matches exist");
     assert_eq!(
         result.child_selectors,
         vec![ToolOutputSelector::Lines { start: 1, end: 5 }],
@@ -1561,7 +1709,7 @@ async fn artifact_recovery_search_preserves_nonoverlapping_utf8_byte_offsets() {
         temp.path(),
         "thread",
         &artifact_id,
-        vec![ToolOutputSelector::Search { case_insensitive: false,
+        vec![ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
             query: "aa".to_string(),
             start_byte: 0,
             max_results: 2,
@@ -1618,7 +1766,7 @@ async fn artifact_recovery_search_page_fits_its_ceiling_and_advances() {
     );
     let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
     let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
-    let search = ToolOutputSelector::Search { case_insensitive: false,
+    let search = ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
         query: "needle".to_string(),
         start_byte: 0,
         max_results: ARTIFACT_SEARCH_MAX_RESULTS,
@@ -1676,7 +1824,7 @@ async fn artifact_recovery_sparse_search_avoids_a_historical_line_sweep() {
         temp.path(),
         "thread",
         &artifact_id,
-        vec![ToolOutputSelector::Search { case_insensitive: false,
+        vec![ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
             query: "recovery target".to_string(),
             start_byte: 0,
             max_results: ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS,
@@ -1971,6 +2119,24 @@ async fn retained_prefix_recovery_reports_the_unavailable_canonical_suffix() {
         recovered.results[0].canonical_range,
         Some(CanonicalByteRange::new(0, retained.len() as u64))
     );
+
+    // A successful search of retained bytes is not proof of absence in the
+    // unavailable suffix. Do not ask the model to infer this from storage fields.
+    for (query, matches) in [("retained", 1), ("unavailable", 0)] {
+        let selector = ToolOutputSelector::Search {
+            query: query.into(), case_insensitive: false, start_byte: 0,
+            enclosing: false,
+            max_results: 20, context_lines: 0,
+        };
+        let result = read_tool_output_selectors(
+            temp.path(), "thread", &artifact_id, vec![selector],
+        ).await.unwrap();
+        assert!(result.complete, "the retained search page was delivered");
+        let search = result.results[0].value.as_ref().unwrap();
+        assert_eq!(search["coverage_complete"], false);
+        assert_eq!(search["total_matches"], matches);
+        assert_eq!(result.unavailable_ranges, metadata.unavailable_ranges);
+    }
 }
 
 #[tokio::test]
@@ -2497,6 +2663,29 @@ fn audit_output_artifact_attach_rollback_preserves_only_base_segment() {
 }
 
 #[test]
+#[serial_test::serial(command_output_artifact)]
+fn uncertain_metadata_preserves_transaction_family() {
+    for preserve_base in [false, true] {
+        for metadata in [b"{broken".as_slice(), b"{\"version\":999999}".as_slice()] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{}.log", ToolOutputArtifactId::new()));
+            begin_logical_artifact_transaction(&path, preserve_base).unwrap();
+            std::fs::write(&path, b"base").unwrap();
+            let tail = logical_segment_path(&path, 1);
+            std::fs::write(&tail, b"tail").unwrap();
+            std::fs::write(logical_metadata_path(&path), metadata).unwrap();
+            let error = reconcile_logical_artifact_transaction(&path).unwrap_err();
+            assert!(matches!(error.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::Unsupported));
+            assert!(error.to_string().contains("preserving family"));
+            assert_eq!(std::fs::read(&path).unwrap(), b"base");
+            assert_eq!(std::fs::read(tail).unwrap(), b"tail");
+            assert_eq!(std::fs::read(logical_metadata_path(&path)).unwrap(), metadata);
+            assert!(logical_transaction_path(&path).exists());
+        }
+    }
+}
+
+#[test]
 fn audit_output_artifact_unavailable_ranges_preserve_canonical_gaps() {
     assert_eq!(
         normalized_unavailable_ranges(12, &[CanonicalByteRange::new(2, 4)], 12),
@@ -2641,6 +2830,33 @@ async fn inline_streaming_output_creates_no_artifact() {
     writer.finish(Some(&state)).await;
     assert!(state.lock().await.is_pending());
     assert!(!temp.path().join("tool-output").exists());
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn streaming_output_gap_retains_suffix_and_marks_capture_incomplete() {
+    for lazy in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = if lazy {
+            RawOutputArtifact::pending(temp.path(), "thread")
+        } else {
+            create_raw_output_artifact(temp.path(), "thread", b"").await
+        };
+        let state = Arc::new(Mutex::new(artifact));
+        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+        writer.mark_output_gap(Some(&state)).await;
+        let suffix = vec![b'x'; LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES + 1];
+        writer.write_chunk(Some(&state), &suffix).await;
+        writer.write_chunk(Some(&state), b"final suffix").await;
+        writer.finish(Some(&state)).await;
+        let artifact = state.lock().await;
+        let RawOutputArtifact::Stored { path, truncated, .. } = &*artifact else { panic!("stored suffix"); };
+        assert!(*truncated);
+        let bytes = tokio::fs::read(path).await.unwrap();
+        assert!(bytes.starts_with(b"\n[output gap:"));
+        assert!(bytes.ends_with(b"final suffix"));
+        assert!(artifact.render_for_model().contains("incomplete capture"));
+    }
 }
 
 #[tokio::test]
@@ -4440,13 +4656,13 @@ async fn audit_search_oversized_context_delivers_coordinates_without_skipping_ma
     let temp = tempfile::tempdir().unwrap();
     let content = format!("needle{}\nneedle short\n", "x".repeat(100_000));
     let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &content).await;
-    let selector = ToolOutputSelector::Search { case_insensitive: false,
+    let selector = ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
         query: "needle".into(),
         start_byte: 0,
         max_results: 20,
         context_lines: 0,
     };
-    let first = search_logical_artifact(&metadata, &snapshot, selector, 1024, &[]);
+    let first = search_logical_artifact(&metadata, &snapshot, selector, SearchBudget::ResponseTokens(1024), &[], None);
     assert_eq!(first.status, ToolOutputSelectorStatus::Ok);
     assert_eq!(first.value.as_ref().unwrap()["matches_returned"], 1);
     assert_eq!(first.value.as_ref().unwrap()["matches"][0]["start_byte"], 0);
@@ -4461,8 +4677,9 @@ async fn audit_search_oversized_context_delivers_coordinates_without_skipping_ma
         &metadata,
         &snapshot,
         first.continuation.unwrap(),
-        1024,
+        SearchBudget::ResponseTokens(1024),
         &[],
+        None,
     );
     assert_eq!(second.value.as_ref().unwrap()["matches_returned"], 1);
     assert_eq!(
@@ -4542,6 +4759,12 @@ async fn reclaim_releases_idle_directories_of_threads_without_rollouts_only() {
     assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Indexed);
 
     let later = SystemTime::now() + UNRESUMABLE_THREAD_ARTIFACT_GRACE + Duration::from_secs(60);
+    let move_owner = codex_rollout::lock_rollout_moves(home).await.unwrap();
+    assert_eq!(reclaim_unresumable_thread_artifacts(home, &active, later, |_| async {
+        panic!("reclamation must skip even the first lookup while unarchive owns movement")
+    }).await.unwrap(), 0);
+    assert!(artifacts[&unresumable].exists());
+    drop(move_owner);
     assert_eq!(
         reclaim_unresumable_thread_artifacts(home, &active, later, &lookup)
             .await
@@ -4597,6 +4820,14 @@ async fn threads_with_live_or_archived_compressed_rollouts_are_resumable() {
     let live = "11111111-1111-7111-8111-111111111111";
     let archived = "22222222-2222-7222-8222-222222222222";
     let deleted = "33333333-3333-7333-8333-333333333333";
+    let rollout = |id: &str| {
+        let id = codex_protocol::ThreadId::from_string(id).unwrap();
+        serde_json::json!({"timestamp": "2026-09-25T00:00:00Z", "type": "session_meta",
+            "payload": codex_protocol::protocol::SessionMeta {
+                id, session_id: id.into(), ..Default::default()
+            }
+        }).to_string() + "\n"
+    };
     let sessions = home
         .join(crate::SESSIONS_SUBDIR)
         .join("2026")
@@ -4605,14 +4836,14 @@ async fn threads_with_live_or_archived_compressed_rollouts_are_resumable() {
     std::fs::create_dir_all(&sessions).expect("sessions");
     std::fs::write(
         sessions.join(format!("rollout-2026-09-25T00-00-00-{live}.jsonl")),
-        b"{}\n",
+        rollout(live),
     )
     .expect("live rollout");
     let archived_sessions = home.join(crate::ARCHIVED_SESSIONS_SUBDIR);
     std::fs::create_dir_all(&archived_sessions).expect("archived sessions");
     std::fs::write(
         archived_sessions.join(format!("rollout-2026-09-25T00-00-00-{archived}.jsonl.zst")),
-        b"compressed",
+        zstd::stream::encode_all(rollout(archived).as_bytes(), 0).unwrap(),
     )
     .expect("archived rollout");
 
@@ -4653,9 +4884,27 @@ fn search_defaults_hydrate_context_and_ascii_case_option_survives_continuation()
     })).unwrap();
     let result = select_producer_snapshot(&canonical, "test", vec![selector], 9_000).unwrap();
     let search = result.results[0].value.as_ref().unwrap();
+    assert_eq!(search["coverage_complete"], true, "coverage differs from pagination");
     assert_eq!(search["total_matches"], 2);
     assert_eq!(search["hydrated_ranges"][0]["text"], "before\nERROR first\nafter\nerror second\nend\n");
     assert!(matches!(result.results[0].continuation, Some(ToolOutputSelector::Search {case_insensitive: true, context_lines: 3, ..})));
+}
+
+#[test]
+fn complete_empty_search_reports_absence_without_recovery() {
+    for text in ["", "before\nretained\nafter\n"] {
+        let canonical = CanonicalToolResult::text(text);
+        let selector = ToolOutputSelector::Search {
+            query: "absent".into(), case_insensitive: false, start_byte: 0,
+            enclosing: false,
+            max_results: 20, context_lines: 0,
+        };
+        let result = select_producer_snapshot(&canonical, "test", vec![selector], 9_000).unwrap();
+        assert!(result.complete);
+        assert_eq!(result.results[0].value.as_ref().unwrap()["coverage_complete"], true);
+        assert_eq!(result.results[0].value.as_ref().unwrap()["total_matches"], 0);
+        assert!(result.results[0].continuation.is_none());
+    }
 }
 
 #[test]
@@ -4672,4 +4921,64 @@ fn evidence_reuse_search_delivery_excludes_coordinate_only_context() {
     }
     assert!(result.delivered_ranges().is_empty(), "coordinates do not deliver source bytes");
     assert!(result.delivered_evidence().is_some(), "the completed search remains new query evidence");
+}
+#[test]
+fn verified10_script_normalization_deduplicates_and_preserves_fitting_fragments() {
+    let canonical = CanonicalToolResult::text("x".repeat(1_200_000));
+    let selector = ToolOutputSelector::Bytes { start: 0, end: 80_000 };
+    let (result, _) = select_file_snapshot_for_script(&canonical, Some(vec![selector; 10])).unwrap();
+    assert!(result.complete);
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(result.results[0].text.as_ref().unwrap().len(), 80_000);
+    let selectors = vec![
+        ToolOutputSelector::Bytes { start: 0, end: 600_000 },
+        ToolOutputSelector::Bytes { start: 500_000, end: 1_100_000 },
+    ];
+    let (result, _) = select_file_snapshot_for_script(&canonical, Some(selectors.clone())).unwrap();
+    assert_eq!(result.results.len(), 2, "do not merge individually fitting ranges into overflow");
+    assert_eq!(result.results[0].selector, selectors[0]);
+    assert!(result.results[0].complete);
+    for selector in selectors {
+        assert!(select_file_snapshot_for_script(&canonical, Some(vec![selector])).unwrap().0.complete);
+    }
+    let canonical = CanonicalToolResult::text("line\n".repeat(30_000));
+    let selectors = vec![ToolOutputSelector::Lines { start: 1, end: 20_000 },
+        ToolOutputSelector::Lines { start: 10_000, end: 30_000 },
+        ToolOutputSelector::Lines { start: 1, end: 20_000 }];
+    let result = select_file_snapshot_for_script(&canonical, Some(selectors)).unwrap().0;
+    assert!(result.complete);
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(result.delivered_ranges(), vec![(0, canonical.exact_bytes)]);
+}
+
+#[test]
+fn verified10_script_search_fits_remaining_bytes_and_keeps_exact_continuation() {
+    for preceding in [false, true] {
+        let prefix = "x".repeat(if preceding { 700_000 } else { 0 });
+        let source = format!("{prefix}\nneedle{}\nneedle short\n", "y".repeat(1_100_000));
+        let canonical = CanonicalToolResult::text(source);
+        let mut selectors = vec![];
+        if preceding { selectors.push(ToolOutputSelector::Bytes { start: 0, end: prefix.len() as u64 }); }
+        selectors.push(ToolOutputSelector::Search { query:"needle".into(), enclosing:false,
+            case_insensitive:false, start_byte:prefix.len() as u64 + 1, max_results:2, context_lines:0 });
+        let result = select_file_snapshot_for_script(&canonical, Some(selectors)).unwrap().0;
+        let search = result.results.iter().find(|result| result.selector.is_search()).unwrap();
+        assert_eq!(search.status, ToolOutputSelectorStatus::Ok);
+        assert!(!search.complete, "coordinates are not hydrated context");
+        assert_eq!(search.value.as_ref().unwrap()["matches_returned"], 1);
+        assert_eq!(search.value.as_ref().unwrap()["remaining_match_count"], 1);
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 1024 * 1024);
+        let next = select_file_snapshot_for_script(&canonical, Some(vec![search.continuation.clone().unwrap()])).unwrap().0;
+        assert_eq!(next.results[0].value.as_ref().unwrap()["hydrated_ranges"][0]["text"], "needle short\n");
+        assert!(next.complete);
+        if preceding { assert!(result.results.iter().any(|result| result.text.as_deref() == Some(prefix.as_str()))); }
+    }
+    let canonical = CanonicalToolResult::text((0..4).map(|_| format!("needle{}\n", "z".repeat(300_000))).collect::<String>());
+    let search = ToolOutputSelector::Search { query:"needle".into(), enclosing:false,
+        case_insensitive:false, start_byte:0, max_results:4, context_lines:0 };
+    let result = select_file_snapshot_for_script(&canonical, Some(vec![search])).unwrap().0;
+    let value = result.results[0].value.as_ref().unwrap();
+    assert_eq!(value["matches_returned"], 3);
+    assert_eq!(value["remaining_match_count"], 1);
+    assert!(!value["hydrated_ranges"].as_array().unwrap().is_empty());
 }

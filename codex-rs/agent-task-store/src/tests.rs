@@ -2693,7 +2693,7 @@ async fn source_inspection_receipts_bind_kind_without_workspace_tracking() {
     fixture.store.submit_agent_receipt(attempt.attempt_id, draft).await.unwrap();
     let task = fixture.store.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
     assert!(task.completion_evidence_summary().contains(
-        "supported by a complete source inspection (semantic correctness not established; freshness unverified)"
+        "supported by complete source acquisition (semantic inspection and correctness not established; freshness unverified)"
     ));
     let stale_fixture = Fixture::new().await;
     initialize_validation_repository(stale_fixture.repo.path());

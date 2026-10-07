@@ -55,6 +55,7 @@ pub(crate) fn format_inter_agent_completion_message(
     task_name: AgentPath,
     sender: AgentPath,
     status: &AgentStatus,
+    receipt: Option<&str>,
 ) -> Option<String> {
     let payload = match status {
         AgentStatus::Completed(Some(message)) => {
@@ -63,6 +64,7 @@ pub(crate) fn format_inter_agent_completion_message(
                 sender,
                 message,
                 TYPED_COMPLETION_NEXT_ACTION,
+                receipt,
             ));
         }
         AgentStatus::Completed(None) => String::new(),
@@ -75,6 +77,7 @@ pub(crate) fn format_inter_agent_completion_message(
                 sender,
                 message,
                 TYPED_COMPLETION_NEXT_ACTION,
+                receipt,
             ));
         }
         AgentStatus::CompletedWithSurface {
@@ -87,13 +90,14 @@ pub(crate) fn format_inter_agent_completion_message(
                 sender,
                 &format!("Agent errored: {error}"),
                 ERROR_NEXT_ACTION,
+                receipt,
             ));
         }
         AgentStatus::Shutdown => "Agent shut down.".to_string(),
         AgentStatus::NotFound => "Agent was not found.".to_string(),
         AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted => return None,
     };
-    Some(InterAgentCompletionMessage::new(task_name, sender, payload).render())
+    Some(InterAgentCompletionMessage::new(task_name, sender, payload).with_receipt(receipt).render())
 }
 
 fn format_bounded_inter_agent_completion_message(
@@ -101,9 +105,11 @@ fn format_bounded_inter_agent_completion_message(
     sender: AgentPath,
     payload: &str,
     retrieval_guidance: &str,
+    receipt: Option<&str>,
 ) -> String {
     let unabridged =
         InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload.to_string())
+            .with_receipt(receipt)
             .render();
     if approx_token_count(&unabridged) < COMPLETION_MESSAGE_MAX_TOKENS {
         return unabridged;
@@ -112,9 +118,12 @@ fn format_bounded_inter_agent_completion_message(
     let mut payload_budget = ERROR_MAX_TOKENS;
     loop {
         let payload = truncate_text(payload, TruncationPolicy::Tokens(payload_budget));
+        let retrieval_guidance = if receipt.is_some() {
+            "The full sealed receipt remains available at the exact receipt locator above; no automatic retrieval was performed."
+        } else { retrieval_guidance };
         let payload = format!("{payload}\n\n{retrieval_guidance}");
         let message =
-            InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload).render();
+            InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload).with_receipt(receipt).render();
         let message_tokens = approx_token_count(&message);
         if message_tokens < COMPLETION_MESSAGE_MAX_TOKENS || payload_budget == 0 {
             return message;

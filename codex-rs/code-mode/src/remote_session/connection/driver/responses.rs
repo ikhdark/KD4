@@ -185,6 +185,7 @@ impl ConnectionDriver {
             PendingRequest::Wait {
                 session,
                 cell_id,
+                terminal_only,
                 cancellation: _,
                 response_tx,
             } => {
@@ -200,7 +201,21 @@ impl ConnectionDriver {
                             self.fail(reason);
                             return false;
                         }
-                        Ok(public_wait_outcome(session.generation, outcome.into()))
+                        let outcome: codex_code_mode_protocol::WaitOutcome = outcome.into();
+                        if terminal_only {
+                            if matches!(&outcome, codex_code_mode_protocol::WaitOutcome::LiveCell(
+                                codex_code_mode_protocol::RuntimeResponse::Yielded { .. }
+                                | codex_code_mode_protocol::RuntimeResponse::ExplicitYield { .. }
+                            )) {
+                                let reason = "receipt recovery returned a live cell across the generation fence".to_string();
+                                let _ = response_tx.send(Err(reason.clone()));
+                                self.fail(reason);
+                                return false;
+                            }
+                            Ok(outcome)
+                        } else {
+                            Ok(public_wait_outcome(session.generation, outcome))
+                        }
                     }
                     Ok(_) => {
                         let reason = "code-mode host returned an invalid cell response".to_string();

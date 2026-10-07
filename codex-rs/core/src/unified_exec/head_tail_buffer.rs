@@ -1,6 +1,14 @@
 use crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use std::collections::VecDeque;
 
+/// Absolute byte coordinates in the process-owned cumulative output artifact.
+/// Notices inserted for display are not counted as producer bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutputChunkRanges {
+    pub(crate) range: std::ops::Range<u64>,
+    pub(crate) gap: Option<std::ops::Range<u64>>,
+}
+
 pub(super) fn omitted_output_marker(omitted_bytes: usize) -> Vec<u8> {
     format!(
         "\n[output truncated: {omitted_bytes} byte(s) omitted from the middle by the output retention limit]\n"
@@ -15,6 +23,10 @@ pub(super) fn omitted_output_marker(omitted_bytes: usize) -> Vec<u8> {
 #[derive(Debug)]
 pub(crate) struct HeadTailBuffer {
     pending_report: Option<Box<HeadTailBuffer>>,
+    /// At most three incomplete UTF-8 bytes, carried between acknowledged
+    /// observations. Raw producer artifacts are independent of this projection.
+    utf8_tail: Vec<u8>,
+    start_offset: Option<u64>,
     max_bytes: usize,
     head_budget: usize,
     tail_budget: usize,
@@ -42,6 +54,8 @@ impl HeadTailBuffer {
         let tail_budget = max_bytes.saturating_sub(head_budget);
         Self {
             pending_report: None,
+            utf8_tail: Vec::new(),
+            start_offset: Some(0),
             max_bytes,
             head_budget,
             tail_budget,
@@ -76,6 +90,10 @@ impl HeadTailBuffer {
     }
 
     pub(crate) fn record_lagged_chunks(&mut self, skipped: u64) {
+        if skipped > 0 {
+            // A chunk count does not establish the missing byte count.
+            self.start_offset = None;
+        }
         self.lagged_chunks = self.lagged_chunks.saturating_add(skipped);
         self.unreported_lagged_chunks = self.unreported_lagged_chunks.saturating_add(skipped);
     }
@@ -115,8 +133,14 @@ impl HeadTailBuffer {
         self.push_to_tail(&chunk[head_len..]);
     }
 
+    pub(crate) fn push_display_notice(&mut self, notice: &[u8]) {
+        // These bytes are not present in the cumulative producer artifact.
+        self.start_offset = None;
+        self.push_chunk(notice);
+    }
+
     pub(crate) fn has_unreported_output(&self) -> bool {
-        self.pending_report.is_some() || self.has_uncollected_output()
+        self.pending_report.is_some() || !self.utf8_tail.is_empty() || self.has_uncollected_output()
     }
 
     pub(crate) fn has_uncollected_output(&self) -> bool {
@@ -128,11 +152,18 @@ impl HeadTailBuffer {
     /// Keep the in-flight polling receipt with the producer until preparation
     /// completes. Cancelling a polling future leaves this evidence recoverable.
     pub(crate) fn begin_output_report(&mut self) {
-        self.pending_report
-            .get_or_insert_with(|| Box::new(Self::default()));
+        if self.pending_report.is_none() {
+            let mut report = Self {
+                start_offset: self.start_offset.and_then(|start| start.checked_sub(self.utf8_tail.len() as u64)),
+                ..Self::default()
+            };
+            report.push_chunk(&std::mem::take(&mut self.utf8_tail));
+            self.pending_report = Some(Box::new(report));
+        }
     }
 
     pub(crate) fn collect_pending_output(&mut self) -> bool {
+        self.begin_output_report();
         let mut report = self
             .pending_report
             .take()
@@ -147,7 +178,52 @@ impl HeadTailBuffer {
     }
 
     pub(crate) fn acknowledge_pending_output(&mut self) {
-        self.pending_report = None;
+        if let Some(report) = self.pending_report.take() {
+            self.utf8_tail = report.utf8_tail;
+        }
+    }
+
+    pub(crate) fn projected_pending_output(&mut self, closed: bool, suffix: &[u8]) -> (Vec<u8>, Option<OutputChunkRanges>) {
+        let Some(report) = self.pending_report.as_mut() else { return (Vec::new(), None); };
+        let mut output = report.to_bytes_with_loss_notice(suffix);
+        let mut ranges = report.output_ranges();
+        report.utf8_tail.clear();
+        if !closed && suffix.is_empty() {
+            // Validate only the suffix: prior invalid bytes must remain lossy
+            // errors, not cause a genuinely incomplete final character to flush.
+            let mut offset = output.len().saturating_sub(4);
+            while offset < output.len() {
+                match std::str::from_utf8(&output[offset..]) {
+                    Ok(_) => break,
+                    Err(error) => {
+                        offset += error.valid_up_to();
+                        if let Some(length) = error.error_len() {
+                            offset += length;
+                        } else {
+                            report.utf8_tail.extend_from_slice(&output[offset..]);
+                            output.truncate(offset);
+                            if let Some(ranges) = &mut ranges {
+                                ranges.range.end -= report.utf8_tail.len() as u64;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        (output, ranges)
+    }
+
+    pub(crate) fn output_ranges(&self) -> Option<OutputChunkRanges> {
+        let start = self.start_offset?;
+        let end = start.checked_add(self.retained_bytes() as u64)?
+            .checked_add(self.omitted_bytes as u64)?;
+        let gap_start = start.checked_add(self.head.len() as u64)?;
+        Some(OutputChunkRanges {
+            range: start..end,
+            gap: (self.omitted_bytes > 0)
+                .then_some(gap_start..gap_start.checked_add(self.omitted_bytes as u64)?),
+        })
     }
 
     /// Drain into another bounded buffer without turning omission notices into
@@ -155,6 +231,12 @@ impl HeadTailBuffer {
     pub(crate) fn drain_into(&mut self, target: &mut Self) -> bool {
         let omitted = self.take_unreported_omitted_bytes();
         let lagged = self.take_unreported_lagged_chunks();
+        let consumed = (self.retained_bytes() as u64).checked_add(omitted as u64);
+        if self.start_offset.is_none() {
+            target.start_offset = None;
+        }
+        self.start_offset = self.start_offset
+            .and_then(|start| start.checked_add(consumed?));
         let meaningful = omitted > 0
             || lagged > 0
             || self

@@ -385,9 +385,8 @@ mod tests {
         assert!(description.contains("unawaited work is discarded"));
         assert!(description.contains("prefer `text(result.output)`"));
         assert!(description.contains("inspect `result.exit_code`"));
-        assert!(description.contains("Await `Promise.allSettled` for independent known calls"));
-        assert!(description.contains("Reuse current schemas and results"));
-        assert!(description.contains("resolve missing/stale schemas before calls"));
+        assert!(description.contains("`Promise.allSettled` retains independent failures"));
+        assert!(description.contains("resolution retains the full contract"));
         assert!(description.contains("Nested tools: use a present schema"));
         assert!(description.contains("`resolve_tool(name)` to obtain a missing schema"));
         assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
@@ -402,17 +401,10 @@ mod tests {
         assert!(description.contains(
             "Retry only if unstarted, safely repeatable after stopping, or tool-approved"
         ));
-        assert!(description.contains("inspect every result"));
-        assert!(
-            description
-                .contains("Check prerequisites before dependents")
-        );
         assert!(description.contains("buffers output while awaited work continues"));
         assert!(description.contains("same awaited evaluation"));
         assert!(description.contains("only for a new model decision"));
         assert!(!description.contains("Parallelize only when tools permit"));
-        assert!(description.contains("Propagate failures with `&&` or exit-code checks"));
-        assert!(description.contains("never mask them with `|| true`"));
         assert!(!description.contains("never repeat the same call/poll"));
         assert!(!description.contains("never whole files"));
         assert!(description.contains("after truncation, select only missing evidence from the retained artifact"));
@@ -424,10 +416,8 @@ mod tests {
             "Output defaults to {} tokens",
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
         )));
-        assert!(description.contains(&format!(
-            "Nested exec_command/write_stdin display results carry at most {} output tokens",
-            crate::MAX_NESTED_COMMAND_OUTPUT_TOKENS,
-        )));
+        assert!(description.contains("display budgets scale with the cell's remaining output budget"));
+        assert!(description.contains("explicit smaller per-call caps are honored"));
         assert!(!description.contains("the cell budget is separate"));
         assert!(description.contains(&format!(
             r#"first-line `// @exec: {{"max_output_tokens": {}}}`"#,
@@ -559,6 +549,12 @@ mod tests {
     }
 
     fn assert_input_declaration(schema: serde_json::Value, expected: &str) {
+        let recovery = if ["schema projection incomplete:", "patternProperties not projected", "unprojected keyword: not"]
+            .iter().any(|marker| expected.contains(marker)) {
+            format!("\n\nAuthoritative input_schema (TypeScript projection incomplete):\n```json\n{schema}\n```")
+        } else {
+            String::new()
+        };
         let definition = ToolDefinition {
             name: "sample".to_string(),
             tool_name: ToolName::plain("sample"),
@@ -571,7 +567,7 @@ mod tests {
         assert_eq!(
             augment_tool_definition(definition).description.as_ref(),
             format!(
-                "Sample tool.\n\nexec tool declaration:\n```ts\ndeclare const tools: {{ sample(args: {expected}, options?: {{ timeout_ms?: number }}): Promise<unknown>; }};\n```"
+                "Sample tool.{recovery}\n\nexec tool declaration:\n```ts\ndeclare const tools: {{ sample(args: {expected}, options?: {{ timeout_ms?: number }}): Promise<unknown>; }};\n```"
             )
         );
     }
@@ -632,13 +628,13 @@ mod tests {
                 "type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}],
                 "items": false, "minItems": 2
             }),
-            "[string, number /* integer */] /* minItems: 2 */",
+            "[string, (number | bigint) /* integer */] /* minItems: 2 */",
         );
         assert_input_declaration(
             json!({
                 "type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]
             }),
-            "[(string)?, (number /* integer */)?, ...Array<unknown>]",
+            "[(string)?, ((number | bigint) /* integer */)?, ...Array<unknown>]",
         );
         assert_input_declaration(
             json!({
@@ -768,7 +764,7 @@ mod tests {
         for (schema, expected) in [
             (
                 json!({"$defs": {"a b": {"type": "integer"}, "a%20b": {"type": "boolean"}}, "$ref": "#/$defs/a%20b"}),
-                "number /* integer */",
+                "(number | bigint) /* integer */",
             ),
             (
                 json!({"type": "object", "additionalProperties": false}),

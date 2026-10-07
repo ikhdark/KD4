@@ -1321,6 +1321,7 @@ impl SessionState {
             exit_code: None,
             closed: true,
             failure: Some(message),
+            output_gap: None,
             sandbox_denied: false,
         }
     }
@@ -1374,7 +1375,9 @@ fn pending_process_event_bytes(event: &ExecProcessEvent) -> usize {
     match event {
         ExecProcessEvent::Output(chunk) => chunk.chunk.0.len(),
         ExecProcessEvent::Failed(message) => message.len(),
-        ExecProcessEvent::Exited { .. } | ExecProcessEvent::Closed { .. } => 0,
+        ExecProcessEvent::Exited { .. }
+        | ExecProcessEvent::Closed { .. }
+        | ExecProcessEvent::OutputGap { .. } => 0,
     }
 }
 
@@ -3080,6 +3083,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_reads_are_bounded_concurrent_and_isolate_one_failure() {
+        const PROCESS_COUNT: usize = 17;
+        const READ_LIMIT: usize = 8;
+        const READ_DELAY: Duration = Duration::from_millis(20);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (disconnect_tx, disconnect_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first = accept_websocket(&listener).await;
+            complete_websocket_initialize(&mut first, "bounded-replay", None).await;
+            disconnect_rx.await.unwrap();
+            drop(first);
+            let mut resumed = accept_websocket(&listener).await;
+            complete_websocket_session_initialize(
+                &mut resumed,
+                "bounded-replay",
+                Some("bounded-replay"),
+            )
+            .await;
+            let started = tokio::time::Instant::now();
+            let mut seen = std::collections::HashSet::new();
+            let mut batches = Vec::new();
+            while seen.len() < PROCESS_COUNT {
+                let batch_size = READ_LIMIT.min(PROCESS_COUNT - seen.len());
+                let mut batch = Vec::new();
+                for _ in 0..batch_size {
+                    let JSONRPCMessage::Request(request) =
+                        read_jsonrpc_websocket(&mut resumed).await
+                    else {
+                        panic!("expected recovery read");
+                    };
+                    assert_eq!(request.method, EXEC_READ_METHOD);
+                    let params: crate::protocol::ReadParams =
+                        serde_json::from_value(request.params.unwrap()).unwrap();
+                    assert_eq!(params.after_seq, Some(0));
+                    assert_eq!(params.wait_ms, Some(0));
+                    assert!(seen.insert(params.process_id.clone()), "duplicate recovery read");
+                    batch.push((request.id, params.process_id));
+                }
+                // Withhold every response for one simulated network round trip.
+                // Serial recovery cannot fill the batch; unbounded recovery sends
+                // a ninth request before any of these reads have completed.
+                assert!(
+                    timeout(READ_DELAY, read_jsonrpc_websocket(&mut resumed))
+                        .await
+                        .is_err(),
+                    "recovery exceeded its in-flight read bound"
+                );
+                batches.push(batch_size);
+                // Reply in reverse order to exercise independent sequencing.
+                for (id, process_id) in batch.into_iter().rev() {
+                    let bad = process_id.as_str() == "process-0";
+                    let lost_output = process_id.as_str() == "process-1";
+                    write_jsonrpc_websocket(
+                        &mut resumed,
+                        JSONRPCMessage::Response(JSONRPCResponse {
+                            id,
+                            result: serde_json::json!({
+                                "chunks": if bad { vec![] } else { vec![serde_json::json!({
+                                    "seq": if lost_output { 4 } else { 1 },
+                                    "stream": "stdout",
+                                    "chunk": crate::protocol::ByteChunk::from(
+                                        process_id.as_str().as_bytes().to_vec()
+                                    ),
+                                })] },
+                                "nextSeq": if lost_output { 5 } else { 2 },
+                                "exited": false,
+                                "exitCode": null,
+                                "closed": false,
+                                "failure": bad.then_some("injected process failure"),
+                                "outputGap": lost_output.then(|| serde_json::json!({
+                                    "throughSeq": 3, "exitSeq": null,
+                                })),
+                                "sandboxDenied": false,
+                            }),
+                        }),
+                    )
+                    .await;
+                }
+            }
+            let elapsed = started.elapsed();
+            let mut terminated = false;
+            let mut probed = false;
+            while !terminated || !probed {
+                let JSONRPCMessage::Request(request) =
+                    read_jsonrpc_websocket(&mut resumed).await
+                else {
+                    panic!("expected cleanup or probe");
+                };
+                let result = match request.method.as_str() {
+                    EXEC_TERMINATE_METHOD => {
+                        let params: crate::protocol::TerminateParams =
+                            serde_json::from_value(request.params.unwrap()).unwrap();
+                        assert_eq!(params.process_id.as_str(), "process-0");
+                        assert!(!terminated, "cleanup must not be duplicated");
+                        terminated = true;
+                        serde_json::json!({"running": false})
+                    }
+                    "probe" => {
+                        probed = true;
+                        serde_json::json!({"usable": true})
+                    }
+                    other => panic!("unexpected request (producer must not restart): {other}"),
+                };
+                write_jsonrpc_websocket(
+                    &mut resumed,
+                    JSONRPCMessage::Response(JSONRPCResponse { id: request.id, result }),
+                )
+                .await;
+            }
+            (batches, elapsed)
+        });
+        let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+            websocket_url,
+            connect_timeout: Duration::from_secs(1),
+            initialize_timeout: Duration::from_secs(1),
+        });
+        let client = lazy.get().await.unwrap();
+        let mut sessions = Vec::new();
+        let mut receivers = Vec::new();
+        for index in 0..PROCESS_COUNT {
+            let session = client
+                .register_session(&ProcessId::from(format!("process-{index}")))
+                .await
+                .unwrap();
+            receivers.push(session.subscribe_events());
+            sessions.push(session);
+        }
+        disconnect_tx.send(()).unwrap();
+        for (index, events) in receivers.iter_mut().enumerate() {
+            let event = timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if index == 0 {
+                assert!(matches!(event, ExecProcessEvent::Failed(message)
+                    if message.contains("injected process failure")));
+            } else {
+                let event = if index == 1 {
+                    assert_eq!(event, ExecProcessEvent::OutputGap { through_seq: 3 });
+                    timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap()
+                } else {
+                    event
+                };
+                assert_eq!(event, ExecProcessEvent::Output(ProcessOutputChunk {
+                    seq: if index == 1 { 4 } else { 1 },
+                    stream: ExecOutputStream::Stdout,
+                    chunk: format!("process-{index}").into_bytes().into(),
+                }));
+                assert!(sessions[index].state.recoverable.load(std::sync::atomic::Ordering::Acquire));
+            }
+        }
+        let response: serde_json::Value = timeout(Duration::from_secs(2), client.call("probe", &()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, serde_json::json!({"usable": true}));
+        let (batches, elapsed) = server.await.unwrap();
+        assert_eq!(batches, vec![8, 8, 1]);
+        eprintln!(
+            "recovered {PROCESS_COUNT} processes in {elapsed:?}: {} delayed read waves; serial requires {PROCESS_COUNT} waves (delay {READ_DELAY:?})",
+            batches.len(),
+        );
+    }
+
+    #[tokio::test]
     async fn failed_replay_cleanup_does_not_block_healthy_recovery() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
@@ -3125,6 +3295,7 @@ mod tests {
                             exit_code: None,
                             closed: false,
                             failure: bad.then(|| "lost output".into()),
+                            output_gap: None,
                             sandbox_denied: false,
                         })
                         .unwrap()
@@ -3198,6 +3369,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_reads_independent_processes_before_a_held_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (disconnect, disconnected) = oneshot::channel();
+        let (finish, finished) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first = accept_websocket(&listener).await;
+            complete_websocket_initialize(&mut first, "parallel-replay", None).await;
+            disconnected.await.unwrap();
+            drop(first);
+            let mut resumed = accept_websocket(&listener).await;
+            complete_websocket_session_initialize(&mut resumed, "parallel-replay", Some("parallel-replay")).await;
+            let JSONRPCMessage::Request(first) = read_jsonrpc_websocket(&mut resumed).await else { panic!("first read") };
+            let JSONRPCMessage::Request(second) = timeout(Duration::from_millis(300),
+                read_jsonrpc_websocket(&mut resumed)).await.expect("second process must be inspected before first replies")
+                else { panic!("second read") };
+            for request in [second, first] {
+                assert_eq!(request.method, EXEC_READ_METHOD);
+                write_jsonrpc_websocket(&mut resumed, JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ReadResponse {
+                        chunks: vec![crate::protocol::ProcessOutputChunk {
+                            seq: 1, stream: crate::protocol::ExecOutputStream::Stdout, chunk: b"recovered".to_vec().into(),
+                        }], next_seq: 2, exited: false, exit_code: None, closed: false, failure: None, output_gap: None, sandbox_denied: false,
+                    }).unwrap(),
+                })).await;
+            }
+            finished.await.unwrap();
+        });
+        let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::websocket_url(websocket_url, Duration::from_secs(1)));
+        let client = lazy.get().await.unwrap();
+        let a = client.register_session(&ProcessId::from("a")).await.unwrap();
+        let b = client.register_session(&ProcessId::from("b")).await.unwrap();
+        let mut a_events = a.subscribe_events();
+        let mut b_events = b.subscribe_events();
+        disconnect.send(()).unwrap();
+        for events in [&mut a_events, &mut b_events] {
+            assert!(matches!(timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap(),
+                ExecProcessEvent::Output(chunk) if chunk.seq == 1 && chunk.chunk.0 == b"recovered"));
+        }
+        finish.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_process_start_cleanup_does_not_block_other_process_recovery() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
@@ -3242,6 +3458,7 @@ mod tests {
                         exit_code: None,
                         closed: false,
                         failure: None,
+                        output_gap: None,
                         sandbox_denied: false,
                     })
                     .unwrap(),
@@ -3415,6 +3632,7 @@ mod tests {
                         exit_code: None,
                         closed: false,
                         failure: None,
+                        output_gap: None,
                         sandbox_denied: false,
                     })
                     .expect("read response should serialize"),

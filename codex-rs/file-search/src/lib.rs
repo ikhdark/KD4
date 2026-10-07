@@ -766,10 +766,26 @@ fn matcher_worker(
                     let snapshot = nucleo.snapshot();
                     let limit = inner.limit.min(snapshot.matched_item_count() as usize);
                     let pattern = snapshot.pattern().column_pattern(0);
-                    let matches: Vec<_> = snapshot
+                    // Select within the retained matcher snapshot, not the
+                    // filesystem walk. Nucleo's insertion-index tie breaker
+                    // must not determine membership at the cutoff.
+                    let mut ranked = snapshot
                         .matches()
                         .iter()
-                        .take(limit)
+                        .filter_map(|matched| {
+                            let item = snapshot.get_item(matched.idx)?;
+                            Some((matched, item.matcher_columns[0].slice(..).len(), item.data.full_path.as_ref()))
+                        })
+                        .collect::<Vec<_>>();
+                    let rank = |a: &(&nucleo::Match, usize, &str), b: &(&nucleo::Match, usize, &str)| {
+                        b.0.score.cmp(&a.0.score).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2))
+                    };
+                    if limit < ranked.len() {
+                        ranked.select_nth_unstable_by(limit, rank);
+                        ranked.truncate(limit);
+                    }
+                    ranked.sort_unstable_by(rank);
+                    let matches: Vec<_> = ranked.into_iter().map(|(matched, _, _)| matched)
                         .filter_map(|match_| {
                             let item = snapshot.get_item(match_.idx)?;
                             let full_path = item.data.full_path.as_ref();
@@ -912,6 +928,25 @@ mod tests {
         ];
 
         assert_eq!(matches, expected);
+    }
+
+    #[test]
+    fn cutoff_ties_ignore_creation_order_and_root_order() {
+        let home = tempfile::tempdir().unwrap();
+        let roots = [home.path().join("a"), home.path().join("b")];
+        for root in &roots { fs::create_dir(root).unwrap(); }
+        for (root, reverse) in roots.iter().zip([false, true]) {
+            let mut names = (0..12).map(|i| format!("same{i:02}.txt")).collect::<Vec<_>>();
+            if reverse { names.reverse(); }
+            for name in names { fs::write(root.join(name), "").unwrap(); }
+        }
+        let search = |roots| run("same", roots, FileSearchOptions {
+            limit: std::num::NonZero::new(5).unwrap(),
+            ..Default::default()
+        }, None).unwrap().matches.into_iter().map(|m| m.full_path()).collect::<Vec<_>>();
+        let first = search(roots.to_vec());
+        assert_eq!(first, search(roots.into_iter().rev().collect()));
+        assert_eq!(first.len(), 5);
     }
 
     #[test]

@@ -172,7 +172,7 @@ async fn handle_spawn_agent(
         && legacy_parent_assignment_id.is_none()
     {
         return Err(FunctionCallError::RespondToModel(
-            "spawn_agent: this turn is in explicit-request-only mode and the user did not explicitly authorize spawning agents"
+            "spawn_agent: spawning is not authorized for this turn. Explicit-request-only permission is checked per turn; an earlier turn's authorization is not carried forward."
                 .to_string(),
         ));
     }

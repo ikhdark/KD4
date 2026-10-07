@@ -19,6 +19,25 @@ use crate::session_runtime::OutputItem;
 
 struct TestHost;
 
+#[tokio::test]
+async fn closing_actor_serves_terminal_event_before_host_cleanup() {
+    let state = Arc::new(CellState::new(CancellationToken::new()));
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let handle = CellHandle::new(command_tx, state.clone());
+    let event = CellEvent::Completed {
+        content_items: vec![OutputItem::Text { text: "retained".into() }],
+        error_text: None, output_loss: None,
+    };
+    assert_eq!(state.commit_completion(event.clone(), None, || {}), CompletionCommit::Committed);
+    let (tx, rx) = oneshot::channel();
+    assert!(matches!(state.deliver_completion(Some(tx)), CompletionDelivery::Delivered));
+    assert_eq!(rx.await.unwrap().unwrap(), event);
+    state.tombstone();
+    drop(command_rx);
+    // No host.closed/mark_closed handoff has happened yet.
+    assert_eq!(handle.observe(ObserveMode::Decision).await.unwrap(), event);
+}
+
 #[derive(Default)]
 struct RecordingHost {
     notified: AtomicBool,
@@ -130,7 +149,7 @@ async fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
             state_path: None,
             tool_call_id: "call-1".to_string(),
             enabled_tools: Vec::new().into(),
-            source: "await new Promise(() => {});".to_string(),
+            source: "await new Promise(resolve => setTimeout(resolve, 600_000));".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
             default_tool_timeout_ms: None,
@@ -370,6 +389,46 @@ async fn decision_observer_buffers_output_until_success_or_failure() {
         harness.task.await.unwrap();
         tokio::time::resume();
     }
+}
+
+#[tokio::test]
+async fn decision_idle_bound_resets_on_output_and_nested_completion() {
+    let mut harness = spawn_cell_actor_harness(ObserveMode::Decision).await;
+    tokio::time::pause();
+    harness.event_tx.send(RuntimeEvent::Started).unwrap();
+    tokio::task::yield_now().await;
+    for event in [
+        RuntimeEvent::ContentItem {
+            item: FunctionCallOutputContentItem::InputText { text: "progress".to_string() },
+            admitted_bytes: 0,
+        },
+        RuntimeEvent::Notify { id: None, call_id: "notify".to_string(), text: "progress".to_string() },
+        RuntimeEvent::ToolCall {
+            id: "tool".to_string(),
+            name: codex_protocol::ToolName::plain("test"),
+            kind: codex_code_mode_protocol::CodeModeToolKind::Function,
+            input: None,
+            timeout_ms: 60_000,
+        },
+    ] {
+        tokio::time::advance(DECISION_IDLE_TIMEOUT - Duration::from_secs(3)).await;
+        harness.event_tx.send(event).unwrap();
+        // Drain the runtime event and the nested callback's completion.
+        for _ in 0..5 { tokio::task::yield_now().await; }
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(harness.initial_event_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    }
+    tokio::time::advance(DECISION_IDLE_TIMEOUT).await;
+    let event = harness.initial_event_rx.await.unwrap().unwrap();
+    assert!(matches!(event, CellEvent::Yielded { content_items }
+        if matches!(content_items.last(), Some(OutputItem::Text { text }) if text.contains("idle for 10 minutes"))));
+    // An idle yield is not cancellation, and the original cell can still finish.
+    harness.event_tx.send(RuntimeEvent::Result {
+        stored_value_writes: HashMap::new(), error_text: None, output_loss: None,
+    }).unwrap();
+    assert!(matches!(harness.handle.observe(ObserveMode::Decision).await, Ok(CellEvent::Completed { .. })));
+    harness.task.await.unwrap();
 }
 
 #[tokio::test]

@@ -203,8 +203,28 @@ impl From<ExecCommandStatus> for CommandExecutionStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
+pub struct CommandExecutionOutputMetadata {
+    /// Process termination and output drain are independent observations.
+    pub process_exited: bool,
+    pub output_drained: bool,
+    pub aggregated_output_is_exact: bool,
+    pub streams_are_exact: bool,
+    pub decoding_lossy: bool,
+    pub display_reduced: bool,
+    /// Conservative owner-classified search miss; the raw exit code remains 1.
+    pub search_no_match: bool,
+    /// Harness/observation failure, not a program exit status or stderr bytes.
+    pub failure_cause: Option<String>,
+    /// Existing retained-output locator, when available at delivery time.
+    pub raw_output_artifact_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct CommandExecutionItem {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output_metadata: Option<CommandExecutionOutputMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub process_id: Option<String>,

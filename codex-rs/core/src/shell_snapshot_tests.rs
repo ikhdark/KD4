@@ -91,6 +91,7 @@ impl ExecProcess for DelayedSnapshotProcess {
             Ok(ReadResponse {
                 chunks: Vec::new(),
                 next_seq: 1,
+                output_gap: None,
                 exited: true,
                 exit_code: Some(0),
                 closed: true,
@@ -227,6 +228,7 @@ async fn remote_snapshot_build_terminates_failed_capture_before_returning() -> R
                                 Vec::new()
                             },
                             next_seq: 1,
+                            output_gap: None,
                             exited: false,
                             exit_code: None,
                             closed: false,
@@ -598,7 +600,13 @@ async fn write_rollout_stub(codex_home: &Path, session_id: ThreadId) -> Result<P
         .join("01");
     fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("rollout-2025-01-01T00-00-00-{session_id}.jsonl"));
-    fs::write(&path, "").await?;
+    let metadata = codex_protocol::protocol::SessionMeta {
+        id: session_id, session_id: session_id.into(),
+        ..Default::default()
+    };
+    fs::write(&path, serde_json::json!({
+        "timestamp": "2025-01-01T00:00:00Z", "type": "session_meta", "payload": metadata
+    }).to_string()).await?;
     Ok(path)
 }
 

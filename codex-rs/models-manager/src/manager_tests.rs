@@ -33,6 +33,35 @@ mod model_info_overrides_tests;
 const DEFAULT_HTTP_CLIENT_FACTORY: HttpClientFactory =
     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
 
+#[test]
+fn catalog_permutations_preserve_defaults_and_quarantine_duplicate_slugs() {
+    let a = remote_model("stable-a", "A", 1);
+    let b = remote_model("stable-b", "B", 1);
+    let conflicting = remote_model("stable-b", "Conflicting B", 1);
+    for catalog in [vec![b.clone(), a.clone(), a.clone()], vec![a.clone(), b.clone(), a.clone()]] {
+        // A cache round trip must use the same normalization as a fresh catalog.
+        let cached = serde_json::from_value(serde_json::to_value(&catalog).unwrap()).unwrap();
+        for models in [catalog, cached] {
+            for auth in [false, true] {
+                let projected = build_available_models_for_auth(models.clone(), auth);
+                assert_eq!(projected.len(), 2);
+                assert_eq!(default_model_from_available(projected.clone()).unwrap(), "stable-a");
+                assert_eq!(*AvailableModelPresets::new(&models).for_auth(auth), projected);
+            }
+        }
+    }
+    for models in [
+        vec![a.clone(), b.clone(), conflicting.clone()],
+        vec![conflicting, b, a.clone()],
+    ] {
+        assert_eq!(normalize_model_catalog(models.clone()), vec![a.clone()]);
+        for auth in [false, true] {
+            assert_eq!(build_available_models_for_auth(models.clone(), auth).len(), 1);
+        }
+        assert!(find_model_by_longest_prefix("stable-b", &models).is_none());
+    }
+}
+
 fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
     remote_model_with_visibility(slug, display, priority, "list")
 }
@@ -1619,7 +1648,9 @@ async fn refresh_available_models_preserves_explicit_remote_sol_6() {
             .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
             .await
             .expect("remote picker models");
-        assert_eq!(manager.get_remote_models().await, remote_models);
+        let mut expected = remote_models;
+        expected.sort_by(|a, b| a.slug.cmp(&b.slug));
+        assert_eq!(manager.get_remote_models().await, expected);
         let entries: Vec<_> = models
             .iter()
             .filter(|model| model.model == "gpt-6-sol")
@@ -1746,7 +1777,8 @@ async fn refresh_available_models_preserves_bundled_catalog_for_empty_chatgpt_re
     let codex_home = tempdir().expect("temp dir");
     let endpoint = TestModelsEndpoint::new(vec![Vec::new()]);
     let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
-    let expected = load_bundled_models().expect("bundled models should parse");
+    let mut expected = load_bundled_models().expect("bundled models should parse");
+    expected.sort_by(|a, b| a.slug.cmp(&b.slug));
 
     manager
         .refresh_available_models(
@@ -1772,6 +1804,7 @@ async fn refresh_available_models_merges_hidden_only_chatgpt_remote_with_bundled
     let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
     let mut expected = load_bundled_models().expect("bundled models should parse");
     expected.push(hidden_remote);
+    expected.sort_by(|a, b| a.slug.cmp(&b.slug));
 
     manager
         .refresh_available_models(
@@ -1809,6 +1842,7 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
     );
     let mut expected = load_bundled_models().expect("bundled models should parse");
     expected.extend(remote_models);
+    expected.sort_by(|a, b| a.slug.cmp(&b.slug));
 
     manager
         .refresh_available_models(

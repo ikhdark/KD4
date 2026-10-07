@@ -144,9 +144,9 @@ fn assert_instruction_replacement_once(
     assert_eq!(instruction_fragments(&requests[0]), vec![initial.clone()]);
     assert_eq!(
         instruction_fragments(&requests[1]),
-        vec![initial.clone(), replacement.clone()]
+        vec![replacement.clone()]
     );
-    assert_eq!(instruction_fragments(&requests[2]), vec![initial, replacement]);
+    assert_eq!(instruction_fragments(&requests[2]), vec![replacement]);
 }
 
 fn assert_single_fresh_instruction_fragment_contains(
@@ -741,7 +741,7 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
     assert_eq!(fragments, vec![expected_fragment.clone()]);
     assert_eq!(
         instruction_fragments(&requests[1]),
-        vec![expected_fragment, replacement_fragment]
+        vec![replacement_fragment]
     );
     let rendered = fragments
         .into_iter()
@@ -868,7 +868,7 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
         .resume(&server, Arc::clone(&home), rollout_path)
         .await?;
 
-    // Resume retains the historical prefix and appends one explicit revocation.
+    // Resume removes the revoked repository slot from the model projection.
     assert_eq!(
         resumed.codex.instruction_sources().await,
         Vec::<PathUri>::new(),
@@ -881,15 +881,9 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
     let initial = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
-    let removal = expected_provider_only_instruction_fragment(
-        "The previously provided AGENTS.md instructions no longer apply.",
-    );
     assert_eq!(instruction_fragments(&requests[0]), vec![initial.clone()]);
-    assert_eq!(
-        instruction_fragments(&requests[1]),
-        vec![initial.clone(), removal.clone()]
-    );
-    assert_eq!(instruction_fragments(&requests[2]), vec![initial, removal]);
+    assert!(instruction_fragments(&requests[1]).is_empty());
+    assert!(instruction_fragments(&requests[2]).is_empty());
 
     Ok(())
 }

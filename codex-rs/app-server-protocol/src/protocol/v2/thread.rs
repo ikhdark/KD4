@@ -1312,6 +1312,13 @@ pub enum ThreadStatus {
 pub enum ThreadActiveFlag {
     WaitingOnApproval,
     WaitingOnUserInput,
+    ResolvingResources,
+    WaitingOnDiffTracker,
+    WaitingOnWorkspaceGate,
+    WaitingOnEvidenceTracker,
+    WaitingOnDelivery,
+    WaitingOnProcessCleanup,
+    ReadyToSample,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

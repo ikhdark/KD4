@@ -4,6 +4,7 @@ use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use futures::StreamExt;
 
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -49,6 +50,9 @@ impl SessionState {
     }
 
     fn recover_events(&self, response: ReadResponse) -> Result<bool, ExecServerError> {
+        if response.output_gap.is_some() && response.failure.is_none() {
+            return self.recover_output_gap(response);
+        }
         let ReadResponse {
             chunks,
             next_seq,
@@ -56,6 +60,7 @@ impl SessionState {
             exit_code,
             closed,
             failure,
+            output_gap: _,
             sandbox_denied,
         } = response;
         if let Some(message) = failure {
@@ -235,6 +240,84 @@ impl SessionState {
 
         self.note_change(target_seq);
         Ok(published_closed)
+    }
+
+    fn recover_output_gap(&self, response: ReadResponse) -> Result<bool, ExecServerError> {
+        let gap = response.output_gap.as_ref().expect("checked output gap");
+        let target = response.next_seq.saturating_sub(1);
+        if gap.through_seq > target
+            || response.exited != gap.exit_seq.is_some()
+            || gap.exit_seq.is_some_and(|seq| seq > target || response.exit_code.is_none())
+            || response.chunks.windows(2).any(|pair| pair[0].seq >= pair[1].seq)
+            || response.chunks.iter().any(|chunk| {
+                chunk.seq > target || Some(chunk.seq) == gap.exit_seq
+                    || (response.closed && chunk.seq == target)
+            })
+        {
+            return Err(recovery_gap_error(target));
+        }
+        let mut ordered = self.ordered_events.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ordered.failure.is_some() || ordered.closed_published {
+            return Ok(false);
+        }
+        // Merge the bounded retained suffix with notifications already received.
+        // Exit position is authoritative: never infer it from an output hole.
+        let mut recovered = std::collections::BTreeMap::new();
+        for chunk in response.chunks {
+            recovered.insert(chunk.seq, ExecProcessEvent::Output(chunk));
+        }
+        if let Some(seq) = gap.exit_seq {
+            recovered.insert(seq, ExecProcessEvent::Exited {
+                seq,
+                exit_code: response.exit_code.expect("validated exit code"),
+                sandbox_denied: (response.sandbox_denied || response.closed)
+                    .then_some(response.sandbox_denied),
+            });
+        }
+        if response.closed {
+            recovered.insert(target, ExecProcessEvent::Closed {
+                seq: target,
+                sandbox_denied: Some(response.sandbox_denied),
+            });
+        }
+        for (seq, event) in ordered.pending.range(..=target) {
+            recovered.entry(*seq).or_insert_with(|| event.clone());
+        }
+        let mut cursor = ordered.last_published_seq;
+        // Validate all holes before publishing anything. Only server-declared
+        // output eviction can advance the cursor without an event.
+        for seq in recovered.keys().copied().filter(|seq| *seq > cursor).collect::<Vec<_>>() {
+            if seq > cursor.saturating_add(1) && seq - 1 > gap.through_seq {
+                return Err(recovery_gap_error(target));
+            }
+            cursor = seq;
+        }
+        if cursor < target && target > gap.through_seq {
+            return Err(recovery_gap_error(target));
+        }
+        ordered.pending.retain(|seq, _| *seq > target);
+        ordered.pending_bytes = ordered.pending.values()
+            .map(super::pending_process_event_bytes).sum();
+        let mut closed = false;
+        for (seq, event) in recovered {
+            if seq <= ordered.last_published_seq {
+                continue;
+            }
+            if seq > ordered.last_published_seq.saturating_add(1) {
+                self.events.publish(ExecProcessEvent::OutputGap { through_seq: seq - 1 });
+                ordered.last_published_seq = seq - 1;
+            }
+            ordered.insert_pending(event).map_err(ExecServerError::Protocol)?;
+            closed |= self.publish_ready(&mut ordered);
+        }
+        if ordered.last_published_seq < target {
+            self.events.publish(ExecProcessEvent::OutputGap { through_seq: target });
+            ordered.last_published_seq = target;
+        }
+        drop(ordered);
+        self.note_change(target);
+        Ok(closed)
     }
 }
 
@@ -505,30 +588,41 @@ impl Inner {
         self: &Arc<Self>,
         rpc_client: &RpcClient,
     ) -> Result<(), ExecServerError> {
-        let sessions = self.sessions.load_full();
-        for (process_id, session) in sessions.iter() {
-            if !session.recoverable.load(Ordering::Acquire) {
-                continue;
-            }
-            let response = rpc_client
-                .call::<_, ReadResponse>(
-                    EXEC_READ_METHOD,
-                    &ReadParams {
-                        process_id: process_id.clone(),
-                        after_seq: Some(session.last_published_seq()),
-                        max_bytes: None,
-                        wait_ms: Some(0),
-                    },
-                )
-                .await
-                .map_err(ExecServerError::from);
+        // Each read owns its process identity and state. Do not carry a borrowed
+        // map iterator through the spawned recovery future's suspension points.
+        let sessions = self
+            .sessions
+            .load_full()
+            .iter()
+            .filter(|(_, session)| session.recoverable.load(Ordering::Acquire))
+            .map(|(process_id, session)| (process_id.clone(), Arc::clone(session)))
+            .collect::<Vec<_>>();
+        let reads = futures::stream::iter(sessions)
+            .map(|(process_id, session)| async move {
+                let response = rpc_client
+                    .call::<_, ReadResponse>(
+                        EXEC_READ_METHOD,
+                        &ReadParams {
+                            process_id: process_id.clone(),
+                            after_seq: Some(session.last_published_seq()),
+                            max_bytes: None,
+                            wait_ms: Some(0),
+                        },
+                    )
+                    .await
+                    .map_err(ExecServerError::from);
+                (process_id, session, response)
+            })
+            .buffer_unordered(8);
+        tokio::pin!(reads);
+        while let Some((process_id, session, response)) = reads.next().await {
             let recovered = match response {
                 Ok(response) => session.recover_events(response),
                 Err(error) if is_transport_closed_error(&error) => return Err(error),
                 Err(error) => Err(error),
             };
             match recovered {
-                Ok(true) => self.remove_session_if(process_id, session),
+                Ok(true) => self.remove_session_if(&process_id, &session),
                 Ok(false) => {}
                 Err(error) => {
                     // Publish the process-local failure now. Retain its identity until
@@ -539,8 +633,6 @@ impl Inner {
                         inner: Arc::clone(self),
                         recovery_policy: RecoveryPolicy::Wait,
                     };
-                    let process_id = process_id.clone();
-                    let session = Arc::clone(session);
                     tokio::spawn(async move {
                         super::cleanup_process_start(&client, &process_id, &session).await;
                     });

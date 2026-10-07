@@ -91,6 +91,12 @@ function Invoke-ParseRequest {
     $commandOutputVariables = @{}
 
     foreach ($statement in $ast.EndBlock.Statements) {
+        # Exit-code propagation is process-local control flow, not a write.
+        # Inspect the complete AST extent; no arbitrary condition or body is
+        # discarded just because it starts with "if" or "exit".
+        if (Test-NativeExitGuard $statement) {
+            continue
+        }
         if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst]) {
             if ($statement.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
                 return @{ id = $RequestId; status = 'unsupported' }
@@ -105,11 +111,25 @@ function Invoke-ParseRequest {
                 continue
             }
 
+            if (Test-PureLocalStatement $statement) {
+                $localConstants.Clear()
+                $commandOutputVariables.Clear()
+                continue
+            }
+
             $commands = $null
             break
         }
 
         if (Test-IsBareCommandOutputRead $statement $commandOutputVariables) {
+            continue
+        }
+
+        if (Test-PureLocalStatement $statement) {
+            # Loops may overwrite an earlier literal binding. Do not use a
+            # pre-loop value as proof of later command arguments.
+            $localConstants.Clear()
+            $commandOutputVariables.Clear()
             continue
         }
 
@@ -181,6 +201,106 @@ function Invoke-ParseRequest {
         powershell_version = $powershellVersion
         resolved_application = $resolvedApplication
     }
+}
+
+function Test-NativeExitGuard {
+    param($statement)
+    return (
+        $statement -is [System.Management.Automation.Language.IfStatementAst] -and
+        $statement.Extent.Text -match '^if\s*\(\s*\$LASTEXITCODE\s+-ne\s+0\s*\)\s*\{\s*exit\s+(?:\$LASTEXITCODE|[0-9]+)\s*;?\s*\}\s*$'
+    )
+}
+
+# Value-only ASTs may be emitted, indexed or assigned to local variables.
+# Calls, method invocation, static members, casts, redirections, scoped writes
+# and executable subexpressions are deliberately not represented here.
+function Test-PureLocalExpression {
+    param($expression)
+    if ($expression -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+        return $expression.Type.TypeName.FullName -eq 'pscustomobject' -and
+            (Test-PureLocalExpression $expression.Child)
+    }
+    if ($expression -is [System.Management.Automation.Language.HashtableAst]) {
+        foreach ($pair in $expression.KeyValuePairs) {
+            if (-not (Test-PureLocalExpression $pair.Item1) -or
+                -not (Test-PureLocalStatement $pair.Item2)) { return $false }
+        }
+        return $true
+    }
+    if ($expression -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) {
+        if (-not $expression.Static -or
+            $expression.Expression -isnot [System.Management.Automation.Language.TypeExpressionAst] -or
+            $expression.Expression.TypeName.FullName -ne 'math' -or
+            $expression.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or
+            $expression.Member.Value -ne 'Round') { return $false }
+        foreach ($argument in $expression.Arguments) {
+            if (-not (Test-PureLocalExpression $argument)) { return $false }
+        }
+        return $true
+    }
+    if ($expression -is [System.Management.Automation.Language.VariableExpressionAst]) {
+        return -not $expression.Splatted -and $expression.VariablePath.IsUnscopedVariable
+    }
+    if ($expression -is [System.Management.Automation.Language.ConstantExpressionAst] -or
+        $expression -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        return $true
+    }
+    if ($expression -is [System.Management.Automation.Language.IndexExpressionAst]) {
+        return (Test-PureLocalExpression $expression.Target) -and (Test-PureLocalExpression $expression.Index)
+    }
+    if ($expression -is [System.Management.Automation.Language.BinaryExpressionAst]) {
+        return (Test-PureLocalExpression $expression.Left) -and (Test-PureLocalExpression $expression.Right)
+    }
+    if ($expression -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+        foreach ($element in $expression.Elements) {
+            if (-not (Test-PureLocalExpression $element)) { return $false }
+        }
+        return $true
+    }
+    if ($expression -is [System.Management.Automation.Language.ArrayExpressionAst]) {
+        return Test-PureLocalBlock $expression.SubExpression
+    }
+    if ($expression -is [System.Management.Automation.Language.ParenExpressionAst]) {
+        return Test-PureLocalStatement $expression.Pipeline
+    }
+    if ($expression -is [System.Management.Automation.Language.MemberExpressionAst] -and
+        $expression -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        -not $expression.Static) {
+        return (Test-PureLocalExpression $expression.Expression) -and
+            ($expression.Member -is [System.Management.Automation.Language.StringConstantExpressionAst])
+    }
+    return $false
+}
+
+function Test-PureLocalBlock {
+    param($block)
+    if ($block.Traps.Count -gt 0) { return $false }
+    foreach ($statement in $block.Statements) {
+        if (-not (Test-PureLocalStatement $statement)) { return $false }
+    }
+    return $true
+}
+
+function Test-PureLocalStatement {
+    param($statement)
+    if ($statement -is [System.Management.Automation.Language.PipelineAst]) {
+        return $statement.PipelineElements.Count -eq 1 -and
+            (Test-PureLocalStatement $statement.PipelineElements[0])
+    }
+    if ($statement -is [System.Management.Automation.Language.CommandExpressionAst]) {
+        return $statement.Redirections.Count -eq 0 -and
+            (Test-PureLocalExpression $statement.Expression)
+    }
+    if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+        return $statement.Operator -eq [System.Management.Automation.Language.TokenKind]::Equals -and
+            $statement.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+            (Test-PureLocalExpression $statement.Left) -and (Test-PureLocalStatement $statement.Right)
+    }
+    if ($statement -is [System.Management.Automation.Language.ForEachStatementAst]) {
+        return (Test-PureLocalExpression $statement.Variable) -and
+            (Test-PureLocalStatement $statement.Condition) -and (Test-PureLocalBlock $statement.Body)
+    }
+    return $false
 }
 
 function Write-Response {
@@ -526,6 +646,16 @@ function Convert-PipelineElement {
 
         $parts = [System.Collections.ArrayList]::new()
         foreach ($commandElement in $element.CommandElements) {
+            if ($commandElement -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
+                $element.GetCommandName() -in @('Where-Object', 'where', '?', 'ForEach-Object', '%')) {
+                $block = $commandElement.ScriptBlock
+                if ($block.ParamBlock -ne $null -or $block.BeginBlock -ne $null -or
+                    $block.ProcessBlock -ne $null -or $block.DynamicParamBlock -ne $null -or
+                    $block.UsingStatements.Count -gt 0 -or
+                    ($block.PSObject.Properties['CleanBlock'] -ne $null -and $block.CleanBlock -ne $null) -or
+                    -not (Test-PureLocalBlock $block.EndBlock)) { return $null }
+                continue
+            }
             $converted = Convert-CommandElement $commandElement $localConstants
             if ($converted -eq $null) {
                 return $null
@@ -559,6 +689,11 @@ function Convert-PipelineElement {
             if ($innerPipeline -and $innerPipeline.PipelineElements.Count -eq 1) {
                 return Convert-PipelineElement $innerPipeline.PipelineElements[0] $localConstants
             }
+        }
+
+        if (Test-PureLocalExpression $element.Expression) {
+            # A value expression emits data but invokes no command.
+            return @('Write-Output')
         }
 
         return $null

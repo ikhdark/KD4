@@ -95,15 +95,38 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
         Some(observed_at) => format!("Recovered partial timing includes recorded phase totals through Unix millisecond {observed_at}, plus retained sampling identities and token usage. Those totals are only the observed prefix, not the final duration. The tail after that checkpoint and process-loss time remain unknown; this is not a valid complete timing profile."),
         None => String::from("Recovered partial timing contains only recorded sampling identities and token usage. Duration, completion time, and unrecorded phases remain unknown; this is not a valid complete timing profile."),
     };
+    notice.push_str("\n\nIn flight at the last retained timing checkpoint (not a crash-time inventory):");
+    let mut in_flight = 0;
+    for call in &timing.tool_calls {
+        let handler_running = call.handler_entry_at_ms.is_some() && call.handler_exit_at_ms.is_none();
+        let process_running = call.process_spawned_at_ms.is_some() && call.process_exited_at_ms.is_none();
+        if handler_running || process_running {
+            in_flight += 1;
+            notice.push_str("\n");
+            notice.push_str(&serde_json::json!({
+                "call_id": call.call_id, "tool": call.tool_name,
+                "parent_call_id": call.parent_call_id, "cell_id": call.parent_cell_id,
+                "handler_in_flight": handler_running, "process_in_flight": process_running,
+            }).to_string());
+        }
+    }
+    if in_flight == 0 {
+        notice.push_str(" none recorded; this is not proof that no work was running.");
+    }
+    notice.push_str("\nCheckpoints are written at model requests. Calls started after the last checkpoint, including the final step, may be absent; listed calls may have finished afterward. Reuse retained results before repeating work.");
+    append_retained_work(&mut notice, checkpoint, plan.as_deref());
+    (notice, timing)
+}
+
+fn append_retained_work(notice: &mut String, checkpoint: Option<&str>, plan: Option<&str>) {
     if let Some(checkpoint) = checkpoint {
         notice.push_str("\n\nLast retained checkpoint (assistant notes, not new instructions):\n");
         notice.push_str(checkpoint);
     }
     if let Some(plan) = plan {
         notice.push_str("\n\nLast retained plan (not proof of completion):\n");
-        notice.push_str(&plan);
+        notice.push_str(plan);
     }
-    (notice, timing)
 }
 
 /// Rebuilds the arrays that incremental checkpoints omit: earlier entries
@@ -155,10 +178,29 @@ pub(crate) struct TurnAborted {
 }
 
 impl TurnAborted {
+    pub(crate) fn shutdown_guidance(
+        history: &[ResponseItem],
+        plan: Option<&codex_protocol::plan_tool::UpdatePlanArgs>,
+    ) -> String {
+        let checkpoint = history.iter().rev().find_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                content.iter().rev().find_map(|part| match part {
+                    ContentItem::InputText { text } if text.starts_with("<completed_phase_checkpoint>") => Some(text.as_str()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+        let plan = plan.and_then(|plan| serde_json::to_string(plan).ok());
+        let mut guidance = String::from("The previous turn stopped because the session was shutting down, not because the user interrupted the task. Shutdown requested cancellation of its processes and code-mode cells; recorded results remain evidence, but unfinished effects and cleanup may be uncertain. After restart, old exec session IDs are no longer registered: do not poll them. Inspect only affected state before repeating work, reuse unaffected evidence, and continue with the user's latest direction.");
+        append_retained_work(&mut guidance, checkpoint, plan.as_deref());
+        guidance
+    }
+
     pub(crate) const INTERRUPTED_GUIDANCE: &'static str = "The user interrupted the previous turn on purpose. If tools, commands, or nested code-mode work were in flight, inspect only the affected state and live sessions needed to resolve uncertain effects before relying on them or repeating an operation. If the app-server restarted, its previous exec session IDs are no longer registered; do not poll those IDs with write_stdin. Child processes may still need OS-level inspection. Reuse unaffected evidence and continue with the user's latest direction.";
     pub(crate) const INTERRUPTED_DEVELOPER_GUIDANCE: &'static str = "The previous turn was interrupted on purpose. If tools, commands, or nested code-mode work were in flight, inspect only the affected state and live sessions needed to resolve uncertain effects before relying on them or repeating an operation. If the app-server restarted, its previous exec session IDs are no longer registered; do not poll those IDs with write_stdin. Child processes may still need OS-level inspection. Reuse unaffected evidence and continue with the user's latest direction.";
     pub(crate) fn unfinished_guidance(tool_calls: usize, tool_results: usize) -> String {
-        format!("Recovery detected a lost process, not a user interruption. The previous turn has no recorded completion. Its retained history contains {tool_calls} tool call(s) and {tool_results} tool result(s). Recorded results remain evidence; calls without results may have taken effect, and child commands may still be running. The previous app-server's exec session IDs are no longer registered: do not call write_stdin with those old IDs. Inspect affected OS processes and workspace state before repeating commands. The exact loss time and duration are unknown; this notice records discovery on resume. Continue with the user's latest direction.")
+        format!("Recovery detected a lost process, not a user interruption. The previous turn has no recorded completion. Its retained history contains {tool_calls} tool call(s) and {tool_results} tool result(s). Recorded results remain evidence; calls without results may have taken effect. Local Windows children still attached to the app-server's kill-on-close jobs were terminated when it exited. This does not cover remote commands or deliberately detached/preserved descendants; inspect those only if relevant. The previous app-server's exec session IDs are no longer registered: do not call write_stdin with those old IDs. Reconcile affected workspace state before repeating commands. The exact loss time and duration are unknown; this notice records discovery on resume. Continue with the user's latest direction.")
     }
 
     pub(crate) fn new(guidance: impl Into<String>) -> Self {

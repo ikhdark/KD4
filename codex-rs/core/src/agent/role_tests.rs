@@ -332,6 +332,77 @@ async fn apply_role_preserves_unspecified_keys() {
 }
 
 #[tokio::test]
+async fn apply_role_preserves_runtime_instructions_unless_explicitly_replaced() {
+    let persisted_home = TempDir::new().expect("create persisted instruction directory");
+    let persisted_base = persisted_home.path().join("base.md");
+    fs::write(&persisted_base, "persisted file base").expect("write persisted instructions");
+    let cases = [
+        ("model_reasoning_effort = 'high'", false, false),
+        ("developer_instructions = 'role developer'", false, true),
+        ("instructions = 'role base'", true, false),
+        ("model_instructions_file = 'role-base.md'", true, false),
+        (
+            "model_instructions_file = 'role-base.md'\ndeveloper_instructions = 'role developer'",
+            true,
+            true,
+        ),
+    ];
+    for inherited in [Some("API instruction sentinel"), None, Some("")] {
+        for (contents, replaces_base, replaces_developer) in cases {
+            let (home, mut config) = test_config_with_cli_overrides(vec![
+                (
+                    "model_instructions_file".to_string(),
+                    TomlValue::String(persisted_base.to_string_lossy().into_owned()),
+                ),
+                (
+                    "instructions".to_string(),
+                    TomlValue::String("persisted base".to_string()),
+                ),
+                (
+                    "developer_instructions".to_string(),
+                    TomlValue::String("persisted developer".to_string()),
+                ),
+            ])
+            .await;
+            config.base_instructions = inherited.map(str::to_string);
+            config.developer_instructions = inherited.map(str::to_string);
+            write_role_config(&home, "role-base.md", "role base").await;
+            let role_path = write_role_config(&home, "custom.toml", contents).await;
+            config.agent_roles.insert(
+                "custom".to_string(),
+                AgentRoleConfig {
+                    config_file: Some(role_path),
+                    ..Default::default()
+                },
+            );
+
+            apply_role_to_config(&mut config, Some("custom"))
+                .await
+                .expect("custom role should apply");
+
+            assert_eq!(
+                config.base_instructions.as_deref(),
+                if replaces_base {
+                    Some("role base")
+                } else {
+                    inherited
+                },
+                "base instructions for {contents}, inherited {inherited:?}"
+            );
+            assert_eq!(
+                config.developer_instructions.as_deref(),
+                if replaces_developer {
+                    Some("role developer")
+                } else {
+                    inherited
+                },
+                "developer instructions for {contents}, inherited {inherited:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn apply_role_reports_explicit_service_tier() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let role_path = write_role_config(

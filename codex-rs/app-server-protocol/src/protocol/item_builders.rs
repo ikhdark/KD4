@@ -68,6 +68,9 @@ pub fn build_file_change_end_item(payload: &PatchApplyEndEvent) -> ThreadItem {
 pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> ThreadItem {
     let command_actions = command_actions_for_path_uri(&payload.parsed_cmd, &payload.cwd);
     ThreadItem::CommandExecution {
+        output_metadata: None,
+        stdout: None,
+        stderr: None,
         id: payload.call_id.clone(),
         command: command_display_string(&payload.command),
         cwd: payload.cwd.clone().into(),
@@ -95,6 +98,9 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
     let command_actions = command_actions_for_path_uri(&payload.parsed_cmd, &payload.cwd);
 
     ThreadItem::CommandExecution {
+        output_metadata: payload.output_metadata.clone(),
+        stdout: Some(payload.stdout.clone()),
+        stderr: Some(payload.stderr.clone()),
         id: payload.call_id.clone(),
         command: command_display_string(&payload.command),
         cwd: payload.cwd.clone().into(),
@@ -107,7 +113,7 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
         status: (&payload.status).into(),
         command_actions,
         aggregated_output,
-        exit_code: Some(payload.exit_code),
+        exit_code: payload.exit_code,
         duration_ms: Some(duration_ms),
     }
 }

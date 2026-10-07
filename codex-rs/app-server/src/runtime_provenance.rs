@@ -31,6 +31,11 @@ pub(crate) fn write_desktop_runtime_receipt(
         .ok_or_else(|| io::Error::other("could not hash the running executable"))?
         .to_string();
     let build_info = BuildInfo::current();
+    // This owner runs after readiness. Hash bytes rather than interpreting path
+    // equality as evidence that the running build is the published build.
+    let published = expected_local_binary_path();
+    let (published_executable_sha256, published_build_match, expected_codex_home, codex_home_match) =
+        published_identity(published.as_ref(), &executable_sha256, codex_home);
     let receipt = DesktopRuntimeReceipt {
         schema_version: 1,
         pid: std::process::id(),
@@ -43,11 +48,28 @@ pub(crate) fn write_desktop_runtime_receipt(
         build_dirty: build_info.dirty.to_string(),
         build_profile: build_info.profile.to_string(),
         build_built: build_info.built.to_string(),
+        published_executable_sha256,
+        published_build_match,
+        expected_codex_home,
+        codex_home_match,
     };
     let contents = serde_json::to_string_pretty(&receipt).map_err(io::Error::other)?;
     let receipt_path = codex_home.join(DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH);
     codex_file_system::write_atomically(&receipt_path, &contents)?;
     Ok(Some(receipt_path))
+}
+
+fn published_identity(
+    published: Option<&AbsolutePathBuf>, running_sha256: &str, codex_home: &Path,
+) -> (Option<String>, Option<bool>, Option<PathBuf>, Option<bool>) {
+    let hash = published.and_then(|path| codex_utils_build_info::file_sha256(path.as_path()).ok());
+    let build_match = hash.as_ref().map(|hash| hash == running_sha256);
+    let home = published.and_then(|path| path.as_path().parent())
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "bin"))
+        .and_then(Path::parent).map(Path::to_path_buf);
+    let home_match = home.as_ref()
+        .map(|expected| path_utils::paths_match_after_normalization(codex_home, expected));
+    (hash, build_match, home, home_match)
 }
 
 pub(crate) fn current() -> ServerRuntimeInfo {
@@ -244,6 +266,25 @@ mod tests {
         assert_eq!(install_method_label(&InstallMethod::Pnpm), "pnpm");
         assert_eq!(standalone_install_method_label(true), "standalone-windows");
         assert_eq!(standalone_install_method_label(false), "standalone-unix");
+    }
+
+    #[test]
+    fn publication_identity_checks_bytes_and_home_independently() {
+        let dir = TempDir::new().unwrap();
+        let binary = absolute_temp_path(&dir, "bin/codex.exe");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"running-build").unwrap();
+        let running_hash = codex_utils_build_info::file_sha256(binary.as_path()).unwrap();
+        let same = published_identity(Some(&binary), &running_hash, dir.path());
+        assert_eq!(same.1, Some(true));
+        assert_eq!(same.3, Some(true));
+        std::fs::write(&binary, b"replacement-build-at-identical-path").unwrap();
+        let changed = published_identity(Some(&binary), &running_hash, &dir.path().join("other-home"));
+        assert_eq!(changed.1, Some(false));
+        assert_eq!(changed.3, Some(false));
+        std::fs::remove_file(binary.as_path()).unwrap();
+        assert_eq!(published_identity(Some(&binary), &running_hash, dir.path()).1, None);
+        assert_eq!(published_identity(None, &running_hash, dir.path()), (None, None, None, None));
     }
 
     #[test]

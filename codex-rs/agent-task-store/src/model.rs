@@ -412,46 +412,46 @@ impl Assignment {
         match self.role {
             AgentRole::Architect => {
                 if self.read_scope.is_empty() {
-                    return invalid("architects require a non-empty architecture scope");
+                    return invalid("architects require a non-empty read_scope");
                 }
                 if !self.required_evidence.is_empty() {
-                    return invalid("architects cannot require focused validation proofs");
+                    return invalid("architects require an empty required_evidence");
                 }
             }
             AgentRole::Explorer => {
                 if self.read_scope.is_empty() {
-                    return invalid("explorers require a non-empty primary investigation scope");
+                    return invalid("explorers require a non-empty read_scope");
                 }
                 if !self.required_evidence.is_empty() {
-                    return invalid("explorers cannot require focused validation proofs");
+                    return invalid("explorers require an empty required_evidence");
                 }
             }
             AgentRole::Worker => {
                 if self.write_scope.is_empty() {
-                    return invalid("workers require a non-empty owned write scope");
+                    return invalid("workers require a non-empty write_scope");
                 }
                 if self.admission_origin == AssignmentAdmissionOrigin::Typed
                     && self.required_evidence.is_empty()
                 {
-                    return invalid("workers require at least one proof obligation");
+                    return invalid("workers require at least one proof obligation in required_evidence");
                 }
             }
             AgentRole::Reviewer => {
                 if !self.required_evidence.is_empty() {
                     return invalid(
-                        "reviewers report diff/findings/gate evidence and cannot own focused proof obligations",
+                        "reviewers report diff/findings/gate evidence and require an empty required_evidence",
                     );
                 }
             }
             AgentRole::Verifier => {
                 if self.required_evidence.is_empty() {
-                    return invalid("verifiers require at least one focused proof obligation");
+                    return invalid("verifiers require at least one focused proof obligation in required_evidence");
                 }
             }
             AgentRole::Integrator => {
                 if self.required_evidence.is_empty() {
                     return invalid(
-                        "integrators require at least one integration proof obligation",
+                        "integrators require at least one integration proof obligation in required_evidence",
                     );
                 }
             }
@@ -852,7 +852,8 @@ pub enum CriterionEvidenceKind {
     /// A successful recorded execution; does not imply a test or runtime boundary passed.
     ValidationExecution,
     /// The native file reader delivered a complete, hash-bound source snapshot
-    /// without establishing semantic correctness or current workspace freshness.
+    /// without establishing semantic inspection, correctness, or freshness.
+    /// The persisted variant name is retained for compatibility.
     SourceInspection,
 }
 
@@ -1191,7 +1192,7 @@ impl AgentTask {
                         CriterionEvidenceKind::ValidationExecution =>
                             "supported by a successful validation execution (test coverage not established; freshness unverified)",
                         CriterionEvidenceKind::SourceInspection =>
-                            "supported by a complete source inspection (semantic correctness not established; freshness unverified)",
+                            "supported by complete source acquisition (semantic inspection and correctness not established; freshness unverified)",
                     }
                 }
                 (CriterionStatus::Passed, None) => "reported complete; behavior unverified",

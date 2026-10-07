@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use codex_api::SharedAuthProvider;
@@ -72,6 +74,7 @@ pub(crate) enum StreamableHttpClientAdapterError {
     UnexpectedHttpStatus {
         status: StatusCode,
         body_preview: String,
+        retry_after: Option<Duration>,
     },
     #[error("invalid HTTP header: {0}")]
     Header(String),
@@ -209,7 +212,29 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             } else {
                 NON_JSON_RESPONSE_BODY_PREVIEW_BYTES
             };
-            let (body, truncated) = collect_body_prefix(&mut body_stream, limit).await?;
+            // Diagnostics must not hold a known retryable failure hostage to EOF.
+            // The enclosing operation deadline still bounds this optional preview.
+            let preview_result = if parse_error {
+                collect_body_prefix(&mut body_stream, limit).await
+            } else {
+                match tokio::time::timeout(
+                    Duration::from_millis(25),
+                    collect_body_prefix(&mut body_stream, limit),
+                ).await {
+                    Ok(result) => result,
+                    Err(_) => return Err(unexpected_http_status_error(
+                        response.status, "error body preview timed out".into(),
+                        retry_after(&response.headers, SystemTime::now()),
+                    )),
+                }
+            };
+            let (body, truncated) = match preview_result {
+                Ok(result) => result,
+                Err(error) => return Err(unexpected_http_status_error(
+                    response.status, format!("error body preview unavailable: {error}"),
+                    retry_after(&response.headers, SystemTime::now()),
+                )),
+            };
             if parse_error
                 && !truncated
                 && let Some(message) = parse_json_rpc_error(&body)
@@ -225,7 +250,9 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                     "... (HTTP error body exceeds {limit}-byte collection limit)"
                 );
             }
-            return Err(unexpected_http_status_error(response.status, preview));
+            return Err(unexpected_http_status_error(
+                response.status, preview, retry_after(&response.headers, SystemTime::now()),
+            ));
         }
         match content_type.as_deref() {
             Some(content_type) if has_media_type(content_type, EVENT_STREAM_MIME_TYPE) => {
@@ -304,6 +331,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             return Err(unexpected_http_status_error(
                 response.status,
                 "DELETE request failed".to_string(),
+                retry_after(&response.headers, SystemTime::now()),
             ));
         }
         Ok(())
@@ -380,6 +408,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             return Err(unexpected_http_status_error(
                 response.status,
                 "GET request failed".to_string(),
+                retry_after(&response.headers, SystemTime::now()),
             ));
         }
 
@@ -565,15 +594,27 @@ pub(crate) fn is_retryable_http_status(status: StatusCode) -> bool {
     )
 }
 
+fn retry_after(headers: &[HttpHeader], now: SystemTime) -> Option<Duration> {
+    let value = response_header(headers, "retry-after")?;
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse::<u64>().ok().map(Duration::from_secs);
+    }
+    httpdate::parse_http_date(value).ok()
+        .map(|date| date.duration_since(now).unwrap_or_default())
+}
+
 fn unexpected_http_status_error(
     status: u16,
     body_preview: String,
+    retry_after: Option<Duration>,
 ) -> StreamableHttpError<StreamableHttpClientAdapterError> {
     match StatusCode::from_u16(status) {
         Ok(status) => {
             StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
                 status,
                 body_preview,
+                retry_after,
             })
         }
         Err(_) => StreamableHttpError::UnexpectedServerResponse(
@@ -643,6 +684,45 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::routing::any;
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for (value, expected) in [
+            (" 3 ".to_string(), Some(Duration::from_secs(3))),
+            (httpdate::fmt_http_date(now + Duration::from_secs(7)), Some(Duration::from_secs(7))),
+            (httpdate::fmt_http_date(now - Duration::from_secs(7)), Some(Duration::ZERO)),
+            ("-1".to_string(), None),
+            ("not a date".to_string(), None),
+        ] {
+            assert_eq!(retry_after(&[HttpHeader { name: "Retry-After".into(), value }], now), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_error_body_preserves_retryable_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/", any(|| async {
+            (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "2")],
+                Body::from_stream(stream::pending::<Result<Bytes, io::Error>>()))
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let adapter = StreamableHttpClientAdapter::new(
+            Arc::new(codex_exec_server::ReqwestHttpClient), HeaderMap::new(), None,
+        );
+        let result = tokio::time::timeout(Duration::from_millis(500), adapter.post_message(
+            format!("http://{address}/").into(),
+            serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap(),
+            None, None, HashMap::new(),
+        )).await.expect("optional diagnostics must not wait for EOF");
+        server.abort();
+        assert!(matches!(result, Err(StreamableHttpError::Client(
+            StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+                status: StatusCode::SERVICE_UNAVAILABLE, retry_after: Some(delay), ..
+            }
+        )) if delay == Duration::from_secs(2)));
+    }
 
     #[tokio::test]
     async fn transport_bounds_errors_and_preserves_large_successes() {

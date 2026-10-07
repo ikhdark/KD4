@@ -870,10 +870,15 @@ impl AgentControl {
                 else {
                     return;
                 };
+                let receipt = watched_binding.as_ref().map(|binding| format!(
+                    "Receipt: get_agent_task({{\"assignment_id\":\"{}\"}})\nProducer attempt: {}",
+                    binding.assignment_id, binding.attempt_id,
+                ));
                 let Some(message) = format_inter_agent_completion_message(
                     parent_agent_path.clone(),
                     child_agent_path.clone(),
                     &status,
+                    receipt.as_deref(),
                 ) else {
                     return;
                 };

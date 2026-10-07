@@ -36,6 +36,8 @@ export type Usage = {
 export type TurnCompletedEvent = {
   type: "turn.completed";
   usage: Usage;
+  /** Owner-supplied timing, absent on legacy producers or null when unavailable. */
+  timing?: Record<string, unknown> | null;
   /** Authoritative tool result delivered without a final assistant message. */
   surfaced_result?: {
     adapter: string;
@@ -49,7 +51,32 @@ export type TurnCompletedEvent = {
 export type TurnFailedEvent = {
   type: "turn.failed";
   error: ThreadError;
+  disposition?: "failed" | "interrupted" | "transport_lost";
+  usage?: Usage | null;
+  timing?: Record<string, unknown> | null;
 };
+
+/** Bounded incremental evidence; item.completed remains authoritative. */
+export type ItemProgressEvent = {
+  type: "item.progress";
+  item_id: string;
+  call_id: string;
+} & (
+  | {
+      kind: "command_output";
+      delta: string;
+      stream: "stdout" | "stderr" | null;
+      decoding_lossy: boolean | null;
+      truncated: boolean;
+    }
+  | {
+      kind: "mcp";
+      message: string;
+      progress: number | null;
+      total: number | null;
+      truncated: boolean;
+    }
+);
 
 /** Emitted when a new item is added to the thread. Typically the item is initially "in progress". */
 export type ItemStartedEvent = {
@@ -88,5 +115,6 @@ export type ThreadEvent =
   | TurnFailedEvent
   | ItemStartedEvent
   | ItemUpdatedEvent
+  | ItemProgressEvent
   | ItemCompletedEvent
   | ThreadErrorEvent;

@@ -775,6 +775,10 @@ mod tests {
         std::fs::write(&executable_path, b"test codex binary").expect("write test binary");
         let build = BuildInfo::current();
         DesktopRuntimeReceipt {
+            published_executable_sha256: None,
+            published_build_match: None,
+            expected_codex_home: None,
+            codex_home_match: None,
             schema_version: 1,
             pid,
             executable_sha256: file_sha256(&executable_path).expect("hash test binary"),

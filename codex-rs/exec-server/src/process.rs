@@ -30,6 +30,8 @@ pub struct StartedExecProcess {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecProcessEvent {
     Output(ProcessOutputChunk),
+    /// Missing output only; does not imply exit, closure, or process failure.
+    OutputGap { through_seq: u64 },
     Exited {
         seq: u64,
         exit_code: i32,
@@ -77,6 +79,7 @@ impl ExecProcessEvent {
             ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq, .. } => {
                 Some(*seq)
             }
+            ExecProcessEvent::OutputGap { through_seq } => Some(*through_seq),
             ExecProcessEvent::Failed(_) => None,
         }
     }
@@ -85,7 +88,9 @@ impl ExecProcessEvent {
         match self {
             ExecProcessEvent::Output(chunk) => chunk.chunk.0.len(),
             ExecProcessEvent::Failed(message) => message.len(),
-            ExecProcessEvent::Exited { .. } | ExecProcessEvent::Closed { .. } => 0,
+            ExecProcessEvent::Exited { .. }
+            | ExecProcessEvent::Closed { .. }
+            | ExecProcessEvent::OutputGap { .. } => 0,
         }
     }
 }

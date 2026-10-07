@@ -25,19 +25,19 @@ impl ToolOutputSchema {
 
     /// Materialize the schema for consumers that traverse JSON values.
     pub fn to_value(&self) -> Value {
-        match &self.0 {
+        crate::json_schema::canonical_schema(match &self.0 {
             OutputSchemaStorage::Json(schema) => schema.as_ref().clone(),
             OutputSchemaStorage::McpCallToolResult(structured_content) => {
                 mcp_call_tool_result_output_schema(Value::Object(
                     structured_content.as_deref().cloned().unwrap_or_default(),
                 ))
             }
-        }
+        })
     }
 
     /// Consume the schema, reusing uniquely owned JSON and cloning shared storage.
     pub fn into_value(self) -> Value {
-        match self.0 {
+        crate::json_schema::canonical_schema(match self.0 {
             OutputSchemaStorage::Json(schema) => Arc::unwrap_or_clone(schema),
             OutputSchemaStorage::McpCallToolResult(structured_content) => {
                 mcp_call_tool_result_output_schema(Value::Object(
@@ -46,13 +46,13 @@ impl ToolOutputSchema {
                         .unwrap_or_default(),
                 ))
             }
-        }
+        })
     }
 }
 
 impl From<Value> for ToolOutputSchema {
     fn from(value: Value) -> Self {
-        Self(OutputSchemaStorage::Json(Arc::new(value)))
+        Self(OutputSchemaStorage::Json(Arc::new(crate::json_schema::canonical_schema(value))))
     }
 }
 

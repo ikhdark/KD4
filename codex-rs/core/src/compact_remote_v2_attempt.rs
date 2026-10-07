@@ -22,7 +22,7 @@ use tracing::info;
 
 pub(super) struct RemoteCompactV2Attempt {
     pub(super) trace_input_history: Option<Vec<ResponseItem>>,
-    pub(super) prompt_input: Vec<ResponseItem>,
+    pub(super) retention_input: Vec<ResponseItem>,
     pub(super) compaction_output: ResponseItem,
     pub(super) token_usage: Option<TokenUsage>,
     /// Keeps a session created for standalone compaction alive through lifecycle completion.
@@ -133,13 +133,13 @@ pub(super) async fn run_remote_compact_v2_attempt(
         compaction_output,
         token_usage,
     } = compaction_output_result?;
-    let mut prompt_input = prompt.input.to_vec();
-    let Some(ResponseItem::CompactionTrigger {}) = prompt_input.pop() else {
-        unreachable!("remote compaction v2 prompt must end with its synthetic trigger");
-    };
+    // Sampling projection may split messages and discard their trusted IDs.
+    // Select exact task/skill retention from the same source history instead;
+    // it also excludes the synthetic compaction trigger by construction.
+    let retention_input = history.into_raw_items();
     Ok(RemoteCompactV2Attempt {
         trace_input_history,
-        prompt_input,
+        retention_input,
         compaction_output,
         token_usage,
         owned_client_session,

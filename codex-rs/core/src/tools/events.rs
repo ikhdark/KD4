@@ -43,6 +43,8 @@ pub(crate) struct ToolEventCtx<'a> {
     pub parent_call_id: Option<&'a str>,
     pub parent_cell_id: Option<&'a str>,
     pub runtime_tool_call_id: Option<&'a str>,
+    pub observed_exit_code: Option<Option<i32>>,
+    pub output_metadata: Option<&'a codex_protocol::items::CommandExecutionOutputMetadata>,
 }
 
 impl<'a> ToolEventCtx<'a> {
@@ -60,6 +62,8 @@ impl<'a> ToolEventCtx<'a> {
             parent_call_id: None,
             parent_cell_id: None,
             runtime_tool_call_id: None,
+            observed_exit_code: None,
+            output_metadata: None,
         }
     }
 
@@ -174,6 +178,7 @@ pub(crate) async fn emit_exec_command_begin(
         .emit_turn_item_started(
             ctx.turn,
             &TurnItem::CommandExecution(CommandExecutionItem {
+                output_metadata: None,
                 id: ctx.call_id.to_string(),
                 process_id: process_id.map(str::to_owned),
                 parent_call_id: ctx.parent_call_id.map(str::to_owned),
@@ -660,7 +665,7 @@ struct ExecCommandResult {
     stdout: String,
     stderr: String,
     aggregated_output: String,
-    exit_code: i32,
+    exit_code: Option<i32>,
     duration: Duration,
     formatted_output: String,
     status: ExecCommandStatus,
@@ -687,6 +692,8 @@ async fn emit_exec_stage(
     exec_input: ExecCommandInput<'_>,
     stage: ToolEventStage<'_>,
 ) -> CodexResult<()> {
+    let failed = matches!(&stage, ToolEventStage::Failure(_))
+        || ctx.output_metadata.is_some_and(|metadata| metadata.failure_cause.is_some());
     match stage {
         ToolEventStage::Begin => {
             let native_cwd = exec_input.cwd.to_abs_path().ok();
@@ -726,12 +733,14 @@ async fn emit_exec_stage(
                 stdout: output.stdout.text.clone(),
                 stderr: output.stderr.text.clone(),
                 aggregated_output: output.aggregated_output.text.clone(),
-                exit_code: output.exit_code,
+                exit_code: ctx.observed_exit_code.unwrap_or(Some(output.exit_code)),
                 duration: output.duration,
                 formatted_output: formatted_output.unwrap_or_else(|| {
                     format_exec_output_str(&output, ctx.turn.model_info.truncation_policy.into())
                 }),
-                status: if output.exit_code == 0 {
+                status: if !failed && !output.timed_out
+                    && (ctx.observed_exit_code.unwrap_or(Some(output.exit_code)) == Some(0)
+                        || ctx.output_metadata.is_some_and(|metadata| metadata.search_no_match)) {
                     ExecCommandStatus::Completed
                 } else {
                     ExecCommandStatus::Failed
@@ -746,7 +755,7 @@ async fn emit_exec_stage(
                 stdout: String::new(),
                 stderr: text.clone(),
                 aggregated_output: text.clone(),
-                exit_code: -1,
+                exit_code: None,
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: ExecCommandStatus::Failed,
@@ -760,7 +769,7 @@ async fn emit_exec_stage(
                 stdout: String::new(),
                 stderr: text.clone(),
                 aggregated_output: text.clone(),
-                exit_code: -1,
+                exit_code: None,
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: ExecCommandStatus::Declined,
@@ -869,8 +878,16 @@ async fn emit_exec_end(
             let workspace_changed =
                 observed_workspace_identity_changed(baseline.as_ref(), current.as_ref());
             workspace_unchanged = workspace_changed == Some(false);
+            let changed_paths = baseline.as_ref().and_then(Option::as_ref)
+                .and_then(|before| current.as_ref()?.changed_paths_since(before));
             observed_workspace_identity = current;
-            if matches!(mutation, crate::turn_diff_tracker::CommandMutation::Uncertain) {
+            if let Some(mut paths) = changed_paths.filter(|paths| !paths.is_empty()) {
+                // Include concurrent writes too, without claiming this command
+                // caused them. Retain explicit effects (including ignored files).
+                if let Some(declared) = mutation.paths() { paths.extend(declared.iter().cloned()); }
+                crate::turn_diff_tracker::CommandMutation::KnownMutation { paths: Some(paths) }
+            } else if matches!(mutation, crate::turn_diff_tracker::CommandMutation::Uncertain
+                | crate::turn_diff_tracker::CommandMutation::KnownMutation { paths: None }) {
                 crate::turn_diff_tracker::resolve_uncertain_command_observation(workspace_changed)
             } else {
                 mutation
@@ -948,17 +965,34 @@ async fn emit_exec_end(
         let mut tracker = tracker.lock().await;
         captured_workspace_identity &=
             capture_revision == Some(tracker.current_mutation_revision());
+        let observed_mutation = if workspace_unchanged && captured_workspace_identity {
+            crate::turn_diff_tracker::CommandMutation::ReadOnly
+        } else {
+            mutation.clone()
+        };
+        let tool = match exec_input.source {
+            ExecCommandSource::UnifiedExecStartup => "exec_command",
+            ExecCommandSource::UnifiedExecInteraction => "write_stdin",
+            ExecCommandSource::Agent => "shell",
+            ExecCommandSource::UserShell => "user_shell",
+        };
+        let filesystem = ctx.turn.environments.turn_environments.iter()
+            .find(|environment| environment.environment_id == exec_input.environment_id
+                && !environment.environment.is_remote())
+            .map(|environment| environment.environment.get_filesystem());
+        let observed_mutation = tracker.reconcile_command_mutation(
+            exec_input.environment_id, observed_mutation, filesystem.as_deref(),
+        ).await;
+        tracker.record_command_invalidation_cause(
+            Some(ctx.call_id), tool, exec_input.command, &observed_mutation,
+        );
         tracker.record_exec_command_end_with_mutation_at(
             exec_input.command,
-            exec_result.exit_code,
+            exec_result.exit_code.unwrap_or(-1),
             exec_result.timed_out,
             exec_input.environment_id,
             native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-            if workspace_unchanged && captured_workspace_identity {
-                crate::turn_diff_tracker::CommandMutation::ReadOnly
-            } else {
-                mutation.clone()
-            },
+            observed_mutation,
         );
         Some(tracker.current_mutation_revision())
     } else {
@@ -1019,6 +1053,7 @@ async fn emit_exec_end(
             TurnItem::CommandExecution(CommandExecutionItem {
                 id: ctx.call_id.to_string(),
                 process_id: exec_input.process_id.map(str::to_owned),
+                output_metadata: ctx.output_metadata.cloned(),
                 parent_call_id: ctx.parent_call_id.map(str::to_owned),
                 parent_cell_id: ctx.parent_cell_id.map(str::to_owned),
                 runtime_tool_call_id: ctx.runtime_tool_call_id.map(str::to_owned),
@@ -1033,7 +1068,7 @@ async fn emit_exec_end(
                 stdout: Some(exec_result.stdout),
                 stderr: Some(exec_result.stderr),
                 aggregated_output: Some(exec_result.aggregated_output),
-                exit_code: Some(exec_result.exit_code),
+                exit_code: exec_result.exit_code,
                 duration: Some(exec_result.duration),
                 formatted_output: Some(exec_result.formatted_output),
             }),
@@ -1202,10 +1237,20 @@ async fn emit_patch_end(
                         environment_id.as_deref().unwrap_or_default(),
                         patch_modes,
                     );
+                    if !delta.is_exact() {
+                        guard.record_invalidation_cause(serde_json::json!({
+                            "call_id": ctx.call_id, "tool": "apply_patch",
+                            "mutation_class": "inexact_patch_delta",
+                        }));
+                    }
                     guard.track_delta(environment_id.as_deref().unwrap_or_default(), delta);
                     guard.take_unified_diff_if_changed()
                 }
                 TurnDiffTrackerUpdate::Invalidate => {
+                    guard.record_invalidation_cause(serde_json::json!({
+                        "call_id": ctx.call_id, "tool": "apply_patch",
+                        "mutation_class": "unknown_patch_mutation",
+                    }));
                     guard.record_unknown_mutation();
                     guard.take_unified_diff_if_changed()
                 }
@@ -1959,6 +2004,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_path_writer_with_unchanged_workspace_preserves_mutation_revision() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        initialize_git_repository(&repo);
+        let (session, mut turn, _events) = make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        set_turn_environments(&mut turn, &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, repo.as_path())]);
+        let command = vec!["bash".into(), "-c".into(), "echo report > /tmp/report.txt".into()];
+        assert!(matches!(crate::turn_diff_tracker::command_mutation(&command, Some(&repo)),
+            crate::turn_diff_tracker::CommandMutation::KnownMutation { paths: None }));
+        let emitter = ToolEmitter::shell(command, AbsolutePathBuf::from_absolute_path(&repo).unwrap(),
+            ExecCommandSource::Agent, codex_exec_server::LOCAL_ENVIRONMENT_ID.into());
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        emitter.begin(ToolEventCtx::new(session.as_ref(), turn.as_ref(), "unchanged-writer", Some(&tracker))).await.unwrap();
+        // The command's only effect is outside the repository.
+        std::fs::write(temp.path().join("report.txt"), "report").unwrap();
+        emitter.finish(ToolEventCtx::new(session.as_ref(), turn.as_ref(), "unchanged-writer", Some(&tracker)),
+            Ok(ExecToolCallOutput::default()), None).await.unwrap();
+        assert_eq!(tracker.lock().await.current_mutation_revision(), 0);
+    }
+
+    #[tokio::test]
     async fn duplicate_repository_reads_uncertain_command_reuses_post_command_identity() {
         let temp = tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -2347,12 +2413,11 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            warnings,
-            vec![
-                "The turn diff is unavailable because command effects or workspace changes could not be tracked exactly. Do not claim that no files changed without fresh workspace verification."
-            ]
-        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("The turn diff is unavailable"));
+        assert!(warnings[0].contains("unknown-patch"));
+        assert!(warnings[0].contains("apply_patch"));
+        assert!(warnings[0].contains("unknown_patch_mutation"));
         assert_eq!(
             std::fs::read(dir.path().join("a.txt"))
                 .expect("invalidation preserves the actual file"),
@@ -2519,7 +2584,7 @@ mod tests {
             EventMsg::ExecCommandEnd(event) if !apply_patch => {
                 assert_eq!(event.call_id, "mutation");
                 assert_eq!(event.status, ExecCommandStatus::Completed);
-                assert_eq!(event.exit_code, 0);
+                assert_eq!(event.exit_code, Some(0));
             }
             event => panic!("unexpected legacy completion event: {event:?}"),
         }
@@ -2532,9 +2597,10 @@ mod tests {
             );
         } else {
             let warning = events.next().expect("unknown command diff warning");
-            assert!(matches!(warning.msg, EventMsg::Warning(event)
-                if event.message.contains("The turn diff is unavailable")
-                    && event.message.contains("without fresh workspace verification")));
+            assert!(matches!(&warning.msg, EventMsg::Warning(event)
+                if (event.message.contains("The turn diff is partial")
+                    || event.message.contains("The turn diff is unavailable"))
+                    && event.message.contains("without fresh workspace verification")), "{warning:?}");
             // Published exactly once: the turn-end emission must not repeat it.
             assert_eq!(tracker.lock().await.take_invalidation_warning(), None);
         }

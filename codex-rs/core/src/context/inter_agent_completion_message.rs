@@ -7,6 +7,7 @@ pub(crate) struct InterAgentCompletionMessage {
     task_name: AgentPath,
     sender: AgentPath,
     payload: String,
+    receipt: Option<String>,
 }
 
 impl InterAgentCompletionMessage {
@@ -15,7 +16,13 @@ impl InterAgentCompletionMessage {
             task_name,
             sender,
             payload: payload.into(),
+            receipt: None,
         }
+    }
+
+    pub(crate) fn with_receipt(mut self, receipt: Option<&str>) -> Self {
+        self.receipt = receipt.map(str::to_string);
+        self
     }
 }
 
@@ -34,8 +41,10 @@ impl ContextualUserFragment for InterAgentCompletionMessage {
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Owned(format!(
-            "Message Type: FINAL_ANSWER\nTask name: {}\nSender: {}\nPayload:\n{}",
-            self.task_name, self.sender, self.payload,
+            "Message Type: FINAL_ANSWER\nTask name: {}\nSender: {}\n{}Payload:\n{}",
+            self.task_name, self.sender,
+            self.receipt.as_ref().map(|receipt| format!("{receipt}\n")).unwrap_or_default(),
+            self.payload,
         ))
     }
 }

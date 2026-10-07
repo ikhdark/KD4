@@ -86,6 +86,13 @@ pub(crate) struct DeferredToolActivationState {
     activations: HashMap<codex_tools::ToolName, DeferredToolActivation>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PendingToolContext {
+    pub(crate) items: Vec<ResponseItem>,
+    pub(crate) search_items: Vec<ResponseItem>,
+    activations: Vec<(codex_tools::ToolName, String)>,
+}
+
 #[derive(Clone)]
 pub(crate) struct TurnEnvironment {
     pub(crate) environment_id: String,
@@ -195,7 +202,7 @@ pub struct TurnContext {
     pub(crate) developer_instructions: Option<String>,
     pub(crate) collaboration_mode: CollaborationMode,
     pub(crate) multi_agent_version: MultiAgentVersion,
-    pub(crate) multi_agent_spawn_authorized: AtomicBool,
+    pub(crate) multi_agent_spawn_authorized: super::multi_agents::SpawnAuthorization,
     pub(crate) personality: Option<Personality>,
     pub(crate) approval_policy: Constrained<AskForApproval>,
     pub(crate) permission_profile: PermissionProfile,
@@ -212,7 +219,7 @@ pub struct TurnContext {
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     /// Shared by model variants of this turn; tool dispatch and ordered delivery
     /// access it without entering the synchronous extension type map.
-    pub(crate) pending_post_tool_contexts: Arc<Mutex<HashMap<String, Vec<ResponseItem>>>>,
+    pub(crate) pending_post_tool_contexts: Arc<Mutex<HashMap<String, PendingToolContext>>>,
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
     pub(crate) tool_call_acceptance: Arc<crate::state::ToolCallAcceptanceGate>,
@@ -282,16 +289,50 @@ impl TurnContext {
             .await
             .entry(call_id.to_string())
             .or_default()
+            .items
             .extend(contexts);
+    }
+
+    pub(crate) async fn queue_tool_search_context(
+        &self,
+        call_id: &str,
+        tools: &[codex_tools::ToolName],
+        items: Vec<ResponseItem>,
+    ) {
+        let activations = {
+            let state = self.deferred_tool_activations.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            tools.iter().filter_map(|name| state.capability_revisions.get(name)
+                .map(|revision| (name.clone(), revision.clone()))).collect::<Vec<_>>()
+        };
+        let mut pending = self.pending_post_tool_contexts.lock().await;
+        let context = pending.entry(call_id.into()).or_default();
+        context.activations.extend(activations);
+        context.search_items.extend(items);
+    }
+
+    pub(crate) fn commit_tool_search_activations(&self, context: PendingToolContext) {
+        let mut state = self.deferred_tool_activations.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
+        for (name, revision) in context.activations {
+            if state.capability_revisions.get(&name) != Some(&revision) { continue; }
+            let activation = DeferredToolActivation {
+                root_task_epoch: self.sub_id.clone(), provenance: name.to_string(), capability_revision: revision,
+            };
+            changed |= state.activations.get(&name) != Some(&activation);
+            state.activations.insert(name, activation);
+        }
+        if changed { state.revision = state.revision.saturating_add(1); }
     }
 
     #[cfg(test)]
     pub(crate) async fn take_post_tool_contexts(&self, call_id: &str) -> Vec<ResponseItem> {
-        self.pending_post_tool_contexts
+        let mut context = self.pending_post_tool_contexts
             .lock()
             .await
             .remove(call_id)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        context.items.extend(context.search_items);
+        context.items
     }
 
     pub(crate) fn record_dispatched_tool_name(&self, tool_name: &str) {
@@ -593,9 +634,7 @@ impl TurnContext {
             developer_instructions: self.developer_instructions.clone(),
             collaboration_mode,
             multi_agent_version: self.multi_agent_version,
-            multi_agent_spawn_authorized: AtomicBool::new(
-                self.multi_agent_spawn_authorized.load(Ordering::Relaxed),
-            ),
+            multi_agent_spawn_authorized: self.multi_agent_spawn_authorized.clone(),
             personality: self.personality,
             approval_policy: self.approval_policy.clone(),
             permission_profile: self.permission_profile.clone(),
@@ -957,7 +996,7 @@ impl Session {
             developer_instructions: session_configuration.developer_instructions.clone(),
             collaboration_mode: session_configuration.collaboration_mode.clone(),
             multi_agent_version,
-            multi_agent_spawn_authorized: AtomicBool::new(false),
+            multi_agent_spawn_authorized: Default::default(),
             personality: session_configuration.personality,
             approval_policy: session_configuration.approval_policy.clone(),
             permission_profile: session_configuration.permission_profile(),
@@ -1214,6 +1253,9 @@ impl Session {
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
         }
+        turn_context.turn_timing_state.bind_live_phase_events(
+            turn_context.sub_id.clone(), self.tx_event.clone(),
+        );
         let turn_context = Arc::new(turn_context);
         if turn_context
             .environments

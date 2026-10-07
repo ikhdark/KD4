@@ -70,6 +70,7 @@ impl Handler {
             payload,
             call_id,
             cancellation_token,
+            source,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -163,8 +164,11 @@ impl Handler {
                 _ => parsed_cursor,
             };
             let wait_started = Instant::now();
-            let deadline = explicit_timeout_ms
-                .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64));
+            let deadline = earliest_deadline(
+                explicit_timeout_ms
+                    .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64)),
+                crate::unified_exec::nested_poll_bound(source.nested_deadline()),
+            );
             let mut maintenance_deadline = Some(wait_started + maintenance_interval);
             let mut pending_activity = pending_activity;
             let mut activity_open = true;
@@ -1851,6 +1855,66 @@ mod tests {
         let (combined, _) = drain.finish();
         assert_eq!(combined, first);
         assert_eq!(combined.updated_agents.len(), MAX_WAKE_EVENTS_PER_ROOT - 1);
+    }
+
+    #[tokio::test]
+    async fn nested_deadline_returns_timeout_through_wait_handler() {
+        use crate::session::step_context::StepContext;
+        use crate::tools::context::ToolCallSource;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let step_context = StepContext::for_test(Arc::new(turn));
+        let session = Arc::new(session);
+        for arguments in [json!({}), json!({"timeout_ms": 300_000})] {
+            let payload = ToolPayload::Function { arguments: arguments.to_string() };
+            let invocation = ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: Arc::clone(&step_context),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call_id: "nested-deadline".into(),
+                tool_name: ToolName::plain("wait_agent"),
+                source: ToolCallSource::CodeMode {
+                    cell_id: "deadline-cell".into(), parent_call_id: None,
+                    runtime_tool_call_id: "deadline-wait".into(),
+                    nested_deadline: Some(std::time::Instant::now()),
+                    cancellation_cause: None,
+                },
+                payload: payload.clone(),
+            };
+            let result = tokio::time::timeout(Duration::from_secs(5),
+                Handler::default().handle_call(invocation))
+                .await.expect("nested wait must return, not wait indefinitely")
+                .expect("nested timeout is a normal result")
+                .code_mode_result(&payload);
+            assert_eq!(result["timed_out"], true);
+            assert_eq!(result["message"], "Wait timed out.");
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_deadline_caps_passive_wait_without_throwing() {
+        let (_activity_tx, mut activity_rx) =
+            tokio::sync::watch::channel(InputQueueActivity::Mailbox);
+        let mut activity_open = true;
+        // An exhausted wrapper budget must yield normally even without an
+        // explicit timeout; it must never become an unbounded passive wait.
+        let nested = crate::unified_exec::nested_poll_bound(Some(std::time::Instant::now()));
+        for explicit in [None, Some(Instant::now() + Duration::from_secs(300))] {
+            let deadline = earliest_deadline(explicit, nested);
+            assert_eq!(deadline, nested);
+            let (outcome, _) = wait_for_activity(
+                &mut activity_rx, &mut activity_open, None, deadline, None, None, None,
+            ).await.unwrap();
+            assert_eq!(outcome, WaitOutcome::BoundaryElapsed);
+            let result = WaitAgentResult::from_outcome(
+                WaitOutcome::TimedOut, None, Vec::new(), 0, Vec::new(),
+            );
+            assert!(result.timed_out);
+            assert_eq!(result.message, "Wait timed out.");
+        }
+        assert_eq!(earliest_deadline(None, None), None);
     }
 
     #[tokio::test]

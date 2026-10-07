@@ -306,6 +306,7 @@ impl SandboxedFileSystem {
         options: WalkOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<WalkOutcome> {
+        options.filters.validate()?;
         let sandbox = require_platform_sandbox(sandbox)?;
         validate_native_path(path)?;
         let response = self
@@ -313,13 +314,17 @@ impl SandboxedFileSystem {
                 sandbox,
                 FsHelperRequest::Walk(FsWalkParams {
                     path: path.clone(),
-                    options,
+                    options: options.clone(),
                     sandbox: None,
                 }),
             )
             .await?
             .expect_walk()
             .map_err(map_sandbox_error)?;
+        if !options.filters.is_empty() && response.applied_filters.as_ref() != Some(&options.filters) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "filesystem helper did not apply requested walk filters; update the helper or use an unfiltered audit"));
+        }
         Ok(response)
     }
 

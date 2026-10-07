@@ -6,20 +6,74 @@ use super::parse_tool_input_schema;
 use super::parse_tool_input_schema_without_compaction;
 
 #[test]
-fn compact_schema_byte_count_matches_serialized_utf8_and_escapes() {
+fn schema_guidance_preserves_utf8_and_escapes() {
+    let guidance = format!("{}Use milliseconds, not seconds. 界\n\t\\", "x".repeat(5_500));
     let schema = parse_tool_input_schema(&serde_json::json!({
-        "type": "object", "properties": {
-            "quoted\"field": {"type": "string", "description": "Unicode: 界\n\t\\"}
-        }
-    }))
-    .unwrap();
-    assert_eq!(
-        super::compact_schema_bytes(&schema),
-        Some(serde_json::to_vec(&schema).unwrap().len())
-    );
+        "type": "object", "description": guidance,
+        "properties": {"quoted\"field": {"type": "string", "description": guidance}}
+    })).unwrap();
+    assert_eq!(schema.description.as_ref(), Some(&guidance));
+    assert_eq!(schema.properties.unwrap()["quoted\"field"].description.as_ref(), Some(&guidance));
 }
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
+
+#[test]
+fn ingestion_preserves_schema_contracts_through_rendering() {
+    let guidance = format!("{}Tail restriction: values are milliseconds; never retry mutations blindly.", "guide ".repeat(1000));
+    let input = serde_json::json!({
+        "$schema":"https://json-schema.org/draft/2020-12/schema", "$id":"https://example.test/tool",
+        "type":"object", "description":guidance,
+        "properties": {
+            "when":{"type":"string", "format":"date-time", "default":null, "description":guidance},
+            "url":{"type":"string", "format":"uri", "default":"https://example.test"},
+            "number":{"minimum":2},
+            "array":{"items":{"type":"string"}},
+            "object":{"properties":{"x":{"type":"string"}}},
+            "sibling":{"$ref":"#/$defs/n", "type":"number", "minimum":2},
+            "resource":{"$id":"child", "$ref":"#/$defs/n"}
+        }, "$defs":{"n":{"type":"number"}}
+    });
+    let dynamic = crate::parse_dynamic_tool(&codex_protocol::dynamic_tools::DynamicToolFunctionSpec {
+        name:"contract".into(), description:"contract".into(), input_schema:input.clone(), defer_loading:true,
+    }).unwrap();
+    let mcp = crate::parse_mcp_tool(&rmcp::model::Tool::new("contract", "contract",
+        std::sync::Arc::new(rmcp::model::object(input.clone())))).unwrap();
+    for tool in [dynamic, mcp] {
+        let lowered = serde_json::to_value(tool.input_schema).unwrap();
+        assert_eq!(lowered, input);
+        let rendered = codex_code_mode::render_json_schema_to_typescript(&lowered);
+        assert!(rendered.contains("format: \"date-time\""));
+        assert!(rendered.contains("format: \"uri\""));
+        assert!(rendered.contains("when?: string"));
+        assert!(rendered.contains("default annotation: null; not automatically applied on omission"));
+        assert!(rendered.contains("minimum (numbers only): 2"));
+        assert!(rendered.contains("(number /* minimum: 2 */) & (number)"));
+        assert!(rendered.contains("nested $id resource not projected"));
+        assert!(rendered.contains("Tail restriction:"));
+    }
+}
+
+#[test]
+fn untyped_nested_constraints_preserve_all_instance_types() {
+    for constraint in [
+        serde_json::json!({"minimum":2}), serde_json::json!({"items":{"type":"string"}}),
+        serde_json::json!({"properties":{"x":{"type":"string"}}}),
+    ] {
+        let input = serde_json::json!({"type":"object", "properties":{"value":constraint}});
+        let lowered = serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap();
+        // Identity proves identical acceptance for null, strings, numbers,
+        // arrays and objects without introducing a second schema validator.
+        assert_eq!(lowered, input);
+    }
+    for dialect in ["http://json-schema.org/draft-07/schema#", "https://json-schema.org/draft/2020-12/schema"] {
+        let input = serde_json::json!({"$schema":dialect, "$defs":{"n":{"type":"number"}},
+            "$ref":"#/$defs/n", "type":"number", "minimum":2});
+        let lowered = serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap();
+        assert_eq!(codex_code_mode::render_json_schema_to_typescript(&lowered),
+            codex_code_mode::render_json_schema_to_typescript(&input));
+    }
+}
 
 fn untyped_enum(values: Vec<serde_json::Value>, description: Option<String>) -> JsonSchema {
     JsonSchema {
@@ -200,8 +254,8 @@ fn parse_tool_input_schema_sanitizes_additional_properties_schema() {
         JsonSchema::object(
             BTreeMap::new(),
             /*required*/ None,
-            Some(AdditionalProperties::Schema(Box::new(JsonSchema::object(
-                BTreeMap::from([(
+            Some(AdditionalProperties::Schema(Box::new(JsonSchema {
+                properties: Some(BTreeMap::from([(
                     "value".to_string(),
                     JsonSchema::any_of(
                         vec![
@@ -210,10 +264,10 @@ fn parse_tool_input_schema_sanitizes_additional_properties_schema() {
                         ],
                         /*description*/ None,
                     ),
-                )]),
-                Some(vec!["value".to_string()]),
-                /*additional_properties*/ None,
-            ))))
+                )])),
+                required: Some(vec!["value".to_string()]),
+                ..Default::default()
+            })))
         )
     );
 }
@@ -240,15 +294,14 @@ fn parse_tool_input_schema_infers_object_shape_from_boolean_additional_propertie
 }
 
 #[test]
-fn parse_tool_input_schema_infers_number_from_numeric_keywords() {
+fn parse_tool_input_schema_preserves_untyped_numeric_keywords() {
     // Example schema shape:
     // {
     //   "minimum": 1
     // }
     //
     // Expected normalization behavior:
-    // - Numeric constraint keywords imply a number schema when `type` is
-    //   omitted.
+    // - Numeric constraint keywords do not exclude nonnumeric instances.
     let schema = parse_tool_input_schema(&serde_json::json!({
         "minimum": 1
     }))
@@ -258,21 +311,20 @@ fn parse_tool_input_schema_infers_number_from_numeric_keywords() {
         schema,
         JsonSchema {
             minimum: Some(1.into()),
-            ..JsonSchema::number(/*description*/ None)
+            ..Default::default()
         }
     );
 }
 
 #[test]
-fn parse_tool_input_schema_infers_number_from_multiple_of() {
+fn parse_tool_input_schema_preserves_untyped_multiple_of() {
     // Example schema shape:
     // {
     //   "multipleOf": 5
     // }
     //
     // Expected normalization behavior:
-    // - `multipleOf` follows the same numeric-keyword inference path as
-    //   `minimum` / `maximum`.
+    // - `multipleOf` constrains numbers without excluding other instance types.
     let schema = parse_tool_input_schema(&serde_json::json!({
         "multipleOf": 5
     }))
@@ -282,7 +334,7 @@ fn parse_tool_input_schema_infers_number_from_multiple_of() {
         schema,
         JsonSchema {
             multiple_of: Some(5.into()),
-            ..JsonSchema::number(/*description*/ None)
+            ..Default::default()
         }
     );
 }
@@ -345,11 +397,11 @@ fn parse_tool_input_schema_preserves_untyped_enum_and_const() {
         ),
         (
             serde_json::json!({"format":"date-time"}),
-            serde_json::json!({"type":"string"}),
+            serde_json::json!({"format":"date-time"}),
         ),
         (
             serde_json::json!({"type":"integer","enum":[1,2],"const":3,"allOf":[{"minimum":1}]}),
-            serde_json::json!({"type":"integer","enum":[1,2],"allOf":[{"type":"number","minimum":1},{"enum":[3]}]}),
+            serde_json::json!({"type":"integer","enum":[1,2],"allOf":[{"minimum":1},{"enum":[3]}]}),
         ),
     ] {
         assert_eq!(
@@ -406,11 +458,10 @@ fn parse_tool_input_schema_preserves_nested_empty_schema() {
         JsonSchema::object(
             BTreeMap::from([(
                 "metadata".to_string(),
-                JsonSchema::object(
-                    BTreeMap::from([("extra".to_string(), JsonSchema::default())]),
-                    /*required*/ None,
-                    /*additional_properties*/ None,
-                )
+                JsonSchema {
+                    properties: Some(BTreeMap::from([("extra".to_string(), JsonSchema::default())])),
+                    ..Default::default()
+                }
             )]),
             /*required*/ None,
             /*additional_properties*/ None,
@@ -432,7 +483,7 @@ fn parse_tool_input_schema_rejects_prefix_items_without_type() {
 }
 
 #[test]
-fn parse_tool_input_schema_preserves_boolean_additional_properties_on_inferred_object() {
+fn parse_tool_input_schema_preserves_untyped_boolean_additional_properties() {
     // Example schema shape:
     // {
     //   "type": "object",
@@ -444,8 +495,8 @@ fn parse_tool_input_schema_preserves_boolean_additional_properties_on_inferred_o
     // }
     //
     // Expected normalization behavior:
-    // - The nested `metadata` schema is inferred to be an object because it has
-    //   `additionalProperties`.
+    // - The nested `metadata` schema remains untyped: this constraint applies
+    //   to objects but does not exclude other instance types.
     // - `additionalProperties: true` is preserved rather than rewritten.
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
@@ -462,7 +513,10 @@ fn parse_tool_input_schema_preserves_boolean_additional_properties_on_inferred_o
         JsonSchema::object(
             BTreeMap::from([(
                 "metadata".to_string(),
-                JsonSchema::object(BTreeMap::new(), /*required*/ None, Some(true.into())),
+                JsonSchema {
+                    additional_properties: Some(true.into()),
+                    ..Default::default()
+                },
             )]),
             /*required*/ None,
             /*additional_properties*/ None
@@ -970,61 +1024,19 @@ fn many_string_properties(count: usize) -> serde_json::Map<String, serde_json::V
 }
 
 #[test]
-fn parse_large_tool_input_schema_compacts_descriptions_only_on_default_path() {
+fn parse_large_tool_input_schema_preserves_descriptions_on_both_paths() {
     let input_schema = serde_json::json!({
         "type": "object",
         "description": "x".repeat(5_500),
-        "properties": {
-            "metadata": {
-                "$ref": "#/$defs/metadata"
-            }
-        },
-        "$defs": {
-            "metadata": {
-                "type": "string",
-                "description": "Metadata value"
-            }
-        }
+        "properties": {"metadata": {"$ref": "#/$defs/metadata"}},
+        "$defs": {"metadata": {"type": "string", "description": "Metadata value"}}
     });
-    let schema = parse_tool_input_schema(&input_schema).expect("parse schema");
-
-    assert_eq!(
-        serde_json::to_value(schema).expect("serialize schema"),
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "metadata": {
-                    "$ref": "#/$defs/metadata"
-                }
-            },
-            "$defs": {
-                "metadata": {
-                    "type": "string",
-                    "description": "Metadata value"
-                }
-            }
-        })
-    );
-
-    let schema = parse_tool_input_schema_without_compaction(&input_schema).expect("parse schema");
-    assert_eq!(
-        serde_json::to_value(schema).expect("serialize schema"),
-        serde_json::json!({
-            "type": "object",
-            "description": "x".repeat(5_500),
-            "properties": {
-                "metadata": {
-                    "$ref": "#/$defs/metadata"
-                }
-            },
-            "$defs": {
-                "metadata": {
-                    "type": "string",
-                    "description": "Metadata value"
-                }
-            }
-        })
-    );
+    for schema in [
+        parse_tool_input_schema(&input_schema).unwrap(),
+        parse_tool_input_schema_without_compaction(&input_schema).unwrap(),
+    ] {
+        assert_eq!(serde_json::to_value(schema).unwrap(), input_schema);
+    }
 }
 
 #[test]
@@ -1080,6 +1092,7 @@ fn parse_large_tool_input_schema_preserves_reachable_definitions_over_budget() {
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
+            "description": "x".repeat(5_500),
             "properties": {
                 "event": {
                     "type": "object",
@@ -1168,6 +1181,7 @@ fn parse_large_tool_input_schema_preserves_field_descriptions_and_description_pr
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
+            "description": "x".repeat(5_500),
             "properties": {
                 "choice": {
                     "description": "Choice value",
@@ -1218,29 +1232,16 @@ fn parse_large_tool_input_schema_preserves_field_descriptions_and_description_pr
 }
 
 #[test]
-fn parse_large_tool_input_schema_truncates_only_oversized_field_descriptions() {
+fn parse_large_tool_input_schema_preserves_oversized_field_descriptions() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
         "properties": {
-            "payload": {
-                "type": "string",
-                "description": "x".repeat(5_500)
-            },
-            "mode": {
-                "type": "string",
-                "description": "Select the processing mode."
-            }
+            "payload": {"type": "string", "description": "x".repeat(5_500)},
+            "mode": {"type": "string", "description": "Select the processing mode."}
         }
-    }))
-    .expect("parse schema");
-
+    })).expect("parse schema");
     let properties = schema.properties.expect("object properties");
-    let payload_description = properties["payload"]
-        .description
-        .as_deref()
-        .expect("truncated payload description");
-    assert!(payload_description.len() <= 512);
-    assert!(payload_description.ends_with(" [... truncated ...]"));
+    assert_eq!(properties["payload"].description.as_deref(), Some("x".repeat(5_500).as_str()));
     assert_eq!(
         properties["mode"].description.as_deref(),
         Some("Select the processing mode.")
@@ -1353,6 +1354,7 @@ fn parse_large_tool_input_schema_compaction_preserves_validation_keywords() {
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
+            "description": "x".repeat(5_500),
             "properties": {
                 "count": {
                     "type": "integer",
@@ -1399,6 +1401,7 @@ fn parse_large_tool_input_schema_preserves_object_enum_literal_descriptions() {
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
+            "description": "x".repeat(5_500),
             "properties": {
                 "choice": {
                     "enum": [
@@ -2087,7 +2090,7 @@ fn parse_tool_input_schema_preserves_string_assertions_through_compaction() {
     });
     assert_eq!(
         serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap(),
-        serde_json::json!({"type":"object", "properties":{"code":{"type":"string", "pattern":"^[0-9]{6}$", "minLength":6, "maxLength":6}}})
+        input
     );
 }
 

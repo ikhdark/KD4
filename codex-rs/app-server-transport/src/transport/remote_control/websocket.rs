@@ -1246,7 +1246,7 @@ impl RemoteControlWebsocket {
                 }
             }
             if let Some(write_complete_tx) = write_complete_tx {
-                let _ = write_complete_tx.send(());
+                let _ = write_complete_tx.send(std::time::Instant::now());
             }
         }
     }

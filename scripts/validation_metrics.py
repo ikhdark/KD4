@@ -227,7 +227,7 @@ def summarize(records):
     reasons = Counter()
     proof_states = Counter()
     new_current_proof = 0
-    proof_latencies = []
+    successful_validation_work = []
     classified = []
     repeat_observations = []
     prior_by_command = {}
@@ -295,14 +295,14 @@ def summarize(records):
             prior_by_command[command_key] = row
             if current and row["outcome"] == "passed" and proof["status"] == "passed" and reason != "redundant":
                 new_current_proof += 1
-                proof_latencies.append(row["lifecycle_seconds"])
+                successful_validation_work.append(row["lifecycle_seconds"])
     work["redundant_lifecycle"] = _sum_known(
         row["lifecycle_seconds"] for row, reason in classified if reason == "redundant"
     )
     work["unclassified_lifecycle"] = _sum_known(
         row["lifecycle_seconds"] for row, reason in classified if reason == "unknown"
     )
-    work["time_to_current_proof"] = _sum_known(proof_latencies)
+    work["successful_current_validation_lifecycle"] = _sum_known(successful_validation_work)
     return {
         "schema_version": 1, "launches": len(executed), "reuse_decisions": len(reused),
         "child_commands": len(commands), "duplicate_records": duplicates,
@@ -322,6 +322,7 @@ def summarize(records):
             "Ledger producer assertions are observations, not permission to reuse or skip checks.",
             "Current means at the explicit freshness basis, not automatically at report time.",
             "Child command wall sums are work, not elapsed critical-path time.",
+            "Successful current-validation lifecycle is summed work, not time to proof; use turn timing for end-to-end comparisons including failures, repair/model gaps, requests, tool calls and correctness.",
             "Reported build/test and cleanup/process times are subsets of command wall; do not add them.",
             "Missing instrumentation is unknown, not zero. Old launches cannot be reconstructed from summary text.",
             "Preparation, provenance and reconciliation exclude child command wall when produced by the Rust runner.",

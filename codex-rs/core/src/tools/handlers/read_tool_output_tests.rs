@@ -227,6 +227,26 @@ async fn new_recovery_transaction_revalidates_same_length_modified_bytes() {
 }
 
 use super::*;
+
+#[test]
+fn partial_recovery_preserves_delivered_ranges_and_selection_failure() {
+    let mut signatures = Vec::new();
+    for start in [0, 10, 20] {
+        let evidence = serde_json::json!({"source":"artifact", "scope":"snapshot",
+            "identity":{"sha256":"source-hash", "ranges":[[start, start + 10]], "values":[]}});
+        let output = recovery_tool_output(serde_json::json!({
+            "artifact_id":"snapshot", "canonical_sha256":"source-hash", "complete":false,
+            "results":[{"status":"ok", "text":"new bytes"}, {"status":"not_found"}]
+        }), false, Some(evidence.clone()));
+        let signal = output.sampling_request_signal().unwrap();
+        assert_eq!(signal["semantic_evidence"], evidence);
+        assert_eq!(signal["outcome"], "failure");
+        assert!(!output.success_for_logging());
+        signatures.push(signal["failure_signature"].clone());
+    }
+    assert_eq!(signatures[0], signatures[1]);
+    assert_eq!(signatures[1], signatures[2]);
+}
 use crate::tools::command_output_artifact::ByteSubdivisionPlan;
 
 #[tokio::test]
@@ -247,6 +267,13 @@ async fn byte_budget_delivers_an_exact_prefix_and_resumable_remainder() {
     assert!(delivered > 0 && delivered <= 4096, "{delivered}");
     assert!(!result.output.complete);
     assert!(result.continuation_stop.as_ref().is_some_and(|stop| stop.resumable));
+    assert!(recovery_call_succeeded(&result.output, result.continuation_stop.as_ref()));
+    let mut cancelled = result.continuation_stop.clone().unwrap();
+    cancelled.reason = ContinuationStopReason::Cancelled;
+    assert!(!recovery_call_succeeded(&result.output, Some(&cancelled)));
+    let mut invalid = result.output.clone();
+    invalid.results[0].status = ToolOutputSelectorStatus::Invalid;
+    assert!(!recovery_call_succeeded(&invalid, result.continuation_stop.as_ref()));
     for page in &result.output.results {
         if let (Some(range), Some(value)) = (page.canonical_range, page.text.as_ref()) {
             assert_eq!(value, &text[range.start as usize..range.end as usize]);
@@ -697,13 +724,13 @@ fn many_page_incremental_recovery_matches_reconstruction_and_budget_rollback() {
 
 #[test]
 fn search_page_limit_does_not_automatically_fetch_later_matches() {
-    let selector = ToolOutputSelector::Search { case_insensitive: false,
+    let selector = ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
         query: "needle".into(),
         start_byte: 0,
         max_results: 1,
         context_lines: 0,
     };
-    let next = ToolOutputSelector::Search { case_insensitive: false,
+    let next = ToolOutputSelector::Search { enclosing: false, case_insensitive: false,
         query: "needle".into(),
         start_byte: 100,
         max_results: 1,
@@ -1006,6 +1033,31 @@ fn exact_continuation_pages_are_drained_in_selector_order() {
             .iter()
             .all(|result| result.continuation.is_none())
     );
+}
+
+#[test]
+fn selector_errors_do_not_strand_later_pages() {
+    for status in [ToolOutputSelectorStatus::Invalid, ToolOutputSelectorStatus::NotFound] {
+        let initial = recovery_output(vec![
+            selector_result(status),
+            continuation_result(page_selector(0), Some(page_selector(10)), "first"),
+        ]);
+        let mut state = RecoveryContinuationState::new(initial, usize::MAX);
+        for (index, next) in [(1, Some(page_selector(20))), (2, None)] {
+            let ContinuationStep::Follow { result_index, selector } = state.next_step() else {
+                panic!("independent pages must still drain");
+            };
+            assert_eq!(result_index, index);
+            state.accept_page(result_index, &selector,
+                recovery_output(vec![continuation_result(selector.clone(), next, "page")])).unwrap();
+        }
+        assert_eq!(state.next_step(), ContinuationStep::Complete);
+        let result = state.finish();
+        assert_eq!(result.drained_continuation_pages, 2);
+        assert_eq!(result.output.results[0].status, status);
+        assert!(!result.output.complete);
+        assert!(result.output.results[1..].iter().all(|result| result.complete));
+    }
 }
 
 #[test]
@@ -1479,6 +1531,25 @@ fn continuation_stop_is_typed_and_preserves_the_unconsumed_selector() {
         serde_json::to_value(stop).expect("serialize stop")["reason"],
         "budget"
     );
+}
+
+#[test]
+fn verified_evidence_negative_search_identity_includes_matching_mode_not_display_limits() {
+    let proof = |case_insensitive, max_results, context_lines| {
+        let mut result = selector_result(ToolOutputSelectorStatus::Ok);
+        result.text = None;
+        result.canonical_range = None;
+        result.selector = ToolOutputSelector::Search {
+            query: "missing".into(), case_insensitive, start_byte: 0, max_results, context_lines,
+            enclosing: false,
+        };
+        result.value = Some(serde_json::json!({"query":"missing", "start_byte":0,
+            "coverage_complete":true, "matches":[], "total_matches":0,
+            "matches_returned":0, "remaining_match_count":0, "hydrated_ranges":[]}));
+        recovery_output(vec![result]).delivered_evidence()
+    };
+    assert_ne!(proof(false, 20, 3), proof(true, 20, 3));
+    assert_eq!(proof(false, 20, 3), proof(false, 1, 0));
 }
 
 #[test]

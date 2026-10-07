@@ -221,7 +221,9 @@ struct ExecCommandEndTracePayload<'a> {
     stdout: &'a str,
     stderr: &'a str,
     aggregated_output: &'a str,
-    exit_code: i32,
+    exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_metadata: Option<&'a codex_protocol::items::CommandExecutionOutputMetadata>,
     duration: Duration,
     formatted_output: &'a str,
     status: &'a ExecCommandStatus,
@@ -243,6 +245,7 @@ impl<'a> From<&'a ExecCommandEndEvent> for ExecCommandEndTracePayload<'a> {
             stderr,
             aggregated_output,
             exit_code,
+            output_metadata,
             duration,
             formatted_output,
             status,
@@ -261,6 +264,7 @@ impl<'a> From<&'a ExecCommandEndEvent> for ExecCommandEndTracePayload<'a> {
             stderr,
             aggregated_output,
             exit_code: *exit_code,
+            output_metadata: output_metadata.as_ref(),
             duration: *duration,
             formatted_output,
             status,
@@ -363,6 +367,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::ThreadSettingsApplied(_)
+        | EventMsg::TurnPhaseChanged(_)
         | EventMsg::TurnComplete(_)
         | EventMsg::TokenCount(_)
         | EventMsg::AgentMessage(_)
@@ -429,6 +434,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::ContextCompacted(_)
         | EventMsg::ThreadSettingsApplied(_)
+        | EventMsg::TurnPhaseChanged(_)
         | EventMsg::TokenCount(_)
         | EventMsg::AgentMessage(_)
         | EventMsg::UserMessage(_)

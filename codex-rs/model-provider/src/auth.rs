@@ -573,6 +573,7 @@ mod tests {
         let key_material = generate_agent_key_material().expect("generate key material");
         AgentIdentityAuth::from_record(
             AgentIdentityAuthRecord {
+                issuer_origin: Some("https://auth.openai.com/api/accounts".into()),
                 agent_runtime_id: "agent-runtime-1".to_string(),
                 agent_private_key: key_material.private_key_pkcs8_base64,
                 account_id: account_id.to_string(),

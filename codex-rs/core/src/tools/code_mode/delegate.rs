@@ -26,6 +26,7 @@ use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 
 const MAX_PENDING_CONTINUATIONS_PER_CELL: usize = 64;
+const MAX_QUEUED_DISPATCHES: usize = 128;
 
 struct CellDispatchState {
     ready: watch::Sender<bool>,
@@ -39,15 +40,17 @@ pub(super) struct CodeModeDispatchBroker {
     dispatch_tx: async_channel::Sender<DispatchMessage>,
     dispatch_rx: async_channel::Receiver<DispatchMessage>,
     cells: CellDispatchStates,
+    dequeue_owner: Arc<Mutex<Option<Arc<()>>>>,
 }
 
 impl CodeModeDispatchBroker {
     pub(super) fn new() -> Self {
-        let (dispatch_tx, dispatch_rx) = async_channel::unbounded();
+        let (dispatch_tx, dispatch_rx) = async_channel::bounded(MAX_QUEUED_DISPATCHES);
         Self {
             dispatch_tx,
             dispatch_rx,
             cells: Arc::new(Mutex::new(HashMap::new())),
+            dequeue_owner: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -146,21 +149,45 @@ impl CodeModeDispatchBroker {
         tracker: SharedTurnDiffTracker,
         request_signals: crate::session::turn_execution::SamplingRequestSignalCollector,
     ) -> CodeModeDispatchWorker {
+        // Replacement and dequeue share one synchronous fence. Tasks already
+        // admitted by the old owner retain their context and effects; it can
+        // never take another queued message after this handoff.
+        let owner = Arc::new(());
+        {
+            let mut current = self.dequeue_owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            cleanup_terminal_cells(&self.cells);
+            *current = Some(Arc::clone(&owner));
+        }
         let tool_runtime = ToolCallRuntime::new(Arc::clone(&exec.session), step_context, tracker)
             .with_sampling_request_signals(request_signals);
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
         let dispatch_rx = self.dispatch_rx.clone();
         let cells = Arc::clone(&self.cells);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let dequeue_owner = Arc::clone(&self.dequeue_owner);
+        let worker_owner = Arc::clone(&owner);
         tokio::spawn(async move {
             loop {
+                let receive = dispatch_rx.recv();
+                tokio::pin!(receive);
+                let receive = std::future::poll_fn(|cx| {
+                    let current = dequeue_owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &worker_owner)) {
+                        return std::task::Poll::Ready(None);
+                    }
+                    std::future::Future::poll(receive.as_mut(), cx).map(Result::ok)
+                });
                 let message = tokio::select! {
+                    biased;
                     _ = &mut shutdown_rx => break,
-                    message = dispatch_rx.recv() => message.ok(),
+                    message = receive => message,
                 };
                 let Some(message) = message else {
                     break;
                 };
+                if message.cancelled() {
+                    continue;
+                }
                 match message {
                     DispatchMessage::Notify {
                         call_id,
@@ -306,10 +333,15 @@ impl CodeModeDispatchBroker {
                     }
                 }
             }
-            cleanup_terminal_cells(&cells);
+            let current = dequeue_owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &worker_owner)) {
+                cleanup_terminal_cells(&cells);
+            }
         });
         CodeModeDispatchWorker {
             shutdown_tx: Some(shutdown_tx),
+            dequeue_owner: Arc::clone(&self.dequeue_owner),
+            owner,
         }
     }
 }
@@ -394,15 +426,17 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
             }
             let cancellation_token = cancellation.token().clone();
             let (response_tx, response_rx) = oneshot::channel();
-            self.dispatch_tx
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return Err("code mode nested tool call cancelled".to_string()),
+                sent = self.dispatch_tx
                 .send(DispatchMessage::InvokeTool {
                     invocation,
                     cancellation: cancellation.clone(),
                     enqueued_at: Instant::now(),
                     response_tx,
-                })
-                .await
-                .map_err(|_| "code mode nested tool dispatcher is unavailable".to_string())?;
+                }) => sent.map_err(|_| "code mode nested tool dispatcher is unavailable".to_string())?,
+            }
             tokio::select! {
                 response = response_rx => response
                     .map_err(|_| "code mode nested tool dispatcher stopped".to_string())?,
@@ -425,16 +459,18 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
                 return Err("code mode notification cancelled".to_string());
             }
             let (response_tx, response_rx) = oneshot::channel();
-            self.dispatch_tx
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return Err("code mode notification cancelled".to_string()),
+                sent = self.dispatch_tx
                 .send(DispatchMessage::Notify {
                     call_id,
                     cell_id,
                     text,
                     cancellation_token: cancellation_token.clone(),
                     response_tx,
-                })
-                .await
-                .map_err(|_| "code mode notification dispatcher is unavailable".to_string())?;
+                }) => sent.map_err(|_| "code mode notification dispatcher is unavailable".to_string())?,
+            }
             tokio::select! {
                 response = response_rx => response
                     .map_err(|_| "code mode notification dispatcher stopped".to_string())?,
@@ -468,12 +504,27 @@ enum DispatchMessage {
 
 pub(crate) struct CodeModeDispatchWorker {
     shutdown_tx: Option<oneshot::Sender<()>>,
+    dequeue_owner: Arc<Mutex<Option<Arc<()>>>>,
+    owner: Arc<()>,
 }
 
 impl Drop for CodeModeDispatchWorker {
     fn drop(&mut self) {
+        let mut current = self.dequeue_owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &self.owner)) {
+            *current = None;
+        }
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
+        }
+    }
+}
+
+impl DispatchMessage {
+    fn cancelled(&self) -> bool {
+        match self {
+            Self::InvokeTool { cancellation, response_tx, .. } => cancellation.is_cancelled() || response_tx.is_closed(),
+            Self::Notify { cancellation_token, response_tx, .. } => cancellation_token.is_cancelled() || response_tx.is_closed(),
         }
     }
 }
@@ -523,6 +574,49 @@ impl CoreTurnHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancelled_callbacks_cannot_grow_the_retained_dispatch_queue() {
+        let broker = CodeModeDispatchBroker::new();
+        for index in 0..MAX_QUEUED_DISPATCHES * 4 {
+            let cancellation = CancellationToken::new();
+            let notify = broker.notify("parent".into(), CellId::new("cell".into()), "payload".repeat(1000), cancellation.clone());
+            tokio::pin!(notify);
+            assert!(futures::poll!(&mut notify).is_pending());
+            cancellation.cancel();
+            assert!(notify.await.is_err());
+            assert_eq!(broker.dispatch_rx.len(), (index + 1).min(MAX_QUEUED_DISPATCHES));
+        }
+        while let Ok(message) = broker.dispatch_rx.try_recv() {
+            assert!(message.cancelled(), "retired entries must never dispatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_fences_retired_worker_before_queued_notification() -> anyhow::Result<()> {
+        let (old_session, old_turn) = crate::session::tests::make_session_and_context().await;
+        let (new_session, new_turn) = crate::session::tests::make_session_and_context().await;
+        let old_session = Arc::new(old_session);
+        let new_session = Arc::new(new_session);
+        let broker = CodeModeDispatchBroker::new();
+        let start = |session: Arc<crate::session::Session>, turn| {
+            let turn = Arc::new(turn);
+            broker.start_turn_worker(ExecContext { session, turn: Arc::clone(&turn) }, StepContext::for_test(turn),
+                Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())), Default::default())
+        };
+        let old = start(Arc::clone(&old_session), old_turn);
+        let replacement = start(Arc::clone(&new_session), new_turn);
+        drop(old); // A late old drop must not revoke its replacement.
+        let cell = CellId::new("handoff".into());
+        broker.mark_cell_ready_for_dispatch(&cell);
+        tokio::time::timeout(std::time::Duration::from_secs(10), broker.notify("handoff-parent".into(), cell, "replacement-only".into(), CancellationToken::new())).await?.map_err(anyhow::Error::msg)?;
+        let old_history = serde_json::to_string(&old_session.clone_history().await.into_raw_items())?;
+        let new_history = serde_json::to_string(&new_session.clone_history().await.into_raw_items())?;
+        assert!(!old_history.contains("replacement-only"));
+        assert!(new_history.contains("replacement-only"));
+        drop(replacement);
+        Ok(())
+    }
+
     use codex_protocol::protocol::DeterministicContinuationClass;
     use codex_protocol::protocol::DeterministicContinuationHostAction;
     use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
@@ -541,6 +635,82 @@ mod tests {
                 suppressed_continuation_count: 1,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_returns_buffered_cell_output_and_nested_receipts() -> anyhow::Result<()> {
+        use crate::tools::code_mode::{CodeModeService, CodeModeNestedResultEvidence};
+        use crate::tools::code_mode::execute_handler::CodeModeExecuteHandler;
+        use crate::tools::code_mode::wait_handler::CodeModeWaitHandler;
+        use crate::tools::context::ToolPayload;
+        use crate::tools::registry::{CoreToolRuntime, ToolRegistry};
+        use crate::tools::router::{ToolCall, ToolRouter};
+        use codex_tools::ToolName;
+        for use_wait in [false, true] {
+            let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+            session.services.code_mode_service = CodeModeService::new(Arc::new(codex_code_mode::InProcessCodeModeSessionProvider));
+            let session = Arc::new(session);
+            let step = StepContext::for_test(Arc::new(turn));
+            let execute = CodeModeExecuteHandler::new(
+                crate::tools::code_mode::execute_spec::create_code_mode_tool(true, false, &[], &[]), Vec::new(), Vec::new(),
+            ).map_err(anyhow::Error::msg)?;
+            let handlers: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(execute), Arc::new(CodeModeWaitHandler)];
+            let router = Arc::new(ToolRouter::from_parts(ToolRegistry::from_tools(handlers), Vec::new()));
+            let step = step.with_tool_router_for_test(router);
+            let timing = Arc::clone(&step.turn.turn_timing_state);
+            let tracker = Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new()));
+            let runtime = ToolCallRuntime::new(Arc::clone(&session), step, tracker);
+            let service = &session.services.code_mode_service;
+            // Notification admission is a deterministic rendezvous after text(),
+            // not a sleep or a second observer that drains the buffered output.
+            let source = "text('buffered before interrupt'); await notify('ready');";
+            let call = if use_wait {
+                let started = service.execute(codex_code_mode::ExecuteRequest {
+                    state_path: None, tool_call_id: "outer".into(), enabled_tools: Vec::new().into(),
+                    source: format!("await yield_control(); {source}"), yield_time_ms: None,
+                    max_output_tokens: None, default_tool_timeout_ms: None,
+                }).await.map_err(anyhow::Error::msg)?;
+                let cell = started.cell_id.clone();
+                service.record_cell_parent_call_id(&cell, "outer");
+                service.mark_cell_ready_for_dispatch(&cell);
+                assert!(matches!(started.initial_response().await.unwrap(), codex_code_mode::RuntimeResponse::ExplicitYield { .. }));
+                ToolCall { tool_name: ToolName::plain("wait"), call_id: "wait-call".into(),
+                    payload: ToolPayload::Function { arguments: json!({"cell_id": cell.as_str()}).to_string() } }
+            } else {
+                ToolCall { tool_name: ToolName::plain("exec"), call_id: "outer".into(),
+                    payload: ToolPayload::Custom { input: source.into() } }
+            };
+            let cancellation = CancellationToken::new();
+            let task = tokio::spawn(runtime.handle_tool_call(call, cancellation.clone()));
+            let notification = tokio::time::timeout(std::time::Duration::from_secs(10), service.dispatch_broker.dispatch_rx.recv()).await??;
+            let DispatchMessage::Notify { cell_id, .. } = &notification else { panic!("expected notification rendezvous"); };
+            // A yielded cell can enqueue its notification before wait is admitted.
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while timing.lifecycle_context().active_tool_count == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await?;
+            let ordinal = service.begin_packet_call(cell_id).unwrap();
+            service.complete_packet_call(cell_id, ordinal, false, 0, Vec::new(), Some(CodeModeNestedResultEvidence {
+                failed: false, ordinal, call_id: "completed-nested".into(), parent_call_id: Some("outer".into()),
+                parent_cell_id: cell_id.to_string(), runtime_tool_call_id: "nested-1".into(), tool_name: "exec_command".into(),
+                output: json!({"output": "completed nested result", "session_id": 60964, "process_exited": false}).to_string(),
+                output_truncated: false,
+                output_fingerprints: Vec::new(),
+                command_state: Some(json!({"tool":"exec_command", "session_id":60964, "process_exited":false})),
+            }), None);
+            cancellation.cancel();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(10), task).await???;
+            let text = serde_json::to_string(&response)?;
+            assert!(text.contains("buffered before interrupt"), "{text}");
+            assert!(text.contains("completed nested result"), "{text}");
+            assert!(text.contains("60964"), "{text}");
+            assert!(!text.contains("cleanup_state"), "cleanup must finish before the response: {text}");
+            assert!(!service.dispatch_broker.has_waitable_cells());
+            drop(notification);
+            service.shutdown().await.map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
     }
 
     #[test]

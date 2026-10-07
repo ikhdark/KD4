@@ -868,7 +868,13 @@ impl RequestUserInputOverlay {
         let answers = self.response_answers(/*committed_only*/ false);
         self.app_event_tx.user_input_answer(
             self.request.turn_id.clone(),
+            self.request.item_id.clone(),
             ToolRequestUserInputResponse {
+                disposition: Some(if answers.values().any(|answer| !answer.answers.is_empty()) {
+                    codex_protocol::request_user_input::RequestUserInputDisposition::Answered
+                } else {
+                    codex_protocol::request_user_input::RequestUserInputDisposition::Skipped
+                }),
                 answers: answers.clone(),
                 interrupted: false,
             },
@@ -928,7 +934,9 @@ impl RequestUserInputOverlay {
         let answers = self.response_answers(/*committed_only*/ true);
         self.app_event_tx.user_input_answer(
             self.request.turn_id.clone(),
+            self.request.item_id.clone(),
             ToolRequestUserInputResponse {
+                disposition: Some(codex_protocol::request_user_input::RequestUserInputDisposition::Interrupted),
                 answers: answers.clone(),
                 interrupted: true,
             },
@@ -949,7 +957,9 @@ impl RequestUserInputOverlay {
         let answers: HashMap<String, ToolRequestUserInputAnswer> = HashMap::new();
         self.app_event_tx.user_input_answer(
             self.request.turn_id.clone(),
+            self.request.item_id.clone(),
             ToolRequestUserInputResponse {
+                disposition: Some(codex_protocol::request_user_input::RequestUserInputDisposition::TimedOut),
                 answers: answers.clone(),
                 interrupted: false,
             },
@@ -2136,11 +2146,14 @@ mod tests {
         assert!(overlay.done);
 
         let event = rx.try_recv().expect("expected UserInputAnswer event");
-        let AppEvent::CodexOp(Op::UserInputAnswer { id, response }) = event else {
+        let AppEvent::CodexOp(Op::UserInputAnswer { id, call_id, response }) = event else {
             panic!("expected UserInputAnswer event");
         };
         assert_eq!(id, "turn-1");
+        assert_eq!(call_id, "call-1");
         assert_eq!(response.answers, HashMap::new());
+        assert!(!response.interrupted);
+        assert_eq!(response.disposition, Some(codex_protocol::request_user_input::RequestUserInputDisposition::TimedOut));
 
         let event = rx.try_recv().expect("expected history cell event");
         assert!(

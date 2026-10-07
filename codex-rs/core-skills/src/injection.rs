@@ -77,15 +77,95 @@ pub struct SkillInjectionMetric {
 ///
 /// Core uses this to keep the legacy skill-injection path from sending the same
 /// host `SKILL.md` body again while the skills extension is being wired in.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct InjectedHostSkillPrompts {
     paths: HashSet<String>,
     // Selection precedence, a failed load, or a prompt budget can suppress
     // legacy host injection without implying successful instruction delivery.
     suppressed_paths: HashSet<String>,
+    pub selected: Vec<SkillMetadata>,
+    resolved: HashMap<String, Result<String, String>>,
+    admitted_bodies: Vec<(String, String, String)>,
 }
 
 impl InjectedHostSkillPrompts {
+    pub fn record_resolution(&mut self, skill: SkillMetadata, result: Result<String, String>) {
+        let path = skill.path_to_skills_md.to_string_lossy();
+        self.resolved
+            .insert(normalize_host_skill_path(&path), result);
+        if !self
+            .selected
+            .iter()
+            .any(|selected| selected.path_to_skills_md == skill.path_to_skills_md)
+        {
+            self.selected.push(skill);
+        }
+    }
+
+    pub fn admitted_skills(&self) -> Vec<SkillMetadata> {
+        self.selected
+            .iter()
+            .filter(|skill| {
+                self.resolved
+                    .get(&normalize_host_skill_path(
+                        &skill.path_to_skills_md.to_string_lossy(),
+                    ))
+                    .is_some_and(Result::is_ok)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn admitted_instruction_bodies(&self) -> impl Iterator<Item = &str> {
+        self.admitted_bodies
+            .iter()
+            .map(|(_, _, body)| body.as_str())
+            .chain(
+                self.resolved
+                    .values()
+                    .filter_map(|result| result.as_ref().ok().map(String::as_str)),
+            )
+    }
+
+    pub fn record_instruction_fragment(&mut self, role: &str, rendered: String, body: String) {
+        self.admitted_bodies
+            .push((role.to_string(), rendered, body));
+    }
+
+    /// Final aggregate admission may reject a fragment admitted by its producer.
+    /// Runtime consumers must see exactly the same accepted body, never reread it.
+    pub fn retain_admitted_items(&mut self, items: &[codex_protocol::models::ResponseItem]) {
+        use codex_protocol::models::{ContentItem, ResponseItem};
+        let retained = |role: &str, text: &str| {
+            items.iter().any(|item| {
+                matches!(item,
+                    ResponseItem::Message { role: actual_role, content, .. }
+                        if actual_role == role && content.iter().any(|part| matches!(part,
+                            ContentItem::InputText { text: actual } if actual == text))
+                )
+            })
+        };
+        self.admitted_bodies
+            .retain(|(role, text, _)| retained(role, text));
+        for skill in &self.selected {
+            let key = normalize_host_skill_path(&skill.path_to_skills_md.to_string_lossy());
+            let Some(Ok(body)) = self.resolved.get(&key) else {
+                continue;
+            };
+            let injection = SkillInjection {
+                name: skill.name.clone(),
+                path: skill.path_to_skills_md.to_string_lossy().into_owned(),
+                contents: body.clone(),
+                scope: skill.scope,
+            };
+            if !retained(injection.role(), &injection.render()) {
+                self.resolved.insert(
+                    key,
+                    Err("Selected skill was not admitted by the final context budget".to_string()),
+                );
+            }
+        }
+    }
     pub fn insert_path(&mut self, path: impl Into<String>) {
         let path = path.into();
         self.paths.insert(normalize_host_skill_path(&path));
@@ -135,6 +215,14 @@ pub async fn plan_skill_injections(
     mentioned_skills: &[SkillMetadata],
     loaded_skills: Option<&SkillLoadOutcome>,
 ) -> PlannedSkillInjections {
+    plan_skill_injections_with_resolved(mentioned_skills, loaded_skills, None).await
+}
+
+pub async fn plan_skill_injections_with_resolved(
+    mentioned_skills: &[SkillMetadata],
+    loaded_skills: Option<&SkillLoadOutcome>,
+    resolved: Option<&InjectedHostSkillPrompts>,
+) -> PlannedSkillInjections {
     if mentioned_skills.is_empty() {
         return PlannedSkillInjections::default();
     }
@@ -153,7 +241,22 @@ pub async fn plan_skill_injections(
             .and_then(|outcome| outcome.file_system_for_skill(skill))
             .unwrap_or_else(|| Arc::clone(&LOCAL_FS));
         let path = PathUri::from_abs_path(&skill.path_to_skills_md);
-        match fs.read_file_text(&path, /*sandbox*/ None).await {
+        let contents = if let Some(resolved) = resolved {
+            resolved
+                .resolved
+                .get(&normalize_host_skill_path(
+                    &skill.path_to_skills_md.to_string_lossy(),
+                ))
+                .cloned()
+                .unwrap_or_else(|| {
+                    Err("Selected host skill was not admitted by its owner".to_string())
+                })
+        } else {
+            fs.read_file_text(&path, /*sandbox*/ None)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        match contents {
             Ok(contents) => {
                 plan.metrics.push(SkillInjectionMetric {
                     skill_name: skill.name.clone(),
@@ -390,6 +493,8 @@ pub fn extract_tool_mentions(text: &str) -> ToolMentions<'_> {
 
 pub fn extract_tool_mentions_with_sigil(text: &str, sigil: char) -> ToolMentions<'_> {
     let text_bytes = text.as_bytes();
+    let literal_ranges = markdown_literal_ranges(text);
+    let mut literals = literal_ranges.iter().peekable();
     let mut mentioned_names: HashSet<&str> = HashSet::new();
     let mut mentioned_paths: HashSet<&str> = HashSet::new();
     let mut plain_names: HashSet<&str> = HashSet::new();
@@ -397,6 +502,22 @@ pub fn extract_tool_mentions_with_sigil(text: &str, sigil: char) -> ToolMentions
 
     let mut index = 0;
     while index < text_bytes.len() {
+        while literals.peek().is_some_and(|range| range.end <= index) {
+            literals.next();
+        }
+        if let Some(range) = literals.peek()
+            && range.start <= index
+        {
+            index = range.end;
+            continue;
+        }
+        if text_bytes[index] == b'\\' {
+            index += 1;
+            if index < text_bytes.len() {
+                index += text[index..].chars().next().map_or(0, char::len_utf8);
+            }
+            continue;
+        }
         let byte = text_bytes[index];
         if byte == b'['
             && let Some(LinkedToolMention {
@@ -455,6 +576,76 @@ pub fn extract_tool_mentions_with_sigil(text: &str, sigil: char) -> ToolMentions
         plain_names,
         linked_paths,
     }
+}
+
+/// Syntactic Markdown literals are examples, not invocations. Keep offsets into
+/// the original text so selection still borrows names and qualified locators.
+fn markdown_literal_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut fence: Option<(u8, usize, usize)> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let marker = trimmed.as_bytes().first().copied().unwrap_or_default();
+        let width = trimmed.bytes().take_while(|byte| *byte == marker).count();
+        if let Some((open, count, start)) = fence {
+            if indent <= 3 && marker == open && width >= count && trimmed[width..].trim().is_empty()
+            {
+                ranges.push(start..offset + line.len());
+                fence = None;
+            }
+        } else if indent <= 3 && matches!(marker, b'`' | b'~') && width >= 3 {
+            fence = Some((marker, width, offset));
+        } else if indent >= 4 || line.starts_with('\t') || trimmed.starts_with('>') {
+            ranges.push(offset..offset + line.len());
+        }
+        offset += line.len();
+    }
+    if let Some((_, _, start)) = fence {
+        ranges.push(start..text.len());
+    }
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(range) = ranges.iter().find(|range| range.contains(&index)) {
+            index = range.end;
+        } else if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes[index] == b'`' {
+            let width = bytes[index..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            let mut end = index + width;
+            let mut close = None;
+            while end < bytes.len() {
+                if bytes[end] == b'`' {
+                    let count = bytes[end..]
+                        .iter()
+                        .take_while(|byte| **byte == b'`')
+                        .count();
+                    if count == width {
+                        close = Some(end + count);
+                        break;
+                    }
+                    end += count;
+                } else {
+                    end += 1;
+                }
+            }
+            if let Some(end) = close {
+                ranges.push(index..end);
+                index = end;
+            } else {
+                index += width;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    ranges.sort_by_key(|range| range.start);
+    ranges
 }
 
 /// Select mentioned skills while preserving the order of `skills`.

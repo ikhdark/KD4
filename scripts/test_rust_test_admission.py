@@ -400,7 +400,7 @@ class AdmissionDispatchTest(RunnerTestCase):
         instance, _ = self.runner()
         instance.cargo_profile = cargo_profile
         args = argparse.Namespace(command=command, manifest=self.temp_dir / "manifest.toml",
-                                  admission_timeout_seconds=.02, names=["fixture"], name="fixture")
+                                  admission_timeout_seconds=.02, names=["demo-gate"], name="core_lib")
         args.manifest.write_text("fixture")
         output = io.StringIO()
         ledger = {"fixture": ["b", "a"]}

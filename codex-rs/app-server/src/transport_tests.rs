@@ -306,7 +306,7 @@ async fn to_connection_receipt_sender_reaches_the_transport_writer() {
     queued_message
         .write_complete_tx
         .expect("routing must preserve the receipt sender")
-        .send(())
+        .send(std::time::Instant::now())
         .expect("receipt receiver should remain live");
     write_complete_rx
         .await

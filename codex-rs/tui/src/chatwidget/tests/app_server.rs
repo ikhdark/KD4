@@ -1023,6 +1023,9 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             turn_id: "turn-1".to_string(),
             started_at_ms: 0,
             item: AppServerThreadItem::CommandExecution {
+                output_metadata: None,
+                stdout: None,
+                stderr: None,
                 id: "cmd-1".to_string(),
                 command: command.clone(),
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -1049,6 +1052,9 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             turn_id: "turn-1".to_string(),
             completed_at_ms: 0,
             item: AppServerThreadItem::CommandExecution {
+                output_metadata: None,
+                stdout: None,
+                stderr: None,
                 id: "cmd-1".to_string(),
                 command,
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -1864,6 +1870,9 @@ async fn live_app_server_command_completion_preserves_status_without_exit_code()
         let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
         let thread_id = "019cff70-2599-75e2-af72-b90000000002";
         let mut item = AppServerThreadItem::CommandExecution {
+            output_metadata: None,
+            stdout: None,
+            stderr: None,
             id: "approval-command".to_string(),
             command: "echo reviewed-command".to_string(),
             cwd: test_path_buf("/tmp").abs().into(),

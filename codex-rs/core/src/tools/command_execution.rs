@@ -98,6 +98,12 @@ impl SearchNarrowingAttempt {
 }
 
 impl CommandAttemptKey {
+    pub(crate) fn local_cwd(&self) -> Option<PathBuf> {
+        if self.environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID { return None; }
+        codex_utils_path_uri::PathUri::parse(&self.cwd).ok()?.to_abs_path().ok()
+            .map(|path| path.to_path_buf())
+    }
+
     pub(crate) fn new(
         tool_name: &str,
         environment_id: &str,
@@ -392,6 +398,7 @@ struct AttemptEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct RunningCommand {
     pub(crate) execution_id: CommandExecutionId,
+    pub(crate) incarnation: uuid::Uuid,
     pub(crate) parent_tool_execution_id: ToolExecutionId,
     pub(crate) key: CommandAttemptKey,
     pub(crate) artifact: RawOutputArtifact,
@@ -407,13 +414,16 @@ struct PendingCommandCompletion {
 #[derive(Debug, Clone)]
 struct CommandCompletionReceipt {
     parent_tool_execution_id: ToolExecutionId,
+    process_id: u32,
+    incarnation: uuid::Uuid,
+    exit_code: Option<i32>,
+    artifact: RawOutputArtifact,
 }
 
 #[derive(Debug, Clone)]
 struct CommandExecutionPersistence {
     cache_path: PathBuf,
     cwd: PathBuf,
-    effect_journal_directory: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,7 +491,6 @@ pub(crate) struct CommandExecutionLedger {
     persistence: Option<CommandExecutionPersistence>,
     workspace_cache: Option<Arc<crate::git_workspace::GitWorkspaceCache>>,
     cache_persist: Arc<Mutex<()>>,
-    effect_recovery: tokio::sync::OnceCell<Option<serde_json::Value>>,
     #[cfg(test)]
     cache_commit_count: AtomicU64,
     #[cfg(test)]
@@ -504,7 +513,6 @@ impl Default for CommandExecutionLedger {
             persistence: None,
             workspace_cache: None,
             cache_persist: Arc::new(Mutex::new(())),
-            effect_recovery: tokio::sync::OnceCell::new(),
             #[cfg(test)]
             cache_commit_count: AtomicU64::new(0),
             #[cfg(test)]
@@ -526,7 +534,6 @@ impl CommandExecutionLedger {
                 .join("command-execution-cache")
                 .join(format!("{thread_id}.json")),
             cwd: cwd.to_path_buf(),
-            effect_journal_directory: codex_home.join("effect-journal").join(&thread_id),
         };
         Self {
             state: Mutex::new(CommandExecutionState::default()),
@@ -534,7 +541,6 @@ impl CommandExecutionLedger {
             persistence: Some(persistence),
             workspace_cache: None,
             cache_persist: Arc::new(Mutex::new(())),
-            effect_recovery: tokio::sync::OnceCell::new(),
             #[cfg(test)]
             cache_commit_count: AtomicU64::new(0),
             #[cfg(test)]
@@ -550,13 +556,6 @@ impl CommandExecutionLedger {
     ) -> Self {
         self.workspace_cache = Some(cache);
         self
-    }
-
-    pub(crate) async fn effect_recovery(&self) -> Option<serde_json::Value> {
-        let persistence = self.persistence.as_ref()?;
-        self.effect_recovery.get_or_init(|| {
-            crate::tools::effect_journal::recover(persistence.effect_journal_directory.clone())
-        }).await.clone()
     }
 
     pub(crate) async fn admit_search_narrowing(
@@ -969,6 +968,7 @@ impl CommandExecutionLedger {
             process_id,
             key,
             artifact,
+            uuid::Uuid::new_v4(),
         )
         .await
     }
@@ -981,6 +981,7 @@ impl CommandExecutionLedger {
         process_id: u32,
         key: CommandAttemptKey,
         artifact: RawOutputArtifact,
+        incarnation: uuid::Uuid,
     ) -> Result<(), String> {
         let mut state = self.state.lock().await;
         debug_assert_command_execution_invariants(&state);
@@ -990,10 +991,15 @@ impl CommandExecutionLedger {
                 "process id {process_id} already has live command bookkeeping"
             ));
         }
+        // A reused transport ID must not recover an earlier execution's result.
+        state.process.completion_receipts.retain(|_, receipt| receipt.process_id != process_id);
+        let retained = state.process.completion_receipts.keys().copied().collect::<HashSet<_>>();
+        state.process.completion_receipt_order.retain(|id| retained.contains(id));
         state.process.running.insert(
             process_id,
             RunningCommand {
                 execution_id,
+                incarnation,
                 parent_tool_execution_id,
                 key,
                 artifact,
@@ -1012,6 +1018,57 @@ impl CommandExecutionLedger {
             .running
             .get(&process_id)
             .cloned()
+    }
+
+    pub(crate) async fn identical_running_process(
+        &self, key: &CommandAttemptKey,
+    ) -> Option<(u32, CommandExecutionId)> {
+        // An epoch alone cannot prove unchanged external inputs. Missing full
+        // workspace evidence must not suppress a requested validation.
+        if !key.execution_context.contains_key("workspace_identity") { return None; }
+        let state = self.state.lock().await;
+        state.process.running.iter()
+            .filter(|(_, running)| running.key == *key && running.completed_exit_code.is_none())
+            .min_by_key(|(id, _)| **id)
+            .map(|(id, running)| (*id, running.execution_id))
+    }
+
+    pub(crate) async fn completed_process_result(&self, process_id: u32, incarnation: uuid::Uuid) -> Option<serde_json::Value> {
+        let state = self.state.lock().await;
+        if state.process.running.contains_key(&process_id) {
+            return None;
+        }
+        let (exit_code, artifact) = if let Some(pending) = state.process.pending_by_execution_id.values()
+            .find(|pending| pending.process_id == process_id)
+        {
+            if pending.command.incarnation != incarnation { return None; }
+            (pending.command.completed_exit_code, &pending.command.artifact)
+        } else {
+            let receipt = state.process.completion_receipt_order.iter().rev()
+                .filter_map(|id| state.process.completion_receipts.get(id))
+                .find(|receipt| receipt.process_id == process_id)?;
+            if receipt.incarnation != incarnation { return None; }
+            (receipt.exit_code, &receipt.artifact)
+        };
+        let (artifact_id, bytes, error) = artifact.model_projection();
+        let mut result = serde_json::json!({
+            "execution_state": "exited", "process_exited": true,
+            "exit_code": exit_code,
+            "output": "", "output_complete": false, "output_reduced": true,
+            "raw_output_artifact_retention_limit_hit": artifact.retention_limit_hit(),
+            "completion_recovered": true,
+            "notice": "Process already completed and was cleaned up. Output is not replayed; recover the retained artifact when needed. Do not restart the command.",
+        });
+        if let Some(id) = artifact_id { result["raw_output_artifact_id"] = id.to_string().into(); }
+        if let Some(bytes) = bytes { result["raw_output_artifact_bytes"] = bytes.into(); }
+        if let Some(error) = error { result["raw_output_artifact_error"] = error.into(); }
+        if let (Some(id), Some(bytes)) = (artifact_id, bytes) {
+            result["recovery_selector"] = serde_json::json!({"kind":"bytes", "start":0, "end":bytes.min(4096)});
+            result["recovery"] = serde_json::json!({"tool":"read_tool_output", "arguments": {
+                "artifact_id":id.to_string(), "selectors":[{"kind":"bytes", "start":0, "end":bytes.min(4096)}]
+            }});
+        }
+        Some(result)
     }
 
     pub(crate) async fn process_execution_identity(
@@ -1179,6 +1236,10 @@ impl CommandExecutionLedger {
                     .find(|pending| pending.process_id == process_id)
                 {
                     pending.command.artifact = artifact;
+                } else if let Some(receipt) = state.process.completion_receipts.values_mut()
+                    .find(|receipt| receipt.process_id == process_id)
+                {
+                    receipt.artifact = artifact;
                 }
             }
             debug_assert_command_execution_invariants(&state);
@@ -1234,8 +1295,9 @@ impl CommandExecutionLedger {
         process_id: u32,
         execution_id: CommandExecutionId,
         parent_tool_execution_id: &ToolExecutionId,
-        exit_code: i32,
+        exit_code: impl Into<Option<i32>>,
     ) -> CompletionApplyResult {
+        let exit_code = exit_code.into();
         {
             let mut state = self.state.lock().await;
             debug_assert_command_execution_invariants(&state);
@@ -1284,8 +1346,10 @@ impl CommandExecutionLedger {
             let Some(mut running) = state.process.running.remove(&process_id) else {
                 return CompletionApplyResult::Missing;
             };
-            running.completed_exit_code = Some(exit_code);
-            record_running_exit_locked(&mut state, &running, exit_code);
+            running.completed_exit_code = exit_code;
+            if let Some(exit_code) = exit_code {
+                record_running_exit_locked(&mut state, &running, exit_code);
+            }
             state.process.pending_by_execution_id.insert(
                 execution_id,
                 PendingCommandCompletion {
@@ -1324,7 +1388,8 @@ impl CommandExecutionLedger {
         insert_completion_receipt(
             &mut state,
             execution_id,
-            pending.command.parent_tool_execution_id,
+            pending.process_id,
+            pending.command,
         );
         while state.retry.attempts.len() > MAX_TRACKED_COMMANDS
             && evict_oldest_inactive_attempt_locked(&mut state)
@@ -1411,7 +1476,7 @@ impl CommandExecutionLedger {
                 running.completed_exit_code = Some(exit_code);
                 record_running_exit_locked(&mut state, &running, exit_code);
             }
-            insert_completion_receipt(&mut state, execution_id, running.parent_tool_execution_id);
+            insert_completion_receipt(&mut state, execution_id, process_id, running);
         } else if let Some(pending) = state.process.pending_by_execution_id.get(&execution_id) {
             if pending.process_id != process_id
                 || &pending.command.parent_tool_execution_id != parent_tool_execution_id
@@ -1424,7 +1489,8 @@ impl CommandExecutionLedger {
             insert_completion_receipt(
                 &mut state,
                 execution_id,
-                pending.command.parent_tool_execution_id,
+                pending.process_id,
+                pending.command,
             );
         } else {
             return CompletionApplyResult::Missing;
@@ -1464,7 +1530,8 @@ impl CommandExecutionLedger {
 fn insert_completion_receipt(
     state: &mut CommandExecutionState,
     execution_id: CommandExecutionId,
-    parent_tool_execution_id: ToolExecutionId,
+    process_id: u32,
+    command: RunningCommand,
 ) {
     if state
         .process
@@ -1476,7 +1543,11 @@ fn insert_completion_receipt(
     state.process.completion_receipts.insert(
         execution_id,
         CommandCompletionReceipt {
-            parent_tool_execution_id,
+            parent_tool_execution_id: command.parent_tool_execution_id,
+            process_id,
+            incarnation: command.incarnation,
+            exit_code: command.completed_exit_code,
+            artifact: command.artifact,
         },
     );
     state
@@ -1509,7 +1580,6 @@ fn debug_assert_command_execution_invariants(state: &CommandExecutionState) {
             .iter()
             .all(|(execution_id, pending)| {
                 pending.command.execution_id == *execution_id
-                    && pending.command.completed_exit_code.is_some()
                     && !state.process.completion_receipts.contains_key(execution_id)
                     && state
                         .process
@@ -1740,6 +1810,19 @@ mod tests {
     fn key(command: &str) -> CommandAttemptKey {
         let cwd = if cfg!(windows) { "C:/repo" } else { "/repo" };
         CommandAttemptKey::new("exec_command", "local", cwd, &[command.to_string()])
+    }
+
+    #[tokio::test]
+    async fn verified_running_validation_reuse_requires_exact_workspace_and_attempt() {
+        let ledger = CommandExecutionLedger::default();
+        let original = key("cargo test -p app").with_workspace_identity(Some("revision-a"));
+        ledger.track_running_process(42, original.clone(), RawOutputArtifact::unavailable("fixture")).await.unwrap();
+        assert_eq!(ledger.identical_running_process(&original).await.map(|(id, _)| id), Some(42));
+        assert!(ledger.identical_running_process(&key("cargo test -p app")).await.is_none());
+        assert!(ledger.identical_running_process(&key("cargo test -p app").with_workspace_identity(Some("revision-b"))).await.is_none());
+        assert!(ledger.identical_running_process(&original.clone().with_environment_fingerprint("changed")).await.is_none());
+        assert!(ledger.finish_running_process(42, Some(0)).await.accepted());
+        assert!(ledger.identical_running_process(&original).await.is_none());
     }
 
     fn initialize_git_repository(path: &Path) {
@@ -2109,6 +2192,7 @@ mod tests {
                 42,
                 key("first"),
                 RawOutputArtifact::unavailable("first"),
+                uuid::Uuid::new_v4(),
             )
             .await
             .expect("track first running process");
@@ -2140,6 +2224,7 @@ mod tests {
                 42,
                 key("second"),
                 RawOutputArtifact::unavailable("second"),
+                uuid::Uuid::new_v4(),
             )
             .await
             .expect("track second running process");
@@ -2189,6 +2274,7 @@ mod tests {
                 42,
                 first_key.clone(),
                 RawOutputArtifact::unavailable("first"),
+                uuid::Uuid::new_v4(),
             )
             .await
             .expect("track first running process");
@@ -2201,6 +2287,7 @@ mod tests {
                 42,
                 key("second"),
                 RawOutputArtifact::unavailable("second"),
+                uuid::Uuid::new_v4(),
             )
             .await
             .expect_err("a live process id must not be reassigned");
@@ -2227,6 +2314,7 @@ mod tests {
                 73,
                 key("sticky-exit"),
                 RawOutputArtifact::unavailable("sticky exit"),
+                uuid::Uuid::new_v4(),
             )
             .await
             .expect("track running process");
@@ -2494,8 +2582,18 @@ mod tests {
         );
         assert!(ledger.running_process(41).await.is_none());
         assert!(ledger.running_process(42).await.is_some());
+        assert!(ledger.completed_process_result(41, uuid::Uuid::new_v4()).await.is_none());
+        let recovered = ledger.completed_process_result(41, completed.incarnation).await.expect("terminal receipt");
+        assert_eq!(recovered["exit_code"], 7);
+        assert_eq!(recovered["process_exited"], true);
+        assert_eq!(recovered["output_complete"], false);
+        assert!(ledger.completed_process_result(42, completed.incarnation).await.is_none());
+        assert!(ledger.completed_process_result(99, completed.incarnation).await.is_none());
         assert_eq!(ledger.consecutive_failures(&completed_key).await, 1);
         assert_eq!(ledger.consecutive_failures(&live_key).await, 0);
+        ledger.track_running_process(41, completed_key, RawOutputArtifact::unavailable("reused"))
+            .await.unwrap();
+        assert!(ledger.completed_process_result(41, completed.incarnation).await.is_none());
     }
 
     #[test]
@@ -2681,6 +2779,7 @@ mod tests {
             std::fs::write(root.join("src/example.txt"), "present\n").unwrap();
             std::fs::write(root.join("patterns.txt"), "absent\n").unwrap();
             let command = std::iter::once("rg")
+                .chain(["--no-ignore-global", "--no-ignore-parent"])
                 .chain(pattern_args.iter().copied())
                 .chain(std::iter::once("src"))
                 .map(ToString::to_string)
@@ -2744,9 +2843,9 @@ mod tests {
         let root = fixture.path();
         std::fs::create_dir_all(root.join("codex-rs/core/src/tools")).unwrap();
         let argv = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
-        let narrow_command = argv(&["rg", "-n", "needle with space", "codex-rs/core/src/tools"]);
+        let narrow_command = argv(&["rg", "--no-ignore-global", "--no-ignore-parent", "-n", "needle with space", "codex-rs/core/src/tools"]);
         let equivalent_command =
-            argv(&["rg", "-n", "needle with space", "./codex-rs/core/src/tools"]);
+            argv(&["rg", "--no-ignore-global", "--no-ignore-parent", "-n", "needle with space", "./codex-rs/core/src/tools"]);
         let broad_command = argv(&["rg", "-n", "needle with space", "."]);
         let classify = |command: &[String], shell| {
             classify_rg_search_narrowing(command, shell, root, root)
@@ -2910,6 +3009,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn implicit_global_ignore_changes_never_replay_negative_searches() {
+        use crate::tools::handlers::command_search::{classify_rg_search_narrowing, observe_rg_search_scope_state};
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        let home = fixture.path().join("home");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(home.join(".config/git")).unwrap();
+        let ignore = home.join(".config/git/ignore");
+        std::fs::write(&ignore, "*.txt\n").unwrap();
+        std::fs::write(root.join("src/input.txt"), "needle\n").unwrap();
+        let command = ["rg", "needle", "src"].map(str::to_string).to_vec();
+        let run = || std::process::Command::new("rg").args(&command[1..]).current_dir(&root)
+            .env("HOME", &home).env("USERPROFILE", &home).env("XDG_CONFIG_HOME", home.join(".config"))
+            .env_remove("GIT_CONFIG_GLOBAL").env_remove("RIPGREP_CONFIG_PATH").output().unwrap();
+        let mut scope = classify_rg_search_narrowing(&command, None, &root, &root).unwrap().unwrap();
+        observe_rg_search_scope_state(&mut scope).await;
+        assert!(!scope.can_record_miss);
+        assert!(scope.scope_state_identity.is_none());
+        let key = CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
+            .with_search_narrowing("turn", "repo", Some(scope));
+        let ledger = CommandExecutionLedger::default();
+        assert_eq!(run().status.code(), Some(1));
+        ledger.record_exit(&key, 1).await;
+        std::fs::write(&ignore, "").unwrap();
+        ledger.begin_attempt(&key, false).await.expect("default global ignore inputs are unproven");
+        assert_eq!(run().status.code(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn external_preprocessor_output_changes_never_replay_negative_searches() {
+        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/input.py"), "from pathlib import Path\nprint(Path('output.txt').read_text())\n").unwrap();
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        for pre in [vec!["--pre".to_string(), python.to_string()], vec![format!("--pre={python}")]] {
+            let mut command = ["rg", "--no-ignore-global", "--no-ignore-parent"].map(str::to_string).to_vec();
+            command.extend(pre);
+            command.extend(["needle", "src"].map(str::to_string));
+            let scope = classify_rg_search_narrowing(&command, None, root, root).unwrap().unwrap();
+            assert!(!scope.can_record_miss);
+            let key = CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
+                .with_search_narrowing("turn", "repo", Some(scope));
+            let run = || std::process::Command::new("rg").args(&command[1..]).current_dir(root)
+                .env_remove("RIPGREP_CONFIG_PATH").output().unwrap();
+            std::fs::write(root.join("output.txt"), "absent").unwrap();
+            assert_eq!(run().status.code(), Some(1));
+            let ledger = CommandExecutionLedger::default();
+            ledger.record_exit(&key, 1).await;
+            std::fs::write(root.join("output.txt"), "needle").unwrap();
+            ledger.begin_attempt(&key, false).await.unwrap();
+            assert_eq!(run().status.code(), Some(0));
+        }
+    }
+
+    #[tokio::test]
     async fn external_ripgrep_config_changes_cannot_replay_a_cached_miss() {
         use crate::tools::handlers::command_search::classify_rg_search_narrowing;
         use crate::tools::handlers::command_search::observe_rg_search_scope_state;
@@ -2924,7 +3081,7 @@ mod tests {
             "RIPGREP_CONFIG_PATH".to_string(),
             config.to_string_lossy().into_owned(),
         )]);
-        let command = vec!["rg".to_string(), "needle".to_string(), ".".to_string()];
+        let command = ["rg", "--no-ignore-global", "--no-ignore-parent", "needle", "."].map(str::to_string).to_vec();
         let attempt = async || {
             let mut scope = classify_rg_search_narrowing(&command, None, &root, &root)
                 .unwrap()
@@ -2970,7 +3127,7 @@ mod tests {
         initialize_git_repository(&repository);
         std::fs::create_dir(repository.join("src")).unwrap();
         std::fs::write(repository.join("src/lib.rs"), "original content").unwrap();
-        let command = vec!["rg".to_string(), "needle".to_string(), "src".to_string()];
+        let command = ["rg", "--no-ignore-global", "--no-ignore-parent", "needle", "src"].map(str::to_string).to_vec();
         let search = async |turn_id: &str, repository_epoch: u64, workspace_identity: &str| {
             let mut scope = classify_rg_search_narrowing(&command, None, &repository, &repository)
                 .unwrap()

@@ -1,21 +1,469 @@
 use super::*;
 
+#[tokio::test]
+async fn verified10_remote_compaction_storage_failure_does_not_install_history() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let mut items = Vec::new();
+    for index in 0..COMPACTION_ARTIFACT_PIN_MAX_ITEMS + 5 {
+        let call = format!("retained-{index}");
+        let output = format!("retained canonical evidence {index}");
+        let mut record = candidate(&call, output.clone());
+        record.artifact_id = format!("artifact-{index}");
+        session.register_tool_history_candidate(record).await;
+        items.push(text_output(&call, output));
+    }
+    session.record_conversation_items(&turn, &items).await.unwrap();
+    let before = session.clone_history().await;
+    let window = session.current_window_id().await;
+    let reference = session.reference_context_item().await;
+    let home = session.codex_home().await;
+    let blocked = home.join("tool-output").join(session.thread_id().to_string());
+    assert!(!blocked.exists(), "the fixture must own a new artifact directory");
+    std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    std::fs::write(&blocked, "not a directory").unwrap();
+    let result = crate::compact_remote::process_compacted_history_with_retained_input(
+        &session, &turn, vec![ResponseItem::Compaction {
+            id: None, encrypted_content: "uninstalled".into(),
+            internal_chat_message_metadata_passthrough: None,
+        }], Vec::new(), &crate::compact::InitialContextInjection::DoNotInject,
+    ).await;
+    assert!(result.is_err());
+    assert_eq!(session.current_window_id().await, window);
+    assert_eq!(session.reference_context_item().await, reference);
+    assert_eq!(session.clone_history().await.raw_items(), before.raw_items());
+}
+
 #[test]
-fn evidence_budget_reserves_generation_and_obligation_room() {
+fn verified10_compaction_preserves_recency_across_sidecars() {
+    let mut state = ToolHistoryState::default();
+    let mut items = Vec::new();
+    for index in 0..40 {
+        let id = format!("opaque-{index:03}");
+        let mut record = candidate(&id, bounded_output());
+        record.artifact_id = format!("artifact-{index}");
+        state.register(record);
+        items.push(text_output(&id, bounded_output()));
+    }
+    let first = state.artifact_pin_payload_for_items(&items).unwrap();
+    let first_value: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(first_value["artifacts"][0]["call_id"], "opaque-039");
+    let second = state.artifact_pin_payload_for_items(&[text_output("sidecar", first)]).unwrap();
+    let second_value: serde_json::Value = serde_json::from_str(&second).unwrap();
+    let call_ids = |value: &serde_json::Value| value["artifacts"].as_array().unwrap()
+        .iter().map(|pin| pin["call_id"].clone()).collect::<Vec<_>>();
+    assert_eq!(call_ids(&second_value), call_ids(&first_value));
+    let mut record = candidate("aaa-newest", bounded_output());
+    record.artifact_id = "latest-artifact".into();
+    state.register(record);
+    let third = state.artifact_pin_payload_for_items(&[
+        text_output("sidecar", second), text_output("aaa-newest", bounded_output()),
+    ]).unwrap();
+    let third: serde_json::Value = serde_json::from_str(&third).unwrap();
+    assert_eq!(third["artifacts"][0]["call_id"], "aaa-newest");
+}
+
+#[test]
+fn verified10_read_status_recovers_all_snapshots_and_disjoint_ranges() {
+    let path = PathBuf::from("never-open-this-source");
+    let mut state = ToolHistoryState::default();
+    for version in 0..9 {
+        let output = serde_json::json!({
+            "path":path, "environment_id":"local", "canonical_uri":"file:///source",
+            "source_sha256":format!("hash-{version}"), "canonical_bytes":140,
+            "results":(0..70).map(|index| serde_json::json!({
+                "status":"ok", "complete":true, "text":"x",
+                "canonical_range":{"start":index*2,"end":index*2+1}
+            })).collect::<Vec<_>>()
+        });
+        let mut entry = candidate(&format!("read-{version}"), output.to_string());
+        entry.tool_identity = "read_file".into();
+        state.register(entry);
+    }
+    let report = state.read_status(&[path.clone()], Some("local"), &[]);
+    assert_eq!(report["paths"][0]["next_snapshot_offset"], 8);
+    let query = ReadStatusQuery { snapshot_offset:8, ..Default::default() };
+    let tail = state.read_status_page(&[path.clone()], Some("local"), &[], &query);
+    assert_eq!(tail["paths"][0]["snapshots"].as_array().unwrap().len(), 1);
+    let snapshot = &tail["paths"][0]["snapshots"][0];
+    assert_eq!(report["paths"][0]["snapshots"][0]["source_sha256"], "hash-8");
+    assert_eq!(snapshot["source_sha256"], "hash-0");
+    assert_eq!(snapshot["next_range_offset"], 64);
+    let query = ReadStatusQuery { snapshot_id: snapshot["snapshot_id"].as_str().map(str::to_string),
+        range_offset:64, ..Default::default() };
+    let tail_ranges = state.read_status_page(&[path.clone()], Some("local"), &[], &query);
+    let tail_snapshot = &tail_ranges["paths"][0]["snapshots"][0];
+    assert_eq!(tail_snapshot["obtained_ranges"].as_array().unwrap().len(), 6);
+    assert_eq!(tail_snapshot["unread_ranges"].as_array().unwrap().len(), 6);
+    assert!(tail_snapshot["next_range_offset"].is_null());
+    for version in 0..9 {
+        let query = ReadStatusQuery { source_sha256:Some(format!("hash-{version}")), ..Default::default() };
+        let selected = state.read_status_page(&[path.clone()], Some("local"), &[], &query);
+        assert_eq!(selected["paths"][0]["snapshots"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn read_status_prioritizes_observation_recency_and_selects_historical_hashes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    let mut state = ToolHistoryState::default();
+    for index in 0..12 {
+        let call = format!("call-{}", 100 - index);
+        let output = serde_json::json!({"path":path, "environment_id":"local", "canonical_uri":"file:///source.rs",
+            "source_sha256":format!("hash-{index:02}"), "canonical_bytes":1,
+            "results":[{"status":"ok", "complete":true, "canonical_range":{"start":0,"end":1}, "text":"x"}]});
+        let mut entry = candidate(&call, output.to_string());
+        entry.tool_identity = "read_file".into();
+        entry.source_dependencies_current = false;
+        ToolHistoryMutation::RegisterCandidate { candidate: entry }.apply(&mut state);
+    }
+    let persisted = serde_json::to_value(&state).unwrap();
+    let mut state: ToolHistoryState = serde_json::from_value(persisted.clone()).unwrap();
+    let latest = state.read_status(&[path.clone()], Some("local"), &[]);
+    assert_eq!(latest["paths"][0]["snapshots"][0]["source_sha256"], "hash-11");
+    assert_eq!(latest["paths"][0]["snapshots"][0]["freshness"], "invalidated");
+    assert_eq!(latest["paths"][0]["omitted_snapshots"], 4);
+    let selected = state.read_status_page(&[path.clone()], Some("local"), &[], &ReadStatusQuery {
+        source_sha256: Some("hash-00".into()), ..Default::default()
+    });
+    assert_eq!(selected["paths"][0]["snapshots"].as_array().unwrap().len(), 1);
+    assert_eq!(selected["paths"][0]["snapshots"][0]["source_sha256"], "hash-00");
+    assert_eq!(serde_json::to_value(&state).unwrap(), persisted);
+    let mut legacy = persisted;
+    legacy.as_object_mut().unwrap().remove("observation_order");
+    let legacy: ToolHistoryState = serde_json::from_value(legacy).unwrap();
+    let report = legacy.read_status(&[path], Some("local"), &[]);
+    assert_eq!(report["paths"][0]["snapshots"][0]["observation_recency"], "unknown");
+    state.retain_for_history(&[]);
+    assert!(state.observation_order.is_empty());
+}
+
+#[tokio::test]
+async fn dependency_notices_distinguish_changed_current_and_unverified_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("a.rs");
+    let b = root.path().join("b.rs");
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    let cache = GitWorkspaceCache::new();
+    let watches = cache.begin_source_path_change_observations(root.path(), &[(a.clone(), false), (b.clone(), false)])
+        .await.unwrap();
+    let mut identity = workspace_identity("captured");
+    identity.repository_root = Some(root.path().to_string_lossy().into_owned());
+    let output = serde_json::json!({"environment_id":"local"}).to_string();
+    let observation = WorkspaceEvidenceObservation::from_response_item(Some(identity.clone()),
+        &text_output("read", output.clone()), BTreeSet::from([
+            SourceDependencyV1::new(&a, false), SourceDependencyV1::new(&b, false),
+        ])).unwrap().with_source_path_observations(watches);
+    cache.note_host_workspace_mutation_paths(root.path(), &["a.rs".into()]).await;
+    let scope = observation.dependency_notice(&output, Some(&identity), Some(&cache));
+    assert_eq!(scope["dependencies"][0]["path"], SourceDependencyV1::new(&a, false).path);
+    assert_eq!(scope["dependencies"][0]["freshness"], "changed");
+    assert_eq!(scope["dependencies"][1]["freshness"], "current");
+    assert_eq!(scope["dependencies"][0]["environment_id"], "local");
+    let unknown = observation.dependency_notice(&output, Some(&identity), None);
+    assert!(unknown["dependencies"].as_array().unwrap().iter().all(|row| row["freshness"] == "unknown"));
+    let mut bounded = observation;
+    bounded.source_dependencies = (0..12).map(|index|
+        SourceDependencyV1::new(&root.path().join(format!("{index}.rs")), false)).collect();
+    assert_eq!(bounded.dependency_notice("{}", None, None)["omitted_dependencies"], 4);
+}
+
+#[tokio::test]
+async fn verified10_segmented_history_survives_resume_fork_and_boundary_recovery() {
+    let home = tempfile::tempdir().unwrap();
+    let boundary = 16 * 1024 * 1024;
+    let canonical = CanonicalToolResult::text("x".repeat(boundary + 32));
+    let artifact = create_canonical_output_artifact(home.path(), "parent", &canonical).await;
+    assert!(artifact.complete);
+    let id = artifact.artifact_id().unwrap();
+    protect_active_tool_history_artifact(home.path(), "parent", &id, canonical.exact_bytes, &canonical.sha256).await.unwrap();
+    let mut record = candidate("segmented", bounded_output());
+    record.artifact_id = id.clone();
+    record.artifact_bytes = canonical.exact_bytes;
+    record.artifact_sha256 = canonical.sha256;
+    record.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 1 });
+    let mut state = ToolHistoryState::default();
+    state.register(record);
+    persist_tool_history_state(home.path(), "parent", &state).await.unwrap();
+    let resumed = expect_loaded_tool_history(load_tool_history_state(home.path(), "parent").await);
+    assert_eq!(resumed.candidates.len(), 1);
+    let (forked, dropped) = remint_tool_history_state_for_fork(home.path(), "parent", "child", resumed).await;
+    assert_eq!(dropped, 0);
+    persist_tool_history_state(home.path(), "child", &forked).await.unwrap();
+    let restored = expect_loaded_tool_history(load_tool_history_state(home.path(), "child").await);
+    assert_eq!(restored.candidates.len(), 1);
+    let result = crate::tools::command_output_artifact::read_tool_output_selectors(
+        home.path(), "child", &id, vec![crate::tools::command_output_artifact::ToolOutputSelector::Bytes {
+            start: boundary as u64 - 16, end: boundary as u64 + 16,
+        }],
+    ).await.unwrap();
+    assert!(result.complete);
+    assert_eq!(result.results[0].text.as_deref(), Some("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+    let segment = home.path().join("tool-output/child").join(format!("{id}.segment-000001.log"));
+    // Use the actual advertised segment filename, without assuming its format.
+    let segment = std::fs::read_dir(segment.parent().unwrap()).unwrap().map(|entry| entry.unwrap().path())
+        .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(&format!("{id}.segment-"))).unwrap();
+    std::fs::write(segment, "corrupt").unwrap();
+    assert!(crate::tools::command_output_artifact::verify_tool_history_artifact(
+        home.path(), "child", &id, canonical.exact_bytes, &restored.candidates["segmented"].artifact_sha256,
+    ).await.is_err());
+}
+
+#[test]
+fn verified10_nested_read_coverage_survives_compaction_without_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    let output = serde_json::json!({"path":path, "environment_id":"local", "canonical_uri":"file:///source.rs",
+        "source_sha256":"hash", "canonical_bytes":8_000, "artifact_id":"source-snapshot",
+        "retained_artifact_complete":true, "file_complete":true,
+        "results":[{"status":"ok", "complete":true, "canonical_range":{"start":0,"end":8_000},
+            "text":"x".repeat(8_000)}]});
+    let pin = compact_read_evidence(&output);
+    assert!(pin.to_string().len() < 1_024);
+    let mut state = ToolHistoryState::default();
+    let observation = WorkspaceEvidenceObservation::from_response_item(None,
+        &text_output("nested", output.to_string()), BTreeSet::from([SourceDependencyV1::new(&path, false)])).unwrap();
+    ToolHistoryMutation::RegisterWorkspaceEvidence { observation }.apply(&mut state);
+    ToolHistoryMutation::RegisterArtifactOrigin { artifact_id:"source-snapshot".into(), call_id:"nested".into(),
+        bytes:8_000, sha256:"hash".into() }.apply(&mut state);
+    ToolHistoryMutation::RegisterCodeModeNestedEvidence { parent_call_id:"cell".into(), call_id:"nested".into(), output:pin.to_string() }.apply(&mut state);
+    let before = state.read_status(&[path.clone()], Some("local"), &[]);
+    assert_eq!(before["paths"][0]["snapshots"][0]["coverage"], "full");
+    state.retain_for_history(&[text_output("compact", pin.to_string())]);
+    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+    assert_eq!(restored.read_status(&[path], Some("local"), &[]), before);
+}
+
+#[tokio::test]
+async fn adjacent_recovery_pages_coalesce_before_persistence_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let canonical = CanonicalToolResult::text("x".repeat(650));
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let mut record = candidate("source", bounded_output());
+    record.artifact_id = artifact.artifact_id().unwrap();
+    record.artifact_bytes = canonical.exact_bytes;
+    record.artifact_sha256 = canonical.sha256;
+    let id = record.artifact_id.clone();
+    let mut state = ToolHistoryState::default();
+    state.register(record);
+    for page in 0..65 {
+        assert!(ToolHistoryMutation::RecordArtifactRecovery { artifact_id:id.clone(),
+            recovery_call_id:format!("page-{page}"), selectors:vec![serde_json::json!({
+                "kind":"bytes", "start":page * 10, "end":(page + 1) * 10})] }.apply(&mut state));
+    }
+    let expected = vec![serde_json::json!({"kind":"bytes", "start":0, "end":650})];
+    assert_eq!(state.recovered_ranges["source"], expected);
+    persist_tool_history_state(temp.path(), "thread", &state).await.unwrap();
+    let mut restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
+    assert_eq!(restored.recovered_ranges["source"], expected);
+    assert!(!ToolHistoryMutation::RecordArtifactRecovery { artifact_id:id,
+        recovery_call_id:"source".into(), selectors:vec![serde_json::json!({
+            "kind":"bytes", "start":10, "end":20})] }.apply(&mut restored));
+}
+
+#[test]
+fn forgotten_recovery_coverage_is_unknown_not_unread() {
+    let path = PathBuf::from("source.txt");
+    let mut record = candidate("source", serde_json::json!({"path":path, "source_sha256":"hash",
+        "canonical_bytes":200, "results":[]}).to_string());
+    record.tool_identity = "read_file".into();
+    let id = record.artifact_id.clone();
+    let mut state = ToolHistoryState::default();
+    state.register(record);
+    for page in 0..65 {
+        ToolHistoryMutation::RecordArtifactRecovery { artifact_id:id.clone(),
+            recovery_call_id:"page".into(), selectors:vec![serde_json::json!({
+                "kind":"bytes", "start":page * 2, "end":page * 2 + 1})] }.apply(&mut state);
+    }
+    assert_eq!(state.recovered_ranges["source"].len(), 64);
+    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+    let report = restored.read_status(&[path], None, &[]);
+    let snapshot = &report["paths"][0]["snapshots"][0];
+    assert_eq!(snapshot["coverage_history_complete"], false);
+    assert_eq!(snapshot["unread_ranges"], serde_json::json!([]));
+    assert!(!snapshot["unknown_ranges"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stale_validation_pin_survives_compaction_and_restart_without_rerun() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("input.rs");
+    let text = bounded_output();
+    let canonical = CanonicalToolResult::text(text.clone());
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let mut record = candidate("validation", text.clone());
+    record.artifact_id = artifact.artifact_id().unwrap();
+    record.artifact_bytes = canonical.exact_bytes;
+    record.artifact_sha256 = canonical.sha256;
+    record.source_dependencies.insert(SourceDependencyV1::new(&source, false));
+    record.consumed_by_generation = Some(ModelGenerationId { turn_id:"turn".into(), ordinal:1 });
+    let mut state = ToolHistoryState::default();
+    state.register(record);
+    assert_eq!(state.candidates["validation"].artifact_pin_value().unwrap()["source_dependencies_current"], true);
+    assert!(state.invalidate_source_dependencies(Some(&BTreeSet::from([source])), None));
+    let pins = state.artifact_pin_payload_for_items(&[text_output("validation", text)]).unwrap();
+    let pin: serde_json::Value = serde_json::from_str(&pins).unwrap();
+    assert_eq!(pin["artifacts"][0]["successful"], true);
+    assert_eq!(pin["artifacts"][0]["source_dependencies_current"], false);
+    state.retain_for_history(&[text_output("compacted", pins)]);
+    persist_tool_history_state(temp.path(), "thread", &state).await.unwrap();
+    let restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
+    let pin = restored.candidates["validation"].artifact_pin_value().unwrap();
+    assert_eq!(pin["successful"], true);
+    assert_eq!(pin["source_dependencies_current"], false);
+    assert_eq!(pin["artifact_id"], state.candidates["validation"].artifact_id);
+}
+
+#[test]
+fn receipt_digest_preserves_decisive_diagnostic_at_any_position() {
+    for position in [11, 333, 880] {
+        let mut lines = vec!["compiler boilerplate"; 1000];
+        lines[position] = "error: decisive counterexample: alias overwrote source A";
+        for output in [lines.join("\n"), serde_json::json!({"output":lines.join("\n"), "exit_code":1}).to_string()] {
+            let mut record = candidate("failure", output);
+            record.successful = false;
+            record.refresh_derived();
+            let receipt: serde_json::Value = serde_json::from_str(record.admission_receipt().unwrap().1).unwrap();
+            assert!(receipt["digest"].as_str().unwrap().contains("decisive counterexample"));
+            assert!(record.artifact_pin_value().unwrap()["digest"].as_str().unwrap().contains("decisive counterexample"));
+        }
+    }
+    let record = candidate("selection", serde_json::json!({"output":"boilerplate".repeat(4000),
+        "results":[{"selector":{"kind":"lines","start":1,"end":2},
+            "status":"not_found", "message":"decisive selection error"}]}).to_string());
+    assert!(record.artifact_pin_value().unwrap()["digest"].as_str().unwrap().contains("decisive selection error"));
+}
+
+#[test]
+fn recovered_detail_preference_ends_after_turn_or_compact_exposure() {
+    let mut state = ToolHistoryState::default();
+    state.recovered_call_ids.insert("page".into());
+    state.mark_consumed(&[text_output("page", "small recovered detail".into())],
+        ModelGenerationId { turn_id:"first".into(), ordinal:1 });
+    assert!(state.reuse_priority("page", 5) < state.reuse_priority("cold", 5));
+    state.mark_consumed(&[text_output("next", "new investigation".into())],
+        ModelGenerationId { turn_id:"second".into(), ordinal:1 });
+    assert_eq!(state.reuse_priority("page", 5), state.reuse_priority("cold", 5));
+    state.exposed_representations.insert("page".into(), ExposedRepresentation::Compact { sha256: "pin".into() });
+    assert_eq!(state.reuse_priority("page", 5), state.reuse_priority("cold", 5));
+}
+
+#[test]
+fn read_status_keeps_environments_and_legacy_observations_separate() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    let mut state = ToolHistoryState::default();
+    for (call, environment, start, end) in [
+        ("one", Some("env-a"), 0, 5), ("two", Some("env-b"), 5, 10),
+        ("legacy-one", None, 0, 5), ("legacy-two", None, 5, 10),
+    ] {
+        let value = serde_json::json!({"path":path, "source_sha256":"same", "canonical_bytes":10,
+            "environment_id":environment, "canonical_uri":environment.map(|_| "file:///source.rs"),
+            "results":[{"status":"ok", "complete":true,
+                "canonical_range":{"start":start,"end":end}, "text":"x".repeat(end-start)}]});
+        let mut entry = candidate(call, value.to_string());
+        entry.tool_identity = "read_file".into();
+        state.register(entry);
+    }
+    let report = state.read_status(&[path.clone()], None, &[]);
+    let snapshots = report["paths"][0]["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 4);
+    assert!(snapshots.iter().all(|row| row["coverage"] == "partial" && row["obtained_bytes"] == 5));
+    let filtered = state.read_status(&[path], Some("env-a"), &[]);
+    assert!(filtered["paths"][0]["snapshots"].as_array().unwrap().iter()
+        .all(|row| row["environment_id"] != "env-b"));
+}
+
+#[test]
+fn read_status_merges_only_same_snapshot_and_retains_unknown_and_stale_states() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    let mut state = ToolHistoryState::default();
+    for (call, hash, start, end, current) in [
+        ("first", "a", 0, 4, true), ("second", "a", 4, 8, true),
+        ("old", "b", 0, 2, false),
+    ] {
+        let value = serde_json::json!({"path":path, "source_sha256":hash, "canonical_bytes":10,
+            "environment_id":"local", "canonical_uri":"file:///source.rs",
+            "artifact_id":format!("snapshot-{call}"), "retained_artifact_complete":true,
+            "results":[{"status":"ok", "complete":true,
+                "canonical_range":{"start":start, "end":end}, "text":"x".repeat(end-start)}]});
+        let mut entry = candidate(call, value.to_string());
+        entry.tool_identity = "read_file".into();
+        entry.source_dependencies_current = current;
+        state.register(entry);
+    }
+    state.recovered_ranges.insert("second".into(), vec![serde_json::json!({"kind":"bytes","start":8,"end":10})]);
+    let persisted = serde_json::to_value(&state).unwrap();
+    let restored: ToolHistoryState = serde_json::from_value(persisted.clone()).unwrap();
+    let report = restored.read_status(&[path, root.path().join("unread.rs")], Some("local"), &[]);
+    let snapshots = report["paths"][0]["snapshots"].as_array().unwrap();
+    let full = snapshots.iter().find(|row| row["source_sha256"] == "a").unwrap();
+    let partial = snapshots.iter().find(|row| row["source_sha256"] == "b").unwrap();
+    assert_eq!(full["coverage"], "full");
+    assert_eq!(full["obtained_bytes"], 10);
+    assert_eq!(partial["coverage"], "partial");
+    assert_eq!(partial["freshness"], "invalidated");
+    assert_eq!(report["paths"][1]["status"], "unknown");
+    assert_eq!(serde_json::to_value(restored).unwrap(), persisted, "read-only query");
+}
+
+#[test]
+fn evidence_budget_reserves_generation_room_without_plan_authority() {
     let mut state = ToolHistoryState::default();
     let mut reusable = candidate("reusable", "retained source\n".repeat(100));
     reusable.consumed_by_generation = Some(ModelGenerationId {
         turn_id: "previous".into(), ordinal: 1,
     });
     state.register(reusable);
-    let baseline = state.task_sensitive_tool_result_budget(100_000, 0, 4096, 0);
-    let pressured = state.task_sensitive_tool_result_budget(100_000, 90_000, 8192, 20);
-    assert!(pressured < baseline, "evidence must leave room for generation and active obligations");
-    assert!(pressured <= 100_000 - 8192 - 20 * 128);
+    let baseline = state.task_sensitive_tool_result_budget(100_000, 0, 4096);
+    let pressured = state.task_sensitive_tool_result_budget(100_000, 90_000, 8192);
+    assert!(pressured < baseline, "evidence must leave room for generation");
+    assert!(pressured <= 100_000 - 8192);
     state.recovered_call_ids.insert("reusable".into());
-    let reusable_budget = state.task_sensitive_tool_result_budget(100_000, 0, 4096, 1);
+    let reusable_budget = state.task_sensitive_tool_result_budget(100_000, 0, 4096);
     assert!(reusable_budget >= baseline);
     assert!(reusable_budget <= model_visible_tool_result_token_budget());
+}
+
+#[tokio::test]
+async fn recovered_evidence_budget_is_identical_with_pending_completed_and_absent_plans() {
+    use codex_protocol::plan_tool::PlanItemArg;
+    use codex_protocol::plan_tool::StepStatus;
+    use codex_protocol::plan_tool::UpdatePlanArgs;
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let mut state = ToolHistoryState::default();
+    // The recovered detail and its originating artifact are distinct calls.
+    // Recent recovery may prefer the detail, never promote its whole producer.
+    let mut origin = candidate("origin", "canonical source".into());
+    origin.consumed_by_generation = Some(ModelGenerationId { turn_id: "old".into(), ordinal: 1 });
+    state.register(origin);
+    state.consumption_turns.push("old".into());
+    let mut evidence = candidate("recovered", "source ".repeat(20_000));
+    evidence.consumed_by_generation = Some(ModelGenerationId { turn_id: "old".into(), ordinal: 1 });
+    state.register(evidence);
+    let baseline = state.task_sensitive_tool_result_budget(100_000, 0, 4096);
+    state.recovered_call_ids.insert("recovered".into());
+    let expected = state.task_sensitive_tool_result_budget(100_000, 0, 4096);
+    assert!(expected > baseline, "fixture must exercise recovered evidence preference");
+    {
+        let mut owner = session.lock_history_state_for_test().await;
+        owner.history.set_token_info(Some(codex_protocol::protocol::TokenUsageInfo {
+            model_context_window: Some(100_000),
+            total_token_usage: Default::default(),
+            last_token_usage: Default::default(),
+        }));
+        owner.history.set_tool_history_state(state);
+    }
+    for status in [Some(StepStatus::Pending), Some(StepStatus::Completed), None] {
+        session.services.plan_store.restore(status.map(|status| UpdatePlanArgs {
+            explanation: None,
+            plan: vec![PlanItemArg { step: "Investigate".into(), status }],
+        })).await;
+        assert_eq!(session.clone_history().await.tool_history_state()
+            .configured_model_visible_tool_result_token_budget(), Some(expected));
+    }
 }
 
 #[tokio::test]
@@ -226,8 +674,8 @@ async fn long_session_prompt_pressure_comparison() {
     );
 
     // The next task uses the real sampling owner, including restart recovery.
-    // Unlike a phase checkpoint, an explicit final answer + new user boundary
-    // needs no additional model round to retire the completed task's evidence.
+    // A final answer plus review-to-fix continuation is not a checkpoint. The
+    // same evidence stays directly usable without manufactured recovery calls.
     persist_tool_history_state(home.path(), "pressure", &original).await.unwrap();
     let restored = expect_loaded_tool_history(load_tool_history_state(home.path(), "pressure").await);
     let mut history = crate::context_manager::ContextManager::new();
@@ -249,33 +697,40 @@ async fn long_session_prompt_pressure_comparison() {
         crate::stable_context::StableContextTarget::Sampling, None, &cache,
     );
     assert!(sampled.items().contains(&text_output("active", active)));
+    let continuation_started = std::time::Instant::now();
+    let mut continuation_recovery_calls = 0;
     for index in 0..18 {
         let id = format!("completed-{index}");
         let (_, text) = sampled.items().iter().filter_map(canonical_textual_output_identity)
             .find(|(call_id, _)| *call_id == id).unwrap();
+        if index != 0 {
+            assert_eq!(text, source, "review-to-implementation needs no recovery");
+            continue;
+        }
+        // Only the explicitly checkpointed result was retired. Keep its exact
+        // recovery proof without reconstructing the other seventeen results.
         let pin: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(pin["kind"], "tool_history_artifact_pin");
-        assert_eq!(pin["call_id"], id);
-        assert!(pin["tool_identity"].is_string());
-        assert!(pin["semantic_class"].is_string());
-        assert_eq!(pin["bytes"], source.len());
-        assert_eq!(pin["sha256"], sha256(source.as_bytes()));
+        let artifact_id = &original.candidates[&id].artifact_id;
         assert_eq!(read_exact_tool_output_artifact(
-            home.path(), "pressure", pin["artifact_id"].as_str().unwrap(),
+            home.path(), "pressure", artifact_id,
         ).await.unwrap(), source.as_bytes());
         let (recovered, _) = crate::tools::handlers::execute_recovery_transaction(
-            home.path(), "pressure", pin["artifact_id"].as_str().unwrap(),
+            home.path(), "pressure", artifact_id,
             vec![ToolOutputSelector::Lines { start: 1, end: 2 }], false,
         ).await.unwrap();
+        continuation_recovery_calls += 1;
         assert!(recovered.complete);
         assert_eq!(recovered.results[0].text.as_deref().unwrap().lines().collect::<Vec<_>>(),
             source.lines().take(2).collect::<Vec<_>>());
     }
     let tokens = |items: &[ResponseItem]| items.iter().filter_map(canonical_textual_output_identity)
         .map(|(_, text)| codex_utils_output_truncation::model_token_count(&text)).sum::<usize>();
-    assert!(tokens(sampled.items()) * 2 < tokens(&canonical));
+    assert_eq!(continuation_recovery_calls, 1);
+    assert!(tokens(sampled.items()) < tokens(&canonical));
     assert_eq!(history.raw_items(), canonical, "canonical evidence remains unchanged");
-    eprintln!("completed-task-projection input_tool_tokens_before={} after={}", tokens(&canonical), tokens(sampled.items()));
+    eprintln!("review-to-implementation continuation_ms={} actual_model_requests=0 recovery_calls={continuation_recovery_calls} input_tool_tokens_before={} after={} live_model_correctness=unmeasured",
+        continuation_started.elapsed().as_secs_f64() * 1000.0, tokens(&canonical), tokens(sampled.items()));
 }
 
 #[test]
@@ -296,6 +751,61 @@ fn task_sensitive_budget_reserves_unread_evidence_and_releases_it_after_consumpt
 }
 
 #[test]
+fn checkpoint_does_not_grant_contract_provenance_to_printed_text() {
+    let mut state = ToolHistoryState::default();
+    for id in ["ordinary", "lookup", "source-marker", "unread-schema"] {
+        let mut entry = candidate(id, bounded_output());
+        entry.artifact_id = format!("artifact-{id}");
+        entry.consumed_by_generation = Some(ModelGenerationId {
+            turn_id: "turn".into(), ordinal: 1,
+        });
+        if id != "ordinary" {
+            entry.tool_identity = "functions.exec".into();
+            entry.bounded_model_output.push_str(&serde_json::json!({
+                "name":"sample", "description":"exec tool declaration:\n```ts\ndeclare const tools: { sample(): void };\n```"
+            }).to_string());
+        }
+        if id == "unread-schema" {
+            entry.consumed_by_generation = None;
+        }
+        if id == "source-marker" {
+            entry.bounded_model_output.push_str("\n// source containing exec tool declaration:\n");
+        }
+        state.register(entry);
+    }
+    assert!(state.candidates["ordinary"].checkpoint_pin().is_some());
+    assert!(state.candidates["lookup"].checkpoint_pin().is_some());
+    assert!(state.candidates["source-marker"].checkpoint_pin().is_some());
+    assert!(state.candidates["unread-schema"].checkpoint_pin().is_none());
+    assert_ne!(state.phase_checkpoint_receipts(&["lookup".into()]).unwrap(), serde_json::json!({}));
+    assert!(state.candidates["lookup"].bounded_model_output.contains("declare const tools"));
+}
+
+#[test]
+fn consumed_failure_keeps_receipt_without_displacing_corrected_evidence() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(3_000);
+    let mut state = ToolHistoryState::default();
+    let mut failed = candidate("bad-selector", "invalid selector diagnostic\n".repeat(4_000));
+    failed.successful = false;
+    failed.consumed_by_generation = Some(ModelGenerationId { turn_id: "turn".into(), ordinal: 1 });
+    let artifact = failed.artifact_id.clone();
+    let old = failed.bounded_model_output.clone();
+    state.register(failed);
+    let current = "required corrected selection\n".repeat(300);
+    state.register(candidate("correct-selector", current.clone()));
+    let projected = state.project(Arc::from([
+        function_call("bad-selector"), text_output("bad-selector", old),
+        function_call("correct-selector"), text_output("correct-selector", current.clone()),
+    ]));
+    let outputs = projected.items.iter().filter_map(textual_output_identity).collect::<BTreeMap<_, _>>();
+    assert_eq!(outputs["correct-selector"], current);
+    let receipt: serde_json::Value = serde_json::from_str(outputs["bad-selector"]).unwrap();
+    assert_eq!(receipt["artifact_id"], artifact);
+    assert_eq!(receipt["successful"], false);
+    assert!(state.failure_resolution(&state.candidates["bad-selector"]).is_none());
+}
+
+#[test]
 fn phase_checkpoint_leaves_tiny_results_inline() {
     let mut state = ToolHistoryState::default();
     for text in ["ok".to_string(), "x".repeat(900), " ".repeat(2_000)] {
@@ -312,219 +822,6 @@ fn phase_checkpoint_leaves_tiny_results_inline() {
     }
 }
 
-#[tokio::test]
-async fn checkpoint_handler_boundaries_and_retained_artifacts() {
-    use crate::tools::context::ToolInvocation;
-    use crate::tools::handlers::ContextCheckpointHandler;
-    use crate::tools::registry::ToolExecutor;
-    use crate::tools::router::ToolCallSource;
-    use codex_tools::ToolName;
-    use serde_json::json;
-    let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
-    let mut active_artifact = String::new();
-    let mut completed_artifact = String::new();
-    for (id, successful, consumed) in [
-        ("done", true, true),
-        ("active", false, false),
-        ("tiny", true, true),
-        ("invalid-artifact", true, true),
-    ] {
-        let output = if id == "tiny" {
-            "ok".into()
-        } else {
-            codex_utils_output_truncation::truncate_text(
-                &bounded_output(),
-                turn.model_info.truncation_policy.into(),
-            )
-        };
-        let canonical = CanonicalToolResult::text(output.clone());
-        let artifact = create_canonical_output_artifact(
-            &turn.config.codex_home,
-            &session.thread_id.to_string(),
-            &canonical,
-        )
-        .await;
-        let mut entry = candidate(id, output.clone());
-        entry.artifact_id = artifact.artifact_id().unwrap();
-        entry.artifact_bytes = canonical.exact_bytes;
-        entry.artifact_sha256 = canonical.sha256;
-        if id == "invalid-artifact" {
-            entry.artifact_sha256 = "0".repeat(64);
-        }
-        entry.successful = successful;
-        if consumed {
-            entry.consumed_by_generation = Some(ModelGenerationId {
-                turn_id: "turn".into(),
-                ordinal: 0,
-            });
-        }
-        if id == "active" {
-            active_artifact = entry.artifact_id.clone();
-        }
-        if id == "done" {
-            completed_artifact = entry.artifact_id.clone();
-        }
-        session.register_tool_history_candidate(entry).await;
-        session
-            .record_conversation_items(&turn, &[function_call(id), text_output(id, output)])
-            .await
-            .unwrap();
-    }
-    for (name, completed, retained, summary, expected) in [
-        (
-            "unknown",
-            vec![String::from("unknown")],
-            vec![],
-            "".into(),
-            None,
-        ),
-        (
-            "unread-failure",
-            vec!["active".into()],
-            vec![],
-            "".into(),
-            None,
-        ),
-        (
-            "overlap",
-            vec!["done".into()],
-            vec!["done".into()],
-            "".into(),
-            None,
-        ),
-        (
-            "artifact-alias-overlap",
-            vec!["done".into()],
-            vec![completed_artifact],
-            "".into(),
-            None,
-        ),
-        (
-            "unknown-retained",
-            vec!["done".into()],
-            vec!["missing".into()],
-            "".into(),
-            None,
-        ),
-        (
-            "unrecoverable-retained",
-            vec!["done".into()],
-            vec!["invalid-artifact".into()],
-            "".into(),
-            None,
-        ),
-        (
-            "oversized",
-            vec!["done".into()],
-            vec![],
-            "x".repeat(8193),
-            None,
-        ),
-        (
-            "too-many-retained",
-            vec!["done".into()],
-            vec!["active".into(); 33],
-            "".into(),
-            None,
-        ),
-        (
-            "long-reference",
-            vec!["done".into()],
-            vec!["x".repeat(257)],
-            "".into(),
-            None,
-        ),
-        ("empty", vec![], vec![], " \n\t".into(), Some(false)),
-        ("tiny", vec!["tiny".into()], vec![], "".into(), Some(false)),
-        (
-            "valid",
-            vec!["done".into()],
-            vec![active_artifact.clone()],
-            "done, active failure remains".into(),
-            Some(true),
-        ),
-        (
-            "repeat",
-            vec!["done".into()],
-            vec!["active".into()],
-            "duplicate".into(),
-            Some(false),
-        ),
-    ] {
-        let before = session.clone_history().await.raw_items().len();
-        let mut arguments = json!({"completed_call_ids":completed,"retained_evidence":retained,"summary":summary,"active_work":""});
-        if name == "valid" {
-            arguments["answered_questions"] = json!([{
-                "question": "Which evidence completed?", "answer": "The done call.",
-                "evidence_refs": ["done"],
-            }]);
-        }
-        let payload = ToolPayload::Function { arguments: arguments.to_string() };
-        let result = ContextCheckpointHandler
-            .handle(ToolInvocation {
-                session: Arc::clone(&session),
-                step_context: crate::session::step_context::StepContext::for_test(Arc::clone(
-                    &turn,
-                )),
-                cancellation_token: Default::default(),
-                tracker: Arc::new(tokio::sync::Mutex::new(
-                    crate::turn_diff_tracker::TurnDiffTracker::new(),
-                )),
-                call_id: name.into(),
-                tool_name: ToolName::plain("context_checkpoint"),
-                source: ToolCallSource::Direct,
-                payload: payload.clone(),
-            })
-            .await;
-        match expected {
-            None => assert!(result.is_err(), "{name}"),
-            Some(changed) => {
-                let value = result.unwrap().code_mode_result(&payload);
-                assert_eq!(value["changed"], changed, "{name}");
-                assert_eq!(value["checkpoint_item_persisted"], changed, "{name}");
-                assert_eq!(value["checkpointed_call_count"], usize::from(changed));
-                assert!(value.get("checkpointed_call_ids").is_none());
-            }
-        }
-        assert_eq!(
-            session.clone_history().await.raw_items().len(),
-            before + usize::from(expected == Some(true)),
-            "{name}"
-        );
-    }
-    let history = session.clone_history().await;
-    let mut state = history.tool_history_state();
-    let checkpoints = history
-        .raw_items()
-        .iter()
-        .filter(|item| phase_checkpoint_ids(item).is_some())
-        .cloned()
-        .collect::<Vec<_>>();
-    let checkpoint = phase_checkpoint_payload(&checkpoints[0]).unwrap();
-    assert_eq!(checkpoint["answer_evidence"]["done"]["status"], "evidence_linked_not_claim_verified");
-    assert_eq!(checkpoint["answer_evidence"]["done"]["original_output_sha256"],
-        state.checkpoint_evidence("done").unwrap().original_output_sha256);
-    state.retain_for_history(&checkpoints);
-    assert!(
-        state.checkpoint_evidence(&active_artifact).is_ok(),
-        "checkpoint pins survive canonical output removal"
-    );
-    assert_eq!(
-        read_exact_tool_output_artifact(
-            &turn.config.codex_home,
-            &session.thread_id.to_string(),
-            &active_artifact
-        )
-        .await
-        .unwrap(),
-        codex_utils_output_truncation::truncate_text(
-            &bounded_output(),
-            turn.model_info.truncation_policy.into(),
-        ).as_bytes()
-    );
-}
 
 #[test]
 fn phase_checkpoint_compacts_only_selected_consumed_recoverable_evidence() {
@@ -684,6 +981,35 @@ fn checkpoint_answer_lineage_downgrades_without_rewriting_or_repeating_notes() {
 }
 
 #[test]
+fn verified_evidence_uncertainty_only_lineage_downgrades_both_reference_sets() {
+    for field in ["supporting_evidence", "contradicting_evidence"] {
+        let mut state = ToolHistoryState::default();
+        let mut stale = candidate("stale", bounded_output());
+        stale.source_dependencies_current = false;
+        state.register(stale);
+        state.register(candidate("current", bounded_output()));
+        let mut uncertainty = serde_json::json!({"claim":"open", "next_action":"inspect"});
+        uncertainty[field] = serde_json::json!(["stale", "current"]);
+        let checkpoint = ResponseItem::Message {
+            id: None, role: "developer".into(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                    serde_json::json!({"receipts":{}, "uncertainties":[uncertainty]})),
+            }], phase: None, internal_chat_message_metadata_passthrough: None,
+        };
+        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+        let projection = state.project_sampling_with_workspace_cache(Arc::from([checkpoint.clone()]), None, &cache);
+        assert_eq!(projection.items.len(), 2);
+        assert_eq!(projection.items[0], checkpoint);
+        let ResponseItem::Message { content, .. } = &projection.items[1] else { panic!("notice") };
+        let codex_protocol::models::ContentItem::InputText { text } = &content[0] else { panic!("text") };
+        let notice: serde_json::Value = text.lines().find_map(|line| serde_json::from_str(line).ok()).unwrap();
+        assert_eq!(notice["notices"][0]["kind"], "checkpoint_uncertainty_evidence");
+        assert_eq!(notice["notices"][0]["evidence_refs"], serde_json::json!(["stale"]));
+    }
+}
+
+#[test]
 fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_history() {
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let captured = workspace_identity("captured");
@@ -785,6 +1111,73 @@ fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_histo
 }
 
 #[test]
+fn child_message_continuation_preserves_the_previous_freshness_layout() {
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let captured = workspace_identity("captured");
+    let changed = workspace_identity("changed");
+    let output = text_output("read-old", "original source evidence".into());
+    let canonical: Arc<[ResponseItem]> = Arc::from([function_call("read-old"), output.clone()]);
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(captured),
+            &output,
+            BTreeSet::new(),
+        )
+        .unwrap(),
+    );
+    let previous = state.project_sampling_with_workspace_cache(
+        Arc::clone(&canonical), Some(&changed), &cache,
+    );
+    assert_eq!(previous.items.len(), canonical.len() + 1, "fixture has a freshness notice");
+    let anchor = SamplingProjectionAnchor {
+        prepared_items: Arc::clone(&canonical),
+        projection: previous.clone(),
+    };
+    let mail = codex_protocol::protocol::InterAgentCommunication::new(
+        codex_protocol::AgentPath::try_from("/root/worker").unwrap(),
+        codex_protocol::AgentPath::root(),
+        Vec::new(),
+        "child result".to_string(),
+        true,
+    );
+    // Cover both current agent messages and the legacy assistant encoding.
+    let legacy: ResponseItem = mail.to_response_input_item().into();
+    for message in [mail.to_model_input_item(), legacy] {
+        let mut extended = canonical.to_vec();
+        extended.push(message.clone());
+        let continued = state.project_continuation_with_workspace_cache(
+            &anchor, extended.into(), Some(&changed), &cache,
+        ).expect("child messages continue the same history layout");
+        for (items, prior) in [
+            (&continued.items, &previous.items),
+            (&continued.unreplaced_items, &previous.unreplaced_items),
+        ] {
+            assert!(items.starts_with(prior));
+            assert_eq!(items.len(), prior.len() + 1, "notice must not move or repeat");
+            assert_eq!(items.last(), Some(&message));
+        }
+    }
+    // Actual user input and explicit checkpoints must still rebuild.
+    for (role, text) in [
+        ("user", "next task"),
+        ("developer", "<completed_phase_checkpoint>\n{\"receipts\":{}}\n</completed_phase_checkpoint>"),
+    ] {
+        let mut extended = canonical.to_vec();
+        extended.push(ResponseItem::Message {
+            id: None,
+            role: role.to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText { text: text.to_string() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        });
+        assert!(state.project_continuation_with_workspace_cache(
+            &anchor, extended.into(), Some(&changed), &cache,
+        ).is_none());
+    }
+}
+
+#[test]
 fn sampling_freshness_batches_results_and_only_appends_new_invalidations() {
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
     let captured = workspace_identity("captured");
@@ -818,6 +1211,7 @@ fn sampling_freshness_batches_results_and_only_appends_new_invalidations() {
         .lines()
         .find_map(|line| serde_json::from_str(line).ok())
         .unwrap();
+    assert_eq!(text.lines().count(), 3, "only the envelope and evidence records belong in recurring notices");
     let notices = batch["notices"].as_array().unwrap();
     assert_eq!(notices.len(), 2);
     assert_eq!(notices[0]["call_id"], "first");
@@ -1236,6 +1630,7 @@ fn workspace_identity(label: &str) -> WorkspaceEvidenceIdentity {
         head_identity: Some(format!("head-{label}")),
         index_identity: Some(format!("index-{label}")),
         worktree_identity: Some(format!("worktree-{label}")),
+        path_fingerprints: None,
     }
 }
 
@@ -1521,9 +1916,12 @@ fn workspace_freshness_notice_distinguishes_unknown_from_changed_identity() {
 }
 
 #[test]
-fn non_git_workspace_evidence_remains_visible_without_a_git_revision() {
+fn non_git_workspace_evidence_is_historical_after_external_edit() {
     let call_id = "non-git-call";
-    let output = text_output(call_id, "plain directory output".to_string());
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.txt");
+    std::fs::write(&path, "plain directory output").unwrap();
+    let output = text_output(call_id, std::fs::read_to_string(&path).unwrap());
     let canonical: Arc<[ResponseItem]> = Arc::from([function_call(call_id), output.clone()]);
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(
@@ -1531,8 +1929,13 @@ fn non_git_workspace_evidence_remains_visible_without_a_git_revision() {
             .expect("non-git observation"),
     );
 
+    std::fs::write(&path, "externally changed").unwrap();
     let current = state.project_with_workspace_identity(Arc::clone(&canonical), None);
-    assert_eq!(current.items, canonical);
+    let (_, text) = textual_output_identity(&current.items[1]).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(notice["reason_code"], "workspace_identity_unavailable");
+    assert_eq!(notice["historical_digest"], "plain directory output");
+    assert_eq!(notice["valid_for_current_workspace"], false);
 
     let initialized =
         state.project_with_workspace_identity(canonical, Some(&workspace_identity("initialized")));
@@ -1552,7 +1955,7 @@ fn non_git_unknown_workspace_evidence_invalidates_on_recorded_mutation() {
     );
 
     let current = state.project_with_workspace_identity(Arc::clone(&canonical), None);
-    assert_eq!(current.items, canonical);
+    assert_ne!(current.items, canonical, "unknown freshness is not current proof");
 
     assert!(state.invalidate_source_dependencies(
         Some(&BTreeSet::from([PathBuf::from("/repo/changed.rs")])),
@@ -1793,7 +2196,7 @@ fn small_budget_excess_compacts_only_oldest_consumed_results() {
 }
 
 #[test]
-fn workspace_error_outputs_are_never_stale_masked() {
+fn workspace_error_outputs_preserve_diagnostics_with_historical_applicability() {
     let call_id = "failed-workspace-read";
     let dependency = PathBuf::from("/repo/src/foo.rs");
     let mut payload = FunctionCallOutputPayload::from_text("permission denied".to_string());
@@ -1826,7 +2229,7 @@ fn workspace_error_outputs_are_never_stale_masked() {
         .expect("failed workspace observation"),
     );
 
-    assert!(!state.invalidate_source_dependencies(
+    assert!(state.invalidate_source_dependencies(
         Some(&BTreeSet::from([dependency])),
         Some(&workspace_identity("changed")),
     ));
@@ -1834,7 +2237,12 @@ fn workspace_error_outputs_are_never_stale_masked() {
         Arc::clone(&canonical),
         Some(&workspace_identity("changed")),
     );
-    assert_eq!(projection.items, canonical);
+    let (_, text) = textual_output_identity(&projection.items[1]).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(notice["historical_output"], "permission denied");
+    assert_eq!(notice["valid_for_current_workspace"], false);
+    assert!(notice["failure_applicability"].as_str().unwrap().contains("current applicability is unverified"));
+    assert_eq!(response_item_output_success(&projection.items[1]), Some(false));
 }
 
 #[tokio::test]
@@ -2029,9 +2437,21 @@ async fn watcher_proof_retains_dependency_scoped_evidence_after_external_disjoin
     cache
         .note_host_workspace_mutation_paths(root.path(), &["src/foo.rs".to_string()])
         .await;
-    let stale = state.project_with_workspace_cache(canonical, Some(&changed), cache.as_ref());
+    let stale = state.project_with_workspace_cache(Arc::clone(&canonical), Some(&changed), cache.as_ref());
     let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
     assert!(stale_output.contains("stale_workspace_evidence"));
+    let notice: serde_json::Value = serde_json::from_str(&stale_output).unwrap();
+    assert_eq!(notice["workspace_evidence_freshness"], "changed");
+    assert_eq!(notice["qualification"], "Observed dependency change");
+    assert_eq!(notice["historical_authenticity"], "authenticated");
+    cache.note_host_workspace_mutation();
+    let unknown = state.project_with_workspace_cache(canonical, Some(&changed), cache.as_ref());
+    let (_, output) = textual_output_identity(&unknown.items[1]).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(notice["workspace_evidence_freshness"], "unknown");
+    assert_eq!(notice["qualification"], "Currentness unknown; no dependency change established");
+    assert_eq!(notice["historical_authenticity"], "authenticated");
+    assert_eq!(notice["valid_for_current_workspace"], false);
 }
 
 #[test]
@@ -2168,12 +2588,16 @@ fn nested_workspace_evidence_retains_only_current_results_after_resume() {
     let projected = state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after));
     let (_, output) = textual_output_identity(&projected.items[1]).expect("parent result");
     let notice: serde_json::Value = serde_json::from_str(output).expect("freshness notice");
-    assert_eq!(
-        notice["current_nested_results"],
-        serde_json::json!([
-            {"call_id": "b", "output": "current B"}
-        ])
-    );
+    let current = notice["current_nested_results"].as_array().unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0]["call_id"], "b");
+    assert_eq!(current[0]["output"], "current B");
+    assert_eq!(current[0]["workspace_evidence_freshness"], "current");
+    assert_eq!(current[0]["source_scope"]["dependencies"][0]["path"],
+        SourceDependencyV1::new(Path::new("/repo/b"), false).path);
+    assert_eq!(notice["stale_nested_results"][0]["call_id"], "a");
+    assert_eq!(notice["stale_nested_results"][0]["source_scope"]["dependencies"][0]["path"],
+        SourceDependencyV1::new(Path::new("/repo/a"), false).path);
     assert!(!output.contains("old A"));
     assert_eq!(notice["historical_digest"], "combined A and B");
     assert_eq!(notice["valid_for_current_workspace"], false);
@@ -2223,7 +2647,8 @@ fn command_dependencies_cover_search_test_and_read_inputs() {
     };
     assert_eq!(
         source_dependencies_for_tool_call("exec_command", &test, cwd),
-        BTreeSet::from([SourceDependencyV1::new(cwd, true)])
+        BTreeSet::new(),
+        "unscoped Cargo commands cannot establish a selective dependency graph"
     );
 
     let python_test = ToolPayload::Function {
@@ -2708,6 +3133,11 @@ fn cargo_test_dependencies_follow_selected_local_package_graph() {
         arguments: serde_json::json!({"package": "app", "workdir": temp.path()}).to_string(),
     };
     let dependencies = source_dependencies_for_tool_call("cargo_test", &payload, temp.path());
+    let receipt = serde_json::json!({"runner":"rust_test_runner", "selected_packages":["app"],
+        "dependency_manifest":{"source_roots":[temp.path()]}});
+    assert_eq!(runner_receipt_dependencies(&receipt, temp.path()), dependencies);
+    assert!(runner_receipt_dependencies(&serde_json::json!({"runner":"rust_test_runner",
+        "selected_packages":["missing"], "dependency_manifest":{"source_roots":[temp.path()]}}), temp.path()).is_empty());
     let package_index = cargo_package_index(temp.path());
     assert!(
         dependencies.contains(&SourceDependencyV1::new(&temp.path().join("app"), true,)),
@@ -2715,6 +3145,25 @@ fn cargo_test_dependencies_follow_selected_local_package_graph() {
     );
     assert!(dependencies.contains(&SourceDependencyV1::new(&temp.path().join("support"), true,)));
     assert!(!dependencies.contains(&SourceDependencyV1::new(temp.path(), true)));
+    for arguments in [
+        serde_json::json!({"program":"cargo", "args":["test", "-p", "app"]}),
+        serde_json::json!({"cmd":"cargo nextest run --package=app"}),
+        serde_json::json!({"program":"cargo", "args":["test", "-papp", "--", "--package=ignored-test-arg"]}),
+    ] {
+        let payload = ToolPayload::Function { arguments: arguments.to_string() };
+        assert_eq!(source_dependencies_for_tool_call("exec_command", &payload, temp.path()), dependencies);
+    }
+    let runner = serde_json::from_value(serde_json::json!({
+        "programs":["python"], "prefixes":[["run-lane"]], "passthrough_after":"--",
+        "allow_extra_args":true,
+    })).unwrap();
+    let command = ["python", "run-lane", "--", "cargo", "test", "-p", "app"].map(str::to_owned);
+    assert_eq!(runner_source_dependencies(&command, temp.path(), &[runner]), Some(dependencies));
+    for args in [vec!["test"], vec!["test", "--workspace", "-p", "app"],
+        vec!["test", "--manifest-path", "other/Cargo.toml", "-p", "app"],
+        vec!["test", "-p", "unknown"]] {
+        assert!(cargo_argv_dependencies(&args.into_iter().map(str::to_owned).collect::<Vec<_>>(), temp.path()).is_empty());
+    }
 }
 
 #[test]
@@ -2792,6 +3241,33 @@ fn cargo_configuration_changes_invalidate_observed_validation() {
             );
             assert!(notice["rerun"].get("force_fresh").is_none(), "{path:?}");
         }
+    }
+}
+
+#[test]
+fn verified_named_runner_scope_uses_manifest_target_package_graph() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("codex-rs");
+    std::fs::create_dir_all(workspace.join(".config")).unwrap();
+    std::fs::create_dir_all(workspace.join("app")).unwrap();
+    std::fs::create_dir_all(workspace.join("tui")).unwrap();
+    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers=[\"app\",\"tui\"]\n").unwrap();
+    for name in ["app", "tui"] {
+        std::fs::write(workspace.join(name).join("Cargo.toml"), format!("[package]\nname=\"{name}\"\nversion=\"0.1.0\"\n")).unwrap();
+    }
+    let manifest = workspace.join(".config/kd4-rust-tests.toml");
+    std::fs::write(&manifest, "version=1\n[targets.app_lib]\npackage=\"app\"\n[gates.small]\nsteps=[{target=\"app_lib\"}]\n").unwrap();
+    let mut runner: codex_shell_command::validation::RepositoryRunner = serde_json::from_value(serde_json::json!({
+        "programs":["python"], "prefixes":[["scripts/rust_test_runner.py", "run-target"],["scripts/rust_test_runner.py", "run-gate"]],
+        "operations":["test"], "receipt_runner":"rust_test_runner", "allow_extra_args":true,
+    })).unwrap();
+    runner.path_context = Some((root.path().to_path_buf(), root.path().to_path_buf()));
+    for (operation, name) in [("run-target", "app_lib"), ("run-gate", "small")] {
+        let command = ["python", "scripts/rust_test_runner.py", operation, name].map(str::to_owned);
+        let scope = runner_source_dependencies(&command, root.path(), &[runner.clone()]).unwrap();
+        assert!(scope.contains(&SourceDependencyV1::new(&workspace.join("app"), true)));
+        assert!(!scope.contains(&SourceDependencyV1::new(&workspace.join("tui"), true)));
+        assert!(scope.contains(&SourceDependencyV1::new(&manifest, false)));
     }
 }
 
@@ -3189,7 +3665,7 @@ fn tool_history_receipt_requires_consumed_complete_matching_bounded_output() {
 }
 
 #[test]
-fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts() {
+fn tool_history_admission_keeps_first_exposure_receipt_detail_unresolved() {
     let _budget = override_model_visible_tool_result_token_budget_for_test(10_000);
     let first = "alpha ".repeat(6_000);
     let second = "beta ".repeat(6_000);
@@ -3245,10 +3721,14 @@ fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts(
             ordinal: 1,
         },
     ));
-    assert_eq!(state.consumed_outputs_for_tool("functions.exec").len(), 2);
+    assert_eq!(state.consumed_outputs_for_tool("functions.exec").len(), 1);
+    let unread = state.candidates.values().find(|candidate| candidate.consumed_by_generation.is_none()).unwrap().call_id.clone();
+    let _pressure = override_model_visible_tool_result_token_budget_for_test(1);
     let consumed = state.project(canonical);
-    assert_eq!(consumed.substitutions.len(), 1);
-    assert_eq!(consumed.items, projection.items);
+    let rendered = serde_json::to_string(&consumed.items).unwrap();
+    assert!(rendered.contains("unread outcomes are unresolved"));
+    assert!(rendered.contains(&unread));
+    assert!(rendered.contains("artifact-1"));
 }
 
 #[test]
@@ -3673,7 +4153,10 @@ async fn remote_compaction_bounds_recovery_metadata_and_keeps_newest_exact_handl
     tracked.refresh_derived();
     state.register(tracked);
     assert_eq!(
-        state.artifact_reference_positions(&[text_output("sidecar", sidecar.0.clone())]),
+        state.artifact_reference_positions(&[text_output("sidecar", sidecar.0.clone())])
+            .into_iter()
+            .map(|(call_id, (std::cmp::Reverse(index), _))| (call_id, index))
+            .collect::<BTreeMap<_, _>>(),
         BTreeMap::from([("newest".to_string(), 0)])
     );
 }
@@ -4479,6 +4962,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
         artifact_call_ids: BTreeMap::new(),
         model_visible_tool_result_token_budget: None,
         workspace_projection_cache: Arc::default(),
+        ..Default::default()
     };
     let mut serialized = serde_json::to_value(&state).expect("serialize ledger state");
     let candidate = &serialized["candidates"]["call-1"];
@@ -4499,7 +4983,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
 }
 
 #[tokio::test]
-async fn recovered_evidence_priority_survives_persistence_and_preserves_safety_classes() {
+async fn recovered_source_does_not_displace_newer_evidence_after_persistence() {
     let temp = tempfile::tempdir().unwrap();
     let output = "exact source evidence ".repeat(500);
     let _budget = override_model_visible_tool_result_token_budget_for_test(
@@ -4532,8 +5016,8 @@ async fn recovered_evidence_priority_survives_persistence_and_preserves_safety_c
     let restored = expect_loaded_tool_history(load_tool_history_state(temp.path(), "thread").await);
     let projection = restored.project(items);
     let outputs = projection.items.iter().filter_map(textual_output_identity).collect::<Vec<_>>();
-    assert!(outputs.iter().any(|(id, text)| *id == "old-hot" && *text == output));
-    assert!(!outputs.iter().any(|(id, text)| *id == "new-cold" && *text == output));
+    assert!(!outputs.iter().any(|(id, text)| *id == "old-hot" && *text == output));
+    assert!(outputs.iter().any(|(id, text)| *id == "new-cold" && *text == output));
     assert!(restored.reuse_priority("new-cold", 0) < restored.reuse_priority("old-hot", 5));
     assert!(restored.reuse_priority("new-unread", 2) < restored.reuse_priority("old-hot", 5));
     persist_tool_history_state(temp.path(), "thread", &restored).await.unwrap();
@@ -4545,7 +5029,7 @@ async fn recovered_evidence_priority_survives_persistence_and_preserves_safety_c
 }
 
 #[test]
-fn recovered_evidence_priority_follows_nested_file_provenance_to_its_carrier() {
+fn recovered_evidence_does_not_promote_its_mixed_purpose_carrier() {
     let mut state = ToolHistoryState::default();
     let output = text_output("nested", "exact file evidence".into());
     state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
@@ -4563,7 +5047,7 @@ fn recovered_evidence_priority_follows_nested_file_provenance_to_its_carrier() {
         artifact_id: "file-artifact".into(),
     }.apply(&mut state));
     let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
-    assert!(restored.reuse_priority("outer", 5) < restored.reuse_priority("cold", 5));
+    assert_eq!(restored.reuse_priority("outer", 5), restored.reuse_priority("cold", 5));
     assert!(restored.reuse_priority("unread", 2) < restored.reuse_priority("outer", 5));
 }
 
@@ -4749,7 +5233,7 @@ async fn tool_history_ledger_load_distinguishes_absence_corruption_and_version_m
             found,
             supported: LEDGER_VERSION,
             ..
-        } if found == LEDGER_VERSION.saturating_add(1)
+        } if u64::from(found) == u64::from(LEDGER_VERSION.saturating_add(1))
     ));
 }
 
@@ -4975,7 +5459,7 @@ async fn corrupt_journal_record_keeps_checkpoint_and_valid_prefix() {
     let mut corrupted = journal[..first_end].to_vec();
     corrupted.extend_from_slice(b"{\"version\":1,\"not\":\"a record\"}\n");
     corrupted.extend_from_slice(&journal[first_end..]);
-    std::fs::write(&path, corrupted).expect("corrupt a complete middle record");
+    std::fs::write(&path, &corrupted).expect("corrupt a complete middle record");
 
     let outcome = load_tool_history_state(temp.path(), thread_id).await;
     let ToolHistoryLoadOutcome::RecoveredJournalPrefix { state, path: _, error } = outcome else {
@@ -4987,14 +5471,135 @@ async fn corrupt_journal_record_keeps_checkpoint_and_valid_prefix() {
     );
     assert!(error.contains("quarantined"), "{error}");
     assert!(!path.exists(), "the invalid journal is moved aside");
-    persist_tool_history_state(temp.path(), thread_id, &state)
-        .await
-        .expect("the recovered state persists without the invalid journal");
+    // No startup/terminal persist: crash immediately after recovery, then
+    // restart twice. Recovery itself must have made the prefix durable.
+    for _ in 0..2 {
+        assert_eq!(
+            expect_loaded_tool_history(load_tool_history_state(temp.path(), thread_id).await)
+                .non_workspace_code_mode_calls,
+            state.non_workspace_code_mode_calls
+        );
+    }
+    let checkpoint: ToolHistoryLedgerFile = serde_json::from_slice(
+        &std::fs::read(ledger_path(temp.path(), thread_id)).unwrap(),
+    ).unwrap();
+    assert_eq!(checkpoint.journal_sequences.get("writer"), Some(&1));
+
+    // Also model a crash after checkpoint commit but before journal retirement.
+    std::fs::write(&path, &corrupted).unwrap();
+    let (recovered, warning) = load_tool_history_state(temp.path(), thread_id)
+        .await.into_state_and_warning();
+    assert!(warning.is_some());
+    assert_eq!(recovered.non_workspace_code_mode_calls, state.non_workspace_code_mode_calls);
     assert_eq!(
         expect_loaded_tool_history(load_tool_history_state(temp.path(), thread_id).await)
             .non_workspace_code_mode_calls,
         state.non_workspace_code_mode_calls
     );
+}
+
+#[tokio::test]
+async fn unsupported_history_files_fence_cold_and_cached_writers() {
+    for cached in [false, true] {
+        for future_journal in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let thread_id = "unsupported-write-boundary";
+            let writer = Arc::new(std::sync::Mutex::new(ToolHistoryJournalWriter::default()));
+            let mut state = ToolHistoryState::default();
+            state.register_non_workspace_code_mode_call("checkpoint".into());
+            persist_tool_history_state_with_writer(temp.path(), thread_id, &state, Arc::clone(&writer))
+                .await.unwrap();
+            let mutations = [(1, ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "journal".into(),
+            })];
+            persist_tool_history_mutations_with_writer(
+                temp.path(), thread_id, "writer", &mutations, Arc::clone(&writer),
+            ).await.unwrap();
+            let ledger = ledger_path(temp.path(), thread_id);
+            let journal = journal_path(temp.path(), thread_id);
+            // The new format deliberately cannot decode as the old state or
+            // mutation schema, and its version does not fit in a u8.
+            let future_path = if future_journal { &journal } else { &ledger };
+            std::fs::write(future_path, b"{\"version\":512,\"future_format\":[1,2,3]}\n").unwrap();
+            let ledger_before = std::fs::read(&ledger).unwrap();
+            let journal_before = std::fs::read(&journal).unwrap();
+            let outcome = load_tool_history_state(temp.path(), thread_id).await;
+            assert!(matches!(&outcome, ToolHistoryLoadOutcome::UnsupportedVersion { found: 512, .. }));
+            let (empty, warning) = outcome.into_state_and_warning();
+            assert!(warning.is_some_and(|message| message.contains("unsupported version")));
+            let writer = if cached { writer } else { Arc::default() };
+            // Exercise the same empty initial checkpoint that startup attempts.
+            assert!(persist_tool_history_state_with_writer(
+                temp.path(), thread_id, &empty, Arc::clone(&writer),
+            ).await.is_err());
+            assert!(persist_tool_history_mutations_with_writer(
+                temp.path(), thread_id, "writer", &mutations, writer,
+            ).await.is_err());
+            assert_eq!(std::fs::read(&ledger).unwrap(), ledger_before);
+            assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+            assert_eq!(std::fs::read_dir(ledger.parent().unwrap()).unwrap().count(), 2);
+        }
+    }
+}
+
+async fn write_recovery_boundary_fixture(home: &Path, thread_id: &str) -> Vec<u8> {
+    persist_tool_history_mutations(home, thread_id, "writer", &[(
+        1,
+        ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall { call_id: "prefix".into() },
+    )]).await.unwrap();
+    let path = journal_path(home, thread_id);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"{not-json}\n");
+    std::fs::write(&path, &bytes).unwrap();
+    bytes
+}
+
+async fn assert_recovery_boundary_survives_two_restarts(home: &Path, thread_id: &str) {
+    for _ in 0..2 {
+        let outcome = load_tool_history_state(home, thread_id).await;
+        assert!(matches!(&outcome,
+            ToolHistoryLoadOutcome::RecoveredJournalPrefix { .. } | ToolHistoryLoadOutcome::Loaded(_)
+        ));
+        let (state, _) = outcome.into_state_and_warning();
+        assert_eq!(state.non_workspace_code_mode_calls, BTreeSet::from(["prefix".to_string()]));
+    }
+    assert!(!journal_path(home, thread_id).exists());
+}
+
+#[tokio::test]
+async fn recovery_checkpoint_failure_keeps_source_until_successful_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let thread_id = "recovery-checkpoint-failure-boundary";
+    let bytes = write_recovery_boundary_fixture(temp.path(), thread_id).await;
+    let failure = fail_next_tool_history_persistence_for_test(thread_id);
+    failure.release();
+    let outcome = load_tool_history_state(temp.path(), thread_id).await;
+    let ToolHistoryLoadOutcome::RecoveredJournalPrefix { state, error, .. } = outcome else {
+        panic!("expected recoverable prefix");
+    };
+    assert!(error.contains("injected tool-history persistence failure"), "{error}");
+    assert!(state.non_workspace_code_mode_calls.contains("prefix"));
+    assert!(!ledger_path(temp.path(), thread_id).exists());
+    assert_eq!(std::fs::read(journal_path(temp.path(), thread_id)).unwrap(), bytes);
+    drop(failure);
+    assert_recovery_boundary_survives_two_restarts(temp.path(), thread_id).await;
+}
+
+#[tokio::test]
+async fn recovery_checkpoint_cancellation_keeps_source_until_successful_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let thread_id = "recovery-checkpoint-cancellation-boundary";
+    let bytes = write_recovery_boundary_fixture(temp.path(), thread_id).await;
+    let pause = pause_next_tool_history_persistence_for_test(thread_id);
+    let home = temp.path().to_path_buf();
+    let recovery = tokio::spawn(async move { load_tool_history_state(&home, thread_id).await });
+    pause.wait_until_reached().await;
+    recovery.abort();
+    assert!(recovery.await.unwrap_err().is_cancelled());
+    drop(pause);
+    assert!(!ledger_path(temp.path(), thread_id).exists());
+    assert_eq!(std::fs::read(journal_path(temp.path(), thread_id)).unwrap(), bytes);
+    assert_recovery_boundary_survives_two_restarts(temp.path(), thread_id).await;
 }
 
 #[tokio::test]
@@ -5489,6 +6094,7 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
         let mut tracked = candidate(case, bounded);
         tracked.tool_identity = "cargo_test".to_string();
         tracked.source_dependencies = classification.source_dependencies.clone();
+        let known_dependencies = !tracked.source_dependencies.is_empty();
         let captured = workspace_identity("captured");
         let mut state = ToolHistoryState::default();
         state.register(tracked);
@@ -5538,6 +6144,16 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
                 let digest = digest.as_str().unwrap();
                 assert!(digest.contains("bounded model-visible tool output"));
                 assert!(approx_token_count(digest) <= RECEIPT_DIGEST_TARGET_TOKENS);
+                assert_eq!(value["qualification"], "Currentness unknown; no dependency change established");
+                assert_eq!(value["historical_authenticity"], "authenticated");
+                assert_eq!(value["workspace_evidence_freshness"], "unknown");
+                assert_eq!(value["source_scope"]["dependency_scope"], if known_dependencies { "recorded" } else { "unknown" });
+                assert!(value["source_scope"]["dependencies"].as_array().is_some_and(|dependencies|
+                    dependencies.is_empty() != known_dependencies
+                        && dependencies.iter().all(|dependency| dependency["freshness"] == "unknown")));
+                for key in ["qualification", "historical_authenticity", "workspace_evidence_freshness", "source_scope"] {
+                    value.as_object_mut().unwrap().remove(key);
+                }
                 assert_eq!(
                     value,
                     serde_json::json!({
@@ -6324,4 +6940,268 @@ fn recovery_priority_and_exact_selectors_survive_compaction_metadata() {
         function_call("origin"), text_output("origin", bounded_output())
     ]).unwrap()).unwrap();
     assert_eq!(pin["artifacts"][0]["recovered_selectors"], serde_json::json!([selector]));
+}
+
+#[test]
+fn verified_evidence_oversized_pin_does_not_block_later_handles() {
+    let mut state = ToolHistoryState::default();
+    let mut items = Vec::new();
+    for id in ["small-a", "small-b", "large"] {
+        let mut record = candidate(id, bounded_output());
+        record.artifact_id = format!("artifact-{id}");
+        let artifact = record.artifact_id.clone();
+        state.register(record);
+        items.push(text_output(id, bounded_output()));
+        if id == "large" {
+            state.recovered_ranges.insert(id.into(), (0..1000).map(|n|
+                serde_json::json!({"kind":"bytes", "start":n * 2, "end":n * 2 + 1})
+            ).collect());
+        }
+        assert!(state.artifact_call_ids.contains_key(&artifact));
+    }
+    let rendered = state.artifact_pin_payload_for_items(&items).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(payload["artifacts"].as_array().unwrap().len(), 3);
+    assert_eq!(payload["omitted_artifact_count"], 0);
+    assert!(payload["artifacts"][0].get("recovered_selectors").is_none());
+    assert!(approx_token_count(&rendered) <= COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET);
+}
+
+#[test]
+fn factored_workspace_metadata_round_trips_every_per_call_exception() {
+    let base = serde_json::json!({"observed_revision":{"repository_root":"repo","worktree_identity":"same"},
+        "reason":"matching identities do not verify source dependencies", "reason_code":"workspace_freshness_unverified",
+        "stale_workspace_evidence":true, "valid_for_current_workspace":false});
+    let notices = (0..5).map(|index| {
+        let mut notice = base.clone();
+        notice["call_id"] = format!("call-{index}").into();
+        notice["current_nested_results"] = serde_json::json!([{"call_id":format!("nested-{index}")}]);
+        if index == 4 { notice["reason_code"] = "source_dependencies_invalidated".into(); }
+        notice
+    }).collect::<Vec<_>>();
+    let factored = factor_workspace_notices(notices.clone());
+    assert_eq!(factored["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(factored["notices"][4]["reason_code"], "source_dependencies_invalidated");
+    assert!(factored.to_string().len() < serde_json::json!({"notices":notices}).to_string().len());
+    assert_eq!(expand_workspace_notices(factored), notices);
+}
+
+#[tokio::test]
+async fn overflow_directory_preserves_every_artifact_after_replacement_and_resume() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let home = session.codex_home().await;
+    let thread = session.thread_id().to_string();
+    let mut state = ToolHistoryState::default();
+    let mut items = Vec::new();
+    for index in 0..COMPACTION_ARTIFACT_PIN_MAX_ITEMS + 5 {
+        let id = format!("source-{index}");
+        let mut record = candidate(&id, bounded_output());
+        let canonical = CanonicalToolResult::json(serde_json::json!({"required_fact": id}));
+        let artifact = create_canonical_output_artifact(home.as_path(), &thread, &canonical).await;
+        assert!(artifact.complete);
+        record.artifact_id = artifact.artifact_id().unwrap();
+        record.artifact_bytes = canonical.exact_bytes;
+        record.artifact_sha256 = canonical.sha256;
+        protect_active_tool_history_artifact(home.as_path(), &thread, &record.artifact_id,
+            record.artifact_bytes, &record.artifact_sha256).await.unwrap();
+        state.register(record);
+        items.push(text_output(&id, bounded_output()));
+    }
+    state.recovered_ranges.insert("source-0".into(), (0..1000).map(|index|
+        serde_json::json!({"kind":"bytes","start":index*2,"end":index*2+1})).collect());
+    let payload = session.compaction_artifact_pins(&state, &items).await.unwrap().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let directory = &payload["directory"];
+    let bytes = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
+        session.codex_home().await.as_path(), &session.thread_id().to_string(), directory["artifact_id"].as_str().unwrap()
+    ).await.unwrap();
+    let recovered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(recovered["items"].as_array().unwrap().len(), COMPACTION_ARTIFACT_PIN_MAX_ITEMS + 5);
+    assert_eq!(recovered["items"].as_array().unwrap().iter().find(|pin| pin["call_id"] == "source-0").unwrap()["recovered_selectors"].as_array().unwrap().len(), 1000);
+    ToolHistoryMutation::RegisterArtifactOrigin {
+        artifact_id: directory["artifact_id"].as_str().unwrap().to_string(),
+        call_id: "context:artifact_directory".into(), bytes: directory["bytes"].as_u64().unwrap(),
+        sha256: directory["sha256"].as_str().unwrap().into(),
+    }.apply(&mut state);
+    let replacement = vec![text_output("directory", payload.to_string())];
+    ToolHistoryMutation::RegisterArtifactDirectory {
+        artifact_id: directory["artifact_id"].as_str().unwrap().into(),
+        members: recovered["items"].as_array().unwrap().iter()
+            .map(|pin| pin["artifact_id"].as_str().unwrap().to_string()).collect(),
+    }.apply(&mut state);
+    let mut unrelated = candidate("created-after-directory", bounded_output());
+    unrelated.artifact_id = "unrelated-later-artifact".into();
+    state.register(unrelated);
+    state.retain_for_history(&replacement);
+    assert!(!state.candidates.contains_key("created-after-directory"));
+    assert!(!state.artifact_recovery_directory().as_array().unwrap().iter()
+        .any(|pin| pin["call_id"] == "context:artifact_directory"));
+    let mut resumed: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    resumed.refresh_derived_and_indexes();
+    resumed = reconcile_tool_history_state(home.as_path(), &thread, resumed).await;
+    resumed.retain_for_history(&replacement);
+    assert_eq!(resumed.candidates.len(), COMPACTION_ARTIFACT_PIN_MAX_ITEMS + 5);
+    for pin in recovered["items"].as_array().unwrap() {
+        let bytes = read_exact_tool_output_artifact(home.as_path(), &thread, pin["artifact_id"].as_str().unwrap()).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["required_fact"], pin["call_id"]);
+    }
+    resumed.retain_for_history(&[]);
+    assert!(resumed.is_persisted_empty());
+}
+#[test]
+fn verified10_compactor_receives_decisive_evidence_not_only_checkpoint_pins() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(3000);
+    let fact = format!("{}\nDECISIVE_FACT: use the canonical byte offset, not the display offset\n{}",
+        "source prelude\n".repeat(80), "source suffix\n".repeat(80));
+    let failure = "error: the current implementation addresses normalized bytes\n".repeat(8);
+    let mut state = ToolHistoryState::default();
+    let mut reviewed = candidate("reviewed", fact.clone());
+    reviewed.consumed_by_generation = Some(ModelGenerationId {turn_id:"review".into(), ordinal:1});
+    state.register(reviewed);
+    let mut failed = candidate("failure", failure.clone());
+    failed.successful = false;
+    state.register(failed);
+    let generic = "generic completed log\n".repeat(4000);
+    state.register(candidate("generic", generic.clone()));
+    for call_id in ["generic", "reviewed", "failure"] {
+        state.register_non_workspace_code_mode_call(call_id.to_string());
+    }
+    let checkpoint = ResponseItem::Message {
+        id:None, role:"assistant".into(), content:vec![codex_protocol::models::ContentItem::InputText {
+            text:format!("<completed_phase_checkpoint>\n{}\n</completed_phase_checkpoint>",
+                state.phase_checkpoint_receipts(&["reviewed".into()]).unwrap()),
+        }], phase:None, internal_chat_message_metadata_passthrough:None,
+    };
+    let items = vec![function_call("generic"), text_output("generic", generic),
+        function_call("reviewed"), text_output("reviewed", fact.clone()), checkpoint,
+        function_call("failure"), text_output("failure", failure.clone())];
+    let mut history = crate::context_manager::ContextManager::new();
+    history.set_tool_history_state(state);
+    history.record_items(items.iter(), TruncationPolicy::Tokens(100_000));
+    let prompt = history.for_compaction_prompt_with_completed_tool_projection(
+        &[codex_protocol::openai_models::InputModality::Text], None);
+    let outputs = prompt.iter().filter_map(canonical_textual_output_identity).collect::<BTreeMap<_, _>>();
+    assert_eq!(outputs.get("reviewed").map(|text| text.as_ref()), Some(fact.as_str()));
+    assert_eq!(outputs.get("failure").map(|text| text.as_ref()), Some(failure.as_str()));
+    let tokens = prompt.iter().filter_map(canonical_textual_output_identity)
+        .map(|(_, text)| approx_token_count(&text)).sum::<usize>();
+    assert!(tokens <= 3000, "compaction reuses its existing allowance: {tokens}");
+}
+#[test]
+fn verified10_search_receipts_are_semantically_idempotent() {
+    for omitted in [Some(0), Some(7), None] {
+        let mut item = tool_search_pair("idempotent", 2000)[1].clone();
+        if let ResponseItem::ToolSearchOutput { tools, omitted_result_count, .. } = &mut item {
+            *tools = (0..80).map(|index| serde_json::json!({"name":format!("tool-{index}"), "description":"detail".repeat(100)})).collect();
+            *omitted_result_count = omitted;
+        }
+        let (once, _) = tool_search_receipt_item(&item, Some(&serde_json::json!({"query":"scope"}))).unwrap();
+        let (twice, _) = tool_search_receipt_item(&once, None).unwrap();
+        assert_eq!(once, twice);
+        let receipt = tool_search_receipt(&twice).unwrap();
+        assert_eq!(receipt.result_count, 80);
+        assert_eq!(receipt.omitted_result_count, omitted);
+        assert_eq!(receipt.ordered_tool_identities.len() + receipt.omitted_identity_count, 80);
+        let mut invalid = twice;
+        if let ResponseItem::ToolSearchOutput { tools, .. } = &mut invalid { tools[0]["receipt"]["result_count"] = 1.into(); }
+        assert!(tool_search_receipt_item(&invalid, None).is_none());
+    }
+}
+
+#[test]
+fn verified10_pressure_keeps_exact_nested_continuation_contracts() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(100);
+    let states = (0..4).map(|index| serde_json::json!({
+        "call_id":format!("nested-{index}"), "session_id":index + 1,
+        "execution_state":"running", "process_exited":false,
+        "session_capabilities":{"stdin":index == 0, "interrupt":index == 1,
+            "polling":true, "cancellation":index != 1, "incarnation":format!("creation-{index}")},
+        "pending_deferred_completions":[format!("job-{index}")],
+        "continuation":{"tool":"write_stdin", "arguments":{"session_id":index+1, "incarnation":format!("creation-{index}"), "chars":""}}
+    })).collect::<Vec<_>>();
+    for output in [
+        serde_json::json!({"essential":{"nested_commands":states}, "output":"log ".repeat(4000)}).to_string(),
+        format!("{}\nNested command states (independent of script completion):\n{}", "log ".repeat(4000), serde_json::json!(states)),
+    ] {
+        let state = ToolHistoryState::default();
+        let mut items = ProjectedResponseItems::Owned(vec![text_output("batch", output)]);
+        assert_eq!(state.enforce_tool_result_budget(&mut items).count, 0);
+        let (_, output) = canonical_textual_output_identity(&items[0]).unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(receipt["control"]["nested_commands"], serde_json::json!(states));
+        assert!(receipt["output_omitted"].as_bool().unwrap());
+    }
+}
+
+#[test]
+fn verified10_typed_receipts_distinguish_scope_and_incomplete_coverage() {
+    for (path, complete) in [("owner.rs", true), ("consumer.rs", false)] {
+        let mut record = candidate("read", serde_json::json!({"path":path, "file_complete":complete,
+            "complete":true, "results":[{"selector":{"kind":"lines", "start":5,"end":12},
+                "status":"ok", "complete":true, "text":"success ".repeat(500)}]}).to_string());
+        record.tool_identity = "read_file".into();
+        record.refresh_derived();
+        let pin = record.artifact_pin_value().unwrap();
+        assert_eq!(pin["evidence"]["path"], path);
+        assert_eq!(pin["evidence"]["file_complete"], complete);
+        assert_eq!(pin["evidence"]["results"][0]["selector"]["start"], 5);
+        assert!(pin["evidence"]["results"][0].get("text").is_none());
+        if let Some((_, receipt, _)) = record.admission_receipt() {
+            let receipt: serde_json::Value = serde_json::from_str(receipt).unwrap();
+            assert_eq!(receipt["evidence"], pin["evidence"]);
+        }
+    }
+}
+
+#[test]
+fn verified10_local_compaction_retains_late_counterexample_under_pressure() {
+    let _budget = override_model_visible_tool_result_token_budget_for_test(200);
+    let source = format!("All selected unit tests passed.\n{}\nCounterexample: integration failed; do NOT claim complete coverage.\n{}",
+        "irrelevant detail ".repeat(1500), "irrelevant tail ".repeat(1500));
+    let mut record = candidate("review", source.clone());
+    record.consumed_by_generation = Some(ModelGenerationId {turn_id:"review".into(), ordinal:1});
+    let mut state = ToolHistoryState::default();
+    state.register(record);
+    state.register_non_workspace_code_mode_call("review".into());
+    let mut history = crate::context_manager::ContextManager::new();
+    history.set_tool_history_state(state);
+    history.record_items([&function_call("review"), &text_output("review", source.clone())], TruncationPolicy::Tokens(100_000));
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let prompt = history.for_local_compaction_prompt(&[codex_protocol::openai_models::InputModality::Text], None, &cache);
+    assert!(prompt.contains(&text_output("review", source)));
+}
+#[test]
+fn verified10_directory_closure_is_bounded_across_compaction_and_restart() {
+    let mut state = ToolHistoryState::default();
+    let mut required = candidate("required", "Keep the unresolved prohibition.".into());
+    required.artifact_id = "required-artifact".into();
+    state.register(required);
+    let mut initial_size = None;
+    for cycle in 0..8 {
+        let directory = format!("directory-{cycle}");
+        let context = format!("context-{cycle}");
+        for (artifact_id, call_id) in [(&directory, "context:artifact_directory"), (&context, "context:plan")] {
+            ToolHistoryMutation::RegisterArtifactOrigin {artifact_id:artifact_id.clone(), call_id:call_id.into(),
+                bytes:1, sha256:sha256(b"x")}.apply(&mut state);
+        }
+        ToolHistoryMutation::RegisterArtifactDirectory {artifact_id:directory.clone(),
+            members:BTreeSet::from(["required-artifact".into(), context.clone()])}.apply(&mut state);
+        let mut unrelated = candidate("unrelated", "unrelated".into());
+        unrelated.artifact_id = "unrelated-artifact".into();
+        state.register(unrelated);
+        state.retain_for_history(&[text_output("checkpoint", serde_json::json!({"artifact_id":directory}).to_string())]);
+        assert_eq!(state.candidates.len(), 1);
+        assert_eq!(state.internal_artifact_origins.len(), 2);
+        assert_eq!(state.artifact_directory_members.len(), 1);
+        let flat = state.artifact_recovery_directory();
+        assert_eq!(flat.as_array().unwrap().len(), 2);
+        assert!(!flat.to_string().contains("context:artifact_directory"));
+        let bytes = serde_json::to_vec(&state).unwrap();
+        assert!(bytes.len() <= *initial_size.get_or_insert(bytes.len()) + 32);
+        state = serde_json::from_slice(&bytes).unwrap();
+        state.refresh_derived_and_indexes();
+    }
+    state.retain_for_history(&[]);
+    assert!(state.is_persisted_empty());
 }

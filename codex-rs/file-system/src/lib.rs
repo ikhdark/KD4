@@ -37,7 +37,7 @@ pub const FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_WALK_DEPTH: usize = 64;
 const MAX_WALK_DIRECTORIES: usize = 10_000;
 const MAX_WALK_ENTRIES: usize = 50_000;
-const MAX_WALK_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_WALK_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const WALK_RESPONSE_ITEM_OVERHEAD_BYTES: usize = 64;
 const MAX_CONCURRENT_WALK_METADATA: usize = 8;
 
@@ -116,7 +116,7 @@ impl From<FileMetadata> for WalkEntryMetadata {
 }
 
 /// Bounds for a recursive filesystem walk.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WalkOptions {
     /// Maximum directory depth below the root that may be traversed.
@@ -130,6 +130,69 @@ pub struct WalkOptions {
     /// Whether directories whose names start with `.` should be returned but not traversed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prune_hidden_directories: bool,
+    #[serde(default, skip_serializing_if = "WalkFilters::is_empty")]
+    pub filters: WalkFilters,
+}
+
+/// Case-sensitive basename wildcards, independent of platform and gitignore.
+/// `*` matches zero or more Unicode characters; `?` matches one. Everything
+/// else is literal. File filters never prune directories needed for coverage.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WalkFilters {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_directories: Vec<String>,
+}
+
+impl WalkFilters {
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty() && self.exclude_directories.is_empty()
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        let patterns = self.include.iter().chain(&self.exclude).chain(&self.exclude_directories);
+        if self.include.len() + self.exclude.len() + self.exclude_directories.len() > 64
+            || patterns.into_iter().any(|pattern| pattern.is_empty() || pattern.len() > 256
+                || pattern.contains(['/', '\\', '\0']))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "walk filters require at most 64 nonempty basename patterns, each at most 256 UTF-8 bytes, without path separators or NUL"));
+        }
+        Ok(())
+    }
+
+    fn includes_file(&self, name: &str) -> bool {
+        (self.include.is_empty() || self.include.iter().any(|pattern| basename_matches(pattern, name)))
+            && !self.exclude.iter().any(|pattern| basename_matches(pattern, name))
+    }
+}
+
+fn basename_matches(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let name = name.chars().collect::<Vec<_>>();
+    let (mut p, mut n) = (0, 0);
+    let mut star = None;
+    let mut retry = 0;
+    while n < name.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            p += 1;
+            retry = n;
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if let Some(index) = star {
+            retry += 1;
+            n = retry;
+            p = index + 1;
+        } else { return false; }
+    }
+    while p < pattern.len() && pattern[p] == '*' { p += 1; }
+    p == pattern.len()
 }
 
 /// Type of a filesystem entry returned by a walk.
@@ -156,6 +219,16 @@ pub struct WalkError {
     pub message: String,
 }
 
+/// A scope to re-examine, not a resumable offset into a mutable directory.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalkStop {
+    pub path: PathUri,
+    pub reason: String,
+    pub effective_limit: usize,
+    pub partially_examined: bool,
+}
+
 /// Entries and recoverable errors collected by a bounded walk.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -164,6 +237,12 @@ pub struct WalkOutcome {
     pub errors: Vec<WalkError>,
     /// Whether a traversal budget prevented inspecting all eligible descendants.
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unexplored: Vec<WalkStop>,
+    /// Echo only when filters were applied. Older remote backends omit this;
+    /// their unfiltered response must not certify a filtered requested scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_filters: Option<WalkFilters>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -534,6 +613,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
     options: WalkOptions,
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> FileSystemResult<WalkOutcome> {
+    options.filters.validate()?;
     if options.max_directories == 0 || options.max_entries == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -553,10 +633,11 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
     }
 
     let root_metadata = file_system.get_metadata(root, sandbox).await?;
-    if !root_metadata.is_directory
-        || (root_metadata.is_symlink && !options.follow_directory_symlinks)
-    {
-        return Ok(WalkOutcome::default());
+    if root_metadata.is_symlink && !options.follow_directory_symlinks {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "walk root symlink skipped by policy; root was not traversed"));
+    }
+    if !root_metadata.is_directory {
+        return Err(io::Error::new(io::ErrorKind::NotADirectory, "walk root is not a directory"));
     }
 
     let root_identity = if options.follow_directory_symlinks {
@@ -564,7 +645,10 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
     } else {
         root.clone()
     };
-    let mut outcome = WalkOutcome::default();
+    let mut outcome = WalkOutcome {
+        applied_filters: (!options.filters.is_empty()).then(|| options.filters.clone()),
+        ..WalkOutcome::default()
+    };
     let mut queue = VecDeque::from([(root.clone(), 0usize)]);
     let mut visited_directories = HashSet::from([root_identity]);
     let mut directory_count = 1usize;
@@ -573,8 +657,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
 
     while let Some((directory, depth)) = queue.pop_front() {
         if entry_count == options.max_entries {
-            outcome.truncated = true;
-            return Ok(outcome);
+            return Ok(finish_stopped_walk(outcome, root, queue, directory, false, "entry_limit", options.max_entries));
         }
         let batch = match file_system
             .read_directory_bounded_for_walk(&directory, options.max_entries - entry_count, sandbox)
@@ -586,16 +669,18 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 if !push_walk_error(
                     &mut outcome,
                     &mut response_bytes,
-                    directory,
+                    directory.clone(),
                     error.to_string(),
                 ) {
-                    return Ok(outcome);
+                    return Ok(finish_stopped_walk(outcome, root, queue, directory, true, "response_bytes", MAX_WALK_RESPONSE_BYTES));
                 }
                 continue;
             }
         };
         entry_count += batch.entries_examined;
-        outcome.truncated |= batch.limit_reached;
+        if batch.limit_reached {
+            record_walk_stop(&mut outcome, root, directory.clone(), true, "entry_limit", options.max_entries);
+        }
         let mut entries = batch.entries;
         entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
 
@@ -629,7 +714,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                         directory.clone(),
                         error.to_string(),
                     ) {
-                        return Ok(outcome);
+                        return Ok(finish_stopped_walk(outcome, root, queue, directory.clone(), true, "response_bytes", MAX_WALK_RESPONSE_BYTES));
                     }
                     continue;
                 }
@@ -639,7 +724,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 Err(error) => {
                     if !push_walk_error(&mut outcome, &mut response_bytes, path, error.to_string())
                     {
-                        return Ok(outcome);
+                        return Ok(finish_stopped_walk(outcome, root, queue, directory.clone(), true, "response_bytes", MAX_WALK_RESPONSE_BYTES));
                     }
                     continue;
                 }
@@ -655,9 +740,15 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
             } else {
                 continue;
             };
+            if (kind == WalkEntryKind::File && !options.filters.includes_file(&entry.file_name))
+                || (kind == WalkEntryKind::Directory && options.filters.exclude_directories.iter()
+                    .any(|pattern| basename_matches(pattern, &entry.file_name)))
+            {
+                continue;
+            }
             if !reserve_walk_response_bytes(&mut outcome, &mut response_bytes, path.as_str().len())
             {
-                return Ok(outcome);
+                return Ok(finish_stopped_walk(outcome, root, queue, directory.clone(), true, "response_bytes", MAX_WALK_RESPONSE_BYTES));
             }
             outcome.entries.push(WalkEntry {
                 path: path.clone(),
@@ -678,7 +769,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                                 path,
                                 error.to_string(),
                             ) {
-                                return Ok(outcome);
+                                return Ok(finish_stopped_walk(outcome, root, queue, directory.clone(), true, "response_bytes", MAX_WALK_RESPONSE_BYTES));
                             }
                             continue;
                         }
@@ -690,7 +781,10 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                     continue;
                 }
                 if depth == options.max_depth || directory_count == options.max_directories {
-                    outcome.truncated = true;
+                    let (reason, limit) = if depth == options.max_depth {
+                        ("depth_limit", options.max_depth)
+                    } else { ("directory_limit", options.max_directories) };
+                    record_walk_stop(&mut outcome, root, path, false, reason, limit);
                 } else {
                     directory_count += 1;
                     queue.push_back((path, depth + 1));
@@ -700,6 +794,27 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
     }
 
     Ok(outcome)
+}
+
+fn record_walk_stop(outcome: &mut WalkOutcome, root: &PathUri, path: PathUri, partially_examined: bool, reason: &str, effective_limit: usize) {
+    const MAX_FRONTIER: usize = 64;
+    outcome.truncated = true;
+    if outcome.unexplored.len() < MAX_FRONTIER {
+        outcome.unexplored.push(WalkStop { path, reason: reason.into(), effective_limit, partially_examined });
+    } else {
+        // A bounded conservative ancestor covers every omitted frontier item.
+        // It explicitly requires a fresh walk, never a stable resume cursor.
+        outcome.unexplored[MAX_FRONTIER - 1] = WalkStop { path: root.clone(),
+            reason: "frontier_limit".into(), effective_limit: MAX_FRONTIER, partially_examined: true };
+    }
+}
+
+fn finish_stopped_walk(mut outcome: WalkOutcome, root: &PathUri, queue: VecDeque<(PathUri, usize)>, directory: PathUri,
+    partially_examined: bool, reason: &str, limit: usize) -> WalkOutcome
+{
+    record_walk_stop(&mut outcome, root, directory, partially_examined, reason, limit);
+    for (path, _) in queue { record_walk_stop(&mut outcome, root, path, false, reason, limit); }
+    outcome
 }
 
 fn push_walk_error(
@@ -740,3 +855,4 @@ pub use atomic_write::atomic_write_lock_path;
 pub use atomic_write::resolve_symlink_write_paths;
 pub use atomic_write::write_atomically;
 pub use atomic_write::write_bytes_atomically;
+pub use atomic_write::write_bytes_atomically_without_sync;

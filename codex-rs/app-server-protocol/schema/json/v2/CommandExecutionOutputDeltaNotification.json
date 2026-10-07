@@ -1,11 +1,38 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ExecOutputStream": {
+      "enum": [
+        "stdout",
+        "stderr"
+      ],
+      "type": "string"
+    }
+  },
   "properties": {
+    "decodingLossy": {
+      "description": "Whether invalid UTF-8 was replaced while decoding this delta.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "delta": {
       "type": "string"
     },
     "itemId": {
       "type": "string"
+    },
+    "stream": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ExecOutputStream"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Origin of this delta; absent only for legacy producers."
     },
     "threadId": {
       "type": "string"

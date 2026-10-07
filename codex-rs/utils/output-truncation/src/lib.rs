@@ -12,6 +12,8 @@ mod tokenizer;
 pub use tokenizer::model_token_count;
 pub use tokenizer::truncate_model_text;
 pub use tokenizer::truncate_model_text_at_lines;
+pub use tokenizer::truncate_model_text_at_lines_with_artifact;
+pub use tokenizer::truncate_model_text_at_lines_with_recovery;
 
 pub use codex_protocol::protocol::TruncationPolicy;
 
@@ -312,7 +314,8 @@ const JSON_OUTLINE_MAX_DEPTH: usize = 3;
 /// outline. Line count and order are unchanged, so line coordinates and
 /// recovery selectors still refer to the original output; the outlined line
 /// reads as omitted, and exact values remain recoverable from the retained
-/// output with JSON pointer selectors.
+/// output with line or byte selectors. A JSON-looking line does not establish
+/// that its containing artifact is a single indexed JSON document.
 fn outline_oversized_json_lines(content: &str, max_tokens: usize) -> Option<String> {
     let line_budget = max_tokens / JSON_LINE_OUTLINE_BUDGET_DIVISOR;
     let mut outlined = String::new();
@@ -343,7 +346,7 @@ fn json_line_outline(value: &serde_json::Value, bytes: usize, max_tokens: usize)
         best.clear();
         let _ = write!(
             best,
-            "[JSON line of {bytes} bytes outlined; select exact values with JSON pointers] "
+            "[JSON line of {bytes} bytes outlined; recover exact source with line or byte selectors] "
         );
         json_outline(value, depth, &mut best);
         if !approx_token_count_exceeds(&best, max_tokens) {

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -53,10 +54,11 @@ const MISSING_LOCAL_EXIT_STATUS_MESSAGE: &str = "local process exit status chann
 /// beyond the artifact cap so the writer can preserve its truncation marker
 /// while the in-memory queue remains bounded.
 struct RawOutputArtifactTask {
-    sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    sender: Option<mpsc::UnboundedSender<Option<Vec<u8>>>>,
     task: JoinHandle<()>,
     state: Arc<Mutex<RawOutputArtifact>>,
     accepted_bytes: usize,
+    gap_recorded: bool,
 }
 
 impl RawOutputArtifactTask {
@@ -65,14 +67,18 @@ impl RawOutputArtifactTask {
         ready: CancellationToken,
     ) -> Option<Self> {
         let state = state?;
-        let (sender, mut receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
         let task_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
             let ready_on_exit = ready.clone().drop_guard();
             let mut writer = RawOutputArtifactWriter::open(Some(&task_state)).await;
             while let Some(output) = receiver.recv().await {
                 if let Some(writer) = writer.as_mut() {
-                    writer.write_chunk(Some(&task_state), &output).await;
+                    if let Some(output) = output {
+                        writer.write_chunk(Some(&task_state), &output).await;
+                    } else {
+                        writer.mark_output_gap(Some(&task_state)).await;
+                    }
                 }
             }
             if let Some(writer) = writer.as_mut() {
@@ -89,6 +95,7 @@ impl RawOutputArtifactTask {
             task,
             state,
             accepted_bytes: 0,
+            gap_recorded: false,
         })
     }
 
@@ -105,7 +112,7 @@ impl RawOutputArtifactTask {
         let Some(sender) = self.sender.as_ref() else {
             return;
         };
-        if sender.send(retained.to_vec()).is_ok() {
+        if sender.send(Some(retained.to_vec())).is_ok() {
             self.accepted_bytes = self.accepted_bytes.saturating_add(retained.len());
         } else {
             self.sender = None;
@@ -138,6 +145,14 @@ impl RawOutputArtifactTask {
             RawOutputArtifact::Failed { .. } => return,
         };
         *artifact = failed;
+    }
+
+    fn mark_output_gap(&mut self) {
+        if self.gap_recorded { return; }
+        self.gap_recorded = true;
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(None);
+        }
     }
 }
 
@@ -236,6 +251,7 @@ type TerminalCompletionReceiver = watch::Receiver<Option<Result<(), String>>>;
 /// Unified wrapper over directly spawned PTY sessions and exec-server-backed
 /// processes.
 pub(crate) struct UnifiedExecProcess {
+    incarnation: uuid::Uuid,
     validation: std::sync::OnceLock<crate::validation::CommandValidation>,
     process_handle: ProcessHandle,
     termination_owner: std::sync::OnceLock<ProcessTerminationOwner>,
@@ -250,6 +266,7 @@ pub(crate) struct UnifiedExecProcess {
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
     termination_requested: AtomicBool,
+    silent_for_ms: AtomicU64,
     stdin_closed: AtomicBool,
     termination_lock: Semaphore,
     output_drained: CancellationToken,
@@ -306,6 +323,7 @@ impl UnifiedExecProcess {
             let timeout = Duration::from_millis(stall_timeout_ms);
             let deadline = tokio::time::sleep(timeout);
             tokio::pin!(deadline);
+            let mut notice_armed = true;
             loop {
                 tokio::select! {
                     biased;
@@ -316,27 +334,34 @@ impl UnifiedExecProcess {
                             Err(broadcast::error::RecvError::Closed) => return,
                             // Lag means output progressed faster than the watchdog read it.
                             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                                if let Some(process) = process.upgrade() {
+                                    process.silent_for_ms.store(0, Ordering::Release);
+                                }
                                 deadline.as_mut().reset(tokio::time::Instant::now() + timeout);
+                                notice_armed = true;
                             }
                         }
                     }
-                    _ = &mut deadline => break,
+                    _ = &mut deadline, if notice_armed => {
+                        notice_armed = false;
+                        let Some(process) = process.upgrade() else {
+                            return;
+                        };
+                        if process.has_exited() || process.termination_was_requested() {
+                            return;
+                        }
+                        // One notice per silent interval; only real output re-arms it.
+                        // Keep diagnostics out of stdout/stderr and the retained artifact.
+                        process.silent_for_ms.store(stall_timeout_ms, Ordering::Release);
+                        let message = format!(
+                            "\n[harness: no output observed for {stall_timeout_ms} milliseconds; process exit not observed, termination not requested. Resume this session; do not restart the command.]\n"
+                        );
+                        process.output_buffer.lock().await.push_display_notice(message.as_bytes());
+                        process.output_notify.notify_waiters();
+                        process.interaction_requested.notify_waiters();
+                    }
                 }
             }
-            let Some(process) = process.upgrade() else {
-                return;
-            };
-            if process.has_exited() || process.termination_was_requested() {
-                return;
-            }
-            // Silence is an observation, not a terminal failure. Keep diagnostics
-            // out of the actual stdout/stderr and retained process-output artifact.
-            let message = format!(
-                "\n[harness: command stalled after {stall_timeout_ms} milliseconds without stdout or stderr; still running, not terminated. Resume this session; do not restart the command.]\n"
-            );
-            process.output_buffer.lock().await.push_chunk(message.as_bytes());
-            process.output_notify.notify_waiters();
-            process.interaction_requested.notify_waiters();
         };
         // An idle observer owns no shutdown-barrier slot.
         if let Some(owner) = self.termination_owner.get() {
@@ -392,6 +417,7 @@ impl UnifiedExecProcess {
 
         Self {
             validation: std::sync::OnceLock::new(),
+            incarnation: uuid::Uuid::new_v4(),
             process_handle,
             termination_owner: std::sync::OnceLock::new(),
             output_tx,
@@ -405,6 +431,7 @@ impl UnifiedExecProcess {
             output_closed_notify,
             cancellation_token,
             termination_requested: AtomicBool::new(false),
+            silent_for_ms: AtomicU64::new(0),
             stdin_closed: AtomicBool::new(false),
             termination_lock: Semaphore::new(1),
             output_drained,
@@ -581,6 +608,18 @@ impl UnifiedExecProcess {
         }
     }
 
+    /// Optional recovery reference for a deadline handback; never wait for the
+    /// output writer or claim pending artifact bytes are already recoverable.
+    pub(super) fn try_raw_output_artifact(&self) -> Option<RawOutputArtifact> {
+        let artifact = self.raw_output_artifact.as_ref()?.try_lock().ok()?;
+        (!artifact.is_pending()).then(|| artifact.clone())
+    }
+
+    #[cfg(test)]
+    pub(super) fn raw_output_artifact_owner_for_test(&self) -> Option<Arc<Mutex<RawOutputArtifact>>> {
+        self.raw_output_artifact.clone()
+    }
+
     pub(super) async fn snapshot_completion_output(&self) -> ProcessOutputSnapshot {
         let (aggregated_output, aggregated_output_is_exact) =
             snapshot_retained_output(&self.completion_output_buffer).await;
@@ -755,11 +794,19 @@ impl UnifiedExecProcess {
         // delivery. Never advertise a speculative Ctrl-C operation.
         let interrupt =
             tty || matches!(&self.process_handle, ProcessHandle::Local(_)) && !cfg!(windows);
+        let silent_for_ms = self.silent_for_ms.load(Ordering::Acquire);
         crate::tools::context::ExecSessionCapabilities {
+            incarnation: self.incarnation,
             stdin: running && tty && !self.stdin_closed.load(Ordering::Acquire),
             interrupt: running && interrupt,
             cancellation: running,
             polling: true,
+            observation: (silent_for_ms != 0).then_some(crate::tools::context::ExecSilenceObservation {
+                silent_for_ms,
+                reason: crate::tools::context::ExecObservationReason::NoOutputObserved,
+                process_exited: !running,
+                termination_requested: self.termination_was_requested(),
+            }),
         }
     }
 
@@ -1037,6 +1084,7 @@ impl UnifiedExecProcess {
                         Some(*seq)
                     }
                     ExecProcessEvent::Failed(_) => None,
+                    ExecProcessEvent::OutputGap { .. } => None,
                 });
                 let missing_sandbox_denial = matches!(
                     event.as_ref(),
@@ -1072,8 +1120,22 @@ impl UnifiedExecProcess {
                         exit_code,
                         closed,
                         failure,
+                        output_gap,
                         sandbox_denied,
                     } = response;
+                    if let Some(gap) = &output_gap {
+                        // Even an empty suffix must report lost output. Keep
+                        // lifecycle authoritative; output loss is not failure.
+                        if gap.through_seq > last_seq {
+                            if let Some(task) = artifact_task.as_mut() {
+                                task.mark_output_gap();
+                            }
+                            for buffer in [&output_buffer, &completion_output_buffer,
+                                &stdout_buffer, &stderr_buffer] {
+                                buffer.lock().await.record_lagged_chunks(1);
+                            }
+                        }
+                    }
                     for chunk in chunks {
                         if chunk.seq <= last_seq {
                             continue;
@@ -1139,6 +1201,18 @@ impl UnifiedExecProcess {
                     continue;
                 };
                 match event {
+                    ExecProcessEvent::OutputGap { through_seq } => {
+                        let skipped = through_seq.saturating_sub(last_seq);
+                        if skipped > 0 && let Some(task) = artifact_task.as_mut() {
+                            task.mark_output_gap();
+                        }
+                        for buffer in [&output_buffer, &completion_output_buffer,
+                            &stdout_buffer, &stderr_buffer] {
+                            buffer.lock().await.record_lagged_chunks(skipped);
+                        }
+                        last_seq = last_seq.max(through_seq);
+                        output_notify.notify_waiters();
+                    }
                     ExecProcessEvent::Output(chunk) => {
                         if chunk.seq <= last_seq {
                             continue;
@@ -1322,6 +1396,7 @@ mod raw_artifact_queue_tests {
             task: tokio::spawn(async {}),
             state: Arc::new(Mutex::new(RawOutputArtifact::unavailable("test sink"))),
             accepted_bytes: 0,
+            gap_recorded: false,
         };
         for _ in 0..100 {
             artifact.write_chunk(b"");
@@ -1334,7 +1409,7 @@ mod raw_artifact_queue_tests {
         artifact.write_chunk(b"retained output");
         assert_eq!(
             receiver.try_recv().expect("nonempty output queued"),
-            b"retained output"
+            Some(b"retained output".to_vec())
         );
         assert_eq!(artifact.accepted_bytes, 15);
         artifact.finish().await;

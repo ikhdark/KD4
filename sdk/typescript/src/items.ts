@@ -13,6 +13,19 @@ export type CommandExecutionItem = {
   command: string;
   /** Aggregated stdout and stderr captured while the command was running. */
   aggregated_output: string;
+  stdout?: string;
+  stderr?: string;
+  output_metadata?: {
+    process_exited: boolean;
+    output_drained: boolean;
+    aggregated_output_is_exact: boolean;
+    streams_are_exact: boolean;
+    decoding_lossy: boolean;
+    display_reduced: boolean;
+    search_no_match: boolean;
+    failure_cause: string | null;
+    raw_output_artifact_id: string | null;
+  };
   /** Set when the command exits; null while still running. */
   exit_code: number | null;
   /** Current status of the command execution. */
@@ -25,13 +38,13 @@ export type CommandExecutionItem = {
   execution_id?: string;
 };
 
-/** A terminally failed code-mode JavaScript cell. */
+/** A code-mode cell. Completion does not imply its child processes exited. */
 export type CodeModeCellItem = {
   id: string;
   type: "code_mode_cell";
   call_id: string;
   cell_id: string;
-  status: "failed";
+  status: "in_progress" | "yielded" | "completed" | "failed" | "terminated";
   error: string;
 };
 

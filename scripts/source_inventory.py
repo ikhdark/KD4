@@ -1325,7 +1325,7 @@ def describe_contract():
             "scan_pending": "number of files awaiting another scan batch",
             "source_bytes_read": "source bytes read in this batch",
             "source_bytes_reused": "bytes not reread because full file revisions and required rule hashes matched retained observations; --refresh bypasses this metadata-guarded cache",
-            "evidence_lineage": "kind (source_scan or retained_projection), source, and identity (digest of query_id and source_snapshot_sha256); attribution only, not semantic completeness or current runtime authority. Disk JSON adds content_sha256 over compact UTF-8 JSON with sorted keys and no top-level evidence_lineage; Markdown hashes the exact UTF-8 body after its header. Changed or legacy unsigned files fall back to ordinary file evidence.",
+            "evidence_lineage": "kind (source_scan or retained_projection), source, and identity (digest of query, source snapshot, classification results and review conclusions, independent of presentation); attribution only, not semantic completeness or current runtime authority. Disk JSON adds content_sha256 over compact UTF-8 JSON with sorted keys and no top-level evidence_lineage; Markdown hashes the exact UTF-8 body after its header. Changed or legacy unsigned files fall back to ordinary file evidence.",
             "scope_delta": "on a scope correction: added/removed selected source counts and up to 50 paths each, with an explicit completeness flag; prior scope and correction reason remain in state",
             "evidence_scope": "captured evidence freshness and scope",
             "unresolved_count": "records requiring inspection",
@@ -1509,10 +1509,26 @@ def evidence_lineage(state, kind="retained_projection"):
     if not snapshot:
         return {}
     query_id = output.get("query_id", query_identity(state["query"]))
+    # Source identity alone cannot identify derived classification or review
+    # conclusions. Hash semantic result data, not delivery paths or scan timing.
+    result = {
+        "query_id": query_id,
+        "source_snapshot_sha256": snapshot,
+        "records": sorted(state.get("records", []),
+                          key=lambda row: (row["path"], row["category"])),
+        "output": {key: output[key] for key in (
+            "paths", "untracked_paths", "categories", "unresolved", "excluded",
+            "deleted", "missing_categories", "ready_to_render", "review_progress",
+        ) if key in output},
+        "review": state.get("review", {}),
+        "stale_review": state.get("stale_review", {}),
+        "review_observations": state.get("review_observations", []),
+    }
     return {"evidence_lineage": {
         "kind": kind,
         "source": "source_inventory",
-        "identity": hashlib.sha256(f"{query_id}:{snapshot}".encode()).hexdigest()[:16],
+        "identity": digest(json.dumps(result, sort_keys=True, ensure_ascii=False,
+                                      separators=(",", ":")).encode("utf-8"))[:16],
     }}
 
 def file_lineage_document(document, lineage):

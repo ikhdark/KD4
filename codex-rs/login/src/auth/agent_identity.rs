@@ -135,6 +135,10 @@ impl AgentIdentityAuth {
         agent_identity_authapi_base_url: &str,
         auth_route_config: &AuthRouteConfig,
     ) -> std::io::Result<Self> {
+        if record.issuer_origin.as_deref() != Some(agent_identity_authapi_base_url.trim_end_matches('/'))
+        {
+            return Err(std::io::Error::other("agent identity belongs to a different auth-service origin"));
+        }
         public_key_ssh_from_private_key_pkcs8_base64(&record.agent_private_key)
             .map_err(std::io::Error::other)?;
         if record_needs_task_registration(&record) {
@@ -158,7 +162,8 @@ impl AgentIdentityAuth {
         agent_identity_authapi_base_url: &str,
         auth_route_config: &AuthRouteConfig,
     ) -> std::io::Result<Self> {
-        let record = verified_record_from_jwt(jwt, chatgpt_base_url, auth_route_config).await?;
+        let mut record = verified_record_from_jwt(jwt, chatgpt_base_url, auth_route_config).await?;
+        record.issuer_origin = Some(agent_identity_authapi_base_url.trim_end_matches('/').to_string());
         Self::from_record(record, agent_identity_authapi_base_url, auth_route_config).await
     }
 
@@ -207,7 +212,7 @@ pub(super) async fn register_managed_chatgpt_agent_identity(
     agent_identity_authapi_base_url: &str,
     session_source: SessionSource,
     auth_route_config: &AuthRouteConfig,
-) -> std::io::Result<AgentIdentityAuth> {
+) -> std::io::Result<AgentIdentityAuthRecord> {
     let key_material = generate_agent_key_material().map_err(std::io::Error::other)?;
     let registration_url = agent_registration_url(agent_identity_authapi_base_url);
     let client = create_default_auth_client(&registration_url, auth_route_config).await?;
@@ -236,6 +241,7 @@ pub(super) async fn register_managed_chatgpt_agent_identity(
     .map_err(|err| classify_bootstrap_error("agent identity registration", err))?;
 
     let record = AgentIdentityAuthRecord {
+        issuer_origin: Some(agent_identity_authapi_base_url.trim_end_matches('/').to_string()),
         agent_runtime_id: runtime_id,
         agent_private_key: key_material.private_key_pkcs8_base64,
         account_id: binding.account_id,
@@ -245,9 +251,8 @@ pub(super) async fn register_managed_chatgpt_agent_identity(
         chatgpt_account_is_fedramp: binding.chatgpt_account_is_fedramp,
         task_id: None,
     };
-    AgentIdentityAuth::from_record(record, agent_identity_authapi_base_url, auth_route_config)
-        .await
-        .map_err(|err| classify_bootstrap_error("agent task registration", err))
+    // The caller durably saves this successful stage before task registration.
+    Ok(record)
 }
 
 pub(super) async fn verified_record_from_jwt(
@@ -286,8 +291,10 @@ pub(super) fn record_needs_task_registration(record: &AgentIdentityAuthRecord) -
 pub(super) fn record_matches_managed_chatgpt_binding(
     record: &AgentIdentityAuthRecord,
     binding: &ManagedChatGptAgentIdentityBinding,
+    issuer_origin: &str,
 ) -> bool {
-    record.account_id == binding.account_id
+    record.issuer_origin.as_deref() == Some(issuer_origin.trim_end_matches('/'))
+        && record.account_id == binding.account_id
         && record.chatgpt_user_id == binding.chatgpt_user_id
         && public_key_ssh_from_private_key_pkcs8_base64(&record.agent_private_key).is_ok()
 }
@@ -404,6 +411,7 @@ mod tests {
 
     fn agent_identity_record(private_key: String) -> AgentIdentityAuthRecord {
         AgentIdentityAuthRecord {
+            issuer_origin: None,
             agent_runtime_id: "agent-runtime-1".to_string(),
             agent_private_key: private_key,
             account_id: "account-1".to_string(),
@@ -433,7 +441,11 @@ mod tests {
             .await;
 
         let auth = AgentIdentityAuth::from_record(
-            agent_identity_record_with_generated_key(),
+            {
+                let mut record = agent_identity_record_with_generated_key();
+                record.issuer_origin = Some(server.uri());
+                record
+            },
             &server.uri(),
             &crate::test_support::transport_default_auth_route_config(),
         )
@@ -522,7 +534,11 @@ mod tests {
             .mount(&server)
             .await;
         let auth = AgentIdentityAuth::from_record(
-            agent_identity_record_with_generated_key(),
+            {
+                let mut record = agent_identity_record_with_generated_key();
+                record.issuer_origin = Some(server.uri());
+                record
+            },
             &server.uri(),
             &crate::test_support::transport_default_auth_route_config(),
         )

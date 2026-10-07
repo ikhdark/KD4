@@ -34,6 +34,7 @@ use codex_tools::CanonicalToolResultKind;
 #[cfg(test)]
 use codex_tools::ToolProjectionInclusion;
 use codex_tools::ToolProjectionSection;
+use codex_utils_string::TokenCountEstimate;
 use codex_utils_string::approx_token_count_exceeds;
 use serde::Deserialize;
 use serde::Serialize;
@@ -97,6 +98,8 @@ pub(crate) enum ToolOutputSelector {
     },
     Search {
         query: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        enclosing: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         case_insensitive: bool,
         #[serde(default)]
@@ -202,6 +205,19 @@ pub(crate) struct ReadToolOutputResult {
 }
 
 impl ReadToolOutputResult {
+    /// Requested-page delivery, independent of transport and whole-file coverage.
+    pub(crate) fn selection_status(&self) -> &'static str {
+        if self.complete && !self.results.is_empty()
+            && self.results.iter().all(|result| result.status == ToolOutputSelectorStatus::Ok && result.complete)
+        {
+            "complete"
+        } else if self.results.iter().any(|result| result.status == ToolOutputSelectorStatus::Ok) {
+            "partial"
+        } else {
+            "failed"
+        }
+    }
+
     /// Exact bytes delivered in this response, including hydrated search context.
     /// Coordinates, recovery handles, and shared references alone are not delivery.
     pub(crate) fn delivered_ranges(&self) -> Vec<(u64, u64)> {
@@ -264,12 +280,15 @@ impl ReadToolOutputResult {
             if let Some(value) = &result.value {
                 // Search values include the query and scanned coverage, including
                 // successful negative searches. JSON selections retain their location.
-                if matches!(result.selector, ToolOutputSelector::Search { .. }) {
+                if let ToolOutputSelector::Search { query, case_insensitive, start_byte, .. } = &result.selector {
                     let mut proof = value.clone();
                     if let Some(fields) = proof.as_object_mut() {
                         fields.remove("hydrated_ranges");
                     }
-                    values.push(proof);
+                    values.push(serde_json::json!({
+                        "matching": {"query": query, "case_insensitive": case_insensitive, "start_byte": start_byte},
+                        "value": proof,
+                    }));
                 } else {
                     values.push(serde_json::json!({
                         "selector": result.selector,
@@ -297,13 +316,14 @@ impl Serialize for ReadToolOutputResult {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut result = serializer.serialize_struct("ReadToolOutputResult", 9)?;
+        let mut result = serializer.serialize_struct("ReadToolOutputResult", 10)?;
         result.serialize_field("artifact_id", &self.artifact_id)?;
         result.serialize_field("canonical_sha256", &self.canonical_sha256)?;
         result.serialize_field("canonical_bytes", &self.canonical_bytes)?;
         result.serialize_field("retained_bytes", &self.retained_bytes)?;
         // `complete` remains the legacy selection-completeness field.
         result.serialize_field("complete", &self.complete)?;
+        result.serialize_field("selection_status", &self.selection_status())?;
         result.serialize_field("delivered_selection_complete", &self.complete)?;
         result.serialize_field(
             "retained_artifact_complete",
@@ -389,7 +409,7 @@ macro_rules! record_retention_diagnostics {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetentionModeKind {
+pub(crate) enum RetentionModeKind {
     Indexed,
     Dirty,
     Reconciling,
@@ -1472,7 +1492,12 @@ impl RawOutputArtifactWriter {
             if let Some(state) = state {
                 *state.lock().await = artifact;
                 if let Some(opened) = Self::open(Some(state)).await {
+                    let truncated = self.truncated;
                     *self = opened;
+                    self.truncated |= truncated;
+                    if let RawOutputArtifact::Stored { truncated, .. } = &mut *state.lock().await {
+                        *truncated |= self.truncated;
+                    }
                 }
             }
             return;
@@ -1535,6 +1560,16 @@ impl RawOutputArtifactWriter {
             truncated: self.truncated,
             handle,
         };
+    }
+
+    pub(crate) async fn mark_output_gap(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
+        self.truncated = true;
+        self.write_chunk(state, b"\n[output gap: earlier producer output was evicted; capture is incomplete]\n").await;
+        if let Some(state) = state
+            && let RawOutputArtifact::Stored { truncated, .. } = &mut *state.lock().await
+        {
+            *truncated = true;
+        }
     }
 
     /// Makes buffered bytes visible before the process's artifact-ready signal.
@@ -1771,7 +1806,7 @@ impl RawOutputArtifact {
                 ..
             } => {
                 let suffix = if *truncated {
-                    ", truncated at safety limit"
+                    ", incomplete capture (output gap or safety limit)"
                 } else {
                     ""
                 };
@@ -2106,9 +2141,22 @@ fn reconcile_logical_artifact_transaction(path: &Path) -> std::io::Result<()> {
         // an uncommitted family. Preserve every segment for a later recovery.
         Err(error) => return Err(error),
     };
-    let metadata = metadata_bytes
-        .and_then(|bytes| serde_json::from_slice::<LogicalArtifactMetadata>(&bytes).ok())
-        .filter(|metadata| metadata.version == LOGICAL_ARTIFACT_METADATA_VERSION);
+    let metadata = metadata_bytes.map(|bytes| -> std::io::Result<LogicalArtifactMetadata> {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("corrupt artifact metadata; preserving family: {error}"))
+        })?;
+        if value.get("version").and_then(serde_json::Value::as_u64)
+            != Some(u64::from(LOGICAL_ARTIFACT_METADATA_VERSION))
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "unsupported artifact metadata version; preserving family"));
+        }
+        serde_json::from_value(value).map_err(|error| std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("corrupt artifact metadata; preserving family: {error}"),
+        ))
+    }).transpose()?;
     if let Some(metadata) = metadata {
         let retained = metadata
             .segments
@@ -2443,6 +2491,96 @@ fn response_fits_recovery_retry_avoidance_ceiling(
         value,
         token_ceiling.saturating_add(RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN),
     )
+}
+
+// Like recovery continuation accounting, combine serialized, independently
+// delimited fragments before rounding. This state belongs only to one selection.
+struct SelectorResponseCost {
+    envelopes: [TokenCountEstimate; 2],
+    results: TokenCountEstimate,
+    parts: Vec<SelectorPartCost>,
+}
+
+#[derive(Clone, Copy)]
+struct SelectorPartCost {
+    serialized: TokenCountEstimate,
+    successful: bool,
+    complete: bool,
+}
+
+#[expect(clippy::expect_used, reason = "typed selector values have infallible JSON serialization")]
+fn selector_serialized_cost(value: &ToolOutputSelectorResult) -> SelectorPartCost {
+    // These typed JSON values contain no fallible map keys or custom payloads.
+    SelectorPartCost {
+        serialized: TokenCountEstimate::new(&serde_json::to_string(value).expect("selector value serializes")),
+        successful: value.status == ToolOutputSelectorStatus::Ok,
+        complete: value.complete,
+    }
+}
+
+impl SelectorResponseCost {
+    fn new(metadata: &LogicalArtifactMetadata, previous: &[ToolOutputSelectorResult]) -> Self {
+        let mut envelope = ReadToolOutputResult {
+            artifact_id: metadata.artifact_id.clone(),
+            canonical_sha256: metadata.canonical_sha256.clone(),
+            canonical_bytes: metadata.canonical_bytes,
+            retained_bytes: metadata.retained_bytes,
+            complete: false,
+            unavailable_ranges: metadata.unavailable_ranges.clone(),
+            results: Vec::new(),
+        };
+        let incomplete = TokenCountEstimate::new(&serde_json::to_string(&envelope).expect("envelope serializes"));
+        envelope.complete = true;
+        let mut cost = Self {
+            envelopes: [incomplete, TokenCountEstimate::new(&serde_json::to_string(&envelope).expect("envelope serializes"))],
+            results: TokenCountEstimate::default(),
+            parts: Vec::with_capacity(previous.len()),
+        };
+        for result in previous {
+            cost.push(selector_serialized_cost(result));
+        }
+        cost
+    }
+
+    fn size(&self, complete: bool) -> TokenCountEstimate {
+        self.envelope(complete, None).add_delimited(self.results)
+    }
+
+    fn envelope(&self, complete: bool, next: Option<SelectorPartCost>) -> TokenCountEstimate {
+        let mut parts = self.parts.iter().copied().chain(next);
+        let any_success = parts.clone().any(|part| part.successful);
+        let all_complete = parts.all(|part| part.successful && part.complete);
+        let status = if complete && any_success && all_complete {
+            "\"complete\""
+        } else if any_success {
+            "\"partial\""
+        } else {
+            "\"failed\""
+        };
+        // Empty-result envelopes serialize selection_status as "failed".
+        self.envelopes[usize::from(complete)]
+            .subtract_delimited(TokenCountEstimate::new("\"failed\""))
+            .add_delimited(TokenCountEstimate::new(status))
+    }
+
+    fn with_next(&self, next: SelectorPartCost, complete: bool) -> TokenCountEstimate {
+        self.envelope(complete, Some(next)).add_delimited(self.results).add_delimited(next.serialized).add_delimited(
+            TokenCountEstimate::new(if self.parts.is_empty() { "" } else { "," }),
+        )
+    }
+
+    fn push(&mut self, next: SelectorPartCost) {
+        if !self.parts.is_empty() {
+            self.results = self.results.add_delimited(TokenCountEstimate::new(","));
+        }
+        self.results = self.results.add_delimited(next.serialized);
+        self.parts.push(next);
+    }
+
+    fn replace(&mut self, index: usize, next: SelectorPartCost) {
+        self.results = self.results.subtract_delimited(self.parts[index].serialized).add_delimited(next.serialized);
+        self.parts[index] = next;
+    }
 }
 
 fn successful_byte_selector_result(
@@ -3035,6 +3173,41 @@ fn commit_attach_canonical_output_artifact(
         .iter()
         .map(|segment| segment.range.end - segment.range.start)
         .sum::<u64>();
+    // A hash match alone does not authorize replacing already-advertised
+    // section or JSON-pointer addresses (for example with a later plain file read). Let the
+    // producer allocate a new artifact rather than invalidate old recovery.
+    if let Ok(metadata) = load_logical_metadata(&path, id) {
+        if (!metadata.sections.is_empty() && metadata.sections != canonical.sections)
+            || metadata.json_pointers.iter().any(|(pointer, address)| {
+                canonical.json_pointers.get(pointer) != Some(address)
+            })
+        {
+            return CanonicalOutputArtifact {
+                id: Some(id), retained_bytes: metadata.retained_bytes, complete: false,
+                unavailable_ranges: Vec::new(),
+                error: Some("existing artifact has incompatible recovery addresses".to_string()),
+            };
+        }
+        if metadata.complete && canonical.complete
+            && metadata.canonical_bytes == canonical.exact_bytes
+            && metadata.canonical_sha256 == canonical.sha256
+            && metadata.canonical_kind == canonical.kind
+            && metadata.sections == canonical.sections
+            && metadata.json_pointers == canonical.json_pointers
+        {
+            // Authenticate under the existing retention lock. Unchanged bytes
+            // and addresses need no transaction, index rebuild or metadata sync.
+            let error = load_validated_logical_snapshot(&path, &metadata)
+                .and_then(|bytes| if bytes == canonical.bytes { Ok(()) } else {
+                    Err(ReadToolOutputError::Io("existing artifact bytes changed".into()))
+                }).err().map(|error| error.for_model());
+            return CanonicalOutputArtifact {
+                id: Some(id), retained_bytes: metadata.retained_bytes,
+                complete: error.is_none(), unavailable_ranges: metadata.unavailable_ranges,
+                error,
+            };
+        }
+    }
     if let Err(err) = reconcile_logical_artifact_transactions(&directory) {
         return CanonicalOutputArtifact {
             id: Some(id),
@@ -3393,6 +3566,7 @@ fn create_new_protection_marker(marker: &Path, contents: &[u8]) -> std::io::Resu
     Ok(())
 }
 
+#[cfg(test)]
 fn verified_artifact_digest(reader: impl Read, expected_bytes: u64) -> Result<String, String> {
     // The file can change after its metadata was inspected. Bound both
     // memory and the read, including one extra byte to detect growth.
@@ -3440,14 +3614,25 @@ fn verify_tool_history_artifact_blocking(
     expected_bytes: u64,
     expected_sha256: &str,
 ) -> Result<(), String> {
-    let (file, artifact_bytes) = open_regular_artifact(path)
+    let id = path.file_stem().and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<ToolOutputArtifactId>().ok())
+        .ok_or_else(|| "invalid tool-output artifact id".to_string())?;
+    let (metadata, snapshot) = load_logical_metadata_with_snapshot(path, id)
         .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
-    if artifact_bytes != expected_bytes {
+    if !metadata.complete || metadata.canonical_bytes != expected_bytes
+        || metadata.retained_bytes != expected_bytes || !metadata.unavailable_ranges.is_empty()
+    {
         return Err("artifact byte count does not match receipt metadata".to_string());
     }
-    if verified_artifact_digest(file, expected_bytes)? != expected_sha256 {
+    if metadata.canonical_sha256 != expected_sha256
+        || metadata.retained_sha256.as_deref().is_some_and(|digest| digest != expected_sha256)
+    {
         return Err("artifact digest does not match receipt metadata".to_string());
     }
+    // Raw loading already authenticates the bytes; logical loading validates
+    // every segment, its lock, digest and index exactly once.
+    snapshot.map_or_else(|| load_validated_logical_snapshot(path, &metadata), Ok)
+        .map_err(|error| format!("artifact is not retrievable: {}", error.for_model()))?;
     Ok(())
 }
 
@@ -3473,15 +3658,31 @@ pub(crate) async fn protect_active_tool_history_artifacts(
     thread_id: &str,
     references: BTreeMap<String, (u64, String)>,
 ) -> Result<(), String> {
+    protect_tool_history_artifact_batch(codex_home, thread_id, references, false).await.map(|_| ())
+}
+
+/// Lifecycle preparation must retain healthy siblings even when one receipt
+/// is stale or corrupt. It shares the strict admission owner's worker and lock.
+pub(crate) async fn protect_retrievable_tool_history_artifacts(
+    codex_home: &Path,
+    thread_id: &str,
+    references: BTreeMap<String, (u64, String)>,
+) -> BTreeSet<String> {
+    protect_tool_history_artifact_batch(codex_home, thread_id, references, true)
+        .await.unwrap_or_else(|error| {
+            tracing::warn!(%error, "artifact batch protection failed");
+            BTreeSet::new()
+        })
+}
+
+async fn protect_tool_history_artifact_batch(
+    codex_home: &Path,
+    thread_id: &str,
+    references: BTreeMap<String, (u64, String)>,
+    best_effort: bool,
+) -> Result<BTreeSet<String>, String> {
     if references.is_empty() {
-        return Ok(());
-    }
-    for artifact_id in references.keys() {
-        let id = artifact_id.parse::<ToolOutputArtifactId>()
-            .map_err(|_| "invalid tool-output artifact id".to_string())?;
-        if id.to_string() != *artifact_id {
-            return Err("non-canonical tool-output artifact id".to_string());
-        }
+        return Ok(BTreeSet::new());
     }
     let directory = codex_home.join("tool-output").join(thread_id);
     let (root, semaphore) = retention_sweep_admission_for_directory(&directory)
@@ -3498,10 +3699,21 @@ pub(crate) async fn protect_active_tool_history_artifacts(
             record_retention_sweep_permit_failure(&root, &error);
             format!("failed to acquire artifact retention lock: {error}")
         })?;
+        let mut verified = BTreeSet::new();
         for (id, (bytes, sha256)) in &references {
-            verify_tool_history_artifact_blocking(&directory.join(format!("{id}.log")), *bytes, sha256)?;
+            let result = id.parse::<ToolOutputArtifactId>()
+                .ok().filter(|parsed| parsed.to_string() == *id)
+                .ok_or_else(|| "invalid tool-output artifact id".to_string())
+                .and_then(|_| verify_tool_history_artifact_blocking(
+                    &directory.join(format!("{id}.log")), *bytes, sha256));
+            match result {
+                Ok(()) => { verified.insert(id.clone()); }
+                Err(error) if !best_effort => return Err(error),
+                Err(_) => {}
+            }
         }
-        for (id, _) in references {
+        let mut protected = BTreeSet::new();
+        for id in verified {
             let token = capture_retention_token(&directory);
             let path = directory.join(format!("{id}.log"));
             let marker = active_tool_history_protection_path(&path);
@@ -3540,9 +3752,13 @@ pub(crate) async fn protect_active_tool_history_artifacts(
             if result.is_err() {
                 reject_stale_delta(&token);
             }
-            result?;
+            match result {
+                Ok(()) => { protected.insert(id); }
+                Err(error) if !best_effort => return Err(error),
+                Err(_) => {}
+            }
         }
-        Ok(())
+        Ok(protected)
     })
     .await
     .map_err(|error| format!("artifact protection worker failed: {error}"))?
@@ -3657,21 +3873,9 @@ pub(crate) async fn reconcile_active_tool_history_artifact_protection(
     thread_id: &str,
     referenced_artifacts: &BTreeMap<String, (u64, String)>,
 ) -> BTreeSet<String> {
-    let mut live = BTreeSet::new();
-    for (artifact_id, (expected_bytes, expected_sha256)) in referenced_artifacts {
-        if protect_active_tool_history_artifact(
-            codex_home,
-            thread_id,
-            artifact_id,
-            *expected_bytes,
-            expected_sha256,
-        )
-        .await
-        .is_ok()
-        {
-            live.insert(artifact_id.clone());
-        }
-    }
+    let live = protect_retrievable_tool_history_artifacts(
+        codex_home, thread_id, referenced_artifacts.clone(),
+    ).await;
 
     let directory = codex_home.join("tool-output").join(thread_id);
     let retention_token = match capture_retention_token_async(&directory).await {
@@ -4041,12 +4245,22 @@ fn load_logical_metadata(
     path: &Path,
     id: ToolOutputArtifactId,
 ) -> Result<LogicalArtifactMetadata, ReadToolOutputError> {
-    load_logical_metadata_with_snapshot(path, id).map(|(metadata, _)| metadata)
+    let (mut metadata, snapshot) = load_logical_metadata_with_snapshot(path, id)?;
+    // Attachment and namespace transfer request the complete address metadata
+    // so they cannot erase previously usable raw JSON pointers. Byte/line
+    // recovery loads the snapshot directly and does not take this path.
+    if let Some(bytes) = snapshot {
+        metadata.json_pointers = raw_json_pointer_index(&bytes).unwrap_or_default();
+        if !metadata.json_pointers.is_empty() {
+            metadata.canonical_kind = CanonicalToolResultKind::Json;
+        }
+    }
+    Ok(metadata)
 }
 
 /// Index borrowed lexical values, retaining the producer's whitespace, key
 /// order, and byte offsets rather than reserializing its JSON.
-fn raw_json_pointer_index(contents: &[u8]) -> Option<BTreeMap<String, CanonicalJsonPointer>> {
+pub(crate) fn raw_json_pointer_index(contents: &[u8]) -> Option<BTreeMap<String, CanonicalJsonPointer>> {
     fn visit<'a>(
         raw: &'a serde_json::value::RawValue,
         base: usize,
@@ -4128,22 +4342,17 @@ fn load_logical_metadata_with_snapshot(
             })?;
             let bytes = contents.len() as u64;
             let sha256 = format!("{:x}", Sha256::digest(&contents));
-            let json_pointers = raw_json_pointer_index(&contents).unwrap_or_default();
             let metadata = LogicalArtifactMetadata {
                 version: LOGICAL_ARTIFACT_METADATA_VERSION,
                 artifact_id: id.to_string(),
-                canonical_kind: if json_pointers.is_empty() {
-                    CanonicalToolResultKind::Bytes
-                } else {
-                    CanonicalToolResultKind::Json
-                },
+                canonical_kind: CanonicalToolResultKind::Bytes,
                 canonical_sha256: sha256.clone(),
                 retained_sha256: Some(sha256),
                 canonical_bytes: bytes,
                 retained_bytes: bytes,
                 complete: true,
                 unavailable_ranges: Vec::new(),
-                json_pointers,
+                json_pointers: BTreeMap::new(),
                 sections: Vec::new(),
                 line_starts: canonical_line_starts(&contents),
                 segments: vec![LogicalArtifactSegment {
@@ -4364,11 +4573,14 @@ fn selector_range_and_children(
                 .map(|id| ToolOutputSelector::Section { id: id.clone() })
                 .collect::<Vec<_>>();
             if section.canonical_range.is_none() {
-                let value = serde_json::json!({
+                let mut value = serde_json::json!({
                     "section_id": section.id,
                     "kind": "directory",
                     "children": children,
                 });
+                if let Some(details) = &section.value {
+                    value["details"] = details.clone();
+                }
                 Ok((None, children, Some(value)))
             } else {
                 Ok((section.canonical_range, children, section.value.clone()))
@@ -4426,6 +4638,7 @@ fn merged_selector_still_completes(
         fragment_token_ceiling,
         final_token_ceiling,
         &[],
+        None,
     );
     match selected.status {
         ToolOutputSelectorStatus::Ok => true,
@@ -4458,6 +4671,17 @@ fn normalize_tool_output_selectors(
     snapshot: &[u8],
     fragment_token_ceiling: usize,
     final_token_ceiling: usize,
+) -> Vec<ToolOutputSelector> {
+    normalize_tool_output_selectors_with_fit(selectors, metadata, |selector| {
+        merged_selector_still_completes(metadata, snapshot, selector,
+            fragment_token_ceiling, final_token_ceiling)
+    })
+}
+
+fn normalize_tool_output_selectors_with_fit(
+    selectors: Vec<ToolOutputSelector>,
+    metadata: &LogicalArtifactMetadata,
+    fits: impl Fn(&ToolOutputSelector) -> bool,
 ) -> Vec<ToolOutputSelector> {
     let mut byte_ranges = Vec::<(u64, u64)>::new();
     let mut line_ranges = Vec::<(usize, usize)>::new();
@@ -4498,13 +4722,7 @@ fn normalize_tool_output_selectors(
                     start: *previous_start,
                     end,
                 };
-                if merged_selector_still_completes(
-                    metadata,
-                    snapshot,
-                    &candidate,
-                    fragment_token_ceiling,
-                    final_token_ceiling,
-                ) {
+                if fits(&candidate) {
                     *previous_end = end;
                 } else {
                     merged_bytes.push((start, end));
@@ -4514,13 +4732,7 @@ fn normalize_tool_output_selectors(
         }
     }
     let merged_lines = normalize_line_ranges_within_ceiling(line_ranges, |start, end| {
-        merged_selector_still_completes(
-            metadata,
-            snapshot,
-            &ToolOutputSelector::Lines { start, end },
-            fragment_token_ceiling,
-            final_token_ceiling,
-        )
+        fits(&ToolOutputSelector::Lines { start, end })
     });
 
     let mut normalized = merged_bytes
@@ -4699,21 +4911,28 @@ fn share_overlapping_search_hydration(
     }
 }
 
+enum SearchBudget {
+    ResponseTokens(usize),
+    SelectorBytes(usize),
+}
+
 fn search_logical_artifact(
     metadata: &LogicalArtifactMetadata,
     snapshot: &[u8],
     selector: ToolOutputSelector,
-    token_ceiling: usize,
+    budget: SearchBudget,
     previous_results: &[ToolOutputSelectorResult],
+    previous_cost: Option<&SelectorResponseCost>,
 ) -> ToolOutputSelectorResult {
-    let (query, start_byte, max_results, context_lines, case_insensitive) = match &selector {
+    let (query, start_byte, max_results, context_lines, case_insensitive, enclosing) = match &selector {
         ToolOutputSelector::Search {
             query,
             start_byte,
             max_results,
             context_lines,
             case_insensitive,
-        } => (query.clone(), *start_byte, *max_results, *context_lines, *case_insensitive),
+            enclosing,
+        } => (query.clone(), *start_byte, *max_results, *context_lines, *case_insensitive, *enclosing),
         _ => unreachable!("search helper requires a search selector"),
     };
     if query.is_empty() || query.len() > ARTIFACT_SEARCH_MAX_QUERY_BYTES {
@@ -4761,44 +4980,46 @@ fn search_logical_artifact(
         }
     }
 
+    // Item sections are retained with the immutable snapshot. Resolve each
+    // discovered hit once, before fitting/presenting prefixes of this page.
+    let enrichment_available = !enclosing || metadata.sections.iter().any(|section| section.id == "outline");
+    let contexts = indexed_matches.iter().map(|&(match_start, match_end)| {
+        let line = metadata.line_starts.partition_point(|start| *start <= match_start as u64).max(1);
+        let end_line = metadata.line_starts.partition_point(|start| *start <= match_end.saturating_sub(1) as u64).max(line);
+        let mut start = line.saturating_sub(context_lines).max(1);
+        let mut end = end_line.saturating_add(context_lines).min(metadata.line_starts.len());
+        if enclosing && let Some(range) = metadata.sections.iter()
+            .filter(|section| section.id.starts_with("code:"))
+            .filter_map(|section| section.canonical_range)
+            .filter(|range| range.start <= match_start as u64 && match_end as u64 <= range.end)
+            .min_by_key(|range| range.len())
+        {
+            start = start.min(metadata.line_starts.partition_point(|offset| *offset <= range.start).max(1));
+            end = end.max(metadata.line_starts.partition_point(|offset| *offset < range.end).max(1));
+        }
+        (line, end_line, start, end)
+    }).collect::<Vec<_>>();
     let build_result = |matches_returned: usize| {
         let mut matches = Vec::with_capacity(matches_returned);
-        let mut child_selectors = Vec::<ToolOutputSelector>::new();
-        for (match_start, match_end) in indexed_matches.iter().copied().take(matches_returned) {
-            let line = metadata
-                .line_starts
-                .partition_point(|line_start| *line_start <= match_start as u64)
-                .max(1);
-            let end_line = metadata
-                .line_starts
-                .partition_point(|line_start| *line_start <= match_end.saturating_sub(1) as u64)
-                .max(line);
-            let context_start = line.saturating_sub(context_lines).max(1);
-            let context_end = end_line
-                .saturating_add(context_lines)
-                .min(metadata.line_starts.len());
+        let mut ranges = Vec::with_capacity(matches_returned);
+        for ((match_start, match_end), &(line, end_line, context_start, context_end)) in
+            indexed_matches.iter().copied().zip(&contexts).take(matches_returned)
+        {
             matches.push(serde_json::json!({
                 "line": line,
                 "end_line": end_line,
                 "start_byte": match_start,
                 "end_byte": match_end,
             }));
-            match child_selectors.last_mut() {
-                Some(ToolOutputSelector::Lines { end, .. })
-                    if context_start <= end.saturating_add(1) =>
-                {
-                    *end = (*end).max(context_end);
-                }
-                _ => child_selectors.push(ToolOutputSelector::Lines {
-                    start: context_start,
-                    end: context_end,
-                }),
-            }
+            ranges.push((context_start, context_end));
         }
+        let child_selectors = normalize_line_ranges(ranges).into_iter()
+            .map(|(start, end)| ToolOutputSelector::Lines { start, end }).collect::<Vec<_>>();
 
         let remaining_match_count = total_matches.saturating_sub(matches_returned);
         let continuation = (remaining_match_count > 0).then(|| ToolOutputSelector::Search {
             query: query.clone(),
+            enclosing,
             case_insensitive,
             start_byte: indexed_matches
                 .get(..matches_returned)
@@ -4835,17 +5056,21 @@ fn search_logical_artifact(
             .collect::<Vec<_>>();
         let mut result =
             ToolOutputSelectorResult::state(selector.clone(), ToolOutputSelectorStatus::Ok);
-        result.complete = continuation.is_none();
+        result.complete = matches_returned == indexed_matches.len() && enrichment_available;
         result.value = Some(serde_json::json!({
             "query": query,
             "start_byte": start_byte,
-            "coverage_complete": true,
+            "coverage_complete": metadata.complete && metadata.unavailable_ranges.is_empty(),
             "total_matches": total_matches,
             "matches_returned": matches_returned,
             "remaining_match_count": remaining_match_count,
+            "search_exhausted": remaining_match_count == 0,
             "matches": matches,
             "hydrated_ranges": hydrated_ranges,
         }));
+        if enclosing && let Some(value) = result.value.as_mut() {
+            value["enclosing_complete"] = Value::Bool(enrichment_available);
+        }
         result.child_selectors = child_selectors;
         result.continuation = continuation;
         result.message = match remaining_match_count > 0 {
@@ -4855,22 +5080,27 @@ fn search_logical_artifact(
             ),
             false => None,
         };
+        if !enrichment_available {
+            result.message = Some("Enclosing enrichment unavailable: this snapshot has no retained item sections. Ordinary search evidence is returned; it is not a complete enclosing item.".into());
+        }
         result
     };
 
+    let owned_cost;
+    let previous_cost = match previous_cost {
+        Some(cost) => cost,
+        None => {
+            owned_cost = SelectorResponseCost::new(metadata, previous_results);
+            &owned_cost
+        }
+    };
     let fits = |candidate: &ToolOutputSelectorResult| {
-        let mut results = previous_results.to_vec();
-        results.push(candidate.clone());
-        let response = ReadToolOutputResult {
-            artifact_id: metadata.artifact_id.clone(),
-            canonical_sha256: metadata.canonical_sha256.clone(),
-            canonical_bytes: metadata.canonical_bytes,
-            retained_bytes: metadata.retained_bytes,
-            complete: metadata.complete,
-            unavailable_ranges: metadata.unavailable_ranges.clone(),
-            results,
-        };
-        response_fits_recovery_token_ceiling(&response, token_ceiling)
+        match budget {
+            SearchBudget::ResponseTokens(ceiling) =>
+                previous_cost.with_next(selector_serialized_cost(candidate), metadata.complete).tokens() <= ceiling,
+            SearchBudget::SelectorBytes(ceiling) =>
+                serde_json::to_vec(candidate).is_ok_and(|bytes| bytes.len() <= ceiling),
+        }
     };
     // Most search pages fit as a whole. Avoid building and serializing every
     // smaller prefix in that case. Oversized pages retain the exact bounded
@@ -4894,8 +5124,10 @@ fn search_logical_artifact(
         && !indexed_matches.is_empty()
     {
         let mut coordinates = build_result(1);
+        coordinates.complete = false;
         if let Some(value) = coordinates.value.as_mut() {
             value["hydrated_ranges"] = serde_json::json!([]);
+            if enclosing { value["enclosing_complete"] = Value::Bool(false); }
         }
         coordinates.message = Some(
             "Match coordinates delivered; context exceeds this budget. Read child_selectors for exact context; the search continuation starts after this match.".to_string(),
@@ -5040,6 +5272,10 @@ fn exact_selector_result(
     snapshot: &[u8],
     selector: ToolOutputSelector,
 ) -> ToolOutputSelectorResult {
+    if matches!(selector, ToolOutputSelector::JsonPointer { .. }) && metadata.json_pointers.is_empty() {
+        return invalid_selector_result(selector,
+            "json_pointer requires valid JSON within the existing depth limit; raw snapshot bytes and sibling selections remain available");
+    }
     let (range, children, directory_value) = match selector_range_and_children(&selector, metadata)
     {
         Ok(result) => result,
@@ -5126,14 +5362,16 @@ fn select_logical_artifact(
     fragment_token_ceiling: usize,
     final_token_ceiling: usize,
     previous_results: &[ToolOutputSelectorResult],
+    previous_cost: Option<&SelectorResponseCost>,
 ) -> ToolOutputSelectorResult {
     if selector.is_search() {
         return search_logical_artifact(
             metadata,
             snapshot,
             selector,
-            final_token_ceiling,
+            SearchBudget::ResponseTokens(final_token_ceiling),
             previous_results,
+            previous_cost,
         );
     }
     let mut result = exact_selector_result(metadata, snapshot, selector.clone());
@@ -5179,7 +5417,6 @@ pub(crate) async fn read_tool_output_selectors(
 /// Host-side exact read for transformations of retained evidence. Reuses the
 /// selector reader's identity, confinement, integrity, and writer-lock checks;
 /// unlike a model projection it must reject any incomplete source.
-#[cfg(test)]
 pub(crate) async fn read_complete_canonical_snapshot(
     codex_home: &Path,
     thread_id: &str,
@@ -5268,6 +5505,7 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
 pub(crate) struct ToolOutputSnapshot {
     metadata: LogicalArtifactMetadata,
     bytes: Vec<u8>,
+    indexed_metadata: OnceLock<LogicalArtifactMetadata>,
 }
 
 impl ToolOutputSnapshot {
@@ -5282,8 +5520,21 @@ impl ToolOutputSnapshot {
     ) -> Result<ReadToolOutputResult, ReadToolOutputError> {
         let snapshot = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
+            // Derive missing lexical addresses once per authenticated recovery
+            // transaction, regardless of how the snapshot was first selected.
+            let metadata = if snapshot.metadata.json_pointers.is_empty()
+                && snapshot.metadata.complete
+                && selectors.iter().any(|selector| matches!(selector, ToolOutputSelector::JsonPointer { .. }))
+            {
+                snapshot.indexed_metadata.get_or_init(|| LogicalArtifactMetadata {
+                    json_pointers: raw_json_pointer_index(&snapshot.bytes).unwrap_or_default(),
+                    ..snapshot.metadata.clone()
+                })
+            } else {
+                &snapshot.metadata
+            };
             select_tool_output_snapshot(
-                &snapshot.metadata,
+                metadata,
                 &snapshot.bytes,
                 selectors,
                 token_ceiling,
@@ -5313,7 +5564,7 @@ pub(crate) async fn load_tool_output_snapshot(
         let (metadata, snapshot) = load_logical_metadata_with_snapshot(&path, id)?;
         open_regular_artifact(&path)?;
         let bytes = snapshot.map_or_else(|| load_validated_logical_snapshot(&path, &metadata), Ok)?;
-        Ok(Arc::new(ToolOutputSnapshot { metadata, bytes }))
+        Ok(Arc::new(ToolOutputSnapshot { metadata, bytes, indexed_metadata: OnceLock::new() }))
     })
     .await
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
@@ -5345,13 +5596,13 @@ fn select_tool_output_snapshot(
         unavailable_ranges: metadata.unavailable_ranges.clone(),
         results: Vec::with_capacity(selectors.len()),
     };
+    let mut cost = SelectorResponseCost::new(metadata, &[]);
+    let retry_ceiling = token_ceiling.saturating_add(RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN);
     for (index, selector) in selectors.iter().enumerate() {
         // A search is a page, not an indivisible exact value. Share the remaining
         // response capacity so the first query cannot starve every later query.
         let selection_ceiling = if selector.is_search() {
-            let occupied = serde_json::to_string(&response)
-                .map(|text| codex_utils_string::approx_token_count(&text))
-                .unwrap_or(token_ceiling);
+            let occupied = cost.size(response.complete).tokens();
             // Search measures the entire response, including its existing envelope.
             occupied
                 .saturating_add(token_ceiling.saturating_sub(occupied) / (selectors.len() - index))
@@ -5366,43 +5617,33 @@ fn select_tool_output_snapshot(
             selection_ceiling.min(RECOVERY_FRAGMENT_TOKEN_CEILING),
             selection_ceiling,
             &response.results,
+            Some(&cost),
         );
         if selected.status == ToolOutputSelectorStatus::SelectorTooLarge
             && let Some(completed) =
                 internally_drain_exact_subdivisions(metadata, snapshot, &selected)
         {
-            let mut candidate = response.clone();
-            candidate.results.push(completed.clone());
-            candidate.complete = candidate
-                .results
-                .iter()
-                .all(|result| result.status == ToolOutputSelectorStatus::Ok && result.complete);
-            let mut individual_candidate = response.clone();
-            individual_candidate.results.clear();
-            individual_candidate.results.push(completed.clone());
-            individual_candidate.complete = true;
-            if response_fits_recovery_retry_avoidance_ceiling(&candidate, token_ceiling)
-                || response_fits_recovery_retry_avoidance_ceiling(
-                    &individual_candidate,
-                    token_ceiling,
-                )
+            let completed_cost = selector_serialized_cost(&completed);
+            let complete = (response.results.is_empty() || response.complete)
+                && completed.status == ToolOutputSelectorStatus::Ok && completed.complete;
+            if cost.with_next(completed_cost, complete).tokens() <= retry_ceiling
+                || SelectorResponseCost::new(metadata, &[]).with_next(completed_cost, true).tokens() <= retry_ceiling
             {
                 selected = completed;
             }
         }
+        response.complete = (response.results.is_empty() || response.complete)
+            && selected.status == ToolOutputSelectorStatus::Ok && selected.complete;
+        cost.push(selector_serialized_cost(&selected));
         response.results.push(selected);
-        response.complete = response
-            .results
-            .iter()
-            .all(|result| result.status == ToolOutputSelectorStatus::Ok && result.complete);
-        if response_fits_recovery_retry_avoidance_ceiling(&response, token_ceiling) {
+        if cost.size(response.complete).tokens() <= retry_ceiling {
             continue;
         }
         let Some(selected) = response.results.last_mut() else {
             unreachable!("the selected result was just appended");
         };
         if selected.status == ToolOutputSelectorStatus::Ok {
-            let previous = selected.clone();
+            let previous = &*selected;
             let mut omitted = previous
                 .canonical_range
                 .map(|range| {
@@ -5433,13 +5674,14 @@ fn select_tool_output_snapshot(
                     .to_string(),
             );
             *selected = omitted;
+            cost.replace(cost.parts.len() - 1, selector_serialized_cost(selected));
         }
         response.complete = false;
         // A later selector can exhaust the envelope after an earlier value has
         // fitted. Keep the batch addressable instead of discarding every result
         // and forcing a model/tool retry with fewer selectors. Compact from the
         // tail so retained search hydration never references an omitted prefix.
-        if !response_fits_recovery_token_ceiling(&response, token_ceiling) {
+        if cost.size(false).tokens() > token_ceiling {
             for index in (0..response.results.len()).rev() {
                 let previous = &response.results[index];
                 if !matches!(previous.status,
@@ -5457,12 +5699,13 @@ fn select_tool_output_snapshot(
                 omitted.canonical_range = previous.canonical_range;
                 omitted.continuation = Some(previous.selector.clone());
                 response.results[index] = omitted;
-                if response_fits_recovery_token_ceiling(&response, token_ceiling) {
+                cost.replace(index, selector_serialized_cost(&response.results[index]));
+                if cost.size(false).tokens() <= token_ceiling {
                     break;
                 }
             }
         }
-        if !response_fits_recovery_token_ceiling(&response, token_ceiling) {
+        if cost.size(false).tokens() > token_ceiling {
             return Err(ReadToolOutputError::InvalidRange(
                 "normalized selector manifest cannot fit a bounded typed-overflow response; use fewer selectors"
                     .to_string(),
@@ -5473,6 +5716,11 @@ fn select_tool_output_snapshot(
         .results
         .iter()
         .all(|result| result.status == ToolOutputSelectorStatus::Ok && result.complete);
+    if !response_fits_recovery_retry_avoidance_ceiling(&response, token_ceiling) {
+        return Err(ReadToolOutputError::InvalidRange(
+            "selector response exceeds its final recovery ceiling".to_string(),
+        ));
+    }
     Ok(response)
 }
 
@@ -5554,21 +5802,39 @@ pub(crate) fn select_file_snapshot_for_script(
     // The envelope and previously selected fragments do not change while
     // admitting the next selector. Size each fragment once instead of
     // serializing the growing prefix (up to 64 times).
+    let mut cost = SelectorResponseCost::new(&metadata, &[]);
     let envelope_bytes = serde_json::to_vec(&response).map(|bytes| bytes.len()).unwrap_or(MAX_SCRIPT_BYTES);
+    let selectors = normalize_tool_output_selectors_with_fit(selectors, &metadata, |selector| {
+        let selected = exact_selector_result(&metadata, &canonical.bytes, selector.clone());
+        selected.status == ToolOutputSelectorStatus::Ok && selected.complete
+            && serde_json::to_vec(&selected).is_ok_and(|bytes|
+                envelope_bytes.saturating_add(bytes.len()) <= MAX_SCRIPT_BYTES - 128 * 1024)
+    });
     let mut result_bytes = 0usize;
     for selector in selectors {
-        let mut selected = select_logical_artifact(
-            &metadata, &canonical.bytes, selector.clone(), usize::MAX, usize::MAX,
-            &response.results,
-        );
+        let remaining = (MAX_SCRIPT_BYTES - 128 * 1024).saturating_sub(envelope_bytes)
+            .saturating_sub(result_bytes).saturating_sub(usize::from(!response.results.is_empty()));
+        let mut selected = if selector.is_search() {
+            search_logical_artifact(&metadata, &canonical.bytes, selector.clone(),
+                SearchBudget::SelectorBytes(remaining), &response.results, Some(&cost))
+        } else {
+            exact_selector_result(&metadata, &canonical.bytes, selector.clone())
+        };
         loop {
             // Reserve enough room for all remaining selectors' overflow metadata.
-            let selected_bytes = serde_json::to_vec(&selected).map(|bytes| bytes.len()).unwrap_or(MAX_SCRIPT_BYTES);
-            let next_bytes = result_bytes.saturating_add(selected_bytes)
+            let serialized = serde_json::to_string(&selected).map_err(|error|
+                ReadToolOutputError::InvalidRange(error.to_string()))?;
+            let selected_cost = SelectorPartCost {
+                serialized: TokenCountEstimate::new(&serialized),
+                successful: selected.status == ToolOutputSelectorStatus::Ok,
+                complete: selected.complete,
+            };
+            let next_bytes = result_bytes.saturating_add(serialized.len())
                 .saturating_add(usize::from(!response.results.is_empty()));
             let fits = envelope_bytes.saturating_add(next_bytes) <= MAX_SCRIPT_BYTES - 128 * 1024;
             if fits {
                 result_bytes = next_bytes;
+                cost.push(selected_cost);
                 response.results.push(selected);
                 break;
             }
@@ -5582,16 +5848,38 @@ pub(crate) fn select_file_snapshot_for_script(
                 );
                 continue;
             }
-            let mut omitted = ToolOutputSelectorResult::state(
+            let mut omitted = selected.canonical_range.map(|range| {
+                too_large_result(
+                    selector.clone(), range, Vec::new(), &metadata, &canonical.bytes,
+                    RECOVERY_AGGREGATE_TOKEN_CEILING,
+                )
+            }).unwrap_or_else(|| ToolOutputSelectorResult::state(
                 selector.clone(), ToolOutputSelectorStatus::AggregateOmitted,
-            );
+            ));
+            omitted.status = ToolOutputSelectorStatus::AggregateOmitted;
             omitted.exact_bytes = selected.exact_bytes;
             omitted.canonical_range = selected.canonical_range;
-            omitted.continuation = Some(selector.clone());
-            omitted.message = Some("Selection exceeds the 1 MiB script payload cap; request smaller ranges.".into());
-            result_bytes = result_bytes
-                .saturating_add(serde_json::to_vec(&omitted).map(|bytes| bytes.len()).unwrap_or(MAX_SCRIPT_BYTES))
+            // The bounded prefix alone is not a complete recovery recipe when
+            // the range is too large for an automatic subdivision plan.
+            if let (Some(range), Some(ToolOutputSelector::Bytes { end, .. })) =
+                (selected.canonical_range, omitted.child_selectors.first())
+                && *end < range.end
+            {
+                omitted.child_selectors.push(ToolOutputSelector::Bytes {
+                    start: *end,
+                    end: range.end,
+                });
+            }
+            omitted.message = Some("Selection exceeds the 1 MiB script payload cap; recover the exact range through continuation or child_selectors, not the original selector.".into());
+            let serialized = serde_json::to_string(&omitted).map_err(|error|
+                ReadToolOutputError::InvalidRange(error.to_string()))?;
+            result_bytes = result_bytes.saturating_add(serialized.len())
                 .saturating_add(usize::from(!response.results.is_empty()));
+            cost.push(SelectorPartCost {
+                serialized: TokenCountEstimate::new(&serialized),
+                successful: omitted.status == ToolOutputSelectorStatus::Ok,
+                complete: omitted.complete,
+            });
             response.results.push(omitted);
             break;
         }
@@ -5603,6 +5891,11 @@ pub(crate) fn select_file_snapshot_for_script(
         && end < canonical.exact_bytes
     {
         continuation = Some(ToolOutputSelector::Bytes { start: end, end: canonical.exact_bytes });
+    }
+    if !serde_json::to_vec(&response).is_ok_and(|bytes| bytes.len() <= MAX_SCRIPT_BYTES) {
+        return Err(ReadToolOutputError::InvalidRange(
+            "selector response exceeds the 1 MiB script payload cap; use fewer selectors".into(),
+        ));
     }
     Ok((response, continuation))
 }
@@ -6832,6 +7125,9 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<bool>>,
 {
+    let Some(move_owner) = codex_rollout::try_lock_rollout_moves(codex_home).await? else {
+        return Ok(0);
+    };
     let root = codex_home.join("tool-output");
     let scan_root = root.clone();
     let active_thread_id = active_thread_id.to_string();
@@ -6854,6 +7150,8 @@ where
     };
     run_blocking_artifact_io(move || {
         let _permit = permit;
+        // The blocking owner retains the move exclusion if its caller is dropped.
+        let _move_owner = move_owner;
         let mut removed = 0;
         for thread_id in unresumable {
             match std::fs::remove_dir_all(root.join(&thread_id)) {
@@ -7576,7 +7874,7 @@ fn retention_registry_mutex_is_available_for_test() -> bool {
 }
 
 #[cfg(test)]
-async fn force_retention_reconciliation_for_test(root: &Path) -> RetentionModeKind {
+pub(crate) async fn force_retention_reconciliation_for_test(root: &Path) -> RetentionModeKind {
     let permit = retention_sweep_permit(root).await;
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {

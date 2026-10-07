@@ -3,7 +3,7 @@ use crate::agents_md::LoadedAgentsMd;
 use crate::agents_md::RepositoryStableContextBundle;
 use crate::agents_md::discover_project_instructions_with_markers;
 use crate::agents_md::effective_project_root_markers;
-use crate::agents_md::load_project_instructions_from_discovery;
+use crate::agents_md::load_project_instructions_with_fallback;
 use crate::config::Config;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -21,6 +21,7 @@ const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Owns the inputs and cached result of AGENTS.md discovery for a session.
 pub(crate) struct AgentsMdManager {
     user_instructions: Option<UserInstructions>,
+    omission_recovery: Option<crate::agents_md::ProjectDocOmissionRecovery>,
     refresh_gate: Semaphore,
     cache: Mutex<AgentsMdCache>,
     project_root_markers_cache: StdMutex<Option<ProjectRootMarkersCacheEntry>>,
@@ -114,12 +115,18 @@ impl AgentsMdCache {
 impl AgentsMdManager {
     pub(crate) fn new(user_instructions: Option<UserInstructions>) -> Self {
         Self {
+            omission_recovery: None,
             user_instructions: user_instructions
                 .filter(|instructions| !instructions.text.trim().is_empty()),
             refresh_gate: Semaphore::new(1),
             cache: Mutex::new(AgentsMdCache::default()),
             project_root_markers_cache: StdMutex::new(None),
         }
+    }
+
+    pub(crate) fn with_thread_id(mut self, thread_id: String) -> Self {
+        self.omission_recovery = Some(crate::agents_md::ProjectDocOmissionRecovery::new(thread_id));
+        self
     }
 
     fn project_root_markers(&self, config: &Config) -> Arc<[String]> {
@@ -273,18 +280,23 @@ impl AgentsMdManager {
         // File metadata is discovery evidence, not a content identity. Editors, sync tools, and
         // remote filesystems can replace a file while preserving its size and modification time,
         // so every sampling-step refresh must read the discovered instruction files again.
-        let load = load_project_instructions_from_discovery(
+        let previous = {
+            let cache = self.cache.lock().await;
+            (cache.key.as_ref() == Some(&key)).then(|| cache.loaded.clone()).flatten()
+        };
+        let load = load_project_instructions_with_fallback(
             config.as_ref(),
             self.user_instructions.clone(),
             discovery,
+            self.omission_recovery.as_ref(),
+            previous.as_deref(),
         )
         .await;
         let mut cache = self.cache.lock().await;
-        if !load.complete && cache.key.as_ref() == Some(&key) {
-            return cache.cached_observation(AgentsMdFreshness::CachedFallback);
-        }
         let freshness = if load.complete {
             AgentsMdFreshness::Refreshed
+        } else if previous.is_some() {
+            AgentsMdFreshness::CachedFallback
         } else {
             AgentsMdFreshness::IncompleteRead
         };

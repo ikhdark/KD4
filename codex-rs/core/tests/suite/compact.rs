@@ -511,6 +511,13 @@ async fn summarize_context_three_requests_and_instructions() {
     let rollout_path = test.session_configured.rollout_path.expect("rollout path");
 
     // 1) Normal user input – should hit server once.
+    let application_context = indexmap::IndexMap::from([(
+        "application-policy".to_string(),
+        codex_protocol::protocol::AdditionalContextEntry {
+            value: "Application sentinel: never modify the protected file.".to_string(),
+            kind: codex_protocol::protocol::AdditionalContextKind::Application,
+        },
+    )]);
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
@@ -519,7 +526,7 @@ async fn summarize_context_three_requests_and_instructions() {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: Default::default(),
+            additional_context: application_context.clone(),
             thread_settings: Default::default(),
         })
         .await
@@ -535,7 +542,7 @@ async fn summarize_context_three_requests_and_instructions() {
     assert_eq!(message, COMPACT_WARNING_MESSAGE);
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    // 3) Next user input – third hit; history should include only the summary.
+    // 3) Next user input – retain exact task input alongside the summary.
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
@@ -544,7 +551,7 @@ async fn summarize_context_three_requests_and_instructions() {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
-            additional_context: Default::default(),
+            additional_context: application_context,
             thread_settings: Default::default(),
         })
         .await
@@ -557,6 +564,15 @@ async fn summarize_context_three_requests_and_instructions() {
     let body1 = requests[0].body_json();
     let body2 = requests[1].body_json();
     let body3 = requests[2].body_json();
+    let policy = "Application sentinel: never modify the protected file.";
+    assert_eq!(
+        requests[2]
+            .message_input_texts("developer")
+            .iter()
+            .filter(|text| text.contains(policy))
+            .count(),
+        1
+    );
 
     // Manual compact should use the dedicated bounded compaction instructions.
     let instr1 = body1.get("instructions").and_then(|v| v.as_str()).unwrap();
@@ -632,10 +648,10 @@ async fn summarize_context_three_requests_and_instructions() {
         "third request should include the new user message"
     );
     assert!(
-        !messages
+        messages
             .iter()
             .any(|(r, t)| r == "user" && t == "hello world"),
-        "third request must evict the consumed original user message"
+        "third request must retain the exact original user message"
     );
     assert!(
         messages
@@ -1804,12 +1820,12 @@ async fn auto_compact_openai_provider_with_custom_prompt_uses_local_route() {
         })
         .collect();
     assert!(
-        !user_texts.iter().any(|text| text == FIRST_AUTO_MSG),
-        "auto compact follow-up request should evict the consumed first user message"
+        user_texts.iter().any(|text| text == FIRST_AUTO_MSG),
+        "auto compact follow-up request should preserve the exact first user message"
     );
     assert!(
-        !user_texts.iter().any(|text| text == SECOND_AUTO_MSG),
-        "auto compact follow-up request should evict the consumed second user message"
+        user_texts.iter().any(|text| text == SECOND_AUTO_MSG),
+        "auto compact follow-up request should preserve the exact second user message"
     );
     assert!(
         user_texts.iter().any(|text| text == POST_AUTO_USER_MSG),
@@ -3667,7 +3683,7 @@ async fn manual_compact_retryable_failure_retries_then_succeeds() {
 async fn manual_compact_twice_preserves_latest_user_messages() {
     require_network!();
 
-    let first_user_message = "first manual turn";
+    let first_user_message = "first manual turn: do not modify X";
     let second_user_message = "second manual turn";
     let final_user_message = "post compact follow-up";
     let first_summary = "FIRST_MANUAL_SUMMARY";
@@ -3851,8 +3867,8 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         "regular requests after compaction should not be marked as compact requests"
     );
     assert!(
-        !contains_user_text(&requests[2], first_user_message),
-        "second turn request should evict user history consumed by the compact summary"
+        contains_user_text(&requests[2], first_user_message),
+        "a compact summary does not expire original user constraints"
     );
 
     assert!(
@@ -3886,8 +3902,8 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         "final request user texts: {final_request_user_texts:#?}"
     );
     assert!(final_request_user_texts.contains(&final_user_message.to_string()));
-    assert!(!final_request_user_texts.contains(&first_user_message.to_string()));
-    assert!(!final_request_user_texts.contains(&second_user_message.to_string()));
+    assert!(final_request_user_texts.contains(&first_user_message.to_string()));
+    assert!(final_request_user_texts.contains(&second_user_message.to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4857,6 +4873,7 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
         .with_home(Arc::clone(&home))
         .with_config(move |config| {
             config.model_provider = provider;
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
         });
     let test = builder.build(&server).await?;
 
@@ -4945,6 +4962,7 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
         .with_home(Arc::clone(&home))
         .with_config(move |config| {
             config.model_provider = provider;
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
             config.model_context_window = Some(100_000);
             config.model_auto_compact_token_limit = Some(90_000);
         });
@@ -5154,7 +5172,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     );
     assert_eq!(
         instruction_fragments(&requests[3]),
-        vec![old_fragment, replacement_fragment]
+        vec![replacement_fragment]
     );
     assert_eq!(
         resumed.codex.instruction_sources().await,

@@ -128,6 +128,10 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
             .as_deref()
             .is_some_and(|description| {
                 description.contains("replaces the plaintext typed bootstrap message")
+                    && description.contains("worker needs non-empty write_scope and required_evidence")
+                    && description.contains("architect/explorer need non-empty read_scope and empty required_evidence")
+                    && description.contains("reviewer needs empty required_evidence")
+                    && description.contains("verifier/integrator need non-empty required_evidence")
             })
     );
     assert!(!properties.contains_key("items"));
@@ -161,7 +165,7 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
     let output_schema = output_schema.expect("spawn_agent output schema").into_value()["oneOf"][0].clone();
     assert_eq!(
         output_schema["required"],
-        json!(["task_name", "nickname", "assignment_id", "integration_plan"])
+        json!(["assignment_id", "integration_plan", "nickname", "task_name"])
     );
     assert_eq!(
         output_schema["properties"]["assignment_id"]["type"],

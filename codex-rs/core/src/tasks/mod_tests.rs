@@ -868,6 +868,47 @@ async fn concurrent_start_task_calls_install_exactly_one_worker() {
 }
 
 #[tokio::test]
+async fn shutdown_abort_retains_checkpoint_and_plan_without_claiming_user_interrupt() {
+    for shutdown in [false, true] {
+        let (session, mut turn, _events) = make_session_and_context_with_rx().await;
+        Arc::make_mut(&mut Arc::get_mut(&mut turn).expect("unshared turn fixture").config)
+            .agent_interrupt_message_enabled = true;
+        let checkpoint = ResponseItem::Message {
+            id: None, role: "developer".into(),
+            content: vec![ContentItem::InputText { text: "<completed_phase_checkpoint>keep this evidence</completed_phase_checkpoint>".into() }],
+            phase: None, internal_chat_message_metadata_passthrough: None,
+        };
+        session.record_conversation_items(&turn, &[checkpoint]).await.unwrap();
+        session.services.plan_store.update(codex_protocol::plan_tool::UpdatePlanArgs {
+            explanation: None,
+            plan: vec![codex_protocol::plan_tool::PlanItemArg {
+                step: "remaining validation".into(), status: codex_protocol::plan_tool::StepStatus::InProgress,
+            }],
+        }).await;
+        session.start_task(Arc::clone(&turn), Vec::new(), FenceBlockingTask).await;
+        if shutdown { session.begin_shutdown().await; }
+        session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        let history = session.clone_history().await;
+        let marker = history.raw_items().iter().rev().find_map(|item| match item {
+            ResponseItem::Message { content, .. } => content.iter().find_map(|part| match part {
+                ContentItem::InputText { text } if text.contains("<turn_aborted>") => Some(text),
+                _ => None,
+            }),
+            _ => None,
+        }).expect("abort marker");
+        if shutdown {
+            assert!(marker.contains("session was shutting down"));
+            assert!(!marker.contains("interrupted the previous turn on purpose"));
+            assert!(marker.contains("keep this evidence"));
+            assert!(marker.contains("remaining validation"));
+        } else {
+            assert!(marker.contains("interrupted"));
+            assert!(!marker.contains("session was shutting down"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn shutdown_latch_is_linearized_with_task_start_admission() {
     let (session, turn_context, _events) = make_session_and_context_with_rx().await;
     let task_start_guard = session

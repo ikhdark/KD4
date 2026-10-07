@@ -30,6 +30,160 @@ fn plan_arguments(step: &str, status: StepStatus) -> String {
     serde_json::to_string(&plan_update_args(step, status)).expect("serialize plan arguments")
 }
 
+fn status_arguments(step: &str, status: StepStatus) -> String {
+    serde_json::json!({"set": [{
+        "step_id": crate::plan_store::plan_step_id(step), "status": status,
+    }]}).to_string()
+}
+
+#[tokio::test]
+async fn restored_orphans_can_be_reattached_or_superseded_through_the_tool() {
+    for supersede in [false, true] {
+        let (session, turn, _events) = make_session_and_context_with_rx().await;
+        let plan = plan_update_args("current", StepStatus::Completed);
+        let mut lineage = crate::plan_store::PlanLineage::default();
+        lineage.requirements.insert("orphan".into(), crate::plan_store::PlanRequirement {
+            text: "original remaining work".into(), status: StepStatus::Pending, superseded_reason: None,
+        });
+        session.services.plan_store.restore_with_lineage(Some(plan), Some(lineage)).await;
+        let revision = session.services.plan_store.execution_snapshot().await.unwrap().revision;
+        let mut args = serde_json::json!({
+            "expected_revision": revision,
+            "plan": [{"step": "current", "status": "completed"}],
+        });
+        if supersede {
+            args["superseded"] = serde_json::json!([{"step_id": "orphan", "reason": "User removed this scope"}]);
+        } else {
+            args["plan"][0]["step"] = serde_json::json!("original remaining work");
+            args["plan"][0]["continues"] = serde_json::json!(["orphan"]);
+        }
+        let payload = ToolPayload::Function { arguments: args.to_string() };
+        let result = PlanHandler.handle(ToolInvocation {
+            session: Arc::clone(&session), step_context: StepContext::for_test(turn),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: format!("resolve-orphan-{supersede}"), tool_name: ToolName::plain("update_plan"),
+            source: ToolCallSource::Direct, payload: payload.clone(),
+        }).await.unwrap();
+        let output = result.code_mode_result(&payload);
+        assert_plan_output_schema(&output);
+        // A proposed supersession is not a verified user instruction.
+        assert_eq!(output["obligations"]["unresolved"],
+            if supersede { serde_json::json!(["orphan"]) } else { serde_json::json!([]) });
+        assert_eq!(output["completion_authority"], "checklist_only");
+        let (_, lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+        assert_eq!(lineage.requirements["orphan"].superseded_reason.is_some(), supersede);
+        if !supersede {
+            assert_eq!(lineage.requirements["orphan"].status, StepStatus::Completed);
+        }
+    }
+}
+
+#[tokio::test]
+async fn published_noop_skips_durable_write_and_event_but_restore_requires_publication() {
+    let (mut session, turn, events) = make_session_and_context_with_rx().await;
+    crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+    let invoke = |arguments: String| ToolInvocation {
+        session: Arc::clone(&session), step_context: StepContext::for_test(Arc::clone(&turn)),
+        cancellation_token: CancellationToken::new(), tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "publication-proof".into(), tool_name: ToolName::plain("update_plan"),
+        source: ToolCallSource::Direct, payload: ToolPayload::Function { arguments },
+    };
+    PlanHandler.handle(invoke(plan_arguments("work", StepStatus::Pending))).await.unwrap();
+    assert_eq!(std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| matches!(event.msg, EventMsg::PlanUpdate(_))).count(), 1);
+    let before = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+    session.live_thread().unwrap().shutdown().await.unwrap();
+    // A durable write would now fail. This proves the ordinary no-op bypasses it.
+    let output = PlanHandler.handle(invoke(status_arguments("work", StepStatus::Pending))).await.unwrap();
+    assert_eq!(output.log_preview(), PLAN_UNCHANGED_MESSAGE);
+    assert!(events.try_recv().is_err());
+    assert_eq!(session.services.plan_store.snapshot_with_lineage().await.unwrap(), before);
+    session.services.plan_store.restore_with_lineage(Some(before.0), Some(before.1)).await;
+    let error = PlanHandler.handle(invoke(status_arguments("work", StepStatus::Pending))).await;
+    assert!(matches!(error, Err(FunctionCallError::RespondToModel(message))
+        if message.contains("durable plan publication failed")));
+}
+
+#[tokio::test]
+async fn failed_plan_publication_preserves_plan_and_revision() {
+    let (mut session, turn, events) = make_session_and_context_with_rx().await;
+    crate::session::tests::attach_thread_persistence(
+        Arc::get_mut(&mut session).expect("unique session"),
+    ).await;
+    session.services.plan_store.update(plan_update_args("retained", StepStatus::Pending)).await;
+    let before = session.services.plan_store.snapshot_with_lineage().await;
+    session.live_thread().unwrap().shutdown().await.unwrap();
+    let result = PlanHandler.handle(ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(turn),
+        cancellation_token: CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "failed-plan-publication".into(),
+        tool_name: ToolName::plain("update_plan"),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: status_arguments("retained", StepStatus::Completed),
+        },
+    }).await;
+    assert!(matches!(result, Err(FunctionCallError::RespondToModel(message))
+        if message.contains("previous plan and revision are unchanged")));
+    assert_eq!(session.services.plan_store.snapshot_with_lineage().await, before);
+    assert!(!std::iter::from_fn(|| events.try_recv().ok())
+        .any(|event| matches!(event.msg, EventMsg::PlanUpdate(_))));
+}
+
+#[tokio::test]
+async fn cancellation_while_waiting_for_plan_lock_preserves_revision_and_retry_publishes_once() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    session.services.plan_store.update(plan_update_args("retained", StepStatus::Pending)).await;
+    let before = session.services.plan_store.snapshot_with_lineage().await;
+    let arguments = status_arguments("retained", StepStatus::Completed);
+    let staged = session.services.plan_store.stage_tool(
+        serde_json::from_str(&arguments).unwrap(),
+    ).await.unwrap();
+    let token = CancellationToken::new();
+    let invocation = |token| ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        cancellation_token: token,
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "cancelled-waiting-for-plan-lock".into(),
+        tool_name: ToolName::plain("update_plan"),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function { arguments: arguments.clone() },
+    };
+    let mut request = PlanHandler.handle(invocation(token.clone()));
+    assert!(futures::poll!(&mut request).is_pending());
+    token.cancel();
+    drop(staged);
+    assert!(request.await.is_err());
+    assert_eq!(session.services.plan_store.snapshot_with_lineage().await, before);
+    assert!(events.try_recv().is_err());
+    PlanHandler.handle(invocation(CancellationToken::new())).await.unwrap();
+    assert_eq!(session.services.plan_store.snapshot().await,
+        Some(plan_update_args("retained", StepStatus::Completed)));
+    assert_eq!(std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| matches!(event.msg, EventMsg::PlanUpdate(_))).count(), 1);
+}
+
+#[tokio::test]
+async fn persisted_plan_response_omits_redundant_lineage() {
+    let store = crate::plan_store::PlanStore::default();
+    let update = store.update(plan_update_args("inspect", StepStatus::Pending)).await;
+    let output = PlanToolOutput { current_plan: update.current, effect: update.effect, lineage: update.lineage };
+    let response = output.response_result();
+    assert!(response.get("lineage").is_none());
+    assert_eq!(response["step_ids"][0].as_str().unwrap().len(), 16);
+    assert_plan_output_schema(&response);
+    let snapshot = crate::plan_store::plan_snapshot_item(&response);
+    let restored = crate::plan_store::plan_snapshot_from_item(&snapshot).unwrap();
+    let resumed = crate::plan_store::PlanStore::default();
+    resumed.restore_with_lineage(Some(restored.current_plan), Some(restored.lineage)).await;
+    assert_eq!(resumed.snapshot_with_lineage().await.unwrap().1.obligation_summary(&output.current_plan).unresolved,
+        vec![response["step_ids"][0].as_str().unwrap().to_string()]);
+}
+
 fn assert_plan_output_schema(response: &serde_json::Value) {
     let definition =
         codex_tools::tool_spec_to_code_mode_tool_definition(&create_update_plan_tool())
@@ -80,6 +234,7 @@ async fn plan_mode_rejects_updates_without_side_effects() {
     let (session, mut turn) = crate::session::tests::make_session_and_context().await;
     let session = Arc::new(session);
     turn.collaboration_mode.mode = ModeKind::Plan;
+    session.services.plan_store.update(plan_update_args("interrupted implementation", StepStatus::Pending)).await;
     let before = session.services.plan_store.current_for_test().await;
     let result = PlanHandler
         .handle(ToolInvocation {
@@ -205,7 +360,7 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
     }
     assert_eq!(
         tool.pointer("/parameters/properties/plan/items/required"),
-        Some(&serde_json::json!(["step", "status"]))
+        Some(&serde_json::json!(["status", "step"]))
     );
     assert_eq!(
         tool.pointer("/parameters/additionalProperties"),
@@ -250,7 +405,7 @@ async fn plan_updates_use_session_checklist_store_and_preserve_governor_effects(
     );
 
     let completed_payload = ToolPayload::Function {
-        arguments: plan_arguments("Implement the change", StepStatus::Completed),
+        arguments: status_arguments("Implement the change", StepStatus::Completed),
     };
     let completed = handler
         .handle(ToolInvocation {
@@ -378,6 +533,7 @@ async fn plan_revision_must_carry_or_supersede_each_removed_unfinished_step() {
     };
     session.services.plan_store.restore(Some(initial.clone())).await;
     let narrowed = serde_json::json!({
+        "expected_revision": crate::plan_store::plan_revision(Some(&initial)),
         "explanation": "Only review core.",
         "plan": [{"step": "Review core warnings", "status": "in_progress"}],
     });
@@ -408,6 +564,8 @@ async fn plan_revision_must_carry_or_supersede_each_removed_unfinished_step() {
 
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
+            "expected_revision": crate::plan_store::plan_revision(
+                session.services.plan_store.snapshot().await.as_ref()),
             "plan": [{
                 "step": "Review core warnings",
                 "status": "in_progress",
@@ -438,7 +596,7 @@ async fn plan_revision_must_carry_or_supersede_each_removed_unfinished_step() {
     assert_eq!(output["effect"], "structural_revision");
     assert_eq!(
         output["current_plan"]["explanation"],
-        "Superseded \"Fix warnings\": The user will fix them separately."
+        "Proposed supersession (unverified) \"Fix warnings\": The user will fix them separately."
     );
     assert_eq!(
         accepted.sampling_request_signal().unwrap()["plan"],
@@ -461,7 +619,12 @@ async fn plan_revision_must_carry_or_supersede_each_removed_unfinished_step() {
             "set": [{"step_id": review_id, "status": "completed"}],
         }),
     ).unwrap()).await.unwrap();
-    assert_eq!(completed.lineage.requirements[&review_id].status, StepStatus::Completed);
+    assert_eq!(completed.lineage.requirements[&review_id].status, StepStatus::InProgress);
+    let summary = completed.lineage.obligation_summary(&completed.current);
+    assert_eq!(summary.completed, 0);
+    assert_eq!(summary.superseded, 0);
+    assert!(summary.unresolved.contains(&review_id));
+    assert!(summary.unresolved.contains(&fix_id));
     assert_eq!(completed.lineage.requirements[&fix_id].status, StepStatus::Pending);
     assert_eq!(
         completed.lineage.requirements[&fix_id].superseded_reason.as_deref(),
@@ -611,9 +774,13 @@ async fn status_deltas_preserve_steps_and_reject_invalid_updates_atomically() {
             session.services.plan_store.current_for_test().await,
             Some(expected.clone())
         );
-        assert!(
-            matches!(events.recv().await.unwrap().msg, EventMsg::PlanUpdate(ref plan) if plan == &expected)
-        );
+        if effect == "no_op" {
+            assert!(events.try_recv().is_err(), "published no-op must not emit another event");
+        } else {
+            assert!(
+                matches!(events.recv().await.unwrap().msg, EventMsg::PlanUpdate(ref plan) if plan == &expected)
+            );
+        }
     }
 }
 

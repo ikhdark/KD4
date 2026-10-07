@@ -347,6 +347,8 @@ where
             }
 
             let mut injected_host_skill_prompts = InjectedHostSkillPrompts::default();
+            // Publish the authoritative merged selection even when it is empty:
+            // core must not resolve ambiguous names from its host-only catalog.
             let unavailable = SkillInstructions {
                 name: "Unavailable selected instructions".to_string(),
                 path: String::new(),
@@ -356,6 +358,14 @@ where
             let mut omitted_instructions = false;
             let mut remaining_prompt_bytes = MAX_SELECTED_PROMPT_BYTES - unavailable.render().len();
             for (index, entry) in selected_entries.iter().enumerate() {
+                let host_metadata = host_snapshot.as_ref().and_then(|snapshot| {
+                    (entry.authority.kind == SkillSourceKind::Host).then(|| snapshot.outcome().skills.iter().find(|skill|
+                        skill.path_to_skills_md.to_string_lossy().replace('\\', "/") == entry.main_prompt.as_str().replace('\\', "/")
+                    ).cloned()).flatten()
+                });
+                if let Some(skill) = &host_metadata {
+                    injected_host_skill_prompts.record_resolution(skill.clone(), Err("Selected skill was not admitted within the instruction budget".to_string()));
+                }
                 // This extension owns the selected load, including its failure
                 // and budget outcome. Legacy injection must not bypass it.
                 if entry.authority.kind == SkillSourceKind::Host {
@@ -391,12 +401,19 @@ where
                                 ),
                             );
                         }
+                        injected_host_skill_prompts.record_instruction_fragment(fragment.role(), fragment.render(), fragment.contents.clone());
+                        if let Some(skill) = host_metadata {
+                            injected_host_skill_prompts.record_resolution(skill, Ok(fragment.contents.clone()));
+                        }
                         fragments.push(Box::new(fragment));
                         if entry.authority.kind == SkillSourceKind::Host {
                             injected_host_skill_prompts.insert_path(entry.main_prompt.as_str());
                         }
                     }
                     Err(message) => {
+                        if let Some(skill) = host_metadata {
+                            injected_host_skill_prompts.record_resolution(skill, Err(message.clone()));
+                        }
                         self.emit_turn_warning(
                             thread_store,
                             turn_store,
@@ -439,9 +456,7 @@ where
                 }
             }
 
-            if !injected_host_skill_prompts.is_empty() {
-                turn_store.insert(injected_host_skill_prompts);
-            }
+            turn_store.insert(injected_host_skill_prompts);
 
             fragments
         })

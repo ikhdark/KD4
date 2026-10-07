@@ -18,6 +18,39 @@ use tracing::trace;
 
 pub type ByteStream = BoxStream<'static, Result<Bytes, TransportError>>;
 
+const ERROR_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+// Failure headers are authoritative even when diagnostic body delivery stalls.
+// Use one deadline, not a fresh timeout for every chunk of an endless body.
+async fn collect_error_body(
+    stream: impl futures::Stream<Item = Result<Bytes, reqwest::Error>>,
+) -> Option<String> {
+    tokio::pin!(stream);
+    let deadline = tokio::time::Instant::now() + ERROR_BODY_TIMEOUT;
+    let mut body = Vec::new();
+    loop {
+        if tokio::time::Instant::now() >= deadline { break; }
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                let remaining = MAX_ERROR_BODY_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if body.len() == MAX_ERROR_BODY_BYTES {
+                    break;
+                }
+            }
+            Ok(None) => return Some(String::from_utf8_lossy(&body).into_owned()),
+            // Preserve the existing unavailable-body contract on transport errors.
+            Ok(Some(Err(_))) => return None,
+            Err(_) => break,
+        }
+    }
+    Some(format!(
+        "{}\n[HTTP error body incomplete: diagnostic limit reached]",
+        String::from_utf8_lossy(&body)
+    ))
+}
+
 pub struct StreamResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
@@ -80,7 +113,9 @@ impl ReqwestTransport {
     }
 
     fn map_error(err: reqwest::Error) -> TransportError {
-        if err.is_connect() {
+        if err.is_builder() || is_permanent_connection_error(&err) {
+            TransportError::Build(format!("permanent transport configuration failure: {:#}", err.without_url()))
+        } else if err.is_connect() {
             TransportError::Connection(err.without_url())
         } else if err.is_timeout() {
             TransportError::Timeout
@@ -98,6 +133,36 @@ impl ReqwestTransport {
                 request_body_for_trace(req)
             );
         }
+    }
+}
+
+/// Recognize configuration and certificate failures without treating transient
+/// socket errors or remote TLS alerts as permanent network failures.
+pub fn is_permanent_connection_error(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if error.downcast_ref::<rustls::Error>().is_some_and(|error| matches!(error,
+            rustls::Error::InvalidCertificate(_)
+                | rustls::Error::NoCertificatesPresented
+                | rustls::Error::UnsupportedNameType
+                | rustls::Error::PeerIncompatible(_)
+                | rustls::Error::InvalidCertRevocationList(_)
+                | rustls::Error::InconsistentKeys(_)
+                | rustls::Error::BadMaxFragmentSize
+                | rustls::Error::NoApplicationProtocol
+        ))
+            || error.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidInput)
+        {
+            return true;
+        }
+        // io::Error::source can delegate to the wrapped error's source, skipping
+        // the typed TLS error itself. Inspect its payload before walking on.
+        let source = error.downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| error.source());
+        let Some(source) = source else { return false };
+        error = source;
     }
 }
 
@@ -125,11 +190,7 @@ impl HttpTransport for ReqwestTransport {
         let headers = resp.headers().clone();
         if !(status.is_success() || status == StatusCode::NOT_MODIFIED && accepts_not_modified) {
             let retry_after = RetryAfter::from_headers(&headers);
-            let body = resp
-                .bytes()
-                .await
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
+            let body = collect_error_body(resp.bytes_stream()).await;
             return Err(TransportError::Http {
                 status,
                 url: Some(url),
@@ -156,7 +217,7 @@ impl HttpTransport for ReqwestTransport {
         let headers = resp.headers().clone();
         if !status.is_success() {
             let retry_after = RetryAfter::from_headers(&headers);
-            let body = resp.text().await.ok();
+            let body = collect_error_body(resp.bytes_stream()).await;
             return Err(TransportError::Http {
                 status,
                 url: Some(url),

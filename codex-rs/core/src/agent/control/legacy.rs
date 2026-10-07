@@ -60,6 +60,11 @@ impl AgentControl {
         };
         thread.wait_until_terminated().await;
 
+        // Shutdown acknowledgement is bounded, but accepted terminal work can
+        // outlive it. Retain the registered worker until that owner drains too.
+        thread.codex.session.terminal_tasks.wait().await;
+        thread.codex.session.wait_for_ordered_history_commits().await;
+
         if state.remove_thread_if_same(&agent_id, &thread).await {
             self.forget_v2_residency(agent_id);
             self.state.release_spawned_thread(agent_id);

@@ -1,4 +1,6 @@
 AGENTS.md text eol=lf
+*.rs diff=rust
+*.py diff=python
 # Keep diffs textual against revisions with a literal NUL in a test comment.
 codex-rs/core/src/tools/command_output_artifact_tests.rs diff
 *.sh text eol=lf

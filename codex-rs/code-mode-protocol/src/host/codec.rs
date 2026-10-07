@@ -46,6 +46,25 @@ pub struct EncodedFrame {
 }
 
 impl EncodedFrame {
+    /// Measure without allocating an encoded buffer so callers can admit bytes
+    /// before serialization. Encoding still independently enforces the limit.
+    pub fn encoded_len<T: Serialize>(message: &T) -> io::Result<usize> {
+        struct Counter(usize);
+        impl io::Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                if self.0 > MAX_FRAME_BYTES {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "IPC frame exceeds byte limit"));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let mut count = Counter(0);
+        serde_json::to_writer(&mut count, message).map_err(io::Error::other)?;
+        Ok(count.0 + LENGTH_PREFIX_BYTES)
+    }
+
     pub fn encode<T>(message: &T) -> io::Result<Self>
     where
         T: Serialize,

@@ -66,11 +66,12 @@ pub(crate) fn collect_explicit_skill_mentions(
             if blocked_plain_names.contains(name) {
                 continue;
             }
-            if let Some(entry) = catalog
+            let mut matches = catalog
                 .entries
                 .iter()
-                .rev()
-                .find(|entry| entry.entry.name == name)
+                .filter(|entry| entry.entry.name == name);
+            if let Some(entry) = matches.next()
+                && matches.next().is_none()
             {
                 push_selected(entry.entry, &mut seen, &mut selected);
             }
@@ -86,10 +87,9 @@ fn select_by_path(
     seen: &mut HashSet<SkillCatalogEntryKey>,
     selected: &mut Vec<SkillCatalogEntry>,
 ) {
-    for entry in &catalog.entries {
-        if entry.matches(path) {
-            push_selected(entry.entry, seen, selected);
-        }
+    let mut matches = catalog.entries.iter().filter(|entry| entry.matches(path));
+    if let Some(entry) = matches.next() && matches.next().is_none() {
+        push_selected(entry.entry, seen, selected);
     }
 }
 
@@ -178,6 +178,45 @@ impl From<&SkillCatalogEntry> for SkillCatalogEntryKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_names_never_select_by_catalog_order_but_locators_do() {
+        use crate::catalog::SkillResourceId;
+        use crate::catalog::SkillSourceKind;
+
+        let mut catalog = SkillCatalog::default();
+        for (kind, locator) in [
+            (SkillSourceKind::Host, "host"),
+            (SkillSourceKind::Executor, "executor"),
+            (SkillSourceKind::Orchestrator, "orchestrator"),
+        ] {
+            catalog.push_entry(SkillCatalogEntry::new(
+                SkillPackageId(format!("skill://{locator}/same")),
+                SkillAuthority::new(kind, locator),
+                "same",
+                "description",
+                SkillResourceId::new(format!("skill://{locator}/same/SKILL.md")),
+            ));
+        }
+        let input = |text: &str| {
+            vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }]
+        };
+        for _ in 0..3 {
+            assert!(collect_explicit_skill_mentions(&input("$same"), &catalog).is_empty());
+            for mention in [
+                "[$same](skill://executor/same)",
+                "[$same](skill://executor/same/SKILL.md)",
+            ] {
+                let selected = collect_explicit_skill_mentions(&input(mention), &catalog);
+                assert_eq!(selected.len(), 1);
+                assert_eq!(selected[0].authority.kind, SkillSourceKind::Executor);
+            }
+            catalog.entries.rotate_left(1);
+        }
+    }
 
     #[test]
     fn canonical_skill_path_classifies_and_normalizes_once_at_the_boundary() {

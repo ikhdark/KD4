@@ -278,15 +278,24 @@ async fn read_thread_from_rollout_path(
         message: format!("failed to read thread id from {}", path.display()),
     })?;
     thread.rollout_path = Some(codex_rollout::plain_rollout_path(path.as_path()));
-    let meta_line = read_required_session_meta_line(path.as_path()).await?;
-    if meta_line.meta.id != thread.thread_id {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!("rollout session metadata id mismatch in {}", path.display()),
-        });
+    match read_session_meta_line(path.as_path()).await {
+        Ok(meta_line) => {
+            if meta_line.meta.id != thread.thread_id {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!("rollout session metadata id mismatch in {}", path.display()),
+                });
+            }
+            thread.forked_from_id = meta_line.meta.forked_from_id;
+            thread.parent_thread_id = meta_line.meta.parent_thread_id;
+            thread.history_mode = meta_line.meta.history_mode;
+        }
+        // The rollout summary recovered the filename identity. Preserve the
+        // readable suffix without inventing missing creation-only fields.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ThreadStoreError::Internal {
+            message: format!("failed to read session metadata {}: {error}", path.display()),
+        }),
     }
-    thread.forked_from_id = meta_line.meta.forked_from_id;
-    thread.parent_thread_id = meta_line.meta.parent_thread_id;
-    thread.history_mode = meta_line.meta.history_mode;
     // The rollout summary already applies later persisted settings to the provider.
     // SessionMeta supplies creation-only fields, not the current provider.
     if let Ok(Some(title)) =
@@ -568,6 +577,57 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn read_thread_history_preserves_malformed_record_gap() {
+        let home = TempDir::new().unwrap();
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let uuid = Uuid::new_v4();
+        let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let (meta, rest) = original.split_once('\n').unwrap();
+        std::fs::write(&path, format!("{meta}\nmalformed middle record\n{rest}")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let thread = store.read_thread(ReadThreadParams {
+            thread_id, include_archived: false, include_history: true,
+        }).await.unwrap();
+        let items = thread.history.unwrap().items;
+        assert_eq!(items.len(), 3);
+        let codex_protocol::protocol::RolloutItem::ResponseItem(
+            codex_protocol::models::ResponseItem::Message { role, content, .. },
+        ) = items.last().unwrap() else { panic!("missing reconstruction gap"); };
+        assert_eq!(role, "developer");
+        assert!(serde_json::to_string(content).unwrap().contains("1 malformed rollout records"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn read_thread_recovers_when_metadata_payload_is_missing() {
+        let home = TempDir::new().unwrap();
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let uuid = Uuid::from_u128(220);
+        let id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let missing = serde_json::json!({"type": "rollout_payload_artifact", "payload": {
+            "sha256": "0".repeat(64), "bytes": 10000, "item_type": "session_meta"
+        }});
+        std::fs::write(&path, format!("{missing}\n{}\n", original.lines().skip(1).collect::<Vec<_>>().join("\n"))).unwrap();
+        let thread = store.read_thread(ReadThreadParams {
+            thread_id: id, include_archived: false, include_history: true,
+        }).await.unwrap();
+        assert_eq!(thread.thread_id, id);
+        assert_eq!(thread.preview, "Hello from user");
+        let history = thread.history.unwrap();
+        assert_eq!(history.items.len(), 2);
+        assert!(serde_json::to_string(history.items.last().unwrap()).unwrap().contains("rollout_reconstruction_gap"));
+        let thread = store.read_thread_by_rollout_path(path, false, true).await.unwrap();
+        assert_eq!(thread.thread_id, id);
+        let history = thread.history.unwrap();
+        assert_eq!(history.items.len(), 2);
+        assert!(serde_json::to_string(history.items.last().unwrap()).unwrap().contains("rollout_reconstruction_gap"));
     }
 
     #[tokio::test]

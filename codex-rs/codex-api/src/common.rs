@@ -72,6 +72,20 @@ pub enum ResponseEvent {
     ModelsEtag(String),
 }
 
+impl ResponseEvent {
+    pub(crate) fn advances_model_response(&self) -> bool {
+        match self {
+            Self::OutputTextDelta(delta)
+            | Self::ToolCallInputDelta { delta, .. }
+            | Self::ReasoningSummaryDelta { delta, .. }
+            | Self::ReasoningContentDelta { delta, .. } => !delta.is_empty(),
+            Self::OutputItemAdded(_) | Self::OutputItemDone(_)
+            | Self::ReasoningSummaryDone { .. } | Self::Completed { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SafetyBuffering {
     pub use_cases: Vec<String>,

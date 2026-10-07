@@ -787,7 +787,12 @@ impl DirectFileSystem {
     ) -> FileSystemResult<()> {
         reject_sandbox_context(sandbox)?;
         let path = path.to_abs_path()?;
-        tokio::fs::write(path.as_path(), contents).await
+        tokio::task::spawn_blocking(move || {
+            let paths = codex_file_system::resolve_symlink_write_paths(path.as_path())?;
+            codex_file_system::write_bytes_atomically_without_sync(&paths.write_path, &contents)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     async fn create_directory(

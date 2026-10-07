@@ -2,9 +2,9 @@
 //!
 //! Roles are selected at spawn time and are loaded with the same config machinery as
 //! `config.toml`. This module resolves built-in and user-defined role files, inserts the role as a
-//! high-precedence layer, and preserves the caller's current provider and service tier unless the
-//! role layer sets them. It does not decide when to spawn a sub-agent or which role to use; the
-//! multi-agent tool handler owns that orchestration.
+//! high-precedence layer, and preserves the caller's runtime instructions, provider, and service
+//! tier unless the role layer sets them. It does not decide when to spawn a sub-agent or which role
+//! to use; the multi-agent tool handler owns that orchestration.
 
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
@@ -37,12 +37,13 @@ pub(crate) struct AgentRoleLocks {
     pub(crate) permissions: bool,
 }
 
-/// Applies a named role layer to `config` while preserving caller-owned provider settings.
+/// Applies a named role layer to `config` while preserving caller-owned runtime settings.
 ///
 /// The role layer is inserted at session-flag precedence so it can override persisted config, but
 /// the caller's current `model_provider` and `service_tier` remain sticky runtime choices unless
 /// the role explicitly sets the corresponding top-level config key. Rebuilding the config without
-/// those overrides would make a spawned agent silently fall back to default settings.
+/// those overrides would make a spawned agent silently fall back to default settings. Active base
+/// and developer instructions are also inherited unless the role explicitly replaces them.
 pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
@@ -156,9 +157,21 @@ mod reload {
         preserve_current_service_tier: bool,
     ) -> anyhow::Result<Config> {
         let config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
-        let merged_config = deserialize_effective_config(config, &config_layer_stack)?;
+        let mut merged_config = deserialize_effective_config(config, &config_layer_stack)?;
 
-        let next_config = Config::load_config_with_layer_stack(
+        // Runtime instructions may come from the API or the parent's active turn rather than
+        // persisted layers. Preserve even an absent value, and do not reread an inherited file.
+        if role_layer_toml.get("model_instructions_file").is_none() {
+            merged_config.model_instructions_file = None;
+            if role_layer_toml.get("instructions").is_none() {
+                merged_config.instructions = config.base_instructions.clone();
+            }
+        }
+        if role_layer_toml.get("developer_instructions").is_none() {
+            merged_config.developer_instructions = config.developer_instructions.clone();
+        }
+
+        let mut next_config = Config::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             merged_config,
             reload_overrides(
@@ -170,6 +183,12 @@ mod reload {
             config_layer_stack,
         )
         .await?;
+        if preserve_current_provider {
+            next_config.model_provider = config.model_provider.clone();
+            next_config.model_providers.insert(
+                config.model_provider_id.clone(), config.model_provider.clone(),
+            );
+        }
         Ok(next_config)
     }
 

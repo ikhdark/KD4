@@ -173,13 +173,35 @@ impl InProcessCodeModeSession {
         let WaitRequest {
             cell_id,
             yield_time_ms,
+            recovery,
         } = request;
-        let runtime_cell_id = runtime_cell_id(&cell_id);
-        match self
-            .runtime
-            .begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms))
-            .await
+        let terminal_only = recovery.as_ref().is_some_and(|recovery| recovery.terminal_only);
+        let runtime_cell_id = if terminal_only {
+            // The wire keeps the old public ID so the receipt is returned with
+            // its original generation. It is never sent to a live actor.
+            let raw = cell_id.as_str().split_once(':').map_or(cell_id.as_str(), |(_, raw)| raw);
+            runtime::CellId::new(raw)
+        } else {
+            runtime_cell_id(&cell_id)
+        };
+        let mut observation = if terminal_only {
+            Err(runtime::Error::MissingCell(runtime_cell_id.clone()))
+        } else {
+            self.runtime.begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms)).await
+        };
+        if matches!(&observation, Err(runtime::Error::MissingCell(_) | runtime::Error::ClosedCell(_)))
+            && let Some(recovery) = recovery
         {
+            if let Err(error) = self.runtime.restore_existing_durable_state(&recovery.path).await {
+                return Box::pin(async move { Err(error.to_string()) });
+            }
+            observation = if terminal_only {
+                self.runtime.recovered_terminal_observation(&runtime_cell_id).await
+            } else {
+                self.runtime.begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms)).await
+            };
+        }
+        match observation {
             Ok(pending_event) => Box::pin(async move {
                 match pending_event.event().await {
                     Ok(event) => Ok(WaitOutcome::LiveCell(runtime_response(&cell_id, event)?)),
@@ -267,6 +289,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
                     cell_id: protocol_cell_id(&invocation.cell_id),
                     parent_tool_call_id: Some(invocation.parent_tool_call_id),
                     runtime_tool_call_id: invocation.runtime_tool_call_id,
+                    buffered_output_bytes: invocation.buffered_output_bytes,
                     tool_name: codex_protocol::ToolName {
                         name: invocation.tool_name.name,
                         namespace: invocation.tool_name.namespace,
@@ -313,25 +336,7 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
     runtime::CreateCellRequest {
         state_path: request.state_path,
         tool_call_id: request.tool_call_id,
-        enabled_tools: request
-            .enabled_tools
-            .iter()
-            .map(|definition| runtime::ToolDefinition {
-                name: definition.name.clone(),
-                tool_name: runtime::ToolName {
-                    name: definition.tool_name.name.clone(),
-                    namespace: definition.tool_name.namespace.clone(),
-                },
-                description: definition.description.clone(),
-                default_timeout_ms: definition
-                    .default_timeout_ms
-                    .map(|timeout| timeout.clamp(1, MAX_TOOL_TIMEOUT_MS)),
-                kind: match definition.kind {
-                    CodeModeToolKind::Function => runtime::ToolKind::Function,
-                    CodeModeToolKind::Freeform => runtime::ToolKind::Freeform,
-                },
-            })
-            .collect(),
+        enabled_tools: request.enabled_tools,
         source: request.source,
         default_tool_timeout_ms,
     }
@@ -394,7 +399,12 @@ fn output_item(item: runtime::OutputItem) -> FunctionCallOutputContentItem {
 
 fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
     RuntimeResponse::Result {
-        error_text: Some(format!("exec cell {cell_id} not found")),
+        error_text: Some(serde_json::json!({
+            "kind": "exec_result_unavailable", "cell_id": cell_id,
+            "status": "unknown_cell", "terminal_state": "unknown", "recovery": null,
+            "automatic_replay_allowed": false,
+            "message": "No retained lifecycle evidence is available for this cell. It may be unknown, unstarted, or outside retention; absence does not prove completion or safe replay.",
+        }).to_string()),
         output_loss: None,
         cell_id,
         content_items: Vec::new(),

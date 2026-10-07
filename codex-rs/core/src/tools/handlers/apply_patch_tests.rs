@@ -30,6 +30,26 @@ fn sample_patch() -> &'static str {
 }
 
 #[tokio::test]
+async fn patch_reports_only_added_line_whitespace_and_conflict_diagnostics() {
+    let workspace = TempDir::new().unwrap();
+    let path = workspace.path().join("diagnostics.txt");
+    std::fs::write(&path, "existing trailing  \nold\n").unwrap();
+    let patch = format!("*** Begin Patch\n*** Update File: {}\n@@\n existing trailing  \n-old\n+new trailing  \n+ \tindented\n+<<<<<<< ours\n+=======\n+>>>>>>> theirs\n*** End Patch", path.display());
+    let mut call = invocation_for_payload(ToolPayload::Custom { input: patch }).await;
+    Arc::get_mut(&mut Arc::make_mut(&mut call.step_context).turn)
+        .expect("test invocation owns its turn").permission_profile = PermissionProfile::Disabled;
+    let payload = call.payload.clone();
+    let result = ApplyPatchHandler::default().handle(call).await.unwrap().code_mode_result(&payload);
+    assert_eq!(result["success"], true);
+    let diagnostics = result["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 5, "{result}");
+    assert_eq!(diagnostics[0]["line"], 2);
+    assert_eq!(diagnostics[0]["kind"], "trailing_whitespace");
+    assert_eq!(diagnostics[1]["kind"], "space_before_tab");
+    assert!(diagnostics[2..].iter().all(|item| item["kind"] == "conflict_marker"));
+}
+
+#[tokio::test]
 async fn retained_retry_reaches_filesystem_once_and_hooks_see_expanded_code() {
     let workspace = TempDir::new().unwrap();
     std::fs::write(workspace.path().join("a.txt"), "current\n").unwrap();
@@ -62,6 +82,13 @@ async fn retained_retry_reaches_filesystem_once_and_hooks_see_expanded_code() {
     assert!(!workspace.path().join("b.txt").exists());
     let id = failed["retry"]["patch_id"].as_str().unwrap();
     assert_eq!(failed["retry"]["observed_source"]["chunk"], 1);
+    let diagnostic = &failed["diagnostics"][0];
+    assert_eq!(diagnostic["kind"], "expected_lines_not_found");
+    assert_eq!(diagnostic["hunk_ordinal"], 1);
+    assert_eq!(diagnostic["chunk_ordinal"], 1);
+    assert_eq!(diagnostic["current_content_sha256"], failed["retry"]["observed_source"]["sha256"]);
+    assert!(diagnostic["current_excerpt"].is_string());
+    assert!(diagnostic["current_line_start"].is_number());
     call.call_id = "retained-retry".into();
     call.payload = ToolPayload::Custom {
         input: format!(
@@ -145,11 +172,20 @@ async fn retained_retry_reaches_filesystem_once_and_hooks_see_expanded_code() {
 
 #[tokio::test]
 async fn hook_replacement_consumes_retained_id_without_replaying_original_code() {
+    let workspace = TempDir::new().unwrap();
     let patch = sample_patch();
     let mut call = invocation_for_payload(ToolPayload::Custom {
         input: patch.into(),
     })
     .await;
+    let step = Arc::make_mut(&mut call.step_context);
+    Arc::get_mut(&mut step.turn).expect("test invocation owns its turn")
+        .permission_profile = PermissionProfile::Disabled;
+    step.environments.turn_environments = vec![TurnEnvironment::new(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        PathUri::from_host_native_path(workspace.path()).unwrap(), None,
+    )];
     let environment = &call.step_context.environments.turn_environments[0];
     let receipt = call
         .session
@@ -171,10 +207,32 @@ async fn hook_replacement_consumes_retained_id_without_replaying_original_code()
         input: retry.clone(),
     };
     let updated = "*** Begin Patch\n*** Add File: different.txt\n+hook contents\n*** End Patch";
-    let changed = ApplyPatchHandler::default()
+    let mut changed = ApplyPatchHandler::default()
         .with_updated_hook_input(call.clone(), json!({"command": updated}))
         .unwrap();
-    assert!(matches!(changed.payload, ToolPayload::Custom { input } if input == updated));
+    let ToolPayload::Custom { input } = &changed.payload else { panic!("custom patch"); };
+    let recovery = {
+        let retained = call.session.services.retained_patches.lock().unwrap();
+        assert_eq!(retained.prepare(input).unwrap().args.patch, updated);
+        retained.recovery_for_call(&call.call_id).expect("amended recovery")
+    };
+    assert!(input.contains(recovery["patch_id"].as_str().unwrap()));
+    changed.cancellation_token.cancel();
+    assert!(ApplyPatchHandler::default().handle(changed.clone()).await.is_err());
+    assert!(!workspace.path().join("different.txt").exists());
+    assert!(!workspace.path().join("hello.txt").exists());
+    assert!(call.session.services.retained_patches.lock().unwrap()
+        .recovery_for_call(&call.call_id).is_some());
+    changed.cancellation_token = tokio_util::sync::CancellationToken::new();
+    let handler = ApplyPatchHandler::default();
+    let (one, two) = tokio::join!(handler.handle(changed.clone()), handler.handle(changed.clone()));
+    let one = one.unwrap().code_mode_result(&changed.payload);
+    let two = two.unwrap().code_mode_result(&changed.payload);
+    assert_eq!([&one, &two].iter().filter(|result| result["success"] == true).count(), 1);
+    assert_eq!(std::fs::read_to_string(workspace.path().join("different.txt")).unwrap(), "hook contents\n");
+    assert!(!workspace.path().join("hello.txt").exists());
+    assert!(call.session.services.retained_patches.lock().unwrap()
+        .recovery_for_call(&call.call_id).is_none());
     assert!(
         call.session
             .services
@@ -254,7 +312,10 @@ async fn registered_large_patch_keeps_native_acknowledgment_and_complete_structu
     };
     assert_eq!(output.success, Some(true));
     let text = output.body.to_text().unwrap();
-    assert_eq!(text, "Success. Updated the files.");
+    assert!(text.contains("Success. Updated the files."), "{text}");
+    let receipt: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(receipt["output_reduced"], true);
+    assert!(receipt["artifact_id"].is_string());
     let structured = result.code_mode_result();
     assert_eq!(structured["success"], true);
     assert_eq!(structured["changes_exact"], true);
@@ -263,6 +324,7 @@ async fn registered_large_patch_keeps_native_acknowledgment_and_complete_structu
         structured["changes"][128],
         json!({
             "path": cwd.join(&names[128]).unwrap().to_path_buf(), "kind": "add", "move_path": null,
+            "unified_diff": "@@ -0,0 +1 @@\n+content\n", "diff_complete": true, "diff_bytes": 23,
         })
     );
     for name in names {
@@ -573,12 +635,12 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             .unwrap();
         assert_eq!(
             writes.len(),
-            if partial { 2 } else { 1 },
-            "each hunk has one remote write attempt, no unapproved retry"
+            if partial { 3 } else { 1 },
+            "failed partial patches restore their committed prefix without replaying it"
         );
         assert_eq!(
             approvals, 1,
-            "a failed write must not request approval to replay the patch"
+            "a failed remote write is rolled back without automatically replaying the patch"
         );
         assert_eq!(writes[0]["path"], json!(target_uri));
         assert_eq!(
@@ -650,7 +712,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
         );
         assert_eq!(
             labels["mutation"],
-            if deny_write && !partial { "none" } else { "exact" }
+            if deny_write { "none" } else { "exact" }
         );
         for name in [
             "codex.apply_patch.files_requested",
@@ -689,7 +751,6 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             if cancel_after_prefix {
                 assert!(text.contains("aborted by user"), "{text}");
             } else {
-                assert!(text.contains("Automatic patch retry withheld"), "{text}");
                 assert!(!text.contains("PatchContextMismatch"), "{text}");
             }
             assert!(!text.contains("cancelled before mutation"), "{text}");
@@ -708,7 +769,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                     target_uri.to_path_buf().display()
                 ))
                 .count(),
-                1,
+                0,
                 "{text}"
             );
             assert!(
@@ -719,8 +780,11 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                 !text.contains("Additional filesystem changes may not be listed."),
                 "{text}"
             );
-            assert!(text.contains("do not retry the whole patch"), "{text}");
-            assert_eq!(std::fs::read(&remote_file).unwrap(), b"replacement\n");
+            assert!(!text.contains("do not retry the whole patch"), "{text}");
+            assert_eq!(writes[2]["path"], json!(target_uri));
+            assert_eq!(writes[2]["sandbox"], writes[0]["sandbox"]);
+            assert_eq!(STANDARD.decode(writes[2]["dataBase64"].as_str().unwrap()).unwrap(), b"original\n");
+            assert_eq!(std::fs::read(&remote_file).unwrap(), b"original\n");
             assert_eq!(std::fs::read(&blocked_file).unwrap(), b"blocked original\n");
         } else if deny_write {
             assert!(!text.contains("Success. Updated"), "{text}");
@@ -1162,6 +1226,7 @@ async fn post_tool_use_payload_uses_patch_input_and_tool_output() {
             tool_response: json!({
                 "text": "Success. Updated files.", "success": true,
                 "changes": [], "changes_exact": true, "environment_id": null,
+                "diagnostics": [],
             }),
         })
     );

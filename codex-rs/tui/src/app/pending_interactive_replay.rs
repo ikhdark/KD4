@@ -32,8 +32,8 @@ impl ElicitationRequestKey {
 //
 // We keep both fast lookup sets (for snapshot filtering by call_id/request key) and
 // turn-indexed queues/vectors so turn completion or interruption can clear
-// stale prompts tied to a turn. `request_user_input` removal is FIFO because
-// the overlay answers queued prompts in FIFO order for a shared `turn_id`.
+// stale prompts tied to a turn. Answers remove their originating request, even
+// when a delayed answer arrives after a same-turn prompt has been replaced.
 pub(super) struct PendingInteractiveReplayState {
     exec_approval_call_ids: HashSet<String>,
     exec_approval_call_ids_by_turn_id: HashMap<String, Vec<String>>,
@@ -131,28 +131,23 @@ impl PendingInteractiveReplayState {
                     },
                 );
             }
-            // `Op::UserInputAnswer` identifies the turn, not the prompt call_id. The UI
-            // answers queued prompts for the same turn in FIFO order, so remove the oldest
-            // queued call_id for that turn.
-            AppCommand::UserInputAnswer { id, .. } => {
-                let mut remove_turn_entry = false;
-                if let Some(call_ids) = self.request_user_input_call_ids_by_turn_id.get_mut(id) {
-                    if !call_ids.is_empty() {
-                        let call_id = call_ids.remove(0);
-                        self.request_user_input_call_ids.remove(&call_id);
-                        self.pending_requests_by_request_id.retain(
-                            |_, pending| {
-                                !matches!(pending, PendingInteractiveRequest::RequestUserInput { item_id, .. } if *item_id == call_id)
-                            },
-                        );
-                    }
-                    if call_ids.is_empty() {
-                        remove_turn_entry = true;
-                    }
+            AppCommand::UserInputAnswer { id, call_id, .. } => {
+                if !self.request_user_input_call_ids_by_turn_id.get(id)
+                    .is_some_and(|call_ids| call_ids.contains(call_id)) {
+                    return;
                 }
-                if remove_turn_entry {
-                    self.request_user_input_call_ids_by_turn_id.remove(id);
-                }
+                self.request_user_input_call_ids.remove(call_id);
+                Self::remove_call_id_from_turn_map_entry(
+                    &mut self.request_user_input_call_ids_by_turn_id,
+                    id,
+                    call_id,
+                );
+                self.pending_requests_by_request_id.retain(
+                    |_, pending| {
+                        !matches!(pending, PendingInteractiveRequest::RequestUserInput { turn_id, item_id }
+                            if turn_id == id && item_id == call_id)
+                    },
+                );
             }
             _ => {}
         }
@@ -605,7 +600,8 @@ mod tests {
 
         store.note_outbound_op(&Op::UserInputAnswer {
             id: "turn-1".to_string(),
-            response: ToolRequestUserInputResponse {
+            call_id: "call-1".to_string(),
+            response: ToolRequestUserInputResponse { disposition: None,
                 answers: HashMap::new(),
                 interrupted: false,
             },
@@ -693,7 +689,8 @@ mod tests {
 
         store.note_outbound_op(&Op::UserInputAnswer {
             id: "turn-1".to_string(),
-            response: ToolRequestUserInputResponse {
+            call_id: "call-1".to_string(),
+            response: ToolRequestUserInputResponse { disposition: None,
                 answers: HashMap::new(),
                 interrupted: false,
             },
@@ -718,7 +715,8 @@ mod tests {
 
         store.note_outbound_op(&Op::UserInputAnswer {
             id: "turn-1".to_string(),
-            response: ToolRequestUserInputResponse {
+            call_id: "call-1".to_string(),
+            response: ToolRequestUserInputResponse { disposition: None,
                 answers: HashMap::new(),
                 interrupted: false,
             },
@@ -731,6 +729,25 @@ mod tests {
             Some(ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { params, .. }))
                 if params.item_id == "call-2"
         ));
+    }
+
+    #[test]
+    fn delayed_user_input_answer_does_not_hide_replacement_on_replay() {
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        store.push_request(request_user_input_request("call-1", "turn-1"));
+        store.push_notification(request_resolved(AppServerRequestId::String("call-1".into())));
+        store.push_request(request_user_input_request("call-2", "turn-1"));
+        store.note_outbound_op(&Op::UserInputAnswer {
+            id: "turn-1".into(),
+            call_id: "call-1".into(),
+            response: ToolRequestUserInputResponse { disposition: None, answers: HashMap::new(), interrupted: true },
+        });
+        let snapshot = store.snapshot();
+        let requests = snapshot.events.iter().filter_map(|event| match event {
+            ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { params, .. }) => Some(params.item_id.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(requests, vec!["call-2"]);
     }
 
     #[test]

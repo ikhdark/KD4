@@ -1,5 +1,239 @@
 use super::*;
 
+#[test]
+fn successful_script_inventories_do_not_rank_incidental_diagnostic_words() {
+    let output = (0..800).map(|i| format!("src/file{i}.rs: fn warning(error: Error) -> Result<()> {{}}\n"))
+        .collect::<String>();
+    assert!(summarize_shell_output_for_model(&output, 0, false,
+        options(Some("python inspect_sources.py"), Some(1000))).is_none());
+    let diagnosed = format!("{output}\nwarning: actual diagnostic\n");
+    assert!(summarize_shell_output_for_model(&diagnosed, 0, false,
+        options(Some("python inspect_sources.py"), Some(1000))).is_some());
+}
+
+fn compiler_record(message: &str) -> String {
+    serde_json::json!({"reason":"compiler-message", "message": {
+        "level":"error", "message":message,
+        "code":{"code":"E0308", "explanation":"manual ".repeat(1000)},
+        "spans":[{"file_name":"src/λ.rs", "line_start":7, "column_start":3,
+            "is_primary":true, "suggested_replacement":"value.into()", "suggestion_applicability":"MachineApplicable"}],
+        "children":[{"level":"help", "message":"convert the value", "spans":[], "children":[]}],
+        "rendered":"redundant compiler prose ".repeat(3000)
+    }}).to_string()
+}
+
+#[test]
+fn structured_diagnostics_replace_the_lossy_summary_and_keep_fixes() {
+    let output = format!("{}\n{}\n{}\n", compiler_record("expected λ"),
+        serde_json::json!({"reason":"build-finished","success":false}),
+        serde_json::json!({"reason":"build-finished","success":true}));
+    let text = summarize_shell_output_for_model(&output, 1, false, options(Some("cargo check --message-format=json"), Some(2000))).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(result["format"], "compiler_diagnostics");
+    assert_eq!(result["build_success"], false);
+    assert_eq!(result["diagnostics_complete"], true);
+    assert_eq!(result["diagnostics"][0]["source_line"], 1);
+    let diagnostic = &result["diagnostics"][0]["diagnostic"];
+    assert_eq!(diagnostic["message"], "expected λ");
+    assert_eq!(diagnostic["spans"][0]["suggested_replacement"], "value.into()");
+    assert_eq!(diagnostic["children"][0]["message"], "convert the value");
+    assert!(diagnostic.get("rendered").is_none());
+    assert!(!text.contains("Shell output summary:"));
+    let exec_output = codex_protocol::exec_output::ExecToolCallOutput {
+        exit_code: 1,
+        stdout: codex_protocol::exec_output::StreamOutput::new(output.clone()),
+        stderr: codex_protocol::exec_output::StreamOutput::new(String::new()),
+        aggregated_output: codex_protocol::exec_output::StreamOutput::new(output.clone()),
+        duration: std::time::Duration::ZERO,
+        timed_out: false,
+    };
+    let projected = crate::tools::project_exec_output_text_with_budget(
+        &exec_output, codex_utils_output_truncation::TruncationPolicy::Tokens(2000),
+        Some(2000), Some("cargo check --message-format=json"),
+    );
+    assert!(projected.reduced);
+    assert!(projected.text.contains("compiler_diagnostics"));
+    assert!(projected.text.contains("suggested_replacement"));
+    assert_eq!(exec_output.aggregated_output.text, output);
+    // Source reads must never be interpreted as compiler diagnostics.
+    assert!(summarize_shell_output_for_model(&output, 0, false, options(Some("cat output.jsonl"), Some(2000))).is_none());
+}
+
+#[test]
+fn structured_diagnostics_count_omissions_and_fall_back_for_unknown_output() {
+    let output = (0..80).map(|i| compiler_record(&format!("error {i}"))).collect::<Vec<_>>().join("\n");
+    let text = structured_compiler_summary(&output, 1, false, Some(1800)).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(result["diagnostic_count"], 80);
+    assert_eq!(result["diagnostics_complete"], false);
+    assert_eq!(result["diagnostics"].as_array().unwrap().len() as u64 + result["omitted_diagnostics"].as_u64().unwrap(), 80);
+    assert!(!codex_utils_string::approx_token_count_exceeds(&text, 1800));
+    for suffix in ["{broken", r#"{"reason":"new-format"}"#] {
+        assert!(structured_compiler_summary(&format!("{}\n{suffix}", compiler_record("failure")), 1, false, None).is_none());
+    }
+}
+
+#[test]
+fn structured_diagnostics_accept_cargo_stderr_without_double_counting_errors() {
+    let mut abort: serde_json::Value = serde_json::from_str(&compiler_record("aborting due to 1 previous error")).unwrap();
+    abort["message"]["spans"] = serde_json::json!([]);
+    let mut note = abort.clone();
+    note["message"]["level"] = "failure-note".into();
+    note["message"]["message"] = "For more information, try rustc --explain E0308".into();
+    let output = format!("   Compiling sample\n{}\n{abort}\n{note}\nerror: could not compile sample\n", compiler_record("expected λ"));
+    let text = structured_compiler_summary(&output, 1, false, Some(3000)).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(result["error_count"], 1);
+    assert_eq!(result["diagnostic_count"], 3);
+    assert_eq!(result["diagnostics"][0]["source_line"], 2);
+    assert_eq!(result["text_lines"][1]["text"], "error: could not compile sample");
+    assert!(structured_compiler_summary("plain failure context", 1, false, None).is_none());
+}
+
+#[test]
+fn structured_diagnostics_keep_central_error_before_warnings() {
+    let output = (0..80).map(|i| {
+        let mut record: serde_json::Value = serde_json::from_str(&compiler_record(&format!("diagnostic {i}"))).unwrap();
+        if i != 40 { record["message"]["level"] = "warning".into(); }
+        record.to_string()
+    }).collect::<Vec<_>>().join("\n");
+    for budget in [1800, 8000] {
+        let summary = structured_compiler_summary(&output, 1, false, Some(budget)).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        let retained = result["diagnostics"].as_array().unwrap();
+        let error = retained.iter().find(|item| item["diagnostic"]["level"] == "error").unwrap();
+        assert_eq!(error["diagnostic"]["message"], "diagnostic 40");
+        assert_eq!(error["diagnostic"]["spans"][0]["line_start"], 7);
+        assert_eq!(error["diagnostic"]["children"][0]["message"], "convert the value");
+        assert_eq!(retained.len() as u64 + result["omitted_diagnostics"].as_u64().unwrap(), 80);
+        assert!(retained.windows(2).all(|pair| pair[0]["source_line"].as_u64() < pair[1]["source_line"].as_u64()));
+    }
+}
+
+#[test]
+fn structured_diagnostics_keep_oversized_error_locations_and_fixes() {
+    for level in ["error", "fatal"] {
+        let mut error: serde_json::Value = serde_json::from_str(&compiler_record("required conversion")).unwrap();
+        error["message"]["level"] = level.into();
+        error["message"]["spans"][0]["text"] = serde_json::json!([
+            {"text": "long source excerpt ".repeat(4_000), "highlight_start": 3, "highlight_end": 7}
+        ]);
+        let mut warning: serde_json::Value = serde_json::from_str(&compiler_record("advisory")).unwrap();
+        warning["message"]["level"] = "warning".into();
+        let output = std::iter::repeat_n(warning.to_string(), 40)
+            .chain([error.to_string()])
+            .chain(std::iter::repeat_n(warning.to_string(), 40))
+            .collect::<Vec<_>>().join("\n");
+        let summary = summarize_shell_output_for_model(&output, 1, false,
+            options(Some("cargo check --message-format=json"), Some(1_800))).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        let retained = result["diagnostics"].as_array().unwrap();
+        let error = retained.iter().find(|item| item["diagnostic"]["level"] == level).unwrap();
+        assert_eq!(error["source_line"], 41);
+        assert_eq!(error["details_omitted"], true);
+        assert_eq!(result["diagnostics_complete"], false);
+        assert_eq!(error["diagnostic"]["message"], "required conversion");
+        assert_eq!(error["diagnostic"]["spans"][0]["file_name"], "src/λ.rs");
+        assert_eq!(error["diagnostic"]["spans"][0]["line_start"], 7);
+        assert_eq!(error["diagnostic"]["spans"][0]["suggested_replacement"], "value.into()");
+        assert_eq!(error["diagnostic"]["children"][0]["message"], "convert the value");
+        assert!(error["diagnostic"]["spans"][0].get("text").is_none());
+        assert!(!codex_utils_string::approx_token_count_exceeds(&summary, 1_800));
+    }
+}
+
+#[test]
+fn structured_diagnostics_abbreviate_long_prose_without_losing_child_fixes() {
+    let mut error: serde_json::Value = serde_json::from_str(&compiler_record(&"type detail ".repeat(8_000))).unwrap();
+    error["message"]["children"][0]["spans"] = error["message"]["spans"].clone();
+    let summary = structured_compiler_summary(&error.to_string(), 1, false, Some(1_800)).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&summary).unwrap();
+    assert_eq!(result["omitted_diagnostics"], 0);
+    assert_eq!(result["diagnostics_complete"], false);
+    assert_eq!(result["diagnostics"][0]["details_omitted"], true);
+    assert_eq!(result["diagnostics"][0]["diagnostic"]["children"][0]["spans"][0]["suggested_replacement"], "value.into()");
+    assert!(result["diagnostics"][0]["diagnostic"]["message"].as_str().unwrap().contains("[line truncated]"));
+    assert!(!codex_utils_string::approx_token_count_exceeds(&summary, 1_800));
+}
+
+#[test]
+fn verified10_compiler_compaction_keeps_child_fixes_among_oversized_notes() {
+    let mut record: serde_json::Value = serde_json::from_str(&compiler_record("fix required")).unwrap();
+    let fix = serde_json::json!({"level":"help", "message":"convert", "spans":record["message"]["spans"], "children":[]});
+    // The only actionable replacement belongs to a child, not the parent.
+    record["message"]["spans"] = serde_json::json!([]);
+    let mut children = vec![serde_json::json!({"level":"note", "message":"unlocated note", "spans":[], "children":[]}); 1000];
+    children.insert(500, fix.clone());
+    record["message"]["children"] = children.into();
+    let raw = record.to_string();
+    let summary = structured_compiler_summary(&raw, 1, false, Some(1800)).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&summary).unwrap();
+    assert_eq!(value["omitted_diagnostics"], 0);
+    assert_eq!(value["diagnostics"][0]["diagnostic"]["children"], serde_json::json!([fix]));
+    assert_eq!(value["diagnostics"][0]["recovery_selector"], serde_json::json!({"kind":"bytes","start":0,"end":raw.len()}));
+}
+
+#[test]
+fn verified10_compiler_recovery_uses_canonical_crlf_and_unicode_bytes() {
+    use crate::tools::context::{ExecCommandToolOutput, ToolOutput, ToolPayload};
+    use crate::unified_exec::ProcessOutputSnapshot;
+    use codex_utils_output_truncation::TruncationPolicy;
+    use std::sync::Arc;
+    let record = compiler_record(&"long λ detail ".repeat(4000));
+    let prefix = "building λ\r\n";
+    let stdout = format!("{prefix}{record}\r\n");
+    for interleaved in [false, true] {
+        let stderr = "stderr λ\r\n";
+        let split = if interleaved { prefix.len() + record.find("rendered").unwrap() } else { prefix.len() };
+        let raw = format!("{}{stderr}{}", &stdout[..split], &stdout[split..]);
+        let output = ExecCommandToolOutput {
+            output_ranges: None,
+            process_output: Some(Arc::new(ProcessOutputSnapshot {
+                aggregated_output: raw.as_bytes().to_vec(), stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(), aggregated_output_is_exact: true, streams_are_exact: true,
+            })),
+            error: None, validation: None, event_call_id: String::new(), chunk_id: String::new(),
+            wall_time: std::time::Duration::ZERO, raw_output: raw.as_bytes().to_vec(),
+            truncation_policy: TruncationPolicy::Tokens(2000), max_output_tokens: Some(2000),
+            process_id: None, session_capabilities: None, exit_code: Some(1), process_exited: true,
+            search_no_match: false, original_token_count: None,
+            hook_command: Some("cargo check --message-format=json".into()),
+            raw_output_artifact: None, repair_notice: None, pending_deferred_completions: Vec::new(),
+        };
+        let result = output.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
+        let summary: serde_json::Value = serde_json::from_str(result["output"].as_str().unwrap()).unwrap();
+        assert_eq!(summary["diagnostic_stream"], "stdout");
+        assert_eq!(summary["stderr"], stderr);
+        assert_eq!(summary["original_bytes"], raw.len());
+        let selector = &summary["diagnostics"][0]["recovery_selector"];
+        let bytes = &raw[selector["start"].as_u64().unwrap() as usize..selector["end"].as_u64().unwrap() as usize];
+        assert_eq!(bytes, if interleaved { raw.as_str() } else { record.as_str() });
+    }
+}
+
+#[test]
+fn verified_evidence_single_oversized_compiler_error_keeps_actionable_core_and_exact_recovery() {
+    let mut record: serde_json::Value = serde_json::from_str(&compiler_record("short actionable error")).unwrap();
+    record["message"]["spans"][0]["expansion"] = serde_json::json!({"macro_decl_name":"expansion ".repeat(10_000)});
+    record["message"]["children"] = serde_json::json!((0..1000).map(|n|
+        serde_json::json!({"level":"note", "message":format!("child {n}"), "spans":[], "children":[]})
+    ).collect::<Vec<_>>());
+    let output = record.to_string();
+    let summary = structured_compiler_summary(&output, 1, false, Some(1800)).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&summary).unwrap();
+    assert_eq!(value["omitted_diagnostics"], 0);
+    assert_eq!(value["diagnostics_complete"], false);
+    let error = &value["diagnostics"][0];
+    assert_eq!(error["diagnostic"]["message"], "short actionable error");
+    assert_eq!(error["diagnostic"]["code"]["code"], "E0308");
+    assert_eq!(error["diagnostic"]["spans"][0]["file_name"], "src/λ.rs");
+    assert_eq!(error["diagnostic"]["spans"][0]["line_start"], 7);
+    let selector = &error["recovery_selector"];
+    assert_eq!(selector["kind"], "bytes");
+    let recovered = &output[selector["start"].as_u64().unwrap() as usize..selector["end"].as_u64().unwrap() as usize];
+    assert_eq!(serde_json::from_str::<serde_json::Value>(recovered).unwrap(), record);
+}
+
 fn options(
     command_text: Option<&str>,
     applied_token_limit: Option<usize>,
@@ -9,6 +243,94 @@ fn options(
         applied_token_limit,
         command_text,
     }
+}
+
+#[test]
+fn compiler_json_uses_complete_stdout_and_keeps_stderr_independent() {
+    use codex_protocol::exec_output::{ExecToolCallOutput, StreamOutput};
+    use codex_utils_output_truncation::TruncationPolicy;
+
+    let stdout = compiler_record("authoritative stdout failure");
+    // Reader scheduling can interleave stderr inside a stdout JSON record.
+    let stderr = "{stderr progress, not JSON}\n   Compiling sample\r\n";
+    let split = stdout.find("rendered").unwrap();
+    let mixed = format!("{}{}{}", &stdout[..split], stderr, &stdout[split..]);
+    let mut output = ExecToolCallOutput {
+        exit_code: 1,
+        stdout: StreamOutput::new(stdout.clone()),
+        stderr: StreamOutput::new(stderr.to_string()),
+        aggregated_output: StreamOutput::new(mixed.clone()),
+        ..Default::default()
+    };
+    let project = |output: &ExecToolCallOutput| crate::tools::project_exec_output_text_with_budget(
+        output, TruncationPolicy::Tokens(2000), Some(2000), Some("cargo check --message-format=json"));
+    let projected = project(&output);
+    let summary: serde_json::Value = serde_json::from_str(&projected.text).unwrap();
+    assert!(projected.reduced);
+    assert_eq!(summary["diagnostic_stream"], "stdout");
+    assert_eq!(summary["stderr"], stderr);
+    assert_eq!(summary["diagnostics"][0]["source_line"], 1);
+    assert_eq!(summary["diagnostics"][0]["diagnostic"]["message"], "authoritative stdout failure");
+    assert_eq!(summary["diagnostics"][0]["diagnostic"]["spans"][0]["suggested_replacement"], "value.into()");
+    let direct = crate::tools::project_exec_output_for_model_with_budget(
+        &output, TruncationPolicy::Tokens(2000), Some(2000), Some("cargo check --message-format=json"));
+    assert!(direct.text.contains("compiler_diagnostics") && direct.text.contains("stderr progress"));
+    assert_eq!(output.aggregated_output.text, mixed);
+
+    for stream in 0..3 {
+        let mut incomplete = output.clone();
+        match stream {
+            0 => incomplete.stdout.truncated = true,
+            1 => incomplete.stderr.truncated_after_lines = Some(1),
+            _ => incomplete.aggregated_output.truncated = true,
+        }
+        assert!(!project(&incomplete).text.contains("\"format\":\"compiler_diagnostics\""));
+    }
+    output.stdout.text.push_str("\n{\"reason\":\"unknown-output\"}");
+    output.aggregated_output.text.push_str("\n{\"reason\":\"unknown-output\"}");
+    let unknown = project(&output);
+    assert!(!unknown.text.contains("\"format\":\"compiler_diagnostics\""));
+    assert!(unknown.text.contains("unknown-output"), "{}", unknown.text);
+}
+
+#[test]
+fn unified_exec_compiler_streams_do_not_replay_prior_poll_output() {
+    use crate::tools::context::{ExecCommandToolOutput, ToolOutput, ToolPayload};
+    use crate::unified_exec::ProcessOutputSnapshot;
+    use codex_utils_output_truncation::TruncationPolicy;
+    use std::sync::Arc;
+
+    let stdout = compiler_record("unified stdout failure");
+    let stderr = "{stderr progress, not JSON}\r\n";
+    let split = stdout.find("rendered").unwrap();
+    let mixed = format!("{}{}{}", &stdout[..split], stderr, &stdout[split..]);
+    let mut output = ExecCommandToolOutput {
+        output_ranges: None,
+        process_output: Some(Arc::new(ProcessOutputSnapshot {
+            aggregated_output: mixed.as_bytes().to_vec(),
+            stdout: stdout.into_bytes(), stderr: stderr.as_bytes().to_vec(),
+            aggregated_output_is_exact: true, streams_are_exact: true,
+        })),
+        error: None, validation: None, event_call_id: String::new(), chunk_id: String::new(),
+        wall_time: std::time::Duration::ZERO, raw_output: mixed.into_bytes(),
+        truncation_policy: TruncationPolicy::Tokens(2000), max_output_tokens: Some(2000),
+        process_id: None, session_capabilities: None, exit_code: Some(1), process_exited: true,
+        search_no_match: false, original_token_count: None,
+        hook_command: Some("cargo check --message-format=json".to_string()),
+        raw_output_artifact: None, repair_notice: None, pending_deferred_completions: Vec::new(),
+    };
+    let payload = ToolPayload::Function { arguments: "{}".to_string() };
+    let result = output.code_mode_result(&payload);
+    let summary: serde_json::Value = serde_json::from_str(result["output"].as_str().unwrap()).unwrap();
+    assert_eq!(summary["diagnostics"][0]["diagnostic"]["message"], "unified stdout failure");
+    assert_eq!(summary["stderr"], stderr);
+    Arc::make_mut(output.process_output.as_mut().unwrap()).streams_are_exact = false;
+    assert!(!output.code_mode_result(&payload)["output"].as_str().unwrap().contains("compiler_diagnostics"));
+    Arc::make_mut(output.process_output.as_mut().unwrap()).streams_are_exact = true;
+    output.raw_output = b"last poll only\n".to_vec();
+    assert_eq!(output.code_mode_result(&payload)["output"], "last poll only\n");
+    output.raw_output.clear();
+    assert_eq!(output.code_mode_result(&payload)["output"], "");
 }
 
 #[test]
@@ -24,6 +346,35 @@ fn counter_only_progress_does_not_displace_failure_diagnostics() {
     assert_eq!(summary.matches("KDA elapsed").count(), 1);
     assert!(summary.contains("elapsed 699s"));
     assert!(summary.contains("collapsed_progress_lines: 697"));
+}
+
+#[test]
+fn verified_evidence_progress_keeps_numeric_entity_identity() {
+    assert_eq!(progress_line_key("job 12 shard 3 progress 1/90 elapsed 1s"),
+        progress_line_key("job 12 shard 3 progress 8/90 elapsed 8s"));
+    assert_ne!(progress_line_key("job 12 shard 3 progress 1/90 elapsed 1s"),
+        progress_line_key("job 13 shard 3 progress 8/90 elapsed 8s"));
+    assert_eq!(progress_line_key("job 12 unknown progress format 45"), None);
+    let text = (0..30).flat_map(|n| [format!("job 12 progress {n}/90 elapsed {n}s"),
+        format!("job 13 progress {n}/90 elapsed {n}s")]).collect::<Vec<_>>().join("\n");
+    let selected = select_lines(&text, 60, false, false);
+    assert!(selected.indexes.contains(&58) && selected.indexes.contains(&59));
+    assert_eq!(selected.collapsed_progress_lines, 58);
+}
+
+#[test]
+fn verified_evidence_repeated_headlines_keep_distinct_assertions() {
+    let mut lines = vec!["ordinary output".to_string(); 900];
+    for (line, actual) in [(100, 7), (400, 9)] {
+        lines[line] = "error: assertion failed".into();
+        lines[line + 1] = "  --> src/a.rs:12:3".into();
+        lines[line + 2] = format!("actual: {actual}; expected: 4");
+        lines[line + 3] = String::new();
+    }
+    let summary = summarize_shell_output_for_model(&lines.join("\n"), 1, false,
+        options(Some("cargo test"), Some(2000))).unwrap();
+    assert!(summary.contains("actual: 7; expected: 4"), "{summary}");
+    assert!(summary.contains("actual: 9; expected: 4"), "{summary}");
 }
 
 #[test]
@@ -298,11 +649,27 @@ fn unretained_distinct_diagnostics_are_counted() {
     let summary =
         summarize_shell_output_for_model(&lines.join("\n"), 1, false, options(None, None)).unwrap();
     assert!(
-        summary.contains("omitted_diagnostic_groups: 4; inspect the raw output"),
+        summary.contains("omitted_diagnostic_groups: at least 4 (selection-stage lower bound)"),
         "{summary}"
     );
     assert!(summary.contains("fatal: distinct category 0"));
     assert!(summary.contains("fatal: distinct category 11"));
+}
+
+#[test]
+fn verified10_tight_diagnostic_budgets_report_only_a_lower_bound() {
+    let mut lines = vec!["ordinary context".to_string(); 900];
+    for i in 0..12 {
+        lines[40 + i * 20] = format!("fatal: distinct {i} {}", "λ detail ".repeat(4000));
+    }
+    for budget in [1800, 4000, 8000] {
+        let summary = summarize_shell_output_for_model(&lines.join("\n"), 1, false,
+            options(None, Some(budget))).unwrap();
+        assert!(summary.contains("omitted_diagnostic_groups: at least 4"));
+        assert!(summary.contains("final fitting may omit additional diagnostics"));
+        assert!(summary.contains("[line truncated]"));
+        assert!(!codex_utils_string::approx_token_count_exceeds(&summary, budget));
+    }
 }
 
 #[test]
@@ -861,9 +1228,12 @@ fn powershell_read_pipelines_use_ordered_truncation() {
         "Write-Output \"it's\"; Remove-Item src/old.rs; Write-Output 'done'",
         "Write-Output \"$(Remove-Item src/old.rs)\"",
     ] {
+        assert!(!is_read_only_command(command), "{command}");
+        // A successful mutating script is still not a diagnostic producer.
+        // Incidental "error" in source text must retain source-order truncation.
         assert!(
             summarize_shell_output_for_model(&output, 0, false, options(Some(command), Some(400)))
-                .is_some(),
+                .is_none(),
             "{command}"
         );
     }
@@ -1088,16 +1458,41 @@ fn source_reads_get_room_without_expanding_noisy_command_defaults() {
 }
 
 #[test]
-fn exit_one_means_no_matches_only_when_a_final_search_owns_the_exit_code() {
+fn oversized_rg_leads_with_complete_per_file_counts() {
+    let output = format!("{}{}notice\n",
+        "C:\\src\\a.rs:12:needle λ\n".repeat(400),
+        "src/b.py:3:needle\n".repeat(200));
+    let summary = summarize_shell_output_for_model(
+        &output, 1, false, options(Some("rg -n needle src; rg -n other src"), Some(500)),
+    ).unwrap();
+    assert!(summary.starts_with("rg output summary"));
+    assert!(summary.contains("600 hits across 2 files; 1 other lines"));
+    assert!(summary.contains(": 400") && summary.contains(": 200"));
+    assert!(summary.contains("not complete"));
+    assert!(codex_utils_string::approx_token_count(&summary) <= 500);
+    assert!(summarize_shell_output_for_model(
+        &output, 0, false, options(Some("cat fixture.txt"), Some(500)),
+    ).is_none());
+    assert!(summarize_shell_output_for_model(
+        "src/a.rs:1:needle\n", 0, false, options(Some("rg -n needle src"), Some(500)),
+    ).is_none());
+}
+
+#[test]
+fn exit_one_means_no_matches_only_for_a_single_search() {
     for command in [
         "rg -n foo src",
-        "Get-Content README.md -TotalCount 40; rg -n 'a|b' src",
-        "Get-ChildItem src\nrg.exe -n foo",
-        "Get-Content log.txt | findstr ERROR",
+        "rg.exe -n 'a|b' src",
     ] {
         assert!(super::ends_with_native_search(command), "{command}");
     }
     for command in [
+        "rg -n match src; rg -n missing src",
+        "Get-Content README.md -TotalCount 40; rg -n 'a|b' src",
+        "Get-ChildItem src\nrg.exe -n foo",
+        "Get-Content log.txt | findstr ERROR",
+        "set -o pipefail; false | rg pattern",
+        "false | rg pattern",
         "pnpm build && rg foo src",
         "rg foo src || echo none",
         "if ($ok) { rg foo src }",

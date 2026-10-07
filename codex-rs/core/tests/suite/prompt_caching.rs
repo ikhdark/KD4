@@ -245,9 +245,9 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         "write_stdin",
         "read_tool_output",
         "read_file",
+        "read_status",
         "list_files",
         "update_plan",
-        "context_checkpoint",
         "request_user_input",
         "request_permissions",
         "apply_patch",
@@ -531,11 +531,11 @@ async fn overrides_turn_context_preserve_history_and_update_cache_routing() -> a
     let request2 = req2.single_request();
     let body1 = request1.body_json();
     let body2 = request2.body_json();
-    // Permission changes alter the exposed tool schemas and their cache identity.
+    // Permission changes alter schemas without changing thread cache routing.
     assert_ne!(body1["tools"], body2["tools"]);
-    assert_ne!(
+    assert_eq!(
         body1["prompt_cache_key"], body2["prompt_cache_key"],
-        "different tool prefixes must use different cache routing keys"
+        "cache routing stays bound to the thread"
     );
 
     let first_permissions = message_texts(&body1, "developer")
@@ -552,13 +552,13 @@ async fn overrides_turn_context_preserve_history_and_update_cache_routing() -> a
         message_texts(&body2, "developer")
             .into_iter()
             .find(|text| text.starts_with("<permissions instructions>")),
-        Some(first_permissions)
+        Some(second_permissions)
     );
 
     let env_contexts = environment_contexts(&body2);
-    assert_eq!(env_contexts.len(), 2);
-    assert_eq!(env_contexts[0], environment_contexts(&body1)[0]);
-    let env_text = env_contexts[1];
+    assert_eq!(env_contexts.len(), 1);
+    assert_ne!(env_contexts[0], environment_contexts(&body1)[0]);
+    let env_text = env_contexts[0];
     assert_env_context_fragment(env_text);
     assert!(
         env_text.contains("<permission_profile type=\"managed\">")
@@ -819,11 +819,11 @@ async fn per_turn_overrides_preserve_history_and_update_cache_routing() -> anyho
     let body1 = request1.body_json();
     let body2 = request2.body_json();
 
-    // The model is part of the stable-prefix cache identity.
+    // Model changes retain the thread's cache routing identity.
     assert_ne!(body1["model"], body2["model"]);
-    assert_ne!(
+    assert_eq!(
         body1["prompt_cache_key"], body2["prompt_cache_key"],
-        "different models must use different cache routing keys"
+        "cache routing stays bound to the thread"
     );
 
     let first_permissions = message_texts(&body1, "developer")
@@ -840,7 +840,7 @@ async fn per_turn_overrides_preserve_history_and_update_cache_routing() -> anyho
         message_texts(&body2, "developer")
             .into_iter()
             .find(|text| text.starts_with("<permissions instructions>")),
-        Some(first_permissions)
+        Some(second_permissions)
     );
     assert!(
         request2.has_message_with_input_texts("developer", |texts| {
@@ -849,9 +849,9 @@ async fn per_turn_overrides_preserve_history_and_update_cache_routing() -> anyho
         "expected model switch section after model override"
     );
     let env_contexts = environment_contexts(&body2);
-    assert_eq!(env_contexts.len(), 2);
-    assert_eq!(env_contexts[0], environment_contexts(&body1)[0]);
-    let env_text = env_contexts[1];
+    assert_eq!(env_contexts.len(), 1);
+    assert_ne!(env_contexts[0], environment_contexts(&body1)[0]);
+    let env_text = env_contexts[0];
     let expected_cwd = new_cwd.path().display().to_string();
     assert_env_context_location(env_text, &expected_cwd);
     assert!(env_text.contains("<current_date>"));
@@ -1087,9 +1087,9 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
         "expected model switch section after model override"
     );
     let updated_env = environment_contexts(&body2);
-    assert_eq!(updated_env.len(), 2);
-    assert_eq!(updated_env[0], initial_env[0]);
-    let expected_env_update_text = updated_env[1];
+    assert_eq!(updated_env.len(), 1);
+    assert_ne!(updated_env[0], initial_env[0]);
+    let expected_env_update_text = updated_env[0];
     assert_env_context_fragment(expected_env_update_text);
     assert!(
         expected_env_update_text.contains(

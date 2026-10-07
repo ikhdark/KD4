@@ -41,6 +41,14 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                 panic!("nested function dispatch must preserve its payload kind");
             };
             let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+            if args["partial_selection"] == true {
+                return Ok(crate::tools::context::boxed_tool_output(
+                    codex_tools::JsonToolOutput::with_success(serde_json::json!({
+                        "complete":false, "results":[{"text":"EXACT_SIBLING"}],
+                        "selector_errors":[{"status":"invalid_selector"}]
+                    }), Some(false)).with_code_mode_failure_as_data(),
+                ));
+            }
             let process_exit_code = args["process_exit_code"]
                 .as_i64()
                 .or_else(|| (args["cmd"] == "fixture-exit-101").then_some(101));
@@ -48,6 +56,7 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
             if process_exit_code.is_some() || process_running {
                 return Ok(crate::tools::context::boxed_tool_output(
                     crate::tools::context::ExecCommandToolOutput {
+                        output_ranges: None,
                         process_output: None,
                         error: None,
                         validation: None,
@@ -83,6 +92,7 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                         changes_exact: true,
                         environment_id: Some("local".to_string()),
                         retry: None,
+                        diagnostics: Vec::new(),
                     },
                 ));
             }
@@ -123,7 +133,11 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
     }
 }
 
-impl crate::tools::registry::CoreToolRuntime for PacketTestTool {}
+impl crate::tools::registry::CoreToolRuntime for PacketTestTool {
+    fn command_argument_format(&self) -> Option<crate::tools::registry::CommandArgumentFormat> {
+        (self.name == "exec_command").then_some(crate::tools::registry::CommandArgumentFormat::Exec)
+    }
+}
 
 struct PacketRuntime {
     session: Arc<crate::session::session::Session>,
@@ -140,14 +154,16 @@ impl PacketRuntime {
     }
 
     async fn with_nested_tool(name: &'static str) -> Self {
+        Self::with_nested_runtime(Arc::new(PacketTestTool { name })).await
+    }
+
+    async fn with_nested_runtime(nested: Arc<dyn crate::tools::registry::CoreToolRuntime>) -> Self {
         let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
         session.services.code_mode_service = super::CodeModeService::new(Arc::new(
             codex_code_mode::InProcessCodeModeSessionProvider,
         ));
         turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeMode);
         let session = Arc::new(session);
-        let nested: Arc<dyn crate::tools::registry::CoreToolRuntime> =
-            Arc::new(PacketTestTool { name });
         let execute = super::execute_handler::CodeModeExecuteHandler::new(
             super::execute_spec::create_code_mode_tool(false, false, &[], &[]),
             vec![nested.spec()],
@@ -382,16 +398,14 @@ async fn exec_reports_omitted_nested_fallback_results() {
         let output = runtime.exec(&source).await;
         assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
         let visible = packet_output_text(output.as_ref());
-        assert_eq!(visible.matches("READ_RESULT_42").count(), 2, "{visible}");
+        let rows = visible.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).collect::<Vec<_>>();
+        assert_eq!(rows.iter().filter(|row| row.get("result").is_some() && row.get("tool_name").is_some()).count(), 2, "{visible}");
         if omitted > 0 {
-            assert!(
-                visible.contains(&format!(
-                    "{omitted} additional nested tool results were omitted"
-                )),
-                "{visible}"
-            );
+            let directory = rows.iter().find(|row| row.get("nested_result_recovery_directory").is_some()).expect("all settled results remain recoverable");
+            assert_eq!(directory["omitted_inline_result_count"], omitted);
+            assert_eq!(directory["nested_result_recovery_directory"].as_array().unwrap().len(), count);
         } else {
-            assert!(!visible.contains("results were omitted"), "{visible}");
+            assert!(!visible.contains("nested_result_recovery_directory"), "{visible}");
         }
     }
     let output = runtime
@@ -521,7 +535,7 @@ async fn cancelled_wait_retires_packet_created_by_real_nested_dispatch() {
     let runtime = PacketRuntime::new().await;
     let initial = runtime
         .exec(
-            "await tools.read_tool_output({}); await yield_control(); await new Promise(() => {});",
+            "await tools.read_tool_output({}); await yield_control(); await new Promise(resolve => setTimeout(resolve, 60_000));",
         )
         .await;
     assert_eq!(initial.outcome_for_logging(), ToolOutputOutcome::Yielded);
@@ -537,9 +551,9 @@ async fn cancelled_wait_retires_packet_created_by_real_nested_dispatch() {
             cancellation,
         )
         .await;
-    assert!(
-        matches!(result, Err(crate::FunctionCallError::RespondToModel(ref message)) if message == "wait cancelled")
-    );
+    let output = result.expect("cancelled wait returns the retained terminal packet");
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    assert!(output.log_preview().contains("Script terminated"));
     let service = &runtime.session.services.code_mode_service;
     assert!(service.packet_admission.lock().unwrap().cells.is_empty());
     assert_eq!(service.cell_parent_call_id(&cell), None);
@@ -664,6 +678,7 @@ async fn command_failure_remains_inspectable_without_another_cell() {
             &runtime.signals,
             &crate::session::turn_execution::SamplingRequestSettledState {
                 mutation_revision: 0,
+                attributed_mutation_revision: 0,
                 tool_exposure_revision: 0,
             },
             false,
@@ -711,6 +726,18 @@ async fn command_dispatch_errors_still_stop_dependent_work() {
     let visible = packet_output_text(output.as_ref());
     assert!(visible.contains("dispatch rejected"));
     assert!(!visible.contains("READ_RESULT_42"));
+    runtime.finish().await;
+}
+
+#[tokio::test]
+async fn partial_selection_data_survives_nested_dispatch() {
+    let runtime = PacketRuntime::new().await;
+    let output = runtime.exec(
+        "const r = await tools.read_tool_output({partial_selection:true}); \
+         if (r.complete || r.selector_errors.length !== 1) throw new Error('lost failure'); \
+         text(r.results[0].text);",
+    ).await;
+    assert!(packet_output_text(output.as_ref()).contains("EXACT_SIBLING"));
     runtime.finish().await;
 }
 
@@ -787,6 +814,7 @@ async fn nested_status_codes_remain_distinct_in_the_continuation_consumer() {
             &runtime.signals,
             &SamplingRequestSettledState {
                 mutation_revision: 0,
+                attributed_mutation_revision: 0,
                 tool_exposure_revision: 0,
             },
             false,
@@ -814,13 +842,16 @@ use super::MAX_FAILED_CELL_ERROR_BYTES;
 use super::bounded_serialized_json;
 use super::failed_code_mode_cell_item;
 use super::format_runtime_response;
+use super::nested_result_already_emitted;
 use super::response_needs_retained_nested_results;
 use super::retained_nested_output;
+use super::shows_session_handle;
 
 fn nested_result_evidence(output: &str) -> CodeModeNestedResultEvidence {
     CodeModeNestedResultEvidence {
         failed: false,
         command_state: None,
+        output_fingerprints: Vec::new(),
         ordinal: 0,
         call_id: "exec-cell-1-call-1".to_string(),
         parent_call_id: Some("outer-exec-call".to_string()),
@@ -878,6 +909,26 @@ fn failed_cell_error_is_bounded_without_splitting_utf8() {
     assert!(error.len() <= MAX_FAILED_CELL_ERROR_BYTES);
     assert!(error.ends_with(FAILED_CELL_ERROR_TRUNCATION_MARKER));
     assert!(!error.contains("TAIL_MUST_NOT_SURVIVE"));
+}
+
+#[test]
+fn cell_projection_preserves_running_yielded_and_successful_boundaries() {
+    let cell = CellId::new("cell-live-process".to_string());
+    for (response, state, success) in [
+        (RuntimeResponse::Yielded { cell_id: cell.clone(), content_items: Vec::new() }, "in_progress", None),
+        (RuntimeResponse::ExplicitYield { cell_id: cell.clone(), content_items: Vec::new() }, "yielded", None),
+        (RuntimeResponse::Result {
+            cell_id: cell, content_items: vec![RuntimeContentItem::InputText {
+                text: r#"{"session_id":42,"process_exited":false}"#.into(),
+            }], error_text: None, output_loss: None,
+        }, "completed", Some(true)),
+    ] {
+        let item = failed_code_mode_cell_item("exec-parent", &response, Duration::ZERO).unwrap();
+        assert_eq!(item.id, "code-mode-cell:cell-live-process");
+        assert_eq!(item.arguments["state"], state);
+        assert_eq!(item.success, success);
+        assert!(item.error.is_none());
+    }
 }
 
 #[test]
@@ -1093,6 +1144,8 @@ fn failed_script_keeps_successful_nested_result_and_linkage_visible() {
 
     assert!(!output.contains("Nested tool result:"));
     assert!(output.contains("COMMAND_SENTINEL"));
+    assert!(output.contains("exec-cell-1-call-1"));
+    assert!(output.contains("\"tool_name\":\"exec_command\""));
     assert!(!output.contains("parent_call_id"));
     assert!(!output.contains("parent_cell_id"));
     assert!(!output.contains("runtime_tool_call_id"));
@@ -1158,6 +1211,7 @@ fn failed_script_does_not_repeat_nested_results_it_already_printed() {
     });
     let retained = |tool: &str, value: &serde_json::Value| CodeModeNestedResultEvidence {
         tool_name: tool.to_string(),
+        output_fingerprints: super::nested_output_fingerprints(&codex_tools::ToolName::plain(tool), value),
         output: retained_nested_output(
             &codex_tools::ToolName::plain(tool),
             value,
@@ -1235,6 +1289,82 @@ fn empty_successful_script_projects_retained_nested_result() {
     .into_text();
 
     assert!(output.contains("NO_TEXT_SENTINEL"));
+}
+
+#[test]
+fn verified10_failed_siblings_keep_authoritative_identity_and_truncation() {
+    let first = nested_result_evidence("same shaped output");
+    let mut second = first.clone();
+    second.call_id = "second-call".into();
+    second.tool_name = "read_file".into();
+    second.output_truncated = true;
+    let output = format_runtime_response(RuntimeResponse::Result {
+        output_loss: None, cell_id: CellId::new("cell-1".into()), content_items: Vec::new(),
+        error_text: Some("exception".into()),
+    }, None, usize::MAX, true, Instant::now(), Vec::new(), vec![first, second], None);
+    let envelopes = output.body.iter().filter_map(|item| match item {
+        FunctionCallOutputContentItem::InputText { text } => serde_json::from_str::<serde_json::Value>(text).ok(),
+        _ => None,
+    }).filter(|value| value.get("call_id").is_some()).collect::<Vec<_>>();
+    assert_eq!(envelopes.len(), 2);
+    assert_eq!(envelopes[0]["call_id"], "exec-cell-1-call-1");
+    assert_eq!(envelopes[0]["output_truncated"], false);
+    assert_eq!(envelopes[1]["call_id"], "second-call");
+    assert_eq!(envelopes[1]["tool_name"], "read_file");
+    assert_eq!(envelopes[1]["output_truncated"], true);
+}
+
+#[test]
+fn verified_evidence_matching_ends_do_not_hide_an_unprinted_middle() {
+    let prefix = "shared wrapper ".repeat(30);
+    let suffix = "shared trailer ".repeat(30);
+    let first = format!("{prefix}actual: 7{suffix}");
+    let second = format!("{prefix}actual: 9{suffix}");
+    let retained = nested_result_evidence(&second);
+    assert!(!nested_result_already_emitted(&retained, &first));
+    assert!(!nested_result_already_emitted(&retained, &serde_json::json!({"output": first}).to_string()));
+    assert!(nested_result_already_emitted(&retained, &second));
+    assert!(nested_result_already_emitted(&retained, &serde_json::json!({"output": second}).to_string()));
+    let object = serde_json::json!({"diagnostic":"important middle error", "tail":"end"}).to_string();
+    let retained = nested_result_evidence(&object);
+    assert!(!nested_result_already_emitted(&retained, &object[1..]));
+    assert!(nested_result_already_emitted(&retained, &object));
+}
+
+#[test]
+fn verified_evidence_projection_preserves_batch_positions() {
+    let value = serde_json::json!({"results": [
+        {"payload": "a"}, {"payload": "b"}, {"payload": "c"}, {"payload": "d"},
+        {"status": "failed", "payload": "diagnostic"}
+    ]});
+    let projection = codex_tools::ToolOutputProjectionMetadata::from_json(&value, true, None).essential_inline;
+    assert_eq!(projection["results"], serde_json::json!([null, null, null, null, {"status":"failed"}]));
+    let nested = serde_json::json!({"results":["ordinary", [null, {"payload":1},
+        [{"payload":2}, {"status":"failed"}]], {"error":"last"}]});
+    let projection = codex_tools::ToolOutputProjectionMetadata::from_json(&nested, true, None).essential_inline;
+    assert_eq!(projection["results"], serde_json::json!([null, [null, null,
+        [null, {"status":"failed"}]], {"error":"last"}]));
+}
+
+#[test]
+fn verified_evidence_quoted_handles_do_not_replace_live_receipts() {
+    let state = serde_json::json!({"session_id":12, "execution_state":"running", "session_capabilities":{"polling":true}});
+    for visible in [r#"const example = {"session_id":12};"#.to_string(),
+        serde_json::json!({"source":state.to_string()}).to_string(),
+        "Historical example: Running command session_id: 12".into(),
+        serde_json::json!({"session_id":12}).to_string(),
+        serde_json::json!({"session_id":12, "execution_state":"exited", "session_capabilities":{"polling":true}}).to_string()] {
+        assert!(!shows_session_handle(&visible, &state), "{visible}");
+    }
+    assert!(shows_session_handle(&serde_json::json!({"results":[{"value":state.clone()}]}).to_string(), &state));
+}
+
+#[test]
+fn verified_evidence_large_state_remains_spillable_beside_cursor() {
+    let value = serde_json::json!({"state": {"status":"x".repeat(100_000)},
+        "action":"y".repeat(100_000), "application_id":["z".repeat(100_000)], "nextCursor":"page-2"});
+    let projection = codex_tools::ToolOutputProjectionMetadata::from_json(&value, true, None).essential_inline;
+    assert_eq!(projection, serde_json::json!({"nextCursor":"page-2"}));
 }
 
 #[test]
@@ -1319,14 +1449,14 @@ async fn terminated_packet_keeps_nested_results_and_omission_notice_after_printe
         let visible = output.into_text();
         assert!(visible.contains("Script terminated"));
         assert!(visible.contains("progress log"));
-        assert_eq!(
-            visible.matches("RETAINED_BEFORE_TERMINATION").count(),
-            count.min(2)
-        );
-        assert_eq!(
-            visible.contains("8 additional nested tool results were omitted"),
-            count == 10
-        );
+        let rows = visible.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).collect::<Vec<_>>();
+        assert_eq!(rows.iter().filter(|row| row.get("result").is_some() && row.get("tool_name").is_some()).count(), count.min(2));
+        let directory = rows.iter().find(|row| row.get("nested_result_recovery_directory").is_some());
+        assert_eq!(directory.is_some(), count == 10);
+        if let Some(directory) = directory {
+            assert_eq!(directory["omitted_inline_result_count"], 8);
+            assert_eq!(directory["nested_result_recovery_directory"].as_array().unwrap().len(), count);
+        }
     }
 }
 
@@ -1660,7 +1790,7 @@ async fn live_session_receipt_is_added_only_when_its_handle_is_not_visible() {
     };
     let service = &exec.session.services.code_mode_service;
     for (name, printed, receipts) in [
-        ("envelope", r#"{"session_id":12,"execution_state":"running"}"#, 0),
+        ("envelope", r#"{"session_id":12,"execution_state":"running","session_capabilities":{"polling":true}}"#, 0),
         ("output-only", "building", 1),
         ("longer-id", r#"{"session_id":123,"execution_state":"running"}"#, 1),
     ] {
@@ -1668,7 +1798,12 @@ async fn live_session_receipt_is_added_only_when_its_handle_is_not_visible() {
         service.record_cell_parent_call_id(&cell, &format!("outer-{name}"));
         let ordinal = service.begin_packet_call(&cell).unwrap();
         let mut result = nested_result_evidence("building");
-        result.command_state = Some(serde_json::json!({"session_id": 12, "process_exited": false}));
+        result.command_state = super::nested_command_state(
+            Some(&codex_tools::ToolName::plain("shell_command")), "forwarded",
+            &ToolPayload::Function { arguments: "{}".into() },
+            &serde_json::json!({"session_id": 12, "process_exited": false,
+                "execution_state": "running", "session_capabilities": {"polling": true}}),
+        );
         service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
         let output = super::handle_runtime_response(
             &exec,
@@ -1708,7 +1843,7 @@ async fn command_receipt_fixture(
     let ordinal = service.begin_packet_call(&cell).unwrap();
     let mut result = nested_result_evidence("output");
     result.command_state = super::nested_command_state(
-        &codex_tools::ToolName::plain("exec_command"), "command",
+        Some(&codex_tools::ToolName::plain("exec_command")), "command",
         &ToolPayload::Function { arguments: arguments.to_string() }, &raw,
     );
     service.complete_packet_call(&cell, ordinal, false, 0, Vec::new(), Some(result), None);
@@ -1744,7 +1879,12 @@ async fn recovery_audit_silent_exact_success_does_not_request_recovery() {
         let mut raw = raw.clone();
         raw["streams_complete"] = exact.into();
         let output = command_receipt_fixture(arguments, raw, "summary", error).await;
-        assert_eq!(super::code_mode_text_content(&output.body).contains("output_truncated"), expected);
+        let visible = super::code_mode_text_content(&output.body);
+        assert_eq!(visible.contains("nested_command_display_reduced"), expected);
+        assert!(!visible.contains("\"output_truncated\":true"));
+        if expected {
+            assert!(visible.contains(&format!("\"cumulative_streams_complete\":{exact}")));
+        }
         assert_eq!(output.essential_inline["nested_commands"][0]["raw_output_artifact_id"], "retained");
     }
 }
@@ -1755,6 +1895,7 @@ async fn recovery_audit_exited_but_undrained_process_keeps_handle() {
         let output = command_receipt_fixture(serde_json::json!({}), serde_json::json!({
             "process_exited": true, "exit_code": 0, "execution_state": "exited",
             "session_id": session_id, "output_complete": false,
+            "session_capabilities": {"incarnation": "exact-creation"},
         }), "last output", None).await;
         assert_eq!(super::code_mode_text_content(&output.body).contains("Running command session_id: 12"), expected);
         assert_eq!(output.essential_inline["nested_commands"][0].get("continuation").is_some(), expected);
@@ -1763,7 +1904,7 @@ async fn recovery_audit_exited_but_undrained_process_keeps_handle() {
 
 #[tokio::test]
 async fn fork91_live_fallback_preserves_capabilities_without_inventing_them() {
-    let capabilities = serde_json::json!({"stdin":false,"interrupt":false,"polling":true,"cancellation":true});
+    let capabilities = serde_json::json!({"stdin":false,"interrupt":false,"polling":true,"cancellation":true,"incarnation":"exact-creation"});
     for caps in [capabilities.clone(), serde_json::Value::Null] {
         let raw = serde_json::json!({
             "process_exited":false, "exit_code":null, "execution_state":"running",
@@ -1777,9 +1918,11 @@ async fn fork91_live_fallback_preserves_capabilities_without_inventing_them() {
             let receipt = visible.lines().find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).unwrap();
             assert_eq!(receipt["session_capabilities"], caps);
             assert_eq!(receipt["continuation"]["arguments"]["session_id"], 12);
+            assert_eq!(receipt["continuation"]["arguments"]["incarnation"], "exact-creation");
         }
         let output = command_receipt_fixture(serde_json::json!({}), raw.clone(), &raw.to_string(), None).await;
-        assert!(!super::code_mode_text_content(&output.body).contains("Running command session_id"));
+        assert_eq!(super::code_mode_text_content(&output.body).contains("Running command session_id"),
+            !caps.is_object(), "a numeric-only historical handle is not a usable capability");
     }
 }
 
@@ -1852,9 +1995,55 @@ async fn recovery_audit_bare_locator_does_not_hide_exact_selector() {
     }
 }
 #[tokio::test]
+async fn verified10_paginated_recovery_delivers_in_one_cell_without_erasing_failure() {
+    for failed_sibling in [false, true] {
+        let runtime = PacketRuntime::with_nested_runtime(Arc::new(
+            crate::tools::handlers::ReadToolOutputHandler,
+        )).await;
+        let raw = "λ exact source evidence\n".repeat(1000);
+        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+            &runtime.step.turn.config.codex_home, &runtime.session.thread_id.to_string(),
+            &codex_tools::CanonicalToolResult::text(raw.clone()),
+        ).await;
+        let source = format!(r#"// @exec: {{"deliver":true}}
+            const artifact_id = {};
+            if ({failed_sibling}) await tools.read_tool_output({{artifact_id, selectors:[{{kind:'lines',start:0,end:0}}]}});
+            let selector = {{kind:'bytes',start:0,end:{}}};
+            let parts = [], end = 0, pages = 0;
+            while (selector) {{
+                // A text-only consumer chooses pages aligned to these 25-byte lines.
+                // Arbitrary byte boundaries may correctly return data_base64 instead.
+                const r = await tools.read_tool_output({{artifact_id, selectors:[selector], max_bytes:4000}});
+                for (const row of r.results) {{
+                    if (row.status !== 'ok' || typeof row.text !== 'string') continue;
+                    if (row.canonical_range.start !== end) throw Error('noncontiguous recovery');
+                    parts.push(row.text); end = row.canonical_range.end;
+                }}
+                pages++;
+                if (pages > 64) throw Error('recovery did not progress');
+                if (r.complete) break;
+                selector = r.continuation_stop?.selector;
+                if (!selector) throw Error('missing continuation');
+            }}
+            if (parts.join('') !== {} || pages < 2) throw Error('incomplete evidence');
+            text('verified recovered selection');
+        "#, serde_json::to_string(&artifact.artifact_id().unwrap()).unwrap(), raw.len(), serde_json::to_string(&raw).unwrap());
+        let output = runtime.exec(&source).await;
+        let signal = output.sampling_request_signal().unwrap();
+        assert_eq!(signal.get("explicit_completion_message").and_then(serde_json::Value::as_str),
+            (!failed_sibling).then_some("verified recovered selection"), "{}", packet_output_text(output.as_ref()));
+        if failed_sibling {
+            assert!(serde_json::to_string(&output.to_response_item("exec", &ToolPayload::Custom { input: source }))
+                .unwrap().contains("nested_work_failed_or_incomplete"));
+        }
+        runtime.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn completion_audit_retained_intent_requires_authoritative_terminal_commands() {
     for scenario in ["complete", "empty-yield", "partial-yield", "input-changed",
-                     "schema-changed", "running", "unknown", "failed", "missing-exit", "deferred",
+                     "schema-changed", "running", "forwarded-shell", "unknown", "failed", "missing-exit", "deferred",
                      "no-match", "no-match-error", "invalid-no-match"] {
         let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         let service = &session.services.code_mode_service;
@@ -1866,6 +2055,14 @@ async fn completion_audit_retained_intent_requires_authoritative_terminal_comman
             "execution_state":"exited", "process_exited":true, "exit_code":0
         });
         match scenario {
+            "forwarded-shell" => {
+                command = super::nested_command_state(
+                    Some(&codex_tools::ToolName::plain("shell_command")), "forwarded-call",
+                    &ToolPayload::Function { arguments: "{}".into() },
+                    &serde_json::json!({"execution_state":"running", "process_exited":false,
+                        "session_id":12, "session_capabilities":{"polling":true}}),
+                ).expect("forwarded shell command state");
+            }
             "running" => { command["execution_state"] = "running".into(); command["process_exited"] = false.into(); }
             "unknown" => command["execution_state"] = "unknown".into(),
             "failed" => command["exit_code"] = 1.into(),
@@ -1888,7 +2085,9 @@ async fn completion_audit_retained_intent_requires_authoritative_terminal_comman
                     vec![RuntimeContentItem::InputText { text: "partial".into() }]
                 } else { Vec::new() },
             };
-            assert!(service.delivery_for_response(&cell, &turn, &yielded).is_none());
+            let refusal = service.delivery_for_response(&cell, &turn, &yielded).unwrap_err();
+            assert_eq!(refusal["category"], if scenario == "partial-yield" { "partial_output" } else { "cell_running" });
+            assert_eq!(refusal["cell_id"], cell.as_str());
             service.finish_packet(cell.as_str(), true);
         }
         let response = RuntimeResponse::Result {
@@ -1896,9 +2095,13 @@ async fn completion_audit_retained_intent_requires_authoritative_terminal_comman
             content_items: vec![RuntimeContentItem::InputText { text: "verified result".into() }],
             error_text: None, output_loss: None,
         };
-        assert_eq!(service.delivery_for_response(&cell, &turn, &response).as_deref(),
+        let decision = service.delivery_for_response(&cell, &turn, &response);
+        if !matches!(scenario, "complete" | "empty-yield" | "no-match" | "partial-yield") {
+            assert!(decision.as_ref().unwrap_err()["category"].is_string(), "{scenario}");
+        }
+        assert_eq!(decision.ok().flatten().as_deref(),
             matches!(scenario, "complete" | "empty-yield" | "no-match").then_some("verified result"), "{scenario}");
-        assert!(service.delivery_for_response(&cell, &turn, &response).is_none(), "intent is consumed once");
+        assert!(service.delivery_for_response(&cell, &turn, &response).unwrap().is_none(), "intent is consumed once");
         service.finish_cell_dispatch(&cell);
     }
 }

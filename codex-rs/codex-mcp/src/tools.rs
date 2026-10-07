@@ -152,108 +152,62 @@ pub(crate) fn normalize_tools_for_model_with_prefix<I>(
 where
     I: IntoIterator<Item = ToolInfo>,
 {
-    let mut seen_raw_names = HashSet::new();
-    let mut candidates = Vec::new();
+    let mut raw = std::collections::BTreeMap::<String, Option<ToolInfo>>::new();
     for tool in tools {
-        let raw_namespace_identity = format!(
-            "{}\0{}\0{}",
-            tool.server_name,
-            tool.callable_namespace,
-            tool.connector_id.as_deref().unwrap_or_default()
-        );
-        let raw_tool_identity = format!(
-            "{}\0{}\0{}",
-            raw_namespace_identity, tool.callable_name, tool.tool.name
-        );
-        if !seen_raw_names.insert(raw_tool_identity.clone()) {
-            warn!("skipping duplicated tool {}", tool.tool.name);
-            continue;
+        let identity = format!("{}\0{}\0{}\0{}\0{}", tool.server_name, tool.callable_namespace,
+            tool.connector_id.as_deref().unwrap_or_default(), tool.callable_name, tool.tool.name);
+        match raw.entry(identity) {
+            std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(Some(tool)); }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref().is_some_and(|previous| previous != &tool) {
+                    entry.insert(None);
+                }
+            }
         }
-
-        let callable_namespace = callable_namespace_with_prefix(
-            &sanitize_responses_api_tool_name(&tool.callable_namespace),
-            prefix_mcp_tool_names,
-        );
-
-        candidates.push(CallableToolCandidate {
-            callable_namespace,
-            callable_name: sanitize_responses_api_tool_name(&tool.callable_name),
-            raw_namespace_identity,
-            raw_tool_identity,
-            tool,
-        });
     }
-
-    let mut namespace_identities_by_base = HashMap::<String, HashSet<String>>::new();
-    for candidate in &candidates {
-        namespace_identities_by_base
-            .entry(candidate.callable_namespace.clone())
-            .or_default()
-            .insert(candidate.raw_namespace_identity.clone());
-    }
-    let colliding_namespaces = namespace_identities_by_base
-        .into_iter()
-        .filter_map(|(namespace, identities)| (identities.len() > 1).then_some(namespace))
-        .collect::<HashSet<_>>();
-    for candidate in &mut candidates {
-        if colliding_namespaces.contains(&candidate.callable_namespace) {
-            candidate.callable_namespace = append_namespace_hash_suffix(
-                &candidate.callable_namespace,
-                &candidate.raw_namespace_identity,
+    let mut candidates = Vec::new();
+    for (raw_tool_identity, tool) in raw {
+        let Some(mut tool) = tool else {
+            warn!(identity = ?raw_tool_identity, "quarantining conflicting MCP tool definitions");
+            continue;
+        };
+        let raw_namespace_identity = format!("{}\0{}\0{}", tool.server_name,
+            tool.callable_namespace, tool.connector_id.as_deref().unwrap_or_default());
+        let sanitized_namespace = sanitize_responses_api_tool_name(&tool.callable_namespace);
+        let mut namespace = callable_namespace_with_prefix(&sanitized_namespace, prefix_mcp_tool_names);
+        // Hash lossy identities even in singleton catalogs. Adding another
+        // connector must never change an existing callable name.
+        if sanitized_namespace != tool.callable_namespace
+            || tool.callable_namespace != tool.server_name
+            || tool.connector_id.is_some()
+        {
+            namespace = append_namespace_hash_suffix(&namespace, &raw_namespace_identity);
+        }
+        let mut name = sanitize_responses_api_tool_name(&tool.callable_name);
+        if name != tool.callable_name || tool.callable_name != tool.tool.name {
+            name = append_hash_suffix(&name, &raw_tool_identity);
+        }
+        if namespace.len() + name.len() + MCP_TOOL_NAME_DELIMITER.len() > MAX_TOOL_NAME_LENGTH {
+            (namespace, name) = fit_callable_parts_with_hash(
+                &namespace, &name, &raw_tool_identity, MCP_TOOL_NAME_DELIMITER.len(),
             );
         }
+        tool.callable_namespace = namespace;
+        tool.callable_name = name;
+        candidates.push(tool);
     }
-
-    let mut tool_identities_by_base = HashMap::<(String, String), HashSet<String>>::new();
-    for candidate in &candidates {
-        tool_identities_by_base
-            .entry((
-                candidate.callable_namespace.clone(),
-                candidate.callable_name.clone(),
-            ))
-            .or_default()
-            .insert(candidate.raw_tool_identity.clone());
+    // A native identifier can deliberately equal a generated alias. Quarantine
+    // the ambiguous identity instead of redirecting old code or reallocating it.
+    let mut counts = HashMap::<ToolName, usize>::new();
+    for tool in &candidates {
+        *counts.entry(tool.canonical_tool_name()).or_default() += 1;
     }
-    let colliding_tools = tool_identities_by_base
-        .into_iter()
-        .filter_map(|(key, identities)| (identities.len() > 1).then_some(key))
-        .collect::<HashSet<_>>();
-    for candidate in &mut candidates {
-        if colliding_tools.contains(&(
-            candidate.callable_namespace.clone(),
-            candidate.callable_name.clone(),
-        )) {
-            candidate.callable_name =
-                append_hash_suffix(&candidate.callable_name, &candidate.raw_tool_identity);
-        }
-    }
-
-    candidates.sort_by(|left, right| left.raw_tool_identity.cmp(&right.raw_tool_identity));
-
-    let mut used_names = HashSet::new();
-    let mut model_tools = Vec::new();
-    for mut candidate in candidates {
-        let (callable_namespace, callable_name) = unique_callable_parts(
-            &candidate.callable_namespace,
-            &candidate.callable_name,
-            &candidate.raw_tool_identity,
-            &mut used_names,
-            MCP_TOOL_NAME_DELIMITER.len(),
-        );
-        candidate.tool.callable_namespace = callable_namespace;
-        candidate.tool.callable_name = callable_name;
-        model_tools.push(candidate.tool);
-    }
-    model_tools
-}
-
-#[derive(Debug)]
-struct CallableToolCandidate {
-    tool: ToolInfo,
-    raw_namespace_identity: String,
-    raw_tool_identity: String,
-    callable_namespace: String,
-    callable_name: String,
+    candidates.retain(|tool| {
+        let valid = counts[&tool.canonical_tool_name()] == 1;
+        if !valid { warn!(name = %tool.canonical_tool_name(), "quarantining ambiguous MCP callable name"); }
+        valid
+    });
+    candidates
 }
 
 const MAX_TOOL_NAME_LENGTH: usize = 64;
@@ -362,33 +316,4 @@ fn fit_callable_parts_with_hash(
 
     let max_namespace_len = MAX_TOOL_NAME_LENGTH.saturating_sub(suffix.len() + reserved_len);
     (truncate_name(namespace, max_namespace_len), suffix)
-}
-
-fn unique_callable_parts(
-    namespace: &str,
-    tool_name: &str,
-    raw_identity: &str,
-    used_names: &mut HashSet<(String, String)>,
-    reserved_len: usize,
-) -> (String, String) {
-    if namespace.len() + tool_name.len() + reserved_len <= MAX_TOOL_NAME_LENGTH
-        && used_names.insert((namespace.to_string(), tool_name.to_string()))
-    {
-        return (namespace.to_string(), tool_name.to_string());
-    }
-
-    let mut attempt = 0_u32;
-    loop {
-        let hash_input = if attempt == 0 {
-            raw_identity.to_string()
-        } else {
-            format!("{raw_identity}\0{attempt}")
-        };
-        let (namespace, tool_name) =
-            fit_callable_parts_with_hash(namespace, tool_name, &hash_input, reserved_len);
-        if used_names.insert((namespace.clone(), tool_name.clone())) {
-            return (namespace, tool_name);
-        }
-        attempt = attempt.saturating_add(1);
-    }
 }

@@ -112,7 +112,8 @@ fn next_action(body: &Value, step: usize) -> Value {
             };
             assert_eq!(schema, payload(body, "step-1")["result"]);
             assert!(schema.to_string().contains("mirror"));
-            "const r=await tools.mcp__bench__mirror({message:'verified'}); if(r.content.length!==2) throw Error('raw MCP shape changed'); text({kind:'mcp',result:r});".to_owned()
+            let name = codex_tools::code_mode_name_for_tool_name(&codex_tools::ToolName::namespaced("mcp__bench", "mirror"));
+            format!("const r=await tools[{name:?}]({{message:'verified'}}); if(r.content.length!==2) throw Error('raw MCP shape changed'); text({{kind:'mcp',result:r}});")
         }
         4 => {
             let mcp = payload(body, "step-3");
@@ -136,7 +137,7 @@ fn next_action(body: &Value, step: usize) -> Value {
             let text = output_text(output(body, "step-4"));
             assert!(text.contains("ROW_0000"));
             assert!(!text.contains(ROW), "fixture must exercise actual recovery");
-            "const initial=load('command-result'); let r=initial; while(r.session_id && !r.process_exited) r=await tools.write_stdin({session_id:r.session_id,chars:''}); const recovered=await tools.read_tool_output({artifact_id:initial.raw_output_artifact_id,selectors:[{kind:'lines',start:501,end:501}]}); text({kind:'recovered',result:recovered,exited:r.process_exited,exit_code:r.exit_code});".to_owned()
+            "const initial=load('command-result'); let r=initial; while(r.session_id && !r.process_exited) r=await tools.write_stdin({session_id:r.session_id,incarnation:r.session_capabilities.incarnation,chars:''}); const recovered=await tools.read_tool_output({artifact_id:initial.raw_output_artifact_id,selectors:[{kind:'lines',start:501,end:501}]}); text({kind:'recovered',result:recovered,exited:r.process_exited,exit_code:r.exit_code});".to_owned()
         }
         6 => {
             let recovered = payload(body, "step-5");

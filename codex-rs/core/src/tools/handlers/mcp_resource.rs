@@ -408,6 +408,7 @@ impl ListResourcesPayload {
         truncation_policy: TruncationPolicy,
     ) -> Result<Self, FunctionCallError> {
         let total_resources = result.resources.len();
+        let errors = collection_page_errors(&server, result.meta.as_ref());
         let mut payload = Self {
             server: Some(server.clone()),
             resources: Vec::new(),
@@ -416,7 +417,7 @@ impl ListResourcesPayload {
             remaining_servers: Vec::new(),
             truncated: total_resources > 0,
             omitted_count: total_resources,
-            errors: Vec::new(),
+            errors,
             omitted_error_count: 0,
         };
 
@@ -529,6 +530,12 @@ struct McpResourceServerError {
     message: String,
 }
 
+fn collection_page_errors(server: &str, meta: Option<&rmcp::model::Meta>) -> Vec<McpResourceServerError> {
+    meta.and_then(|meta| meta.get("codex/collectionError")).and_then(Value::as_str)
+        .map(|message| McpResourceServerError { server: server.to_string(), message: message.to_string() })
+        .into_iter().collect()
+}
+
 impl From<McpServerCollectionError> for McpResourceServerError {
     fn from(error: McpServerCollectionError) -> Self {
         Self {
@@ -567,6 +574,7 @@ impl ListResourceTemplatesPayload {
         truncation_policy: TruncationPolicy,
     ) -> Result<Self, FunctionCallError> {
         let total_templates = result.resource_templates.len();
+        let errors = collection_page_errors(&server, result.meta.as_ref());
         let mut payload = Self {
             server: Some(server.clone()),
             resource_templates: Vec::new(),
@@ -575,7 +583,7 @@ impl ListResourceTemplatesPayload {
             remaining_servers: Vec::new(),
             truncated: total_templates > 0,
             omitted_count: total_templates,
-            errors: Vec::new(),
+            errors,
             omitted_error_count: 0,
         };
         ensure_payload_metadata_fits(&payload, truncation_policy)?;
@@ -1158,11 +1166,16 @@ fn canonical_single_list_resources(
         .iter()
         .map(|resource| serialize_value_with_server(server, resource))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(serde_json::json!({
+    let mut canonical = serde_json::json!({
         "server": server,
         "resources": resources,
         "nextCursor": result.next_cursor,
-    }))
+    });
+    let errors = collection_page_errors(server, result.meta.as_ref());
+    if !errors.is_empty() {
+        canonical["errors"] = serde_json::json!(errors);
+    }
+    Ok(canonical)
 }
 
 fn canonical_all_list_resources(
@@ -1205,11 +1218,16 @@ fn canonical_single_list_resource_templates(
         .iter()
         .map(|template| serialize_value_with_server(server, template))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(serde_json::json!({
+    let mut canonical = serde_json::json!({
         "server": server,
         "resourceTemplates": resource_templates,
         "nextCursor": result.next_cursor,
-    }))
+    });
+    let errors = collection_page_errors(server, result.meta.as_ref());
+    if !errors.is_empty() {
+        canonical["errors"] = serde_json::json!(errors);
+    }
+    Ok(canonical)
 }
 
 fn canonical_all_list_resource_templates(

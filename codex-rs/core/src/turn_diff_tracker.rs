@@ -24,6 +24,7 @@ const REGULAR_FILE_MODE: &str = "100644";
 // Normal edits finish well within 100 ms; pathological inputs fall back to a coarse,
 // content-exact diff without stalling tool completion.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const TURN_DIFF_LOCATOR: &str = "context:turn-diff";
 struct TrackedContent {
     content: String,
     mode: Option<String>,
@@ -115,15 +116,21 @@ impl From<bool> for CommandMutation {
 }
 
 /// Tracks the net text diff for the current turn from committed apply_patch
-/// mutations, without rereading the workspace filesystem.
+/// mutations. Unattributed changes recheck only these tracked paths.
 pub struct TurnDiffTracker {
     valid: bool,
     invalidation_reported: bool,
+    first_invalidation_cause: Option<serde_json::Value>,
     display_roots_by_environment: HashMap<String, PathBuf>,
     baseline_by_path: HashMap<TrackedPath, TrackedContent>,
     current_by_path: HashMap<TrackedPath, TrackedContent>,
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
     mutation_revision: u64,
+    attributed_mutation_revision: u64,
+    /// Exact patch effects since each validation baseline. Unknown effects
+    /// invalidate the proof without discarding the ordinary net diff.
+    validation_path_revisions: HashMap<TrackedPath, u64>,
+    validation_unknown_revision: u64,
     rendered_diffs: BTreeMap<(String, TrackedPath), String>,
     unavailable_paths: BTreeSet<TrackedPath>,
     display_keys: HashMap<TrackedPath, String>,
@@ -143,11 +150,15 @@ impl Default for TurnDiffTracker {
         Self {
             valid: true,
             invalidation_reported: false,
+            first_invalidation_cause: None,
             display_roots_by_environment: HashMap::new(),
             baseline_by_path: HashMap::new(),
             current_by_path: HashMap::new(),
             origin_by_current_path: HashMap::new(),
             mutation_revision: 0,
+            attributed_mutation_revision: 0,
+            validation_path_revisions: HashMap::new(),
+            validation_unknown_revision: 0,
             rendered_diffs: BTreeMap::new(),
             unavailable_paths: BTreeSet::new(),
             display_keys: HashMap::new(),
@@ -218,6 +229,7 @@ impl TurnDiffTracker {
     }
 
     pub fn track_delta(&mut self, environment_id: &str, delta: &AppliedPatchDelta) {
+        let previous_unknown_revision = self.validation_unknown_revision;
         if !delta.is_empty() {
             self.record_mutation();
         }
@@ -227,9 +239,15 @@ impl TurnDiffTracker {
         }
 
         if !delta.is_exact() {
+            self.record_invalidation_cause(serde_json::json!({
+                "tool": "apply_patch", "mutation_class": "inexact_patch_delta",
+                "environment_id": environment_id,
+            }));
             self.invalidate();
             return;
         }
+
+        self.validation_unknown_revision = previous_unknown_revision;
 
         let mut changed = HashSet::new();
         for change in delta.changes() {
@@ -242,6 +260,7 @@ impl TurnDiffTracker {
                 paths.push(TrackedPath::new(environment_id, path));
             }
             for path in &paths {
+                self.validation_path_revisions.insert(path.clone(), self.mutation_revision);
                 self.collect_diff_partners(path, &mut changed);
             }
             if paths.iter().any(|path| self.unavailable_paths.contains(path)) {
@@ -308,6 +327,9 @@ impl TurnDiffTracker {
     }
 
     pub fn invalidate(&mut self) {
+        self.record_invalidation_cause(serde_json::json!({
+            "mutation_class": "unknown_mutation",
+        }));
         self.valid = false;
         self.rendered_diffs.clear();
         self.aggregate_dirty = false;
@@ -317,6 +339,36 @@ impl TurnDiffTracker {
     pub(crate) fn record_unknown_mutation(&mut self) {
         self.record_mutation();
         self.invalidate();
+    }
+
+    pub(crate) fn record_invalidation_cause(&mut self, cause: serde_json::Value) {
+        self.first_invalidation_cause.get_or_insert(cause);
+    }
+
+    pub(crate) fn record_command_invalidation_cause(
+        &mut self,
+        call_id: Option<&str>,
+        tool: &str,
+        command: &[String],
+        mutation: &CommandMutation,
+    ) {
+        if self.first_invalidation_cause.is_some() {
+            return;
+        }
+        let mutation_class = match mutation {
+            CommandMutation::ReadOnly => return,
+            CommandMutation::KnownMutation { paths: Some(paths) } if paths.is_empty() => return,
+            CommandMutation::KnownMutation { .. } => "known_mutation",
+            CommandMutation::Uncertain => "uncertain",
+            CommandMutation::UnattributedWorkspaceChange => "unattributed_workspace_change",
+        };
+        let command_prefix: String = command.iter().enumerate().flat_map(|(index, arg)| {
+            (index != 0).then_some(' ').into_iter().chain(arg.chars())
+        }).take(240).collect();
+        self.record_invalidation_cause(serde_json::json!({
+            "call_id": call_id, "tool": tool, "mutation_class": mutation_class,
+            "command_prefix": command_prefix,
+        }));
     }
 
     #[cfg(test)]
@@ -341,7 +393,7 @@ impl TurnDiffTracker {
 
     pub(crate) fn record_exec_command_end_with_mutation_at(
         &mut self,
-        _command: &[String],
+        command: &[String],
         _exit_code: i32,
         _timed_out: bool,
         environment_id: &str,
@@ -351,9 +403,15 @@ impl TurnDiffTracker {
         // A command can write before failing or timing out, so every observed
         // mutation advances the generic turn revision. Known touched paths
         // lose exactness without discarding unrelated apply_patch diffs.
+        self.record_command_invalidation_cause(None, "shell", command, &mutation);
         match mutation {
             CommandMutation::KnownMutation { paths: Some(paths) } => {
-                self.record_mutation();
+                if paths.is_empty() {
+                    self.mutation_revision = self.mutation_revision.saturating_add(1);
+                    self.validation_unknown_revision = self.mutation_revision;
+                } else {
+                    self.record_mutation();
+                }
                 if !self.valid {
                     return;
                 }
@@ -389,17 +447,68 @@ impl TurnDiffTracker {
         }
     }
 
+    /// Narrow uncertain effects to mismatching patch paths. The caller holds
+    /// the tracker lock through observation and recording, so a concurrent
+    /// patch cannot install newer expected content midway through this check.
+    pub(crate) async fn reconcile_command_mutation(
+        &mut self,
+        environment_id: &str,
+        mutation: CommandMutation,
+        fs: Option<&dyn codex_exec_server::ExecutorFileSystem>,
+    ) -> CommandMutation {
+        if !self.valid || !matches!(mutation, CommandMutation::Uncertain | CommandMutation::UnattributedWorkspaceChange) {
+            return mutation;
+        }
+        let paths = self.baseline_by_path.keys().chain(self.current_by_path.keys())
+            .filter(|path| path.environment_id == environment_id)
+            .collect::<BTreeSet<_>>();
+        let mut mismatches = BTreeSet::new();
+        for path in paths {
+            let expected = self.current_by_path.get(path).map(|content| content.content.as_str());
+            let matches = if let (Some(fs), Ok(uri)) = (fs, codex_utils_path_uri::PathUri::from_host_native_path(&path.path)) {
+                let limit = expected.map_or(0, str::len);
+                match (expected, fs.read_file_bounded(&uri, limit, None).await) {
+                    (Some(expected), Ok(Some(actual))) => actual == expected.as_bytes(),
+                    (None, Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !matches {
+                mismatches.insert(path.path.clone());
+            }
+        }
+        // Even an empty mismatch set advances the workspace evidence revision;
+        // it does not turn an unattributed change into proof of a read-only call.
+        CommandMutation::KnownMutation { paths: Some(mismatches) }
+    }
+
     pub(crate) fn current_mutation_revision(&self) -> u64 {
         self.mutation_revision
+    }
+
+    pub(crate) fn validation_changes_since(&self, revision: u64) -> Option<Vec<(String, PathBuf)>> {
+        if !self.valid || self.validation_unknown_revision > revision || revision > self.mutation_revision {
+            return None;
+        }
+        Some(self.validation_path_revisions.iter()
+            .filter(|(_, changed_at)| **changed_at > revision)
+            .map(|(path, _)| (path.environment_id.clone(), path.path.clone())).collect())
+    }
+
+    pub(crate) fn attributed_mutation_revision(&self) -> u64 {
+        self.attributed_mutation_revision
     }
 
     /// Net changed paths, including both sides of renames. Never infer an empty
     /// change set from an invalidated diff.
     pub(crate) fn exact_changed_paths(&self) -> Option<Vec<(String, PathBuf)>> {
-        if !self.valid || !self.unavailable_paths.is_empty() {
+        if !self.valid {
             return None;
         }
         Some(self.baseline_by_path.keys().chain(self.current_by_path.keys())
+            .filter(|path| !self.unavailable_paths.contains(*path))
             .filter(|path| {
                 match (self.baseline_by_path.get(*path), self.current_by_path.get(*path)) {
                     (Some(before), Some(after)) =>
@@ -412,6 +521,25 @@ impl TurnDiffTracker {
             .collect::<BTreeSet<_>>().into_iter().collect())
     }
 
+    pub(crate) fn has_untracked_changes(&self) -> bool {
+        !self.valid || !self.unavailable_paths.is_empty()
+    }
+
+    /// Known patch paths remain useful for validation attribution even when
+    /// their exact diff is unavailable. This is not the entire workspace delta.
+    pub(crate) fn changed_paths(&self) -> Vec<(String, PathBuf)> {
+        self.baseline_by_path.keys().chain(self.current_by_path.keys())
+            .chain(self.unavailable_paths.iter())
+            .filter(|path| !self.valid || self.unavailable_paths.contains(*path)
+                || match (self.baseline_by_path.get(*path), self.current_by_path.get(*path)) {
+                    (Some(before), Some(after)) => before.content != after.content || before.mode != after.mode,
+                    (None, None) => false,
+                    _ => true,
+                })
+            .map(|path| (path.environment_id.clone(), path.path.clone()))
+            .collect::<BTreeSet<_>>().into_iter().collect()
+    }
+
     #[cfg(test)]
     pub fn get_unified_diff(&self) -> Option<String> {
         if self.aggregate_dirty {
@@ -419,6 +547,32 @@ impl TurnDiffTracker {
         } else {
             self.unified_diff.clone()
         }
+    }
+
+    /// An on-demand snapshot, not a workspace diff. Reuse rendered fragments
+    /// without consuming the client's change notification or reading files.
+    pub(crate) fn model_snapshot(&self) -> serde_json::Value {
+        let status = if !self.valid {
+            "unavailable"
+        } else if self.unavailable_paths.is_empty() {
+            "exact"
+        } else {
+            "partial"
+        };
+        let diff = self.valid.then(|| {
+            if self.aggregate_dirty { self.flatten_diff() } else { self.unified_diff.clone() }
+                .unwrap_or_default()
+        });
+        serde_json::json!({
+            "status": status,
+            "mutation_revision": self.mutation_revision,
+            "first_invalidation_cause": self.first_invalidation_cause,
+            "scope": "Current turn's tracked apply_patch text changes only; not a working-tree diff. Untracked or pre-existing changes are outside this scope. Recovery snapshots are historical, not freshness proof.",
+            "unified_diff": diff,
+            "unavailable_paths": self.unavailable_paths.iter().map(|path| serde_json::json!({
+                "environment_id": path.environment_id, "path": path.path,
+            })).collect::<Vec<_>>(),
+        })
     }
 
     /// Returns the latest aggregate only when it differs from the last value
@@ -438,18 +592,22 @@ impl TurnDiffTracker {
         Some(self.unified_diff.clone().unwrap_or_default())
     }
 
-    pub(crate) fn take_invalidation_warning(&mut self) -> Option<&'static str> {
+    pub(crate) fn take_invalidation_warning(&mut self) -> Option<String> {
         if (self.valid && self.unavailable_paths.is_empty()) || self.invalidation_reported {
             return None;
         }
         self.invalidation_reported = true;
-        Some(
-            "The turn diff is unavailable because command effects or workspace changes could not be tracked exactly. Do not claim that no files changed without fresh workspace verification.",
-        )
+        let status = if self.valid { "partial" } else { "unavailable" };
+        Some(format!(
+            "The turn diff is {status} because command effects or workspace changes could not be tracked exactly. First cause: {}. Do not claim that no files changed without fresh workspace verification.",
+            self.first_invalidation_cause.as_ref().unwrap_or(&serde_json::Value::Null),
+        ))
     }
 
     fn record_mutation(&mut self) {
         self.mutation_revision = self.mutation_revision.saturating_add(1);
+        self.validation_unknown_revision = self.mutation_revision;
+        self.attributed_mutation_revision = self.attributed_mutation_revision.saturating_add(1);
     }
 
     fn collect_diff_partners(&self, path: &TrackedPath, changed: &mut HashSet<TrackedPath>) {
@@ -1158,240 +1316,36 @@ fn is_direct_file_read_command(command: &[String], unwrapped: &[String]) -> bool
 }
 
 fn is_read_only_powershell_command(command: &[String]) -> bool {
-    let Some(program) = command.first().map(|token| command_basename(token)) else {
-        return false;
-    };
-    if !matches!(program.to_ascii_lowercase().as_str(), "powershell" | "pwsh") {
-        return false;
-    }
-    let Some(command_position) = command
-        .iter()
-        .position(|token| matches!(token.to_ascii_lowercase().as_str(), "-command" | "-c"))
-    else {
-        return false;
-    };
-    let script = command[command_position.saturating_add(1)..].join(" ");
-    let Some(script) = powershell_literal_syntax_mask(&script) else {
-        return false;
-    };
-    if script.trim().is_empty()
-        || script.contains(['>', '<', '`', '&'])
-        || script.contains("$(")
-        || script.contains("::")
-    {
-        return false;
-    }
-
-    script
-        .split([';', '|', '\n', '\r'])
-        .filter(|segment| !segment.trim().is_empty())
-        .all(powershell_segment_is_read_only)
+    // The safety check and this consumer share the cached native AST parse.
+    // Never reinterpret quoted source with a second shell tokenizer.
+    codex_shell_command::powershell::parse_powershell_command_into_plain_commands(command)
+        .is_some_and(|commands| !commands.is_empty() && commands.iter().all(|argv| {
+            let Some(program) = argv.first().map(|word| word.to_ascii_lowercase()) else { return false; };
+            if matches!(program.as_str(), "get-command" | "gcm") { return false; }
+            codex_shell_command::is_safe_command::is_safe_powershell_words(argv)
+                || matches!(program.as_str(),
+                    "compare-object" | "convertfrom-json" | "convertto-json"
+                    | "format-list" | "fl" | "format-table" | "ft"
+                    | "get-date" | "get-member" | "get-variable" | "get-filehash"
+                    | "get-process" | "join-path" | "out-string" | "out-null"
+                    | "sort-object" | "group-object" | "split-path"
+                    | "write-information" | "write-verbose" | "write-warning"
+                    | "where-object" | "where" | "?")
+                // The AST parser admits only pure script blocks and removes
+                // them from semantic argv. Member-invocation forms stay opaque.
+                || (matches!(program.as_str(), "foreach-object" | "%") && argv.len() == 1)
+                || !looks_like_mutating_command(argv)
+        }))
 }
-
-// Keep the existing conservative command classifier, but do not interpret
-// literal regex/path characters as redirects, pipelines, or statement breaks.
-// Expansion and unfamiliar syntax remain uncertain, not evidence of a read.
-fn powershell_literal_syntax_mask(script: &str) -> Option<String> {
-    if script.contains(['\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}']) {
-        return None;
-    }
-    let mut quote = None;
-    let mut masked = String::with_capacity(script.len());
-    let mut chars = script.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '`' || (quote == Some('"') && ch == '$') {
-            return None;
-        }
-        if let Some(delimiter) = quote {
-            if ch == delimiter {
-                if delimiter == '\'' && chars.peek() == Some(&'\'') {
-                    masked.push_str("''");
-                    chars.next();
-                    continue;
-                }
-                quote = None;
-            }
-            masked.push(
-                if matches!(ch, '>' | '<' | '&' | ';' | '|' | '{' | '}' | '\n' | '\r') {
-                    'x'
-                } else {
-                    ch
-                },
-            );
-        } else {
-            if ch == '#' || (ch == '@' && matches!(chars.peek(), Some('\'' | '"'))) {
-                return None;
-            }
-            if matches!(ch, '\'' | '"') {
-                quote = Some(ch);
-            }
-            masked.push(ch);
-        }
-    }
-    quote.is_none().then_some(masked)
-}
-
-fn powershell_segment_is_read_only(segment: &str) -> bool {
-    let segment = segment
-        .trim()
-        .trim_matches(|ch| matches!(ch, '{' | '}'))
-        .trim();
-    if segment.is_empty() {
-        return true;
-    }
-    if let Some((header, body)) = segment.split_once('{') {
-        return powershell_control_header_is_read_only(header)
-            && powershell_segment_is_read_only(body);
-    }
-    let compact = segment
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if matches!(
-        compact.as_str(),
-        "$erroractionpreference='stop'" | "$erroractionpreference=\"stop\""
-    ) {
-        return true;
-    }
-
-    if segment.starts_with('$') {
-        let Some((binding, expression)) = segment.split_once('=') else {
-            // Indexing, slicing, and emitting already-populated variables are
-            // process-local reads. File and process invocation syntax is rejected above.
-            return powershell_variable_expression_is_read_only(segment);
-        };
-        if !powershell_local_variable_binding_is_read_only(binding) {
-            return false;
-        }
-        let expression = expression.trim();
-        if expression.is_empty() {
-            return false;
-        }
-        if expression.starts_with(['\'', '"'])
-            || expression
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_digit() || ch == '-')
-        {
-            return true;
-        }
-        if expression.starts_with('$') {
-            return powershell_variable_expression_is_read_only(expression);
-        }
-        if expression.starts_with("@(") && expression.ends_with(')') {
-            return expression.chars().all(|ch| {
-                ch.is_ascii_digit()
-                    || ch.is_whitespace()
-                    || matches!(
-                        ch,
-                        '@' | '$' | '(' | ')' | '[' | ']' | ',' | '.' | '-' | '\'' | '"'
-                    )
-            });
-        }
-        if expression.starts_with('(') && expression.ends_with(')') {
-            return powershell_invocation_is_read_only(&expression[1..expression.len() - 1]);
-        }
-        return powershell_invocation_is_read_only(expression);
-    }
-
-    if matches!(
-        segment
-            .split_ascii_whitespace()
-            .next()
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("else" | "exit")
-    ) {
-        return true;
-    }
-    powershell_invocation_is_read_only(segment)
-}
-
-fn powershell_local_variable_binding_is_read_only(binding: &str) -> bool {
-    let Some(name) = binding.trim().strip_prefix('$') else {
-        return false;
-    };
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-fn powershell_variable_expression_is_read_only(expression: &str) -> bool {
-    let expression = expression.trim();
-    expression.starts_with('$')
-        && !expression.contains('(')
-        && expression.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || byte.is_ascii_whitespace()
-                || matches!(byte, b'$' | b'_' | b':' | b'.' | b'[' | b']' | b'-')
-        })
-}
-
-fn powershell_control_header_is_read_only(header: &str) -> bool {
-    let header = header.trim();
-    let Some(inner) = header
-        .strip_prefix("foreach")
-        .or_else(|| header.strip_prefix("ForEach"))
-        .map(str::trim)
-        .and_then(|value| value.strip_prefix('('))
-        .and_then(|value| value.strip_suffix(')'))
-    else {
-        return false;
-    };
-    let Some((binding, collection)) = inner.split_once(" in ") else {
-        return false;
-    };
-    binding.trim().starts_with('$')
-        && powershell_segment_is_read_only(&format!("$collection = {}", collection.trim()))
-}
-
-fn powershell_invocation_is_read_only(invocation: &str) -> bool {
-    let normalized = normalized_command_tokens(&[invocation.to_string()]);
-    let Some(program) = normalized.first().map(|token| command_basename(token)) else {
-        return false;
-    };
-    if matches!(
-        program,
-        "compare-object"
-            | "convertfrom-json"
-            | "convertto-json"
-            | "format-list"
-            | "format-table"
-            | "get-childitem"
-            | "get-command"
-            | "get-content"
-            | "get-date"
-            | "get-item"
-            | "get-location"
-            | "get-member"
-            | "get-variable"
-            | "join-path"
-            | "measure-object"
-            | "out-string"
-            | "resolve-path"
-            | "select-object"
-            | "select-string"
-            | "sort-object"
-            | "split-path"
-            | "test-path"
-            | "write-host"
-            | "write-information"
-            | "write-output"
-            | "write-verbose"
-            | "write-warning"
-    ) {
-        return true;
-    }
-    if let Some(subcommand) = git_subcommand(&normalized) {
-        return is_read_only_git_subcommand(subcommand);
-    }
-    codex_shell_command::is_safe_command::is_known_safe_command(&normalized)
-}
-
 pub(crate) fn command_may_mutate(command: &[String]) -> bool {
     command_mutation(command, None).may_have_mutated()
+}
+
+pub(crate) fn script_is_read_only(script: &str) -> bool {
+    let bash = ["bash".to_string(), "-lc".to_string(), script.to_string()];
+    if command_mutation(&bash, None) == CommandMutation::ReadOnly { return true; }
+    let powershell = ["pwsh".to_string(), "-NoProfile".to_string(), "-Command".to_string(), script.to_string()];
+    command_mutation(&powershell, None) == CommandMutation::ReadOnly
 }
 
 pub(crate) fn command_mutation(command: &[String], cwd: Option<&Path>) -> CommandMutation {

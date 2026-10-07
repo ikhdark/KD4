@@ -68,8 +68,12 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
             // Legacy assistant events lack IDs; keep their canonical item for output recovery.
             // Other legacy items are retained only when they lack a raw/legacy equivalent.
             matches!(history_mode, ThreadHistoryMode::Paginated)
-                || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_) | TurnItem::AgentMessage(_))
+                || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_) | TurnItem::AgentMessage(_) | TurnItem::CommandExecution(_))
+                || matches!(&event.item, TurnItem::DynamicToolCall(item)
+                    if item.namespace.as_deref() == Some("codex.internal") && item.tool == "code_mode_cell")
         }
+        EventMsg::ItemStarted(event) => matches!(&event.item, TurnItem::DynamicToolCall(item)
+            if item.namespace.as_deref() == Some("codex.internal") && item.tool == "code_mode_cell"),
         EventMsg::TokenCount(_)
         | EventMsg::PlanUpdate(_)
         | EventMsg::ThreadGoalUpdated(_)
@@ -104,6 +108,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::SubAgentActivity(_) => matches!(history_mode, ThreadHistoryMode::Legacy),
 
         // Transient, non-durable events.
+        EventMsg::TurnPhaseChanged(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::ViewImageToolCall(_)
         | EventMsg::CollabAgentSpawnEnd(_)
@@ -136,7 +141,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::WebSearchBegin(_)
         | EventMsg::ShutdownComplete
         | EventMsg::DeprecationNotice(_)
-        | EventMsg::ItemStarted(_)
         | EventMsg::AgentMessageContentDelta(_)
         | EventMsg::PlanDelta(_)
         | EventMsg::ReasoningContentDelta(_)
@@ -201,6 +205,8 @@ mod tests {
             RolloutItem::EventMsg(EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
                 call_id: "call-1".to_string(),
                 message: "halfway".to_string(),
+                progress: Some(1.0),
+                total: Some(2.0),
             })),
         );
 
@@ -272,6 +278,8 @@ mod tests {
         let event = EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
             call_id: "call-1".to_string(),
             message: "halfway".to_string(),
+            progress: Some(1.0),
+            total: Some(2.0),
         });
         for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
             assert!(!should_persist_event_msg(&event, history_mode));

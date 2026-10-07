@@ -66,6 +66,11 @@ _DERIVED_UNITS = {
     "inputTokens": "tokens",
     "cachedInputTokens": "tokens",
     "uncachedInputTokens": "tokens",
+    "visibleOutputTokens": "tokens",
+    "reasoningTokens": "tokens",
+    "outputTokens": "tokens",
+    "totalTokens": "tokens",
+    "physicalRequests": "count",
     "failedCommands": "count",
     "duplicateToolRequests": "count",
     "redundantToolRequests": "count",
@@ -171,6 +176,114 @@ def tool_observation(name: str, arguments: str, output: str) -> dict[str, Any]:
         "checkpoint": tool == "context_checkpoint",
         "checkpointUseful": checkpoint_useful,
     }
+
+
+class SubscriptionUsage:
+    """Fold persisted account-limit observations, not inferred token costs."""
+
+    def __init__(self) -> None:
+        self.counts = dict.fromkeys(
+            ("tokenCountEvents", "rateLimitSnapshots", "missingRateLimitSnapshots",
+             "invalidRateLimitSnapshots", "missingWindows", "invalidWindows"), 0
+        )
+        self.windows: dict[tuple, dict[str, Any]] = {}
+
+    def observe(self, file: str, timestamp_ns: int | None, snapshot: Any) -> None:
+        self.counts["tokenCountEvents"] += 1
+        if snapshot is None:
+            self.counts["missingRateLimitSnapshots"] += 1
+            return
+        if not isinstance(snapshot, dict) or any(
+            snapshot.get(key) is not None and not isinstance(snapshot[key], str)
+            for key in ("limit_id", "plan_type")
+        ):
+            self.counts["invalidRateLimitSnapshots"] += 1
+            return
+        self.counts["rateLimitSnapshots"] += 1
+        for name in ("primary", "secondary"):
+            window = snapshot.get(name)
+            if window is None:
+                self.counts["missingWindows"] += 1
+                continue
+            if not isinstance(window, dict):
+                self.counts["invalidWindows"] += 1
+                continue
+            used = window.get("used_percent")
+            minutes, reset = window.get("window_minutes"), window.get("resets_at")
+            if not _number(used) or used > 100 or any(
+                value is not None and (type(value) is not int or not 0 < value < 2**63)
+                for value in (minutes, reset)
+            ):
+                self.counts["invalidWindows"] += 1
+                continue
+            # Never subtract across files, plans, buckets, or reset boundaries.
+            key = (file, snapshot.get("limit_id"), snapshot.get("plan_type"),
+                   name, minutes, reset)
+            timestamp_ms = timestamp_ns // 1_000_000 if timestamp_ns is not None else None
+            row = self.windows.setdefault(key, {
+                "file": file,
+                "limitId": snapshot.get("limit_id"),
+                "planType": snapshot.get("plan_type"),
+                "window": name,
+                "windowMinutes": minutes,
+                "resetsAt": reset,
+                "samples": 0,
+                "firstObservedAtUnixMs": timestamp_ms,
+                "lastObservedAtUnixMs": timestamp_ms,
+                "firstUsedPercent": used,
+                "lastUsedPercent": used,
+                "peakUsedPercent": used,
+                "_invalidTime": False,
+                "_decreased": False,
+            })
+            previous_ms = row["lastObservedAtUnixMs"]
+            row["_invalidTime"] |= (
+                timestamp_ms is None or previous_ms is None
+                or timestamp_ms < previous_ms
+                or (reset is not None and timestamp_ms >= reset * 1000)
+            )
+            row["_decreased"] |= used < row["lastUsedPercent"]
+            row["samples"] += 1
+            row["lastObservedAtUnixMs"] = timestamp_ms
+            row["lastUsedPercent"] = used
+            row["peakUsedPercent"] = max(row["peakUsedPercent"], used)
+
+    def report(self, parse_errors: int = 0) -> dict[str, Any]:
+        windows = []
+        for row in self.windows.values():
+            reason = (
+                "incomplete_session_coverage" if parse_errors
+                else "insufficient_snapshots" if row["samples"] < 2
+                else "window_identity_unavailable"
+                if row["windowMinutes"] is None or row["resetsAt"] is None
+                else "invalid_out_of_order_or_expired_timestamp" if row["_invalidTime"]
+                else "usage_decreased_within_window" if row["_decreased"]
+                else None
+            )
+            windows.append({
+                **{key: value for key, value in row.items() if not key.startswith("_")},
+                "lastRemainingPercent": 100 - row["lastUsedPercent"],
+                "observedChangePercentagePoints": (
+                    row["lastUsedPercent"] - row["firstUsedPercent"] if reason is None else None
+                ),
+                "changeUnavailableReason": reason,
+            })
+        return {
+            "schemaVersion": 1,
+            "available": bool(windows),
+            "measurementNote": (
+                "Persisted account-level subscription-limit snapshots, including active turns; "
+                "not usage attributable to this session, billable tokens, or monetary cost. "
+                "Other sessions can consume the same quota. Samples may repeat cached state "
+                "and are not request counts. Percentages describe the last observation, not "
+                "live remaining quota. Changes compare observed endpoints only within one "
+                "file/plan/limit/window/reset; no cross-window or cross-session total is inferred."
+            ),
+            **self.counts,
+            "parseErrorCount": parse_errors,
+            "windowCount": len(windows),
+            "windows": windows,
+        }
 
 
 def _distribution(values: list[int | float], unit: str, turns: int) -> dict[str, Any]:
@@ -309,6 +422,11 @@ def _turn_metrics(record: dict, turn: dict, coverage: dict, annotation: dict) ->
         ("inputTokens", "inputTokens"),
         ("cachedInputTokens", "cachedInputTokens"),
         ("uncachedInputTokens", "nonCachedInputTokens"),
+        ("visibleOutputTokens", "visibleOutputTokens"),
+        ("reasoningTokens", "reasoningTokens"),
+        ("outputTokens", "outputTokens"),
+        ("totalTokens", "totalTokens"),
+        ("physicalRequests", "physicalAttempts"),
     ):
         if tokens.get("complete") is True and _number(tokens.get(field)):
             metrics[name] = tokens[field]
@@ -401,6 +519,145 @@ def _turn_metrics(record: dict, turn: dict, coverage: dict, annotation: dict) ->
     }
 
 
+def _usage_efficiency(records: list[dict], reports: dict, measured: dict) -> dict:
+    """Reuse reconciled provider accounting; never price cached tokens or quota."""
+    component_names = (
+        "uncachedInputTokens", "cachedInputTokens", "visibleOutputTokens", "reasoningTokens",
+    )
+    rows = []
+    purposes = collections.defaultdict(list)
+    for record in records:
+        turn_id = record["turn_id"]
+        turn = reports.get(turn_id, {})
+        metrics = measured[turn_id]["metrics"]
+        tokens = turn.get("tokens", {})
+        complete = turn.get("requestRetention", {}).get("complete") is True and all(
+            metrics[name] is not None for name in (*component_names, "totalTokens")
+        )
+        categories = tokens.get("promptCategories") or {}
+        avoided = record["timing"].get("counters", {}).get("provenAvoidedModelRequests")
+        if type(avoided) is not int or not 0 <= avoided < 2**32 - 1 or record["timing"].get("counters", {}).get("saturationCount"):
+            avoided = None
+        row = {
+            "turnId": turn_id,
+            "file": record.get("file"),
+            "status": record["status"],
+            "providerUsageComplete": complete,
+            "components": {name: metrics[name] for name in component_names},
+            "totalTokens": metrics["totalTokens"],
+            "physicalRequests": metrics["physicalRequests"],
+            "cacheHitRatio": metrics["cachedInputTokens"] / metrics["inputTokens"]
+            if complete and metrics["inputTokens"] else None,
+            "reasoningOutputRatio": metrics["reasoningTokens"] / metrics["outputTokens"]
+            if complete and metrics["outputTokens"] else None,
+            "inputTokensPerRequest": metrics["inputTokens"] / metrics["physicalRequests"]
+            if complete and metrics["physicalRequests"] else None,
+            "provenAvoidedModelRequests": avoided,
+            "savedTokens": None,
+            "savedSubscriptionPercentagePoints": None,
+            "promptEstimates": {
+                "coverage": tokens.get("promptCategoryCoverage"),
+                "logicalPromptTokens": categories.get("logicalTotal"),
+                "repeatedUnchangedContextTokens": categories.get("repeatedUnchangedContext"),
+                "rankedCategories": tokens.get("rankedPromptConsumers", []),
+            },
+        }
+        rows.append(row)
+        measured[turn_id]["usageEfficiency"] = row
+        # Existing intervals already merge retries and deduplicate sampling IDs.
+        # Only partition when every interval reconciles with the whole-turn total.
+        intervals = turn.get("tokenIntervals", [])
+        partition_complete = complete and bool(intervals) and all(
+            item.get("tokens", {}).get("complete") is True for item in intervals
+        ) and all(
+            sum(item["tokens"].get(field, 0) for item in intervals) == tokens.get(field)
+            for field in ("inputTokens", "cachedInputTokens", "visibleOutputTokens", "reasoningTokens", "physicalAttempts")
+        )
+        row["purposePartitionComplete"] = partition_complete
+        if partition_complete:
+            requests = record["timing"].get("modelRequests", [])
+            for item in intervals:
+                labels = {str(requests[index].get("generationPurpose") or "unknown")
+                          for index in item["requestIndexes"]}
+                purpose = next(iter(labels)) if len(labels) == 1 else "mixed"
+                purposes[purpose].append(item["tokens"])
+    complete_rows = [row for row in rows if row["providerUsageComplete"]]
+    component_totals = {
+        name: sum(row["components"][name] for row in complete_rows)
+        for name in component_names
+    }
+    observed_total = sum(component_totals.values())
+    ranked_turns = sorted(complete_rows, key=lambda row: (-row["totalTokens"], row["turnId"]))
+    # Each experiment is a hypothesis with concrete counters, not inferred waste.
+    specs = (
+        ("reduce_model_round_trips", ("generations", "physicalRequests", "waitOnlyGenerations", "samePurposeContinuations"),
+         "Batch independent work and drain deterministic waits without a model handoff.",
+         "Compare physical requests and provider input/output per matched task; use provenAvoidedModelRequests only for avoided handoff counts."),
+        ("reduce_recovery_and_rereads", ("artifactRecoveryCalls", "artifactRereads", "recoveryRetruncations", "truncationContinuationGenerations"),
+         "Use exact selectors and retained results; avoid re-fetching unchanged evidence.",
+         "Require fewer recovery generations and lower provider usage, with unchanged evidence coverage."),
+        ("reduce_tool_projection", ("toolOutputTokensProjected", "projectionTruncations"),
+         "Project decision-relevant results without dropping required evidence.",
+         "Compare subsequent provider input and request count; smaller output alone is not saved subscription usage."),
+        ("reduce_reasoning_or_response_volume", ("reasoningTokens", "visibleOutputTokens", "outputTokens"),
+         "Test shorter responses or a different reasoning setting one at a time.",
+         "Compare output/reasoning tokens on the same tasks and verify correctness; shorter reasoning is not automatically better."),
+        ("improve_cache_reuse", ("inputTokens", "cachedInputTokens", "uncachedInputTokens"),
+         "Test stable shared context and avoid unnecessary context churn.",
+         "Compare absolute cached and uncached input, not hit ratio alone; cache hits are observed reuse, not a known subscription discount."),
+        ("review_repeated_work", ("duplicateToolRequests", "nonprogressGenerations", "failedCommands"),
+         "Review duplicate requests and failures before removing work.",
+         "Confirm redundancy, then compare end-to-end usage and task outcome; nonprogress and duplicate counts are not proof of waste."),
+    )
+    experiments = []
+    for name, metrics, change, proof in specs:
+        evidence = {
+            metric: _distribution(
+                [row["metrics"][metric] for row in measured.values() if row["metrics"][metric] is not None],
+                (_METRICS[metric][0] if metric in _METRICS else _DERIVED_UNITS[metric]),
+                len(records),
+            ) for metric in metrics
+        }
+        experiments.append({"hypothesis": name, "evidence": evidence, "experiment": change,
+                            "verification": proof, "provenSavings": False})
+    return {
+        "schemaVersion": 1,
+        "measurementNote": (
+            "Provider token counts are measured consumption, not subscription weights or money. "
+            "Components partition input plus output: cached input is part of input and reasoning "
+            "is part of output. Prompt categories are local estimates and may repeat across requests. "
+            "Purpose labels describe activity, not waste; experiments overlap and their costs must "
+            "not be added. Avoided handoff counts do not reveal counterfactual token or quota savings. "
+            "Active turns are excluded; complete-turn totals below exclude unmeasured turns."
+        ),
+        "turns": len(rows),
+        "completeProviderTurns": len(complete_rows),
+        "unmeasuredProviderTurns": len(rows) - len(complete_rows),
+        "observedCompleteTurnTotalTokens": observed_total if complete_rows else None,
+        "rankedTokenComponents": [
+            {"component": name, "tokens": value, "share": value / observed_total if observed_total else None}
+            for name, value in sorted(component_totals.items(), key=lambda item: (-item[1], item[0]))
+        ] if complete_rows else [],
+        "purposePartitionTurns": sum(row["purposePartitionComplete"] for row in rows),
+        "costByPurpose": sorted([
+            {"purpose": purpose, "generationIntervals": len(items),
+             **{field: sum(item[field] for item in items) for field in (
+                 "inputTokens", "cachedInputTokens", "nonCachedInputTokens",
+                 "visibleOutputTokens", "reasoningTokens", "totalTokens", "physicalAttempts",
+             )}}
+            for purpose, items in purposes.items()
+        ], key=lambda row: (-row["totalTokens"], row["purpose"])),
+        "rankedTurns": ranked_turns[:10],
+        "omittedRankedTurns": max(0, len(ranked_turns) - 10),
+        "avoidedModelRequests": _distribution(
+            [row["provenAvoidedModelRequests"] for row in rows if row["provenAvoidedModelRequests"] is not None],
+            "count", len(rows),
+        ),
+        "experiments": experiments,
+        "subscriptionSavings": {"status": "unproven", "savedPercentagePoints": None},
+    }
+
+
 def build_diagnostics(
     records: list[dict[str, Any]],
     populations: dict[str, str],
@@ -465,6 +722,7 @@ def build_diagnostics(
     return {
         "schemaVersion": SCHEMA_VERSION,
         "measurementNote": _NOTE,
+        "usageEfficiency": _usage_efficiency(records, reports, measured),
         "coverageBlockers": {
             key: coverage[key] for key in _COVERAGE_BLOCKERS if coverage.get(key)
         },
@@ -612,6 +870,22 @@ def compare_diagnostics(
         "schemaVersion": SCHEMA_VERSION,
         "measurementNote": _NOTE,
         "minSamples": min_samples,
+        "usageSavingsAssessment": {
+            "status": "observational_only",
+            "subscriptionSavingsProven": False,
+            "measurementNote": (
+                "Token decreases are measured per-turn distribution changes, not causal savings. "
+                "Cohorts do not match task, model, reasoning effort, cache warmth or permissions. "
+                "Keep those fixed (except the tested variable), check quality and completion rate, "
+                "and compare isolated account quota windows before claiming subscription savings. "
+                "A lower cache-hit ratio or fewer cached tokens alone is not an improvement."
+            ),
+            "decreasedStatisticCounts": dict(collections.Counter(
+                row["metric"]
+                for row in rows if row["status"] == "decreased"
+                and row["metric"] in ("inputTokens", "uncachedInputTokens", "outputTokens", "reasoningTokens", "totalTokens", "physicalRequests")
+            )),
+        },
         "relativeThreshold": relative_threshold,
         "absoluteThresholds": dict(_THRESHOLDS),
         **{
@@ -694,10 +968,61 @@ def render_diagnostics(report: dict[str, Any]) -> list[str]:
     if diagnostics is None:
         return []
     lines = ["session diagnostics: " + diagnostics["measurementNote"]]
+    subscription = diagnostics.get("subscriptionUsage")
+    if subscription is not None:
+        lines.append("subscription usage: " + subscription["measurementNote"])
+        lines.append(
+            f"  snapshots={subscription['rateLimitSnapshots']} "
+            f"missing={subscription['missingRateLimitSnapshots']} "
+            f"invalid={subscription['invalidRateLimitSnapshots']} "
+            f"windows={subscription['windowCount']} "
+            f"missingWindows={subscription['missingWindows']} "
+            f"invalidWindows={subscription['invalidWindows']} "
+            f"parseErrors={subscription['parseErrorCount']}"
+        )
+        if not subscription["available"]:
+            lines.append("  subscription limits unavailable; not measured as zero")
+        for window in subscription["windows"][:8]:
+            change = window["observedChangePercentagePoints"]
+            change_text = (
+                f"{change:+g}pp" if change is not None
+                else "unavailable (" + window["changeUnavailableReason"] + ")"
+            )
+            lines.append(
+                f"  {window['file']} plan={window['planType']} limit={window['limitId']} "
+                f"{window['window']} ({window['windowMinutes']} min): "
+                f"last used={window['lastUsedPercent']:g}% "
+                f"remaining={window['lastRemainingPercent']:g}% "
+                f"peak={window['peakUsedPercent']:g}% "
+                f"observed change={change_text} resetsAt={window['resetsAt']}"
+            )
+        if len(subscription["windows"]) > 8:
+            lines.append("  additional subscription windows in JSON output")
     if diagnostics["coverageBlockers"]:
         lines.append(
             f"  comparison coverage blockers: {diagnostics['coverageBlockers']}"
         )
+    efficiency = diagnostics.get("usageEfficiency")
+    if efficiency is not None:
+        lines.append("usage efficiency: " + efficiency["measurementNote"])
+        lines.append(
+            f"  provider coverage: {efficiency['completeProviderTurns']}/{efficiency['turns']} turns; "
+            f"subscription savings: {efficiency['subscriptionSavings']['status']}"
+        )
+        for row in efficiency["rankedTokenComponents"]:
+            lines.append(f"  {row['component']}: {row['tokens']} tokens; share={row['share']}")
+        lines.append(f"  purpose partition coverage: {efficiency['purposePartitionTurns']}/{efficiency['turns']} turns")
+        for row in efficiency["costByPurpose"][:8]:
+            lines.append(f"  purpose={row['purpose']}: {row['totalTokens']} tokens; requests={row['physicalAttempts']}")
+        if len(efficiency["costByPurpose"]) > 8:
+            lines.append("  additional purposes in JSON output")
+        for row in efficiency["rankedTurns"]:
+            lines.append(f"  costly turn={row['turnId']} status={row['status']}: {row['totalTokens']} tokens; cacheHitRatio={row['cacheHitRatio']} reasoningOutputRatio={row['reasoningOutputRatio']}")
+        lines.append(f"  proven avoided handoffs: {efficiency['avoidedModelRequests']}; saved tokens/quota unknown")
+        for row in efficiency["experiments"]:
+            evidence = ", ".join(f"{name}={metric.get('total', 'unavailable')} (missing={metric['missing']})" for name, metric in row["evidence"].items())
+            lines.append(f"  investigate {row['hypothesis']}: {evidence}")
+            lines.append(f"    test: {row['experiment']} verify: {row['verification']}")
     for cohort in diagnostics["cohorts"][:8]:
         lines.append(
             f"  {cohort['population']}/{cohort['lifecycle']}/schema-{cohort['timingSchemaVersion']}: "
@@ -715,6 +1040,8 @@ def render_diagnostics(report: dict[str, Any]) -> list[str]:
         lines.append("  additional cohorts in JSON output")
     comparison = report.get("baselineComparison")
     if comparison is not None:
+        if "usageSavingsAssessment" in comparison:
+            lines.append("usage savings comparison: " + comparison["usageSavingsAssessment"]["measurementNote"])
         lines.append(
             f"baseline comparison (observational): {comparison['comparedStatistics']} "
             f"compared statistics; {comparison['statusCounts']}; "

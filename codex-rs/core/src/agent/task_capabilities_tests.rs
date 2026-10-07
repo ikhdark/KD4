@@ -167,11 +167,13 @@ fn independent_review_shell_policy_rejects_mutation_and_permission_overrides() {
     assert!(err.contains("without assignments or script blocks"));
     assert!(validate_independent_review_shell(&reviewer, true, true, false).is_err());
     assert!(validate_independent_review_shell(&reviewer, true, false, true).is_err());
-    assert!(validate_independent_review_stdin(&reviewer, "").is_ok());
-    assert!(validate_independent_review_stdin(&reviewer, "y\n").is_err());
+    assert!(validate_independent_review_stdin(&reviewer, "", false).is_ok());
+    assert!(validate_independent_review_stdin(&reviewer, "y\n", false).is_err());
+    assert!(validate_independent_review_stdin(&reviewer, "", true).is_err());
 
     assert!(validate_independent_review_shell(&SessionSource::Cli, false, true, true).is_ok());
-    assert!(validate_independent_review_stdin(&SessionSource::Cli, "y\n").is_ok());
+    assert!(validate_independent_review_stdin(&SessionSource::Cli, "y\n", false).is_ok());
+    assert!(validate_independent_review_stdin(&SessionSource::Cli, "", true).is_ok());
 }
 
 #[test]

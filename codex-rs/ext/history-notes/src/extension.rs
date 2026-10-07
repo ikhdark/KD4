@@ -118,13 +118,13 @@ impl ContextContributor for HistoryNotesExtension {
                 )
                 .await
             else {
-                return Vec::new();
+                return vec![PromptFragment::unavailable()];
             };
             let Some(text) = result.get("text").and_then(serde_json::Value::as_str) else {
-                return Vec::new();
+                return vec![PromptFragment::unavailable()];
             };
             if text.len() > MAX_THREAD_HINT_BYTES {
-                return Vec::new();
+                return vec![PromptFragment::unavailable()];
             }
             if text.trim().is_empty() {
                 return Vec::new();
@@ -261,12 +261,8 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            assert!(
-                contributor
-                    .contribute_thread_context(&session, &thread)
-                    .await
-                    .is_empty()
-            );
+            let fragments = contributor.contribute_thread_context(&session, &thread).await;
+            assert!(fragments.is_empty() || fragments.iter().all(PromptFragment::is_unavailable));
             server.verify().await;
         }
         server.reset().await;

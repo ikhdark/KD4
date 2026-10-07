@@ -74,8 +74,6 @@ use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
-use rmcp::model::Resource;
-use rmcp::model::ResourceTemplate;
 use serde_json::Value as JsonValue;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -92,6 +90,46 @@ const MCP_UI_MODEL_VISIBILITY: &str = "model";
 const MAX_MCP_SERVER_COLLECTION_ERROR_CHARS: usize = 240;
 const MAX_MCP_COLLECTION_PAGES: usize = 100;
 const MAX_MCP_COLLECTION_ITEMS: usize = 10_000;
+
+// An exhaustive collection returns a retained prefix with its retry cursor on
+// late failure. Metadata travels with the page so single-server callers cannot
+// accidentally drop the incomplete status when extracting a successful prefix.
+async fn collect_resource_pages<T, F, Fut>(budget: Duration, mut fetch: F)
+    -> Result<(Vec<T>, Option<String>, Option<rmcp::model::Meta>)>
+where
+    F: FnMut(Option<String>, Duration) -> Fut,
+    Fut: Future<Output = Result<(Vec<T>, Option<String>)>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = HashSet::new();
+    let mut completed_pages = 0;
+    let failure = loop {
+        if completed_pages == MAX_MCP_COLLECTION_PAGES { break "collection page limit reached".to_string(); }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() { break "collection deadline expired".to_string(); }
+        let page = tokio::time::timeout_at(deadline, fetch(cursor.clone(), remaining)).await;
+        let (page_items, next) = match page {
+            Ok(Ok(page)) => page,
+            Ok(Err(error)) => break sanitize_server_collection_error(error),
+            Err(_) => break "collection deadline expired".to_string(),
+        };
+        if items.len().saturating_add(page_items.len()) > MAX_MCP_COLLECTION_ITEMS {
+            break "collection item limit reached; retry the unconsumed page".to_string();
+        }
+        items.extend(page_items);
+        completed_pages += 1;
+        cursor = next;
+        let Some(next) = cursor.as_ref() else { return Ok((items, None, None)); };
+        if !seen.insert(next.clone()) { break "server returned a repeated continuation cursor".to_string(); }
+    };
+    if completed_pages == 0 { return Err(anyhow!(failure)); }
+    let message = format!("incomplete collection after {completed_pages} page(s): {failure}");
+    let mut meta = rmcp::model::Meta::new();
+    meta.insert("codex/collectionError".into(), JsonValue::String(message));
+    Ok((items, cursor, Some(meta)))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpServerCollectionError {
@@ -836,6 +874,37 @@ impl McpConnectionManager {
             .map(super::server::McpServerOrigin::as_str)
     }
 
+    /// Private authority inputs for approval hashing; never surface or log this
+    /// value because a configured transport can contain credentials. Unknown
+    /// account identities are scoped to the existing client incarnation.
+    pub fn approval_authority(&self, server: &str) -> Option<(serde_json::Value, bool)> {
+        let config = self.server_definitions.get(server)?.configured_config()?;
+        let client = self.clients.get(server)?;
+        let stable_account = matches!(config.auth, McpServerAuth::ChatGpt)
+            && self.client_reuse_context.codex_apps_tools_cache_key.account_id.is_some()
+            && matches!(&config.transport, McpServerTransportConfig::StreamableHttp {
+                bearer_token_env_var: None, env_http_headers: None, http_headers, ..
+            } if http_headers.as_ref().is_none_or(|headers|
+                headers.keys().all(|name| !name.eq_ignore_ascii_case("authorization"))))
+            && config.is_local_environment();
+        Some((serde_json::json!({
+            "transport": config.transport,
+            "environment": config.environment_id,
+            "auth": config.auth,
+            "oauth": config.oauth,
+            "oauth_resource": config.oauth_resource,
+            "account": self.client_reuse_context.codex_apps_tools_cache_key,
+            "connection": (!stable_account).then_some(client.approval_incarnation),
+        }), stable_account))
+    }
+
+    pub fn has_scoped_tool_approval(&self, server: &str, policy_key: &str) -> bool {
+        self.server_definitions.get(server)
+            .and_then(EffectiveMcpServer::configured_config)
+            .and_then(|config| config.tools.get(policy_key))
+            .and_then(|tool| tool.approval_mode) == Some(codex_config::AppToolApproval::Approve)
+    }
+
     pub fn server_environment_id(&self, server_name: &str) -> Option<&str> {
         self.server_metadata
             .get(server_name)
@@ -1118,7 +1187,7 @@ impl McpConnectionManager {
     pub async fn list_all_resources(
         &self,
         include_server: impl Fn(&str) -> bool,
-    ) -> McpServerCollection<Vec<Resource>> {
+    ) -> McpServerCollection<ListResourcesResult> {
         let mut join_set = JoinSet::new();
         let mut collection = McpServerCollection::default();
         let mut task_servers = HashMap::new();
@@ -1147,52 +1216,13 @@ impl McpConnectionManager {
                 if !managed_client.server_supports_resources_capability {
                     return (server_name, Ok(None));
                 }
-                let timeout = Some(managed_client.tool_timeout);
-                let client = managed_client.client.clone();
-                let mut collected: Vec<Resource> = Vec::new();
-                let mut cursor: Option<String> = None;
-                let mut seen_cursors = HashSet::new();
-                let mut page_count = 0usize;
-
-                loop {
-                    page_count += 1;
-                    if page_count > MAX_MCP_COLLECTION_PAGES {
-                        return (
-                            server_name,
-                            Err(anyhow!("resources/list exceeded page limit")),
-                        );
-                    }
-                    let params = cursor.as_ref().map(|next| {
-                        PaginatedRequestParams::default().with_cursor(Some(next.clone()))
-                    });
-                    let response = match client.list_resources(params, timeout).await {
-                        Ok(result) => result,
-                        Err(err) => return (server_name, Err(err)),
-                    };
-
-                    if collected.len().saturating_add(response.resources.len())
-                        > MAX_MCP_COLLECTION_ITEMS
-                    {
-                        return (
-                            server_name,
-                            Err(anyhow!("resources/list exceeded item limit")),
-                        );
-                    }
-                    collected.extend(response.resources);
-
-                    match response.next_cursor {
-                        Some(next) => {
-                            if !seen_cursors.insert(next.clone()) {
-                                return (
-                                    server_name,
-                                    Err(anyhow!("resources/list returned a repeated cursor")),
-                                );
-                            }
-                            cursor = Some(next);
-                        }
-                        None => return (server_name, Ok(Some(collected))),
-                    }
-                }
+                let client = &managed_client.client;
+                let result = collect_resource_pages(managed_client.tool_timeout, |cursor, remaining| async move {
+                    let params = cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
+                    let page = client.list_resources(params, Some(remaining)).await?;
+                    Ok((page.resources, page.next_cursor))
+                }).await.map(|(resources, next_cursor, meta)| Some(ListResourcesResult { resources, next_cursor, meta }));
+                (server_name, result)
             });
             task_servers.insert(abort_handle.id(), task_server);
         }
@@ -1204,6 +1234,9 @@ impl McpConnectionManager {
                 }
                 Ok((task_id, (server_name, Ok(Some(resources))))) => {
                     task_servers.remove(&task_id);
+                    if let Some(message) = resources.meta.as_ref().and_then(|meta| meta.get("codex/collectionError")).and_then(JsonValue::as_str) {
+                        collection.errors.push(McpServerCollectionError::new(server_name.clone(), message));
+                    }
                     collection.results.insert(server_name, resources);
                 }
                 Ok((task_id, (server_name, Err(err)))) => {
@@ -1315,7 +1348,7 @@ impl McpConnectionManager {
     pub async fn list_all_resource_templates(
         &self,
         include_server: impl Fn(&str) -> bool,
-    ) -> McpServerCollection<Vec<ResourceTemplate>> {
+    ) -> McpServerCollection<ListResourceTemplatesResult> {
         let mut join_set = JoinSet::new();
         let mut collection = McpServerCollection::default();
         let mut task_servers = HashMap::new();
@@ -1344,56 +1377,13 @@ impl McpConnectionManager {
                 if !managed_client.server_supports_resources_capability {
                     return (server_name, Ok(None));
                 }
-                let timeout = Some(managed_client.tool_timeout);
-                let client = managed_client.client.clone();
-                let mut collected: Vec<ResourceTemplate> = Vec::new();
-                let mut cursor: Option<String> = None;
-                let mut seen_cursors = HashSet::new();
-                let mut page_count = 0usize;
-
-                loop {
-                    page_count += 1;
-                    if page_count > MAX_MCP_COLLECTION_PAGES {
-                        return (
-                            server_name,
-                            Err(anyhow!("resources/templates/list exceeded page limit")),
-                        );
-                    }
-                    let params = cursor.as_ref().map(|next| {
-                        PaginatedRequestParams::default().with_cursor(Some(next.clone()))
-                    });
-                    let response = match client.list_resource_templates(params, timeout).await {
-                        Ok(result) => result,
-                        Err(err) => return (server_name, Err(err)),
-                    };
-
-                    if collected
-                        .len()
-                        .saturating_add(response.resource_templates.len())
-                        > MAX_MCP_COLLECTION_ITEMS
-                    {
-                        return (
-                            server_name,
-                            Err(anyhow!("resources/templates/list exceeded item limit")),
-                        );
-                    }
-                    collected.extend(response.resource_templates);
-
-                    match response.next_cursor {
-                        Some(next) => {
-                            if !seen_cursors.insert(next.clone()) {
-                                return (
-                                    server_name,
-                                    Err(anyhow!(
-                                        "resources/templates/list returned a repeated cursor"
-                                    )),
-                                );
-                            }
-                            cursor = Some(next);
-                        }
-                        None => return (server_name, Ok(Some(collected))),
-                    }
-                }
+                let client = &managed_client.client;
+                let result = collect_resource_pages(managed_client.tool_timeout, |cursor, remaining| async move {
+                    let params = cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
+                    let page = client.list_resource_templates(params, Some(remaining)).await?;
+                    Ok((page.resource_templates, page.next_cursor))
+                }).await.map(|(resource_templates, next_cursor, meta)| Some(ListResourceTemplatesResult { resource_templates, next_cursor, meta }));
+                (server_name, result)
             });
             task_servers.insert(abort_handle.id(), task_server);
         }
@@ -1405,6 +1395,9 @@ impl McpConnectionManager {
                 }
                 Ok((task_id, (server_name, Ok(Some(templates))))) => {
                     task_servers.remove(&task_id);
+                    if let Some(message) = templates.meta.as_ref().and_then(|meta| meta.get("codex/collectionError")).and_then(JsonValue::as_str) {
+                        collection.errors.push(McpServerCollectionError::new(server_name.clone(), message));
+                    }
                     collection.results.insert(server_name, templates);
                 }
                 Ok((task_id, (server_name, Err(err)))) => {

@@ -262,8 +262,9 @@ async fn find_thread_path_accepts_existing_state_db_path_without_canonical_filen
     let uuid = Uuid::from_u128(305);
     let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
     let db_rollout_path = home.join("sessions/2025/01/03/custom-rollout-name.jsonl");
-    fs::create_dir_all(db_rollout_path.parent().expect("rollout parent")).unwrap();
-    fs::write(&db_rollout_path, "").unwrap();
+    let ts = "2025-01-03T13-00-00";
+    write_session_file(home, ts, uuid, 1, Some(SessionSource::Cli)).unwrap();
+    fs::rename(home.join(format!("sessions/2025/01/03/rollout-{ts}-{uuid}.jsonl")), &db_rollout_path).unwrap();
     let runtime = insert_state_db_thread(
         home,
         thread_id,

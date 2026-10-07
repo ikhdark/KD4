@@ -89,6 +89,7 @@ struct RunningProcess {
     retained_bytes: usize,
     last_evicted_seq: u64,
     next_seq: u64,
+    exit_seq: Option<u64>,
     exit_code: Option<i32>,
     wake_tx: watch::Sender<u64>,
     events: ExecProcessEventLog,
@@ -107,15 +108,40 @@ struct RunningProcess {
 /// A remote client can retry `process/write` after reconnecting. Remembering accepted
 /// ids lets the server acknowledge the retried request without writing the same bytes
 /// to child stdin twice.
+/// Sequenced IDs (canonical decimal for remote writers, `local-<decimal>` for
+/// local writers) remain retired after eviction. Opaque IDs retain the legacy
+/// bounded deduplication window; they cannot provide an ordered retirement floor.
 #[derive(Default)]
 struct AcceptedStdinWriteIds {
     ids: HashSet<String>,
     order: VecDeque<String>,
+    retired_through: [Option<u64>; 2],
 }
 
 impl AcceptedStdinWriteIds {
-    fn contains(&self, write_id: &str) -> bool {
-        self.ids.contains(write_id)
+    fn sequence(write_id: &str) -> Option<(usize, u64)> {
+        let (writer, digits) = match write_id.strip_prefix("local-") {
+            Some(digits) => (1, digits),
+            None => (0, write_id),
+        };
+        let sequence = digits.parse::<u64>().ok()?;
+        (digits == sequence.to_string()).then_some((writer, sequence))
+    }
+
+    fn already_accepted(&self, write_id: &str) -> Result<bool, JSONRPCErrorError> {
+        if self.ids.contains(write_id) {
+            return Ok(true);
+        }
+        if let Some((writer, sequence)) = Self::sequence(write_id)
+            && self.retired_through[writer].is_some_and(|floor| sequence <= floor)
+        {
+            // Do not acknowledge an unknown gap or turn an expired retry into
+            // a new write. The caller must reconcile, not retry with a new ID.
+            return Err(invalid_params(
+                "writeId has expired from the stdin retry window; input was not written".to_string(),
+            ));
+        }
+        Ok(false)
     }
 
     fn remember(&mut self, write_id: String) {
@@ -129,6 +155,10 @@ impl AcceptedStdinWriteIds {
                 break;
             };
             self.ids.remove(&evicted);
+            if let Some((writer, sequence)) = Self::sequence(&evicted) {
+                let floor = &mut self.retired_through[writer];
+                *floor = Some(floor.map_or(sequence, |previous| previous.max(sequence)));
+            }
         }
     }
 }
@@ -368,6 +398,7 @@ impl LocalProcess {
                     retained_bytes: 0,
                     last_evicted_seq: 0,
                     next_seq: 1,
+                    exit_seq: None,
                     exit_code: None,
                     wake_tx: wake_tx.clone(),
                     events: events.clone(),
@@ -482,10 +513,13 @@ impl LocalProcess {
                         exited: process.exit_code.is_some(),
                         exit_code: process.exit_code,
                         closed: process.closed,
-                        failure: (after_seq < process.last_evicted_seq).then(|| format!(
-                            "process output was evicted through sequence {}; requested after {}",
-                            process.last_evicted_seq, after_seq
-                        )),
+                        failure: None,
+                        output_gap: (after_seq < process.last_evicted_seq).then_some(
+                            crate::protocol::ProcessOutputGap {
+                                through_seq: process.last_evicted_seq,
+                                exit_seq: process.exit_seq,
+                            },
+                        ),
                         sandbox_denied: process.sandbox_denied,
                     },
                     // Register before releasing the state lock: notify_waiters does
@@ -501,6 +535,7 @@ impl LocalProcess {
             let has_new_terminal_event =
                 response.exited && after_seq < response.next_seq.saturating_sub(1);
             if !response.chunks.is_empty()
+                || response.output_gap.is_some()
                 || response.closed
                 || has_new_terminal_event
                 || tokio::time::Instant::now() >= deadline
@@ -557,7 +592,7 @@ impl LocalProcess {
         if accepted_stdin_write_ids
             .lock()
             .await
-            .contains(&params.write_id)
+            .already_accepted(&params.write_id)?
         {
             return Ok(WriteResponse {
                 status: WriteStatus::Accepted,
@@ -569,7 +604,7 @@ impl LocalProcess {
             .await
             .map_err(|_| internal_error("failed to write to process stdin".to_string()))?;
         let mut accepted_stdin_write_ids = accepted_stdin_write_ids.lock().await;
-        if accepted_stdin_write_ids.contains(&params.write_id) {
+        if accepted_stdin_write_ids.already_accepted(&params.write_id)? {
             return Ok(WriteResponse {
                 status: WriteStatus::Accepted,
             });
@@ -640,13 +675,13 @@ impl LocalProcess {
 }
 
 fn child_env(params: &ExecParams) -> HashMap<String, String> {
-    let Some(env_policy) = &params.env_policy else {
-        return params.env.clone();
-    };
-
-    let policy = shell_environment_policy(env_policy);
-    let mut env = shell_environment::create_env(&policy, /*thread_id*/ None);
-    env.extend(params.env.clone());
+    let mut env = params
+        .env_policy
+        .as_ref()
+        .map_or_else(HashMap::new, |env_policy| {
+            shell_environment::create_env(&shell_environment_policy(env_policy), /*thread_id*/ None)
+        });
+    shell_environment::apply_env_overlay(&mut env, params.env.clone());
     env
 }
 
@@ -944,6 +979,7 @@ async fn watch_exit(
             let seq = process.next_seq;
             process.next_seq += 1;
             process.exit_code = Some(exit_code);
+            process.exit_seq = Some(seq);
             let _ = process.wake_tx.send(seq);
             process.events.publish(ExecProcessEvent::Exited {
                 seq,
@@ -1117,6 +1153,107 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tokio::sync::oneshot;
     use tokio::time::timeout;
+
+    #[test]
+    fn stdin_retry_window_retires_sequences_but_preserves_opaque_compatibility() {
+        let mut ids = AcceptedStdinWriteIds::default();
+        ids.remember("10".to_string());
+        ids.remember("local-20".to_string());
+        ids.remember("opaque-id".to_string());
+        for sequence in 11..=RETAINED_STDIN_WRITE_IDS_PER_PROCESS + 11 {
+            ids.remember(sequence.to_string());
+        }
+        assert_eq!(ids.ids.len(), RETAINED_STDIN_WRITE_IDS_PER_PROCESS);
+        assert_eq!(ids.order.len(), RETAINED_STDIN_WRITE_IDS_PER_PROCESS);
+        assert!(ids.already_accepted("10").is_err());
+        assert!(ids.already_accepted("9").is_err());
+        assert!(ids.already_accepted("local-20").is_err());
+        assert!(!ids.already_accepted("local-21").unwrap());
+        assert!(!ids.already_accepted("opaque-id").unwrap());
+        // Noncanonical numbers are opaque, not aliases of sequenced IDs.
+        for opaque in ["010", "+10", "local-020", "18446744073709551616"] {
+            assert!(!ids.already_accepted(opaque).unwrap());
+        }
+
+        let mut out_of_order = AcceptedStdinWriteIds::default();
+        out_of_order.remember("100".to_string());
+        out_of_order.remember("1".to_string());
+        for sequence in 101..100 + RETAINED_STDIN_WRITE_IDS_PER_PROCESS {
+            out_of_order.remember(sequence.to_string());
+        }
+        assert!(out_of_order.already_accepted("100").is_err());
+        assert!(out_of_order.already_accepted("1").unwrap());
+        assert!(out_of_order.already_accepted("2").is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_stdin_retry_never_reaches_the_writer() {
+        for prefix in ["", "local-"] {
+            let backend = LocalProcess::default();
+            let process = spawn_test_process(&backend, "stdin-retirement").await;
+            let (writer_tx, mut writer_rx) = mpsc::channel(1);
+            {
+                let mut processes = backend.inner.processes.lock().await;
+                let ProcessEntry::Running(running) = processes.get_mut(&process.process_id).unwrap() else {
+                    panic!("running process");
+                };
+                running.pipe_stdin = true;
+                running.session = dummy_session_with_writer(writer_tx);
+            }
+            let request = |sequence| WriteParams {
+                process_id: process.process_id.clone(),
+                chunk: b"input".to_vec().into(),
+                write_id: format!("{prefix}{sequence}"),
+            };
+            for sequence in 1..=RETAINED_STDIN_WRITE_IDS_PER_PROCESS + 1 {
+                assert_eq!(backend.exec_write(request(sequence)).await.unwrap().status, WriteStatus::Accepted);
+                assert_eq!(writer_rx.recv().await.unwrap(), b"input");
+            }
+            let error = backend.exec_write(request(1)).await.unwrap_err();
+            assert!(error.message.contains("expired"));
+            assert!(matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            // Recent retries still acknowledge without writing again.
+            assert_eq!(backend.exec_write(request(2)).await.unwrap().status, WriteStatus::Accepted);
+            assert!(matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            drop(process);
+            backend.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stdin_retry_rechecks_retirement_after_waiting_for_writer_capacity() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "stdin-retirement-race").await;
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        writer_tx.send(b"occupied".to_vec()).await.unwrap();
+        let accepted = {
+            let mut processes = backend.inner.processes.lock().await;
+            let ProcessEntry::Running(running) = processes.get_mut(&process.process_id).unwrap() else {
+                panic!("running process");
+            };
+            running.pipe_stdin = true;
+            running.session = dummy_session_with_writer(writer_tx);
+            Arc::clone(&running.accepted_stdin_write_ids)
+        };
+        let pending = backend.exec_write(WriteParams {
+            process_id: process.process_id.clone(),
+            chunk: b"must not be written".to_vec().into(),
+            write_id: "1".to_string(),
+        });
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        {
+            let mut ids = accepted.lock().await;
+            for sequence in 1..=RETAINED_STDIN_WRITE_IDS_PER_PROCESS + 1 {
+                ids.remember(sequence.to_string());
+            }
+        }
+        assert_eq!(writer_rx.recv().await.unwrap(), b"occupied");
+        assert!(pending.await.unwrap_err().message.contains("expired"));
+        assert!(matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        drop(process);
+        backend.shutdown().await;
+    }
 
     fn test_exec_params(env: HashMap<String, String>) -> ExecParams {
         ExecParams {
@@ -1408,6 +1545,106 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn child_env_aliases_reach_pipe_and_pty_with_identical_precedence() {
+        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join("cmd.exe");
+        for with_policy in [false, true] {
+            let mut expected_output = None;
+            for overlay_key in ["PATH", "Path", "path"] {
+                for reverse in [false, true] {
+                    for (tty, pipe_stdin) in [(false, false), (false, true), (true, false)] {
+                        let temp = tempfile::tempdir().expect("tempdir");
+                        let mut pairs = vec![
+                            (overlay_key.to_string(), "overlay-path".to_string()),
+                            ("CODEX_ENV_PROBE".to_string(), "present".to_string()),
+                        ];
+                        if reverse {
+                            pairs.reverse();
+                        }
+                        let mut params = test_exec_params(pairs.into_iter().collect());
+                        if with_policy {
+                            params.env_policy = Some(ExecEnvPolicy {
+                                inherit: ShellEnvironmentPolicyInherit::None,
+                                ignore_default_excludes: true,
+                                exclude: Vec::new(),
+                                r#set: HashMap::from([
+                                    ("Path".into(), "policy-path".into()),
+                                    ("PATH".into(), "other-policy-path".into()),
+                                ]),
+                                include_only: Vec::new(),
+                            });
+                        }
+                        let env = child_env(&params);
+                        assert_eq!(
+                            env.iter()
+                                .filter(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+                                .map(|(_, value)| value.as_str())
+                                .collect::<Vec<_>>(),
+                            ["overlay-path"],
+                        );
+                        params.argv = vec![
+                            cmd.to_string_lossy().into_owned(),
+                            "/d".into(),
+                            "/c".into(),
+                            "set > environment.txt".into(),
+                        ];
+                        params.cwd = PathUri::from_host_native_path(temp.path()).expect("cwd URI");
+                        params.tty = tty;
+                        params.pipe_stdin = pipe_stdin;
+                        let (backend, _, _) = telemetry_backend();
+                        let process_id = backend
+                            .exec(params)
+                            .await
+                            .expect("spawn environment probe")
+                            .process_id;
+                        let response = timeout(
+                            Duration::from_secs(15),
+                            read_process_until_closed(&backend, &process_id),
+                        )
+                        .await
+                        .expect("probe completes");
+                        let captured = backend
+                            .exec_read(ReadParams {
+                                process_id,
+                                after_seq: None,
+                                max_bytes: None,
+                                wait_ms: None,
+                            })
+                            .await
+                            .expect("probe output");
+                        backend.shutdown().await;
+                        assert_eq!(
+                            response.exit_code,
+                            Some(0),
+                            "with_policy={with_policy}, tty={tty}, pipe_stdin={pipe_stdin}: {captured:?}"
+                        );
+                        // Compare the complete child environment, not terminal
+                        // framing (ConPTY adds control sequences to stdout).
+                        let output = std::fs::read_to_string(temp.path().join("environment.txt"))
+                            .expect("child environment");
+                        let mut entries = output
+                            .lines()
+                            .map(|line| {
+                                let (key, value) = line.split_once('=').expect("environment entry");
+                                (key.to_ascii_uppercase(), value.to_string())
+                            })
+                            .collect::<Vec<_>>();
+                        entries.sort();
+                        assert!(entries.contains(&("PATH".into(), "overlay-path".into())));
+                        if let Some(expected) = &expected_output {
+                            assert_eq!(&entries, expected);
+                        } else {
+                            expected_output = Some(entries);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn child_env_applies_policy_then_overlay() {
         let mut params = test_exec_params(HashMap::from([
@@ -1533,6 +1770,7 @@ mod tests {
                 exit_code: Some(0),
                 closed: false,
                 failure: None,
+                output_gap: None,
                 sandbox_denied: false,
             }
         );
@@ -1794,7 +2032,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(lost.failure.unwrap().contains("evicted through sequence 1"));
+        assert_eq!(lost.failure, None);
+        assert_eq!(lost.output_gap.unwrap().through_seq, 1);
+        assert!(!lost.exited);
+        assert_eq!(lost.chunks, tail.chunks);
         process.exit(0);
         drop(process);
         backend.shutdown().await;
@@ -1943,6 +2184,7 @@ mod tests {
                 retained_bytes: 0,
                 last_evicted_seq: 0,
                 next_seq: 1,
+                exit_seq: None,
                 exit_code: None,
                 wake_tx: wake_tx.clone(),
                 events: events.clone(),
@@ -1990,6 +2232,10 @@ mod tests {
 
     fn dummy_session() -> ExecCommandSession {
         let (writer_tx, _writer_rx) = mpsc::channel(1);
+        dummy_session_with_writer(writer_tx)
+    }
+
+    fn dummy_session_with_writer(writer_tx: mpsc::Sender<Vec<u8>>) -> ExecCommandSession {
         let (_stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(1);
         let (_stderr_tx, stderr_rx) = tokio::sync::broadcast::channel(1);
         let (_exit_tx, exit_rx) = oneshot::channel();

@@ -114,14 +114,12 @@ async fn assert_clearing_collaboration_instructions_emits_reset(
 
     let dev_texts = developer_texts(&req2.single_request().input());
     let active_xml = collab_xml(active_instructions);
-    assert_eq!(count_messages_containing(&dev_texts, &active_xml), 1);
+    assert_eq!(count_messages_containing(&dev_texts, &active_xml), 0);
     assert_eq!(
         count_messages_containing(&dev_texts, COLLABORATION_MODE_OPEN_TAG),
-        2,
-        "clearing instructions preserves history and appends an explicit reset"
+        0,
+        "clearing instructions removes the retired sampling slot"
     );
-    let reset = dev_texts.iter().rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG)).unwrap();
-    assert!(reset.contains(&collab_xml("No collaboration-mode-specific instructions are currently active. Any previously provided collaboration-mode instructions no longer apply.")));
 
     Ok(())
 }
@@ -446,7 +444,7 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
     let dev_texts = developer_texts(&input);
     let first_text = collab_xml(first_text);
     let second_text = collab_xml(second_text);
-    assert_eq!(count_messages_containing(&dev_texts, &first_text), 1);
+    assert_eq!(count_messages_containing(&dev_texts, &first_text), 0);
     assert_eq!(count_messages_containing(&dev_texts, &second_text), 1);
     assert!(dev_texts.iter().rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG)).unwrap().contains(&second_text));
 
@@ -609,7 +607,7 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
     let dev_texts = developer_texts(&input);
     let default_text = collab_xml(default_text);
     let plan_text = collab_xml(plan_text);
-    assert_eq!(count_messages_containing(&dev_texts, &default_text), 1);
+    assert_eq!(count_messages_containing(&dev_texts, &default_text), 0);
     assert_eq!(count_messages_containing(&dev_texts, &plan_text), 1);
     assert!(dev_texts.iter().rfind(|text| text.contains(COLLABORATION_MODE_OPEN_TAG)).unwrap().contains(&plan_text));
 

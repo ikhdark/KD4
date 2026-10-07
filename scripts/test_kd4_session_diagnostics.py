@@ -38,6 +38,153 @@ def _elapsed_rows(comparison: dict) -> list[dict]:
     return [row for row in comparison["metrics"] if row["metric"] == "elapsedMs"]
 
 
+class SubscriptionUsageTest(unittest.TestCase):
+    @staticmethod
+    def _limits(used=20, **overrides):
+        return {
+            "limit_id": "codex",
+            "plan_type": "plus",
+            "primary": {"used_percent": used, "window_minutes": 300, "resets_at": 2_000_000_000},
+            "secondary": {"used_percent": 40, "window_minutes": 10080, "resets_at": 2_000_100_000},
+            **overrides,
+        }
+
+    def test_rollout_text_json_summary_cache_and_token_opt_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "rollout.jsonl"
+            lines = [_meta(str(root)), _event({"type": "task_started", "turn_id": "open"})]
+            for used in (20, 20, 25):
+                lines.append(_event({"type": "token_count", "info": None,
+                                     "rate_limits": self._limits(used)}))
+            # A response/tool payload is not a provider limit observation.
+            lines.append(_response({"type": "token_count", "rate_limits": self._limits(90)},
+                                   "2026-08-17T00:00:00Z"))
+            source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            original = source.read_bytes()
+            report = audit.analyze_session_path(source, root)
+            subscription = report["sessionDiagnostics"]["subscriptionUsage"]
+            self.assertTrue(subscription["available"])
+            self.assertEqual(subscription["tokenCountEvents"], 3)
+            self.assertEqual(subscription["windowCount"], 2)
+            self.assertEqual(report["sessionDiagnostics"]["activeTurnsExcluded"], 1)
+            primary, secondary = subscription["windows"]
+            self.assertEqual(primary["firstUsedPercent"], 20)
+            self.assertEqual(primary["lastUsedPercent"], 25)
+            self.assertEqual(primary["peakUsedPercent"], 25)
+            self.assertEqual(primary["lastRemainingPercent"], 75)
+            self.assertEqual(primary["observedChangePercentagePoints"], 5)
+            self.assertEqual(secondary["observedChangePercentagePoints"], 0)
+            self.assertEqual(primary["samples"], 3)
+            text = audit.render_report(report)
+            self.assertIn("subscription usage:", text)
+            self.assertIn("observed change=+5pp", text)
+            self.assertIn("not usage attributable to this session", text)
+            saved = copy.deepcopy(report)
+            summary = audit.bounded_summary(report)
+            self.assertEqual(summary["subscriptionUsage"]["windows"], subscription["windows"])
+            self.assertIn("not usage attributable", summary["subscriptionUsage"]["measurementNote"])
+            with mock.patch.object(audit, "_MAX_SUMMARY_BYTES", 1):
+                tiny = audit.bounded_summary(report)
+            self.assertEqual(tiny["subscriptionUsage"]["windows"], [])
+            self.assertEqual(tiny["subscriptionUsage"]["omittedWindows"], 2)
+            self.assertEqual(report, saved)
+            for flags in (["--json"], ["--summary-json", "--tokens", "off"]):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(audit.main([str(source), "--repo-root", str(root), *flags]), 0)
+                emitted = json.loads(output.getvalue())
+                actual = emitted.get("subscriptionUsage", emitted.get("sessionDiagnostics", {}).get("subscriptionUsage"))
+                self.assertEqual(actual["windows"], subscription["windows"])
+            for _ in range(2):
+                cached = audit.analyze_session_path(source, root, cache_dir=root / "cache")
+                self.assertEqual(cached["sessionDiagnostics"]["subscriptionUsage"], subscription)
+            self.assertEqual(source.read_bytes(), original)
+
+    def test_missing_invalid_and_zero_are_distinct(self):
+        usage = diagnostics.SubscriptionUsage()
+        self.assertFalse(usage.report()["available"])
+        for value in (None, [], {"limit_id": []}, {}, {"primary": []}):
+            usage.observe("file", 1_000_000_000, value)
+        for value in (True, -1, 101, "20", float("nan"), float("inf")):
+            usage.observe("file", 1_000_000_000, self._limits(
+                primary={"used_percent": value}, secondary=None))
+        result = usage.report()
+        self.assertFalse(result["available"])
+        self.assertEqual(result["missingRateLimitSnapshots"], 1)
+        self.assertEqual(result["invalidRateLimitSnapshots"], 2)
+        self.assertEqual(result["invalidWindows"], 7)
+        for _ in range(2):
+            usage.observe("file", 1_000_000_000, self._limits(0, secondary=None))
+        [window] = usage.report()["windows"]
+        self.assertEqual(window["observedChangePercentagePoints"], 0)
+        self.assertEqual(window["lastRemainingPercent"], 100)
+
+    def test_unreliable_changes_are_unavailable_not_zero(self):
+        for override, times, values, reason in (
+            ({}, [1], [10], "insufficient_snapshots"),
+            ({"resets_at": None}, [1, 2], [10, 20], "window_identity_unavailable"),
+            ({"window_minutes": None}, [1, 2], [10, 20], "window_identity_unavailable"),
+            ({}, [2, 1], [10, 20], "invalid_out_of_order_or_expired_timestamp"),
+            ({}, [None, 2], [10, 20], "invalid_out_of_order_or_expired_timestamp"),
+            ({"resets_at": 2}, [1, 2], [10, 20], "invalid_out_of_order_or_expired_timestamp"),
+            ({}, [1, 2, 3], [20, 10, 30], "usage_decreased_within_window"),
+        ):
+            with self.subTest(reason=reason, override=override, times=times):
+                usage = diagnostics.SubscriptionUsage()
+                for timestamp, value in zip(times, values):
+                    snapshot = self._limits(value, secondary=None)
+                    snapshot["primary"].update(override)
+                    usage.observe("file", timestamp * 1_000_000_000 if timestamp is not None else None, snapshot)
+                [window] = usage.report()["windows"]
+                self.assertIsNone(window["observedChangePercentagePoints"])
+                self.assertEqual(window["changeUnavailableReason"], reason)
+        for key in ("window_minutes", "resets_at"):
+            for value in (True, 0, -1, 1.5, "300", 2**63):
+                usage = diagnostics.SubscriptionUsage()
+                snapshot = self._limits(secondary=None)
+                snapshot["primary"][key] = value
+                usage.observe("file", 1_000_000_000, snapshot)
+                self.assertEqual(usage.report()["invalidWindows"], 1)
+                self.assertFalse(usage.report()["available"])
+
+    def test_reset_plan_limit_duration_and_file_boundaries_are_not_merged(self):
+        usage = diagnostics.SubscriptionUsage()
+        snapshots = [self._limits(secondary=None) for _ in range(6)]
+        snapshots[1]["primary"]["resets_at"] += 300
+        snapshots[2]["plan_type"] = "pro"
+        snapshots[3]["limit_id"] = "other"
+        snapshots[4]["primary"]["window_minutes"] = 60
+        for index, snapshot in enumerate(snapshots):
+            usage.observe("other-file" if index == 5 else "file", 1_000_000_000, snapshot)
+        result = usage.report()
+        self.assertEqual(result["windowCount"], 6)
+        self.assertTrue(all(row["observedChangePercentagePoints"] is None for row in result["windows"]))
+
+    def test_parse_errors_and_legacy_rollouts_preserve_unavailable_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            report = _report(root, [100])
+            subscription = report["sessionDiagnostics"]["subscriptionUsage"]
+            self.assertFalse(subscription["available"])
+            self.assertIn("subscription limits unavailable", audit.render_report(report))
+            self.assertNotIn("subscriptionUsage", audit.bounded_summary(report))
+            source = root / "rollout.jsonl"
+            with source.open("a", encoding="utf-8") as handle:
+                handle.write(_event({"type": "token_count", "rate_limits": None}) + "\n")
+            missing = audit.bounded_summary(audit.analyze_session_path(source, root))["subscriptionUsage"]
+            self.assertFalse(missing["available"])
+            self.assertEqual(missing["missingRateLimitSnapshots"], 1)
+            with source.open("a", encoding="utf-8") as handle:
+                for used in (10, 20):
+                    handle.write(_event({"type": "token_count", "rate_limits": self._limits(used)}) + "\n")
+                handle.write("{broken\n")
+            subscription = audit.analyze_session_path(source, root)["sessionDiagnostics"]["subscriptionUsage"]
+            self.assertEqual(subscription["parseErrorCount"], 1)
+            self.assertTrue(all(row["changeUnavailableReason"] == "incomplete_session_coverage"
+                                for row in subscription["windows"]))
+
+
 class SessionDiagnosticsTest(unittest.TestCase):
     def test_nested_calls_terminal_cost_and_calibration_require_complete_measurements(self):
         timing = {
@@ -888,6 +1035,153 @@ class SessionDiagnosticsTest(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertEqual(out.getvalue(), "")
             self.assertIn("regenerate it from rollouts", err.getvalue())
+
+
+class UsageEfficiencyTest(unittest.TestCase):
+    @staticmethod
+    def _measured_report(root, turns=1, timing=None):
+        timing = copy.deepcopy(timing or _timing())
+        timing["counters"]["modelRequestCount"] = len(timing["modelRequests"])
+        timing["counters"]["provenAvoidedModelRequests"] = 3
+        return _report(root, [1000] * turns, **{
+            key: value for key, value in timing.items() if key != "inclusiveDurationNs"
+        })
+
+    def test_provider_partition_purpose_costs_and_estimates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report = self._measured_report(Path(temp))
+        efficiency = report["sessionDiagnostics"]["usageEfficiency"]
+        self.assertEqual(efficiency["completeProviderTurns"], 1)
+        self.assertEqual(efficiency["observedCompleteTurnTotalTokens"], 235)
+        self.assertEqual({r["component"]: r["tokens"] for r in efficiency["rankedTokenComponents"]}, {
+            "uncachedInputTokens": 30, "cachedInputTokens": 180,
+            "visibleOutputTokens": 18, "reasoningTokens": 7,
+        })
+        self.assertAlmostEqual(sum(r["share"] for r in efficiency["rankedTokenComponents"]), 1)
+        self.assertEqual(efficiency["purposePartitionTurns"], 1)
+        self.assertEqual({r["purpose"]: r["totalTokens"] for r in efficiency["costByPurpose"]}, {
+            "implementation": 120, "deterministic_tool_continuation": 115,
+        })
+        row = report["perTurn"][0]["diagnostics"]["usageEfficiency"]
+        self.assertEqual(row["physicalRequests"], 2)
+        self.assertEqual(row["inputTokensPerRequest"], 105)
+        self.assertAlmostEqual(row["cacheHitRatio"], 180 / 210)
+        self.assertAlmostEqual(row["reasoningOutputRatio"], 7 / 25)
+        self.assertEqual(row["promptEstimates"]["repeatedUnchangedContextTokens"], 150)
+        self.assertEqual(row["promptEstimates"]["logicalPromptTokens"], 200)
+        self.assertEqual(efficiency["avoidedModelRequests"]["total"], 3)
+        self.assertIsNone(row["savedTokens"])
+        self.assertIsNone(row["savedSubscriptionPercentagePoints"])
+        self.assertTrue(all(not r["provenSavings"] for r in efficiency["experiments"]))
+        text = audit.render_report(report)
+        self.assertIn("usage efficiency:", text)
+        self.assertIn("improve_cache_reuse", text)
+        self.assertIn("saved tokens/quota unknown", text)
+
+    def test_opt_out_partial_unknown_retention_and_missing_usage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._measured_report(root)
+            source = root / "rollout.jsonl"
+            disabled = audit.analyze_session_path(source, root, include_tokens=False)
+            unknown = _report(root, [1000])
+            missing_timing = _timing()
+            missing_timing["modelRequests"][0].pop("tokenUsage")
+            missing = self._measured_report(root, timing=missing_timing)
+        for report in (disabled, unknown, missing):
+            efficiency = report["sessionDiagnostics"]["usageEfficiency"]
+            self.assertEqual(efficiency["unmeasuredProviderTurns"], 1)
+            self.assertIsNone(efficiency["observedCompleteTurnTotalTokens"])
+            self.assertEqual(efficiency["rankedTokenComponents"], [])
+            self.assertEqual(efficiency["costByPurpose"], [])
+            self.assertEqual(efficiency["rankedTurns"], [])
+        for name in ("totalTokens", "outputTokens", "reasoningTokens", "physicalRequests"):
+            self.assertIsNone(disabled["perTurn"][0]["diagnostics"]["metrics"][name])
+
+    def test_purpose_partition_rejects_cross_generation_duplicate_usage(self):
+        timing = _timing()
+        timing["modelRequests"][1]["tokenUsage"] = copy.deepcopy(timing["modelRequests"][0]["tokenUsage"])
+        for request in timing["modelRequests"]:
+            request["samplingRequestId"] = "same-request"
+        with tempfile.TemporaryDirectory() as temp:
+            report = self._measured_report(Path(temp), timing=timing)
+        efficiency = report["sessionDiagnostics"]["usageEfficiency"]
+        self.assertEqual(efficiency["observedCompleteTurnTotalTokens"], 115)
+        self.assertEqual(efficiency["purposePartitionTurns"], 0)
+        self.assertEqual(efficiency["costByPurpose"], [])
+
+    def test_zero_token_duplicates_do_not_inflate_purpose_request_counts(self):
+        timing = _timing()
+        for request in timing["modelRequests"]:
+            request["samplingRequestId"] = "same-request"
+            request["tokenUsage"] = dict.fromkeys(request["tokenUsage"], 0)
+        with tempfile.TemporaryDirectory() as temp:
+            report = self._measured_report(Path(temp), timing=timing)
+        efficiency = report["sessionDiagnostics"]["usageEfficiency"]
+        self.assertEqual(efficiency["observedCompleteTurnTotalTokens"], 0)
+        self.assertEqual(efficiency["purposePartitionTurns"], 0)
+        self.assertEqual(efficiency["costByPurpose"], [])
+
+    def test_mixed_purpose_generation_and_zero_usage(self):
+        timing = _timing()
+        timing["modelRequests"][1]["generationIndex"] = 0
+        for request in timing["modelRequests"]:
+            request["tokenUsage"] = dict.fromkeys(request["tokenUsage"], 0)
+        with tempfile.TemporaryDirectory() as temp:
+            report = self._measured_report(Path(temp), timing=timing)
+        efficiency = report["sessionDiagnostics"]["usageEfficiency"]
+        self.assertEqual(efficiency["observedCompleteTurnTotalTokens"], 0)
+        self.assertEqual(efficiency["costByPurpose"][0]["purpose"], "mixed")
+        self.assertIsNone(efficiency["rankedTurns"][0]["cacheHitRatio"])
+        self.assertIsNone(efficiency["rankedTurns"][0]["reasoningOutputRatio"])
+        self.assertTrue(all(row["share"] is None for row in efficiency["rankedTokenComponents"]))
+
+    def test_baseline_detects_usage_decreases_without_claiming_savings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            baseline = self._measured_report(root, turns=5)
+            timing = _timing()
+            for request in timing["modelRequests"]:
+                usage = request["tokenUsage"]
+                usage["reasoningTokens"] = 0
+                usage["visibleOutputTokens"] = 0
+                usage["totalTokens"] = usage["inputTokens"]
+            current = self._measured_report(root, turns=5, timing=timing)
+            comparison = diagnostics.compare_diagnostics(current["sessionDiagnostics"], baseline)
+            assessment = comparison["usageSavingsAssessment"]
+            self.assertFalse(assessment["subscriptionSavingsProven"])
+            self.assertEqual(assessment["decreasedStatisticCounts"]["outputTokens"], 2)
+            self.assertEqual(assessment["decreasedStatisticCounts"]["reasoningTokens"], 2)
+            reverse = diagnostics.compare_diagnostics(baseline["sessionDiagnostics"], current)
+            self.assertEqual(diagnostics.regression_gate(reverse, ["outputTokens"])["status"], "regression")
+            old = copy.deepcopy(baseline)
+            for cohort in old["sessionDiagnostics"]["cohorts"]:
+                cohort["metrics"].pop("outputTokens")
+            legacy = diagnostics.compare_diagnostics(current["sessionDiagnostics"], old)
+            self.assertTrue(all(row.get("reason") == "no_matching_baseline_metric"
+                                for row in legacy["metrics"] if row["metric"] == "outputTokens"))
+            baseline_path = root / "before.json"
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(audit.main([str(root / "rollout.jsonl"), "--repo-root", str(root),
+                                             "--baseline", str(baseline_path), "--summary-json"]), 0)
+            self.assertEqual(json.loads(out.getvalue())["baselineComparison"]["usageSavingsAssessment"], assessment)
+
+    def test_ranking_cache_and_full_json_are_consistent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            report = self._measured_report(root, turns=12)
+            efficiency = report["sessionDiagnostics"]["usageEfficiency"]
+            self.assertEqual(len(efficiency["rankedTurns"]), 10)
+            self.assertEqual(efficiency["omittedRankedTurns"], 2)
+            for _ in range(2):
+                cached = audit.analyze_session_path(root / "rollout.jsonl", root, cache_dir=root / "cache")
+                self.assertEqual(cached["sessionDiagnostics"]["usageEfficiency"], efficiency)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(audit.main([str(root / "rollout.jsonl"), "--repo-root", str(root), "--json"]), 0)
+            self.assertEqual(json.loads(out.getvalue())["sessionDiagnostics"]["usageEfficiency"], efficiency)
 
 
 if __name__ == "__main__":

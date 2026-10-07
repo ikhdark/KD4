@@ -27,8 +27,8 @@ Object.defineProperty(globalThis, "run_graph", {
       }
       const requires = [...(node.requires ?? [])];
       if (requires.length > 128 || requires.some(name =>
-          typeof name !== "string" || !ALL_TOOL_NAMES.includes(name))) {
-        throw new TypeError(`required tool capability is unavailable for ${node.id}`);
+          typeof name !== "string" || !name.trim())) {
+        throw new TypeError(`invalid required tool capabilities for ${node.id}`);
       }
       const estimated_ms = node.estimated_ms ?? 0;
       if (!Number.isFinite(estimated_ms) || estimated_ms < 0 || estimated_ms > 86_400_000) {
@@ -52,7 +52,7 @@ Object.defineProperty(globalThis, "run_graph", {
       if (claims.read.some(key => claims.write.includes(key))) {
         throw new TypeError(`duplicate read/write resource for ${node.id}`);
       }
-      graph.set(node.id, { deps, run: node.run, accept: node.accept,
+      graph.set(node.id, { deps, requires, run: node.run, accept: node.accept,
         step_id: node.step_id, estimated_ms, claims, ordinal: graph.size });
     }
     for (const [id, node] of graph) {
@@ -86,6 +86,14 @@ Object.defineProperty(globalThis, "run_graph", {
       for (const dep of graph.get(id).deps) select(dep);
     }
     for (const id of targets ?? graph.keys()) select(id);
+    // An explicitly excluded branch needs valid structure, not capabilities
+    // that will never be dispatched. Check the entire selected closure before
+    // any effect, including transitive dependencies of requested targets.
+    for (const id of selected) {
+      if (graph.get(id).requires.some(name => !ALL_TOOL_NAMES.includes(name))) {
+        throw new TypeError(`required tool capability is unavailable for ${id}`);
+      }
+    }
     // Longest remaining dependency path first; zero estimates retain the
     // original input-order policy. Estimates affect admission, never results.
     const ranks = new Map();
@@ -137,6 +145,8 @@ Object.defineProperty(globalThis, "run_graph", {
       } catch (reason) {
         // Acceptance can fail after a successful, expensive effect. Keep its
         // evidence/live handle so recovery never needs to repeat that effect.
+        // Preserve object identity for recovery scripts. The display serializer
+        // projects bounded diagnostics without modifying the settled evidence.
         results[id] = produced ? { status: "rejected", value, reason }
           : { status: "rejected", reason };
       }

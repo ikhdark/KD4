@@ -18,6 +18,22 @@ pub struct ToolSearchEntry {
 }
 
 impl ToolSearchEntry {
+    /// Callable evidence excludes connector and namespace boilerplate. Shared
+    /// metadata remains in search_text for discovery, not action activation.
+    pub fn callable_search_text(&self) -> String {
+        let mut parts = String::new();
+        match self.output.as_ref() {
+            LoadableToolSpec::Function(tool) => append_function_search_text(tool, &mut parts),
+            LoadableToolSpec::Namespace(namespace) => {
+                for tool in &namespace.tools {
+                    let ResponsesApiNamespaceTool::Function(tool) = tool;
+                    append_function_search_text(tool, &mut parts);
+                }
+            }
+        }
+        parts
+    }
+
     pub fn to_loadable_spec(&self) -> LoadableToolSpec {
         self.normalize_output(self.output.as_ref().clone())
     }
@@ -142,18 +158,11 @@ fn default_tool_search_text(spec: &ToolSpec) -> String {
     match spec {
         ToolSpec::Function(tool) => append_function_search_text(tool, &mut parts),
         ToolSpec::Namespace(namespace) => {
-            push_search_part(&mut parts, &namespace.name);
-            push_search_part(&mut parts, &namespace.description);
             for tool in &namespace.tools {
                 let ResponsesApiNamespaceTool::Function(tool) = tool;
-                push_search_part(
-                    &mut parts,
-                    &code_mode_name_for_tool_name(&crate::ToolName::namespaced(
-                        namespace.name.clone(),
-                        tool.name.clone(),
-                    )),
-                );
-                append_function_search_text(tool, &mut parts);
+                push_search_part(&mut parts, &namespace_member_search_text(
+                    &namespace.name, &namespace.description, tool,
+                ));
             }
         }
         ToolSpec::ToolSearch { description, .. } => {
@@ -172,11 +181,50 @@ fn default_tool_search_text(spec: &ToolSpec) -> String {
     parts
 }
 
+pub fn namespace_member_search_text(
+    namespace: &str,
+    description: &str,
+    tool: &ResponsesApiTool,
+) -> String {
+    let mut parts = String::new();
+    push_search_part(&mut parts, namespace);
+    push_search_part(&mut parts, description);
+    push_search_part(&mut parts, &code_mode_name_for_tool_name(&crate::ToolName::namespaced(
+        namespace, tool.name.clone(),
+    )));
+    append_function_search_text(tool, &mut parts);
+    parts
+}
+
 fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut String) {
     push_search_part(parts, &tool.name);
-    push_search_part(parts, &tool.name.replace('_', " "));
+    push_search_part(parts, &identifier_search_words(&tool.name));
     push_search_part(parts, &tool.description);
     append_schema_search_text(&tool.parameters, parts);
+}
+
+/// Capability words supplement, but never replace, exact callable identities.
+pub fn identifier_search_words(identifier: &str) -> String {
+    let chars = identifier.chars().collect::<Vec<_>>();
+    let mut words = String::new();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if !ch.is_alphanumeric() {
+            if !words.is_empty() && !words.ends_with(' ') {
+                words.push(' ');
+            }
+            continue;
+        }
+        let previous = index.checked_sub(1).map(|index| chars[index]);
+        let boundary = ch.is_uppercase() && previous.is_some_and(|previous| {
+            previous.is_lowercase() || previous.is_numeric()
+                || (previous.is_uppercase() && chars.get(index + 1).is_some_and(|next| next.is_lowercase()))
+        });
+        if boundary && !words.ends_with(' ') {
+            words.push(' ');
+        }
+        words.extend(ch.to_lowercase());
+    }
+    words.trim_end().to_string()
 }
 
 pub fn schema_search_text(schema: &JsonSchema) -> String {

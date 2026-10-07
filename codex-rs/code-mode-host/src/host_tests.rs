@@ -2,7 +2,7 @@ use codex_code_mode_protocol::host::Capability;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientHello;
 use codex_code_mode_protocol::host::ClientToHost;
-use codex_code_mode_protocol::host::EncodedFrame;
+use super::peer::OutgoingFrame;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
 use codex_code_mode_protocol::host::HandshakeRejectReason;
@@ -54,7 +54,7 @@ fn request_id(value: i64) -> RequestId {
     RequestId::new(value)
 }
 
-async fn decode_frame(frame: EncodedFrame) -> HostToClient {
+async fn decode_frame(frame: OutgoingFrame) -> HostToClient {
     let (reader, writer) = tokio::io::duplex(/*max_buf_size*/ 4096);
     let writer = tokio::spawn(async move {
         FramedWriter::new(writer)
@@ -82,6 +82,42 @@ fn execute_request(source: &str) -> WireExecuteRequest {
         max_output_tokens: Some(1_000),
         default_tool_timeout_ms: None,
     }
+}
+
+#[tokio::test]
+async fn immutable_catalog_references_preserve_revision_revocation() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let peer = Arc::new(HostPeer::new(tx));
+    let state = Arc::new(HostState {
+        catalogs: Mutex::new(HashMap::new()), sessions: Mutex::new(HashMap::new()),
+        seen_session_ids: Mutex::new(SeenSessionIds::default()), requests: Mutex::new(RequestRegistry::default()),
+        request_tasks: TaskTracker::new(), request_permits: Arc::new(Semaphore::new(0)),
+        active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)), closing: AtomicBool::new(false), peer,
+    });
+    let session = session_id("catalog-test");
+    state.open_session(session.clone()).unwrap();
+    let submit = |id, revision, register| {
+        let mut request = execute_request("text('never admitted');");
+        request.catalog = Some(codex_code_mode_protocol::host::WireToolCatalog { revision, register });
+        state.spawn_request(request_id(id), HostRequest::Execute { session_id: session.clone(), request }).unwrap();
+    };
+    submit(1, 1, true);
+    let _ = rx.recv().await.unwrap();
+    let first = Arc::clone(&state.catalogs.lock().unwrap()[&session].1);
+    submit(2, 1, false);
+    let _ = rx.recv().await.unwrap();
+    assert!(Arc::ptr_eq(&first, &state.catalogs.lock().unwrap()[&session].1));
+    submit(3, 2, true);
+    let _ = rx.recv().await.unwrap();
+    assert!(!Arc::ptr_eq(&first, &state.catalogs.lock().unwrap()[&session].1));
+    submit(4, 1, false);
+    let error = decode_frame(rx.recv().await.unwrap()).await;
+    assert!(matches!(error, HostToClient::Response { result: WireResult::Err { message }, .. } if message.contains("revoked")));
+    submit(5, 1, true);
+    let error = decode_frame(rx.recv().await.unwrap()).await;
+    assert!(matches!(error, HostToClient::Response { result: WireResult::Err { message }, .. } if message.contains("stale")));
+    assert_eq!(state.catalogs.lock().unwrap()[&session].0, 2);
+    state.disconnect().await;
 }
 
 fn session_capacity_error() -> String {
@@ -378,7 +414,7 @@ async fn saturated_execute_is_rejected_without_side_effects_and_host_shuts_down(
 
         let mut cells = Vec::new();
         for value in 2..10 {
-            let mut request = execute_request("await new Promise(() => {});");
+            let mut request = execute_request("await new Promise(resolve => setTimeout(resolve, 60_000));");
             request.yield_time_ms = Some(1);
             writer
                 .write(&ClientToHost::Request {
@@ -888,9 +924,11 @@ async fn saturated_session_admission_releases_host_permit() {
         state.open_session(id.clone()).expect("open");
         let session = state.session(&id).expect("session");
         for _ in 0..8 {
+            let mut request = execute_request("await new Promise(resolve => setTimeout(resolve, 60_000));");
+            request.yield_time_ms = Some(1);
             session
                 .execute(
-                    execute_request("await new Promise(() => {});")
+                    request
                         .try_into()
                         .expect("request"),
                 )

@@ -32,24 +32,38 @@ pub(crate) fn canonicalize_command_for_approval(command: &[String]) -> Vec<Strin
         return canonical;
     }
 
-    if let Some((shell, script)) = extract_noprofile_powershell_command(command)
-        && is_trusted_powershell_executable(shell)
-    {
-        return vec![
-            CANONICAL_POWERSHELL_SCRIPT_PREFIX.to_string(),
-            POWERSHELL_NO_PROFILE_MODE.to_string(),
-            script.to_string(),
-        ];
-    }
-
     if let Some((shell, script)) = extract_powershell_command(command)
         && is_trusted_powershell_executable(shell)
     {
-        return vec![
+        let profile_mode = if extract_noprofile_powershell_command(command).is_some() {
+            POWERSHELL_NO_PROFILE_MODE
+        } else {
+            POWERSHELL_PROFILES_ENABLED_MODE
+        };
+        let mut canonical = vec![
             CANONICAL_POWERSHELL_SCRIPT_PREFIX.to_string(),
-            POWERSHELL_PROFILES_ENABLED_MODE.to_string(),
-            script.to_string(),
+            shell.to_string(),
+            profile_mode.to_string(),
         ];
+        // Extraction admits only one final script argument, either separate
+        // from -Command (including its aliases) or attached with a colon.
+        let script_index = command.len() - 1;
+        let flags_end = if command[script_index].len() == script.len() {
+            script_index - 1
+        } else {
+            script_index
+        };
+        // Keep the host and every accepted execution flag. Only case and the
+        // command introducer are equivalent syntax; do not sort flags because
+        // conflicting apartment flags can depend on their order.
+        canonical.extend(
+            command[1..flags_end]
+                .iter()
+                .map(|flag| flag.to_ascii_lowercase())
+                .filter(|flag| flag != "-noprofile"),
+        );
+        canonical.push(script.to_string());
+        return canonical;
     }
 
     command.to_vec()

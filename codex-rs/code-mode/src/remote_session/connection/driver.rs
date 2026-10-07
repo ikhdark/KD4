@@ -36,6 +36,7 @@ pub(super) struct DriverLifecycle {
 pub(super) struct ConnectionDriver {
     pub(super) tool_catalog_references: bool,
     pub(super) named_state_snapshots: bool,
+    pub(super) receipt_recovery: bool,
     catalogs: std::collections::HashMap<
         codex_code_mode_protocol::host::SessionId,
         (u64, Arc<[codex_code_mode_protocol::ToolDefinition]>),
@@ -67,6 +68,7 @@ impl ConnectionDriver {
             Self {
                 tool_catalog_references: false,
                 named_state_snapshots: false,
+                receipt_recovery: false,
                 catalogs: std::collections::HashMap::new(),
                 command_rx,
                 event_rx,
@@ -86,14 +88,30 @@ impl ConnectionDriver {
     }
 
     pub(super) async fn run(mut self) {
+        enum Ready {
+            Event(Option<DriverEvent>),
+            Claim(Option<RequestId>),
+            Command(Option<DriverCommand>),
+        }
         loop {
-            tokio::select! {
+            let ready = tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => {
                     self.fail("code-mode host connection closed".to_string());
                     return;
                 }
-                event = self.event_rx.recv() => {
+                ready = async {
+                    // Cancellation stays first; traffic channels share the
+                    // default fair selector rather than event-first priority.
+                    tokio::select! {
+                        event = self.event_rx.recv() => Ready::Event(event),
+                        claim = self.execute_claim_rx.recv() => Ready::Claim(claim),
+                        command = self.command_rx.recv() => Ready::Command(command),
+                    }
+                } => ready,
+            };
+            match ready {
+                Ready::Event(event) => {
                     let Some(event) = event else {
                         self.fail("code-mode host event stream closed".to_string());
                         return;
@@ -102,14 +120,14 @@ impl ConnectionDriver {
                         return;
                     }
                 }
-                claim = self.execute_claim_rx.recv() => {
+                Ready::Claim(claim) => {
                     let Some(request_id) = claim else {
                         self.fail("code-mode execute claim stream closed".to_string());
                         return;
                     };
                     self.requests.claim_execute(request_id);
                 }
-                command = self.command_rx.recv() => {
+                Ready::Command(command) => {
                     let Some(command) = command else {
                         self.fail("code-mode host command stream closed".to_string());
                         return;

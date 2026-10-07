@@ -261,11 +261,12 @@ impl RemoteFileSystem {
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<WalkOutcome> {
         trace!("remote fs walk");
+        options.filters.validate()?;
         let client = self.client.get().await.map_err(map_remote_error)?;
         let response = match client
             .fs_walk(FsWalkParams {
                 path: path.clone(),
-                options,
+                options: options.clone(),
                 sandbox: remote_sandbox_context(sandbox),
             })
             .await
@@ -282,6 +283,10 @@ impl RemoteFileSystem {
             }
             Err(error) => return Err(map_remote_error(error)),
         };
+        if !options.filters.is_empty() && response.applied_filters.as_ref() != Some(&options.filters) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "remote filesystem did not apply requested walk filters; update the execution server or use an unfiltered audit"));
+        }
         Ok(response)
     }
 

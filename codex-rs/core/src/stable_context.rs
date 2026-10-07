@@ -52,7 +52,7 @@ const TRUSTED_STABLE_CONTEXT_ITEM_ID_BASE: &str = "msg_sctx";
 const TRUSTED_STABLE_CONTEXT_ITEM_ID_PREFIX: &str = "msg_sctx_";
 
 pub(crate) fn turn_contribution_text(index: usize, text: &str) -> String {
-    format!("<turn_context_contribution index=\"{index}\">\n{text}\n</turn_context_contribution>")
+    format!("<turn_context_contribution index=\"{index}\">\nCurrent contribution for this source; replaces earlier values with the same index.\n{text}\n</turn_context_contribution>")
 }
 
 pub(crate) fn turn_contribution_removal(index: usize) -> String {
@@ -92,7 +92,7 @@ pub(crate) fn normalize_provider_context_item_id(item: &mut ResponseItem) {
     }
 }
 
-fn is_trusted_stable_context_item(item: &ResponseItem) -> bool {
+pub(crate) fn is_trusted_stable_context_item(item: &ResponseItem) -> bool {
     item.id().is_some_and(is_trusted_stable_context_id)
 }
 
@@ -522,8 +522,7 @@ impl StableContextSlot {
     fn is_volatile(self) -> bool {
         matches!(
             self,
-            Self::TurnContribution(_)
-                | Self::SelectedSkill
+            Self::SelectedSkill
                 | Self::AppContext
                 | Self::ModelSwitch
                 | Self::Environment
@@ -591,9 +590,13 @@ fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSection<'_
     let mut content_index = 0;
     while let Some(content_item) = content.get(content_index) {
         let ContentItem::InputText { text } = content_item else {
-            return None;
+            content_index += 1;
+            continue;
         };
-        let classification = classify_stable_text(role, text)?;
+        let Some(classification) = classify_stable_text(role, text) else {
+            content_index += 1;
+            continue;
+        };
         let (payload, consumed) = match classification.payload {
             StablePayload::Inline | StablePayload::Removed => (text.as_str(), 1),
             StablePayload::FollowingText => {
@@ -619,8 +622,8 @@ fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSection<'_
 /// Removes unchanged non-volatile stable sections that are already the latest
 /// value of their slot in history. A full startup reinjection caused by one
 /// changed fragment therefore appends only its changed and volatile sections;
-/// an item with nothing left is removed. Untrusted or ambiguous items remain
-/// whole, and volatile sections remain turn-scoped.
+/// an item with nothing left is removed. Unclassified content is retained;
+/// untrusted or ambiguous items remain whole. Volatile sections stay turn-scoped.
 pub(crate) fn filter_unchanged_stable_context_items(
     history: &[ResponseItem],
     candidates: Vec<ResponseItem>,
@@ -678,6 +681,22 @@ pub(crate) fn filter_unchanged_stable_context_items(
 pub(crate) fn project_stable_context(
     items: Arc<[ResponseItem]>,
     target: StableContextTarget,
+) -> StableContextProjection {
+    project_stable_context_inner(items, target, false)
+}
+
+/// Replacement history must retain trusted identity, source order, and the
+/// presence markers needed to project the installed history again.
+pub(crate) fn project_compaction_context(items: Arc<[ResponseItem]>) -> Vec<ResponseItem> {
+    project_stable_context_inner(items, StableContextTarget::Sampling, true)
+        .items
+        .to_vec()
+}
+
+fn project_stable_context_inner(
+    items: Arc<[ResponseItem]>,
+    target: StableContextTarget,
+    preserve_history: bool,
 ) -> StableContextProjection {
     let fallback_items = Arc::clone(&items);
     let mut occurrences = Vec::new();
@@ -746,7 +765,11 @@ pub(crate) fn project_stable_context(
         if contains_stable && contains_unprojectable {
             ambiguous = true;
         }
-        if role == "user" && contains_ordinary_user_content {
+        if role == "user"
+            && contains_ordinary_user_content
+            && !trusted_stable_context
+            && !crate::compact::is_compaction_summary_item(item)
+        {
             latest_real_user = Some(item_index);
             if let Some(turn_id) = item.turn_id() {
                 user_insertion_by_turn.entry(turn_id).or_insert(item_index);
@@ -763,6 +786,7 @@ pub(crate) fn project_stable_context(
             &occurrences,
             latest_real_user,
             &user_insertion_by_turn,
+            preserve_history,
         );
         (projected.into(), components)
     } else {
@@ -790,6 +814,7 @@ fn project_items(
     occurrences: &[Occurrence],
     latest_real_user: Option<usize>,
     user_insertion_by_turn: &HashMap<&str, usize>,
+    preserve_history: bool,
 ) -> (Vec<ResponseItem>, Vec<StableContextComponent>) {
     let selected_skill_indexes =
         current_selected_skill_indexes(items, occurrences, latest_real_user);
@@ -856,87 +881,125 @@ fn project_items(
             )
         })
         .collect::<HashSet<_>>();
-    let mut reusable = Vec::<(StableContextSlot, usize, ResponseItem)>::new();
-    let mut volatile = Vec::<(StableContextSlot, usize, ResponseItem)>::new();
-    for (occurrence_index, occurrence) in occurrences.iter().enumerate() {
-        let key = (occurrence.item_index, occurrence.content_index);
-        if !keep.contains(&key) {
-            continue;
-        }
-        let Some(item) = items.get(occurrence.item_index) else {
-            continue;
-        };
-        let text = occurrence.text(items).to_string();
-        let Some(projected_item) =
-            projected_message(item, false, vec![ContentItem::InputText { text }])
-        else {
-            continue;
-        };
-        let target = if occurrence.slot.is_volatile() {
-            &mut volatile
-        } else {
-            &mut reusable
-        };
-        target.push((occurrence.slot, occurrence_index, projected_item));
-    }
-    let sort_fragments = |fragments: &mut Vec<(StableContextSlot, usize, ResponseItem)>| {
-        fragments
-            .sort_by_key(|(slot, occurrence_index, _)| (slot.canonical_order(), *occurrence_index));
-    };
-    sort_fragments(&mut reusable);
-    sort_fragments(&mut volatile);
-
-    let mut ordinary = Vec::<(usize, ResponseItem)>::with_capacity(items.len());
-    for (item_index, item) in items.iter().enumerate() {
-        let ResponseItem::Message { content, .. } = item else {
-            ordinary.push((item_index, item.clone()));
-            continue;
-        };
-        let mut next_content = Vec::with_capacity(content.len());
-        for (content_index, content_item) in content.iter().enumerate() {
-            let key = (item_index, content_index);
-            if occurrence_content.contains(&key) {
+    let projected = if preserve_history {
+        let retained_content = occurrences
+            .iter()
+            .filter(|occurrence| keep.contains(&(occurrence.item_index, occurrence.content_index)))
+            .flat_map(|occurrence| {
+                std::iter::once((occurrence.item_index, occurrence.content_index)).chain(
+                    occurrence
+                        .payload_content_index
+                        .map(|index| (occurrence.item_index, index)),
+                )
+            })
+            .collect::<HashSet<_>>();
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(item_index, item)| {
+                let ResponseItem::Message { content, .. } = item else {
+                    return Some(item.clone());
+                };
+                let content = content
+                    .iter()
+                    .enumerate()
+                    .filter(|(content_index, _)| {
+                        let key = (item_index, *content_index);
+                        !occurrence_content.contains(&key) || retained_content.contains(&key)
+                    })
+                    .map(|(_, part)| part.clone())
+                    .collect::<Vec<_>>();
+                (!content.is_empty())
+                    .then(|| projected_message(item, true, content))
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let mut reusable = Vec::<(StableContextSlot, usize, ResponseItem)>::new();
+        let mut volatile = Vec::<(StableContextSlot, usize, ResponseItem)>::new();
+        for (occurrence_index, occurrence) in occurrences.iter().enumerate() {
+            let key = (occurrence.item_index, occurrence.content_index);
+            if !keep.contains(&key) {
                 continue;
             }
-            next_content.push(content_item.clone());
-        }
-        if next_content.is_empty() {
-            continue;
-        }
-        if let Some(next_item) = projected_message(item, true, next_content) {
-            ordinary.push((item_index, next_item));
-        }
-    }
-
-    let mut projected = Vec::with_capacity(items.len() + reusable.len() + volatile.len());
-    projected.extend(reusable.into_iter().map(|(_, _, item)| item));
-    let mut volatile_by_item = HashMap::<usize, Vec<ResponseItem>>::new();
-    for (_, occurrence_index, item) in volatile {
-        let occurrence = &occurrences[occurrence_index];
-        let item_index = volatile_user_insertion_index(
-            occurrence,
-            items,
-            latest_real_user,
-            user_insertion_by_turn,
-        )
-        .unwrap_or(occurrence.item_index);
-        volatile_by_item.entry(item_index).or_default().push(item);
-    }
-    let mut ordinary = ordinary.into_iter().peekable();
-    for item_index in 0..items.len() {
-        if let Some(items) = volatile_by_item.remove(&item_index) {
-            projected.extend(items);
-        }
-        while ordinary
-            .peek()
-            .is_some_and(|(ordinary_index, _)| *ordinary_index == item_index)
-        {
-            let Some((_, item)) = ordinary.next() else {
-                break;
+            let Some(item) = items.get(occurrence.item_index) else {
+                continue;
             };
-            projected.push(item);
+            let text = occurrence.text(items).to_string();
+            let Some(projected_item) =
+                projected_message(item, false, vec![ContentItem::InputText { text }])
+            else {
+                continue;
+            };
+            let target = if occurrence.slot.is_volatile() {
+                &mut volatile
+            } else {
+                &mut reusable
+            };
+            target.push((occurrence.slot, occurrence_index, projected_item));
         }
-    }
+        let sort_fragments = |fragments: &mut Vec<(StableContextSlot, usize, ResponseItem)>| {
+            fragments.sort_by_key(|(slot, occurrence_index, _)| {
+                (slot.canonical_order(), *occurrence_index)
+            });
+        };
+        sort_fragments(&mut reusable);
+        sort_fragments(&mut volatile);
+
+        let mut ordinary = Vec::<(usize, ResponseItem)>::with_capacity(items.len());
+        for (item_index, item) in items.iter().enumerate() {
+            let ResponseItem::Message { content, .. } = item else {
+                ordinary.push((item_index, item.clone()));
+                continue;
+            };
+            let mut next_content = Vec::with_capacity(content.len());
+            for (content_index, content_item) in content.iter().enumerate() {
+                let key = (item_index, content_index);
+                if occurrence_content.contains(&key) {
+                    continue;
+                }
+                next_content.push(content_item.clone());
+            }
+            if next_content.is_empty() {
+                continue;
+            }
+            if let Some(next_item) = projected_message(item, true, next_content) {
+                ordinary.push((item_index, next_item));
+            }
+        }
+
+        let mut projected = Vec::with_capacity(items.len() + reusable.len() + volatile.len());
+        projected.extend(reusable.into_iter().map(|(_, _, item)| item));
+        let mut volatile_by_item = HashMap::<usize, Vec<ResponseItem>>::new();
+        for (_, occurrence_index, item) in volatile {
+            let occurrence = &occurrences[occurrence_index];
+            let item_index = volatile_user_insertion_index(
+                occurrence,
+                items,
+                latest_real_user,
+                user_insertion_by_turn,
+            )
+            .unwrap_or(occurrence.item_index);
+            volatile_by_item.entry(item_index).or_default().push(item);
+        }
+        let mut ordinary = ordinary.into_iter().peekable();
+        for item_index in 0..items.len() {
+            if let Some(items) = volatile_by_item.remove(&item_index) {
+                projected.extend(items);
+            }
+            while ordinary
+                .peek()
+                .is_some_and(|(ordinary_index, _)| *ordinary_index == item_index)
+            {
+                let Some((_, item)) = ordinary.next() else {
+                    break;
+                };
+                projected.push(item);
+            }
+        }
+
+        projected
+    };
 
     let mut components = Vec::new();
     for (slot, latest_index) in latest_by_slot {
@@ -1044,17 +1107,18 @@ fn current_selected_skill_indexes(
     occurrences: &[Occurrence],
     latest_real_user: Option<usize>,
 ) -> Vec<usize> {
-    let Some(user_index) = latest_real_user else {
-        return Vec::new();
-    };
-    let user_turn_id = items[user_index].turn_id();
+    // An interruption or turn-ID change is not task completion. Share the
+    // conservative completion boundary with sampling and compaction; legacy
+    // histories without accepted completion evidence retain their skills.
+    let completed = crate::context_manager::completed_turn_boundary(items);
+    let user_turn_id = latest_real_user.and_then(|index| items[index].turn_id());
     occurrences
         .iter()
         .enumerate()
         .filter(|(_, occurrence)| occurrence.slot == StableContextSlot::SelectedSkill)
-        .filter(|(_, occurrence)| match user_turn_id {
-            Some(turn_id) => occurrence.turn_id(items) == Some(turn_id),
-            None => occurrence.item_index > user_index,
+        .filter(|(_, occurrence)| {
+            completed.is_none_or(|boundary| occurrence.item_index >= boundary)
+                || user_turn_id.is_some_and(|turn_id| occurrence.turn_id(items) == Some(turn_id))
         })
         .map(|(index, _)| index)
         .collect()
@@ -1542,7 +1606,12 @@ mod tests_optimization {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
-        mark_trusted_stable_context_item(&mut item);
+        if role != "user"
+            || classify_stable_text(role, text).is_some()
+            || contains_known_open_marker(text)
+        {
+            mark_trusted_stable_context_item(&mut item);
+        }
         item
     }
 
@@ -1894,8 +1963,8 @@ mod tests_optimization {
 
         assert_eq!(
             CLASSIFY_STABLE_TEXT_CALLS.with(Cell::get),
-            5,
-            "projection classifies each source fragment exactly once"
+            4,
+            "projection classifies trusted fragments once and skips ordinary user text"
         );
         let prompt_index = projection
             .items

@@ -46,6 +46,67 @@ fn captured(items: Vec<RolloutItem>) -> Vec<CapturedRolloutItem> {
         .collect()
 }
 
+#[tokio::test]
+async fn failed_rollout_backlog_is_bounded_and_only_barriers_retry() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let blocked = home.path().join("blocked");
+    fs::write(&blocked, "not a directory")?;
+    let path = blocked.join("rollout.jsonl");
+    let item = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent { message: "retained evidence".into(), phase: None }));
+    let charge = rollout_admission_bytes(std::slice::from_ref(&item))? as usize;
+    let mut task = RolloutWriterTask::new();
+    task.pending_bytes = Arc::new(tokio::sync::Semaphore::new(charge * 2));
+    let task = Arc::new(task);
+    let (tx, rx) = mpsc::channel(4);
+    let owner = Arc::clone(&task);
+    let writer_path = path.clone();
+    let cwd = home.path().to_path_buf();
+    task.set_handle(tokio::spawn(async move {
+        if let Err(error) = rollout_writer(None, None, rx, None, cwd, Some(None), writer_path, Default::default(), Arc::clone(&owner)).await {
+            owner.mark_failed(&error);
+        }
+    }));
+    let recorder = RolloutRecorder { tx, writer_task: Arc::clone(&task), rollout_path: path.clone() };
+    recorder.record_canonical_items_ordered(std::slice::from_ref(&item)).await?;
+    assert!(recorder.flush().await.is_err(), "durability failure must be observable");
+    // Repair storage, but additions must not each restart the failed episode.
+    fs::remove_file(&blocked)?;
+    fs::create_dir(&blocked)?;
+    recorder.record_canonical_items_ordered(std::slice::from_ref(&item)).await?;
+    for _ in 0..200 {
+        assert!(recorder.record_canonical_items_ordered(std::slice::from_ref(&item)).await.unwrap_err().to_string().contains("no items accepted"));
+    }
+    assert!(!path.exists(), "ordinary additions must not retry degraded I/O");
+    assert_eq!(task.pending_bytes.available_permits(), 0);
+    recorder.flush().await?;
+    assert_eq!(task.pending_bytes.available_permits(), charge * 2);
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(serde_json::to_value(items)?, serde_json::to_value(vec![item.clone(), item])?);
+    recorder.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_reuses_canonical_load_dictionary_for_subsequent_appends() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::new_v4();
+    let id = ThreadId::from_string(&uuid.to_string()).unwrap();
+    let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+    let manifest = RolloutItem::ToolManifest(ToolManifestItem::full("resume-shared".into(), serde_json::json!({"tools": []})));
+    append_rollout_item_to_path(&path, &manifest).await?;
+    let (expected, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
+    let (recorder, history) = RolloutRecorder::resume_and_load(&test_config(home.path()), path.clone(), id).await?;
+    assert_eq!(serde_json::to_value(&history)?, serde_json::to_value(expected)?);
+    recorder.record_canonical_items_ordered(&[manifest]).await?;
+    recorder.shutdown().await?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
+    let RolloutItem::ToolManifest(last) = items.last().unwrap() else { panic!("manifest") };
+    assert!(last.is_reference());
+    assert_eq!(serde_json::to_value(&items[..history.len()])?, serde_json::to_value(&history)?);
+    Ok(())
+}
+
 fn test_config(codex_home: &Path) -> RolloutConfig {
     RolloutConfig {
         codex_home: codex_home.to_path_buf(),
@@ -511,19 +572,109 @@ async fn resume_skips_invalid_utf8_without_fabricating_or_losing_history() -> st
         assert_eq!(parse_errors, 2);
         assert_eq!(loaded_id, thread_id);
         assert_eq!(
-            serde_json::to_value(&items)?,
+            serde_json::to_value(&items[..expected.len()])?,
             serde_json::to_value(&expected)?
         );
+        assert_eq!(items.len(), expected.len() + 1);
+        assert_reconstruction_gap(items.last().unwrap(), 2);
         let InitialHistory::Resumed(history) = RolloutRecorder::get_rollout_history(&path).await?
         else {
             panic!("expected resumed history");
         };
         assert_eq!(
             serde_json::to_value(history.history.as_ref())?,
-            serde_json::to_value(&expected)?
+            serde_json::to_value(&items)?
         );
     }
     assert_eq!(fs::read(home.path().join("original.jsonl"))?, bytes);
+    Ok(())
+}
+
+fn assert_reconstruction_gap(item: &RolloutItem, count: usize) {
+    let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = item else {
+        panic!("expected a model-visible reconstruction gap");
+    };
+    assert_eq!(role, "developer");
+    let [codex_protocol::models::ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("expected bounded gap text");
+    };
+    assert!(text.starts_with("<rollout_reconstruction_gap>"));
+    assert!(text.contains(&format!("{count} malformed rollout records")));
+    assert!(text.len() < 1024);
+}
+
+#[tokio::test]
+async fn resume_integrity_distinguishes_interior_corruption_from_partial_tail() -> std::io::Result<()> {
+    for compressed in [false, true] {
+        for partial in [false, true] {
+            let home = TempDir::new()?;
+            let mut path = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())?;
+            let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+            if partial {
+                write!(file, "{{\"timestamp\":")?;
+            } else {
+                writeln!(file, "corrupt interior result")?;
+            }
+            drop(file);
+            if !partial {
+                append_rollout_item_to_path(&path, &RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                    codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+                ))).await?;
+            }
+            if compressed {
+                let bytes = fs::read(&path)?;
+                path = path.with_extension("jsonl.zst");
+                fs::write(&path, zstd::stream::encode_all(bytes.as_slice(), 0)?)?;
+                fs::remove_file(path.with_extension(""))?;
+            }
+            let InitialHistory::Resumed(history) = RolloutRecorder::get_rollout_history(&path).await? else {
+                panic!("expected resume");
+            };
+            assert_reconstruction_gap(history.history.last().unwrap(), 1);
+            let notice = serde_json::to_string(history.history.last().unwrap())?;
+            assert!(notice.contains(if partial {
+                "malformed_records=0, trailing_partial_records=1, complete=false"
+            } else {
+                "malformed_records=1, trailing_partial_records=0, complete=false"
+            }));
+            let (recorder, resumed) = RolloutRecorder::resume_and_load(
+                &test_config(home.path()), path, history.conversation_id,
+            ).await?;
+            assert_reconstruction_gap(resumed.last().unwrap(), 1);
+            recorder.shutdown().await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_middle_records_remain_visible_after_replacement_history() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())?;
+    let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+    for _ in 0..100 {
+        writeln!(file, "malformed middle record")?;
+    }
+    drop(file);
+    let replacement = RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+        message: "surviving checkpoint".into(),
+        replacement_history: Some(Vec::new()),
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    });
+    append_rollout_item_to_path(&path, &replacement).await?;
+    let original = fs::read(&path)?;
+    for _ in 0..2 {
+        let InitialHistory::Resumed(history) = RolloutRecorder::get_rollout_history(&path).await? else {
+            panic!("expected resumed history");
+        };
+        assert_eq!(history.history.len(), 4);
+        assert!(matches!(history.history[2], RolloutItem::Compacted(_)));
+        assert_reconstruction_gap(history.history.last().unwrap(), 100);
+    }
+    assert_eq!(fs::read(&path)?, original);
     Ok(())
 }
 
@@ -560,7 +711,8 @@ async fn load_rollout_items_ignores_unknown_fork_source_history_mode() -> std::i
 
     assert_eq!(loaded_thread_id, Some(thread_id));
     assert_eq!(parse_errors, 1);
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 3);
+    assert_reconstruction_gap(items.last().unwrap(), 1);
     Ok(())
 }
 
@@ -1698,6 +1850,44 @@ async fn assert_failed_append_is_written_once(
 }
 
 #[tokio::test]
+async fn cancelled_direct_append_finishes_before_releasing_write_ownership() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    File::create(&path)?;
+    let lock = compression::lock_rollout_for_write_blocking(&path)?;
+    let first = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        message: "first".into(), ..Default::default()
+    }));
+    let mut append = Box::pin(append_rollout_item_to_path(&path, &first));
+    assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+        std::future::Future::poll(append.as_mut(), cx)
+    )).await.is_pending());
+    drop(append);
+    drop(lock);
+    let second = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        message: "second".into(), ..Default::default()
+    }));
+    append_rollout_item_to_path(&path, &second).await?;
+    let text = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let text = tokio::fs::read_to_string(&path).await.unwrap();
+            if text.lines().count() == 2 { break text; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the detached append must finish");
+    let mut messages = text.lines().map(|line| {
+        let line: RolloutLine = serde_json::from_str(line).unwrap();
+        match line.item {
+            RolloutItem::EventMsg(EventMsg::UserMessage(event)) => event.message,
+            _ => panic!("unexpected record"),
+        }
+    }).collect::<Vec<_>>();
+    messages.sort();
+    assert_eq!(messages, vec!["first", "second"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn writer_state_does_not_retry_an_ambiguously_flushed_record() -> std::io::Result<()> {
     assert_failed_append_is_written_once(JsonlWriteFault::Complete, "ambiguous-flush-record").await
 }
@@ -2034,6 +2224,60 @@ fn rollout_write_lock_serializes_append_recovery() -> std::io::Result<()> {
         compression::try_lock_rollout_for_write_blocking(&rollout_path)?.is_some(),
         "the append transaction lock should be released with its guard"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn damaged_payloads_preserve_later_records_and_filename_thread_identity() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let id = ThreadId::new();
+    let path = home.path().join(format!("rollout-2026-10-07T00-00-00-{id}.jsonl"));
+    let meta = RolloutItem::SessionMeta(SessionMetaLine {
+        meta: SessionMeta { id, originator: "large metadata ".repeat(1000), ..Default::default() }, git: None,
+    });
+    let later = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent { message: "retained later record".into(), phase: None }));
+    let mut writer = open_log_file(&path)?.into_jsonl_writer();
+    writer.write_rollout_item(&meta).await?;
+    writer.write_rollout_item(&later).await?;
+    let text = fs::read_to_string(&path)?;
+    let reference: serde_json::Value = serde_json::from_str(text.lines().next().unwrap())?;
+    let blob = crate::payload_artifact::root(&path).join(format!("{}.json", reference["payload"]["sha256"].as_str().unwrap()));
+    let bytes = fs::read(&blob)?;
+    for missing in [false, true] {
+        if missing { fs::remove_file(&blob)?; } else { fs::write(&blob, b"corrupt")?; }
+        let (items, thread, errors) = RolloutRecorder::load_rollout_items(&path).await?;
+        assert_eq!(serde_json::to_value(&items[..1])?, serde_json::to_value(vec![later.clone()])?);
+        assert_eq!(items.len(), 2);
+        assert_reconstruction_gap(items.last().unwrap(), 1);
+        assert_eq!(thread, Some(id));
+        assert_eq!(errors, 1);
+        assert!(matches!(RolloutRecorder::get_rollout_history(&path).await?, InitialHistory::Resumed(_)));
+        assert!(crate::list::read_head_for_summary(&path).await.is_ok());
+    }
+    fs::write(&blob, bytes)?;
+    crate::payload_artifact::sync_payload_artifacts(&path).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_flush_retries_unsynced_payloads_before_acknowledging_rollout() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    let writer = open_log_file(&path)?.into_jsonl_writer();
+    let mut state = RolloutWriterState::new(Some(writer), None, None, home.path().into(), None, path.clone(), Default::default());
+    state.add_items(captured(vec![RolloutItem::ToolManifest(ToolManifestItem::full(
+        "payload-sync".into(), serde_json::json!({"large": "x".repeat(10000)}),
+    ))]));
+    state.flush().await?;
+    let text = fs::read_to_string(&path)?;
+    let reference: serde_json::Value = serde_json::from_str(text.lines().next().unwrap())?;
+    let blob = crate::payload_artifact::root(&path).join(format!("{}.json", reference["payload"]["sha256"].as_str().unwrap()));
+    let saved = fs::read(&blob)?;
+    fs::remove_file(&blob)?;
+    assert!(state.flush_durable().await.is_err());
+    fs::write(&blob, saved)?;
+    state.flush_durable().await?;
+    assert_eq!(fs::read_to_string(&path)?, text);
     Ok(())
 }
 

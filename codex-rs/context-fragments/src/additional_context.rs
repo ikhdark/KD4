@@ -44,6 +44,7 @@ impl ContextualUserFragment for AdditionalContextUserFragment {
             "<external_context source=\"",
             "\" kind=\"untrusted\">\n",
             "\n</external_context>",
+            Some(MAX_ADDITIONAL_CONTEXT_VALUE_BYTES),
         ) || matches_legacy_external_context(trimmed)
     }
 
@@ -88,6 +89,7 @@ impl ContextualUserFragment for AdditionalContextDeveloperFragment {
             "<application_context source=\"",
             "\" kind=\"application\">\n",
             "\n</application_context>",
+            None,
         )
     }
 
@@ -106,6 +108,7 @@ fn matches_explicit_context(
     opening_prefix: &str,
     opening_suffix: &str,
     closing_tag: &str,
+    max_body_bytes: Option<usize>,
 ) -> bool {
     let Some(after_prefix) = trimmed.strip_prefix(opening_prefix) else {
         return false;
@@ -129,7 +132,8 @@ fn matches_explicit_context(
 
     body_and_close
         .strip_suffix(closing_tag)
-        .is_some_and(matches_rendered_text_value)
+        .is_some_and(|body| max_body_bytes.is_none_or(|limit| body.len() <= limit)
+            && matches_rendered_text_value(body))
 }
 
 fn matches_rendered_attr_value(mut value: &str) -> bool {
@@ -161,10 +165,6 @@ fn matches_rendered_attr_value(mut value: &str) -> bool {
 }
 
 fn matches_rendered_text_value(mut value: &str) -> bool {
-    if value.len() > MAX_ADDITIONAL_CONTEXT_VALUE_BYTES {
-        return false;
-    }
-
     while !value.is_empty() {
         if let Some(rest) = value
             .strip_prefix("&amp;")
@@ -199,10 +199,17 @@ fn matches_legacy_external_context(trimmed: &str) -> bool {
 }
 
 fn additional_context_body(tag: &str, kind: &str, key: &str, value: &str) -> String {
+    let body = if kind == APPLICATION_CONTEXT_KIND {
+        let mut escaped = String::new();
+        push_escaped_text(&mut escaped, value);
+        escaped
+    } else {
+        escape_text_with_token_budget(value)
+    };
     format!(
         "<{tag} source=\"{}\" kind=\"{kind}\">\n{}\n</{tag}>",
         escape_attr_value_with_byte_budget(key),
-        escape_text_with_token_budget(value)
+        body
     )
 }
 
@@ -362,5 +369,21 @@ fn push_escaped_attr_value(escaped: &mut String, value: &str) {
             '\'' => escaped.push_str("&#39;"),
             _ => escaped.push(ch),
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn application_policy_keeps_middle_while_external_data_remains_bounded() {
+        let value = format!("{}Never modify X.{}", "before ".repeat(1500), " after".repeat(1500));
+        let policy = AdditionalContextDeveloperFragment::new("policy".into(), value.clone()).render();
+        assert!(policy.contains(&value));
+        assert!(AdditionalContextDeveloperFragment::matches_text(&policy));
+        let external = AdditionalContextUserFragment::new("data".into(), value).render();
+        assert!(external.contains("tokens truncated"));
+        assert!(external.len() < 4200);
     }
 }

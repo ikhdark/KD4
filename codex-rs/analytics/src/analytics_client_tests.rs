@@ -963,6 +963,9 @@ fn sample_command_execution_item_with_id(
     duration_ms: Option<i64>,
 ) -> ThreadItem {
     ThreadItem::CommandExecution {
+        output_metadata: None,
+        stdout: None,
+        stderr: None,
         id: id.to_string(),
         command: "echo hi".to_string(),
         cwd: test_path_buf("/tmp").abs().into(),

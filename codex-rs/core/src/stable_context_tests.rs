@@ -12,7 +12,12 @@ fn text_message(role: &str, text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
-    mark_trusted_stable_context_item(&mut item);
+    if role != "user"
+        || classify_stable_text(role, text).is_some()
+        || contains_known_open_marker(text)
+    {
+        mark_trusted_stable_context_item(&mut item);
+    }
     item
 }
 
@@ -522,8 +527,9 @@ fn selected_skills_preserve_usage_and_same_turn_discovery() {
     let restored_text = visible_text(&restored.items);
     assert!(restored_text.contains(&usage));
     assert!(restored_text.contains(&catalog));
-    assert!(!restored_text.contains(&selected_a.as_str()));
-    assert!(!restored_text.contains(&selected_b.as_str()));
+    // A later user message alone does not prove the earlier task completed.
+    assert!(restored_text.contains(&selected_a.as_str()));
+    assert!(restored_text.contains(&selected_b.as_str()));
 }
 
 #[test]
@@ -588,7 +594,7 @@ fn selected_skill_change_and_resolution_failure_replace_then_restore_catalog() {
         StableContextTarget::Sampling,
     );
     let changed_text = visible_text(&changed.items);
-    assert!(!changed_text.contains(&selected_a.as_str()));
+    assert!(changed_text.contains(&selected_a.as_str()));
     assert!(changed_text.contains(&selected_b.as_str()));
     assert!(changed_text.contains(&catalog));
 
@@ -606,7 +612,7 @@ fn selected_skill_change_and_resolution_failure_replace_then_restore_catalog() {
     let unresolved_text = visible_text(&unresolved.items);
     assert!(unresolved_text.contains(&usage));
     assert!(unresolved_text.contains(&catalog));
-    assert!(!unresolved_text.contains(&selected_a.as_str()));
+    assert!(unresolved_text.contains(&selected_a.as_str()));
 }
 
 #[test]
@@ -770,7 +776,7 @@ fn mixed_stable_and_ordinary_user_message_sets_latest_real_user_boundary() {
     let text = visible_text(&projection.items);
     assert!(text.contains(&usage));
     assert!(text.contains(&catalog));
-    assert!(!text.contains(&selected.as_str()));
+    assert!(text.contains(&selected.as_str()));
     assert!(text.contains(&"new ordinary task"));
 }
 

@@ -410,29 +410,26 @@ fn test_apply_patch_cli_rejects_overlapping_eof_chunks() -> anyhow::Result<()> {
 #[test]
 fn test_apply_patch_cli_reports_committed_prefix() -> anyhow::Result<()> {
     let tmp = tempdir()?;
-    // Preflight cannot see that a directory blocks this add; the write fails
-    // after the first hunk has already been committed.
+    // An unreadable destination is rejected in preflight, before the prefix
+    // can commit. It must not be reported as a partially applied patch.
     fs::create_dir(tmp.path().join("blocked"))?;
     let output = apply_patch_command()?
         .arg("*** Begin Patch\n*** Add File: created.txt\n+created\n*** Add File: blocked\n+never written\n*** End Patch")
         .current_dir(tmp.path()).assert().failure();
     let stderr = String::from_utf8_lossy(&output.get_output().stderr);
     assert!(
-        stderr.contains("Patch failed after applying these changes:"),
+        stderr.contains("destination preimage is unreadable"),
         "{stderr}"
     );
     assert_eq!(
         stderr
             .matches(&format!("A {}", tmp.path().join("created.txt").display()))
             .count(),
-        1,
-        "committed files must be reported exactly once: {stderr}"
+        0,
+        "uncommitted files must not be reported: {stderr}"
     );
-    assert!(stderr.contains("do not retry the whole patch"), "{stderr}");
-    assert_eq!(
-        fs::read_to_string(tmp.path().join("created.txt"))?,
-        "created\n"
-    );
+    assert!(!stderr.contains("Patch failed after applying these changes:"), "{stderr}");
+    assert!(!tmp.path().join("created.txt").exists());
     assert!(tmp.path().join("blocked").is_dir());
     Ok(())
 }

@@ -104,25 +104,79 @@ async fn archive_waits_for_compression_and_moves_its_final_representation() -> a
 }
 
 #[tokio::test]
-async fn archive_can_move_rollout_before_live_append_handle_closes() -> anyhow::Result<()> {
+async fn archive_waits_until_live_append_handle_closes() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let uuid = Uuid::from_u128(910);
     let thread_id = ThreadId::from_string(&uuid.to_string())?;
     let path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
     write_rollout(&path, thread_id, "live thread")?;
     let (_, append_guard) = lock_rollout_for_append_blocking(&path)?;
-    let archive = tokio::time::timeout(
-        Duration::from_secs(2),
-        move_rollout_to_directory(&path, &home.path().join(crate::ARCHIVED_SESSIONS_SUBDIR)),
-    )
-    .await;
+    let source = path.clone();
+    let destination = home.path().join(crate::ARCHIVED_SESSIONS_SUBDIR);
+    let mut archive = tokio::spawn(async move { move_rollout_to_directory(&source, &destination).await });
+    let waited = tokio::time::timeout(Duration::from_millis(100), &mut archive).await.is_err();
     drop(append_guard);
-    let archived_path = archive??;
+    assert!(waited, "the source lock must remain owned until append completion");
+    let archived_path = archive.await??;
     assert!(!path.exists());
     assert!(archived_path.exists());
     let (_, loaded_id, parse_errors) = RolloutRecorder::load_rollout_items(&archived_path).await?;
     assert_eq!(loaded_id, Some(thread_id));
     assert_eq!(parse_errors, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rollout_moves_accept_identical_duplicates_and_preserve_conflicts() -> anyhow::Result<()> {
+    for compressed in [false, true] {
+        let home = TempDir::new()?;
+        let source = rollout_path(home.path(), "2025-01-03T12-00-00", Uuid::from_u128(912));
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::write(&source, b"identical\n")?;
+        let destination_dir = home.path().join(crate::ARCHIVED_SESSIONS_SUBDIR);
+        fs::create_dir_all(&destination_dir)?;
+        let destination = destination_dir.join(source.file_name().unwrap());
+        let destination = if compressed { compressed_rollout_path(&destination) } else { destination };
+        let bytes = if compressed { zstd::stream::encode_all(b"different\n".as_slice(), 1)? } else { b"different\n".to_vec() };
+        fs::write(&destination, &bytes)?;
+        assert!(move_rollout_to_directory(&source, &destination_dir).await.is_err());
+        assert_eq!(fs::read(&source)?, b"identical\n");
+        assert_eq!(fs::read(&destination)?, bytes);
+        let bytes = if compressed { zstd::stream::encode_all(b"identical\n".as_slice(), 1)? } else { b"identical\n".to_vec() };
+        fs::write(&destination, &bytes)?;
+        assert_eq!(fs::canonicalize(move_rollout_to_directory(&source, &destination_dir).await?)?, fs::canonicalize(&destination)?);
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination)?, bytes);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unarchive_resolves_representation_after_compression() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(913);
+    let active = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    write_rollout(&active, thread_id, "unarchive after compression")?;
+    let archived = move_rollout_to_directory(&active, &home.path().join(crate::ARCHIVED_SESSIONS_SUBDIR)).await?;
+    set_old_mtime(&archived)?;
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let path = archived.clone();
+    let compressor = tokio::task::spawn_blocking(move ||
+        worker::compress_rollout_if_cold_blocking_paused(&path, reached_tx, resume_rx));
+    reached_rx.await?;
+    let destination = active.parent().unwrap().to_path_buf();
+    let mut mover = tokio::spawn(async move { move_rollout_to_directory(&archived, &destination).await });
+    let waiting = tokio::time::timeout(Duration::from_millis(50), &mut mover).await.is_err();
+    resume_tx.send(())?;
+    compressor.await??;
+    assert!(waiting);
+    let restored = mover.await??;
+    assert!(restored.to_string_lossy().ends_with(".jsonl.zst"));
+    let (_, id, errors) = RolloutRecorder::load_rollout_items(&restored).await?;
+    assert_eq!(id, Some(thread_id));
+    assert_eq!(errors, 0);
     Ok(())
 }
 

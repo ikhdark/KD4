@@ -12,9 +12,11 @@ use serde_json::json;
 use crate::FunctionCallError;
 use crate::tools::command_output_artifact::CanonicalOutputArtifact;
 use crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING;
+use crate::tools::command_output_artifact::ReadToolOutputError;
 use crate::tools::command_output_artifact::ReadToolOutputResult;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
+use crate::tools::command_output_artifact::raw_json_pointer_index;
 use crate::tools::command_output_artifact::select_file_snapshot_for_script;
 use crate::tools::command_output_artifact::select_file_snapshot_with_ceiling;
 use crate::tools::context::ToolCallSource;
@@ -32,7 +34,81 @@ use crate::tools::registry::ToolExecutor;
 const MAX_FILE_MIB: usize = 8;
 const MAX_FILE_BYTES: usize = MAX_FILE_MIB * 1024 * 1024;
 
+#[path = "code_sections.rs"]
+pub(super) mod code_sections;
+
+#[path = "read_file_structure.rs"]
+mod structure;
+use structure::FileSelector;
+
 pub(crate) struct ReadFileHandler;
+pub(crate) struct ReadStatusHandler;
+
+impl ToolExecutor<ToolInvocation> for ReadStatusHandler {
+    fn tool_name(&self) -> ToolName { ToolName::plain("read_status") }
+
+    fn spec(&self) -> ToolSpec {
+        let mut paths = JsonSchema::array(JsonSchema::string(None), Some("1–32 file paths; no source files are read.".into()));
+        paths.min_items = Some(1);
+        paths.max_items = Some(32);
+        ToolSpec::Function(ResponsesApiTool {
+            name: "read_status".into(),
+            description: "Report obtained snapshot byte coverage from read/recovery history, newest observations first (legacy recency may be unknown). Select query.source_sha256 for an exact historical hash; use returned offsets for more snapshots, ranges, or artifacts. No source reread, freshness check, or semantic-read claim. Missing history is unknown; different hashes are never merged.".into(),
+            strict: false, defer_loading: None,
+            parameters: JsonSchema::object(BTreeMap::from([
+                ("paths".into(), paths),
+                ("environment_id".into(), JsonSchema::string(Some("Environment id; omit to use the primary environment.".into()))),
+                ("query".into(), JsonSchema::object(BTreeMap::from([
+                    ("source_sha256".into(), JsonSchema::string(Some("Select the requested source snapshot hash.".into()))),
+                    ("snapshot_id".into(), JsonSchema::string(Some("Select an exact returned snapshot identity, including source attribution.".into()))),
+                    ("snapshot_offset".into(), JsonSchema::integer(Some("Continue at next_snapshot_offset; default 0.".into()))),
+                    ("range_offset".into(), JsonSchema::integer(Some("Continue at next_range_offset for an exact snapshot; default 0.".into()))),
+                    ("artifact_offset".into(), JsonSchema::integer(Some("Continue at next_artifact_offset for an exact snapshot; default 0.".into()))),
+                ]), None, Some(false.into()))),
+            ]), Some(vec!["paths".into()]), Some(false.into())),
+            output_schema: Some(json!({"type":"object", "properties":{
+                "paths":{"type":"array", "items":{"type":"object"}}, "scope":{"type":"string"}},
+                "required":["paths","scope"], "additionalProperties":false}).into()),
+        })
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool { true }
+
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Args {
+                paths: Vec<String>, environment_id: Option<String>,
+                #[serde(default)]
+                query: crate::tool_history::ReadStatusQuery,
+            }
+            let ToolPayload::Function { ref arguments } = invocation.payload else {
+                return Err(FunctionCallError::RespondToModel("read_status requires function arguments".into()));
+            };
+            let args: Args = parse_arguments(arguments)?;
+            if args.paths.is_empty() || args.paths.len() > 32 || args.paths.iter().any(|path| path.trim().is_empty()) {
+                return Err(FunctionCallError::RespondToModel("read_status requires 1–32 nonempty paths".into()));
+            }
+            let environment = wait_for_tool_environment(
+                &invocation.step_context.environments,
+                args.environment_id.as_deref(),
+                &invocation.cancellation_token,
+            ).await?.ok_or_else(|| FunctionCallError::RespondToModel(
+                "read_status requires a selected execution environment.".into()
+            ))?;
+            let paths = args.paths.iter().map(|path| environment.cwd().join(path)
+                .map(|path| std::path::PathBuf::from(path.inferred_native_path_string()))
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string())))
+                .collect::<Result<Vec<_>, _>>()?;
+            let history = invocation.session.clone_history().await;
+            let result = history.tool_history_state().read_status_page(&paths, Some(&environment.environment_id), history.raw_items(), &args.query);
+            Ok(boxed_tool_output(JsonToolOutput::new(result)))
+        })
+    }
+}
+
+impl CoreToolRuntime for ReadStatusHandler {}
 
 struct PendingSourceInspection {
     store: std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>,
@@ -44,7 +120,7 @@ struct PendingSourceInspection {
 struct ReadFileArgs {
     path: String,
     environment_id: Option<String>,
-    selectors: Option<Vec<ToolOutputSelector>>,
+    selectors: Option<Vec<FileSelector>>,
 }
 
 #[derive(Deserialize)]
@@ -53,7 +129,7 @@ struct RawReadFileArgs {
     #[serde(alias = "file_path")]
     path: String,
     environment_id: Option<String>,
-    selectors: Option<Vec<ToolOutputSelector>>,
+    selectors: Option<Vec<FileSelector>>,
     offset: Option<usize>,
     limit: Option<usize>,
     #[serde(default)]
@@ -79,7 +155,7 @@ impl TryFrom<RawReadFileArgs> for ReadFileArgs {
             }
             let end = start.checked_add(limit - 1)
                 .ok_or("line range is too large")?;
-            Some(vec![ToolOutputSelector::Lines { start, end }])
+            Some(vec![FileSelector::Exact(ToolOutputSelector::Lines { start, end })])
         } else {
             raw.selectors
         };
@@ -96,6 +172,8 @@ pub(crate) fn validate_read_file_arguments(arguments: &str) -> Result<(), String
 /// filesystem identity and authorization still belong to the replay guard.
 pub(crate) fn canonical_read_file_arguments(arguments: &str) -> Option<serde_json::Value> {
     let args = parse_arguments::<ReadFileArgs>(arguments).ok()?;
+    // A live turn snapshot is never replayable under a filesystem identity.
+    if args.path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR { return None; }
     Some(json!({
         "path": args.path,
         "environment_id": args.environment_id,
@@ -125,11 +203,11 @@ pub(crate) fn reselect_read_file_output(
     let retained = output["results"].as_array()?;
     let selected = if previous["selectors"].is_null()
         && output["file_complete"] == true
-        && selectors.iter().any(|selector| matches!(selector["kind"].as_str(), Some("lines" | "search")))
+        && selectors.iter().any(|selector| matches!(selector["kind"].as_str(), Some("lines" | "search" | "json_pointer")))
     {
         // Default reads use a byte selector. Reuse that whole authenticated
         // source through the owning selector engine instead of requiring another
-        // filesystem read for lines/search. Search hydration stays self-contained.
+        // filesystem read for lines/search/JSON. Search hydration stays self-contained.
         let source = retained.first()?;
         let text = source["text"].as_str()?;
         if retained.len() != 1 || source["status"] != "ok" || source["complete"] != true
@@ -137,25 +215,21 @@ pub(crate) fn reselect_read_file_output(
             || source["canonical_range"]["end"] != output["canonical_bytes"]
             || output["canonical_bytes"].as_u64()? != text.len() as u64
         { return None; }
-        let canonical = CanonicalToolResult::text(text.to_owned());
-        if output["canonical_sha256"].as_str()? != canonical.sha256 { return None; }
         let selectors: Vec<ToolOutputSelector> = serde_json::from_value(json!(selectors)).ok()?;
         if selectors.iter().any(|selector| !matches!(selector,
             ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Lines { .. } | ToolOutputSelector::Search { .. }
+                | ToolOutputSelector::JsonPointer { .. }
         )) { return None; }
-        let (selection, continuation) = select_file_snapshot_for_script(&canonical, Some(selectors.clone())).ok()?;
-        if !selection.complete || continuation.is_some() { return None; }
-        let selected = serde_json::to_value(selection.results).ok()?;
-        // The replay ledger is shared by direct and script consumers. Direct
-        // selection can reorder/merge mixed ranges and has a smaller budget.
-        // Until the ledger carries that consumer policy, reuse only projections
-        // with identical complete results in both modes, never change the API
-        // shape merely to save an I/O operation.
-        let (direct, _) = select_file_snapshot_with_ceiling(
+        let canonical = file_snapshot(text.to_owned(), Some(&selectors)).ok()?;
+        if output["canonical_sha256"].as_str()? != canonical.sha256 { return None; }
+        // This replay owner is registered by direct model dispatch only; nested
+        // code-mode results do not enter its successful-replay ledger. Match
+        // that consumer's policy once instead of projecting in both modes.
+        let (selection, continuation) = select_file_snapshot_with_ceiling(
             &canonical, Some(selectors), RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000),
         ).ok()?;
-        if !direct.complete || serde_json::to_value(direct.results).ok()? != selected { return None; }
-        selected
+        if !selection.complete || continuation.is_some() { return None; }
+        serde_json::to_value(selection.results).ok()?
     } else {
         // Partial search results can reference other hydration owners. Do not
         // reuse them after removing those owners or infer undelivered source.
@@ -181,7 +255,7 @@ pub(crate) fn reselect_read_file_output(
     let typed = serde_json::from_value::<ReadToolOutputResult>(typed).ok()?;
     output["file_complete"] = json!(file_selection_complete(&typed));
     let fields = output.as_object_mut()?;
-    for key in ["continuation", "page_selectors", "criterion_evidence", "inspection_proof_error"] {
+    for key in ["continuation", "page_selectors", "recovery", "criterion_evidence", "inspection_proof_error", "selector_errors"] {
         fields.remove(key);
     }
     Some(output)
@@ -237,11 +311,13 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Batch known ranges of this file here rather than calling once per range. Search results include matching text in results[].value.hydrated_ranges: consume that text before requesting another inspection. Explicit selectors are exact; oversized selections return child_selectors for the retained snapshot.".to_string()));
+        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Batch known ranges here. Search results include text in results[].value.hydrated_ranges; enclosing:true also returns enclosing Rust/Python items as line selections. json_pointer selects a complete JSON value. symbol and enclosing share the outline parser; qualified names (Type::method or Class.method) disambiguate items, and broken neighboring syntax is tolerated. Unsupported formats and unresolved items fail explicitly. Ordinary reads do not parse source or generate outlines. Exact source ranges remain recoverable from the snapshot. Oversized selections return child_selectors.".to_string()));
         selectors.min_items = Some(1);
         selectors.max_items = Some(READ_TOOL_OUTPUT_MAX_SELECTORS as u64);
         let mut output = read_tool_output_output_schema(file_selector_schema());
         output["properties"]["path"] = json!({"type": "string"});
+        output["properties"]["environment_id"] = json!({"type":"string", "description":"Actual resolved execution environment, or host-skills/host-context for host-owned sources."});
+        output["properties"]["canonical_uri"] = json!({"type":"string", "description":"Canonical path URI in the resolved environment, or the host-owned locator."});
         output["properties"]["total_lines"] = json!({"type": "integer", "minimum": 0});
         output["properties"]["source_sha256"] = json!({"type": "string", "description": "SHA-256 of the complete source file, including bytes outside this selection. Use with revision-bound codex-range patch handles."});
         output["properties"]["artifact_id"] = json!({"type": ["string", "null"], "description": "Immutable snapshot identity when retained; omitted or null for complete inline reads or unavailable storage."});
@@ -252,8 +328,38 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             required.push(json!("source_sha256"));
         }
         output["properties"]["file_complete"] = json!({"type": "boolean", "description": "The returned exact bytes and hydrated ranges together cover the entire file in this response, including explicit selections. Retention, match coordinates, and recovery selectors alone do not establish coverage."});
+        output["properties"]["selector_errors"] = json!({"type":"array", "maxItems":64,
+            "description":"Per-selector structural failures; successful results share this snapshot. Candidate line selectors are exact, not guesses.",
+            "items":{"type":"object", "properties":{
+                "selector_index":{"type":"integer","minimum":0}, "selector":file_selector_schema(),
+                "status":{"const":"invalid_selector"}, "complete":{"const":false}, "message":{"type":"string"},
+                "source_sha256":{"type":"string"}, "omitted_candidates":{"type":"integer","minimum":0},
+                "candidates":{"type":"array","maxItems":8,"items":{"type":"object","properties":{
+                    "qualified_name":{"type":"string"}, "selector":file_selector_schema()},
+                    "required":["qualified_name","selector"],"additionalProperties":false}}},
+                "required":["selector_index","selector","status","complete","message","source_sha256","candidates","omitted_candidates"],
+                "additionalProperties":false}});
         output["properties"]["continuation"] =
             serde_json::to_value(file_selector_schema()).unwrap_or_default();
+        output["properties"]["recovery"] = json!({
+            "type": "object",
+            "description": "Ready-to-pass immutable snapshot recovery: call tools.read_tool_output(recovery.arguments). Bounded, deduplicated unconsumed selections; omitted selections remain in per-result continuations/children.",
+            "properties": {
+                "tool": {"const": "read_tool_output"},
+                "omitted_selectors": {"type":"integer", "minimum":0},
+                "arguments": {
+                    "type": "object",
+                    "properties": {
+                        "artifact_id": {"type": "string"},
+                        "selectors": {"type": "array", "items": file_selector_schema(), "minItems": 1, "maxItems": 64}
+                    },
+                    "required": ["artifact_id", "selectors"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["tool", "arguments"],
+            "additionalProperties": false
+        });
         output["properties"]["page_selectors"] = json!({
             "type": "array", "maxItems": 8, "items": file_selector_schema(),
             "description": "First up to eight independent pages of continuation, in source order. Fetch in parallel; continuation retains the full remaining extent."
@@ -292,7 +398,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     ..JsonSchema::object(BTreeMap::new(), None, None)
                 }).collect()),
                 ..JsonSchema::object(BTreeMap::from([
-                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for complete enabled skill metadata, or `context:desktop` for full configured Desktop guidance. Omit environment_id for host-owned locators. Use search selectors to discover newly relevant guidance.".to_string()))),
+                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for enabled skill metadata, or `context:desktop` for Desktop guidance. Omit environment_id for host-owned locators.".to_string()))),
                 ("file_path".to_string(), JsonSchema::string(Some("Legacy alias for path; use only one.".to_string()))),
                 ("offset".to_string(), JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string()))),
                 ("limit".to_string(), JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string()))),
@@ -327,13 +433,15 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             if args.selectors.iter().flatten().any(|selector| {
                 !matches!(
                     selector,
-                    ToolOutputSelector::Bytes { .. }
+                    FileSelector::Structure(_) | FileSelector::Exact(ToolOutputSelector::Bytes { .. }
                         | ToolOutputSelector::Lines { .. }
                         | ToolOutputSelector::Search { .. }
+                        | ToolOutputSelector::Section { .. }
+                        | ToolOutputSelector::JsonPointer { .. })
                 )
             }) {
                 return Err(FunctionCallError::RespondToModel(
-                    "read_file supports bytes, lines, and search selectors".to_string(),
+                    "read_file supports bytes, lines, search, section, json_pointer, symbol, and enclosing selectors".to_string(),
                 ));
             }
             if invocation.cancellation_token.is_cancelled() {
@@ -345,7 +453,11 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             // The catalog advertises `skill:<id>` locators, so this tool has to
             // resolve them. Without it the model can see every skill listed and
             // load none of them.
-            let (contents, resolved_path, inspection) = if args.path
+            let (contents, resolved_path, inspection, environment_id, canonical_uri) = if args.path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR {
+                return Err(FunctionCallError::RespondToModel(
+                    "context:turn-diff is not available; tracked deltas are not a reliable review source yet.".to_string(),
+                ));
+            } else if args.path
                 == crate::context::desktop_instructions::LOCATOR
             {
                 if args.environment_id.is_some() {
@@ -363,14 +475,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                         "Desktop guidance exceeds the read_file size limit".to_string(),
                     ));
                 }
-                (contents.to_string(), args.path.clone(), None)
+                (contents.to_string(), args.path.clone(), None, "host-context".to_string(), args.path.clone())
             } else if args
                 .path
                 .starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
             {
                 crate::tools::parallel::wait_for_workspace_baseline().await;
                 let (contents, path) = read_skill_locator(&invocation, &args).await?;
-                (contents, path, None)
+                let uri = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&path)
+                    .ok().map(|path| codex_utils_path_uri::PathUri::from_abs_path(&path).to_string())
+                    .unwrap_or_else(|| args.path.clone());
+                (contents, path, None, "host-skills".to_string(), uri)
             } else {
                 read_environment_file(&invocation, &args).await?
             };
@@ -393,14 +508,20 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             // Reserve space for file metadata, page handles, and the exec wrapper.
             let token_ceiling = output_budget.max(2_000).saturating_sub(1_000)
                 .min(RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000));
-            let (canonical, mut result, mut continuation, page_selectors, total_lines) =
+            let structure_path = args.path.clone();
+            let (canonical, mut result, mut continuation, page_selectors, total_lines, selector_errors) =
                 tokio::task::spawn_blocking(move || {
                     let total_lines = contents.lines().count();
-                    let canonical = CanonicalToolResult::text(contents);
+                    let exact = args.selectors.iter().flatten().filter_map(|selector| match selector {
+                        FileSelector::Exact(selector) => Some(selector.clone()),
+                        FileSelector::Structure(_) => None,
+                    }).collect::<Vec<_>>();
+                    let mut canonical = file_snapshot(contents, Some(&exact))?;
+                    let (selectors, selector_errors) = structure::resolve_batch(&structure_path, &mut canonical, args.selectors);
                     let selection = if script_consumer {
-                        select_file_snapshot_for_script(&canonical, args.selectors)
+                        select_file_snapshot_for_script(&canonical, selectors)
                     } else {
-                        select_file_snapshot_with_ceiling(&canonical, args.selectors, token_ceiling)
+                        select_file_snapshot_with_ceiling(&canonical, selectors, token_ceiling)
                     };
                     selection
                         .map(|(result, continuation)| {
@@ -412,7 +533,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                                     ),
                                 _ => Vec::new(),
                             };
-                            (canonical, result, continuation, pages, total_lines)
+                            (canonical, result, continuation, pages, total_lines, selector_errors)
                         })
                 })
                 .await
@@ -422,13 +543,15 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     ))
                 })?
                 .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
-            let file_complete = file_selection_complete(&result);
+            result.complete &= selector_errors.is_empty();
+            let successful = result.selection_status() == "complete";
+            let file_complete = selector_errors.is_empty() && file_selection_complete(&result);
             // Explicit selections retain the existing immutable-snapshot contract.
             // Complete default reads stay inline; omitted bytes need one durable
             // snapshot, but selecting them never rereads the file just written.
             let artifact = if explicit_selection || continuation.is_some() {
                 let reused = if let Some(id) = invocation.session
-                    .reusable_tool_artifact(canonical.exact_bytes, &canonical.sha256).await
+                    .reusable_tool_artifact(&invocation.call_id, canonical.exact_bytes, &canonical.sha256).await
                 {
                     let artifact = crate::tools::command_output_artifact::attach_canonical_output_artifact(
                         &turn.config.codex_home, &thread_id, &id, &canonical,
@@ -485,33 +608,31 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 }
             }
             let evidence = result.delivered_evidence().map(|identity| {
-                crate::tools::context::declared_file_lineage_evidence(&canonical.bytes)
-                    .unwrap_or_else(|| json!({
+                let lineage = crate::tools::context::declared_file_lineage_evidence(&canonical.bytes);
+                json!({
                 "source": "read_file",
+                "producer": lineage,
                 "scope": {
                     "path": resolved_path,
-                    "environment": if args.path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX) {
-                        "host-skills"
-                    } else if args.path == crate::context::desktop_instructions::LOCATOR {
-                        "host-context"
-                    } else {
-                        args.environment_id.as_deref()
-                            .or_else(|| invocation.step_context.environments.primary()
-                                .map(|environment| environment.environment_id.as_str()))
-                            .unwrap_or("primary")
-                    },
+                    "environment": environment_id,
+                    "canonical_uri": canonical_uri,
                 },
                 "identity": identity,
-                    }))
+                })
             });
             let mut output = serde_json::to_value(result)
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
             output["artifact_id"] = json!(artifact_id);
             output["retained_artifact_complete"] = json!(artifact_id.is_some());
             output["path"] = json!(resolved_path);
+            output["environment_id"] = json!(environment_id);
+            output["canonical_uri"] = json!(canonical_uri);
             output["total_lines"] = json!(total_lines);
             output["source_sha256"] = json!(canonical.sha256);
             output["file_complete"] = json!(file_complete);
+            if !selector_errors.is_empty() {
+                output["selector_errors"] = json!(selector_errors);
+            }
             if file_complete && let Some(inspection) = inspection {
                 match inspection.store.record_source_inspection(
                     inspection.start,
@@ -532,10 +653,16 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             if let Some(error) = snapshot_error {
                 output["snapshot_error"] = json!(error);
             }
+            if let Some(artifact_id) = &artifact_id {
+                if let Some(recovery) = file_recovery_recipe(&output, artifact_id) {
+                    output["recovery"] = recovery;
+                }
+            }
             let projected = codex_code_mode::model_visible_tool_result(
                 &ToolName::plain("read_file"), &output,
             );
-            let mut output = JsonToolOutput::new(output);
+            let mut output = JsonToolOutput::with_success(output, Some(successful))
+                .with_code_mode_failure_as_data();
             if let Some(evidence) = evidence {
                 let mut signal = crate::tools::context::semantic_evidence_sampling_signal(evidence);
                 // Recovery handles bind coverage but are not semantic evidence:
@@ -551,6 +678,88 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             Ok(boxed_tool_output(output))
         })
     }
+}
+
+// Reuse the recovery engine's lexical boundaries only when explicitly requested.
+// Ordinary source reads do not parse JSON or build a new index. Exact source bytes
+// (including whitespace and key order) remain the snapshot identity.
+fn file_snapshot(
+    contents: String,
+    selectors: Option<&[ToolOutputSelector]>,
+) -> Result<CanonicalToolResult, ReadToolOutputError> {
+    let mut canonical = CanonicalToolResult::text(contents);
+    if selectors.into_iter().flatten().any(|selector| matches!(selector, ToolOutputSelector::JsonPointer { .. })) {
+        // Index failure belongs to JSON selectors, not the raw snapshot or its
+        // independent line/byte/search siblings. The selector owner reports it.
+        canonical.json_pointers = raw_json_pointer_index(&canonical.bytes).unwrap_or_default();
+    }
+    Ok(canonical)
+}
+
+fn file_recovery_recipe(output: &serde_json::Value, artifact_id: &str) -> Option<serde_json::Value> {
+    let mut pending = Vec::new();
+    if let Some(continuation) = output.get("continuation").filter(|value| !value.is_null()) {
+        pending.push(continuation.clone());
+    }
+    for result in output["results"].as_array().into_iter().flatten()
+        .filter(|result| result["complete"] == false)
+    {
+        let children = result["child_selectors"].as_array();
+        let missing_context = result["selector"]["kind"] == "search"
+            && result["status"] == "ok"
+            && result["value"]["hydrated_ranges"].as_array().is_some_and(Vec::is_empty);
+        if missing_context || result["status"] != "ok" {
+            pending.extend(children.into_iter().flatten().cloned());
+            // Direct overflow may advertise just the first bounded byte child.
+            // Include its unconsumed suffix rather than silently losing it.
+            if let Some(end) = result["canonical_range"]["end"].as_u64()
+                && let Some(last) = children.into_iter().flatten()
+                    .filter(|child| child["kind"] == "bytes")
+                    .filter_map(|child| child["end"].as_u64()).max()
+                && last < end
+            {
+                pending.push(json!({"kind":"bytes", "start":last, "end":end}));
+            }
+        }
+        if let Some(continuation) = result.get("continuation").filter(|value| !value.is_null()) {
+            if result["selector"]["kind"] == "search" && result["status"] == "ok" {
+                // Recover only the undelivered portion of the requested page,
+                // not another full page beyond the caller's max_results.
+                let requested = result["selector"]["max_results"].as_u64().unwrap_or(20)
+                    .min(crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_RESULTS as u64)
+                    .min(result["value"]["total_matches"].as_u64().unwrap_or(0));
+                let remaining = requested.saturating_sub(result["value"]["matches_returned"].as_u64().unwrap_or(0));
+                if remaining > 0 {
+                    let mut continuation = continuation.clone();
+                    continuation["max_results"] = json!(remaining);
+                    pending.push(continuation);
+                }
+            } else if result["selector"]["kind"] == "search" || children.is_none_or(Vec::is_empty) {
+                // Exact overflows with child ranges already describe their remainder.
+                pending.push(continuation.clone());
+            }
+        }
+    }
+    let mut unique = Vec::new();
+    for selector in pending {
+        if !unique.contains(&selector) { unique.push(selector); }
+    }
+    let mut selectors = Vec::new();
+    let mut bytes = 0usize;
+    let mut omitted = 0;
+    for selector in unique {
+        let size = selector.to_string().len();
+        if selectors.len() < READ_TOOL_OUTPUT_MAX_SELECTORS && bytes.saturating_add(size) <= 16 * 1024 {
+            bytes += size;
+            selectors.push(selector);
+        } else {
+            omitted += 1;
+        }
+    }
+    if selectors.is_empty() { return None; }
+    let mut recipe = json!({"tool":"read_tool_output", "arguments":{"artifact_id":artifact_id, "selectors":selectors}});
+    if omitted > 0 { recipe["omitted_selectors"] = json!(omitted); }
+    Some(recipe)
 }
 
 /// Coverage belongs to delivered bytes, not requested ranges or retained storage.
@@ -574,10 +783,36 @@ fn file_selection_complete(result: &ReadToolOutputResult) -> bool {
 }
 
 /// Reads an ordinary path through the selected environment's filesystem.
+pub(crate) async fn validate_retained_file_hash(
+    step: &crate::session::step_context::StepContext,
+    arguments: &str,
+    expected_hash: &str,
+    expected_bytes: u64,
+) -> bool {
+    let Ok(args) = parse_arguments::<ReadFileArgs>(arguments) else { return false };
+    if args.path.starts_with("skill:") || args.path.starts_with("context:")
+        || expected_bytes > MAX_FILE_BYTES as u64
+    { return false; }
+    let environment = match args.environment_id.as_deref() {
+        Some(id) => step.environments.turn_environments.iter().find(|environment| environment.environment_id == id),
+        None => step.environments.primary(),
+    };
+    let Some(environment) = environment.filter(|environment| !environment.environment.is_remote()) else { return false };
+    let Ok(path) = environment.cwd().join(&args.path) else { return false };
+    let sandbox = step.turn.file_system_sandbox_context(None, environment.cwd());
+    let Ok(Some(bytes)) = environment.environment.get_filesystem()
+        .read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox)).await else { return false };
+    if bytes.len() as u64 != expected_bytes { return false; }
+    let expected = expected_hash.to_string();
+    tokio::task::spawn_blocking(move || crate::tool_history::sha256(&bytes) == expected)
+        .await.unwrap_or(false)
+}
+
+/// Reads an ordinary path through the selected environment's filesystem.
 async fn read_environment_file(
     invocation: &ToolInvocation,
     args: &ReadFileArgs,
-) -> Result<(String, String, Option<PendingSourceInspection>), FunctionCallError> {
+) -> Result<(String, String, Option<PendingSourceInspection>, String, String), FunctionCallError> {
     let environment = wait_for_tool_environment(
         &invocation.step_context.environments,
         args.environment_id.as_deref(),
@@ -619,15 +854,47 @@ async fn read_environment_file(
     let contents = match result {
         Ok(Some(contents)) => contents,
         failure => {
-            let metadata = fs
-                .get_metadata(&path, Some(&sandbox))
-                .await
-                .map_err(|err| {
-                    FunctionCallError::RespondToModel(format!(
-                        "unable to locate {}: {err}",
-                        path.inferred_native_path_string()
-                    ))
+            let metadata = match fs.get_metadata(&path, Some(&sandbox)).await {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    let mut message = format!("unable to locate {}: {err}", path.inferred_native_path_string());
+                    // Host-side hints must never probe a remote filesystem or bypass
+                    // read restrictions. Failures other than NotFound need no guesses.
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        && !environment.environment.is_remote()
+                        && turn.file_system_sandbox_policy().has_full_disk_read_access()
+                        && let (Ok(missing), Ok(cwd)) = (path.to_abs_path(), environment.cwd().to_abs_path())
+                    {
+                        let suggestions = crate::tools::run_blocking_command_analysis(move || {
+                            super::command_search::nearest_existing_paths(missing.as_path(), cwd.as_path())
+                        }).await.unwrap_or_default();
+                        if !suggestions.is_empty() {
+                            message.push_str(&format!("\nPossible existing paths (not verified replacements): {}",
+                                suggestions.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")));
+                        }
+                    }
+                    return Err(FunctionCallError::RespondToModel(message));
+                }
+            };
+            if metadata.is_directory {
+                let listing = fs.walk(&path, codex_exec_server::WalkOptions {
+                    max_depth: 0, max_directories: 1, max_entries: 32,
+                    follow_directory_symlinks: false, prune_hidden_directories: true,
+                    filters: Default::default(),
+                }, Some(&sandbox)).await.map_err(|err| {
+                    FunctionCallError::RespondToModel(format!("unable to list directory: {err}"))
                 })?;
+                // This diagnostic promises only immediate entries. Deliberately
+                // not descending into child directories does not truncate them.
+                let truncated = listing.truncated && (listing.unexplored.is_empty()
+                    || listing.unexplored.iter().any(|stop| stop.reason != "depth_limit"));
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "read_file requires a regular file; this path is a directory. Immediate entries (not file contents): {}. Use a file path, or list_files for a larger listing.",
+                    json!({"path":path.inferred_native_path_string(), "entries":listing.entries,
+                        "complete": !truncated && listing.errors.is_empty(),
+                        "truncated":truncated, "errors":listing.errors})
+                )));
+            }
             if !metadata.is_file {
                 return Err(FunctionCallError::RespondToModel(
                     "read_file requires a regular file".to_string(),
@@ -652,7 +919,7 @@ async fn read_environment_file(
     let contents = String::from_utf8(contents).map_err(|_| {
         FunctionCallError::RespondToModel("read_file requires UTF-8 text".to_string())
     })?;
-    Ok((contents, path.inferred_native_path_string(), inspection))
+    Ok((contents, path.inferred_native_path_string(), inspection, environment.environment_id.clone(), path.to_string()))
 }
 
 /// Reads a `skill:<catalog-id>` locator through the provider that discovered
@@ -752,11 +1019,212 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
+    #[tokio::test]
+    async fn read_identity_and_json_pointer_survive_plain_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.json");
+        std::fs::write(&path, r#"{"answer":42}"#).unwrap();
+        let call = invocation(&path, json!([{"kind":"json_pointer","pointer":"/answer"}]), false).await;
+        let output = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+        assert_eq!(output["environment_id"], call.step_context.environments.primary().unwrap().environment_id);
+        assert_eq!(output["canonical_uri"], codex_utils_path_uri::PathUri::from_abs_path(
+            &codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&path).unwrap()).to_string());
+        let mut plain = call.clone();
+        plain.payload = ToolPayload::Function { arguments: json!({"path":path,"force_fresh":true,"selectors":[{"kind":"bytes","start":0,"end":1}]}).to_string() };
+        ReadFileHandler.handle(plain).await.unwrap();
+        let (recovered, _) = read_tool_output_selectors_with_reuse(
+            &call.step_context.turn.config.codex_home, &call.session.thread_id.to_string(),
+            output["artifact_id"].as_str().unwrap(),
+            vec![ToolOutputSelector::JsonPointer { pointer: "/answer".into() }],
+        ).await.unwrap();
+        assert_eq!(recovered.results[0].value, Some(json!(42)));
+    }
+
+    #[tokio::test]
+    async fn verified10_cold_hash_validation_checks_ignored_bytes_and_link_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ignored.txt");
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(&path, "original").unwrap();
+        let call = invocation(&path, json!(null), false).await;
+        let arguments = json!({"path":path}).to_string();
+        let hash = crate::tool_history::sha256(b"original");
+        assert!(validate_retained_file_hash(&call.step_context, &arguments, &hash, 8).await);
+        std::fs::write(&path, "modified").unwrap();
+        assert!(!validate_retained_file_hash(&call.step_context, &arguments, &hash, 8).await);
+        assert!(!validate_retained_file_hash(&call.step_context, &arguments, &hash, 7).await);
+
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "original").unwrap();
+        let link = dir.path().join("source-link.txt");
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_file(&target, &link);
+        #[cfg(any(unix, windows))]
+        {
+            if let Err(error) = created {
+                // Windows may require symlink privileges unavailable to this fixture.
+                if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied { return; }
+                panic!("symlink fixture failed: {error}");
+            }
+            let arguments = json!({"path":link}).to_string();
+            assert!(validate_retained_file_hash(&call.step_context, &arguments, &hash, 8).await);
+            std::fs::remove_file(&link).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&path, &link).unwrap();
+            assert!(!validate_retained_file_hash(&call.step_context, &arguments, &hash, 8).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn code_sections_outline_select_and_recover_original_source() {
+        for script in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.rs");
+            let source = "// λ\r\n#[test]\r\nfn works() { assert!(true); }\r\nfn other() {}\r\n";
+            std::fs::write(&path, source).unwrap();
+            let mut call = invocation(&path, json!([{"kind":"section","id":"outline"}]), false).await;
+            if script {
+                call.source = ToolCallSource::CodeMode { cell_id: "sections".into(), parent_call_id: None,
+                    runtime_tool_call_id: "sections-read".into(), nested_deadline: None, cancellation_cause: None };
+            }
+            let output = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+            assert_eq!(output["complete"], true);
+            assert_eq!(output["file_complete"], false);
+            let item = &output["results"][0]["value"]["details"]["items"][0];
+            assert_eq!(item["name"], "works");
+            assert_eq!(item["is_test"], true);
+            let id = item["id"].as_str().unwrap().to_owned();
+            let selector = ToolOutputSelector::Section { id: id.clone() };
+            let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function tool"); };
+            jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap().validate(&output).unwrap();
+            let mut selected_call = call.clone();
+            selected_call.payload = ToolPayload::Function { arguments: json!({"path":path,"selectors":[selector]}).to_string() };
+            let selected = ReadFileHandler.handle(selected_call.clone()).await.unwrap().code_mode_result(&selected_call.payload);
+            assert_eq!(selected["results"][0]["text"], "#[test]\r\nfn works() { assert!(true); }");
+            // Later plain reads must not erase the section directory on a reused
+            // hash-identical artifact, or invalidate already advertised handles.
+            let mut plain_call = call.clone();
+            plain_call.payload = ToolPayload::Function { arguments: json!({"path":path,"selectors":[{"kind":"lines","start":1,"end":1}]}).to_string() };
+            let plain = ReadFileHandler.handle(plain_call.clone()).await.unwrap().code_mode_result(&plain_call.payload);
+            assert_ne!(plain["artifact_id"], output["artifact_id"]);
+            std::fs::write(&path, "fn replacement() {}\n").unwrap();
+            let (recovered, _) = read_tool_output_selectors_with_reuse(
+                &call.step_context.turn.config.codex_home, &call.session.thread_id.to_string(),
+                output["artifact_id"].as_str().unwrap(), vec![selector],
+            ).await.unwrap();
+            assert_eq!(recovered.results[0].text.as_deref(), Some("#[test]\r\nfn works() { assert!(true); }"));
+            let changed = ReadFileHandler.handle(selected_call.clone()).await.unwrap().code_mode_result(&selected_call.payload);
+            assert_eq!(changed["results"][0]["status"], "not_found");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_file_suggests_existing_sibling_without_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("spec_plan.rs"), "private contents").unwrap();
+        let call = invocation(&dir.path().join("spec.rs"), json!(null), false).await;
+        let Err(FunctionCallError::RespondToModel(message)) = ReadFileHandler.handle(call).await else { panic!("missing file"); };
+        assert!(message.contains("spec_plan.rs"), "{message}");
+        assert!(!message.contains("private contents"));
+    }
+
+    #[tokio::test]
+    async fn structural_selector_failures_preserve_exact_siblings_and_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ambiguous.rs");
+        let source = "// λ\r\nimpl A { fn run() {} }\r\nimpl B { fn run() {} }\r\n";
+        std::fs::write(&path, source).unwrap();
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function"); };
+        let schema = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+        for script in [false, true] {
+            let mut call = invocation(&path, json!([
+                {"kind":"lines","start":1,"end":1},
+                {"kind":"symbol","name":"run"},
+                {"kind":"symbol","name":"missing"},
+                {"kind":"symbol","name":"A::run"}
+            ]), false).await;
+            if script {
+                call.source = ToolCallSource::CodeMode { cell_id:"mixed-selectors".into(), parent_call_id:None,
+                    runtime_tool_call_id:"mixed-read".into(), nested_deadline:None, cancellation_cause:None };
+            }
+            let result = ReadFileHandler.handle(call.clone()).await.unwrap();
+            assert!(!result.success_for_logging());
+            assert!(!result.code_mode_failure_is_error());
+            let output = result.code_mode_result(&call.payload);
+            schema.validate(&output).unwrap();
+            assert_eq!(output["selection_status"], "partial");
+            assert_eq!(output["complete"], false);
+            assert_eq!(output["file_complete"], false);
+            assert!(output["results"].as_array().unwrap().iter().any(|result| result["text"].as_str().is_some_and(|text| text.starts_with("// λ\r\n"))));
+            assert_eq!(output["selector_errors"].as_array().unwrap().len(), 2);
+            let error = &output["selector_errors"][0];
+            assert_eq!(error["selector_index"], 1);
+            assert_eq!(error["source_sha256"], output["source_sha256"]);
+            assert_eq!(error["candidates"][0]["qualified_name"], "A::run");
+            assert_eq!(error["candidates"][1]["selector"], json!({"kind":"lines","start":3,"end":3}));
+            assert_eq!(error["omitted_candidates"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn search_enclosing_and_python_symbols_share_exact_recoverable_items() {
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function"); };
+        let input_schema = jsonschema::validator_for(&serde_json::to_value(&spec.parameters).unwrap()).unwrap();
+        let output_schema = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+        for (file, unit, name) in [
+            ("a.rs", "/// docs\n#[inline]\nfn target() {\n let needle = 1;\n let x = 2;\n let y = 3;\n let z = 4;\n let _ = needle + x + y + z;\n}\n", "target"),
+            ("a.py", "@decorator\ndef target():\n needle = 1\n x = 2\n y = 3\n z = 4\n return needle + x + y + z\n", "target"),
+        ] {
+            for script in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join(file);
+                let source = format!("{unit}\n");
+                std::fs::write(&path, &source).unwrap();
+                let mut call = invocation(&path, json!([
+                    {"kind":"search","query":"NEEDLE","case_insensitive":true,"enclosing":true,"max_results":1,"context_lines":0},
+                    {"kind":"section","id":"outline"}
+                ]), false).await;
+                if script {
+                    call.source = ToolCallSource::CodeMode { cell_id: "search-items".into(), parent_call_id: None,
+                        runtime_tool_call_id: "search-items-read".into(), nested_deadline: None, cancellation_cause: None };
+                }
+                let ToolPayload::Function { arguments } = &call.payload else { unreachable!() };
+                input_schema.validate(&serde_json::from_str::<serde_json::Value>(arguments).unwrap()).unwrap();
+                let output = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+                output_schema.validate(&output).unwrap();
+                let results = output["results"].as_array().unwrap();
+                let search = results.iter().find(|result| result["selector"]["kind"] == "search").unwrap();
+                assert_eq!(search["value"]["hydrated_ranges"][0]["text"], unit);
+                assert_eq!(search["value"]["enclosing_complete"], true);
+                assert_eq!(search["value"]["matches_returned"], 1);
+                assert_eq!(search["value"]["remaining_match_count"], 1);
+                assert!(search["continuation"]["start_byte"].as_u64().unwrap() > 0);
+                let outline = results.iter().find(|result| result["selector"]["kind"] == "section").unwrap();
+                assert_eq!(outline["value"]["details"]["items"][0]["start_line"], 1);
+                let mut symbol_call = call.clone();
+                symbol_call.payload = ToolPayload::Function { arguments: json!({"path":path,"selectors":[{"kind":"symbol","name":name}]}).to_string() };
+                let symbol = ReadFileHandler.handle(symbol_call.clone()).await.unwrap().code_mode_result(&symbol_call.payload);
+                assert_eq!(symbol["results"][0]["text"], unit);
+                std::fs::write(&path, "replacement").unwrap();
+                let (recovered, _) = read_tool_output_selectors_with_reuse(
+                    &call.step_context.turn.config.codex_home, &call.session.thread_id.to_string(),
+                    output["artifact_id"].as_str().unwrap(),
+                    vec![ToolOutputSelector::Lines { start: 1, end: unit.lines().count() }],
+                ).await.unwrap();
+                assert_eq!(recovered.results[0].text.as_deref(), Some(unit));
+            }
+        }
+    }
+
     #[test]
     fn legacy_read_file_arguments_preserve_line_semantics() {
         let args: ReadFileArgs = parse_arguments(r#"{"file_path":"a.rs","offset":3,"limit":2}"#).unwrap();
         assert_eq!(args.path, "a.rs");
-        assert_eq!(args.selectors, Some(vec![ToolOutputSelector::Lines { start: 3, end: 4 }]));
+        assert_eq!(args.selectors, Some(vec![FileSelector::Exact(ToolOutputSelector::Lines { start: 3, end: 4 })]));
         for invalid in [
             r#"{"file_path":"a.rs","offset":0}"#,
             r#"{"file_path":"a.rs","limit":0}"#,
@@ -764,6 +1232,192 @@ mod tests {
         ] {
             assert!(parse_arguments::<ReadFileArgs>(invalid).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn rust_units_are_exact_schema_valid_and_recoverable_in_both_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("units.rs");
+        let unit = "#[inline]\r\nfn target() {\r\n let s = r#\"λ }\"#;\r\n}\r\n";
+        let source = format!("// prefix\r\n{unit}fn other() {{}}\r\n");
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function"); };
+        let input_schema = jsonschema::validator_for(&serde_json::to_value(&spec.parameters).unwrap()).unwrap();
+        let output_schema = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+        for script in [false, true] {
+            for selector in [json!({"kind":"symbol","name":"target"}), json!({"kind":"enclosing","line":4})] {
+                std::fs::write(&path, &source).unwrap();
+                let mut call = invocation(&path, json!([selector]), false).await;
+                if script {
+                    call.source = ToolCallSource::CodeMode {
+                        cell_id: "rust-unit".into(), parent_call_id: None,
+                        runtime_tool_call_id: "rust-unit-read".into(),
+                        nested_deadline: None, cancellation_cause: None,
+                    };
+                }
+                let ToolPayload::Function { arguments } = &call.payload else { unreachable!() };
+                input_schema.validate(&serde_json::from_str::<serde_json::Value>(arguments).unwrap()).unwrap();
+                let result = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+                output_schema.validate(&result).unwrap();
+                assert_eq!(result["results"][0]["text"], unit);
+                assert_eq!(result["results"][0]["selector"], json!({"kind":"lines","start":2,"end":5}));
+                assert_eq!(result["complete"], true);
+                assert_eq!(result["file_complete"], false);
+                std::fs::write(&path, "changed").unwrap();
+                let (recovered, _) = read_tool_output_selectors_with_reuse(
+                    &call.step_context.turn.config.codex_home, &call.session.thread_id.to_string(),
+                    result["artifact_id"].as_str().unwrap(),
+                    vec![ToolOutputSelector::Lines { start: 2, end: 5 }],
+                ).await.unwrap();
+                assert_eq!(recovered.results[0].text.as_deref(), Some(unit));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_diff_locator_is_not_exposed() {
+        let call = invocation(Path::new(crate::turn_diff_tracker::TURN_DIFF_LOCATOR),
+            json!([{"kind":"json_pointer","pointer":""}]), true).await;
+        let ToolPayload::Function { arguments } = &call.payload else { unreachable!() };
+        assert!(canonical_read_file_arguments(arguments).is_none());
+        assert!(ReadFileHandler.handle(call).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn json_pointer_reads_select_complete_units_in_both_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let unit = "{\r\n  \"label\": \"λ😀\", \"items\": [1, {\"enabled\": true}]\r\n}";
+        let source = format!("{{\"unrelated\": 99, \"a/b\": {{\"~unit\": {unit}}}}}\r\n");
+        let expected: serde_json::Value = serde_json::from_str(unit).unwrap();
+        let selectors = json!([{"kind":"json_pointer", "pointer":"/a~1b/~0unit"}]);
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function tool"); };
+        let input_schema = jsonschema::validator_for(&serde_json::to_value(&spec.parameters).unwrap()).unwrap();
+        let output_schema = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+        for script in [false, true] {
+            std::fs::write(&path, &source).unwrap();
+            let mut call = invocation(&path, selectors.clone(), false).await;
+            if script {
+                call.source = ToolCallSource::CodeMode {
+                    cell_id: "json-unit".into(), parent_call_id: None,
+                    runtime_tool_call_id: "json-unit-read".into(),
+                    nested_deadline: None, cancellation_cause: None,
+                };
+            }
+            let ToolPayload::Function { arguments } = &call.payload else { unreachable!() };
+            input_schema.validate(&serde_json::from_str::<serde_json::Value>(arguments).unwrap()).unwrap();
+            let result = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+            output_schema.validate(&result).unwrap();
+            assert_eq!(result["complete"], true);
+            assert_eq!(result["file_complete"], false);
+            assert_eq!(result["results"][0]["value"], expected);
+            assert_eq!(result["source_sha256"], crate::tool_history::sha256(source.as_bytes()));
+            let range = &result["results"][0]["canonical_range"];
+            let start = range["start"].as_u64().unwrap();
+            let end = range["end"].as_u64().unwrap();
+            assert_eq!(&source[start as usize..end as usize], unit);
+
+            // A fresh non-pointer selection of identical bytes must not erase
+            // addresses already advertised by the earlier artifact.
+            let mut plain_call = call.clone();
+            plain_call.payload = ToolPayload::Function {
+                arguments: json!({"path":path,"force_fresh":true,
+                    "selectors":[{"kind":"lines","start":1,"end":1}]}).to_string(),
+            };
+            let plain = ReadFileHandler.handle(plain_call.clone()).await.unwrap()
+                .code_mode_result(&plain_call.payload);
+            assert_eq!(plain["complete"], true);
+            assert!(plain["artifact_id"].is_string());
+
+            // The known unit boundary and original formatting survive source edits.
+            std::fs::write(&path, "replacement").unwrap();
+            let (recovered, _) = read_tool_output_selectors_with_reuse(
+                &call.step_context.turn.config.codex_home, &call.session.thread_id.to_string(),
+                result["artifact_id"].as_str().unwrap(),
+                vec![ToolOutputSelector::JsonPointer { pointer: "/a~1b/~0unit".into() },
+                    ToolOutputSelector::Bytes { start, end }],
+            ).await.unwrap();
+            assert!(recovered.complete);
+            assert!(recovered.results.iter().any(|r| r.value.as_ref() == Some(&expected)));
+            assert!(recovered.results.iter().any(|r| r.text.as_deref() == Some(unit)));
+        }
+    }
+
+    #[tokio::test]
+    async fn json_pointer_reselection_reuses_complete_source_without_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"config":{"enabled":true},"other":null}"#).unwrap();
+        let call = invocation(&path, json!(null), false).await;
+        let raw = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+        let ToolPayload::Function { arguments: previous } = &call.payload else { unreachable!() };
+        let requested = json!({"path":path,"selectors":[{"kind":"json_pointer","pointer":"/config"}]}).to_string();
+        std::fs::remove_file(&path).unwrap();
+        let selected = reselect_read_file_output(previous, &requested, &raw).unwrap();
+        assert_eq!(selected["results"][0]["value"], json!({"enabled":true}));
+        assert_eq!(selected["complete"], true);
+        assert_eq!(selected["file_complete"], false);
+        let mut stale = raw;
+        stale["canonical_sha256"] = json!("wrong");
+        assert!(reselect_read_file_output(previous, &requested, &stale).is_none());
+    }
+
+    #[test]
+    fn json_pointer_indexing_is_opt_in_and_missing_is_not_invalid() {
+        let text = "not JSON\r\n";
+        assert!(file_snapshot(text.into(), None).unwrap().json_pointers.is_empty());
+        let selectors = vec![ToolOutputSelector::JsonPointer { pointer: "".into() }];
+        let invalid = file_snapshot(text.into(), Some(&selectors)).unwrap();
+        let (result, _) = select_file_snapshot_for_script(&invalid, Some(selectors.clone())).unwrap();
+        assert_eq!(result.results[0].status, crate::tools::command_output_artifact::ToolOutputSelectorStatus::Invalid);
+        let canonical = file_snapshot("{\"value\": null}".into(), Some(&selectors)).unwrap();
+        let selectors = vec![
+            ToolOutputSelector::JsonPointer { pointer: "/missing".into() },
+            ToolOutputSelector::JsonPointer { pointer: "invalid".into() },
+            ToolOutputSelector::JsonPointer { pointer: "/value".into() },
+        ];
+        let (result, _) = select_file_snapshot_for_script(&canonical, Some(selectors)).unwrap();
+        use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
+        for (pointer, status) in [("/missing", ToolOutputSelectorStatus::NotFound),
+            ("invalid", ToolOutputSelectorStatus::Invalid), ("/value", ToolOutputSelectorStatus::Ok)] {
+            let selected = result.results.iter().find(|result| result.selector ==
+                ToolOutputSelector::JsonPointer { pointer: pointer.into() }).unwrap();
+            assert_eq!(selected.status, status);
+            if pointer == "/value" { assert_eq!(selected.value, Some(json!(null))); }
+        }
+        assert!(!result.complete);
+    }
+
+    #[tokio::test]
+    async fn oversized_script_selection_has_drainable_children() {
+        let source = "requirement\n".repeat(110_000);
+        let canonical = CanonicalToolResult::text(source.clone());
+        let parent = ToolOutputSelector::Bytes { start: 0, end: canonical.exact_bytes };
+        let (result, _) = select_file_snapshot_for_script(&canonical, Some(vec![parent.clone()])).unwrap();
+        let overflow = &result.results[0];
+        assert!(!result.complete);
+        assert_ne!(overflow.continuation.as_ref(), Some(&parent));
+        assert!(!overflow.child_selectors.is_empty());
+        let mut recovered = String::new();
+        let mut pending = std::collections::VecDeque::from(overflow.child_selectors.clone());
+        let mut calls = 0;
+        while let Some(selector) = pending.pop_front() {
+            calls += 1;
+            assert!(calls < 100, "subdivision must make bounded progress");
+            assert_ne!(selector, parent);
+            let (page, _) = select_file_snapshot_for_script(&canonical, Some(vec![selector.clone()])).unwrap();
+            let result = &page.results[0];
+            if page.complete {
+                assert_eq!(result.canonical_range.unwrap().start, recovered.len() as u64);
+                recovered.push_str(result.text.as_ref().unwrap());
+            } else {
+                assert!(!result.child_selectors.is_empty());
+                for child in result.child_selectors.iter().rev() {
+                    assert_ne!(child, &selector);
+                    pending.push_front(child.clone());
+                }
+            }
+        }
+        assert_eq!(recovered, source);
     }
 
     #[tokio::test]
@@ -788,10 +1442,9 @@ mod tests {
         let output = ReadFileHandler.handle(call).await.unwrap();
         let result = output.code_mode_result(&payload);
         assert_eq!(result["complete"], true);
-        assert_eq!(result["results"].as_array().unwrap().len(), 3);
-        for selection in result["results"].as_array().unwrap() {
-            assert_eq!(selection["text"], line);
-        }
+        assert_eq!(result["results"].as_array().unwrap().len(), 1);
+        assert_eq!(result["results"][0]["selector"], json!({"kind":"lines", "start":1, "end":3}));
+        assert_eq!(result["results"][0]["text"], line.repeat(3));
     }
 
     #[tokio::test]
@@ -815,7 +1468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_reads_reuse_lineage_but_changed_or_unsigned_files_do_not() {
+    async fn report_reads_keep_native_identity_and_descriptive_lineage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.txt");
         let payload = json!({"paths": ["a.rs", "café.rs"]});
@@ -845,7 +1498,19 @@ mod tests {
             let first = ReadFileHandler.handle(invocation(
                 &path, json!([{"kind":"lines", "start":1, "end":100}]), false,
             ).await).await.unwrap();
-            assert_eq!(first.sampling_request_signal().unwrap()["semantic_evidence"], expected);
+            let evidence = first.sampling_request_signal().unwrap()["semantic_evidence"].clone();
+            assert_eq!(evidence["source"], "read_file");
+            assert_eq!(evidence["producer"], expected);
+            let mut selections = Vec::new();
+            for (start, end) in [(1, 1), (2, 2), (1, 2)] {
+                let page = ReadFileHandler.handle(invocation(
+                    &path, json!([{"kind":"lines", "start":start, "end":end}]), false,
+                ).await).await.unwrap();
+                selections.push(page.sampling_request_signal().unwrap()["semantic_evidence"].clone());
+            }
+            assert_ne!(selections[0], selections[1], "disjoint report pages");
+            assert_ne!(selections[0], selections[2], "overlapping report pages");
+            assert_ne!(selections[0], expected, "partial report is not whole producer evidence");
             // A stale copied header must not hide an edit to the report.
             std::fs::write(&path, report.replace("a.rs", "b.rs")).unwrap();
             let changed = ReadFileHandler.handle(invocation(
@@ -859,6 +1524,45 @@ mod tests {
             &path, json!([{"kind":"lines", "start":1, "end":100}]), false,
         ).await).await.unwrap();
         assert_eq!(unsigned.sampling_request_signal().unwrap()["semantic_evidence"]["source"], "read_file");
+    }
+
+    #[tokio::test]
+    async fn distinct_reports_with_valid_identical_lineage_do_not_collapse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.txt");
+        let mut identities = Vec::new();
+        for body in ["validation passed", "validation failed"] {
+            let header = json!({"evidence_lineage": {
+                "source":"report", "scope":"same", "identity":"claimed-same",
+                "content_sha256":crate::tool_history::sha256(body.as_bytes())
+            }});
+            std::fs::write(&path, format!("<!-- codex-evidence: {header} -->\n{body}")).unwrap();
+            let output = ReadFileHandler.handle(invocation(
+                &path, json!([{"kind":"lines", "start":1, "end":100}]), false,
+            ).await).await.unwrap();
+            identities.push(output.sampling_request_signal().unwrap()["semantic_evidence"].clone());
+        }
+        assert_eq!(identities[0]["producer"], identities[1]["producer"]);
+        assert_ne!(identities[0]["identity"], identities[1]["identity"]);
+    }
+
+    #[tokio::test]
+    async fn read_status_resolves_paths_in_the_selected_environment() {
+        let mut call = invocation(Path::new("unused"), json!(null), false).await;
+        let environment = call.step_context.environments.primary().unwrap();
+        let expected = environment.cwd().join("source.rs").unwrap().inferred_native_path_string();
+        let environment_id = environment.environment_id.clone();
+        call.tool_name = ToolName::plain("read_status");
+        call.payload = ToolPayload::Function {
+            arguments: json!({"paths":["source.rs"], "environment_id":environment_id}).to_string(),
+        };
+        let payload = call.payload.clone();
+        let output = ReadStatusHandler.handle(call).await.unwrap().code_mode_result(&payload);
+        assert_eq!(output["paths"][0]["path"], expected);
+        assert_eq!(output["paths"][0]["status"], "unknown");
+        let ToolSpec::Function(spec) = ReadStatusHandler.spec() else { panic!("function tool"); };
+        let schema = serde_json::to_value(spec.parameters).unwrap();
+        assert!(schema["properties"].get("environment_id").is_some());
     }
 
     async fn invocation(
@@ -1436,7 +2140,63 @@ mod tests {
                 assert_eq!(result["complete"], false);
                 assert_eq!(result["file_complete"], false);
                 assert!(result["artifact_id"].is_string());
-                assert_eq!(result["results"][0]["continuation"], selector);
+                let first = &result["results"][0];
+                assert_eq!(first["status"], "aggregate_omitted");
+                let child_end = first["continuation"]["end"].as_u64().unwrap() as usize;
+                assert!(child_end > 0 && child_end < end);
+                assert_eq!(first["continuation"]["start"], 0);
+                assert_eq!(first["child_selectors"][1], json!({"kind":"bytes", "start":child_end, "end":end}));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_files_keep_distinct_provenance_through_edit_and_restart() {
+        use crate::tool_history::{ToolHistoryLoadOutcome, WorkspaceEvidenceObservation, SourceDependencyV1};
+        use std::collections::BTreeSet;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "identical source\n").unwrap();
+        std::fs::write(&b, "identical source\n").unwrap();
+        let mut call_a = invocation(&a, json!([{"kind":"lines", "start":1, "end":1}]), false).await;
+        call_a.call_id = "file-a".into();
+        let mut call_b = call_a.clone();
+        call_b.call_id = "file-b".into();
+        call_b.payload = ToolPayload::Function { arguments:json!({"path":b,
+            "selectors":[{"kind":"lines", "start":1, "end":1}]}).to_string() };
+        let output_a = ReadFileHandler.handle(call_a.clone()).await.unwrap();
+        let output_b = ReadFileHandler.handle(call_b.clone()).await.unwrap();
+        let a_value = output_a.code_mode_result(&call_a.payload);
+        let b_value = output_b.code_mode_result(&call_b.payload);
+        assert_ne!(a_value["artifact_id"], b_value["artifact_id"]);
+        let mut history = call_a.session.lock_history_state_for_test().await.tool_history_state();
+        for (call, output, path) in [(&call_a, &output_a, &a), (&call_b, &output_b, &b)] {
+            let item = output.to_response_item(&call.call_id, &call.payload).into();
+            history.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
+                None, &item, BTreeSet::from([SourceDependencyV1::new(path, false)])).unwrap());
+        }
+        let home = &call_a.step_context.turn.config.codex_home;
+        let thread = call_a.session.thread_id.to_string();
+        let id = a_value["artifact_id"].as_str().unwrap();
+        for edited in [false, true] {
+            if edited {
+                std::fs::write(&a, "changed A only\n").unwrap();
+                assert!(history.invalidate_source_dependencies(Some(&BTreeSet::from([a.clone()])), None));
+            }
+            for restarted in [false, true] {
+                if restarted {
+                    crate::tool_history::persist_tool_history_state(home, &thread, &history).await.unwrap();
+                    let ToolHistoryLoadOutcome::Loaded(restored) = crate::tool_history::load_tool_history_state(home, &thread).await else { panic!("history restart") };
+                    history = restored;
+                }
+                let provenance = serde_json::to_value(&history).unwrap();
+                assert_eq!(provenance["internal_artifact_origins"][id][0], "file-a");
+                assert_eq!(provenance["workspace_evidence"]["file-a"]["source_dependencies_current"], !edited);
+                assert_eq!(provenance["workspace_evidence"]["file-b"]["source_dependencies_current"], true);
+                let (recovered, _) = read_tool_output_selectors_with_reuse(home, &thread, id,
+                    vec![ToolOutputSelector::Lines { start:1, end:1 }]).await.unwrap();
+                assert_eq!(recovered.results[0].text.as_deref(), Some("identical source\n"));
             }
         }
     }
@@ -1481,6 +2241,11 @@ mod tests {
             .as_bytes()
             .to_vec();
         let mut selector = result["continuation"].clone();
+        assert_eq!(result["recovery"], json!({
+            "tool": "read_tool_output",
+            "arguments": {"artifact_id": artifact_id, "selectors": [selector.clone()]}
+        }));
+        let mut recovery_arguments = result["recovery"]["arguments"].clone();
         assert!(!recovered.is_empty());
         assert!(original.as_bytes().starts_with(&recovered));
         std::fs::write(&path, "changed after the first page\n").unwrap();
@@ -1491,7 +2256,7 @@ mod tests {
             let mut recovery_call = call.clone();
             recovery_call.tool_name = ToolName::plain("read_tool_output");
             recovery_call.payload = ToolPayload::Function {
-                arguments: json!({"artifact_id": artifact_id, "selectors": [selector]}).to_string(),
+                arguments: recovery_arguments.to_string(),
             };
             let output = ReadToolOutputHandler
                 .handle(recovery_call.clone())
@@ -1528,6 +2293,7 @@ mod tests {
                 "every recovery must deliver new source bytes: {output}"
             );
             selector = output["continuation_stop"]["selector"].clone();
+            recovery_arguments = json!({"artifact_id": artifact_id, "selectors": [selector.clone()]});
         }
         assert!(selector.is_null(), "recovery must terminate");
         assert_eq!(
@@ -1658,6 +2424,8 @@ mod tests {
             .unwrap()
             .code_mode_result(&payload);
         assert_eq!(result["results"][1]["text"], "before");
+        // Search children already hydrated inline are not missing evidence.
+        assert!(result.get("recovery").is_none());
         assert_eq!(result["results"][0]["value"]["total_matches"], 1);
         assert_eq!(
             result["results"][0]["value"]["hydrated_ranges"][0]["text"],
@@ -1885,12 +2653,6 @@ mod tests {
         for (selectors, sandboxed, cancelled, expected) in [
             (json!([]), false, false, "requires 1-64 selectors"),
             (
-                json!([{"kind": "json_pointer", "pointer": ""}]),
-                false,
-                false,
-                "supports bytes, lines, and search",
-            ),
-            (
                 json!([{"kind": "lines", "start": 1, "end": 1}]),
                 true,
                 false,
@@ -1920,14 +2682,85 @@ mod tests {
                 "rejected reads must not retain snapshots"
             );
         }
+        // Selector-local errors preserve successful siblings and the immutable
+        // snapshot; they are not filesystem failures that abort the whole call.
+        for selector in [
+            json!({"kind":"json_pointer", "pointer":""}),
+            json!({"kind":"section", "id":"unsupported"}),
+        ] {
+            let call = invocation(&path, json!([selector, {"kind":"lines", "start":1, "end":1}]), false).await;
+            let result = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+            assert_eq!(result["complete"], false);
+            assert!(result["artifact_id"].is_string());
+            assert!(result["results"].as_array().unwrap().iter().any(|row| row["text"] == "unchanged"));
+            if selector["kind"] == "json_pointer" {
+                assert!(result["results"].as_array().unwrap().iter().any(|row| row["status"] == "invalid"));
+            } else {
+                assert_eq!(result["selector_errors"][0]["status"], "invalid_selector");
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "unchanged");
+        }
         let spec = serde_json::to_value(ReadFileHandler.spec()).unwrap();
         let validator = jsonschema::validator_for(&spec["parameters"]).unwrap();
-        assert!(!validator.is_valid(
+        assert!(validator.is_valid(
             &json!({"path": "input.txt", "selectors": [{"kind": "section", "id": "x"}]})
         ));
         assert!(validator.is_valid(
             &json!({"path": "input.txt", "selectors": [{"kind": "lines", "start": 1, "end": 2}]})
         ));
+    }
+
+    #[tokio::test]
+    async fn directory_error_includes_bounded_nonrecursive_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("immediate.txt"), "content").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested").join("not-listed.txt"), "content").unwrap();
+        let call = invocation(dir.path(), json!(null), false).await;
+        let Err(FunctionCallError::RespondToModel(message)) = ReadFileHandler.handle(call).await else {
+            panic!("directory is not file contents");
+        };
+        assert!(message.contains("immediate.txt"), "{message}");
+        assert!(message.contains("nested"), "{message}");
+        assert!(!message.contains("not-listed.txt"), "{message}");
+        assert!(message.contains("\"complete\":true"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn file_and_recovery_selection_status_distinguish_failed_partial_and_complete_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("selection.txt");
+        std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+        for (selectors, expected) in [
+            (json!([{"kind":"lines","start":0,"end":0}]), "failed"),
+            (json!([{"kind":"lines","start":1,"end":1},{"kind":"lines","start":0,"end":0}]), "partial"),
+            (json!([{"kind":"lines","start":1,"end":1}]), "complete"),
+        ] {
+            let mut call = invocation(&path, selectors.clone(), false).await;
+            let output = ReadFileHandler.handle(call.clone()).await.unwrap();
+            assert_eq!(output.success_for_logging(), expected == "complete");
+            assert!(!output.code_mode_failure_is_error(), "selector diagnostics remain script data");
+            let value = output.code_mode_result(&call.payload);
+            assert_eq!(value["selection_status"], expected);
+            assert_eq!(value["complete"], expected == "complete");
+            assert_eq!(value["file_complete"], false);
+            let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function"); };
+            jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap().validate(&value).unwrap();
+            if expected != "failed" { assert_eq!(value["results"][0]["text"], "first\n"); }
+            call.tool_name = ToolName::plain("read_tool_output");
+            call.payload = ToolPayload::Function { arguments:json!({
+                "artifact_id":value["artifact_id"], "selectors":selectors,
+            }).to_string() };
+            let recovered = ReadToolOutputHandler.handle(call.clone()).await.unwrap();
+            assert_eq!(recovered.success_for_logging(), expected == "complete");
+            assert!(!recovered.code_mode_failure_is_error(), "keep successful recovery siblings inspectable");
+            let value = recovered.code_mode_result(&call.payload);
+            assert_eq!(value["selection_status"], expected);
+            assert_eq!(value["complete"], expected == "complete");
+            let ToolSpec::Function(spec) = ReadToolOutputHandler.spec() else { panic!("function"); };
+            jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap().validate(&value).unwrap();
+            if expected != "failed" { assert_eq!(value["results"][0]["text"], "first\n"); }
+        }
     }
 
     #[tokio::test]
@@ -1964,6 +2797,152 @@ mod tests {
                 !artifact_dir.exists(),
                 "rejected reads must not retain snapshots"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn verified10_bounded_enclosing_pages_survive_source_edits_and_recovery() {
+        for script in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("items.rs");
+            let first = "/// first\nfn first() {\n let needle = 1;\n}\n";
+            let second = "/// second\nfn second() {\n let needle = 2;\n}\n";
+            std::fs::write(&path, format!("{first}\n{second}")).unwrap();
+            let mut call = invocation(&path, json!([{"kind":"search", "query":"needle", "max_results":1,
+                "context_lines":0, "enclosing":true}]), false).await;
+            if script { call.source = ToolCallSource::CodeMode { cell_id:"verified10".into(), parent_call_id:None,
+                runtime_tool_call_id:"verified10-read".into(), nested_deadline:None, cancellation_cause:None }; }
+            let result = ReadFileHandler.handle(call.clone()).await.unwrap();
+            assert!(result.success_for_logging());
+            let output = result.code_mode_result(&call.payload);
+            assert_eq!(output["selection_status"], "complete");
+            assert_eq!(output["results"][0]["value"]["matches_returned"], 1);
+            assert_eq!(output["results"][0]["value"]["search_exhausted"], false);
+            assert_eq!(output["results"][0]["value"]["hydrated_ranges"][0]["text"], first);
+            assert_eq!(output["file_complete"], false);
+            assert!(output.get("recovery").is_none(), "a delivered bounded page must not expand scope automatically");
+            std::fs::write(&path, "fn replacement() {}\n").unwrap();
+            call.tool_name = ToolName::plain("read_tool_output");
+            call.payload = ToolPayload::Function { arguments:json!({"artifact_id":output["artifact_id"],
+                "selectors":[output["results"][0]["continuation"]]}).to_string() };
+            let ToolSpec::Function(spec) = ReadToolOutputHandler.spec() else { panic!("function"); };
+            let ToolPayload::Function { arguments } = &call.payload else { unreachable!() };
+            jsonschema::validator_for(&serde_json::to_value(&spec.parameters).unwrap()).unwrap()
+                .validate(&serde_json::from_str::<serde_json::Value>(arguments).unwrap()).unwrap();
+            let recovered = ReadToolOutputHandler.handle(call.clone()).await.unwrap();
+            assert!(recovered.success_for_logging());
+            let recovered = recovered.code_mode_result(&call.payload);
+            jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap().validate(&recovered).unwrap();
+            assert_eq!(recovered["canonical_sha256"], output["canonical_sha256"]);
+            assert_eq!(recovered["results"][0]["value"]["hydrated_ranges"][0]["text"], second);
+            assert_eq!(recovered["results"][0]["value"]["enclosing_complete"], true);
+            assert_eq!(recovered["results"][0]["value"]["search_exhausted"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn verified10_json_and_enrichment_failures_preserve_executable_siblings() {
+        for source in ["not JSON\nneedle\n".to_string(), format!("{}0{}\nneedle\n", "[".repeat(3000), "]".repeat(3000))] {
+            for script in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("raw.txt");
+                std::fs::write(&path, &source).unwrap();
+                let mut call = invocation(&path, json!([
+                    {"kind":"lines", "start":2, "end":2},
+                    {"kind":"json_pointer", "pointer":""},
+                    {"kind":"search", "query":"needle", "enclosing":true, "context_lines":0}
+                ]), false).await;
+                if script { call.source = ToolCallSource::CodeMode { cell_id:"verified10-errors".into(), parent_call_id:None,
+                    runtime_tool_call_id:"verified10-read".into(), nested_deadline:None, cancellation_cause:None }; }
+                let result = ReadFileHandler.handle(call.clone()).await.unwrap();
+                assert!(!result.success_for_logging());
+                assert!(!result.code_mode_failure_is_error());
+                let output = result.code_mode_result(&call.payload);
+                assert_eq!(output["selection_status"], "partial");
+                let results = output["results"].as_array().unwrap();
+                assert!(results.iter().any(|result| result["text"] == "needle\n"));
+                let json = results.iter().find(|result| result["selector"]["kind"] == "json_pointer").unwrap();
+                assert_eq!(json["status"], "invalid");
+                assert!(json["message"].as_str().unwrap().contains("valid JSON"));
+                let search = results.iter().find(|result| result["selector"]["kind"] == "search").unwrap();
+                assert_eq!(search["value"]["matches_returned"], 1);
+                assert_ne!(search["value"]["enclosing_complete"], true);
+                assert_eq!(output["selector_errors"][0]["selector_index"], 2);
+                assert_eq!(output["selector_errors"][0]["complete"], false);
+                let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function"); };
+                jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap().validate(&output).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn verified10_recovery_recipe_batches_deduplicates_and_reports_omissions() {
+        let results = (0..80).map(|i| json!({"selector":{"kind":"lines","start":i+1,"end":i+1},
+            "status":"aggregate_omitted", "complete":false,
+            "continuation":{"kind":"bytes","start":i*10,"end":i*10+5}})).collect::<Vec<_>>();
+        let mut output = json!({"results":results});
+        let duplicate = output["results"][0].clone();
+        output["results"].as_array_mut().unwrap().push(duplicate);
+        let recipe = file_recovery_recipe(&output, "snapshot").unwrap();
+        assert_eq!(recipe["arguments"]["selectors"].as_array().unwrap().len(), 64);
+        assert_eq!(recipe["omitted_selectors"], 16);
+        let recipe = file_recovery_recipe(&json!({"results":[
+            {"status":"selector_too_large", "complete":false, "canonical_range":{"start":0,"end":100},
+             "child_selectors":[{"kind":"bytes","start":0,"end":10}], "continuation":{"kind":"bytes","start":0,"end":10}},
+            {"status":"aggregate_omitted", "complete":false, "continuation":{"kind":"lines","start":20,"end":30}}
+        ]}), "snapshot").unwrap();
+        assert_eq!(recipe["arguments"]["selectors"], json!([
+            {"kind":"bytes","start":0,"end":10}, {"kind":"bytes","start":10,"end":100},
+            {"kind":"lines","start":20,"end":30}
+        ]));
+        for max_results in [1, 2] {
+            let recipe = file_recovery_recipe(&json!({"results":[{
+                "selector":{"kind":"search", "query":"needle", "max_results":max_results},
+                "status":"ok", "complete":false,
+                "value":{"total_matches":20, "matches_returned":1, "hydrated_ranges":[]},
+                "child_selectors":[{"kind":"lines", "start":1, "end":1}],
+                "continuation":{"kind":"search", "query":"needle", "start_byte":6, "max_results":max_results}
+            }]}), "snapshot").unwrap();
+            let selectors = recipe["arguments"]["selectors"].as_array().unwrap();
+            assert_eq!(selectors.len(), max_results);
+            assert_eq!(selectors[0], json!({"kind":"lines", "start":1, "end":1}));
+            if max_results == 2 { assert_eq!(selectors[1]["max_results"], 1); }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "opt-in end-to-end enclosing-search timing; not a speedup assertion"]
+    #[expect(clippy::print_stdout, reason = "report measured read/parse/select/persist/serialize wall time")]
+    async fn verified10_multi_query_enclosing_end_to_end_benchmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("benchmark.rs");
+        let source = (0..2000).map(|i| format!("/// docs {i}\nfn item_{i}() {{\n let query_{} = {i};\n}}\n", i % 8)).collect::<String>();
+        std::fs::write(&path, &source).unwrap();
+        let selectors = (0..8).map(|i| json!({"kind":"search", "query":format!("query_{i}"),
+            "enclosing":true, "max_results":2, "context_lines":0})).collect::<Vec<_>>();
+        for script in [false, true] {
+            let mut call = invocation(&path, json!(selectors), false).await;
+            if script { call.source = ToolCallSource::CodeMode { cell_id:"verified10-bench".into(), parent_call_id:None,
+                runtime_tool_call_id:"verified10-bench-read".into(), nested_deadline:None, cancellation_cause:None }; }
+            let mut elapsed = Vec::new();
+            let mut output_bytes = 0;
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                let result = ReadFileHandler.handle(call.clone()).await.unwrap();
+                let output = result.code_mode_result(&call.payload);
+                output_bytes = serde_json::to_vec(&output).unwrap().len();
+                elapsed.push(start.elapsed().as_micros());
+                assert!(result.success_for_logging());
+                assert_eq!(output["results"].as_array().unwrap().len(), 8);
+                for result in output["results"].as_array().unwrap() {
+                    assert_eq!(result["value"]["matches_returned"], 2);
+                    assert_eq!(result["value"]["enclosing_complete"], true);
+                    assert_eq!(result["value"]["hydrated_ranges"].as_array().unwrap().len(), 2);
+                }
+            }
+            let total: u128 = elapsed.iter().sum();
+            elapsed.sort_unstable();
+            println!("verified10_enclosing script={script} source_bytes={} queries=8 iterations=7 median_us={} total_us={total} output_bytes={output_bytes} model_requests=0 handler_calls=7 retries=0 recovery_calls=0", source.len(), elapsed[3]);
         }
     }
 }

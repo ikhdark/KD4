@@ -98,6 +98,35 @@ fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
 }
 
 #[test]
+fn live_gate_phases_clear_only_after_the_last_owner_resumes_or_cancels() {
+    use codex_protocol::protocol::{EventMsg, HarnessPhase};
+    for (start, end, phase) in [
+        (ToolLifecycleBoundary::ResourceResolutionStart, ToolLifecycleBoundary::ResourceResolutionEnd, HarnessPhase::ResourceResolution),
+        (ToolLifecycleBoundary::DiffTrackerWaitStart, ToolLifecycleBoundary::DiffTrackerWaitEnd, HarnessPhase::DiffTracker),
+        (ToolLifecycleBoundary::WorkspaceGateWaitStart, ToolLifecycleBoundary::WorkspaceGateWaitEnd, HarnessPhase::WorkspaceGate),
+        (ToolLifecycleBoundary::EvidenceTrackerWaitStart, ToolLifecycleBoundary::EvidenceTrackerWaitEnd, HarnessPhase::EvidenceTracker),
+    ] {
+        let turn = Arc::new(TurnTimingState::default());
+        let (tx, rx) = async_channel::unbounded();
+        turn.bind_live_phase_events("turn".into(), tx);
+        let first = ToolDispatchTiming::new_with_turn_clock(Arc::clone(&turn), tokio::time::Instant::now(), false);
+        let second = ToolDispatchTiming::new_with_turn_clock(Arc::clone(&turn), tokio::time::Instant::now(), false);
+        first.record_boundary(start);
+        second.record_boundary(start);
+        let EventMsg::TurnPhaseChanged(event) = rx.try_recv().unwrap().msg else { panic!("phase"); };
+        assert_eq!(event.phases, vec![phase]);
+        first.record_boundary(end);
+        assert!(rx.try_recv().is_err(), "another owner remains blocked");
+        second.record_outcome("cancelled");
+        let EventMsg::TurnPhaseChanged(event) = rx.try_recv().unwrap().msg else { panic!("phase"); };
+        assert!(event.phases.is_empty());
+        drop(second);
+        drop(first);
+        assert!(rx.try_recv().is_err(), "no duplicate wakeups");
+    }
+}
+
+#[test]
 fn process_wait_records_timeout_wake_and_reentry() {
     let turn_timing = Arc::new(TurnTimingState::default());
     turn_timing.mark_turn_started();
@@ -408,7 +437,7 @@ async fn deferred_trace_recording_is_awaited_and_survives_waiter_cancellation() 
         .expect("the blocking trace writer should start");
     assert!(
         !waiter.is_finished(),
-        "dispatch completion must await its trace write"
+        "the owned writer task must await its trace write"
     );
     waiter.abort();
     assert!(
@@ -483,10 +512,8 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
             terminal_outcome_flag(),
         )
         .await?;
-    assert!(
-        session.terminal_tasks.is_empty(),
-        "completed dispatches must not leave trace writes pending"
-    );
+    session.terminal_tasks.close();
+    session.terminal_tasks.wait().await;
 
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
     assert_eq!(
@@ -546,7 +573,7 @@ async fn dispatch_lifecycle_trace_records_unsupported_tool_failures() -> anyhow:
     let result = registry
         .dispatch_any_with_terminal_outcome(
             test_invocation(
-                session,
+                Arc::clone(&session),
                 turn,
                 "unsupported-call",
                 "missing_tool",
@@ -558,6 +585,8 @@ async fn dispatch_lifecycle_trace_records_unsupported_tool_failures() -> anyhow:
         .await;
 
     assert!(matches!(result, Err(FunctionCallError::RespondToModel(_))));
+    session.terminal_tasks.close();
+    session.terminal_tasks.wait().await;
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
     let tool_call = &replayed.tool_calls["unsupported-call"];
     assert_eq!(tool_call.execution.status, ExecutionStatus::Failed);
@@ -581,7 +610,7 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
     let result = registry
         .dispatch_any_with_terminal_outcome(
             test_invocation_with_payload(
-                session,
+                Arc::clone(&session),
                 turn,
                 "incompatible-call",
                 codex_tools::ToolName::plain("test_tool"),
@@ -595,6 +624,8 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
         .await;
 
     assert!(matches!(result, Err(FunctionCallError::RespondToModel(_))));
+    session.terminal_tasks.close();
+    session.terminal_tasks.wait().await;
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
     let tool_call = &replayed.tool_calls["incompatible-call"];
     assert_eq!(tool_call.execution.status, ExecutionStatus::Failed);
@@ -616,7 +647,7 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     registry
         .dispatch_any_with_terminal_outcome(
             test_invocation(
-                session,
+                Arc::clone(&session),
                 turn,
                 "wait-call",
                 WAIT_TOOL_NAME,
@@ -627,6 +658,8 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
         )
         .await?;
 
+    session.terminal_tasks.close();
+    session.terminal_tasks.wait().await;
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
     assert_eq!(replayed.code_cells.len(), 0);
     assert!(
@@ -738,4 +771,32 @@ async fn disabled_dispatch_trace_has_no_tracking_state_or_pending_terminal() {
         .await;
     trace.record_cancelled().await;
     assert!(invocation.session.terminal_tasks.is_empty());
+}
+
+#[tokio::test]
+async fn terminal_trace_handoff_does_not_wait_for_start_and_survives_cancellation() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let (mut session, turn) = make_session_and_context().await;
+    attach_test_trace(&mut session, &turn, temp.path())?;
+    let invocation = test_invocation(Arc::new(session), Arc::new(turn), "delayed",
+        "test_tool", ToolCallSource::Direct, "{}");
+    let started = super::ToolDispatchTrace::start(&invocation);
+    let context = started.started_context().await.unwrap();
+    let tasks = invocation.session.terminal_tasks.clone();
+    let (sender, receiver) = tokio::sync::watch::channel(None);
+    let delayed = super::ToolDispatchTrace { state: Some(Arc::new(super::EnabledToolDispatchTrace {
+        context: receiver, terminal_tasks: tasks.clone(),
+        terminal_recording: Arc::new(std::sync::Once::new()),
+    })) };
+    // Dropping the returned future cannot abandon an already accepted terminal.
+    drop(delayed.record_failed(&FunctionCallError::RespondToModel("first terminal".into())));
+    tokio::time::timeout(std::time::Duration::from_millis(100), delayed.record_cancelled()).await?;
+    tasks.close();
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(10), tasks.wait()).await.is_err());
+    sender.send_replace(Some(context));
+    tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait()).await?;
+    let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
+    assert_eq!(replayed.tool_calls["delayed"].execution.status, ExecutionStatus::Failed);
+    assert_eq!(replayed.tool_calls.len(), 1);
+    Ok(())
 }

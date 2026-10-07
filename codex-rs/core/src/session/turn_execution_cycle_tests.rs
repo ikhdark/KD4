@@ -5,6 +5,7 @@ use serde_json::json;
 fn settled(revision: u64) -> SamplingRequestSettledState {
     SamplingRequestSettledState {
         mutation_revision: revision,
+        attributed_mutation_revision: revision,
         tool_exposure_revision: 0,
     }
 }
@@ -53,6 +54,46 @@ fn source(collector: &SamplingRequestSignalCollector, name: &str) {
             "source": "read_file", "scope": name, "identity": "same-bytes"
         }})),
     );
+}
+
+#[test]
+fn uncertain_workspace_changes_preserve_cache_freshness_but_do_not_credit_progress() {
+    let mut control = TurnExecutionControl::new();
+    let mut tracker = crate::turn_diff_tracker::TurnDiffTracker::new();
+    for index in 0..3 {
+        let mut baseline = control.baselines(tracker.current_mutation_revision());
+        baseline.set_attributed_mutation_revision(tracker.attributed_mutation_revision());
+        tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", None,
+            crate::turn_diff_tracker::CommandMutation::Uncertain);
+        let state = SamplingRequestSettledState {
+            mutation_revision: tracker.current_mutation_revision(),
+            attributed_mutation_revision: tracker.attributed_mutation_revision(),
+            tool_exposure_revision: 0,
+        };
+        assert_ne!(baseline.mutation_revision, state.mutation_revision);
+        let collector = control.collector(&baseline);
+        source(&collector, "same-file");
+        let progress = control.observe_progress(&baseline, &collector, &state);
+        assert!(!progress.contains(&TurnTimingProgressKind::WorkspaceMutation));
+        if index > 0 { assert!(progress.is_empty()); }
+        let decision = control.evaluate_convergence(&baseline, &collector, &state);
+        assert_eq!(decision.directive.is_some(), index > 0);
+    }
+    let mut baseline = control.baselines(tracker.current_mutation_revision());
+    baseline.set_attributed_mutation_revision(tracker.attributed_mutation_revision());
+    tracker.record_exec_command_end_with_mutation_at(&[], 0, false, "", None,
+        crate::turn_diff_tracker::CommandMutation::KnownMutation {
+            paths: Some([std::path::PathBuf::from("changed.rs")].into_iter().collect()),
+        });
+    let state = SamplingRequestSettledState {
+        mutation_revision: tracker.current_mutation_revision(),
+        attributed_mutation_revision: tracker.attributed_mutation_revision(),
+        tool_exposure_revision: 0,
+    };
+    let collector = control.collector(&baseline);
+    assert!(control.observe_progress(&baseline, &collector, &state)
+        .contains(&TurnTimingProgressKind::WorkspaceMutation));
+    assert!(control.evaluate_convergence(&baseline, &collector, &state).directive.is_none());
 }
 
 #[test]

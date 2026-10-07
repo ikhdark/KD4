@@ -66,6 +66,7 @@ pub struct ApplyPatchRequest {
 #[derive(Default)]
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
+    patch_mismatch: Option<codex_apply_patch::PatchContextMismatch>,
     workspace_tracking_started: bool,
     workspace_tracking_finished: bool,
     mutation_repo_root: Option<PathBuf>,
@@ -100,6 +101,10 @@ impl ApplyPatchRuntime {
 
     pub fn committed_delta(&self) -> &AppliedPatchDelta {
         &self.committed_delta
+    }
+
+    pub(crate) fn patch_mismatch(&self) -> Option<&codex_apply_patch::PatchContextMismatch> {
+        self.patch_mismatch.as_ref()
     }
 
     pub async fn finish_pending_workspace_tracking(&mut self, ctx: &ToolCtx) {
@@ -464,6 +469,9 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 Ok(delta) => (delta, "none", false),
                 Err(failure) => {
                     let (error, delta) = failure.into_parts();
+                    if let codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) = &error {
+                        self.patch_mismatch = Some(mismatch.clone());
+                    }
                     let kind = patch_failure_kind(&error);
                     let io_failure = matches!(error, codex_apply_patch::ApplyPatchError::IoError(_));
                     (delta, kind, io_failure)

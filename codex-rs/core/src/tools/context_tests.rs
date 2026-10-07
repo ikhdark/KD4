@@ -36,8 +36,12 @@ fn command_evidence_ignores_durations_and_timestamps() {
         semantic_evidence_for_command_output(b"2 failed in 0.12s"));
     assert_ne!(semantic_evidence_for_command_output(b"localhost:8080"),
         semantic_evidence_for_command_output(b"localhost:9090"));
-    assert_eq!(normalize_tool_failure_text("invalid at line 12 column 9 in 1.5s"),
+    // Generic prose has no producer framing: its coordinates and durations
+    // can be substantive facts rather than volatile diagnostics.
+    assert_ne!(normalize_tool_failure_text("invalid at line 12 column 9 in 1.5s"),
         normalize_tool_failure_text("invalid at line 30 column 2 in 8.0s"));
+    assert_eq!(normalize_tool_failure_text("at example.rs:12:9\nFinished test in 1.5s"),
+        normalize_tool_failure_text("at example.rs:30:2\nFinished test in 8.0s"));
 }
 
 #[test]
@@ -86,13 +90,18 @@ fn command_timing_normalization_preserves_substantive_data_and_failure_status() 
 #[test]
 fn exec_validation_timing_is_stable_without_normalizing_source_reads() {
     let output = |command: &str, seconds: &str, exit_code: i32| ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
         event_call_id: "timing".into(),
         chunk_id: "chunk".into(),
         wall_time: std::time::Duration::from_secs(1),
-        raw_output: format!("test result: ok. 1 passed; 0 failed; finished in {seconds}s").into_bytes(),
+        raw_output: if exit_code == 1 {
+            format!("FAIL [{seconds}s] example::fails\nthread 'example::fails' panicked at example.rs:12:3:\nassertion failed\n").into_bytes()
+        } else {
+            format!("test result: ok. 1 passed; 0 failed; finished in {seconds}s").into_bytes()
+        },
         truncation_policy: TruncationPolicy::Tokens(1000),
         max_output_tokens: None,
         process_id: None,
@@ -170,13 +179,21 @@ fn parallel_test_failures_ignore_runner_noise_but_preserve_failure_changes() {
         "missing fixture\nFAIL [ 4.002s] (2/2) suite case_a\n",
         "---- STDERR: (2/2) suite case_a ----\n",
         "thread 'case_a' (666) panicked at src/a.rs:10:2:\n",
-        "assertion failed: expected 1s; log_id=efgh\n",
+        "assertion failed: expected 1s; log_id=abcd\n",
         "Summary [13.005s] 2 tests run: 2 failed\n",
     );
     let fingerprint = |text: &str| command_failure_signature(
         &failed_command_evidence(text.as_bytes(), Some("cargo nextest run")), Some(1),
     );
     assert_eq!(fingerprint(first), fingerprint(reordered));
+    assert_ne!(fingerprint(first), fingerprint(&format!("{first}TIMEOUT [ 30.0s] (3/3) suite case_c\n")));
+    assert_ne!(fingerprint(first), fingerprint(&first.replace("log_id=abcd", "log_id=efgh")));
+    assert_ne!(fingerprint(first), fingerprint(&first.replace("missing fixture", " missing fixture")));
+    let skipped = format!("{first}SKIP [ 0.001s] (3/3) suite sibling\n");
+    assert_ne!(fingerprint(&skipped), fingerprint(&skipped.replace("SKIP ", "TIMEOUT ")));
+    assert_ne!(fingerprint(first), fingerprint(&first.replace("2 tests run: 2 failed", "3 tests run: 2 failed, 1 timed out")));
+    let unknown = format!("unknown diagnostic payload\n{first}");
+    assert_eq!(failed_command_evidence(unknown.as_bytes(), Some("cargo nextest run")), canonical_output_evidence(unknown.as_bytes()));
     assert_ne!(fingerprint(first), fingerprint(&reordered.replace("case_b", "case_c")));
     assert_ne!(fingerprint(first), fingerprint(&reordered.replace("expected 1s", "expected 2s")));
     let assertion = first.replace("assertion failed: expected 1s; log_id=abcd",
@@ -190,7 +207,7 @@ fn parallel_test_failures_ignore_runner_noise_but_preserve_failure_changes() {
         .replace("thread 'swapped'", "thread 'case_b'")));
     assert_ne!(successful_command_evidence(first.as_bytes(), Some("cat failure.txt")),
         successful_command_evidence(reordered.as_bytes(), Some("cat failure.txt")));
-    assert_eq!(
+    assert_ne!(
         test_failure_evidence(b"FAILED tests/a.py::test_one - AssertionError: run_id=123 expected 1s\n"),
         test_failure_evidence(b"FAILED tests/a.py::test_one - AssertionError: run_id=456 expected 1s\n"),
     );
@@ -208,6 +225,29 @@ fn search_evidence_preserves_exact_output_including_file_order() {
         assert_ne!(successful_command_evidence(first, Some(command)),
             successful_command_evidence(reordered, Some(command)));
     }
+}
+
+#[test]
+fn verified_evidence_failed_command_preserves_unknown_owner_and_whitespace() {
+    for command in [None, Some("custom-producer"), Some("cargo check")] {
+        let first = failed_command_evidence(b"src/a.rs:7:3: failed\n  actual: x\n", command);
+        assert_ne!(first, failed_command_evidence(b"src/b.rs:7:3: failed\n  actual: x\n", command));
+        assert_ne!(first, failed_command_evidence(b"src/a.rs:7:3: failed\n actual: x\n", command));
+    }
+    assert_ne!(failed_command_evidence(b"a:7\n", None), failed_command_evidence(b"a:9\n", None));
+    let validation = crate::validation::CommandValidation {
+        execution_context: None,
+        declared: None,
+        classification: crate::validation::classify_validation_script("cargo check"),
+        receipt_runner: None,
+    };
+    let evidence = |bytes: &[u8]| {
+        let mut signal = serde_json::json!({});
+        attach_command_validation(&mut signal, bytes, Some(&validation), Some(1), true);
+        signal["semantic_evidence"].clone()
+    };
+    assert_ne!(evidence(b"src/a.rs:7:3: failed\n"), evidence(b"src/b.rs:7:3: failed\n"));
+    assert_ne!(evidence(b"src/a.rs:7:3: failed\n  actual: x\n"), evidence(b"src/a.rs:7:3: failed\n actual: x\n"));
 }
 
 fn mcp_tool_output(
@@ -294,8 +334,44 @@ fn apply_patch_code_mode_result_preserves_output() {
             "changes": [],
             "changes_exact": true,
             "environment_id": null,
+            "diagnostics": [],
         })
     );
+}
+
+#[tokio::test]
+async fn applied_patch_diffs_report_committed_lines_and_bounds() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = codex_utils_path_uri::PathUri::from_host_native_path(root.path()).unwrap();
+    std::fs::write(root.path().join("old.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(root.path().join("deleted.txt"), "deleted\n").unwrap();
+    let mut patch = "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n one\n-two\n+λ changed\n*** Delete File: deleted.txt\n".to_string();
+    for index in 0..5 {
+        patch.push_str(&format!("*** Add File: large{index}.txt\n+{}\n", "λ".repeat(6000)));
+    }
+    patch.push_str("*** End Patch");
+    let delta = codex_apply_patch::apply_patch(&patch, &cwd, &mut Vec::new(), &mut Vec::new(),
+        codex_exec_server::LOCAL_FS.as_ref(), None).await.unwrap();
+    // The receipt is built from committed bytes, not a post-patch read.
+    std::fs::write(root.path().join("new.txt"), "independent later edit\n").unwrap();
+    let output = ApplyPatchToolOutput::from_delta("applied".into(), true, &delta, None);
+    let changed = output.changes.iter().find(|change| change["kind"] == "update").unwrap();
+    assert!(changed["unified_diff"].as_str().unwrap().contains("@@ -1,2 +1,2 @@"));
+    assert!(changed["unified_diff"].as_str().unwrap().contains("+λ changed"));
+    assert_eq!(changed["diff_complete"], true);
+    assert!(changed["move_path"].as_str().unwrap().ends_with("new.txt"));
+    let deleted = output.changes.iter().find(|change| change["kind"] == "delete").unwrap();
+    assert!(deleted["unified_diff"].as_str().unwrap().contains("-deleted"));
+    assert!(output.changes.iter().any(|change| change["diff_complete"] == false));
+    let mut total = 0;
+    for change in &output.changes {
+        let diff = change["unified_diff"].as_str().unwrap();
+        assert!(diff.len() <= 8 * 1024);
+        total += diff.len();
+        assert_eq!(change["diff_complete"] == true, diff.len() as u64 == change["diff_bytes"].as_u64().unwrap());
+    }
+    assert!(total <= 32 * 1024);
+    assert!(output.model_text().contains("+λ changed"));
 }
 
 #[test]
@@ -308,6 +384,7 @@ fn failed_patch_carries_its_retry_receipt_once_per_projection() {
         changes_exact: true,
         environment_id: None,
         retry: None,
+        diagnostics: Vec::new(),
     }
     .with_retry(Some(receipt.clone()));
     let payload = ToolPayload::Custom {
@@ -883,7 +960,10 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
             }
         })],
         omitted_result_count: 0,
+        activated_omitted_tools: Vec::new(),
         unactivated_matches: Vec::new(),
+        unmatched_identifiers: Vec::new(),
+        exact_name_ambiguity: None,
     };
     assert_eq!(
         output.code_mode_result(&payload),
@@ -948,7 +1028,10 @@ fn partial_tool_search_outputs_are_model_visible_as_incomplete() {
     let output = ToolSearchOutput {
         tools: Vec::new(),
         omitted_result_count: 1,
+        activated_omitted_tools: vec!["calendar.create_event".to_string()],
         unactivated_matches: Vec::new(),
+        unmatched_identifiers: Vec::new(),
+        exact_name_ambiguity: None,
     };
     assert_eq!(
         output.code_mode_result(&payload),
@@ -957,6 +1040,8 @@ fn partial_tool_search_outputs_are_model_visible_as_incomplete() {
             "execution": "client",
             "tools": [],
             "omitted_result_count": 1,
+            "activated_omitted_tools": ["calendar.create_event"],
+            "resolution": {"helper":"resolve_tool", "argument":"exact activated_omitted_tools name"},
         })
     );
     let response = output.to_response_item("search-partial", &payload);
@@ -1007,6 +1092,64 @@ fn aborted_tool_search_payloads_preserve_abort_status() {
             omitted_result_count: None,
         }
     );
+}
+
+#[test]
+fn verified10_search_receipts_match_advertised_schema() {
+    let schema = codex_tools::code_mode_tool_search_output_schema();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let payload = ToolPayload::ToolSearch {
+        arguments: SearchToolCallParams { query: "messages".into(), limit: None },
+    };
+    let mut output = ToolSearchOutput {
+        tools: vec![], omitted_result_count: 0, activated_omitted_tools: vec![],
+        unactivated_matches: vec![], unmatched_identifiers: vec![], exact_name_ambiguity: None,
+    };
+    validator.validate(&output.code_mode_result(&payload)).unwrap();
+    output.omitted_result_count = 1;
+    output.activated_omitted_tools.push("mail.messages".into());
+    validator.validate(&output.code_mode_result(&payload)).unwrap();
+    output.exact_name_ambiguity = Some(json!({
+        "match_count": 2, "omitted_alternative_count": 0,
+        "qualified_alternatives": ["mail.messages", "chat.messages"]
+    }));
+    output.unmatched_identifiers.push("project_alpha".into());
+    validator.validate(&output.code_mode_result(&payload)).unwrap();
+    validator.validate(&AbortedToolOutput { message: "cancelled".into() }.code_mode_result(&payload)).unwrap();
+    let mut invalid = output.code_mode_result(&payload);
+    invalid["resolution"]["helper"] = json!("invented");
+    assert!(!validator.is_valid(&invalid));
+}
+
+#[test]
+fn verified10_search_rejects_invented_filters_with_scope_guidance() {
+    for field in ["source", "provider", "namespace"] {
+        let error = serde_json::from_value::<SearchToolCallParams>(json!({"query":"messages", (field):"gmail"})).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("source:<canonical namespace>"), "{error}");
+    }
+    let args: SearchToolCallParams = serde_json::from_value(json!({"query":"messages source:gmail", "limit":1})).unwrap();
+    assert_eq!(args.limit, Some(1));
+}
+
+#[test]
+fn verified10_anchor_survives_actual_input_normalization() {
+    let input = json!({
+        "$schema":"https://json-schema.org/draft/2020-12/schema",
+        "type":"object", "properties":{"duration":{"$ref":"#Bounded"}},
+        "$defs":{"duration":{"$anchor":"Bounded", "type":"number", "minimum":1, "maximum":5}}
+    });
+    let normalized = serde_json::to_value(codex_tools::parse_tool_input_schema(&input).unwrap()).unwrap();
+    assert_eq!(normalized["$defs"]["duration"]["$anchor"], "Bounded");
+    let before = jsonschema::validator_for(&input).unwrap();
+    let after = jsonschema::validator_for(&normalized).unwrap();
+    for (value, valid) in [(json!({"duration":3}), true), (json!({"duration":6}), false), (json!({"duration":"3"}), false)] {
+        assert_eq!(before.is_valid(&value), valid);
+        assert_eq!(after.is_valid(&value), valid);
+    }
+    for keyword in ["$dynamicAnchor", "$recursiveAnchor"] {
+        assert!(codex_tools::parse_tool_input_schema(&json!({"type":"object", (keyword):"Bounded"})).unwrap_err().to_string().contains(keyword));
+    }
 }
 
 #[test]
@@ -1210,6 +1353,7 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         arguments: "{}".to_string(),
     };
     let response = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1263,6 +1407,7 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
 #[test]
 fn retained_exec_command_process_is_yielded_not_timed_out() {
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1313,6 +1458,7 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
 #[test]
 fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1354,6 +1500,7 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
         arguments: "{}".to_string(),
     };
     let mut output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1439,6 +1586,7 @@ fn exec_output_discloses_lossy_decoding_without_changing_canonical_bytes() {
 #[test]
 fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1479,6 +1627,7 @@ fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
 fn exec_command_projection_metadata_preserves_authoritative_first_output() {
     let raw_output = "first output line\n".repeat(100);
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1529,6 +1678,7 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
 #[test]
 fn token_efficiency_exec_projection_reports_truncation_once() {
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1566,6 +1716,7 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
 #[test]
 fn exec_command_projection_reports_reduction_from_per_call_limit() {
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1601,6 +1752,7 @@ fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
         .collect::<Vec<_>>()
         .join("\n");
     let output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1681,6 +1833,7 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         .collect::<Vec<_>>()
         .join("\n");
     let response = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1727,6 +1880,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     let artifact_path =
         std::path::PathBuf::from(format!(r"C:\codex\tool-output\{artifact_id}.log"));
     let mut output = ExecCommandToolOutput {
+        output_ranges: None,
         process_output: None,
         error: None,
         validation: None,
@@ -1832,6 +1986,9 @@ async fn artifact_backed_exec_output(
         .join("tool-output/thread")
         .join(format!("{artifact_id}.log"));
     let output = ExecCommandToolOutput {
+        output_ranges: Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
+            range: 0..raw_output.len() as u64, gap: None,
+        }),
         process_output: None,
         error: None,
         validation: None,
@@ -1853,6 +2010,49 @@ async fn artifact_backed_exec_output(
         pending_deferred_completions: Vec::new(),
     };
     (output, artifact_id, artifact_path, retained_root)
+}
+
+#[tokio::test]
+async fn command_recovery_targets_current_chunk_gaps_not_cumulative_prefix() {
+    use crate::unified_exec::head_tail_buffer::OutputChunkRanges;
+    let prefix = b"already observed\r\n";
+    let chunk = (0..500).map(|index| format!("current line {index:04}: exact λ evidence\r\n"))
+        .collect::<String>();
+    let raw = [prefix.as_slice(), chunk.as_bytes()].concat();
+    let (mut output, _, _, _root) = artifact_backed_exec_output(&raw, Some(80)).await;
+    output.raw_output = chunk.as_bytes().to_vec();
+    output.output_ranges = Some(OutputChunkRanges { range: prefix.len() as u64..raw.len() as u64, gap: None });
+    let payload = ToolPayload::Function { arguments: "{}".into() };
+    let packet = output.code_mode_result(&payload);
+    let selector = &packet["recovery_selector"];
+    assert_eq!(selector["kind"], "bytes");
+    let start = selector["start"].as_u64().unwrap() as usize;
+    let end = selector["end"].as_u64().unwrap() as usize;
+    assert!(start >= prefix.len() && start < end && end <= raw.len());
+    assert!(end - start <= 4096);
+    let retained = String::from_utf8_lossy(&raw[start..end]);
+    assert!(!retained.contains("already observed"));
+    assert!(retained.starts_with("current line"));
+    assert_eq!(packet["recovery"]["arguments"]["selectors"][0], *selector);
+
+    // The first retention gap is known even if the displayed head/tail fit.
+    output.raw_output = b"head\n[output retention gap]\ntail\n".to_vec();
+    output.output_ranges = Some(OutputChunkRanges { range: 18..100, gap: Some(22..96) });
+    output.max_output_tokens = Some(1000);
+    let gap = output.code_mode_result(&payload);
+    assert_eq!(gap["recovery_selector"], json!({"kind":"bytes", "start":22, "end":96}));
+    assert_eq!(gap["output_reduced"], true);
+    output.raw_output.clear();
+    output.output_ranges = Some(OutputChunkRanges { range: raw.len() as u64..raw.len() as u64, gap: None });
+    let empty = output.code_mode_result(&payload);
+    assert!(empty.get("recovery_selector").is_none());
+    assert_eq!(empty["output_reduced"], false);
+
+    // Unknown coordinates must not turn into a guessed 0..4096 selector.
+    output.raw_output = chunk.into_bytes();
+    output.output_ranges = None;
+    output.max_output_tokens = Some(80);
+    assert!(output.code_mode_result(&payload).get("recovery_selector").is_none());
 }
 
 #[tokio::test]
@@ -1880,6 +2080,71 @@ async fn exec_small_output_spills_only_when_its_display_is_reduced() {
     }
 }
 
+#[test]
+fn final_test_summaries_attribute_counts_without_execution_receipts() {
+    for (command, output, expected) in [
+        ("python -m unittest", "Ran 98 tests in 1.2s\n\nOK\n", Some(98)),
+        ("python -m unittest", "Ran 4 tests in 1.2s\n\nOK (skipped=2)\n", Some(2)),
+        ("pytest", "=== 12 passed, 2 skipped in 0.20s ===\n", Some(12)),
+        ("cargo test", "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n", Some(3)),
+        ("cargo test", "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.0s\n", None),
+        ("python -m unittest", "Ran 4 tests in 1.2s\nOK (skipped=4)\n", None),
+        ("python -m unittest", "Ran 4 tests in 1.2s\nFAILED (failures=1)\n", None),
+        ("pytest", "2 failed, 12 passed in 0.20s", None),
+        ("echo OK", "Ran 98 tests in 1.2s\nOK", None),
+    ] {
+        let validation = crate::validation::CommandValidation {
+            execution_context: None,
+            declared: None, receipt_runner: None,
+            classification: crate::validation::classify_validation_script(command),
+        };
+        let mut signal = json!({});
+        attach_command_validation(&mut signal, output.as_bytes(), Some(&validation), Some(0), true);
+        assert_eq!(signal["validation_summary_tests"].as_u64(), expected, "{command}: {output}");
+        assert!(signal.get("runner_execution_receipt").is_none());
+        let mut failed = json!({});
+        attach_command_validation(&mut failed, output.as_bytes(), Some(&validation), Some(1), true);
+        assert!(failed.get("validation_summary_tests").is_none());
+    }
+}
+
+#[test]
+fn runner_receipts_preserve_execution_tuples_and_partial_failures() {
+    let pure = json!({"binary": "core", "helpers": [], "test": "same"});
+    let helper = json!({"binary": "core", "helpers": ["helper"], "test": "same"});
+    let mut receipt = json!({
+        "kind": "codex_test_execution_v1", "runner": "rust_test_runner",
+        "runner_input_fingerprint": "a".repeat(64), "selected_targets": ["a", "b"],
+        "completed_tests": {"core": ["same"]}, "executed_tests": 2,
+        "executions": [pure, helper], "required_executions": [pure, helper],
+        "satisfied_gates": {"a": ["same"], "b": ["same"]}, "exit_code": 0,
+    });
+    assert_eq!(runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner")), Some(receipt.clone()));
+    receipt["exit_code"] = json!(2);
+    receipt["executions"] = json!([pure]);
+    receipt["executed_tests"] = json!(1);
+    let validation = crate::validation::CommandValidation {
+        execution_context: None, declared: None,
+        classification: crate::validation::classify_validation_script("cargo test"),
+        receipt_runner: Some("rust_test_runner".into()),
+    };
+    let mut signal = json!({});
+    attach_command_validation(&mut signal, receipt.to_string().as_bytes(), Some(&validation), Some(2), true);
+    assert_eq!(signal["runner_execution_receipt"], receipt);
+    assert!(signal.get("failure_signature").is_some());
+    for exit_code in [0, 1] {
+        let mut signal = json!({});
+        attach_command_validation(&mut signal, receipt.to_string().as_bytes(), Some(&validation), Some(exit_code), true);
+        assert!(signal.get("runner_execution_receipt").is_none(), "actual exit must match receipt");
+    }
+    receipt["exit_code"] = json!(0);
+    assert!(runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner")).is_none(), "partial selection is not success");
+    receipt["exit_code"] = json!(2);
+    receipt["executions"] = json!([pure, pure]);
+    receipt["executed_tests"] = json!(2);
+    assert!(runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner")).is_none(), "duplicate execution identities are not two passes");
+}
+
 #[tokio::test]
 async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_proof() {
     let tests = (0..160).map(|index| format!("module::日本語::test_{index:04}")).collect::<Vec<_>>();
@@ -1894,6 +2159,7 @@ async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_pro
         artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
     output.hook_command = Some("cargo test --lib".into());
     output.validation = Some(crate::validation::CommandValidation {
+        execution_context: None,
         declared: None,
         classification: crate::validation::classify_validation_script("cargo test --lib"),
         receipt_runner: Some("rust_test_runner".into()),
@@ -1941,6 +2207,7 @@ async fn exec_passing_validation_is_compact_even_when_it_fits_the_output_budget(
     let (mut output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
     output.hook_command = Some("cargo test --lib".into());
     output.validation = Some(crate::validation::CommandValidation {
+        execution_context: None,
         declared: None,
         classification: crate::validation::classify_validation_script("cargo test --lib"),
         receipt_runner: None,
@@ -2025,6 +2292,28 @@ async fn exec_code_mode_preserves_empty_output_and_explicit_lifecycle() {
 }
 
 #[tokio::test]
+async fn silence_observation_survives_zero_display_budget() {
+    let (mut output, _, _, _root) = artifact_backed_exec_output(b"notice", Some(0)).await;
+    output.process_exited = false;
+    output.exit_code = None;
+    output.process_id = Some(1);
+    output.session_capabilities = Some(ExecSessionCapabilities {
+        incarnation: uuid::Uuid::nil(), stdin: false, interrupt: false, cancellation: true, polling: true,
+        observation: Some(ExecSilenceObservation {
+            silent_for_ms: 100,
+            reason: ExecObservationReason::NoOutputObserved,
+            process_exited: false,
+            termination_requested: false,
+        }),
+    });
+    let result = output.code_mode_result_with_budget(&ToolPayload::Function { arguments: "{}".into() }, 0);
+    assert_eq!(result["session_capabilities"]["observation"], serde_json::json!({
+        "silent_for_ms": 100, "reason": "no_output_observed",
+        "process_exited": false, "termination_requested": false,
+    }));
+}
+
+#[tokio::test]
 async fn fork91_empty_terminal_drain_preserves_chunk_and_cumulative_stream_contracts() {
     let raw = b"validation completed: 5 passed\r\n";
     let (mut output, _, _, _root) = artifact_backed_exec_output(raw, Some(1000)).await;
@@ -2049,14 +2338,16 @@ async fn fork91_empty_terminal_drain_preserves_chunk_and_cumulative_stream_contr
 }
 
 #[tokio::test]
-async fn fork91_cumulative_recovery_has_bounded_selector_without_fake_coordinates() {
+async fn fork91_cumulative_recovery_without_coordinates_does_not_guess_a_prefix() {
     let raw = "retained progress\n".repeat(1000);
     let (mut output, id, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(1000)).await;
     output.raw_output = b"last chunk\n".to_vec();
+    output.output_ranges = None;
     let payload = ToolPayload::Function { arguments: "{}".into() };
     let result = output.code_mode_result(&payload);
     assert_eq!(result["raw_output_artifact_id"], id.to_string());
-    assert_eq!(result["recovery_selector"], json!({"kind":"bytes", "start":0, "end":4096}));
+    assert!(result.get("recovery_selector").is_none());
+    assert!(result.get("recovery").is_none());
     output.raw_output_artifact = None;
     assert!(output.code_mode_result(&payload).get("recovery_selector").is_none());
     output.raw_output = raw.into_bytes();
@@ -2082,6 +2373,32 @@ async fn fork91_no_match_requires_exact_error_free_terminal_streams() {
     assert!(!output.success_for_logging(), "unknown streams are not a no-match proof");
     output.exit_code = Some(0);
     assert!(output.success_for_logging(), "ordinary successes are unchanged");
+}
+
+#[tokio::test]
+async fn nested_command_output_uses_cell_budget_and_preserves_explicit_caps() {
+    let raw = "source line with useful evidence\n".repeat(1500);
+    let (output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(8_000)).await;
+    let payload = |cap: Option<usize>| ToolPayload::Function {
+        arguments: json!({"max_output_tokens": cap}).to_string(),
+    };
+    let default = output.code_mode_result_with_budget(&payload(None), 8_000);
+    assert_eq!(default["output_reduced"], true);
+    for budget in [20_800, 24_000, 32_000] {
+        let raised = output.code_mode_result_with_budget(&payload(None), budget);
+        assert_eq!(raised["output"], raw);
+        assert_eq!(raised["output_complete"], true);
+    }
+    for cap in [0, 32, 1000] {
+        let small = output.code_mode_result_with_budget(&payload(Some(cap)), 24_000);
+        assert!(codex_utils_string::approx_token_count(small["output"].as_str().unwrap()) <= cap);
+        assert_eq!(small["output_reduced"], true);
+        assert_eq!(small["exit_code"], 0);
+        assert!(small["raw_output_artifact_id"].is_string());
+    }
+    let depleted = output.code_mode_result_with_budget(&payload(None), 0);
+    assert_eq!(depleted["output"], "");
+    assert_eq!(depleted["output_reduced"], true);
 }
 
 #[tokio::test]
@@ -2172,9 +2489,10 @@ async fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
 
     let packet: JsonValue = serde_json::from_str(&response).unwrap();
     assert_eq!(packet["artifact_id"], artifact_id.to_string());
-    assert_eq!(response.matches(&artifact_id.to_string()).count(), 1);
+    assert_eq!(response.matches(&artifact_id.to_string()).count(), 2);
+    assert_eq!(packet["recovery"]["arguments"]["artifact_id"], artifact_id.to_string());
     assert!(codex_utils_string::approx_token_count(packet["output"].as_str().unwrap()) <= 200);
-    assert!(!response.contains("selectors"));
+    assert!(packet["recovery"]["arguments"]["selectors"].is_array());
     let code_mode = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".into(),
     });

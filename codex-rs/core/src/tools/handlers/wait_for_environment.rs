@@ -55,7 +55,7 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name: WAIT_FOR_ENVIRONMENT_TOOL_NAME.to_string(),
-            description: "Wait for a starting environment to become available before continuing."
+            description: "Wait for environment readiness only. Filesystem tools already wait internally for their selected environment: call the desired available operation directly instead of waiting first. Use this tool for readiness-only requests or when the desired tool surface is unavailable."
                 .to_string(),
             strict: false,
             defer_loading: None,
@@ -175,5 +175,7 @@ mod tests {
             panic!("expected a function tool");
         };
         assert!(spec.parameters.required.as_ref().is_none_or(Vec::is_empty));
+        assert!(spec.description.contains("call the desired available operation directly"));
+        assert!(spec.description.contains("readiness-only requests"));
     }
 }

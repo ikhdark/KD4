@@ -93,6 +93,13 @@ async fn registered_listing_tracks_directory_evidence_and_bounds_traversal() {
         assert_eq!(output["truncated"], truncated);
         assert_eq!(output["complete"], !truncated);
         assert_eq!(output["errors"], json!([]));
+        if truncated {
+            assert!(!output["unexplored"].as_array().unwrap().is_empty());
+            let stop = &output["unexplored"][0];
+            assert!(stop["path"].is_string());
+            assert!(stop["effectiveLimit"].is_number());
+            assert!(stop["partiallyExamined"].is_boolean());
+        }
         assert_eq!(
             dependencies.as_ref(),
             Some(&BTreeSet::from([SourceDependencyV1::new(
@@ -137,6 +144,9 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
         let payload = call.payload.clone();
         let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
         assert_eq!(output["complete"], true);
+        assert_eq!(output["limits_clamped"], true);
+        assert!(output["effective_walk_options"]["max_depth"].as_u64().unwrap() <= MAX_DEPTH as u64);
+        assert!(output["effective_walk_options"]["max_entries"].as_u64().unwrap() <= MAX_ENTRIES as u64);
     }
     assert!(
         ListFilesHandler
@@ -144,6 +154,12 @@ async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
             .await
             .is_err()
     );
+    // A successful empty walk must never stand in for an untraversed root.
+    std::fs::write(root.path().join("regular.txt"), "not a directory").unwrap();
+    let error = ListFilesHandler
+        .handle(invocation(root.path(), json!({"path": "regular.txt"})).await)
+        .await.err().unwrap().to_string();
+    assert!(error.contains("walk root is not a directory"), "{error}");
     let cancelled = invocation(root.path(), json!({"path": "."})).await;
     cancelled.cancellation_token.cancel();
     let error = ListFilesHandler.handle(cancelled).await.err().unwrap();
@@ -168,6 +184,74 @@ async fn listing_does_not_follow_directory_symlinks() {
         .code_mode_result(&payload);
     assert_eq!(output["complete"], true);
     assert!(!output.to_string().contains("outside.txt"));
+    let call = invocation(root.path(), json!({"path":"link"})).await;
+    let error = ListFilesHandler.handle(call).await.err().unwrap().to_string();
+    assert!(error.contains("root symlink skipped"), "{error}");
+}
+
+#[tokio::test]
+async fn listing_filters_cover_nested_files_and_leave_an_unfiltered_audit_mode() {
+    let root = tempfile::tempdir().unwrap();
+    for dir in ["src", "target", ".hidden"] { std::fs::create_dir(root.path().join(dir)).unwrap(); }
+    for name in ["src/keep.rs", "src/drop.rs", "src/readme.txt", "target/build.rs", ".hidden/secret.rs"] {
+        std::fs::write(root.path().join(name), "content").unwrap();
+    }
+    for (extra, expected_files) in [
+        (json!({"include":["*.rs"],"exclude":["drop*"],"exclude_directories":["target"],"include_hidden":true}), 2),
+        (json!({"include_hidden":true}), 5),
+    ] {
+        let mut args = json!({"path":"."});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let call = invocation(root.path(), args).await;
+        let payload = call.payload.clone();
+        let result = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["effective_walk_options"]["max_response_bytes"], codex_exec_server::MAX_WALK_RESPONSE_BYTES);
+        let files = result["entries"].as_array().unwrap().iter().filter(|entry| entry["kind"] == "file").collect::<Vec<_>>();
+        assert_eq!(files.len(), expected_files);
+        if expected_files == 2 {
+            assert!(files.iter().any(|entry| entry["path"].as_str().unwrap().ends_with("keep.rs")));
+            assert!(files.iter().any(|entry| entry["path"].as_str().unwrap().ends_with("secret.rs")));
+        }
+    }
+    let call = invocation(root.path(), json!({"path":".","max_directories":1})).await;
+    let payload = call.payload.clone();
+    let result = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+    assert_eq!(result["complete"], false);
+    assert!(result["unexplored"].as_array().unwrap().iter().any(|stop| stop["reason"] == "directory_limit"));
+}
+
+#[tokio::test]
+async fn verified_evidence_directory_scope_includes_effective_walk_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let mut evidence = Vec::new();
+    for extra in [json!({"max_depth":1}), json!({"max_depth":2}), json!({"max_depth":1,"include_hidden":true})] {
+        let mut args = json!({"path":"."});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let call = invocation(root.path(), args).await;
+        let payload = call.payload.clone();
+        let output = ListFilesHandler.handle(call).await.unwrap();
+        assert_eq!(output.code_mode_result(&payload)["entries"], json!([]));
+        let essential = output.projection_metadata().unwrap().essential_inline;
+        assert_eq!(essential["effective_walk_options"], output.code_mode_result(&payload)["effective_walk_options"]);
+        assert_eq!(essential["limits_clamped"], false);
+        evidence.push(output.sampling_request_signal().unwrap());
+    }
+    assert_ne!(evidence[0], evidence[1]);
+    assert_ne!(evidence[0], evidence[2]);
+}
+
+#[tokio::test]
+async fn listing_distinguishes_empty_directory_and_regular_file() {
+    let root = tempfile::tempdir().unwrap();
+    let call = invocation(root.path(), json!({"path":"."})).await;
+    let payload = call.payload.clone();
+    let output = ListFilesHandler.handle(call).await.unwrap().code_mode_result(&payload);
+    assert_eq!(output["complete"], true);
+    assert_eq!(output["entries"], json!([]));
+    std::fs::write(root.path().join("file.txt"), "text").unwrap();
+    let call = invocation(root.path(), json!({"path":"file.txt"})).await;
+    assert!(ListFilesHandler.handle(call).await.err().unwrap().to_string().contains("not a directory"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -207,8 +291,12 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
                 }
                 "fs/walk" => {
                     walks.push(message["params"].clone());
-                    json!({"entries": [{"path": response_file, "kind": "file"}],
-                           "errors": [{"path": response_cwd, "message": "permission denied for a descendant"}], "truncated": true})
+                    let mut result = json!({"entries": [{"path": response_file, "kind": "file"}],
+                           "errors": [{"path": response_cwd, "message": "permission denied for a descendant"}], "truncated": true});
+                    if walks.len() == 2 {
+                        result["appliedFilters"] = message["params"]["options"]["filters"].clone();
+                    }
+                    result
                 }
                 method => panic!("unexpected filesystem operation {method}"),
             };
@@ -238,27 +326,33 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
         arguments: json!({"path": ".", "environment_id": "remote-listing", "max_entries": 17})
             .to_string(),
     };
-    let call = ToolInvocation {
-        session: Arc::new(session),
-        step_context: StepContext::for_test(Arc::new(turn)),
-        cancellation_token: CancellationToken::new(),
-        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-        call_id: "remote-list".into(),
-        tool_name: ToolName::plain("list_files"),
-        source: ToolCallSource::Direct,
-        payload: payload.clone(),
+    let session = Arc::new(session);
+    let step_context = StepContext::for_test(Arc::new(turn));
+    let call = |payload: ToolPayload| ToolInvocation {
+        session: Arc::clone(&session), step_context: Arc::clone(&step_context),
+        cancellation_token: CancellationToken::new(), tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "remote-list".into(), tool_name: ToolName::plain("list_files"),
+        source: ToolCallSource::Direct, payload,
     };
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        ListFilesHandler.handle(call),
+        ListFilesHandler.handle(call(payload.clone())),
     )
     .await
     .unwrap()
     .unwrap()
     .code_mode_result(&payload);
+    let filtered_payload = ToolPayload::Function {
+        arguments: json!({"path":".", "environment_id":"remote-listing", "include":["*.txt"], "exclude_directories":["target"]}).to_string(),
+    };
+    let filtered = ListFilesHandler.handle(call(filtered_payload.clone())).await.unwrap().code_mode_result(&filtered_payload);
+    assert_eq!(filtered["complete"], false);
+    let incompatible = ListFilesHandler.handle(call(filtered_payload)).await.err().unwrap().to_string();
+    assert!(incompatible.contains("did not apply requested walk filters"));
     stop_tx.send(()).unwrap();
     let walks = server.await.unwrap();
-    assert_eq!(walks.len(), 1);
+    assert_eq!(walks.len(), 3);
+    assert_eq!(walks[1]["options"]["filters"], json!({"include":["*.txt"],"excludeDirectories":["target"]}));
     assert_eq!(walks[0]["sandbox"], json!(expected_sandbox));
     assert_eq!(walks[0]["options"]["maxEntries"], 17);
     assert_eq!(walks[0]["options"]["followDirectorySymlinks"], false);

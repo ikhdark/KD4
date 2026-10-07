@@ -104,10 +104,15 @@ pub(crate) enum RuntimeEvent {
 #[derive(Clone, Debug)]
 pub(crate) struct StoredValue {
     pub(crate) value: Arc<JsonValue>,
+    /// Trusted display edit recipes captured from the tool-owned projector.
+    /// Plain JSON values never infer or synthesize these registrations.
+    pub(crate) presentation: Option<Arc<JsonValue>>,
     /// Immutable wire representation shared by loads and cell snapshots. Each
     /// load still parses a fresh JS value, so callers cannot mutate the store.
-    serialized: Option<Arc<str>>,
-    /// Serialized bytes of the key and value, charged to the session limit.
+    pub(crate) serialized: Option<Arc<serde_json::value::RawValue>>,
+    /// Transaction-only tombstone; never installed in the committed values map.
+    pub(crate) deleted: bool,
+    /// Serialized key, value and presentation bytes charged to the session limit.
     pub(crate) bytes: usize,
     /// Keys read by the producing cell. None means the bounded read set
     /// overflowed and the owner must compare the complete snapshot.
@@ -116,18 +121,36 @@ pub(crate) struct StoredValue {
 
 impl StoredValue {
     pub(crate) fn new(key: &str, value: JsonValue) -> Self {
-        let serialized = serde_json::to_string(&value).ok().map(Arc::<str>::from);
+        let serialized: Option<Arc<serde_json::value::RawValue>> =
+            serde_json::value::to_raw_value(&value).ok().map(Arc::from);
         let bytes = serialized.as_ref().and_then(|json| {
             stored_value_entry_bytes(key, &JsonValue::Null)
                 .checked_sub(4)
-                .and_then(|key_bytes| key_bytes.checked_add(json.len()))
+                .and_then(|key_bytes| key_bytes.checked_add(json.get().len()))
         }).unwrap_or(usize::MAX);
         Self {
             bytes,
             value: Arc::new(value),
+            presentation: None,
             serialized,
+            deleted: false,
             read_dependencies: Some(Arc::new(HashSet::new())),
         }
+    }
+
+    pub(crate) fn deletion(key: &str) -> Self {
+        let mut value = Self::new(key, JsonValue::Null);
+        value.deleted = true;
+        value
+    }
+
+    pub(crate) fn with_presentation(mut self, presentation: Option<JsonValue>) -> Self {
+        if let Some(presentation) = presentation {
+            let bytes = serde_json::to_vec(&presentation).map_or(usize::MAX, |bytes| bytes.len());
+            self.bytes = self.bytes.saturating_add(bytes);
+            self.presentation = Some(Arc::new(presentation));
+        }
+        self
     }
 }
 
@@ -338,9 +361,24 @@ pub(crate) fn prewarm_runtime() {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn spawn_runtime(
     stored_values: HashMap<String, StoredValue>,
     request: ExecuteRequest,
+    default_tool_timeout_ms: u64,
+    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    output_admission: Arc<OutputAdmission>,
+    task_failure_handler: Option<TaskFailureHandler>,
+) -> Result<(std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle), String> {
+    let catalog = Arc::new(EnabledToolCatalog::from_definitions(&request.enabled_tools)?);
+    spawn_runtime_with_catalog(stored_values, request, catalog, default_tool_timeout_ms,
+        event_tx, output_admission, task_failure_handler).await
+}
+
+pub(crate) async fn spawn_runtime_with_catalog(
+    stored_values: HashMap<String, StoredValue>,
+    request: ExecuteRequest,
+    enabled_tools: Arc<EnabledToolCatalog>,
     default_tool_timeout_ms: u64,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     output_admission: Arc<OutputAdmission>,
@@ -351,22 +389,9 @@ pub(crate) async fn spawn_runtime(
     let (isolate_handle_tx, isolate_handle_rx) = tokio::sync::oneshot::channel();
     let ExecuteRequest {
         tool_call_id,
-        enabled_tools,
         source,
         ..
     } = request;
-    let enabled_tools = Arc::new(EnabledToolCatalog::new(
-        enabled_tools
-            .iter()
-            .map(|definition| EnabledToolMetadata {
-                global_name: normalize_code_mode_identifier(&definition.name),
-                tool_name: definition.tool_name.clone(),
-                description: definition.description.clone(),
-                kind: definition.kind,
-                default_timeout_ms: definition.default_timeout_ms,
-            })
-            .collect(),
-    )?);
     let config = RuntimeConfig {
         tool_call_id,
         enabled_tools,
@@ -483,12 +508,25 @@ struct RuntimeConfig {
 }
 
 #[derive(Default)]
-struct EnabledToolCatalog {
+pub(crate) struct EnabledToolCatalog {
     tools: Vec<EnabledToolMetadata>,
     by_global_name: HashMap<String, usize>,
+    input_bytes: usize,
 }
 
 impl EnabledToolCatalog {
+    pub(crate) fn from_definitions(definitions: &[codex_code_mode_protocol::ToolDefinition]) -> Result<Self, String> {
+        Self::new(definitions.iter().map(|definition| EnabledToolMetadata {
+            global_name: normalize_code_mode_identifier(&definition.name),
+            tool_name: definition.tool_name.clone(),
+            description: Arc::clone(&definition.description),
+            kind: definition.kind,
+            default_timeout_ms: definition.default_timeout_ms.map(|timeout| timeout.min(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS)),
+        }).collect())
+    }
+
+    pub(crate) fn input_bytes(&self) -> usize { self.input_bytes }
+
     fn new(tools: Vec<EnabledToolMetadata>) -> Result<Self, String> {
         let mut by_global_name: HashMap<String, usize> = HashMap::with_capacity(tools.len());
         for (index, tool) in tools.iter().enumerate() {
@@ -501,9 +539,17 @@ impl EnabledToolCatalog {
             }
             by_global_name.insert(tool.global_name.clone(), index);
         }
+        let input_bytes = tools.iter().fold(0usize, |bytes, tool| {
+            bytes.saturating_add(std::mem::size_of::<EnabledToolMetadata>())
+                .saturating_add(tool.global_name.len().saturating_mul(2))
+                .saturating_add(tool.tool_name.name.len())
+                .saturating_add(tool.tool_name.namespace.as_ref().map_or(0, String::len))
+                .saturating_add(tool.description.len())
+        });
         Ok(Self {
             tools,
             by_global_name,
+            input_bytes,
         })
     }
 
@@ -519,15 +565,45 @@ impl EnabledToolCatalog {
     /// discovery reports for a namespaced tool. Ambiguous identities stay
     /// unresolved rather than dispatching to an arbitrary tool.
     fn resolve_requested_name(&self, requested_name: &str) -> Option<usize> {
-        if let Some(index) = self.index_of(requested_name) {
-            return Some(index);
-        }
-        let (namespace, name) = requested_name.split_once('.')?;
         let mut matches = self.tools.iter().enumerate().filter(|(_, tool)| {
-            tool.tool_name.namespace.as_deref() == Some(namespace) && tool.tool_name.name == name
+            tool.global_name == requested_name
+                || tool.tool_name.to_string() == requested_name
+                || requested_name.split_once('.').is_some_and(|(namespace, name)| {
+                    tool.tool_name.namespace.as_deref() == Some(namespace) && tool.tool_name.name == name
+                })
         });
         let (index, _) = matches.next()?;
         matches.next().is_none().then_some(index)
+    }
+
+    fn resolution_diagnostic(&self, requested: Option<&str>) -> serde_json::Value {
+        let valid = requested.is_some_and(|name| !name.trim().is_empty() && name.len() <= 4096);
+        let name = requested.filter(|_| valid).unwrap_or_default();
+        let exact = self.tools.iter().filter(|tool| {
+            tool.tool_name.to_string() == name || tool.tool_name.name == name
+                || name.split_once('.').is_some_and(|(namespace, local_name)| {
+                    tool.tool_name.namespace.as_deref() == Some(namespace)
+                        && tool.tool_name.name == local_name
+                })
+        }).collect::<Vec<_>>();
+        let ambiguous = exact.len() > 1;
+        let candidates = if exact.is_empty() && valid {
+            self.tools.iter().filter(|tool| tool.global_name.contains(name)).collect::<Vec<_>>()
+        } else { exact };
+        let total = candidates.len();
+        let mut bytes = 0;
+        let candidates = candidates.into_iter().filter_map(|tool| {
+            let size = serde_json::to_string(&tool.global_name).ok()?.len();
+            if bytes + size > 2048 { return None; }
+            bytes += size;
+            Some(tool.global_name.clone())
+        }).take(8).collect::<Vec<_>>();
+        serde_json::json!({
+            "status": if !valid { "invalid_name" } else if ambiguous { "ambiguous" } else { "not_found" },
+            "omitted_candidate_count": total.saturating_sub(candidates.len()),
+            "candidates": candidates,
+            "recovery": "Resolve an exact canonical candidate with resolve_tool(name); otherwise use tool_search for capability discovery. No tool was invoked."
+        })
     }
 }
 
@@ -542,7 +618,7 @@ pub(super) struct RuntimeState {
     stored_values: HashMap<String, StoredValue>,
     total_stored_value_bytes: usize,
     stored_value_writes: HashMap<String, StoredValue>,
-    stored_value_limit_error: Option<String>,
+    storage_limit_rejected: bool,
     stored_value_reads: Option<HashSet<String>>,
     #[cfg(test)]
     completion_collections: usize,
@@ -566,8 +642,8 @@ pub(crate) const MAX_SESSION_STORED_VALUE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Counts serialized bytes without retaining them.
 #[derive(Default)]
-struct JsonByteCounter {
-    bytes: usize,
+pub(crate) struct JsonByteCounter {
+    pub(crate) bytes: usize,
 }
 
 impl std::io::Write for JsonByteCounter {
@@ -595,12 +671,8 @@ pub(crate) fn stored_values_with_writes_within_limits(
     current: &HashMap<String, StoredValue>,
     writes: &HashMap<String, StoredValue>,
 ) -> bool {
-    let entry_count = current.len().saturating_add(
-        writes
-            .keys()
-            .filter(|key| !current.contains_key(*key))
-            .count(),
-    );
+    let entry_count = current.keys().filter(|key| !writes.contains_key(*key)).count()
+        + writes.values().filter(|value| !value.deleted).count();
     if entry_count > MAX_SESSION_STORED_VALUES {
         return false;
     }
@@ -608,9 +680,23 @@ pub(crate) fn stored_values_with_writes_within_limits(
     current
         .iter()
         .filter(|(key, _)| !writes.contains_key(*key))
-        .chain(writes.iter())
+        .chain(writes.iter().filter(|(_, value)| !value.deleted))
         .try_fold(0usize, |total, (_, stored)| total.checked_add(stored.bytes))
         .is_some_and(|bytes| bytes <= MAX_SESSION_STORED_VALUE_BYTES)
+}
+
+pub(crate) fn apply_stored_value_writes(
+    current: &mut HashMap<String, StoredValue>,
+    writes: HashMap<String, StoredValue>,
+) {
+    for (key, mut value) in writes {
+        if value.deleted {
+            current.remove(&key);
+        } else {
+            value.read_dependencies = None;
+            current.insert(key, value);
+        }
+    }
 }
 
 pub(crate) fn stored_value_limit_message() -> String {
@@ -631,13 +717,10 @@ impl RuntimeState {
         }
     }
 
-    pub(super) fn stored_value_completion(&mut self) -> (HashMap<String, StoredValue>, Option<String>) {
+    pub(super) fn stored_value_completion(&mut self) -> HashMap<String, StoredValue> {
         #[cfg(test)]
         { self.completion_collections += 1; }
-        match self.stored_value_limit_error.as_ref() {
-            Some(error) => (HashMap::new(), Some(error.clone())),
-            None => (std::mem::take(&mut self.stored_value_writes), None),
-        }
+        std::mem::take(&mut self.stored_value_writes)
     }
 }
 
@@ -687,7 +770,7 @@ fn run_runtime(
         stored_values: config.stored_values,
         total_stored_value_bytes,
         stored_value_writes: HashMap::new(),
-        stored_value_limit_error: None,
+        storage_limit_rejected: false,
         stored_value_reads: Some(HashSet::new()),
         #[cfg(test)]
         completion_collections: 0,
@@ -833,7 +916,7 @@ fn capture_scope_send_error(
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     error_text: Option<String>,
 ) {
-    let (stored_value_writes, stored_value_limit_error) = scope
+    let stored_value_writes = scope
         .get_slot_mut::<RuntimeState>()
         .map(RuntimeState::stored_value_completion)
         .unwrap_or_default();
@@ -842,7 +925,7 @@ fn capture_scope_send_error(
         scope,
         event_tx,
         stored_value_writes,
-        stored_value_limit_error.or(error_text),
+        error_text,
     );
 }
 
@@ -852,17 +935,28 @@ fn send_result(
     mut stored_value_writes: HashMap<String, StoredValue>,
     error_text: Option<String>,
 ) {
+    // Catching an admission error and completing successfully can compact and
+    // commit retained evidence. A failed quota-exceeding cell is transactional:
+    // do not commit the prefix of its writes.
+    if error_text.is_some() && scope.get_slot::<RuntimeState>()
+        .is_some_and(|state| state.storage_limit_rejected) {
+        stored_value_writes.clear();
+    }
     let reads = scope.get_slot::<RuntimeState>()
         .and_then(|state| state.stored_value_reads.clone())
         .map(Arc::new);
     for stored in stored_value_writes.values_mut() {
         stored.read_dependencies = reads.clone();
     }
-    let _ = event_tx.send(RuntimeEvent::Result {
-        stored_value_writes,
-        output_loss: scope.get_slot::<RuntimeState>().and_then(|state| state.output_admission.output_loss()),
-        error_text: error_text.map(|mut text| {
+    let error_text = error_text.map(|mut text| {
             if text.len() > MAX_ERROR_TEXT_BYTES {
+                // Error frames stay small, but settled helper evidence belongs
+                // in the existing bounded content/artifact path before clipping.
+                if text.contains("\nHelper ")
+                    && let Some(state) = scope.get_slot::<RuntimeState>()
+                {
+                    state.emit_output(FunctionCallOutputContentItem::InputText { text: text.clone() });
+                }
                 let mut end = MAX_ERROR_TEXT_BYTES - ERROR_TRUNCATION_SUFFIX.len();
                 while !text.is_char_boundary(end) {
                     end -= 1;
@@ -871,7 +965,11 @@ fn send_result(
                 text.push_str(ERROR_TRUNCATION_SUFFIX);
             }
             text
-        }),
+        });
+    let _ = event_tx.send(RuntimeEvent::Result {
+        stored_value_writes,
+        output_loss: scope.get_slot::<RuntimeState>().and_then(|state| state.output_admission.output_loss()),
+        error_text,
     });
 }
 
@@ -937,6 +1035,38 @@ mod tests {
             Some("other")
         );
         assert!(catalog.index_of("sample").is_none());
+        let mut tools = (0..20).map(|index| {
+            let mut tool = metadata(&format!("source{index}__lookup"), "");
+            tool.tool_name = ToolName::namespaced(format!("source{index}"), "lookup");
+            tool
+        }).collect::<Vec<_>>();
+        // A dotted identity collision remains non-callable even with diagnostics.
+        tools[1].tool_name = tools[0].tool_name.clone();
+        let catalog = EnabledToolCatalog::new(tools).unwrap();
+        assert!(catalog.resolve_requested_name("source0.lookup").is_none());
+        let diagnostic = catalog.resolution_diagnostic(Some("source0.lookup"));
+        assert_eq!(diagnostic["status"], "ambiguous");
+        assert_eq!(diagnostic["candidates"].as_array().unwrap().len(), 2);
+        let diagnostic = catalog.resolution_diagnostic(Some("lookup"));
+        assert_eq!(diagnostic["status"], "ambiguous");
+        assert_eq!(diagnostic["candidates"].as_array().unwrap().len(), 8);
+        assert_eq!(diagnostic["omitted_candidate_count"], 12);
+    }
+
+    #[test]
+    fn compatibility_alias_cannot_redirect_to_a_new_native_tool() {
+        let metadata = |global_name: &str, tool_name| EnabledToolMetadata {
+            global_name: global_name.into(), tool_name, description: "".into(),
+            default_timeout_ms: None, kind: CodeModeToolKind::Function,
+        };
+        let catalog = EnabledToolCatalog::new(vec![
+            metadata("acme__lookup__stable_identity", ToolName::namespaced("acme", "lookup")),
+            metadata("acme__lookup", ToolName::plain("acme__lookup")),
+        ]).unwrap();
+        assert_eq!(catalog.resolve_requested_name("acme__lookup"), None);
+        assert_eq!(catalog.resolve_requested_name("acme.lookup"), Some(0));
+        assert_eq!(catalog.resolve_requested_name("acme__lookup__stable_identity"), Some(0));
+        assert_eq!(catalog.resolution_diagnostic(Some("acme__lookup"))["status"], "ambiguous");
     }
 
     #[tokio::test]

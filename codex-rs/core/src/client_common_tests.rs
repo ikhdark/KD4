@@ -10,6 +10,20 @@ use pretty_assertions::assert_eq;
 
 use super::*;
 
+#[test]
+fn schema_artifact_and_request_bytes_share_canonical_literals_and_sets() {
+    let artifact = |schema: &str| ToolSchemaArtifact::new(vec![ToolSpec::Function(codex_tools::ResponsesApiTool {
+        name: "canonical".into(), description: String::new(), strict: false, defer_loading: None,
+        parameters: serde_json::from_str(schema).unwrap(), output_schema: None,
+    })]);
+    let a = artifact(r#"{"type":["object","null"],"required":["b","a"],"default":{"z":1,"a":{"z":2,"a":3}}}"#);
+    let b = artifact(r#"{"default":{"a":{"a":3,"z":2},"z":1},"required":["a","b"],"type":["null","object"]}"#);
+    assert_eq!(a.serialized(), b.serialized());
+    assert_eq!(a.digest(), b.digest());
+    let wire = serde_json::to_vec(&codex_tools::create_tools_json_for_responses_api(b.specs()).unwrap()).unwrap();
+    assert_eq!(a.serialized(), wire);
+}
+
 fn prompt_with_image_outputs() -> Prompt {
     Prompt {
         input: vec![

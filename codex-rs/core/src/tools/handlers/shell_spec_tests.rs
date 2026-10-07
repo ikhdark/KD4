@@ -185,9 +185,10 @@ fn command_declarations_preserve_input_alternatives_and_return_contracts() {
         }
         assert!(declaration.contains("Promise<"));
         if definition.name == "exec_command" {
-            assert!(declaration.contains("session_id?: number"));
-            assert!(declaration.contains("execution_state?:"));
-            assert!(declaration.contains("session_capabilities?:"));
+            let schema = definition.output_schema.as_ref().expect("structured return contract");
+            assert!(schema["properties"].get("session_id").is_some());
+            assert!(schema["properties"].get("execution_state").is_some());
+            assert!(schema["properties"].get("session_capabilities").is_some());
         }
         assert!(
             !declaration.contains("string | number | boolean | null | unknown[]"),
@@ -338,7 +339,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "max_output_tokens".to_string(),
             bounded_integer(
-                "Output token budget, capped at 10000 tokens (8000 inside exec). Zero returns only execution controls.".to_string(),
+                "Output token budget, capped at 10000 tokens for direct calls; inside exec it is bounded by the cell's estimated remaining budget. Explicit smaller caps are honored. Zero returns only execution controls.".to_string(),
                 0, usize::MAX as u64),
         ),
         (
@@ -430,6 +431,10 @@ fn write_stdin_tool_matches_expected_spec() {
             JsonSchema::boolean(Some("True confirms process termination before collecting final output. Requires empty chars. Use only with session_capabilities.cancellation=true.".to_string())),
         ),
         (
+            "incarnation".to_string(),
+            JsonSchema::string(Some("Exact creation identity from the originating session_capabilities.incarnation. Required with session_id for polling, input, and termination; legacy numeric-only handles are rejected.".into())),
+        ),
+        (
             "wait_for_output".to_string(),
             JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Defaults to true when chars is empty, yield_time_ms is omitted, and terminate is false; false preserves bounded polling. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
         ),
@@ -475,7 +480,7 @@ fn write_stdin_tool_matches_expected_spec() {
             defer_loading: None,
             parameters: JsonSchema::object(
                 properties,
-                Some(vec!["session_id".to_string()]),
+                Some(vec!["session_id".to_string(), "incarnation".to_string()]),
                 Some(false.into())
             ),
             output_schema: Some(unified_exec_output_schema().into()),
@@ -829,6 +834,7 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
         (None, None, false, "unknown"),
     ] {
         let output = ExecCommandToolOutput {
+            output_ranges: None,
             process_output: Some(std::sync::Arc::new(crate::unified_exec::ProcessOutputSnapshot {
                 aggregated_output: b"evidence".to_vec(),
                 stdout: b"{}".to_vec(),

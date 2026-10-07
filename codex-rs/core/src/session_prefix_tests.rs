@@ -14,6 +14,7 @@ fn complete_error_does_not_require_fetching_the_same_error_again() {
         AgentPath::root(),
         AgentPath::try_from("/root/worker").expect("valid agent path"),
         &AgentStatus::Errored("missing required command".to_string()),
+        None,
     )
     .expect("error status should produce a completion message");
     assert!(message.contains("Agent errored: missing required command"));
@@ -26,6 +27,7 @@ fn control_character_error_completion_bounds_the_rendered_envelope() {
         AgentPath::root(),
         AgentPath::try_from("/root/worker").expect("valid agent path"),
         &AgentStatus::Errored("\0".repeat(10_000)),
+        None,
     )
     .expect("error status should produce a completion message");
     assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
@@ -38,6 +40,7 @@ fn error_completion_message_stays_below_manual_review_threshold() {
         AgentPath::root(),
         AgentPath::try_from("/root/worker").expect("valid agent path"),
         &AgentStatus::Errored("stream disconnected ".repeat(1_000)),
+        None,
     )
     .expect("error status should produce a completion message");
 
@@ -54,6 +57,7 @@ fn over_truncation_error_completion_points_to_durable_exact_error() {
             "{}ROOT_CAUSE_AT_END",
             "transient wrapper: ".repeat(2_000)
         )),
+        None,
     )
     .expect("error status should produce a completion message");
 
@@ -77,9 +81,22 @@ fn typed_completion_message_stays_bounded_and_points_to_durable_receipt() {
         AgentPath::try_from("/root/architect").expect("valid task path"),
         AgentPath::try_from("/root/architect").expect("valid agent path"),
         &AgentStatus::Completed(Some("architecture contract ".repeat(10_000))),
+        None,
     )
     .expect("completed status should produce a completion message");
 
     assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
     assert!(message.contains(TYPED_COMPLETION_NEXT_ACTION));
+}
+
+#[test]
+fn completion_preserves_exact_receipt_and_attempt_under_truncation() {
+    let receipt = "Receipt: get_agent_task({\"assignment_id\":\"assignment-123\"})\nProducer attempt: attempt-456";
+    let message = format_inter_agent_completion_message(
+        AgentPath::root(), AgentPath::try_from("/root/worker").unwrap(),
+        &AgentStatus::Completed(Some("result ".repeat(10_000))), Some(receipt),
+    ).unwrap();
+    assert!(message.contains(receipt));
+    assert!(!message.contains("returned by spawn_agent"));
+    assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
 }

@@ -201,6 +201,9 @@ pub struct ReadResponse {
     pub exit_code: Option<i32>,
     pub closed: bool,
     pub failure: Option<String>,
+    /// Output before `through_seq` is unavailable, not a process failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_gap: Option<ProcessOutputGap>,
     /// Whether the executor classified the process failure as a sandbox denial.
     /// A false value while output is still open is provisional. A failed read
     /// does not establish a complete negative assessment of discarded output.
@@ -210,9 +213,20 @@ pub struct ReadResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProcessOutputGap {
+    pub through_seq: u64,
+    /// Authoritative exit position, including when output around it was evicted.
+    pub exit_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WriteParams {
     pub process_id: ProcessId,
     pub chunk: ByteChunk,
+    /// Retry identity. Canonical decimal IDs and `local-<decimal>` IDs are
+    /// sequenced per process; expired sequences are rejected, never rewritten.
+    /// Other opaque IDs retain only bounded recent-write deduplication.
     pub write_id: String,
 }
 

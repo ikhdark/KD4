@@ -60,7 +60,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tokio::sync::Semaphore;
 use tokio::sync::watch;
 use tokio::time;
 use tokio::time::Instant;
@@ -144,6 +143,65 @@ struct InitializeContext {
 #[derive(Clone)]
 pub(crate) struct ElicitationPauseState {
     timing: watch::Sender<ElicitationTiming>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ElicitationPauseRegistry {
+    operations: Arc<StdMutex<Vec<ElicitationPauseState>>>,
+}
+
+impl ElicitationPauseRegistry {
+    fn register(&self, state: ElicitationPauseState) -> ElicitationOperationRegistration {
+        self.operations.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(state.clone());
+        ElicitationOperationRegistration { registry: self.clone(), state }
+    }
+
+    pub(crate) fn enter(&self) -> Option<ElicitationPauseGuard> {
+        let operations = self.operations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // RMCP supplies no parent-operation identity for elicitation. Its
+        // progressToken identifies the incoming request, not our tools/call;
+        // comparing the two directions' counters can pause the wrong call.
+        // Preserve the unambiguous single-operation pause, never a client-wide
+        // pause when concurrent operations make attribution unavailable.
+        let [state] = operations.as_slice() else { return None; };
+        Some(state.enter())
+    }
+}
+
+struct ElicitationOperationRegistration {
+    registry: ElicitationPauseRegistry,
+    state: ElicitationPauseState,
+}
+
+#[cfg(test)]
+mod operation_pause_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn elicitation_pause_does_not_extend_unrelated_operation_budgets() {
+        let registry = ElicitationPauseRegistry::default();
+        let a = ElicitationPauseState::new();
+        let b = ElicitationPauseState::new();
+        let _a = registry.register(a.clone());
+        let pause = registry.enter().expect("A is the only active operation");
+        let _b = registry.register(b.clone());
+        assert!(registry.enter().is_none(), "ambiguous dialogs do not pause B");
+        let held_a = active_time_timeout(Duration::from_secs(1), a.subscribe(), std::future::pending::<()>());
+        tokio::pin!(held_a);
+        assert!(futures::poll!(&mut held_a).is_pending());
+        assert!(active_time_timeout(Duration::from_secs(1), b.subscribe(), std::future::pending::<()>()).await.is_err());
+        assert!(futures::poll!(&mut held_a).is_pending());
+        drop(pause);
+        assert!(held_a.await.is_err());
+    }
+}
+
+impl Drop for ElicitationOperationRegistration {
+    fn drop(&mut self) {
+        self.registry.operations.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|state| !state.timing.same_channel(&self.state.timing));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -279,12 +337,17 @@ struct TrackedRequest {
     id: RequestId,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct OperationRequestTracker {
     current: Arc<StdMutex<Option<TrackedRequest>>>,
+    pause_state: ElicitationPauseState,
+    pause_registry: ElicitationPauseRegistry,
 }
 
 impl OperationRequestTracker {
+    fn new(pause_registry: ElicitationPauseRegistry) -> Self {
+        Self { current: Arc::default(), pause_state: ElicitationPauseState::new(), pause_registry }
+    }
     fn register(&self, service: Arc<RunningClientService>, id: RequestId) {
         *self
             .current
@@ -366,6 +429,7 @@ async fn send_tracked_request(
     request: ClientRequest,
     options: rmcp::service::PeerRequestOptions,
 ) -> std::result::Result<ServerResult, rmcp::service::ServiceError> {
+    let _pause_registration = tracker.pause_registry.register(tracker.pause_state.clone());
     let handle = service
         .peer()
         .send_request_with_option(request, options)
@@ -454,6 +518,49 @@ pub struct ListToolsWithConnectorIdResult {
     pub tools: Vec<ToolWithConnectorId>,
 }
 
+type RecoveryOutcome = std::result::Result<(), Arc<anyhow::Error>>;
+type RecoveryObservation = watch::Receiver<Option<RecoveryOutcome>>;
+
+#[derive(Debug)]
+struct SharedRecoveryError(Arc<anyhow::Error>);
+
+impl std::fmt::Display for SharedRecoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl std::error::Error for SharedRecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
+impl SharedRecoveryError {
+    fn into_anyhow(error: Arc<anyhow::Error>) -> anyhow::Error {
+        anyhow::Error::new(Self(error))
+    }
+}
+
+// A leader dropped by its caller's deadline must wake its existing waiters,
+// not leave an in-flight marker behind or cause every waiter to reconnect.
+struct RecoveryOwner<'a> {
+    slot: &'a StdMutex<Option<RecoveryObservation>>,
+    sender: watch::Sender<Option<RecoveryOutcome>>,
+}
+
+impl Drop for RecoveryOwner<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        slot.take();
+        self.sender.send_if_modified(|outcome| {
+            if outcome.is_some() { return false; }
+            *outcome = Some(Err(Arc::new(anyhow!("MCP session recovery was cancelled"))));
+            true
+        });
+    }
+}
+
 /// MCP client implemented on top of the official `rmcp` SDK.
 /// https://github.com/modelcontextprotocol/rust-sdk
 pub struct RmcpClient {
@@ -461,8 +568,8 @@ pub struct RmcpClient {
     stdio_process: Option<StdioServerProcessHandle>,
     transport_recipe: TransportRecipe,
     initialize_context: Mutex<Option<InitializeContext>>,
-    session_recovery_lock: Semaphore,
-    elicitation_pause_state: ElicitationPauseState,
+    session_recovery: StdMutex<Option<RecoveryObservation>>,
+    elicitation_pause_state: ElicitationPauseRegistry,
 }
 
 impl RmcpClient {
@@ -494,8 +601,8 @@ impl RmcpClient {
             stdio_process,
             transport_recipe,
             initialize_context: Mutex::new(None),
-            session_recovery_lock: Semaphore::new(/*permits*/ 1),
-            elicitation_pause_state: ElicitationPauseState::new(),
+            session_recovery: StdMutex::new(None),
+            elicitation_pause_state: ElicitationPauseRegistry::default(),
         })
     }
 
@@ -532,8 +639,8 @@ impl RmcpClient {
             stdio_process: None,
             transport_recipe,
             initialize_context: Mutex::new(None),
-            session_recovery_lock: Semaphore::new(/*permits*/ 1),
-            elicitation_pause_state: ElicitationPauseState::new(),
+            session_recovery: StdMutex::new(None),
+            elicitation_pause_state: ElicitationPauseRegistry::default(),
         })
     }
 
@@ -1188,14 +1295,14 @@ impl RmcpClient {
         F: Fn(Arc<RunningClientService>, OperationRequestTracker) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
     {
-        let tracker = OperationRequestTracker::default();
+        let tracker = OperationRequestTracker::new(self.elicitation_pause_state.clone());
         let mut cancellation_guard = OperationCancellationGuard::new(tracker.clone());
         let operation_future =
             self.run_service_operation_with_recovery(label, tracker.clone(), &operation);
         let result = match timeout {
             Some(duration) => match active_time_timeout(
                 duration,
-                self.elicitation_pause_state.subscribe(),
+                tracker.pause_state.subscribe(),
                 operation_future,
             )
             .await
@@ -1280,7 +1387,7 @@ impl RmcpClient {
                     let Some(retry_delay_ms) = retry_delay_ms else {
                         return Err(error);
                     };
-                    let delay = Duration::from_millis(retry_delay_ms);
+                    let delay = streamable_http_retry::retry_delay(&error, retry_delay_ms);
                     warn!(
                         attempt = attempt + 1,
                         max_attempts = STREAMABLE_HTTP_RETRY_DELAYS_MS.len() + 1,
@@ -1289,7 +1396,8 @@ impl RmcpClient {
                         error = %error,
                         "streamable HTTP MCP read operation failed with a retryable error; retrying"
                     );
-                    time::sleep(delay).await;
+                    // The enclosing active-time timeout owns the total budget.
+                    streamable_http_retry::sleep_with_retry_deadline(delay, None).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -1341,11 +1449,37 @@ impl RmcpClient {
         &self,
         failed_service: &Arc<RunningService<RoleClient, ElicitationClientService>>,
     ) -> Result<()> {
-        let _recovery_guard = self
-            .session_recovery_lock
-            .acquire()
-            .await
-            .map_err(|_| anyhow!("MCP client recovery semaphore closed"))?;
+        if !Arc::ptr_eq(&self.service().await?, failed_service) {
+            return Ok(());
+        }
+        let (mut observation, owner) = {
+            let mut slot = self.session_recovery.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(observation) = slot.as_ref() {
+                (observation.clone(), None)
+            } else {
+                let (sender, observation) = watch::channel(None);
+                *slot = Some(observation.clone());
+                (observation, Some(RecoveryOwner { slot: &self.session_recovery, sender }))
+            }
+        };
+        if let Some(owner) = owner {
+            let outcome = self.reinitialize_session(failed_service).await.map_err(Arc::new);
+            owner.sender.send_replace(Some(outcome.clone()));
+            drop(owner);
+            return outcome.map_err(SharedRecoveryError::into_anyhow);
+        }
+        loop {
+            if let Some(outcome) = observation.borrow_and_update().clone() {
+                return outcome.map_err(SharedRecoveryError::into_anyhow);
+            }
+            observation.changed().await.map_err(|_| anyhow!("MCP recovery owner disappeared"))?;
+        }
+    }
+
+    async fn reinitialize_session(
+        &self,
+        failed_service: &Arc<RunningService<RoleClient, ElicitationClientService>>,
+    ) -> Result<()> {
 
         {
             let guard = self.state.lock().await;

@@ -60,9 +60,14 @@ impl AppEventSender {
         )));
     }
 
-    pub(crate) fn user_input_answer(&self, id: String, response: ToolRequestUserInputResponse) {
+    pub(crate) fn user_input_answer(
+        &self,
+        id: String,
+        call_id: String,
+        response: ToolRequestUserInputResponse,
+    ) {
         self.send(AppEvent::CodexOp(AppCommand::user_input_answer(
-            id, response,
+            id, call_id, response,
         )));
     }
 

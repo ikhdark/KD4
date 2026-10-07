@@ -4253,11 +4253,29 @@
     "CommandExecutionOutputDeltaNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "decodingLossy": {
+          "description": "Whether invalid UTF-8 was replaced while decoding this delta.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "delta": {
           "type": "string"
         },
         "itemId": {
           "type": "string"
+        },
+        "stream": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ExecOutputStream"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Origin of this delta; absent only for legacy producers."
         },
         "threadId": {
           "type": "string"
@@ -4273,6 +4291,57 @@
         "turnId"
       ],
       "title": "CommandExecutionOutputDeltaNotification",
+      "type": "object"
+    },
+    "CommandExecutionOutputMetadata": {
+      "properties": {
+        "aggregated_output_is_exact": {
+          "type": "boolean"
+        },
+        "decoding_lossy": {
+          "type": "boolean"
+        },
+        "display_reduced": {
+          "type": "boolean"
+        },
+        "failure_cause": {
+          "description": "Harness/observation failure, not a program exit status or stderr bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output_drained": {
+          "type": "boolean"
+        },
+        "process_exited": {
+          "description": "Process termination and output drain are independent observations.",
+          "type": "boolean"
+        },
+        "raw_output_artifact_id": {
+          "description": "Existing retained-output locator, when available at delivery time.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "search_no_match": {
+          "description": "Conservative owner-classified search miss; the raw exit code remains 1.",
+          "type": "boolean"
+        },
+        "streams_are_exact": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "aggregated_output_is_exact",
+        "decoding_lossy",
+        "display_reduced",
+        "output_drained",
+        "process_exited",
+        "search_no_match",
+        "streams_are_exact"
+      ],
       "type": "object"
     },
     "CommandExecutionSource": {
@@ -5599,6 +5668,13 @@
       ],
       "title": "ErrorNotification",
       "type": "object"
+    },
+    "ExecOutputStream": {
+      "enum": [
+        "stdout",
+        "stderr"
+      ],
+      "type": "string"
     },
     "ExperimentalFeature": {
       "properties": {
@@ -8922,8 +8998,22 @@
         "message": {
           "type": "string"
         },
+        "progress": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "threadId": {
           "type": "string"
+        },
+        "total": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "turnId": {
           "type": "string"
@@ -15016,7 +15106,14 @@
     "ThreadActiveFlag": {
       "enum": [
         "waitingOnApproval",
-        "waitingOnUserInput"
+        "waitingOnUserInput",
+        "resolvingResources",
+        "waitingOnDiffTracker",
+        "waitingOnWorkspaceGate",
+        "waitingOnEvidenceTracker",
+        "waitingOnDelivery",
+        "waitingOnProcessCleanup",
+        "readyToSample"
       ],
       "type": "string"
     },
@@ -15747,6 +15844,16 @@
             "id": {
               "type": "string"
             },
+            "outputMetadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandExecutionOutputMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "parentCallId": {
               "description": "Model-visible exec call that owns a nested code-mode command.",
               "type": [
@@ -15785,6 +15892,18 @@
             },
             "status": {
               "$ref": "#/definitions/CommandExecutionStatus"
+            },
+            "stderr": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stdout": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "enum": [
@@ -18020,6 +18139,34 @@
       "title": "TurnCompletedNotification",
       "type": "object"
     },
+    "TurnCompletionAssessment": {
+      "properties": {
+        "advisories": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "failedChecks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verificationGaps": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "advisories",
+        "failedChecks",
+        "verificationGaps"
+      ],
+      "type": "object"
+    },
     "TurnDiffUpdatedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "Notification that the turn-level unified diff has changed. Contains the latest aggregated diff across all file changes in the turn.",
@@ -18419,6 +18566,17 @@
             "integer",
             "null"
           ]
+        },
+        "completionAssessment": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnCompletionAssessment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Completion diagnostics captured at the terminal boundary. These are independent of execution status and timing validity; empty diagnostics are not proof that the user's entire task was verified."
         },
         "counters": {
           "$ref": "#/definitions/TurnTimingCounters"

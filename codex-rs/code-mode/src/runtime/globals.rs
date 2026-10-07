@@ -7,6 +7,7 @@ use super::RuntimeState;
 use super::callbacks::clear_timeout_callback;
 use super::callbacks::console_log_callback;
 use super::callbacks::exit_callback;
+use super::callbacks::format_tool_result_callback;
 use super::callbacks::generated_image_callback;
 use super::callbacks::image_callback;
 use super::callbacks::load_callback;
@@ -25,22 +26,12 @@ use super::value::throw_type_error;
 const EXEC_COMMAND_ALIASES: &[&str] = &["exec", "exec_command", "execTool", "shell"];
 const EXEC_COMMAND_GLOBAL_NAME: &str = "exec_command";
 const CONSOLE_METHODS: &[&str] = &["log", "info", "warn", "error", "debug"];
-/// `name` and `message` are non-enumerable, so `text(...)` and `JSON.stringify`
-/// would render every error, including a rejected nested tool call's reason,
-/// as `{}`. Own enumerable fields still follow the standard spread.
-const ERROR_TO_JSON_SOURCE: &str = r#"Object.defineProperty(Error.prototype, "toJSON", {
-  value: function toJSON() { return { name: this.name, message: this.message, ...this }; },
-  writable: true,
-  configurable: true,
-});"#;
-
 pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
     let global = scope.get_current_context().global(scope);
     delete_global(scope, global, "console")?;
     delete_global(scope, global, "Atomics")?;
     delete_global(scope, global, "SharedArrayBuffer")?;
     delete_global(scope, global, "WebAssembly")?;
-    install_error_serialization(scope)?;
     super::output_projection::install(scope)?;
 
     let enabled_tools = scope
@@ -53,10 +44,13 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
     let set_timeout = helper_function(scope, "setTimeout", set_timeout_callback)?;
     let text = helper_function(scope, "text", text_callback)?;
+    let format_tool_result = helper_function(scope, "format_tool_result", format_tool_result_callback)?;
     let image = helper_function(scope, "image", image_callback)?;
     let generated_image = helper_function(scope, "generatedImage", generated_image_callback)?;
     let store = helper_function(scope, "store", store_callback)?;
     let load = helper_function(scope, "load", load_callback)?;
+    let list_keys = helper_function(scope, "listKeys", super::callbacks::list_keys_callback)?;
+    let delete_stored = helper_function(scope, "deleteStored", super::callbacks::delete_stored_callback)?;
     let notify = helper_function(scope, "notify", notify_callback)?;
     let yield_control = helper_function(scope, "yield_control", yield_control_callback)?;
     let exit = helper_function(scope, "exit", exit_callback)?;
@@ -72,10 +66,13 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "clearTimeout", clear_timeout.into())?;
     set_global(scope, global, "setTimeout", set_timeout.into())?;
     set_global(scope, global, "text", text.into())?;
+    set_global(scope, global, "format_tool_result", format_tool_result.into())?;
     set_global(scope, global, "image", image.into())?;
     set_global(scope, global, "generatedImage", generated_image.into())?;
     set_global(scope, global, "store", store.into())?;
     set_global(scope, global, "load", load.into())?;
+    set_global(scope, global, "listKeys", list_keys.into())?;
+    set_global(scope, global, "deleteStored", delete_stored.into())?;
     set_global(scope, global, "notify", notify.into())?;
     set_global(scope, global, "yield_control", yield_control.into())?;
     set_global(scope, global, "exit", exit.into())?;
@@ -92,15 +89,6 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
         .and_then(|script| script.run(scope))
         .ok_or_else(|| "failed to install orchestration helpers".to_string())?;
     Ok(())
-}
-
-fn install_error_serialization(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
-    let source = v8::String::new(scope, ERROR_TO_JSON_SOURCE)
-        .ok_or_else(|| "failed to allocate error serialization source".to_string())?;
-    v8::Script::compile(scope, source, None)
-        .and_then(|script| script.run(scope))
-        .map(|_| ())
-        .ok_or_else(|| "failed to install error serialization".to_string())
 }
 
 fn install_tool_aliases<'s>(
@@ -189,18 +177,30 @@ fn resolve_tool_callback(
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
-    if args.length() == 0 || !args.get(0).is_string() {
-        retval.set(v8::undefined(scope).into());
-        return;
-    }
-    let requested_name = args.get(0).to_rust_string_lossy(scope);
+    let diagnostic = if args.length() > 1 && !args.get(1).is_undefined() {
+        match super::value::v8_value_to_json(scope, args.get(1)) {
+            Ok(Some(options)) if options.is_object() => options["diagnostic"] == true,
+            _ => { throw_type_error(scope, "resolve_tool options must be { diagnostic?: boolean }"); return; }
+        }
+    } else { false };
+    let requested_name = (args.length() > 0 && args.get(0).is_string())
+        .then(|| args.get(0).to_rust_string_lossy(scope));
     let enabled_tools = scope
         .get_slot::<RuntimeState>()
         .map(|state| Arc::clone(&state.enabled_tools));
     let Some(index) = enabled_tools
         .as_deref()
-        .and_then(|enabled_tools| enabled_tools.resolve_requested_name(&requested_name))
+        .and_then(|enabled_tools| requested_name.as_deref().and_then(|name| enabled_tools.resolve_requested_name(name)))
     else {
+        if diagnostic {
+            let value = enabled_tools.as_deref().unwrap_or(&EnabledToolCatalog::default())
+                .resolution_diagnostic(requested_name.as_deref());
+            match super::value::json_to_v8(scope, &value) {
+                Some(value) => retval.set(value),
+                None => throw_type_error(scope, "failed to create resolution diagnostic"),
+            }
+            return;
+        }
         retval.set(v8::undefined(scope).into());
         return;
     };

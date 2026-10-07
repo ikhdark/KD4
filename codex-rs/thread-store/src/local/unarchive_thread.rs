@@ -37,15 +37,10 @@ where
     .map_err(|err| rollout_lookup_error(thread_id, /*archived*/ true, err))?
     .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
-    let canonical_archived_path = scoped_rollout_path_async(
-        store
-            .config
-            .codex_home
-            .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
+    let canonical_archived_path = resolve_archived_representation(
+        store.config.codex_home.join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
         archived_path.clone(),
-        "archived",
-    )
-    .await?;
+    ).await?;
     let file_name = matching_rollout_file_name(
         canonical_archived_path.as_path(),
         thread_id,
@@ -67,7 +62,6 @@ where
         .join(year)
         .join(month)
         .join(day);
-    let restored_path = dest_dir.join(&file_name);
 
     let mut thread = super::read_thread::read_thread_by_rollout_path(
         store,
@@ -81,19 +75,14 @@ where
             message: "archived rollout belongs to a different thread".to_string(),
         });
     }
+    let restored_path =
+        codex_rollout::move_rollout_to_directory(&canonical_archived_path, &dest_dir)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to unarchive thread: {err}"),
+            })?;
     thread.rollout_path = Some(codex_rollout::plain_rollout_path(restored_path.as_path()));
     thread.archived_at = None;
-
-    tokio::fs::create_dir_all(&dest_dir)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to unarchive thread: {err}"),
-        })?;
-    tokio::fs::rename(&canonical_archived_path, &restored_path)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to unarchive thread: {err}"),
-        })?;
 
     if let Some(ctx) = state_db_ctx
         && let Err(err) = ctx
@@ -126,6 +115,25 @@ where
     Ok(thread)
 }
 
+async fn resolve_archived_representation(
+    root: std::path::PathBuf,
+    discovered: std::path::PathBuf,
+) -> ThreadStoreResult<std::path::PathBuf> {
+    match scoped_rollout_path_async(root.clone(), discovered.clone(), "archived").await {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            // Compression may publish its sibling after lookup, before even
+            // path validation. Re-resolve once, preserving the same scope and
+            // identity checks; the move owner resolves again under its lock.
+            let Some(current) = codex_rollout::existing_rollout_path(&discovered).await else {
+                return Err(error);
+            };
+            if current == discovered { return Err(error); }
+            scoped_rollout_path_async(root, current, "archived").await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -144,6 +152,37 @@ mod tests {
     use crate::local::test_support::write_archived_session_file;
 
     #[tokio::test]
+    async fn unarchive_validates_compressed_sibling_of_stale_discovery() {
+        let home = TempDir::new().unwrap();
+        let path = write_archived_session_file(home.path(), "2025-01-03T13-00-00", Uuid::from_u128(9989)).unwrap();
+        let compressed = path.with_extension("jsonl.zst");
+        // Validation only resolves identity; decoding is exercised by the
+        // existing compression-aware movement tests.
+        std::fs::write(&compressed, b"replacement representation").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let resolved = resolve_archived_representation(
+            home.path().join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR), path,
+        ).await.unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(compressed).unwrap());
+    }
+
+    #[tokio::test]
+    async fn unarchive_preserves_both_rollouts_on_destination_conflict() {
+        let home = TempDir::new().unwrap();
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let uuid = Uuid::from_u128(9993);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        let archived = write_archived_session_file(home.path(), "2025-01-03T13-00-00", uuid).unwrap();
+        let destination = home.path().join("sessions/2025/01/03").join(archived.file_name().unwrap());
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, "must survive").unwrap();
+        let original = std::fs::read(&archived).unwrap();
+        assert!(store.unarchive_thread(ArchiveThreadParams { thread_id }).await.is_err());
+        assert_eq!(std::fs::read(&archived).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "must survive");
+    }
+
+    #[tokio::test]
     async fn unarchive_rejects_mismatched_identity_before_moving_rollout() {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), None);
@@ -159,7 +198,7 @@ mod tests {
             .unarchive_thread(ArchiveThreadParams { thread_id })
             .await
             .expect_err("mismatch");
-        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        assert!(matches!(error, ThreadStoreError::ThreadNotFound { thread_id: missing } if missing == thread_id));
         assert_eq!(
             std::fs::read_to_string(&path).expect("retained bytes"),
             bytes

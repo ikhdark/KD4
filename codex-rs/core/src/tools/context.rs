@@ -5,7 +5,9 @@ use crate::tools::command_output_artifact::RawOutputArtifact;
 #[cfg(test)]
 use crate::tools::command_output_artifact::ToolOutputArtifactId;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
+#[cfg(test)]
 use crate::tools::shell_output_summary::summarize_shell_output_for_model;
+use crate::tools::shell_output_summary::summarize_shell_output_for_model_with_streams;
 use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_code_mode::CancellationCause;
@@ -474,7 +476,10 @@ impl McpToolOutput {
 pub struct ToolSearchOutput {
     pub tools: Vec<JsonValue>,
     pub omitted_result_count: usize,
+    pub activated_omitted_tools: Vec<String>,
     pub unactivated_matches: Vec<String>,
+    pub unmatched_identifiers: Vec<String>,
+    pub exact_name_ambiguity: Option<JsonValue>,
 }
 
 impl ToolOutput for ToolSearchOutput {
@@ -510,8 +515,18 @@ impl ToolOutput for ToolSearchOutput {
         };
         let mut result =
             code_mode_tool_search_result(status, self.tools.clone(), Some(self.omitted_result_count));
+        if !self.activated_omitted_tools.is_empty() {
+            result["activated_omitted_tools"] = serde_json::json!(self.activated_omitted_tools);
+            result["resolution"] = serde_json::json!({"helper":"resolve_tool", "argument":"exact activated_omitted_tools name"});
+        }
         if !self.unactivated_matches.is_empty() {
             result["unactivated_matches"] = serde_json::json!(self.unactivated_matches);
+        }
+        if !self.unmatched_identifiers.is_empty() {
+            result["unmatched_identifiers"] = serde_json::json!(self.unmatched_identifiers);
+        }
+        if let Some(ambiguity) = &self.exact_name_ambiguity {
+            result["exact_name_ambiguity"] = ambiguity.clone();
         }
         result
     }
@@ -788,6 +803,7 @@ pub struct ApplyPatchToolOutput {
     pub changes_exact: bool,
     pub environment_id: Option<String>,
     pub retry: Option<JsonValue>,
+    pub diagnostics: Vec<JsonValue>,
 }
 
 /// Text-only projections carry the retry receipt inline. The structured result
@@ -811,10 +827,47 @@ impl ApplyPatchToolOutput {
         environment_id: Option<String>,
     ) -> Self {
         use codex_apply_patch::AppliedPatchFileChange;
+        let mut diagnostics = Vec::new();
+        let mut remaining_diff_bytes = 32 * 1024usize;
         let changes = delta
             .changes()
             .iter()
             .map(|applied| {
+                let (old, new, diagnostic_path) = match &applied.change {
+                    AppliedPatchFileChange::Add { content, overwritten_content } =>
+                        (overwritten_content.as_deref().unwrap_or(""), content.as_str(), &applied.path),
+                    AppliedPatchFileChange::Update { old_content, new_content, move_path, .. } =>
+                        (old_content.as_str(), new_content.as_str(), move_path.as_ref().unwrap_or(&applied.path)),
+                    AppliedPatchFileChange::Delete { content } => (content.as_str(), "", &applied.path),
+                };
+                let diff = similar::TextDiff::from_lines(old, new);
+                for change in diff.iter_all_changes() {
+                    if change.tag() != similar::ChangeTag::Insert {
+                        continue;
+                    }
+                    let text = change.value().trim_end_matches(['\r', '\n']);
+                    let mut kinds = Vec::new();
+                    if text.ends_with([' ', '\t']) {
+                        kinds.push("trailing_whitespace");
+                    }
+                    let indentation = &text[..text.len() - text.trim_start_matches([' ', '\t']).len()];
+                    if indentation.contains(" \t") {
+                        kinds.push("space_before_tab");
+                    }
+                    if ["<<<<<<<", "=======", ">>>>>>>", "|||||||"].iter().any(|marker| {
+                        text.strip_prefix(marker).is_some_and(|rest| {
+                            rest.is_empty() || rest.starts_with(char::is_whitespace)
+                        })
+                    }) {
+                        kinds.push("conflict_marker");
+                    }
+                    for kind in kinds {
+                        diagnostics.push(serde_json::json!({
+                            "path": diagnostic_path, "line": change.new_index().unwrap_or(0) + 1,
+                            "kind": kind,
+                        }));
+                    }
+                }
                 let (kind, move_path) = match &applied.change {
                     AppliedPatchFileChange::Add { .. } => ("add", None),
                     AppliedPatchFileChange::Delete { .. } => ("delete", None),
@@ -822,7 +875,18 @@ impl ApplyPatchToolOutput {
                         ("update", move_path.as_ref())
                     }
                 };
-                serde_json::json!({"path": applied.path, "kind": kind, "move_path": move_path})
+                // Hunk +coordinates refer to the committed post-edit source,
+                // not the proposed patch or a later filesystem read.
+                let unified_diff = diff.unified_diff().context_radius(3).to_string();
+                let limit = remaining_diff_bytes.min(8 * 1024);
+                let end = unified_diff.floor_char_boundary(limit.min(unified_diff.len()));
+                remaining_diff_bytes -= end;
+                serde_json::json!({
+                    "path": applied.path, "kind": kind, "move_path": move_path,
+                    "unified_diff": &unified_diff[..end],
+                    "diff_complete": end == unified_diff.len(),
+                    "diff_bytes": unified_diff.len(),
+                })
             })
             .collect();
         Self {
@@ -832,6 +896,7 @@ impl ApplyPatchToolOutput {
             changes_exact: delta.is_exact(),
             environment_id,
             retry: None,
+            diagnostics,
         }
     }
 
@@ -840,12 +905,28 @@ impl ApplyPatchToolOutput {
         self
     }
 
+    pub(crate) fn with_patch_mismatch(mut self, mismatch: Option<&codex_apply_patch::PatchContextMismatch>) -> Self {
+        if let Some(mismatch) = mismatch {
+            self.diagnostics.push(serde_json::json!(mismatch));
+        }
+        self
+    }
+
     fn model_text(&self) -> String {
-        if self.success {
-            "Success. Updated the files.".to_string()
+        let mut text = if self.success {
+            if self.diagnostics.is_empty() {
+                "Success. Updated the files.".to_string()
+            } else {
+                format!("Success. Updated the files. Added-line diagnostics: {}", serde_json::json!(self.diagnostics))
+            }
         } else {
             failed_patch_text(&self.text, self.retry.as_ref())
+        };
+        if !self.changes.is_empty() {
+            text.push_str("\nApplied changes (unified hunk +ranges are post-edit line numbers): ");
+            text.push_str(&serde_json::json!(self.changes).to_string());
         }
+        text
     }
 
     fn structured_result(&self) -> JsonValue {
@@ -855,6 +936,7 @@ impl ApplyPatchToolOutput {
             "changes": self.changes,
             "changes_exact": self.changes_exact,
             "environment_id": self.environment_id,
+            "diagnostics": self.diagnostics,
         });
         if let Some(retry) = &self.retry {
             result["retry"] = retry.clone();
@@ -898,6 +980,7 @@ impl ToolOutput for ApplyPatchToolOutput {
                 "changes_exact": self.changes_exact,
                 "environment_id": self.environment_id,
                 "retry": self.retry,
+                "diagnostics": self.diagnostics,
             }),
             requested_limit: None,
             predetermined_ranges: Vec::new(),
@@ -994,10 +1077,29 @@ impl ToolOutput for AbortedToolOutput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ExecSessionCapabilities {
+    /// Creation identity; numeric IDs alone are never authority across runtimes.
+    pub incarnation: uuid::Uuid,
     pub stdin: bool,
     pub interrupt: bool,
     pub cancellation: bool,
     pub polling: bool,
+    /// Latest owner-observed silence interval, independent of display reduction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation: Option<ExecSilenceObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ExecSilenceObservation {
+    pub silent_for_ms: u64,
+    pub reason: ExecObservationReason,
+    pub process_exited: bool,
+    pub termination_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecObservationReason {
+    NoOutputObserved,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1012,6 +1114,8 @@ pub struct ExecCommandToolOutput {
     pub wall_time: Duration,
     /// Raw bytes returned for this unified exec call before any truncation.
     pub raw_output: Vec<u8>,
+    /// Exact coordinates supplied by the collector, never inferred from artifact size.
+    pub(crate) output_ranges: Option<crate::unified_exec::head_tail_buffer::OutputChunkRanges>,
     pub truncation_policy: TruncationPolicy,
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<u32>,
@@ -1092,7 +1196,7 @@ impl ToolOutput for ExecCommandToolOutput {
         if outcome == ToolOutputOutcome::Success
             && let Some(evidence) = declared_lineage_evidence(&self.raw_output)
         {
-            signal["semantic_evidence"] = evidence;
+            signal["declared_lineage"] = evidence;
         }
         if let Some(process_id) = self.process_id {
             signal["background_process_id"] = serde_json::json!(process_id);
@@ -1168,7 +1272,14 @@ impl ToolOutput for ExecCommandToolOutput {
         ))
     }
 
-    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+    fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
+        let budget = self.max_output_tokens
+            .unwrap_or(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS)
+            .min(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS);
+        self.code_mode_result_with_budget(payload, budget)
+    }
+
+    fn code_mode_result_with_budget(&self, payload: &ToolPayload, budget: usize) -> JsonValue {
         #[derive(Serialize)]
         struct UnifiedExecCodeModeResult {
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -1214,6 +1325,8 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             recovery_selector: Option<JsonValue>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            recovery: Option<JsonValue>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             validation: Option<JsonValue>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             pending_deferred_completions: Vec<String>,
@@ -1235,31 +1348,25 @@ impl ToolOutput for ExecCommandToolOutput {
         // its cell. Bound it to fit there, so the command's own projection,
         // with its summary and artifact recovery, is the only reduction; the
         // direct response keeps the requested budget.
-        let model_output = self.projected_model_output(
-            raw_output.as_ref(),
-            Some(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS),
+        // The original arguments distinguish an explicit small cap from a
+        // learned/default command limit. Neither defaults nor the direct-call
+        // ceiling should defeat a deliberately raised cell budget.
+        let requested = match payload {
+            ToolPayload::Function { arguments } => serde_json::from_str::<JsonValue>(arguments)
+                .ok().and_then(|args| args["max_output_tokens"].as_u64())
+                .and_then(|limit| usize::try_from(limit).ok()),
+            _ => None,
+        };
+        let limits = resolve_projected_output_limits(
+            Some(requested.unwrap_or(budget)), OutputOutcome::Success,
+            codex_utils_output_truncation::OutputDiagnosticClass::Normal, budget,
         );
+        let model_output = self.projected_model_output_at_limit(raw_output.as_ref(), limits);
         let output_reduced = model_output.reduced;
         let output = model_output.text;
-        // Marked coordinates are exact even for repeated text; only unmarked
-        // projections (summaries, outlined JSON) need text alignment.
-        let recovery_selector = (raw_output_artifact_bytes == Some(self.raw_output.len() as u64))
-            .then(|| {
-                model_output.first_omitted_lines.or_else(|| {
-                    codex_utils_output_truncation::first_omitted_line_range(&raw_output, &output)
-                })
-            })
-            .flatten()
-            .map(|(start, end)| serde_json::json!({"kind": "lines", "start": start, "end": end}))
-            .or_else(|| {
-                // Cumulative artifacts have no chunk-relative line mapping.
-                // Supply a bounded, executable prefix selector rather than
-                // inventing omitted coordinates or requiring discovery first.
-                (output_reduced && raw_output_artifact_id.is_some())
-                    .then_some(raw_output_artifact_bytes).flatten()
-                    .filter(|bytes| *bytes > 0)
-                    .map(|bytes| serde_json::json!({"kind": "bytes", "start": 0, "end": bytes.min(4096)}))
-            });
+        let recovery_selector = self.missing_output_selector(
+            &raw_output, &output, model_output.first_omitted_lines, raw_output_artifact_bytes,
+        );
 
         // Exact programmatic access does not inherit the display-token budget.
         // Never offer a truncated or lossy string as JSON. Larger/binary streams
@@ -1283,6 +1390,12 @@ impl ToolOutput for ExecCommandToolOutput {
             .map(|(stdout, stderr)| (Some(stdout), Some(stderr)))
             .unwrap_or_default();
         let result = UnifiedExecCodeModeResult {
+            recovery: raw_output_artifact_id.as_ref().zip(recovery_selector.as_ref())
+                .map(|(artifact_id, selector)| serde_json::json!({
+                    "tool":"read_tool_output", "arguments": {
+                        "artifact_id":artifact_id, "selectors":[selector]
+                    }
+                })),
             error: self
                 .error
                 .clone()
@@ -1299,7 +1412,8 @@ impl ToolOutput for ExecCommandToolOutput {
             session_capabilities: self.session_capabilities,
             process_exited: self.process_exited,
             search_no_match: self.search_no_match_is_success().then_some(true),
-            output_complete: self.process_exited && self.process_id.is_none() && !output_reduced,
+            output_complete: self.process_exited && self.process_id.is_none() && !output_reduced
+                && raw_output_artifact_bytes.is_none_or(|bytes| bytes <= self.raw_output.len() as u64),
             output_reduced,
             original_token_count: self.original_token_count,
             original_token_count_is_approximate: self.original_token_count.map(|_| true),
@@ -1444,11 +1558,9 @@ fn declared_lineage_evidence_with_integrity(
     raw_output: &[u8],
     require_content_hash: bool,
 ) -> Option<JsonValue> {
-    // Any producer whose whole output is a JSON object may declare the source,
-    // optional scope, and identity it projects, so re-rendering retained
-    // evidence is not counted as new source evidence. Attribution only, never
-    // completion authority or permission to skip a command. Output cannot
-    // claim harness-owned sources; undeclared output stays exact byte evidence.
+    // Self-declared attribution is descriptive only. Even a valid checksum
+    // establishes document consistency, not a trusted producer relationship.
+    // Consumers must retain native content identity for novelty/convergence.
     const KEY: &[u8] = b"\"evidence_lineage\"";
     if !raw_output.windows(KEY.len()).any(|window| window == KEY) {
         return None;
@@ -1508,10 +1620,20 @@ pub(crate) fn failed_command_evidence(raw_output: &[u8], command: Option<&str>) 
         crate::validation::classify_validation_script(command),
         crate::validation::ValidationClassification::Validation { leaves, .. }
             if leaves.iter().any(|leaf| leaf.operation == crate::validation::ValidationOperation::Test)
-    )) && let Some(evidence) = test_failure_evidence(raw_output) {
-        return evidence;
+    )) {
+        return test_failure_evidence(raw_output)
+            .unwrap_or_else(|| canonical_output_evidence(raw_output));
     }
-    semantic_evidence_for_command_output(raw_output)
+    // Unrecognized producers have no diagnostic-framing contract. Even for
+    // recognized validators, preserve the diagnostic owner and whitespace;
+    // normalize only well-known volatile framing, never generic prose facts.
+    if command.is_some_and(|command| matches!(
+        crate::validation::classify_validation_script(command),
+        crate::validation::ValidationClassification::Validation { .. }
+    )) && let Ok(text) = std::str::from_utf8(raw_output) {
+        return canonical_output_evidence(normalize_tool_failure_text(text).as_bytes());
+    }
+    canonical_output_evidence(raw_output)
 }
 
 fn test_failure_evidence(raw_output: &[u8]) -> Option<Vec<String>> {
@@ -1528,6 +1650,8 @@ fn test_failure_evidence(raw_output: &[u8]) -> Option<Vec<String>> {
     let output = strip_ansi_sequences(std::str::from_utf8(raw_output).ok()?);
     let mut names = std::collections::BTreeSet::new();
     let mut diagnostics = Vec::<(String, Vec<String>)>::new();
+    // Terminal statuses and summaries are evidence, not disposable framing.
+    let mut statuses = Vec::new();
     let mut current = None;
     let mut section = String::new();
     for line in output.lines() {
@@ -1537,38 +1661,41 @@ fn test_failure_evidence(raw_output: &[u8]) -> Option<Vec<String>> {
             names.insert(name.as_str().to_string());
             if let Some(message) = captures.name("message") {
                 diagnostics.push((name.as_str().to_string(),
-                    vec![normalize_test_diagnostic_line(message.as_str())]));
+                    vec![message.as_str().to_string()]));
             }
             current = None;
             continue;
         }
-        let normalized = normalize_test_diagnostic_line(line);
-        let line = normalized.trim();
-        if line.starts_with("---") || line.starts_with("___") {
+        let trimmed = line.trim();
+        if trimmed.starts_with("---") || trimmed.starts_with("___") {
             // nextest/libtest/pytest delimit diagnostic blocks. Retain the
             // owning test/binary rather than mixing messages across tests.
-            section = RUNNER_INDEX.replace_all(line.trim_matches(['-', '_', ' ']), "").into_owned();
+            section = RUNNER_INDEX.replace_all(trimmed.trim_matches(['-', '_', ' ']), "").into_owned();
             current = None;
-        } else if line.starts_with("thread '") && line.contains(" panicked at ") {
-            let (owner, location) = line.split_once(" panicked at ")?;
+        } else if trimmed.starts_with("thread '") && trimmed.contains(" panicked at ") {
+            let normalized = normalize_test_diagnostic_line(line);
+            let (owner, location) = normalized.split_once(" panicked at ")?;
             diagnostics.push((format!("{section}\n{owner}"), vec![location.to_string()]));
             current = Some(diagnostics.len() - 1);
-        } else if line.starts_with("stack backtrace:")
-            || line.starts_with("note: run with ")
-            || line.starts_with("test result:")
-            || line.starts_with("Summary ")
-            || line.starts_with("failures:")
-            || line.starts_with("error: test failed")
-            || ["PASS ", "SKIP ", "TIMEOUT ", "test "].iter().any(|prefix| line.starts_with(prefix))
+        } else if trimmed.starts_with("test result:")
+            || trimmed.starts_with("Summary ")
+            || ["PASS ", "SKIP ", "TIMEOUT ", "test "].iter().any(|prefix| trimmed.starts_with(prefix))
         {
+            statuses.push(RUNNER_INDEX.replace_all(&normalize_test_diagnostic_line(line), "").into_owned());
             current = None;
-        } else if !line.is_empty() {
+        } else {
             if let Some(index) = current {
                 // Keep the whole assertion, including left/right values and
-                // multiline messages. Only block order is insignificant.
+                // whitespace and identifiers. Only block order is insignificant.
                 diagnostics[index].1.push(line.to_string());
-            } else if line.starts_with("E ") {
+            } else if trimmed.starts_with("E ") {
                 diagnostics.push((section.clone(), vec![line.to_string()]));
+            } else if trimmed.starts_with("run id: ") {
+                // This is runner framing only outside a diagnostic block.
+            } else if !trimmed.is_empty() {
+                // An unaccounted line may contain another diagnostic. Do not
+                // replace exact evidence with an incomplete parsed identity.
+                return None;
             }
         }
     }
@@ -1576,8 +1703,9 @@ fn test_failure_evidence(raw_output: &[u8]) -> Option<Vec<String>> {
         return None;
     }
     diagnostics.sort();
-    Some(vec![format!("test-failures-v2:{}", crate::tool_history::sha256(
-        serde_json::to_vec(&(names, diagnostics)).ok()?.as_slice()
+    statuses.sort();
+    Some(vec![format!("test-failures-v3:{}", crate::tool_history::sha256(
+        serde_json::to_vec(&(names, diagnostics, statuses)).ok()?.as_slice()
     ))])
 }
 
@@ -1590,12 +1718,11 @@ fn normalize_test_diagnostic_line(line: &str) -> String {
     static VOLATILE: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
         regex_lite::Regex::new(concat!(
             r"(?P<duration>^\s*(?:FAIL|PASS|SKIP|TIMEOUT)\s+\[)\s*\d+(?:\.\d+)?s\]",
-            r"|(?P<thread>^thread '[^']*') \(\d+\)",
-            r"|(?P<id>\b(?:run[-_ ]id|log[-_ ]id)[=: ]+)[A-Za-z0-9_-]+"
+            r"|(?P<thread>^thread '[^']*') \(\d+\)"
         )).expect("valid test diagnostic regex")
     });
     VOLATILE.replace_all(&normalize_command_diagnostic_line(line),
-        "${duration}${thread}${id}<volatile>").into_owned()
+        "${duration}${thread}<volatile>").into_owned()
 }
 
 fn command_failure_signature(semantic_evidence: &[String], exit_code: Option<i32>) -> String {
@@ -1670,10 +1797,14 @@ pub(crate) fn normalize_observation_text(text: &str) -> String {
 
 pub(crate) fn normalize_tool_failure_text(text: &str) -> String {
     static LOCATION: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
-        regex_lite::Regex::new(r"(?i)(:\d+(?::\d+)?|line \d+(?: column \d+)?)")
+        regex_lite::Regex::new(r"(?m)^(?P<owner>\s*(?:--> |at )?[^\r\n]*\.(?:rs|py|js|ts|tsx|jsx|c|cpp|h|java)):\d+(?::\d+)?")
             .expect("valid diagnostic location regex")
     });
-    LOCATION.replace_all(&normalize_observation_text(text), "<location>").into_owned()
+    let normalized = text.split_inclusive('\n').map(|line| {
+        let (body, newline) = line.strip_suffix('\n').map_or((line, ""), |body| (body, "\n"));
+        format!("{}{newline}", normalize_command_diagnostic_line(body))
+    }).collect::<String>();
+    LOCATION.replace_all(&normalized, "${owner}:<location>").into_owned()
 }
 
 fn is_compiler_location_line(line: &str) -> bool {
@@ -1838,7 +1969,7 @@ fn runner_execution_receipt(raw_output: &[u8], trusted_runner: Option<&str>) -> 
         .filter(|value| value["kind"] == "codex_test_execution_v1");
     let receipt = receipts.next()?;
     if receipts.next().is_some() || receipt["runner"] != runner
-        || receipt["exit_code"].as_i64() != Some(0)
+        || !matches!(receipt["exit_code"].as_i64(), Some(0 | 2))
         || receipt["selected_targets"].as_array()?.is_empty()
         || receipt["selected_targets"].as_array()?.iter()
             .any(|target| target.as_str().is_none_or(str::is_empty))
@@ -1876,7 +2007,30 @@ fn runner_execution_receipt(raw_output: &[u8], trusted_runner: Option<&str>) -> 
         }
         executed = executed.checked_add(tests.len() as u64)?;
     }
-    (executed > 0 && receipt["executed_tests"].as_u64() == Some(executed)).then_some(receipt)
+    if let Some(identities) = receipt.get("executions") {
+        let identities = crate::validation::runner_test_identities(identities)?;
+        let mut projection = std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+        for identity in &identities {
+            projection.entry(&identity.binary).or_default().insert(&identity.test);
+        }
+        if serde_json::to_value(projection).ok()? != receipt["completed_tests"] {
+            return None;
+        }
+        if !receipt["required_executions"].is_null() {
+            let required = crate::validation::runner_test_identities(&receipt["required_executions"])?;
+            if !identities.is_subset(&required)
+                || (receipt["exit_code"] == 0 && identities != required)
+            {
+                return None;
+            }
+        }
+        executed = identities.len() as u64;
+    } else if receipt["exit_code"] != 0 {
+        // Legacy success projections cannot establish partial-failure identity.
+        return None;
+    }
+    ((executed > 0 || receipt["exit_code"] == 2)
+        && receipt["executed_tests"].as_u64() == Some(executed)).then_some(receipt)
 }
 
 pub(crate) fn attach_command_validation(
@@ -1892,31 +2046,108 @@ pub(crate) fn attach_command_validation(
         return;
     }
     let failed = exit_code != Some(0);
-    let evidence = if failed && validation.is_test() {
-        test_failure_evidence(raw_output).unwrap_or_else(|| {
-            let normalized = String::from_utf8_lossy(raw_output).lines()
-                .map(normalize_test_diagnostic_line).collect::<Vec<_>>().join("\n");
-            semantic_evidence_for_command_output(normalized.as_bytes())
-        })
+    let evidence = if failed {
+        validation.is_test().then(|| test_failure_evidence(raw_output)).flatten()
+            .unwrap_or_else(|| match std::str::from_utf8(raw_output) {
+                Ok(text) => canonical_output_evidence(normalize_tool_failure_text(text).as_bytes()),
+                Err(_) => canonical_output_evidence(raw_output),
+            })
     } else {
         semantic_evidence_for_command_output(raw_output)
     };
     signal["semantic_evidence"] = serde_json::json!(evidence);
+    if validation.is_test()
+        && let Some(receipt) = runner_execution_receipt(raw_output, validation.receipt_runner.as_deref())
+        && receipt["exit_code"].as_i64() == exit_code.map(i64::from)
+    {
+        // Partial passing identities survive failure, but do not turn it into success.
+        signal["runner_execution_receipt"] = receipt;
+    }
     if failed {
         signal["failure_signature"] = serde_json::json!(command_failure_signature(&evidence, exit_code));
     } else {
         if let Some(lineage) = declared_lineage_evidence(raw_output) {
-            signal["semantic_evidence"] = lineage;
+            signal["declared_lineage"] = lineage;
         }
-        if validation.is_test()
-            && let Some(receipt) = runner_execution_receipt(raw_output, validation.receipt_runner.as_deref())
+        // Summary counts only attribute this successful command to paths. They
+        // are not execution receipts and must never authorize replay or proof.
+        if validation.is_test() && validation.signal()["proof"] == true
+            && let Some(count) = validation_summary_test_count(raw_output)
         {
-            signal["runner_execution_receipt"] = receipt;
+            signal["validation_summary_tests"] = serde_json::json!(count);
         }
     }
 }
 
+fn validation_summary_test_count(raw_output: &[u8]) -> Option<u64> {
+    use std::sync::LazyLock;
+    static CARGO: LazyLock<regex_lite::Regex> = LazyLock::new(|| regex_lite::Regex::new(
+        r"^test result: ok\. ([0-9]+) passed; 0 failed; .*; finished in .+$").unwrap());
+    static UNITTEST: LazyLock<regex_lite::Regex> = LazyLock::new(|| regex_lite::Regex::new(
+        r"^Ran ([0-9]+) tests? in .+$").unwrap());
+    static PYTEST: LazyLock<regex_lite::Regex> = LazyLock::new(|| regex_lite::Regex::new(
+        r"^=*[ ]*([0-9]+) passed(?:, [0-9]+ (?:skipped|deselected|xfailed|xpassed|warnings?))* in .+?(?:[ ]*=*)$").unwrap());
+    let text = std::str::from_utf8(raw_output).ok()?;
+    let lines = text.lines().map(strip_ansi_sequences).collect::<Vec<_>>();
+    let last = lines.iter().rev().find(|line| !line.trim().is_empty())?.trim();
+    let count = if CARGO.is_match(last) {
+        lines.iter().filter_map(|line| CARGO.captures(line.trim()))
+            .try_fold(0_u64, |total, captures| total.checked_add(captures[1].parse::<u64>().ok()?))?
+    } else if last == "OK" || last.starts_with("OK (skipped=") {
+        let count = lines.iter().rev().find_map(|line| UNITTEST.captures(line.trim()))?
+            [1].parse::<u64>().ok()?;
+        let skipped = last.strip_prefix("OK (skipped=").and_then(|s| s.strip_suffix(')'))
+            .map(str::parse::<u64>).transpose().ok()?.unwrap_or(0);
+        count.checked_sub(skipped)?
+    } else {
+        PYTEST.captures(last)?[1].parse().ok()?
+    };
+    (count > 0).then_some(count)
+}
+
 impl ExecCommandToolOutput {
+    fn missing_output_selector(
+        &self,
+        raw_output: &str,
+        output: &str,
+        marked_lines: Option<(usize, usize)>,
+        artifact_bytes: Option<u64>,
+    ) -> Option<JsonValue> {
+        let retained = artifact_bytes?;
+        if self.raw_output.is_empty() { return None; }
+        let bytes_selector = |start: u64, end: u64| {
+            let end = end.min(retained).min(start.saturating_add(4096));
+            (start < end).then(|| serde_json::json!({"kind":"bytes", "start":start, "end":end}))
+        };
+        if let Some(ranges) = &self.output_ranges {
+            if let Some(gap) = &ranges.gap {
+                return bytes_selector(gap.start, gap.end);
+            }
+            // A byte map is valid only for the exact chunk, excluding harness
+            // notices and lossy UTF-8 decoding. Never guess from artifact length.
+            if ranges.range.end.checked_sub(ranges.range.start) != Some(self.raw_output.len() as u64)
+                || std::str::from_utf8(&self.raw_output).is_err() {
+                return None;
+            }
+            let (start_line, end_line) = marked_lines.or_else(||
+                codex_utils_output_truncation::first_omitted_line_range(raw_output, output))?;
+            if ranges.range.start == 0 && ranges.range.end == retained {
+                return Some(serde_json::json!({"kind":"lines", "start":start_line, "end":end_line}));
+            }
+            let mut start = 0usize;
+            let mut end = 0usize;
+            for (index, line) in raw_output.split_inclusive('\n').enumerate() {
+                if index + 1 < start_line { start += line.len(); }
+                if index < end_line { end += line.len(); } else { break; }
+            }
+            return bytes_selector(ranges.range.start.checked_add(start as u64)?,
+                ranges.range.start.checked_add(end as u64)?);
+        }
+        // Matching lengths do not prove identity, especially for synthetic
+        // notices. Unknown coordinates must not become guessed prefix reads.
+        None
+    }
+
     /// The streaming spill threshold is independent of the caller's display
     /// budget. Retain a reduced chunk on demand without replacing a live
     /// process's cumulative writer or making fully inline output hit disk.
@@ -1926,6 +2157,7 @@ impl ExecCommandToolOutput {
         thread_id: &str,
     ) {
         if self.raw_output.is_empty()
+            || self.output_ranges.as_ref().is_some_and(|ranges| ranges.gap.is_some())
             || self.raw_output_artifact.as_ref().is_some_and(|artifact| !artifact.is_pending())
         {
             return;
@@ -1940,16 +2172,34 @@ impl ExecCommandToolOutput {
                     codex_home, thread_id, &self.raw_output,
                 ).await,
             );
+            // This artifact contains only this call's displayed source bytes.
+            self.output_ranges = Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
+                range: 0..self.raw_output.len() as u64, gap: None,
+            });
         }
     }
 
-    fn search_no_match_is_success(&self) -> bool {
+    pub(crate) fn search_no_match_is_success(&self) -> bool {
+        Self::classified_search_no_match_is_success(
+            self.search_no_match, self.exit_code, self.error.as_deref(),
+            self.process_exited, self.process_id.is_none(), self.process_output.as_deref(),
+        )
+    }
+
+    pub(crate) fn classified_search_no_match_is_success(
+        classified: bool,
+        exit_code: Option<i32>,
+        error: Option<&str>,
+        process_exited: bool,
+        output_drained: bool,
+        snapshot: Option<&crate::unified_exec::ProcessOutputSnapshot>,
+    ) -> bool {
         // PowerShell can map native rg errors to exit 1 too. Classification of
         // the command alone cannot turn its stderr (or lost streams) into a
         // successful empty search. Use the process-owned cumulative evidence.
-        self.search_no_match && self.exit_code == Some(1) && self.error.is_none()
-            && self.process_exited && self.process_id.is_none()
-            && self.process_output.as_ref().is_some_and(|snapshot| {
+        classified && exit_code == Some(1) && error.is_none()
+            && process_exited && output_drained
+            && snapshot.is_some_and(|snapshot| {
                 snapshot.streams_are_exact && snapshot.stderr.is_empty()
             })
     }
@@ -2020,18 +2270,31 @@ impl ExecCommandToolOutput {
                 .with_id("output_decoding_notice"),
             );
         }
-        let summary = self.summarized_output(raw_output, self.model_output_limits(raw_output, None).applied_limit);
-        fragments.push(
-            ToolOutputProjectionFragment::new(
-                if summary.is_some() {
-                    ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
-                } else {
-                    ToolOutputProjectionFragmentKind::ContextualSpillableText
-                },
-                summary.clone().unwrap_or_else(|| raw_output.replace("\r\n", "\n")),
-            )
-            .with_id("output"),
-        );
+        let mut output_fragment = ToolOutputProjectionFragment::new(
+            ToolOutputProjectionFragmentKind::ContextualSpillableText,
+            raw_output,
+        ).with_id("output");
+        if self.process_id.is_none() && self.process_exited
+            && let Some(exit_code) = self.exit_code
+        {
+            output_fragment.shell_output = Some(codex_tools::ShellOutputProjectionSource {
+                exit_code,
+                command_text: self.hook_command.clone(),
+                streams: self.process_output.as_ref().and_then(|snapshot| {
+                    if !snapshot.streams_are_exact || !snapshot.aggregated_output_is_exact
+                        || snapshot.aggregated_output != self.raw_output { return None; }
+                    Some((std::str::from_utf8(&snapshot.stdout).ok()?.to_string(),
+                        std::str::from_utf8(&snapshot.stderr).ok()?.to_string()))
+                }),
+            });
+            if self.validation.as_ref().is_some_and(|validation| validation.is_validation())
+                || exit_code != 0
+            {
+                output_fragment.kind = ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary;
+            }
+        }
+        let deferred_summary = output_fragment.shell_output.is_some();
+        fragments.push(output_fragment);
         ToolOutputProjectionMetadata {
             outcome,
             diagnostic_class: match classify_diagnostic(self.hook_command.as_deref(), raw_output) {
@@ -2080,9 +2343,7 @@ impl ExecCommandToolOutput {
                 metadata
             },
             requested_limit: self.requested_model_output_tokens(),
-            predetermined_ranges: if summary.is_some() {
-                Vec::new()
-            } else {
+            predetermined_ranges: if deferred_summary { Vec::new() } else {
                 predetermined_validation_ranges(raw_output, self.hook_command.as_deref())
             },
             predetermined_json_pointers: Vec::new(),
@@ -2155,6 +2416,11 @@ impl ExecCommandToolOutput {
                 "tests": receipt["executed_tests"],
                 "detail": "exact test names retained in raw output; this display is not an execution receipt",
             });
+            if let Some(object) = receipt.as_object_mut() {
+                object.remove("executions");
+                object.remove("required_executions");
+                object.remove("satisfied_gates");
+            }
             let compact = receipt.to_string();
             return Some(raw_output.lines().map(|line| {
                 if serde_json::from_str::<JsonValue>(line).ok()
@@ -2170,7 +2436,7 @@ impl ExecCommandToolOutput {
             return None;
         }
         match (self.process_id, self.exit_code) {
-            (None, Some(exit_code)) => summarize_shell_output_for_model(
+            (None, Some(exit_code)) => summarize_shell_output_for_model_with_streams(
                 raw_output,
                 exit_code,
                 false,
@@ -2179,6 +2445,17 @@ impl ExecCommandToolOutput {
                     applied_token_limit: Some(token_limit),
                     command_text: self.hook_command.as_deref(),
                 },
+                self.process_output.as_ref().and_then(|snapshot| {
+                    // A terminal poll can contain only the last chunk. Never
+                    // summarize previously delivered cumulative output again.
+                    if !self.process_exited || !snapshot.streams_are_exact
+                        || !snapshot.aggregated_output_is_exact
+                        || snapshot.aggregated_output != self.raw_output {
+                        return None;
+                    }
+                    Some((std::str::from_utf8(&snapshot.stdout).ok()?,
+                        std::str::from_utf8(&snapshot.stderr).ok()?))
+                }),
             ),
             _ => None,
         }
@@ -2189,7 +2466,17 @@ impl ExecCommandToolOutput {
         raw_output: &str,
         hard_limit_cap: Option<usize>,
     ) -> ProjectedModelOutput {
+        self.projected_model_output_at_limit(raw_output, self.model_output_limits(raw_output, hard_limit_cap))
+    }
+
+    fn projected_model_output_at_limit(
+        &self,
+        raw_output: &str,
+        limits: OutputLimitResolution,
+    ) -> ProjectedModelOutput {
         let source_bytes = raw_output.len() as u64;
+        // Recovery selectors address retained bytes, not normalized presentation.
+        let summarized = self.summarized_output(raw_output, limits.applied_limit);
         // Normalize only the model projection; canonical artifacts retain exact bytes.
         let normalized;
         let raw_output = if raw_output.contains("\r\n") {
@@ -2198,18 +2485,15 @@ impl ExecCommandToolOutput {
         } else {
             raw_output
         };
-        let limits = self.model_output_limits(raw_output, hard_limit_cap);
-        let summarized = self.summarized_output(raw_output, limits.applied_limit);
         let artifact_has_more_bytes = self
             .raw_output_artifact
             .as_ref()
             .and_then(RawOutputArtifact::retained_bytes)
             .is_some_and(|bytes| bytes > source_bytes);
         let (truncated, first_omitted_lines) = match summarized.as_deref() {
-            // Line coordinates are recovery references only when the text is
-            // the retained source itself, not a summary or one chunk of a
-            // longer cumulative artifact.
-            None if !artifact_has_more_bytes => {
+            // These coordinates are chunk-relative. The output owner translates
+            // them before exposing a cumulative artifact recovery selector.
+            None => {
                 let marked = formatted_truncate_text_with_line_markers(raw_output, limits);
                 let first_omitted_lines = marked.first_omitted_line_range();
                 (marked.output, first_omitted_lines)
@@ -2235,7 +2519,9 @@ impl ExecCommandToolOutput {
             }
         }
         ProjectedModelOutput {
-            reduced: summarized.is_some() || was_truncated || artifact_has_more_bytes,
+            reduced: summarized.is_some() || was_truncated
+                || self.output_ranges.as_ref().is_some_and(|ranges| ranges.gap.is_some())
+                || (self.output_ranges.is_none() && !raw_output.is_empty() && artifact_has_more_bytes),
             text: projected_text,
             first_omitted_lines,
         }
@@ -2271,6 +2557,17 @@ impl ExecCommandToolOutput {
                 .and_then(|a| a.model_projection().0)
         {
             fields.insert("artifact_id".into(), id.to_string().into());
+            if let Some(selector) = self.missing_output_selector(
+                raw_output, &projected.text, projected.first_omitted_lines,
+                self.raw_output_artifact.as_ref().and_then(RawOutputArtifact::retained_bytes),
+            ) {
+                fields.insert("recovery_selector".into(), selector.clone());
+                fields.insert("recovery".into(), serde_json::json!({
+                    "tool":"read_tool_output", "arguments": {
+                        "artifact_id":id.to_string(), "selectors":[selector]
+                    }
+                }));
+            }
         }
         let mut text = projected.text;
         if self.process_exited && self.exit_code.is_none() {

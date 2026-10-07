@@ -40,11 +40,24 @@ pub(crate) struct ShellOutputSummaryOptions<'a> {
     pub(crate) command_text: Option<&'a str>,
 }
 
+#[cfg(test)]
 pub(crate) fn summarize_shell_output_for_model(
     output: &str,
     exit_code: i32,
     timed_out: bool,
     options: ShellOutputSummaryOptions<'_>,
+) -> Option<String> {
+    summarize_shell_output_for_model_with_streams(output, exit_code, timed_out, options, None)
+}
+
+/// `streams` must be complete, producer-owned stdout/stderr for this output,
+/// not a cumulative snapshot paired with a later polling chunk.
+pub(crate) fn summarize_shell_output_for_model_with_streams(
+    output: &str,
+    exit_code: i32,
+    timed_out: bool,
+    options: ShellOutputSummaryOptions<'_>,
+    streams: Option<(&str, &str)>,
 ) -> Option<String> {
     if !options.enabled {
         return None;
@@ -90,11 +103,22 @@ pub(crate) fn summarize_shell_output_for_model(
                     .any(|segment| source_read_output_budget(segment).is_some())
             })
     }) {
+        if let Some(command) = options.command_text
+            && let Some(summary) = rg_file_summary(output, command, options.applied_token_limit)
+        {
+            return Some(summary);
+        }
         // Preserve the requested source order and the existing truncation/raw
         // artifact recovery path instead of ranking code as diagnostic prose.
         // A later failing command does not make earlier source reads diagnostics.
         // Without per-segment output boundaries, keep the entire mixed stream.
         return None;
+    }
+
+    // Replace (never append to) the prose excerpt for recognized compiler JSON.
+    // Raw output remains the canonical artifact owned by the caller.
+    if let Some(summary) = structured_compiler_summary_with_streams(output, exit_code, timed_out, options.applied_token_limit, streams) {
+        return Some(summary);
     }
 
     // A successful command with no diagnostic line has nothing to rank, so the
@@ -108,8 +132,12 @@ pub(crate) fn summarize_shell_output_for_model(
     if !failed
         && !validation
         && !output.lines().any(|line| {
-            let classification = classify_line(line);
-            classification.critical || classification.advisory
+            // Unknown successful scripts often print source signatures or
+            // inventory fields containing these words. Require a diagnostic
+            // label, not an incidental occurrence inside source evidence.
+            let line = line.trim_start();
+            ["error:", "error[", "warning:", "warning[", "fatal:", "npm err!"].iter()
+                .any(|prefix| starts_with_ascii_case(line, prefix))
         })
     {
         return None;
@@ -139,11 +167,11 @@ pub(crate) fn summarize_shell_output_for_model(
     }
     if selection.omitted_groups > 0 {
         let qualifier = if selection.groups_overflowed {
-            "at least "
+            " (group inventory also capped)"
         } else {
             ""
         };
-        builder.push_line(format!("- omitted_diagnostic_groups: {qualifier}{}; inspect the raw output for remaining diagnostics", selection.omitted_groups));
+        builder.push_line(format!("- omitted_diagnostic_groups: at least {} (selection-stage lower bound{qualifier}); final fitting may omit additional diagnostics; inspect the raw output", selection.omitted_groups));
     }
     builder.push_line("");
     builder.push_line("Selected output lines:");
@@ -293,6 +321,200 @@ pub(crate) fn summarize_shell_output_for_model(
     (summary.len() < output.len()).then_some(summary)
 }
 
+/// Cargo/rustc JSON carries diagnostics inside escaped single-line records.
+/// Ranking/truncating those raw lines can hide their message or location.
+/// Cargo mixes JSON stdout with plain stderr; retain that context verbatim.
+/// Malformed/unknown JSON or excessive text still uses the existing text path.
+#[cfg(test)]
+fn structured_compiler_summary(
+    output: &str,
+    exit_code: i32,
+    timed_out: bool,
+    token_limit: Option<usize>,
+) -> Option<String> {
+    structured_compiler_summary_with_streams(output, exit_code, timed_out, token_limit, None)
+}
+
+fn structured_compiler_summary_with_streams(
+    output: &str,
+    exit_code: i32,
+    timed_out: bool,
+    token_limit: Option<usize>,
+    streams: Option<(&str, &str)>,
+) -> Option<String> {
+    let compiler_output = streams.map_or(output, |(stdout, _)| stdout);
+    let stderr = streams.map(|(_, stderr)| stderr);
+    let recovery_selector = |source_line: usize| {
+        let range = compiler_output.lines().nth(source_line.saturating_sub(1))
+            .and_then(|line| output.find(line).map(|start| (start, start + line.len())))
+            .unwrap_or((0, output.len()));
+        serde_json::json!({"kind":"bytes", "start":range.0, "end":range.1})
+    };
+    // Keep stderr independently and verbatim. If it cannot fit, fall back to
+    // ordinary output projection/recovery rather than silently dropping it.
+    if stderr.is_some_and(|stderr| stderr.len() > SUMMARY_MAX_BYTES / 4) {
+        return None;
+    }
+    let mut diagnostics = Vec::new();
+    // Evict the latest lowest-priority complete group. This keeps actionable
+    // errors ahead of warning floods and preserves source order within ties.
+    let lowest_priority_index = |diagnostics: &[serde_json::Value]| {
+        diagnostics.iter().enumerate().max_by_key(|(index, item)| {
+            let diagnostic = &item["diagnostic"];
+            let summary = diagnostic["message"].as_str().is_some_and(|message|
+                message.starts_with("aborting due to "));
+            let priority = match diagnostic["level"].as_str() {
+                Some("error" | "fatal") if !summary => 0,
+                Some("warning") => 1,
+                _ => 2,
+            };
+            (priority, *index)
+        }).map(|(index, _)| index)
+    };
+    let mut text_lines = Vec::new();
+    let mut text_bytes = stderr.map_or(0, str::len);
+    let mut total = 0usize;
+    let mut records = 0usize;
+    let mut omitted = 0usize;
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut build_success = None;
+    for (index, line) in compiler_output.lines().enumerate() {
+        if line.trim().is_empty() { continue; }
+        if !line.trim_start().starts_with('{') {
+            text_bytes = text_bytes.saturating_add(line.len());
+            if text_bytes > SUMMARY_MAX_BYTES / 4 { return None; }
+            text_lines.push(serde_json::json!({"source_line": index + 1, "text": line}));
+            continue;
+        }
+        let mut record: serde_json::Value = serde_json::from_str(line).ok()?;
+        records += 1;
+        let diagnostic = match record["reason"].as_str() {
+            Some("compiler-message") => record.get_mut("message")?,
+            Some("compiler-artifact" | "build-script-executed") => continue,
+            Some("build-finished") => {
+                // A later success cannot erase an earlier failed build.
+                let success = record["success"].as_bool()?;
+                build_success = Some(build_success.unwrap_or(true) && success);
+                continue;
+            }
+            None if record["$message_type"] == "diagnostic" => &mut record,
+            _ => return None,
+        };
+        let level = diagnostic["level"].as_str()?;
+        let message = diagnostic["message"].as_str()?;
+        let is_abort_summary = message.starts_with("aborting due to ")
+            && (message.contains(" previous error") || message.contains(" previous warning"))
+            && diagnostic["spans"].as_array().is_some_and(Vec::is_empty);
+        errors += usize::from(matches!(level, "error" | "fatal") && !is_abort_summary);
+        warnings += usize::from(level == "warning");
+        diagnostic["message"].as_str()?;
+        diagnostic["spans"].as_array()?;
+        diagnostic["children"].as_array()?;
+        total += 1;
+        // Keep locations, source excerpts, children and fix suggestions exact.
+        // Only redundant rendered prose and the general error-code manual go.
+        diagnostic.as_object_mut()?.remove("rendered");
+        if let Some(code) = diagnostic.get_mut("code").and_then(serde_json::Value::as_object_mut) {
+            code.remove("explanation");
+        }
+        let mut item = serde_json::json!({"source_line": index + 1, "diagnostic": diagnostic});
+        if item.to_string().len() > SUMMARY_MAX_BYTES / 2
+            && compact_compiler_diagnostic(&mut item["diagnostic"])
+        {
+            item["details_omitted"] = true.into();
+            item["recovery_selector"] = recovery_selector(index + 1);
+        }
+        diagnostics.push(item);
+        if diagnostics.len() > MAX_DIAGNOSTIC_GROUPS {
+            diagnostics.remove(lowest_priority_index(&diagnostics)?);
+            omitted += 1;
+        }
+    }
+    if total == 0 { return None; }
+    loop {
+        let summary = serde_json::json!({
+            "format": "compiler_diagnostics",
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "build_success": build_success,
+            "original_lines": output.lines().count(),
+            "original_bytes": output.len(),
+            "records": records,
+            "diagnostic_count": total,
+            "error_count": errors,
+            "warning_count": warnings,
+            "omitted_diagnostics": omitted,
+            "diagnostics_complete": omitted == 0 && diagnostics.iter().all(|item| item["details_omitted"] != true),
+            "text_lines": text_lines,
+            "diagnostic_stream": if streams.is_some() { "stdout" } else { "aggregated" },
+            "stderr": stderr,
+            "projection": "Redundant rendered text, code explanations and build artifacts omitted. details_omitted marks abbreviated prose/excerpts or omitted children without locations or fixes. Omitted whole diagnostics may include locations and fixes; recover them with recovery_selector against the retained aggregate bytes.",
+            "recovery_selector": (omitted > 0).then(|| serde_json::json!({"kind":"bytes", "start":0, "end":output.len()})),
+            "diagnostics": diagnostics,
+        }).to_string();
+        if summary.len() <= SUMMARY_MAX_BYTES && token_limit.is_none_or(|limit|
+            !codex_utils_string::approx_token_count_exceeds(&summary, limit)) {
+            return (summary.len() < output.len()).then_some(summary);
+        }
+        let index = lowest_priority_index(&diagnostics)?;
+        let item = &mut diagnostics[index];
+        // Warnings/notes yield before actionable error detail. Once only errors
+        // remain, shed bulky excerpts before evicting their locations and fixes.
+        if matches!(item["diagnostic"]["level"].as_str(), Some("error" | "fatal"))
+            && compact_compiler_diagnostic(&mut item["diagnostic"]) {
+            item["details_omitted"] = true.into();
+            item["recovery_selector"] = recovery_selector(item["source_line"].as_u64()? as usize);
+            continue;
+        }
+        diagnostics.remove(index);
+        omitted += 1;
+    }
+}
+
+/// Drop source excerpts (not span coordinates, labels, or fixes) and bound long
+/// diagnostic prose. The canonical compiler output remains the recovery owner.
+fn compact_compiler_diagnostic(diagnostic: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    if let Some(message) = diagnostic.get_mut("message")
+        && let Some(text) = message.as_str()
+        && text.len() > 1_024
+    {
+        *message = summarize_oversized_line(text, 1_024).into_owned().into();
+        changed = true;
+    }
+    if let Some(spans) = diagnostic.get_mut("spans").and_then(serde_json::Value::as_array_mut) {
+        for span in spans {
+            if let Some(span) = span.as_object_mut() {
+                changed |= span.remove("text").is_some();
+                changed |= span.remove("expansion").is_some();
+            }
+        }
+    }
+    if let Some(children) = diagnostic.get_mut("children").and_then(serde_json::Value::as_array_mut) {
+        for child in children {
+            changed |= compact_compiler_diagnostic(child);
+        }
+    }
+    if diagnostic.to_string().len() > SUMMARY_MAX_BYTES / 2 {
+        if let Some(children) = diagnostic.get_mut("children").and_then(serde_json::Value::as_array_mut)
+            && !children.is_empty()
+        {
+            let before = children.len();
+            children.retain(compiler_diagnostic_has_locations);
+            changed |= children.len() != before;
+        }
+    }
+    changed
+}
+
+fn compiler_diagnostic_has_locations(diagnostic: &serde_json::Value) -> bool {
+    diagnostic["spans"].as_array().is_some_and(|spans| !spans.is_empty())
+        || diagnostic["children"].as_array().is_some_and(|children| {
+            children.iter().any(compiler_diagnostic_has_locations)
+        })
+}
+
 fn render_selected_lines(
     mut builder: SummaryBuilder,
     selected: &[(usize, &str)],
@@ -331,6 +553,53 @@ fn render_selected_lines(
     builder.finish(emitted_source_lines, line_count)
 }
 
+/// Count path-prefixed rg records before selecting a source-ordered excerpt.
+fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> Option<String> {
+    if !command.split(|c: char| !c.is_alphanumeric() && c != '_').any(|word| word == "rg") {
+        return None;
+    }
+    static HIT: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(||
+        regex_lite::Regex::new(r"^(.+?):[0-9]+:").expect("rg path and line prefix"));
+    let mut files = std::collections::BTreeMap::<&str, usize>::new();
+    let mut hits = 0usize;
+    let mut other_lines = 0usize;
+    // Count every visible hit, never just the excerpt selected below.
+    for line in output.lines() {
+        if let Some(hit) = HIT.captures(line) {
+            *files.entry(hit.get(1)?.as_str()).or_default() += 1;
+            hits += 1;
+        } else {
+            other_lines += 1;
+        }
+    }
+    if files.is_empty() { return None; }
+    let limit = token_limit.unwrap_or(8_000).min(8_000);
+    let mut ranked = files.iter().collect::<Vec<_>>();
+    ranked.sort_by(|(left_path, left_count), (right_path, right_count)|
+        right_count.cmp(left_count).then_with(|| left_path.cmp(right_path)));
+    let mut summary = format!(
+        "rg output summary (path:line records in this output, not unique matches): {hits} hits across {} files; {other_lines} other lines. Raw output is unchanged and recoverable.\nPer-file hit counts:\n",
+        files.len(),
+    );
+    let mut listed = 0;
+    for (path, count) in ranked.into_iter().take(64) {
+        let line = format!("- {}: {count}\n", serde_json::to_string(path).ok()?);
+        if codex_utils_string::approx_token_count(&summary) + codex_utils_string::approx_token_count(&line) > limit / 2 { break; }
+        summary.push_str(&line);
+        listed += 1;
+    }
+    if listed < files.len() {
+        let _ = writeln!(summary, "- {} additional files omitted from this directory", files.len() - listed);
+    }
+    summary.push_str("\nSource-ordered excerpt (not complete):\n");
+    let remaining = limit.saturating_sub(codex_utils_string::approx_token_count(&summary) + 64);
+    if listed == 0 || remaining == 0 { return None; }
+    summary.push_str(&codex_utils_output_truncation::formatted_truncate_text(
+        output, codex_utils_output_truncation::TruncationPolicy::Tokens(remaining),
+    ));
+    (summary.len() < output.len()).then_some(summary)
+}
+
 /// Reads, searches, and listings are source material, not diagnostics: ranking
 /// their lines hoists incidental "error" text above the code around it, and
 /// the model then re-reads the file to recover the order. Bash scripts are
@@ -363,207 +632,7 @@ pub(crate) fn source_read_output_budget(command: &str) -> Option<usize> {
 }
 
 pub(crate) fn is_read_only_command(command: &str) -> bool {
-    let commands = codex_shell_command::parse_command::parse_shell_script(command);
-    if !commands.is_empty()
-        && commands.iter().all(|command| {
-            matches!(
-                command,
-                codex_protocol::parse_command::ParsedCommand::Read { .. }
-                    | codex_protocol::parse_command::ParsedCommand::Search { .. }
-                    | codex_protocol::parse_command::ParsedCommand::ListFiles { .. }
-            )
-        })
-    {
-        return true;
-    }
-    is_read_only_powershell_script(command)
-}
-
-fn is_read_only_powershell_script(script: &str) -> bool {
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "get-content",
-        "gc",
-        "cat",
-        "type",
-        "select-string",
-        "sls",
-        "get-childitem",
-        "gci",
-        "ls",
-        "dir",
-        "get-item",
-        "gi",
-        "get-itemproperty",
-        "test-path",
-        "resolve-path",
-        "get-location",
-        "pwd",
-        "set-location",
-        "cd",
-        "push-location",
-        "pop-location",
-        "select-object",
-        "select",
-        "where-object",
-        "where",
-        "?",
-        "foreach-object",
-        "%",
-        "sort-object",
-        "sort",
-        "measure-object",
-        "measure",
-        "group-object",
-        "format-list",
-        "fl",
-        "format-table",
-        "ft",
-        "out-string",
-        "out-null",
-        "write-output",
-        "write-host",
-        "echo",
-        "get-date",
-        "get-process",
-        "get-ciminstance",
-        "get-command",
-        "get-member",
-        "get-filehash",
-        "convertfrom-json",
-        "convertto-json",
-        "rg",
-        "grep",
-        "findstr",
-        "head",
-        "tail",
-        "wc",
-        "find",
-        "fd",
-        "git",
-        // Control flow only sequences the commands above; it emits nothing itself.
-        "if",
-        "elseif",
-        "else",
-        "foreach",
-        "for",
-        "while",
-        "do",
-        "try",
-        "catch",
-        "finally",
-        "switch",
-        "return",
-    ];
-    const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
-        "diff",
-        "show",
-        "log",
-        "status",
-        "grep",
-        "blame",
-        "ls-files",
-        "rev-parse",
-        "branch",
-    ];
-    // Type literals that only build or format values. Any other type may expose
-    // a mutating static member, such as `[IO.File]::Delete(...)`.
-    const PURE_TYPE_LITERALS: &[&str] = &[
-        "pscustomobject",
-        "ordered",
-        "math",
-        "string",
-        "int",
-        "long",
-        "double",
-        "bool",
-        "char",
-        "regex",
-        "datetime",
-        "timespan",
-        "array",
-        "hashtable",
-    ];
-    let segments = powershell_command_segments(script).unwrap_or_else(|| {
-        // Splitting inside unmodeled quoting only makes the check more conservative.
-        script
-            .split([';', '|', '\n', '\r', '{', '('])
-            .flat_map(|segment| segment.split("&&"))
-            .collect()
-    });
-    let mut saw_command = false;
-    for segment in segments {
-        let mut segment = segment
-            .trim()
-            .trim_matches(|character: char| matches!(character, ')' | '}' | '&'))
-            .trim();
-        // A hash-literal entry such as `@{seconds=[math]::Round(...)}` evaluates
-        // only its value.
-        if let Some((key, value)) = segment.split_once('=')
-            && !key.is_empty()
-            && key
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '_')
-            && !value.trim().contains(char::is_whitespace)
-        {
-            segment = value.trim();
-        }
-        // `$x = <command>` runs its right-hand side; other `$` forms are
-        // variable expressions that produce no command output of their own.
-        while let Some(rest) = segment.strip_prefix('$') {
-            match rest.split_once('=') {
-                Some((name, value))
-                    if !name.trim_end().ends_with('-')
-                        && !name.trim_end().contains(char::is_whitespace) =>
-                {
-                    segment = value.trim();
-                }
-                _ => segment = "",
-            }
-        }
-        if segment.is_empty() {
-            continue;
-        }
-        // Literals, array/hash constructors, parameters, and numbers follow a
-        // split point without starting a command: `@('a','b')` splits into an
-        // `@` tail and a quoted list, and `-Recurse` may trail a line break.
-        if segment.starts_with(|character: char| {
-            matches!(character, '\'' | '"' | '@' | '-' | ']' | ',' | '.')
-                || character.is_ascii_digit()
-        }) {
-            continue;
-        }
-        if let Some(rest) = segment.strip_prefix('[') {
-            if rest.split_once(']').is_some_and(|(type_name, _)| {
-                PURE_TYPE_LITERALS.contains(&type_name.trim().to_ascii_lowercase().as_str())
-            }) {
-                continue;
-            }
-            return false;
-        }
-        let mut tokens = segment.split_whitespace();
-        let Some(command) = tokens.next() else {
-            continue;
-        };
-        let command = command
-            .trim_start_matches('&')
-            .trim_matches(|character: char| matches!(character, '"' | '\''))
-            .to_ascii_lowercase();
-        if command.is_empty() {
-            continue;
-        }
-        if !READ_ONLY_COMMANDS.contains(&command.as_str()) {
-            return false;
-        }
-        if command == "git"
-            && !tokens.next().is_some_and(|subcommand| {
-                READ_ONLY_GIT_SUBCOMMANDS.contains(&subcommand.to_ascii_lowercase().as_str())
-            })
-        {
-            return false;
-        }
-        saw_command = true;
-    }
-    saw_command
+    crate::turn_diff_tracker::script_is_read_only(command)
 }
 
 /// Splits a PowerShell script at every position that can start a command:
@@ -637,19 +706,17 @@ fn powershell_command_segments(script: &str) -> Option<Vec<&str>> {
     Some(segments)
 }
 
-/// Whether exit 1 means "no matches": the final pipeline stage of a `;` or
-/// newline sequence is a native search (`rg`, `grep`, `findstr`), which owns
-/// the exit code. `&&`/`||` chains and blocks are excluded because an earlier
-/// command can own the exit code there.
+/// Whether exit 1 can describe an empty search for the whole command.
+/// Compound commands and pipelines may contain earlier matches or failures;
+/// their final search's exit code cannot classify the aggregate output.
 pub(crate) fn ends_with_native_search(command: &str) -> bool {
     if command.contains("&&") || command.contains("||") {
         return false;
     }
     let Some(last) = powershell_command_segments(command).and_then(|segments| {
-        segments
-            .into_iter()
-            .map(str::trim)
-            .rfind(|segment| !segment.is_empty())
+        let mut commands = segments.into_iter().map(str::trim).filter(|segment| !segment.is_empty());
+        let only = commands.next()?;
+        commands.next().is_none().then_some(only)
     }) else {
         return false;
     };
@@ -677,6 +744,10 @@ struct LineClassification {
     critical: bool,
     advisory: bool,
     status: bool,
+}
+
+pub(crate) fn is_critical_output_line(line: &str) -> bool {
+    classify_line(line).critical
 }
 
 fn classify_line(line: &str) -> LineClassification {
@@ -802,18 +873,14 @@ fn progress_line_key(line: &str) -> Option<String> {
     {
         return None;
     }
-    let mut key = String::new();
-    let mut number = false;
-    for character in line.chars() {
-        if character.is_ascii_digit() {
-            if !number { key.push('#'); }
-            number = true;
-        } else {
-            number = false;
-            key.push(character);
-        }
-    }
-    Some(key)
+    static COUNTERS: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(concat!(
+            r"(?i)\b(?P<elapsed>elapsed\s+)\d+(?:\.\d+)?(?P<unit>ms|s)\b",
+            r"|\b(?P<progress>progress\s+)\d+(?P<total>/\d+|%)"
+        )).expect("valid progress counters")
+    });
+    COUNTERS.is_match(line).then(|| COUNTERS.replace_all(line,
+        "${elapsed}${progress}<counter>${unit}${total}").into_owned())
 }
 
 fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool) -> LineSelection {
@@ -829,16 +896,29 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
             }
         }
     }
-    let mut groups: Vec<((&str, Option<&str>), usize)> = Vec::new();
+    let mut groups: Vec<(Option<String>, usize)> = Vec::new();
     let mut groups_overflowed = false;
     let mut lines = output.lines().enumerate().peekable();
     while let Some((index, line)) = lines.next() {
-        let location = lines
-            .peek()
-            .map(|(_, next)| next.trim())
-            .filter(|next| next.starts_with("-->"));
-        let identity = (line.trim(), location);
-        if classify_line(line).critical && !groups.iter().any(|(text, _)| *text == identity) {
+        if !classify_line(line).critical { continue; }
+        // Headlines are not block identities. Keep the complete bounded
+        // assertion/owner context; unknown or oversized blocks stay distinct.
+        let recognized = ["error:", "error[", "thread '", "FAILED ", "--- FAIL:"].iter()
+            .any(|prefix| line.trim_start().starts_with(prefix));
+        let mut bounded = recognized && line.len() <= 4096;
+        let mut block = if bounded { line.to_string() } else { String::new() };
+        for (offset, (_, next)) in lines.clone().enumerate() {
+            if !bounded { break; }
+            if next.is_empty() || classify_line(next).critical { break; }
+            if offset >= 64 || block.len() + next.len() + 1 > 4096 {
+                bounded = false;
+                break;
+            }
+            block.push('\n');
+            block.push_str(next);
+        }
+        let identity = bounded.then_some(block);
+        if identity.is_none() || !groups.iter().any(|(text, _)| *text == identity) {
             if groups.len() == MAX_DIAGNOSTIC_GROUPS {
                 groups_overflowed = true;
                 // Retain the latest distinct group as well as the stable prefix.

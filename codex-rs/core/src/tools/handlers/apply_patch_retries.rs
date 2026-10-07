@@ -25,6 +25,7 @@ struct RetainedPatch {
     patch: String,
     environment_id: String,
     cwd: PathUri,
+    hook_recovery: Option<(String, Value)>,
 }
 
 pub(super) struct PreparedRetry {
@@ -143,6 +144,30 @@ fn parse_retry(input: &str) -> Result<(String, Vec<Amendment>), String> {
 }
 
 impl RetainedPatches {
+    /// Rotate the receipt atomically: the old payload must never become
+    /// replayable, even if execution is cancelled before workspace admission.
+    pub(super) fn replace_after_hook(
+        &mut self, id: &str, patch: &str, call_id: &str,
+    ) -> Result<Value, String> {
+        let saved = self.patches.remove(id).ok_or("patch_id was already consumed by another call")?;
+        self.bytes -= saved.patch.len();
+        let receipt = self.retain(patch, &saved.environment_id, &saved.cwd, &Default::default(), None);
+        let Some(receipt) = receipt else {
+            self.bytes += saved.patch.len();
+            self.patches.insert(id.to_string(), saved);
+            return Err("hook replacement cannot be retained within the patch recovery limit".into());
+        };
+        let replacement_id = receipt["patch_id"].as_str().expect("retained patch id");
+        self.patches.get_mut(replacement_id).expect("new retained patch").hook_recovery =
+            Some((call_id.to_string(), receipt.clone()));
+        Ok(receipt)
+    }
+
+    pub(crate) fn recovery_for_call(&self, call_id: &str) -> Option<Value> {
+        self.patches.values().find_map(|patch| patch.hook_recovery.as_ref()
+            .filter(|(owner, _)| owner == call_id).map(|(_, receipt)| receipt.clone()))
+    }
+
     pub(super) fn prepare(&self, input: &str) -> Result<PreparedRetry, String> {
         let (id, amendments) = parse_retry(input)?;
         let saved = self.patches.get(&id).ok_or("patch_id is unknown, expired or already used; inspect current files before submitting a new patch")?;
@@ -253,6 +278,7 @@ impl RetainedPatches {
                 patch,
                 environment_id: environment_id.into(),
                 cwd: cwd.clone(),
+                hook_recovery: None,
             },
         );
         Some(serde_json::json!({
@@ -438,13 +464,14 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_partial_commit_is_excluded_from_the_retained_patch() {
+        use std::os::windows::fs::OpenOptionsExt;
         let dir = tempfile::tempdir().unwrap();
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
         let patch = "*** Begin Patch\n*** Add File: committed\n+first\n*** Update File: pending\n@@\n-old\n+new\n*** End Patch";
         std::fs::write(dir.path().join("pending"), "old\n").unwrap();
-        // Preflight rejects stale sources before any write, so an exact partial
-        // commit comes from cancellation between hunks.
+        // Deny rollback of the first write, retaining the exact committed prefix.
         let committed = dir.path().join("committed");
+        let reader = std::sync::Mutex::new(None);
         let failure = codex_apply_patch::apply_patch_with_cancellation(
             patch,
             &cwd,
@@ -452,10 +479,16 @@ mod tests {
             &mut Vec::new(),
             LOCAL_FS.as_ref(),
             None,
-            &|| committed.exists(),
+            &|| {
+                if !committed.exists() { return false; }
+                *reader.lock().unwrap() = Some(std::fs::OpenOptions::new().read(true)
+                    .share_mode(1).open(&committed).unwrap());
+                true
+            },
         )
         .await
         .unwrap_err();
+        drop(reader);
         assert_eq!(failure.delta().changes().len(), 1);
         let mut store = RetainedPatches::default();
         let receipt = store
@@ -509,5 +542,28 @@ mod tests {
         );
         assert_eq!(store.patches.len(), MAX_RETAINED_PATCHES);
         assert!(store.bytes <= MAX_RETAINED_BYTES);
+    }
+
+    #[tokio::test]
+    async fn rolled_back_failure_retains_the_identical_patch_for_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let pending = dir.path().join("pending");
+        std::fs::write(&pending, "old\n").unwrap();
+        let reader = std::fs::OpenOptions::new().read(true).share_mode(1).open(&pending).unwrap();
+        let patch = "*** Begin Patch\n*** Add File: first\n+first\n*** Update File: pending\n@@\n-old\n+new\n*** End Patch";
+        let failure = codex_apply_patch::apply_patch(patch, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None).await.unwrap_err();
+        assert!(failure.delta().is_empty());
+        assert!(failure.delta().is_exact());
+        let mut store = RetainedPatches::default();
+        let receipt = store.retain(patch, "local", &cwd, failure.delta(), None).unwrap();
+        assert_eq!(receipt["committed_hunks_excluded"], 0);
+        let retry = store.prepare(&format!("*** Begin Patch\n*** Retry Patch: {}\n*** End Patch", receipt["patch_id"].as_str().unwrap())).unwrap();
+        assert_eq!(retry.args.hunks.len(), 2);
+        drop(reader);
+        codex_apply_patch::apply_patch(&retry.args.patch, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&pending).unwrap(), "new\n");
+        assert_eq!(std::fs::read_to_string(dir.path().join("first")).unwrap(), "first\n");
     }
 }

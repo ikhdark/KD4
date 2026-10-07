@@ -282,6 +282,7 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     let baselines = control.baselines(0);
     let settled = SamplingRequestSettledState {
         mutation_revision: 0,
+        attributed_mutation_revision: 0,
         tool_exposure_revision: 0,
     };
     let collector = control.collector(&baselines);

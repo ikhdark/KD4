@@ -154,8 +154,8 @@ fn collect_code_mode_tool_definitions_disambiguates_flattened_name_collisions() 
             .map(|tool| (tool.name.as_str(), tool.tool_name.clone()))
             .collect::<Vec<_>>(),
         vec![
-            ("acme__lookup", ToolName::namespaced("acme", "lookup")),
-            ("acme__lookup__plain", ToolName::plain("acme__lookup")),
+            ("acme__lookup", ToolName::plain("acme__lookup")),
+            (super::code_mode_name_for_tool_name(&ToolName::namespaced("acme", "lookup")).as_str(), ToolName::namespaced("acme", "lookup")),
         ]
     );
     assert_eq!(
@@ -210,7 +210,7 @@ fn tool_search_code_mode_declaration_matches_structured_result_contract() {
     assert!(
         definition
             .description
-            .contains("omitted_result_count: number /* integer; minimum: 0 */ | null;")
+            .contains("omitted_result_count: (number | bigint) /* integer; minimum: 0 */ | null;")
     );
     assert!(
         definition
@@ -290,12 +290,27 @@ fn code_mode_aliases_disambiguate_identifier_normalization_collisions() {
             .map(|tool| (tool.name.as_str(), tool.tool_name.clone()))
             .collect::<Vec<_>>(),
         vec![
-            ("read-file", ToolName::plain("read-file")),
-            ("read_file__plain", ToolName::plain("read_file")),
+            ("read_file", ToolName::plain("read_file")),
+            (super::code_mode_name_for_tool_name(&ToolName::plain("read-file")).as_str(), ToolName::plain("read-file")),
         ]
     );
     assert_eq!(
         definitions,
         collect_code_mode_tool_definitions(specs.iter().rev())
     );
+}
+
+#[test]
+fn catalog_growth_does_not_reassign_callable_aliases() {
+    let specs = ["read_file", "read-file", "read.file"].map(|name| ToolSpec::Function(ResponsesApiTool {
+        name: name.into(), description: name.into(), strict: false, defer_loading: None,
+        parameters: JsonSchema::default(), output_schema: None,
+    }));
+    let all = collect_code_mode_tool_definitions(&specs);
+    for spec in &specs {
+        let singleton = collect_code_mode_tool_definitions([spec]);
+        let expanded = all.iter().find(|tool| tool.tool_name == singleton[0].tool_name).unwrap();
+        assert_eq!(expanded.name, singleton[0].name);
+    }
+    assert_eq!(all[0].name, "read_file");
 }

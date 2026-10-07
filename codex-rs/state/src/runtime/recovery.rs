@@ -11,6 +11,39 @@ use std::path::PathBuf;
 
 const BACKUP_DIR_NAME: &str = "db-backups";
 
+/// All initializers and quarantine operations acquire the same per-database
+/// owners in stable order. Locks live beside the home so a blocking home file
+/// can be quarantined without replacing the ownership identity.
+pub(super) async fn lock_runtime_initialization(home: &Path) -> std::io::Result<Vec<std::fs::File>> {
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let home = match std::fs::canonicalize(&home) {
+            Ok(home) => home,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => home,
+            Err(error) => return Err(error),
+        };
+        let parent = home.parent().ok_or_else(|| std::io::Error::other("SQLite home has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let parent = std::fs::canonicalize(parent)?;
+        let home_name = home.file_name().ok_or_else(|| std::io::Error::other("SQLite home has no name"))?;
+        let mut paths = super::runtime_db_paths(&home).into_iter().map(|db| {
+            let mut name = std::ffi::OsString::from(".");
+            name.push(home_name);
+            name.push(".");
+            name.push(db.path.file_name().expect("database name"));
+            name.push(".initialize.lock");
+            parent.join(name)
+        }).collect::<Vec<_>>();
+        paths.sort();
+        paths.into_iter().map(|path| {
+            let file = std::fs::OpenOptions::new().create(true).truncate(false)
+                .read(true).write(true).open(path)?;
+            file.lock()?;
+            Ok(file)
+        }).collect()
+    }).await.map_err(std::io::Error::other)?
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeDbBackup {
     /// Path where the runtime database or sidecar lived before it was moved.
@@ -102,6 +135,15 @@ impl std::error::Error for RuntimeDbInitError {
 pub async fn backup_runtime_db_for_fresh_start(
     db_path: &Path,
 ) -> std::io::Result<Vec<RuntimeDbBackup>> {
+    let path = db_path.to_path_buf();
+    tokio::spawn(async move {
+        let home = path.parent().ok_or_else(|| std::io::Error::other("database has no parent"))?;
+        let _owners = lock_runtime_initialization(home).await?;
+        backup_runtime_db_owned(&path).await
+    }).await.map_err(std::io::Error::other)?
+}
+
+pub(super) async fn backup_runtime_db_owned(db_path: &Path) -> std::io::Result<Vec<RuntimeDbBackup>> {
     let sqlite_home = db_path.parent().ok_or_else(|| {
         std::io::Error::other(format!(
             "database path does not have a parent directory: {}",
@@ -214,8 +256,8 @@ async fn backup_sqlite_paths(
         match result {
             Ok(Some(backup)) => backups.push(backup),
             Ok(None) => {}
-            // No exclusive recovery lock is held here. Rolling back could
-            // overwrite a file recreated by another process; retain and report
+            // Retain partial effects even under recovery ownership; filesystem
+            // errors do not establish that reversing the moves is safe. Report
             // every completed move so the original bytes remain recoverable.
             Err(source) => return Err(partial_backup_error(source, backups)),
         }

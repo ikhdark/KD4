@@ -2600,7 +2600,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             {
                 assert_eq!(cwd.as_str(), first_cwd.to_string_lossy().as_ref());
                 assert_eq!(status, CommandExecutionStatus::Declined);
-                assert_eq!(exit_code, Some(-1));
+                assert_eq!(exit_code, None);
                 return Ok::<_, anyhow::Error>(());
             }
         }

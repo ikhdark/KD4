@@ -1912,6 +1912,9 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
             duration_ms,
             ..
         } => ThreadItem::CommandExecution {
+            output_metadata: None,
+            stdout: None,
+            stderr: None,
             id: id.clone(),
             command: String::new(),
             cwd: cwd.clone(),

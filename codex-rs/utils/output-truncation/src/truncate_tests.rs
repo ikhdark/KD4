@@ -110,6 +110,17 @@ fn zero_projection_budget_preserves_omission_metadata_without_text() {
 }
 
 #[test]
+fn verified_evidence_json_line_recovery_does_not_promise_document_pointers() {
+    let document = serde_json::json!({"payload":"x".repeat(20_000)}).to_string();
+    for content in [document.clone(), format!("{document}\n{document}\n"), format!("log start\n{document}\nlog end")] {
+        let outlined = super::outline_oversized_json_lines(&content, 600).unwrap();
+        assert!(outlined.contains("line or byte selectors"));
+        assert!(!outlined.contains("JSON pointers"));
+        assert_eq!(outlined.lines().count(), content.lines().count());
+    }
+}
+
+#[test]
 fn token_ceiling_borrows_unchanged_text_and_reports_actual_omission() {
     for (source, limit, expected, truncated) in [
         ("", 0, "", false),

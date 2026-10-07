@@ -2407,6 +2407,7 @@ dependencies = [
  "codex-utils-cargo-bin",
  "pretty_assertions",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]
@@ -2623,6 +2624,9 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tracing-test",
+ "tree-sitter",
+ "tree-sitter-python",
+ "tree-sitter-rust",
  "unicode-segmentation",
  "url",
  "uuid",
@@ -3615,6 +3619,7 @@ dependencies = [
  "codex-utils-pty",
  "futures",
  "http 1.5.0",
+ "httpdate",
  "keyring",
  "memchr",
  "oauth2",
@@ -3662,6 +3667,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -12617,6 +12623,26 @@ name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-python"
+version = "0.23.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d065aaa27f3aaceaf60c1f0e0ac09e1cb9eb8ed28e7bcdaa52129cffc7f4b04"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.23.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca8ccb3e3a3495c8a943f6c3fd24c3804c471fd7f4f16087623c7fa4c0068e8a"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "triomphe"

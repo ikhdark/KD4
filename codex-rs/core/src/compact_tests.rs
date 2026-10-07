@@ -13,6 +13,65 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::sync::Arc;
 
+#[tokio::test]
+async fn retained_active_plan_omits_retired_history_without_mutating_owner() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let plan = codex_protocol::plan_tool::UpdatePlanArgs {
+        explanation: None,
+        plan: vec![codex_protocol::plan_tool::PlanItemArg {
+            step: "current".into(), status: codex_protocol::plan_tool::StepStatus::Pending,
+        }],
+    };
+    let mut lineage = crate::plan_store::PlanLineage::default();
+    for index in 0..40 {
+        lineage.requirements.insert(format!("retired-{index}"), crate::plan_store::PlanRequirement {
+            text: format!("historical detail {index}"),
+            status: codex_protocol::plan_tool::StepStatus::Completed, superseded_reason: None,
+        });
+    }
+    lineage.requirements.insert("orphan".into(), crate::plan_store::PlanRequirement {
+        text: "unresolved recovery work".into(),
+        status: codex_protocol::plan_tool::StepStatus::Pending, superseded_reason: None,
+    });
+    session.services.plan_store.restore_with_lineage(Some(plan), Some(lineage)).await;
+    let before = session.services.plan_store.snapshot_with_lineage().await;
+    let item = retained_plan_context(&session).await.unwrap().unwrap();
+    let text = serde_json::to_string(&item).unwrap();
+    assert!(!text.contains("historical detail"));
+    assert!(text.contains("unresolved recovery work"));
+    assert_eq!(session.services.plan_store.snapshot_with_lineage().await, before);
+}
+
+#[test]
+fn omission_selectors_resolve_interleaved_messages_in_one_selection() {
+    let source = vec![
+        user_message(&"first exact constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3)),
+        ResponseItem::FunctionCall { id:None, name:"inspect".into(), namespace:None,
+            arguments:"{}".into(), call_id:"tool".into(), internal_chat_message_metadata_passthrough:None },
+        ResponseItem::FunctionCallOutput { id:None, call_id:"tool".into(),
+            output:codex_protocol::models::FunctionCallOutputPayload::from_text("evidence".into()),
+            internal_chat_message_metadata_passthrough:None },
+        user_message(&"latest exact constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3)),
+    ];
+    let (retained, _, _, _, omitted) = build_bounded_input_history(source.clone(), false);
+    assert!(omitted);
+    let canonical = compaction_text_recovery_for_items(source.clone());
+    let mut checked = 0;
+    for item in retained {
+        let ResponseItem::Message { content, .. } = item else { continue; };
+        for part in content {
+            let ContentItem::InputText { text } = part else { continue; };
+            let Ok(receipt) = serde_json::from_str::<serde_json::Value>(&text) else { continue; };
+            if receipt["kind"] != COMPACT_TEXT_OMISSION_MARKER { continue; }
+            let index = receipt["source_index"].as_u64().unwrap() as usize;
+            let pointer = receipt["recovery_selector"]["pointer"].as_str().unwrap();
+            assert_eq!(canonical.value.as_ref().unwrap().pointer(pointer).unwrap(), &serde_json::to_value(&source[index]).unwrap());
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 2);
+}
+
 async fn process_compacted_history_with_test_session(
     compacted_history: Vec<ResponseItem>,
     previous_turn_settings: Option<&PreviousTurnSettings>,
@@ -142,11 +201,19 @@ async fn compaction_initial_context_carries_only_delivered_world_state_snapshot(
 
     assert_eq!(
         delivered_snapshot.clone().into_value(),
-        json!({"large_0": {"value": 0}})
+        json!({"large_0": {"value": 0}, "_codex_extension_delivery": {
+            "large_0": {"role": "developer", "text": "a".repeat(30_000)}
+        }})
     );
     let (retry, final_snapshot) = world_state.render_diff_with_snapshot(&delivered_snapshot);
     assert_eq!(retry.len(), 1);
-    assert_eq!(final_snapshot, world_state.snapshot());
+    assert_eq!(final_snapshot.into_value(), json!({
+        "large_0": {"value": 0}, "large_1": {"value": 1},
+        "_codex_extension_delivery": {
+            "large_0": {"role": "developer", "text": "a".repeat(30_000)},
+            "large_1": {"role": "developer", "text": "b".repeat(30_000)}
+        }
+    }));
 }
 
 fn user_message(text: &str) -> ResponseItem {
@@ -227,11 +294,14 @@ fn compaction_retains_only_latest_task_state_without_dropping_mixed_user_content
     if let ResponseItem::Message { content, .. } = &mut mixed {
         content.push(ContentItem::InputText { text: old.into() });
     }
-    let items = vec![user_message(old), mixed, user_message(latest)];
-    let expected = vec![compacted_user_message("keep this constraint"), compacted_user_message(latest)];
+    let mut items = vec![user_message(old), mixed, user_message(latest)];
+    for item in &mut items { crate::stable_context::mark_trusted_stable_context_item(item); }
+    let mut expected = vec![compacted_user_message("keep this constraint"), compacted_user_message(latest)];
+    expected[0].source_item_id = items[1].id().map(ToString::to_string);
+    expected[1].source_item_id = items[2].id().map(ToString::to_string);
     assert_eq!(collect_user_messages(&items), expected);
     let remote = task_compaction_items(&items);
-    assert_eq!(remote, vec![user_message("keep this constraint"), user_message(latest)]);
+    assert_eq!(collect_user_messages(&remote), expected);
     assert_eq!(task_compaction_items(&remote), remote);
     let (history, _, _, omitted_user_text, omitted_text) = build_bounded_input_history(items, false);
     assert_eq!(collect_user_messages(&history), expected);
@@ -272,6 +342,42 @@ fn collect_user_messages_extracts_user_text_only() {
         }],
         collected
     );
+}
+
+#[test]
+fn user_task_state_markup_survives_runtime_replacement_and_compaction() {
+    let pasted = user_message("<codex_task_state>User's literal example</codex_task_state>");
+    let mut old = user_message("<codex_task_state>old runtime snapshot</codex_task_state>");
+    let mut new = user_message("<codex_task_state>new runtime snapshot</codex_task_state>");
+    crate::stable_context::mark_trusted_stable_context_item(&mut old);
+    crate::stable_context::mark_trusted_stable_context_item(&mut new);
+    let items = vec![old, pasted.clone(), new.clone()];
+    assert!(task_compaction_items(&items).contains(&pasted));
+    let users = collect_user_messages(&items);
+    assert!(users.iter().any(|item| item.content == compacted_user_message("<codex_task_state>User's literal example</codex_task_state>").content));
+    let replaced = insert_compaction_initial_context(items, vec![new], &InitialContextInjection::DoNotInject);
+    assert!(replaced.contains(&pasted));
+    let mut history = replaced;
+    for index in 0..3 {
+        let mut snapshot = user_message(&format!("<codex_task_state>snapshot {index}</codex_task_state>"));
+        crate::stable_context::mark_trusted_stable_context_item(&mut snapshot);
+        history.push(snapshot);
+        history = build_local_task_input_checkpoint(&history).0;
+        assert!(history.contains(&pasted));
+        assert_eq!(history.iter().filter(|item| is_trusted_stable_context_item(item)).count(), 1);
+    }
+}
+
+#[test]
+fn truncated_checkpoint_claims_are_explicitly_non_standalone() {
+    let source = format!("{EVIDENCE_HEADING}\nvalidation passed {} for the old revision only", "detail ".repeat(4000));
+    let bounded = truncate_compaction_summary(&source, 240);
+    assert!(!bounded.contains("validation passed"), "do not sever the qualification from its claim");
+    assert!(!bounded.contains("for the old revision only"));
+    assert!(bounded.contains(INCOMPLETE_CHECKPOINT_EXCERPT));
+    assert!(bounded.starts_with(EVIDENCE_HEADING));
+    assert!(bounded.contains("/items"));
+    assert!(generated_summary_recovery_canonical(None, &source, &bounded).is_some());
 }
 
 #[test]
@@ -384,7 +490,7 @@ fn compacted_history_preserves_mixed_and_image_only_user_requirements() {
 
 #[test]
 fn compaction_strips_tagged_startup_entries_but_retains_untagged_legacy_text() {
-    let items = vec![
+    let mut items = vec![
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -419,6 +525,7 @@ do things
         },
     ];
 
+    crate::stable_context::mark_trusted_stable_context_item(&mut items[0]);
     let compactable = strip_compaction_startup_envelopes(items);
     let collected = collect_user_messages(&compactable);
 
@@ -488,10 +595,140 @@ fn compaction_keeps_only_current_developer_startup_and_preserves_ordinary_develo
             .contains(&"<permissions instructions>\ncurrent\n</permissions instructions>")
     );
     assert!(developer_text.contains(&"ordinary developer conversation"));
+    assert_eq!(developer_text.iter().filter(|text| text.contains("configured_developer_instructions")).count(), 1,
+        "replacement projection must preserve the current presence marker");
+}
+
+#[test]
+fn compaction_preserves_ordinary_user_startup_envelopes() {
+    let examples = [
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>Do not modify X.</INSTRUCTIONS>",
+        "<environment_context>literal environment</environment_context>",
+        "<subagents_context>literal agents</subagents_context>",
+        "<recommended_plugins>literal plugins</recommended_plugins>",
+        "<skill>\n<name>example</name>\n<body>Do not modify X.</body>\n</skill>",
+    ];
+    for text in examples {
+        let mut ordinary = user_message(text);
+        ordinary.set_id(Some(ResponseItemId::new("msg")));
+        ordinary.set_turn_id_if_missing("task-turn");
+        assert_eq!(
+            strip_compaction_startup_envelopes(vec![ordinary.clone()]),
+            vec![ordinary.clone()]
+        );
+        let (checkpoint, ..) = build_local_task_input_checkpoint(&[ordinary.clone()]);
+        assert_eq!(checkpoint, vec![ordinary]);
+    }
+}
+
+#[test]
+fn local_checkpoint_preserves_constraints_and_active_skills_across_repeated_compaction() {
+    let mut request = user_message("Do not modify X. Complete the requested work.");
+    request.set_turn_id_if_missing("task-turn");
+    let mut history = vec![request.clone()];
+    let mut skills = Vec::new();
+    for role in ["user", "developer", "system"] {
+        let mut skill = user_message(&format!(
+            "<skill>\n<name>{role}-skill</name>\n<body>Never modify {role}-protected.</body>\n</skill>"
+        ));
+        if let ResponseItem::Message {
+            role: actual_role, ..
+        } = &mut skill
+        {
+            *actual_role = role.to_string();
+        }
+        crate::stable_context::mark_trusted_stable_context_item(&mut skill);
+        skill.set_turn_id_if_missing("task-turn");
+        skills.push(skill.clone());
+        history.push(skill);
+    }
+    for iteration in 0..3 {
+        history.push(ResponseItem::FunctionCall {
+            id: None,
+            name: "exec".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: format!("call-{iteration}"),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        let (mut checkpoint, images, omitted_images, omitted_user, omitted_text) =
+            build_local_task_input_checkpoint(&history);
+        assert_eq!(
+            (images, omitted_images, omitted_user, omitted_text),
+            (0, 0, false, false)
+        );
+        assert_eq!(checkpoint[0], request);
+        for skill in &skills {
+            assert_eq!(checkpoint.iter().filter(|item| *item == skill).count(), 1);
+        }
+        let (remote_checkpoint, _, _) = build_task_input_checkpoint(&history);
+        for skill in &skills {
+            assert_eq!(
+                remote_checkpoint
+                    .iter()
+                    .filter(|item| *item == skill)
+                    .count(),
+                1
+            );
+        }
+        checkpoint.push(compaction_context_message(
+            "<codex_internal_context source=\"compaction_plan\">Retained checklist, not a new request.</codex_internal_context>".to_string(),
+        ));
+        let mut summary = summary_message("A lossy handoff without the prohibitions.");
+        summary.set_turn_id_if_missing(&format!("compact-{iteration}"));
+        checkpoint.push(summary);
+        let sampled = crate::stable_context::project_stable_context(
+            checkpoint.clone().into(),
+            crate::stable_context::StableContextTarget::Sampling,
+        );
+        for skill in &skills {
+            let ResponseItem::Message { role, content, .. } = skill else {
+                unreachable!()
+            };
+            assert_eq!(
+                sampled
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item,
+                        ResponseItem::Message { role: actual_role, content: actual_content, .. }
+                            if actual_role == role && actual_content == content
+                    ))
+                    .count(),
+                1
+            );
+        }
+        history = checkpoint;
+    }
+    let mut next_request = user_message("A different task, without selected skills.");
+    next_request.set_turn_id_if_missing("next-task");
+    history.push(next_request);
+    let (checkpoint, ..) = build_local_task_input_checkpoint(&history);
+    assert!(checkpoint.iter().any(is_selected_skill_item),
+        "a new turn alone is not accepted task-completion evidence");
+}
+
+#[test]
+fn local_checkpoint_omission_keeps_exact_task_recovery() {
+    let request = user_message(&format!(
+        "start {} Do not modify X. {} end",
+        "before ".repeat(20_000),
+        "after ".repeat(20_000)
+    ));
+    let history = vec![request.clone(), summary_message("lossy summary")];
+    let (checkpoint, _, _, omitted_user, omitted_text) =
+        build_local_task_input_checkpoint(&history);
+    assert!(omitted_user && omitted_text);
     assert!(
-        developer_text
+        checkpoint
             .iter()
-            .all(|text| !text.contains("configured_developer_instructions"))
+            .map(response_item_text_tokens)
+            .sum::<usize>()
+            <= COMPACT_USER_MESSAGE_MAX_TOKENS + 1024
+    );
+    let canonical = compaction_text_recovery_for_items(task_compaction_items(&history));
+    assert_eq!(
+        canonical.value.as_ref().unwrap()["items"][0],
+        serde_json::to_value(request).unwrap()
     );
 }
 
@@ -674,6 +911,37 @@ fn local_compaction_enforces_user_intent_and_task_state_budgets() {
 }
 
 #[test]
+fn original_request_and_corrections_survive_later_bulk_input() {
+    let original = "Diagnosis only; do not edit.";
+    let correction = "Correction: do not install dependencies or run network commands.";
+    let bulk = "log payload ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 4);
+    let mut history = vec![user_message(original), user_message(correction), user_message(&bulk)];
+    for _ in 0..3 {
+        let (checkpoint, _, _, omitted_user, omitted_text) = build_local_task_input_checkpoint(&history);
+        assert!(omitted_user && omitted_text);
+        let user_items = checkpoint.iter().filter(|item| !is_trusted_stable_context_item(item))
+            .cloned().collect::<Vec<_>>();
+        let users = collect_user_messages(&user_items);
+        assert!(users.iter().any(|message| message.content == compacted_user_message(original).content));
+        assert!(users.iter().any(|message| message.content == compacted_user_message(correction).content));
+        assert!(users.iter().map(compacted_user_message_text_tokens).sum::<usize>() <= COMPACT_USER_MESSAGE_MAX_TOKENS);
+        history = checkpoint;
+        history.push(user_message(&bulk));
+    }
+}
+
+#[test]
+fn rebase_cannot_silently_erase_unresolved_prohibition() {
+    let anchor = "Diagnosis only; do not edit. Verification remains unfinished.";
+    let previous = format!("{SUMMARY_PREFIX}\n## Goal\nDiagnose.\n## Current state\nInvestigating.\n## Completed work\nRead source.\n## Unresolved work\n{anchor}\n## Evidence\nSource.\n## Next action\nVerify.");
+    let error = validated_rebased_compaction_summary(&previous, "## Unresolved work\nNone", &[3]).unwrap_err();
+    assert!(error.to_string().contains("omitted a prior unresolved anchor"));
+    let accounted = format!("## Unresolved work\nNone\n## Completed work\nResolved: {anchor} Evidence: diagnosis delivered without edits.");
+    let summary = validated_rebased_compaction_summary(&previous, &accounted, &[3]).unwrap();
+    assert!(summary.contains(anchor), "accounting remains a visible model claim, not proof");
+}
+
+#[test]
 fn incremental_compaction_preserves_the_previous_summary_prefix() {
     let previous = format!("{SUMMARY_PREFIX}\nverified state");
     let summary = bounded_task_state_summary(Some(&previous), "new unresolved item");
@@ -683,11 +951,65 @@ fn incremental_compaction_preserves_the_previous_summary_prefix() {
 }
 
 #[test]
+fn incremental_rebases_preserve_old_unresolved_work_through_unrelated_updates() {
+    let mut summary = format!("{SUMMARY_PREFIX}\n## Goal\nInvestigate.\n## Current state\nStarted.\n## Completed work\nRead source.\n## Unresolved work\nOLD-OBLIGATION remains unresolved.\n## Evidence\nOriginal source.\n## Next action\nVerify.");
+    let mut rebases = 0;
+    for index in 0..100 {
+        let sections = compaction_rebase_sections(&summary);
+        let mut suffix = format!("## Evidence\nObservation {index}: {}", "unrelated evidence ".repeat(30));
+        if sections.contains(&4) {
+            rebases += 1;
+            assert!(compaction_rebase_prompt(&sections).contains("complete refreshed state"));
+            suffix = format!("## Evidence\nCurrent observation {index}; older observations superseded.");
+        }
+        // Next action is always refreshed by the existing rebase policy.
+        suffix.push_str("\n## Next action\nVerify.");
+        summary = validated_rebased_compaction_summary(&summary, &suffix, &sections).unwrap();
+        assert!(summary.contains("OLD-OBLIGATION remains unresolved."));
+        assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    }
+    assert!(rebases > 5);
+    let refreshed = "## Unresolved work\nOLD-OBLIGATION remains unresolved. New obligation added.";
+    let summary = validated_rebased_compaction_summary(&summary, refreshed, &[3]).unwrap();
+    assert_eq!(summary.matches("OLD-OBLIGATION").count(), 1);
+    assert!(validated_rebased_compaction_summary(&summary, "## Evidence\nNew fact", &[3]).is_err());
+    assert!(validated_rebased_compaction_summary(&summary,
+        &format!("## Evidence\n{}", "overflow ".repeat(10_000)), &[]).is_err());
+}
+
+#[test]
+fn incremental_next_action_is_always_a_single_replacement() {
+    let mut summary = format!("{SUMMARY_PREFIX}\n## Goal\nFix.\n## Current state\nWorking.\n## Completed work\nNone.\n## Unresolved work\nDo not modify X.\n## Evidence\nExact user request.\n## Next action\nInspect.");
+    for action in ["Edit permitted files.", "Validate.", "Deliver."] {
+        let sections = compaction_rebase_sections(&summary);
+        assert!(sections.contains(&5));
+        let suffix = format!("## Next action\n{action}");
+        summary = validated_rebased_compaction_summary(&summary, &suffix, &sections).unwrap();
+        assert_eq!(summary.matches(NEXT_ACTION_HEADING).count(), 1);
+        assert!(summary.ends_with(action));
+        assert!(summary.contains("Do not modify X."));
+    }
+}
+
+#[test]
+fn short_corrections_following_bulk_payloads_keep_exact_budget_priority() {
+    let messages = vec![
+        compacted_user_message(&"bulk ".repeat(10_000)),
+        compacted_user_message("Do not modify X."),
+        compacted_user_message("Also inspect Y."),
+    ];
+    let (history, _, _, indices) = append_bounded_user_messages(Vec::new(), &messages, 100, 0, 0);
+    assert_eq!(indices, vec![0, 1, 2]);
+    assert_eq!(collect_user_messages(&history)[1..], messages[1..]);
+    assert!(collect_user_messages(&history).iter().map(compacted_user_message_text_tokens).sum::<usize>() <= 100);
+}
+
+#[test]
 fn semantic_summary_truncation_preserves_conversation_state() {
     let intent = "INTENT-SENTINEL";
     let unresolved = "UNRESOLVED-SENTINEL";
     let generated = format!(
-        "{GOAL_HEADING}\n{intent}\n{}\n\n{CURRENT_STATE_HEADING}\nworking\n\n{COMPLETED_WORK_HEADING}\ndone\n\n{UNRESOLVED_WORK_HEADING}\n{unresolved}\n{}\n\n{EVIDENCE_HEADING}\nverified\n\n{NEXT_ACTION_HEADING}\ncontinue",
+        "{GOAL_HEADING}\n{intent}\n\n{}\n\n{CURRENT_STATE_HEADING}\nworking\n\n{COMPLETED_WORK_HEADING}\ndone\n\n{UNRESOLVED_WORK_HEADING}\n{unresolved}\n\n{}\n\n{EVIDENCE_HEADING}\nverified\n\n{NEXT_ACTION_HEADING}\ncontinue",
         "current detail ".repeat(2_000),
         "hypothesis detail ".repeat(2_000),
     );
@@ -716,7 +1038,24 @@ fn final_bounded_compaction_preserves_all_required_sections() {
     {
         assert!(populated, "bounded checkpoint lost {heading}: {summary}");
     }
-    assert!(validate_generated_compaction_summary(None, &summary).is_ok());
+    assert!(summary.contains(INCOMPLETE_CHECKPOINT_EXCERPT));
+    assert!(validate_generated_compaction_summary(None, &summary).is_err());
+    assert!(generated_summary_recovery_canonical(None, &generated, &summary).is_some());
+}
+
+#[test]
+fn first_and_custom_compaction_prioritize_unresolved_over_completed_text() {
+    let unresolved = format!("{}\nMIDDLE-UNRESOLVED-CONSTRAINT\n{}", "pending detail ".repeat(150), "pending detail ".repeat(150));
+    let generated = format!(
+        "{}\n{GOAL_HEADING}\nfinish\n{CURRENT_STATE_HEADING}\nactive\n{COMPLETED_WORK_HEADING}\n{}\n{UNRESOLVED_WORK_HEADING}\n{unresolved}\n{EVIDENCE_HEADING}\nobserved\n{NEXT_ACTION_HEADING}\ncheck",
+        "intro ".repeat(4_000), "completed ".repeat(8_000),
+    );
+    for custom in [false, true] {
+        let bounded = validated_compaction_summary(None, &generated, true, custom).unwrap();
+        assert!(bounded.contains(unresolved.trim()), "unresolved work must remain actively visible");
+        assert!(approx_token_count(&bounded) <= COMPACT_TASK_STATE_MAX_TOKENS);
+        assert!(generated_summary_recovery_canonical(None, &generated, &bounded).is_some());
+    }
 }
 
 #[test]
@@ -724,12 +1063,12 @@ fn compaction_validation_accepts_a_later_nonempty_duplicate_section() {
     let checkpoint = format!(
         "{GOAL_HEADING}\n\n{CURRENT_STATE_HEADING}\nworking\n\n{GOAL_HEADING}\nkeep the user requirement\n\n{COMPLETED_WORK_HEADING}\nverified\n\n{UNRESOLVED_WORK_HEADING}\nnone\n\n{EVIDENCE_HEADING}\ntest passed\n\n{NEXT_ACTION_HEADING}\nfinish"
     );
-    let summary = validated_compaction_summary(None, &checkpoint, true)
+    let summary = validated_compaction_summary(None, &checkpoint, true, false)
         .expect("a complete checkpoint remains valid when a heading was repeated");
     assert!(summary.contains("keep the user requirement"));
     assert!(summary.contains("test passed"));
     let incomplete = checkpoint.replace("keep the user requirement", "");
-    let error = validated_compaction_summary(None, &incomplete, true).unwrap_err();
+    let error = validated_compaction_summary(None, &incomplete, true, false).unwrap_err();
     assert!(error.to_string().contains(GOAL_HEADING));
 }
 
@@ -749,7 +1088,7 @@ fn compaction_section_allocations_preserve_evidence_and_next_action_under_pressu
                     _ => "SECTION-RETENTION-SENTINEL",
                 };
                 format!(
-                    "{heading}\n{sentinel}\n{}",
+                    "{heading}\n{sentinel}\n\n{}",
                     "bounded content ".repeat(1_000)
                 )
             })
@@ -851,7 +1190,7 @@ fn inline_heading_mentions_do_not_trigger_structured_summary_budgeting() {
 }
 
 #[test]
-fn generated_compaction_accepts_legacy_handoffs_and_validates_structured_checkpoints() {
+fn generated_compaction_requires_structure_except_explicit_custom_handoffs() {
     let complete = format!(
         "{GOAL_HEADING}\nfinish recovery\n\n{CURRENT_STATE_HEADING}\nimplementation present\n\n{COMPLETED_WORK_HEADING}\nproducer updated\n\n{UNRESOLVED_WORK_HEADING}\nkeep ambiguity\n\n{EVIDENCE_HEADING}\nfocused evidence\n\n{NEXT_ACTION_HEADING}\nrun focused proof"
     );
@@ -861,8 +1200,11 @@ fn generated_compaction_accepts_legacy_handoffs_and_validates_structured_checkpo
         "{GOAL_HEADING}\nfinish recovery\n\n{CURRENT_STATE_HEADING}\nimplementation present\n\n{COMPLETED_WORK_HEADING}\nproducer updated\n\n{UNRESOLVED_WORK_HEADING}\nkeep ambiguity\n\n{EVIDENCE_HEADING}\nfocused evidence\n\n{NEXT_ACTION_HEADING}\n"
     );
     assert!(validate_generated_compaction_summary(None, &incomplete).is_err());
-    assert!(validate_generated_compaction_summary(None, "free-form checkpoint").is_ok());
-    assert!(validate_generated_compaction_summary(Some(&complete), "free-form update").is_ok());
+    assert!(validate_generated_compaction_summary(None, "Done").is_err());
+    assert!(validate_generated_compaction_summary(Some(&complete), "free-form update").is_err());
+    assert!(validated_compaction_summary(None, "custom free-form checkpoint", true, true).is_ok());
+    assert!(validated_compaction_summary(None, "", true, true).is_err());
+    assert!(validated_compaction_summary(None, &incomplete, true, true).is_err());
     assert!(
         validate_generated_compaction_summary(
             Some(&complete),
@@ -1222,7 +1564,7 @@ fn newest_section_updates_include_separator_cost_in_their_budget() {
 }
 
 #[test]
-fn goal_section_retains_original_constraints_and_latest_revision() {
+fn oversized_goal_section_retains_newest_text_within_budget() {
     let updates = vec![
         format!("ORIGINAL_CONSTRAINT {}", "original ".repeat(200)),
         "obsolete intermediate goal".to_string(),
@@ -1235,12 +1577,14 @@ fn goal_section_retains_original_constraints_and_latest_revision() {
     })
     .collect::<Vec<_>>();
 
-    let retained = retain_goal_boundary_updates(&updates, 96);
+    let retained = retain_latest_goal(&updates, 96);
 
     assert!(approx_token_count(&retained) <= 96);
-    assert!(retained.contains("ORIGINAL_CONSTRAINT"));
-    assert!(retained.contains("LATEST_REVISION"));
-    assert!(!retained.contains("obsolete intermediate goal"));
+    assert!(!retained.contains("ORIGINAL_CONSTRAINT"));
+    // A partial paragraph could sever a qualification. Keep only the complete
+    // fitting update; its position does not establish that it was superseded.
+    assert!(!retained.contains("LATEST_REVISION"));
+    assert_eq!(retained, "obsolete intermediate goal");
 }
 
 #[test]
@@ -1260,6 +1604,105 @@ fn summary_can_be_reused_when_only_new_user_input_follows_it() {
     ];
     assert_eq!(latest_summary_message(&items), Some(summary_text.as_str()));
     assert!(history_after_latest_summary_is_user_only(&items));
+}
+
+#[test]
+fn incremental_goal_scope_reversal_survives_repeated_compaction() {
+    let mut summary = bounded_task_state_summary(None,
+        "## Goal\nPublish the project.\n\n## Evidence\nOriginal request: publish the project.");
+    let current = format!("Investigate locally. {} DO NOT PUBLISH. {} Finish with findings only.",
+        "scope detail ".repeat(60), "current detail ".repeat(60));
+    assert!(approx_token_count(&current) > 250);
+    summary = bounded_task_state_summary(Some(&summary), &format!("## Goal\n{current}"));
+    for _ in 0..3 {
+        summary = bounded_task_state_summary(Some(&summary), "## Current state\nStill investigating.");
+        assert!(summary.contains(&current));
+        assert!(summary.find("Publish the project.").unwrap() < summary.find("DO NOT PUBLISH.").unwrap());
+        assert!(summary.contains("Original request: publish the project."));
+        assert!(checkpoint_lines(&summary).any(|(_, index)| index == Some(0)));
+        assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    }
+}
+
+#[test]
+fn fitting_goal_updates_keep_middle_restrictions() {
+    let summary = "## Goal\nInvestigate failures.\n\n## Goal\nDo not edit production files.\n\n## Goal\nInclude the reproduction.";
+    assert_eq!(truncate_compaction_summary(summary, 500), summary);
+    assert!(generated_summary_recovery_canonical(None, summary, summary).is_none());
+}
+
+#[test]
+fn trimmed_generated_unresolved_work_remains_exactly_recoverable() {
+    let source = format!("## Unresolved work\n{} FINAL-REQUIREMENT", "required action\n".repeat(10_000));
+    let bounded = truncate_compaction_summary(&source, 200);
+    assert!(!bounded.contains("FINAL-REQUIREMENT"));
+    let canonical = generated_summary_recovery_canonical(None, &source, &bounded).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&canonical.bytes).unwrap();
+    assert_eq!(value["items"][0], source);
+}
+
+#[test]
+fn fitting_checkpoint_preserves_evidence_above_its_guidance_budget() {
+    let summary = format!("## Goal\nDiagnose.\n\n## Evidence\n{} MIDDLE-FACT {}\n\n## Next action\nCheck the fact.",
+        "observed detail ".repeat(100), "authenticated detail ".repeat(100));
+    assert!(approx_token_count(&summary) > 500);
+    assert!(approx_token_count(&summary) < COMPACT_TASK_STATE_MAX_TOKENS);
+    assert_eq!(truncate_compaction_summary(&summary, COMPACT_TASK_STATE_MAX_TOKENS), summary);
+}
+
+#[test]
+fn oversized_checkpoint_sections_borrow_spare_capacity() {
+    let evidence = format!("{} MIDDLE-FACT {}", "observed detail ".repeat(100), "authenticated detail ".repeat(100));
+    let summary = format!("{}\n## Goal\nDiagnose.\n\n## Current state\nInvestigating.\n\n## Completed work\nCaptured source.\n\n## Unresolved work\nCause unknown.\n\n## Evidence\n{evidence}\n\n## Next action\nCheck the fact.", "preamble ".repeat(2_000));
+    assert!(approx_token_count(&summary) > COMPACT_TASK_STATE_MAX_TOKENS);
+    let retained = truncate_compaction_summary(&summary, COMPACT_TASK_STATE_MAX_TOKENS);
+    assert!(retained.contains(evidence.trim()));
+    assert!(approx_token_count(&retained) <= COMPACT_TASK_STATE_MAX_TOKENS);
+    assert!(compaction_section_bodies(&retained).into_iter().all(|body| body));
+}
+
+#[test]
+fn checkpoint_structure_ignores_fenced_quoted_and_indented_headings() {
+    for (open, close) in [("```rust", "```"), ("~~~~text", "~~~~"), ("````", "````")] {
+        let excerpt = format!("Source: example.rs\n{open}\n## Goal\nquoted goal\n```\n## Next action\nquoted action\n{close}");
+        // A longer opening fence must not be closed by a shorter one. For the
+        // three-backtick case use a tilde line inside instead.
+        let excerpt = if open == "```rust" { excerpt.replace("\n```\n## Next action", "\n~~~\n## Next action") } else { excerpt };
+        let summary = format!("## Goal\nCurrent task.\n\n## Evidence\n{excerpt}\n> ## Goal\n    ## Next action\n\n## Next action\nReal action.");
+        let headings = checkpoint_lines(&summary).filter_map(|(_, section)| section).collect::<Vec<_>>();
+        assert_eq!(headings, vec![0, 4, 5]);
+        assert!(!has_compaction_section(&excerpt));
+        let retained = bounded_task_state_summary(Some(&summary), "## Goal\nReplacement task.");
+        assert!(retained.contains(&excerpt));
+        assert!(retained.contains("## Next action\nReal action."));
+        assert!(retained.contains("Current task."));
+        assert_eq!(checkpoint_lines(&retained).filter_map(|(_, section)| section).collect::<Vec<_>>(), vec![0, 4, 5, 0]);
+    }
+}
+
+#[test]
+fn fresh_task_state_replaces_retained_plan_snapshots_without_dropping_mixed_text() {
+    let message = |text: &str| {
+        let mut item = ResponseItem::Message {
+        id: None, role: "user".into(), content: vec![ContentItem::InputText { text: text.into() }],
+        phase: None, internal_chat_message_metadata_passthrough: None,
+        };
+        crate::stable_context::mark_trusted_stable_context_item(&mut item);
+        item
+    };
+    let mut mixed = message("<codex_task_state>old</codex_task_state>");
+    if let ResponseItem::Message { content, .. } = &mut mixed {
+        content.push(ContentItem::InputText { text: "Original user obligation".into() });
+    }
+    let current = message("<codex_task_state>current plan and unique lineage</codex_task_state>");
+    let replaced = insert_compaction_initial_context(
+        vec![mixed, message("<codex_internal_context source=\"compaction_plan\">duplicate plan</codex_internal_context>")],
+        vec![current], &InitialContextInjection::DoNotInject,
+    );
+    let text = replaced.iter().filter_map(|item| match item {
+        ResponseItem::Message { content, .. } => content_items_to_text(content), _ => None,
+    }).collect::<Vec<_>>().join("\n");
+    assert_eq!(text, "Original user obligation");
 }
 
 #[test]
@@ -1537,6 +1980,14 @@ fn incremental_guidance_does_not_repeat_or_override_custom_compact_prompt() {
         incremental_summarization_prompt(None),
         Some(INCREMENTAL_SUMMARIZATION_PROMPT)
     );
+    // The Markdown is runtime input, not documentation: exercise the same
+    // prompt-plus-budget assembly used for an incremental compaction request.
+    let previous = format!("{SUMMARY_PREFIX}\nverified state");
+    let sections = compaction_rebase_sections(&previous);
+    let assembled = format!("{}{}{}", incremental_summarization_prompt(None).unwrap(),
+        compaction_rebase_prompt(&sections), compaction_update_budget_prompt(&previous, &sections));
+    assert!(assembled.starts_with(include_str!("../../prompts/templates/compact/incremental_prompt.md")));
+    assert!(assembled.contains("incremental update"));
 }
 #[tokio::test]
 async fn process_compacted_history_replaces_developer_messages() {
@@ -1901,7 +2352,7 @@ fn compaction_omission_metadata_has_a_fixed_budget() {
 #[tokio::test]
 async fn local_compaction_retains_literal_omission_markers_and_reports_retained_images() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let literal = format!("Explain the marker {COMPACT_TEXT_OMISSION_MARKER} in this image.");
+    let literal = format!("Do not modify X. Explain the marker {COMPACT_TEXT_OMISSION_MARKER} in this image.");
     let mut encoded_image = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
         1,
@@ -1919,7 +2370,7 @@ async fn local_compaction_retains_literal_omission_markers_and_reports_retained_
         content.push(image.clone());
     }
     session
-        .record_conversation_items(&turn, &[summary_message("settled state"), request])
+        .record_conversation_items(&turn, &[summary_message("Modify X next."), request])
         .await
         .unwrap();
     // No text was omitted, so compaction must succeed even if recovery storage is unavailable.
@@ -1948,11 +2399,17 @@ async fn local_compaction_retains_literal_omission_markers_and_reports_retained_
     .await
     .expect("literal marker text must not require a recovery artifact");
 
-    assert_eq!(summary, format!("{SUMMARY_PREFIX}\nsettled state"));
+    assert_eq!(summary, format!("{SUMMARY_PREFIX}\nModify X next."));
     assert_eq!(details.retained_image_count, Some(1));
     let history = session.clone_history().await;
     assert_eq!(history.raw_items().len(), 2);
-    let ResponseItem::Message { content, .. } = &history.raw_items()[0] else {
+    assert!(is_compaction_summary_item(&history.raw_items()[0]));
+    let sampled = history.clone().prepare_for_sampling_prompt(
+        &[codex_protocol::openai_models::InputModality::Text, codex_protocol::openai_models::InputModality::Image],
+        crate::stable_context::StableContextTarget::Sampling,
+    );
+    assert!(is_compaction_summary_item(&sampled.items()[0]));
+    let ResponseItem::Message { content, .. } = &sampled.items()[1] else {
         panic!("expected retained user request");
     };
     assert_eq!(
@@ -2006,6 +2463,128 @@ async fn compaction_recovery_failure_keeps_unresolved_text() {
         session.clone_history().await.raw_items(),
         history.raw_items()
     );
+}
+
+#[tokio::test]
+async fn compaction_recovery_survives_retention_resume_and_fork() {
+    use crate::tool_history::{load_tool_history_state, persist_tool_history_state,
+        remint_tool_history_state_for_fork, ToolHistoryLoadOutcome};
+    use crate::tools::command_output_artifact::read_exact_tool_output_artifact;
+
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let home = &turn.config.codex_home;
+    let parent = session.thread_id().to_string();
+    let canonical = compaction_text_recovery_for_items(vec![user_message(
+        "Keep this exact earlier constraint: do not change Ω or its Unicode spelling.",
+    )]);
+    let sidecar = persist_compaction_recovery(&session, canonical.clone()).await.unwrap();
+    let reference: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
+    let id = reference["artifact_id"].as_str().unwrap();
+    let mut state = session.clone_history().await.tool_history_state();
+    state.retain_for_history(&[compaction_summary_item_with_artifact_pins(
+        format!("{SUMMARY_PREFIX}\nsummary"), Some(sidecar),
+    )]);
+    assert!(state.artifact_references().contains_key(id));
+    persist_tool_history_state(home, &parent, &state).await.unwrap();
+
+    // Force actual retention pressure with cheap legacy sparse artifacts, not
+    // a mocked marker assertion. The recovery handle is the oldest artifact.
+    let directory = home.join("tool-output").join(&parent);
+    let pressure = (0..20).map(|_| {
+        let path = directory.join(format!("{}.log", uuid::Uuid::new_v4()));
+        std::fs::File::create(&path).unwrap().set_len(16 * 1024 * 1024).unwrap();
+        path
+    }).collect::<Vec<_>>();
+    crate::tools::command_output_artifact::force_retention_reconciliation_for_test(
+        &home.join("tool-output"),
+    ).await;
+    let trigger = create_canonical_output_artifact(home, &parent, &CanonicalToolResult::text("trigger retention")).await;
+    assert!(trigger.complete);
+    assert!(pressure.iter().any(|path| !path.exists()), "retention pressure must evict unprotected work");
+
+    let ToolHistoryLoadOutcome::Loaded(resumed) = load_tool_history_state(home, &parent).await else {
+        panic!("expected durable recovery ownership");
+    };
+    assert!(resumed.artifact_references().contains_key(id));
+    let child = codex_protocol::ThreadId::new().to_string();
+    let (forked, dropped) = remint_tool_history_state_for_fork(home, &parent, &child, resumed).await;
+    assert_eq!(dropped, 0);
+    persist_tool_history_state(home, &child, &forked).await.unwrap();
+    let ToolHistoryLoadOutcome::Loaded(reopened) = load_tool_history_state(home, &child).await else {
+        panic!("expected forked recovery ownership");
+    };
+    assert!(reopened.artifact_references().contains_key(id));
+    for thread in [&parent, &child] {
+        let exact = read_exact_tool_output_artifact(home, thread, id).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&exact).unwrap(), canonical.value.clone().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn valid_local_summary_is_not_published_when_replacement_preparation_fails() {
+    use core_test_support::responses::{ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server};
+
+    let server = start_mock_server().await;
+    let summary = COMPACTION_SECTIONS.iter()
+        .map(|(heading, _)| format!("{heading}\nvalid tentative summary"))
+        .collect::<Vec<_>>().join("\n\n");
+    let request = mount_sse_once(&server, sse(vec![
+        ev_assistant_message("tentative-summary", &summary), ev_completed("compaction-response"),
+    ])).await;
+    let home = tempfile::tempdir().unwrap();
+    let (mut session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(), |config| {
+                config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                config.model_provider.supports_websockets = false;
+            },
+        ).await;
+    crate::session::tests::attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+    session.record_conversation_items(&turn, &[user_message(
+        "keep my exact request",
+    )]).await.unwrap();
+    let update = session.services.plan_store.update(codex_protocol::plan_tool::UpdatePlanArgs {
+        explanation: None,
+        plan: vec![codex_protocol::plan_tool::PlanItemArg {
+            step: "exact large obligation ".repeat(COMPACT_TASK_STATE_MAX_TOKENS),
+            status: codex_protocol::plan_tool::StepStatus::Pending,
+        }],
+    }).await;
+    session.services.plan_store.update_tool(crate::plan_store::PlanToolArgs {
+        expected_revision: Some(crate::plan_store::plan_revision_with_lineage(
+            Some(&update.current), &update.lineage,
+        )),
+        plan: Some(vec![crate::plan_store::PlanStepArg {
+            step: "Finish the original obligation".into(),
+            status: codex_protocol::plan_tool::StepStatus::Pending,
+            continues: vec![update.lineage.step_id(&update.current.plan[0].step)],
+        }]),
+        ..Default::default()
+    }).await.unwrap();
+    // The ordinary history append is available. Only replacement preparation
+    // fails, after receiving a valid summarizer response, at unresolved-text recovery.
+    std::fs::write(home.path().join("tool-output"), b"blocked recovery storage").unwrap();
+    let before = session.clone_history().await.into_raw_items();
+    let window = session.current_window_id().await;
+    let result = run_compact_task_inner_impl(
+        Arc::clone(&session), turn, None, Some(&None), Vec::new(),
+        InitialContextInjection::DoNotInject,
+        CompactionTurnMetadata::new(CompactionTrigger::Manual, CompactionReason::UserRequested,
+            CompactionImplementation::Responses, CompactionPhase::StandaloneTurn),
+        &mut CompactionAnalyticsDetails::default(), false, &CancellationToken::new(),
+    ).await;
+    assert!(matches!(result, Err(CodexErr::Fatal(message)) if message.contains("exact unresolved text")));
+    assert_eq!(request.requests().len(), 1);
+    assert_eq!(session.clone_history().await.raw_items(), before);
+    assert_eq!(session.current_window_id().await, window);
+    session.live_thread().unwrap().flush().await.unwrap();
+    let persisted = session.live_thread().unwrap().load_history(false).await.unwrap();
+    assert!(!persisted.items.iter().any(|item| match item {
+        codex_protocol::protocol::RolloutItem::ResponseItem(item) =>
+            serde_json::to_string(item).unwrap().contains("valid tentative summary"),
+        codex_protocol::protocol::RolloutItem::Compacted(_) => true,
+        _ => false,
+    }));
 }
 
 #[tokio::test]
@@ -2064,4 +2643,35 @@ async fn local_compaction_keeps_consumed_resume_invalidation() {
         *internal_chat_message_metadata_passthrough = None;
     }
     assert_eq!(retained, notice);
+}
+#[test]
+fn verified10_whole_qualifications_survive_every_paragraph_position() {
+    let obligation = "Validation passed for the old revision only.\nDo NOT deploy; the integration failure remains unresolved.";
+    for position in [0, 20, 40] {
+        let mut paragraphs = (0..40).map(|index| format!("Observation {index}: {}", "diagnostic ".repeat(80))).collect::<Vec<_>>();
+        paragraphs.insert(position, obligation.into());
+        let generated = format!("{UNRESOLVED_WORK_HEADING}\n{}", paragraphs.join("\n\n"));
+        let bounded = truncate_compaction_summary(&generated, 300);
+        assert!(bounded.contains(obligation) || !bounded.contains("Validation passed"));
+        assert!(bounded.contains(INCOMPLETE_CHECKPOINT_EXCERPT));
+        assert!(generated_summary_recovery_canonical(None, &generated, &bounded).is_some());
+        assert!(validate_generated_compaction_summary(None, &bounded).is_err());
+    }
+}
+
+#[test]
+fn verified10_first_request_accounts_for_aggregate_checkpoint_headroom() {
+    let previous = COMPACTION_SECTIONS.iter().map(|(heading, budget)|
+        format!("{heading}\n{}", "x ".repeat(budget * 3 / 2))).collect::<Vec<_>>().join("\n\n");
+    assert!(approx_token_count(&previous) < COMPACT_TASK_STATE_MAX_TOKENS);
+    let rebased = compaction_rebase_sections(&previous);
+    assert_eq!(rebased, (0..COMPACTION_SECTIONS.len()).collect::<Vec<_>>());
+    let budget = compaction_update_budget_prompt(&previous, &rebased);
+    assert!(budget.contains("NOT to this update alone"));
+    let suffix = COMPACTION_SECTIONS.iter().map(|(heading, budget)| {
+        if *heading == UNRESOLVED_WORK_HEADING { format!("{heading}\n{}", "x ".repeat(budget * 3 / 2)) }
+        else { format!("{heading}\nCurrent state; prior obligations unchanged.") }
+    }).collect::<Vec<_>>().join("\n\n");
+    let accepted = validated_rebased_compaction_summary(&previous, &suffix, &rebased).unwrap();
+    assert!(approx_token_count(&accepted) <= COMPACT_TASK_STATE_MAX_TOKENS);
 }

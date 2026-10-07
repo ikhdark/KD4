@@ -3,6 +3,79 @@ use super::HeadTailBuffer;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn utf8_projection_is_independent_of_poll_boundaries_and_retry() {
+    for input in ["aé中😀z".as_bytes(), b"a\xff\xe2\x82\xac\xe2\x82"] {
+        for split in 0..=input.len() {
+            let mut buffer = HeadTailBuffer::default();
+            buffer.push_chunk(&input[..split]);
+            buffer.collect_pending_output();
+            let first = buffer.projected_pending_output(false, &[]);
+            assert_eq!(first, buffer.projected_pending_output(false, &[]));
+            buffer.acknowledge_pending_output();
+            buffer.push_chunk(&input[split..]);
+            buffer.collect_pending_output();
+            let second = buffer.projected_pending_output(true, &[]);
+            let text = format!("{}{}", String::from_utf8_lossy(&first.0), String::from_utf8_lossy(&second.0));
+            assert_eq!(text, String::from_utf8_lossy(input));
+            assert_eq!(first.1.unwrap().range.end, second.1.unwrap().range.start);
+            buffer.acknowledge_pending_output();
+            assert!(!buffer.has_unreported_output());
+        }
+    }
+}
+
+#[test]
+fn utf8_projection_carries_every_byte_of_a_multibyte_character() {
+    let mut buffer = HeadTailBuffer::default();
+    let mut projected = String::new();
+    for byte in "é中😀".as_bytes() {
+        buffer.push_chunk(&[*byte]);
+        buffer.collect_pending_output();
+        let (bytes, _) = buffer.projected_pending_output(false, &[]);
+        projected.push_str(&String::from_utf8_lossy(&bytes));
+        buffer.acknowledge_pending_output();
+    }
+    assert_eq!(projected, "é中😀");
+}
+
+#[test]
+fn pending_reports_keep_absolute_chunk_and_gap_coordinates() {
+    let mut source = HeadTailBuffer::new(8);
+    source.push_chunk(b"first\r\n");
+    source.collect_pending_output();
+    assert_eq!(source.pending_output().unwrap().output_ranges().unwrap().range, 0..7);
+    source.acknowledge_pending_output();
+    source.push_chunk(b"abcdefghijklmnop");
+    source.collect_pending_output();
+    let ranges = source.pending_output().unwrap().output_ranges().unwrap();
+    assert_eq!(ranges.range, 7..23);
+    assert_eq!(ranges.gap, Some(11..19));
+    // A cancelled preparation retains the same in-flight report. New producer
+    // bytes extend it without moving its starting coordinate or replaying reads.
+    source.begin_output_report();
+    source.collect_pending_output();
+    assert_eq!(source.pending_output().unwrap().output_ranges(), Some(ranges));
+    source.push_chunk(b"tail");
+    source.collect_pending_output();
+    assert_eq!(source.pending_output().unwrap().output_ranges().unwrap().range, 7..27);
+    source.acknowledge_pending_output();
+    source.collect_pending_output();
+    let empty = source.pending_output().unwrap().output_ranges().unwrap();
+    assert_eq!(empty.range, 27..27);
+    assert_eq!(empty.gap, None);
+    source.acknowledge_pending_output();
+    source.record_lagged_chunks(1);
+    source.push_chunk(b"unknown offset");
+    source.collect_pending_output();
+    assert_eq!(source.pending_output().unwrap().output_ranges(), None);
+    let mut notices = HeadTailBuffer::default();
+    notices.push_chunk(b"producer");
+    notices.push_display_notice(b"not in artifact");
+    notices.collect_pending_output();
+    assert_eq!(notices.pending_output().unwrap().output_ranges(), None);
+}
+
+#[test]
 fn loss_notice_snapshot_preserves_wrapped_tail_and_trailing_notice() {
     let mut buf = HeadTailBuffer::new(8);
     buf.push_chunk(b"abcd");

@@ -249,6 +249,12 @@ impl ExecutorProcessTransport {
             }
 
             match self.events.recv().await {
+                Ok(ExecProcessEvent::OutputGap { through_seq }) => {
+                    // A JSON-RPC byte stream cannot safely resume through a
+                    // missing frame. Report transport loss, not process death.
+                    warn!("Remote MCP output lost through sequence {through_seq} ({})", self.program_name);
+                    self.closed = true;
+                }
                 Ok(ExecProcessEvent::Output(chunk)) => {
                     // The executor pushes raw process bytes. This is the only
                     // place where those bytes are split back into the stdout
@@ -314,6 +320,9 @@ impl ExecutorProcessTransport {
             )
             .await
             .map_err(io::Error::other)?;
+        if response.output_gap.is_some() {
+            return Err(io::Error::other("remote MCP output contains an unrecoverable gap"));
+        }
         for chunk in response.chunks {
             self.push_process_output_if_new(chunk);
             if self.closed {

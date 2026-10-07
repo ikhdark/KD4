@@ -301,10 +301,23 @@ pub(super) async fn user_input_or_turn_inner(
             .turn_metadata_state
             .set_responsesapi_client_metadata(responsesapi_client_metadata);
     }
-    current_context.update_multi_agent_spawn_authorization(&items);
+    super::multi_agents::revoke_spawn_authorization_from_input(&current_context, &items);
     current_context.session_telemetry.user_prompt(&items);
     sess.refresh_mcp_servers_if_requested(&current_context)
         .await;
+    let additional_context = match sess.recoverable_additional_context(additional_context).await {
+        Ok(values) => values,
+        Err(error) => {
+            sess.send_event_raw(Event { id: sub_id.clone(), msg: EventMsg::Error(ErrorEvent {
+                message: error.to_string(), codex_error_info: Some(CodexErrorInfo::InternalServerError),
+            }) }).await;
+            if let Some((permit, admission)) = start_only_admission.take() {
+                drop(permit);
+                let _ = admission.send(Err(error));
+            }
+            return;
+        }
+    };
     let additional_context_input = {
         let mut state = sess.state.lock().await;
         state.additional_context.merge(additional_context)
@@ -506,9 +519,10 @@ pub async fn patch_approval(sess: &Arc<Session>, id: String, decision: ReviewDec
 pub async fn request_user_input_response(
     sess: &Arc<Session>,
     id: String,
+    call_id: Option<String>,
     response: RequestUserInputResponse,
 ) {
-    sess.notify_user_input_response(&id, response).await;
+    sess.notify_user_input_response_for_request(&id, call_id.as_deref(), response).await;
 }
 
 pub async fn request_permissions_response(
@@ -520,8 +534,8 @@ pub async fn request_permissions_response(
         .await;
 }
 
-pub async fn dynamic_tool_response(sess: &Arc<Session>, id: String, response: DynamicToolResponse) {
-    sess.notify_dynamic_tool_response(&id, response).await;
+pub async fn dynamic_tool_response(sess: &Arc<Session>, turn_id: String, id: String, response: DynamicToolResponse) {
+    sess.notify_dynamic_tool_response(&turn_id, &id, response).await;
 }
 
 pub async fn refresh_mcp_servers(sess: &Arc<Session>, refresh_config: McpServerRefreshConfig) {
@@ -615,28 +629,18 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
-    sess.apply_rollout_reconstruction(
-        turn_context.as_ref(),
-        replay_items.as_slice(),
-        /*invalidate_unified_exec_sessions*/ false,
-    )
-    .await;
-    sess.recompute_token_usage(turn_context.as_ref()).await;
-
-    sess.persist_rollout_items(&[RolloutItem::EventMsg(rollback_msg.clone())])
-        .await;
-    if let Err(err) = sess.flush_rollout().await {
-        sess.send_event(
-            turn_context.as_ref(),
-            EventMsg::Warning(WarningEvent {
-                message: format!(
-                    "Rolled the thread back in memory, but failed to save the rollback marker. The rollback may be lost when the thread is reopened. Error: {err}"
-                ),
+    if let Err(err) = sess.commit_rollback_history(
+        &turn_context, replay_items, rollback_msg.clone(),
+    ).await {
+        sess.send_event_raw(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::Error(ErrorEvent {
+                message: format!("failed to commit rollback marker; no rollback success was published: {err}"),
+                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
             }),
-        )
-        .await;
+        }).await;
+        return;
     }
-
     sess.deliver_event_raw(Event {
         id: turn_context.sub_id.clone(),
         msg: rollback_msg,
@@ -647,6 +651,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
 pub(super) const TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
+    let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     sess.begin_shutdown().await;
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
@@ -654,14 +659,25 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
     if let Some(startup_transport) = sess.take_session_startup_transport().await {
         startup_transport.abort().await;
     }
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    // The abort waiter and finalizer keep their own session ownership when the
+    // shutdown observation expires. Accepted writes must not be cancelled.
+    let abort = sess.terminal_tasks.spawn({
+        let sess = Arc::clone(sess);
+        async move { sess.abort_all_tasks(TurnAbortReason::Interrupted).await }
+    });
+    let abort_incomplete = !matches!(
+        tokio::time::timeout_at(terminal_deadline, abort).await,
+        Ok(Ok(()))
+    );
     sess.services.turn_environments.shutdown();
     sess.terminal_tasks.close();
-    let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    if tokio::time::timeout_at(terminal_deadline, sess.terminal_tasks.wait())
-        .await
-        .is_err()
-    {
+    let terminal_incomplete = tokio::time::timeout_at(terminal_deadline, async {
+        sess.terminal_tasks.wait().await;
+        sess.wait_for_ordered_history_commits().await;
+    })
+    .await
+    .is_err();
+    if abort_incomplete || terminal_incomplete {
         warn!("timed out waiting for turn terminal finalization during session shutdown");
     }
     if tokio::time::timeout_at(
@@ -694,17 +710,35 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
         )),
     };
     sess.services.shutdown_mcp_managers().await;
-    persistence_error
+    persistence_error.or_else(|| {
+        (abort_incomplete || terminal_incomplete).then(|| CodexErr::Fatal(
+            "turn finalization did not complete before the shutdown deadline; accepted history writes remain owned, but durability is unconfirmed".to_string(),
+        ))
+    })
 }
 
-async fn emit_thread_stop_lifecycle(sess: &Session) {
-    for contributor in sess.services.extensions.thread_lifecycle_contributors() {
-        contributor
-            .on_thread_stop(codex_extension_api::ThreadStopInput {
-                session_store: &sess.services.session_extension_data,
-                thread_store: &sess.services.thread_extension_data,
-            })
-            .await;
+async fn shutdown_thread_persistence(sess: &Arc<Session>) -> Result<(), String> {
+    let Some(live_thread) = sess.live_thread().cloned() else {
+        return Ok(());
+    };
+    // Never close the writer underneath accepted commits. This owner must be
+    // outside terminal_tasks: it waits for that tracker itself to drain.
+    let owner = tokio::spawn({
+        let sess = Arc::clone(sess);
+        async move {
+            sess.terminal_tasks.wait().await;
+            sess.wait_for_ordered_history_commits().await;
+            let result = live_thread.shutdown().await.map_err(|error| error.to_string());
+            if let Err(error) = &result {
+                warn!(%error, "owned thread persistence shutdown failed");
+            }
+            result
+        }
+    });
+    match tokio::time::timeout(TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT, owner).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("thread persistence shutdown remains owned and pending; durability is unconfirmed".to_string()),
     }
 }
 
@@ -732,18 +766,16 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         &[],
     );
 
-    emit_thread_stop_lifecycle(sess.as_ref()).await;
+    sess.emit_thread_stop_lifecycle().await;
 
     // Gracefully flush and shutdown thread persistence on session end so tests
     // that inspect durable state do not race with the background writer.
-    if let Some(live_thread) = sess.live_thread()
-        && let Err(e) = live_thread.shutdown().await
-    {
+    if let Err(e) = shutdown_thread_persistence(sess).await {
         warn!("failed to shutdown thread persistence: {e}");
         let event = Event {
             id: sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
-                message: "Failed to shutdown thread persistence".to_string(),
+                message: format!("Failed to confirm thread persistence shutdown: {e}"),
                 codex_error_info: Some(CodexErrorInfo::Other),
             }),
         };
@@ -931,10 +963,8 @@ pub(super) async fn submission_loop(
                 "completed-tool history was not durable when the submission channel closed: {error}"
             );
         }
-        emit_thread_stop_lifecycle(sess.as_ref()).await;
-        if let Some(live_thread) = sess.live_thread()
-            && let Err(err) = live_thread.shutdown().await
-        {
+        sess.emit_thread_stop_lifecycle().await;
+        if let Err(err) = shutdown_thread_persistence(&sess).await {
             warn!("failed to shutdown thread persistence after submission channel closed: {err}");
         }
     }
@@ -1020,16 +1050,16 @@ async fn dispatch_submission(
                 patch_approval(&sess, id, decision).await;
                 false
             }
-            Op::UserInputAnswer { id, response } => {
-                request_user_input_response(&sess, id, response).await;
+            Op::UserInputAnswer { id, call_id, response } => {
+                request_user_input_response(&sess, id, call_id, response).await;
                 false
             }
             Op::RequestPermissionsResponse { id, response } => {
                 request_permissions_response(&sess, id, response).await;
                 false
             }
-            Op::DynamicToolResponse { id, response } => {
-                dynamic_tool_response(&sess, id, response).await;
+            Op::DynamicToolResponse { turn_id, id, response } => {
+                dynamic_tool_response(&sess, turn_id, id, response).await;
                 false
             }
             Op::RefreshMcpServers { config } => {
@@ -1132,7 +1162,7 @@ mod dispatch_tests {
             .turn_state
             .lock()
             .await
-            .try_insert_pending_dynamic_tool("tool".to_string(), reply_tx)
+            .try_insert_pending_dynamic_tool("tool".to_string(), context.sub_id.clone(), reply_tx)
             .unwrap();
         *session.active_turn.lock().await = Some(active);
         let (sender, receiver) = async_channel::bounded(8);
@@ -1172,6 +1202,7 @@ mod dispatch_tests {
             .send(submit(
                 "reply",
                 Op::DynamicToolResponse {
+                    turn_id: context.sub_id.clone(),
                     id: "tool".to_string(),
                     response: response.clone(),
                 },

@@ -76,7 +76,7 @@ impl RmcpClient {
                     let Some(retry_delay_ms) = retry_delay_ms else {
                         return Err(error);
                     };
-                    let delay = Duration::from_millis(retry_delay_ms);
+                    let delay = retry_delay(error.as_ref(), retry_delay_ms);
                     warn!(
                         attempt = attempt + 1,
                         max_attempts = STREAMABLE_HTTP_RETRY_DELAYS_MS.len() + 1,
@@ -164,6 +164,27 @@ impl RmcpClient {
     }
 }
 
+// RMCP wraps transport failures rather than always exposing them through source().
+// Keep retry advice attached to that error, across both handshake and read paths.
+pub(super) fn retry_delay(error: &(dyn std::error::Error + 'static), fallback_ms: u64) -> Duration {
+    fn advice(error: &(dyn std::error::Error + 'static)) -> Option<Duration> {
+        if let Some(StreamableHttpClientAdapterError::UnexpectedHttpStatus { retry_after, .. }) =
+            error.downcast_ref::<StreamableHttpClientAdapterError>()
+        { return *retry_after; }
+        if let Some(StreamableHttpError::Client(error)) =
+            error.downcast_ref::<StreamableHttpError<StreamableHttpClientAdapterError>>()
+        { return advice(error); }
+        if let Some(rmcp::service::ClientInitializeError::TransportError { error, .. }) =
+            error.downcast_ref::<rmcp::service::ClientInitializeError>()
+        { return advice(error.error.as_ref()); }
+        if let Some(rmcp::service::ServiceError::TransportSend(error)) =
+            error.downcast_ref::<rmcp::service::ServiceError>()
+        { return advice(error.error.as_ref()); }
+        error.source().and_then(advice)
+    }
+    Duration::from_millis(fallback_ms).max(advice(error).unwrap_or_default())
+}
+
 fn remaining_initialize_timeout(
     timeout: Option<Duration>,
     deadline: Option<Instant>,
@@ -190,9 +211,16 @@ pub(super) async fn sleep_with_retry_deadline(delay: Duration, deadline: Option<
         if remaining.is_zero() {
             return false;
         }
+        if delay >= remaining {
+            time::sleep(remaining).await;
+            return false;
+        }
         time::timeout(remaining, time::sleep(delay)).await.is_ok()
     } else {
-        time::sleep(delay).await;
+        match time::Instant::now().checked_add(delay) {
+            Some(deadline) => time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
         true
     }
 }

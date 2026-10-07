@@ -23,6 +23,14 @@ pub struct DesktopRuntimeReceipt {
     pub build_dirty: String,
     pub build_profile: String,
     pub build_built: String,
+    #[serde(default)]
+    pub published_executable_sha256: Option<String>,
+    #[serde(default)]
+    pub published_build_match: Option<bool>,
+    #[serde(default)]
+    pub expected_codex_home: Option<PathBuf>,
+    #[serde(default)]
+    pub codex_home_match: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

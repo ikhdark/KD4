@@ -1794,7 +1794,7 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
         .and_then(|completion| completion.command_end.as_ref())
     {
         CommandResult {
-            exit_code: Some(i64::from(command_end.exit_code)),
+            exit_code: command_end.exit_code.map(i64::from),
             stdout: command_end.aggregated_output.clone(),
         }
     } else if let Some(error) = auto_command_end

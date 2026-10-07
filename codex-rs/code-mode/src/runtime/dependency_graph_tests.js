@@ -120,10 +120,10 @@ const node = (id, run = () => id, extra = {}) => ({ id, run, accept: () => true,
     node("accept-throw", () => 3, { accept: () => { throw cause; }, resources: { write: ["r"] } }),
     node("independent", () => ++calls, { resources: { write: ["r"] } }),
   ]).then(() => { throw Error("failure was swallowed"); }, error => error.results);
-  check(calls === 2 && results.throw.reason === cause, "retry or lost original failure");
+  check(calls === 2 && results.throw.reason.message === cause.message, "retry or lost original failure");
   check(results.blocked.status === "skipped" && results.independent.status === "fulfilled",
     "failure isolation broken");
-  check(results.postcondition.value.exit_code === 7 && results["accept-throw"].reason === cause &&
+  check(results.postcondition.value.exit_code === 7 && results["accept-throw"].reason.message === cause.message &&
     results["accept-throw"].value === 3 && !Object.hasOwn(results.throw, "value"),
     "failure evidence lost");
   check(Object.keys(results).join() === "throw,blocked,postcondition,accept-throw,independent",
@@ -145,7 +145,7 @@ const node = (id, run = () => id, extra = {}) => ({ id, run, accept: () => true,
     node("independent", () => "done", { resources: { write: ["process"] } }),
   ]).then(() => { throw Error("acceptance failure swallowed"); }, error => error.results);
   check(effects === 1 && !dependent && results.producer.value === receipt &&
-    results.producer.reason === cause && results.independent.value === "done",
+    results.producer.reason.message === cause.message && results.independent.value === "done",
     "recovery lost evidence, reran an effect, or failed to release its claim");
 }
 
@@ -171,7 +171,7 @@ const node = (id, run = () => id, extra = {}) => ({ id, run, accept: () => true,
   check(special.constructor.value === 8, "special IDs are not safe");
 }
 
-// All configuration, including excluded branches, is rejected before any effect.
+// Structure is checked globally; availability only in the selected closure.
 {
   let calls = 0;
   const good = () => node("good", () => ++calls);
@@ -187,12 +187,21 @@ const node = (id, run = () => id, extra = {}) => ({ id, run, accept: () => true,
     [[good(), node("bad", undefined, { resources: { write: ["r", "r"] } })], {}],
     [[good(), node("bad", undefined, { resources: { read: ["r"], write: ["r"] } })], {}],
     [[good(), node("bad", undefined, { deps: ["bad"] })], { targets: ["good"] }],
-    [[good(), node("bad", undefined, { requires: ["unavailable-capability"] })], { targets: ["good"] }],
+    [[good(), node("bad", undefined, { requires: [42] })], { targets: ["good"] }],
+    [[good(), node("bad", undefined, { requires: [""] })], { targets: ["good"] }],
+    [[good(), node("bad", undefined, { requires: ["unavailable-capability"] })], {}],
+    [[good(), node("bad", undefined, { requires: ["unavailable-capability"] }),
+      node("final", undefined, { deps: ["bad"] })], { targets: ["good", "final"] }],
   ];
   for (const [nodes, options] of cases) {
     const error = await run_graph(nodes, options).then(() => null, error => error);
     check(error instanceof TypeError && calls === 0, "invalid graph partially executed");
   }
+  const results = await run_graph([good(), node("optional", () => {
+    throw Error("excluded capability dispatched");
+  }, { requires: ["unavailable-capability"] })], { targets: ["good"] });
+  check(calls === 1 && Object.keys(results).join() === "good",
+    "excluded capability prevented selected work");
 }
 // A known recovery chain runs within its branch, without waiting for unrelated
 // discovery. Acceptance must retain immutable snapshot identity, not merely a
@@ -284,5 +293,20 @@ for (const exitCode of [0, 7]) {
     Object.keys(results).join() === "source,proof,final", "target closure omitted a required obligation");
   check(results.proof.value.source === results.source.value && results.final.status === "skipped",
     "target pruning lost failed evidence provenance");
+}
+{
+  const cause = new TypeError("inner"), error = new Error("x".repeat(100_000), {cause});
+  cause.cause = error;
+  const receipt = {artifact_id:"retained", session_id:7};
+  error.evidence = receipt;
+  const results = await run_graph([node("bad", () => { throw error; }), node("ok", () => receipt)])
+    .catch(error => error.results);
+  check(results.bad.reason === error && results.bad.reason.cause === cause &&
+    results.bad.reason.message.length === 100_000, "scripts lost the original error object");
+  check(results.ok.value === receipt && results.bad.reason.evidence === receipt, "receipt identity changed");
+  let deep = new Error("leaf");
+  for (let i = 0; i < 100; i++) deep = new Error("nested", {cause:deep});
+  const bounded = await run_graph([node("deep", () => { throw deep; })]).catch(error => error.results);
+  check(bounded.deep.reason === deep, "error chain identity changed before display");
 }
 text("dependency graph scenarios passed");

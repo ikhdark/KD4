@@ -12,6 +12,39 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 use toml::Value as TomlValue;
 
+#[test]
+fn config_alias_and_target_share_the_persistence_lock() {
+    let tmp = tempdir().expect("tmpdir");
+    let target = tmp.path().join("target.toml");
+    let alias = tmp.path().join("alias.toml");
+    std::fs::write(&target, "model = \"initial\"\n").unwrap();
+    std::os::windows::fs::symlink_file(&target, &alias).unwrap();
+    let lock = acquire_atomic_write_lock(&target).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = ConfigEditsBuilder::for_config_path(&alias)
+            .with_edits([ConfigEdit::SetPath {
+                segments: vec!["alias_key".to_string()],
+                value: value(true),
+            }])
+            .apply_blocking();
+        done_tx.send(result).unwrap();
+    });
+    started_rx.recv().unwrap();
+    let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+    // Simulate the target writer's commit while it holds the same lock.
+    std::fs::write(&target, "model = \"updated\"\n").unwrap();
+    drop(lock);
+    assert!(early.is_err(), "alias writer bypassed the target lock");
+    done_rx.recv().unwrap().unwrap();
+    writer.join().unwrap();
+    let persisted: TomlValue = toml::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+    assert_eq!(persisted["model"].as_str(), Some("updated"));
+    assert_eq!(persisted["alias_key"].as_bool(), Some(true));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn async_project_trust_write_yields_while_persistence_lock_is_held() {
     let tmp = tempdir().expect("tmpdir");
@@ -100,6 +133,30 @@ fn expected_version_is_compared_under_the_persistence_lock() {
     );
     let persisted = std::fs::read_to_string(config_path).expect("read persisted config");
     assert!(persisted == "model = \"first\"\n" || persisted == "model = \"second\"\n");
+}
+
+#[test]
+fn two_config_aliases_with_one_expected_version_have_one_winner() {
+    let tmp = tempdir().unwrap();
+    let target = tmp.path().join("target.toml");
+    std::fs::write(&target, "model = \"initial\"\n").unwrap();
+    let expected = version_for_toml(&toml::from_str("model = \"initial\"\n").unwrap());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let writers = ["first", "second"].map(|model| {
+        let alias = tmp.path().join(format!("{model}.toml"));
+        std::os::windows::fs::symlink_file(&target, &alias).unwrap();
+        let expected = expected.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            ConfigEditsBuilder::for_config_path(&alias)
+                .with_edits([ConfigEdit::SetPath { segments: vec!["model".into()], value: value(model) }])
+                .with_expected_version(Some(expected)).apply_blocking_with_outcome().unwrap()
+        })
+    });
+    let outcomes = writers.map(|writer| writer.join().unwrap());
+    assert_eq!(outcomes.iter().filter(|result| **result == ConfigApplyOutcome::Applied).count(), 1);
+    assert_eq!(outcomes.iter().filter(|result| **result == ConfigApplyOutcome::VersionConflict).count(), 1);
 }
 
 #[test]

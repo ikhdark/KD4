@@ -136,7 +136,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "max_output_tokens".to_string(),
             bounded_integer(
-                "Output token budget, capped at 10000 tokens (8000 inside exec). Zero returns only execution controls.".to_string(),
+                "Output token budget, capped at 10000 tokens for direct calls; inside exec it is bounded by the cell's estimated remaining budget. Explicit smaller caps are honored. Zero returns only execution controls.".to_string(),
                 0, usize::MAX as u64),
         ),
     ]);
@@ -235,6 +235,10 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
             JsonSchema::boolean(Some("True confirms process termination before collecting final output. Requires empty chars. Use only with session_capabilities.cancellation=true.".to_string())),
         ),
         (
+            "incarnation".to_string(),
+            JsonSchema::string(Some("Exact creation identity from the originating session_capabilities.incarnation. Required with session_id for polling, input, and termination; legacy numeric-only handles are rejected.".into())),
+        ),
+        (
             "wait_for_output".to_string(),
             JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Defaults to true when chars is empty, yield_time_ms is omitted, and terminate is false; false preserves bounded polling. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
         ),
@@ -285,7 +289,7 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["session_id".to_string()]),
+            Some(vec!["session_id".to_string(), "incarnation".to_string()]),
             Some(false.into()),
         ),
         output_schema: Some(unified_exec_output_schema().into()),
@@ -445,12 +449,13 @@ fn unified_exec_output_schema() -> Value {
             "session_capabilities": {
                 "type": "object",
                 "properties": {
+                    "incarnation": {"type":"string"},
                     "stdin": {"type": "boolean"},
                     "interrupt": {"type": "boolean"},
                     "cancellation": {"type": "boolean"},
                     "polling": {"type": "boolean"}
                 },
-                "required": ["stdin", "interrupt", "cancellation", "polling"],
+                "required": ["stdin", "interrupt", "cancellation", "polling", "incarnation"],
                 "additionalProperties": false
             },
             "chunk_id": {
@@ -509,9 +514,9 @@ fn unified_exec_output_schema() -> Value {
                 "type": "object",
                 "description": "First omitted source line range, when its coordinates are known in raw_output_artifact_id.",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["lines"]},
-                    "start": {"type": "integer", "minimum": 1},
-                    "end": {"type": "integer", "minimum": 1}
+                    "kind": {"type": "string", "enum": ["lines", "bytes"]},
+                    "start": {"type": "integer", "minimum": 0},
+                    "end": {"type": "integer", "minimum": 0}
                 },
                 "required": ["kind", "start", "end"],
                 "additionalProperties": false
@@ -520,6 +525,14 @@ fn unified_exec_output_schema() -> Value {
                 "type": "string",
                 "description": "Artifact persistence failure, when retention was unavailable."
             },
+            "recovery": {
+                "type": "object",
+                "description": "Ready-to-use read_tool_output call for the retained output.",
+                "properties": {"tool":{"const":"read_tool_output"}, "arguments":{"type":"object"}},
+                "required": ["tool", "arguments"]
+            },
+            "completion_recovered": {"type":"boolean"},
+            "notice": {"type":"string"},
             "repair": {
                 "type": "string",
                 "description": "One pre-execution read-only equivalent repair applied to the command."

@@ -772,13 +772,23 @@ impl OAuthPersistor {
         }
     }
 
+    /// Bound the caller's wait, not the lifetime of an admitted disk write.
+    /// Before admission, credentials remain in the authorization manager for a
+    /// later attempt. After admission, execute() owns the write lock and its
+    /// bookkeeping in spawn_blocking even if this observer times out.
+    pub(crate) async fn persist_if_needed(&self) -> Result<()> {
+        tokio::time::timeout(OAUTH_PERSISTENCE_TIMEOUT, self.persist_latest())
+            .await
+            .context("timed out persisting OAuth credentials; durability remains pending")?
+    }
+
     /// Persists the latest stored credentials if they have changed.
     /// Deletes the credentials if they are no longer present.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "AuthorizationManager async access must be serialized through its mutex"
     )]
-    pub(crate) async fn persist_if_needed(&self) -> Result<()> {
+    async fn persist_latest(&self) -> Result<()> {
         let operation_guard = Arc::clone(&self.inner.persistence.operation_lock)
             .lock_owned()
             .await;
@@ -794,6 +804,8 @@ impl OAuthPersistor {
             .await
     }
 }
+
+const OAUTH_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(1);
 
 const FALLBACK_FILENAME: &str = ".credentials.json";
 const MCP_SERVER_TYPE: &str = "http";
@@ -1608,7 +1620,14 @@ mod tests {
             AuthKeyringBackendKind::Direct,
             None,
         );
+        // An unrelated authorization or persistence lock must not hold a
+        // completed MCP result hostage. A later attempt still samples the
+        // latest credentials, rather than persisting a stale captured token.
+        let manager_guard = persistor.inner.authorization_manager.lock().await;
+        assert!(persistor.persist_if_needed().await.unwrap_err().to_string().contains("durability remains pending"));
+        drop(manager_guard);
         let guard = persistor.inner.persistence.operation_lock.lock().await;
+        assert!(persistor.persist_if_needed().await.unwrap_err().to_string().contains("durability remains pending"));
         let pending = persistor.persist_if_needed();
         tokio::pin!(pending);
         assert!(futures::poll!(&mut pending).is_pending());

@@ -242,46 +242,19 @@ impl McpHandler {
     }
 
     pub(crate) fn external_mutation_intent(&self) -> ExternalMutationIntent {
-        let tool_name = self.tool_name();
-        let read_only = self
-            .tool_info
-            .tool
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.read_only_hint)
-            .unwrap_or_else(|| is_allowlisted_read_only_external_tool(&tool_name));
-        if read_only {
-            ExternalMutationIntent::ProvenReadOnly
+        let annotations = self.tool_info.tool.annotations.as_ref();
+        if annotations.and_then(|hints| hints.destructive_hint) == Some(true) {
+            return ExternalMutationIntent::MayMutate;
+        }
+        // Neither a provider annotation nor a familiar callable name establishes
+        // host authority. In particular, custom servers can reuse app namespaces.
+        if annotations.and_then(|hints| hints.read_only_hint) == Some(true) {
+            ExternalMutationIntent::ProviderAssertedReadOnly
         } else {
             ExternalMutationIntent::MayMutate
         }
     }
 }
-
-pub(crate) fn is_allowlisted_read_only_external_tool(name: &ToolName) -> bool {
-    matches!(
-        (name.namespace.as_deref(), name.name.as_str()),
-        (
-            Some("mcp__codex_apps__github"),
-            "fetch"
-                | "fetch_blob"
-                | "fetch_commit"
-                | "fetch_commit_workflow_runs"
-                | "fetch_file"
-                | "fetch_issue"
-                | "fetch_issue_comments"
-                | "fetch_pr"
-                | "fetch_pr_comments"
-                | "fetch_pr_file_patch"
-                | "fetch_pr_patch"
-                | "fetch_workflow_job_logs"
-                | "fetch_workflow_job_steps"
-                | "fetch_workflow_run_artifacts"
-                | "fetch_workflow_run_jobs"
-        )
-    )
-}
-
 fn join_tool_name(tool_name: &ToolName) -> String {
     match tool_name.namespace.as_deref() {
         Some(namespace) => {
@@ -319,8 +292,8 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
                 .tool
                 .annotations
                 .as_ref()
-                .and_then(|annotations| annotations.read_only_hint)
-                .unwrap_or(false)
+                .is_some_and(|annotations| annotations.read_only_hint == Some(true)
+                    && annotations.destructive_hint != Some(true))
     }
 
     fn search_info_for_registered_spec(
@@ -568,6 +541,12 @@ fn build_mcp_search_text(info: &ToolInfo, registered_spec: &ToolSpec) -> String 
         info.tool.name.to_string(),
         info.server_name.clone(),
     ];
+    for name in [&info.callable_name, info.tool.name.as_ref()] {
+        let words = codex_tools::identifier_search_words(name);
+        if !parts.contains(&words) {
+            parts.push(words);
+        }
+    }
     if let Some(title) = info.tool.title.as_deref().map(str::trim)
         && !title.is_empty()
     {
@@ -1085,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn external_mutation_intent_uses_runtime_annotations_and_inspection_allowlist() {
+    fn external_mutation_intent_does_not_promote_provider_claims_or_names() {
         let unannotated = McpHandler::new(tool_info("example", "mcp__example", "context_for"))
             .expect("MCP tool spec should build");
         assert_eq!(
@@ -1097,7 +1076,7 @@ mod tests {
             .expect("MCP tool spec should build");
         assert_eq!(
             github.external_mutation_intent(),
-            ExternalMutationIntent::ProvenReadOnly
+            ExternalMutationIntent::MayMutate
         );
 
         let mut explicit_mutation = tool_info("github", "mcp__codex_apps__github", "fetch_file");
@@ -1116,7 +1095,18 @@ mod tests {
             McpHandler::new(annotated_read)
                 .expect("MCP tool spec should build")
                 .external_mutation_intent(),
-            ExternalMutationIntent::ProvenReadOnly
+            ExternalMutationIntent::ProviderAssertedReadOnly
+        );
+
+        let mut contradictory = tool_info("other", "mcp__other", "lookup");
+        contradictory.tool.annotations = Some(
+            rmcp::model::ToolAnnotations::from_raw(None, Some(true), Some(true), None, None),
+        );
+        let contradictory = McpHandler::new(contradictory).unwrap();
+        assert!(!contradictory.supports_parallel_tool_calls());
+        assert_eq!(
+            contradictory.external_mutation_intent(),
+            ExternalMutationIntent::MayMutate
         );
 
         assert_eq!(

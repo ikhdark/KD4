@@ -72,14 +72,16 @@
         {
           "pointer": "/definitions/DateTime/properties/timeZone/enum/1",
           "value": "America/Los_Angeles"
+        },
+        {
+          "pointer": "/definitions/DateTime/properties/dateTime/format",
+          "value": "date-time"
         }
       ],
       "expected_pruned": [
         "/definitions/UnusedCalendarResource"
       ],
-      "expected_dropped_fields": [
-        "/definitions/DateTime/properties/dateTime/format"
-      ]
+      "expected_dropped_fields": []
     }
   ]
 }

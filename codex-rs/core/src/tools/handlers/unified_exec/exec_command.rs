@@ -1,5 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_shell;
@@ -23,7 +25,7 @@ use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
 use crate::tools::handlers::command_search::classify_rg_search_narrowing_without_native_scope;
 use crate::tools::handlers::command_search::classify_rg_search_with_repository;
-use crate::tools::handlers::command_search::missing_rg_path_advisory;
+use crate::tools::handlers::command_search::missing_rg_path_advisory_with_cancellation;
 use crate::tools::handlers::command_search::observe_rg_search_scope_state_with_freshness;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
@@ -52,6 +54,7 @@ use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::select_initial;
 use codex_shell_command::is_safe_command::is_known_safe_command;
+use codex_shell_command::is_safe_command::is_known_safe_direct_argv;
 use codex_shell_command::shell_detect::detect_shell_type;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -212,15 +215,46 @@ async fn attach_missing_rg_path_advisory(response: &mut ExecCommandToolOutput, c
     }
     let output = String::from_utf8_lossy(&response.raw_output).into_owned();
     let cwd = cwd.to_path_buf();
-    let Ok(Some(advisory)) = crate::tools::run_blocking_command_analysis(move || {
-        missing_rg_path_advisory(&output, &cwd)
-    })
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let Ok(Ok(Some(advisory))) = tokio::time::timeout(Duration::from_millis(25),
+        crate::tools::run_blocking_command_analysis(move || {
+            missing_rg_path_advisory_with_cancellation(&output, &cwd, cancellation)
+        }))
     .await
     else {
         return;
     };
     response.repair_notice = Some(match response.repair_notice.take() {
         Some(repair_notice) => format!("{repair_notice}\n\n{advisory}"),
+        None => advisory,
+    });
+}
+
+pub(super) async fn attach_hidden_rg_directory_advisory(
+    response: &mut ExecCommandToolOutput, cwd: &Path,
+    workspace: &crate::git_workspace::GitWorkspaceCache,
+) {
+    if !response.search_no_match_is_success() {
+        return;
+    }
+    let Some(script) = response.hook_command.clone() else { return };
+    let directory = cwd.to_path_buf();
+    let Ok(candidates) = crate::tools::run_blocking_command_analysis(move ||
+        crate::tools::handlers::command_search::skipped_hidden_rg_directories(&script, &directory)).await
+    else { return };
+    if candidates.is_empty() { return; }
+    let Ok(Some(root)) = workspace.resolve_workspace_root(cwd).await else { return };
+    let mut visible = Vec::new();
+    for path in candidates {
+        if !crate::git_workspace::git_ignores_all_changed_paths(&root, std::slice::from_ref(&path)).await {
+            visible.push(path.display().to_string());
+        }
+    }
+    if visible.is_empty() { return; }
+    let advisory = format!("rg_hidden_directories: no matches in the searched scope; without --hidden, rg skips hidden directories. Non-ignored candidates (bounded directory scan, not exhaustive):\n{}\nUse --hidden when these paths belong to the requested search scope.", visible.join("\n"));
+    response.repair_notice = Some(match response.repair_notice.take() {
+        Some(previous) => format!("{previous}\n\n{advisory}"),
         None => advisory,
     });
 }
@@ -383,10 +417,14 @@ impl ExecCommandHandler {
             .clone()
             .map(Arc::new)
             .unwrap_or_else(|| session.user_shell());
+        let allow_login_shell = super::super::shell::ShellCommandHandler::effective_allow_login_shell(
+            &turn.session_source,
+            turn.config.permissions.allow_login_shell,
+        );
         let (mut args, original_resolved_command) = get_command_async(
             args,
             Arc::clone(&shell),
-            turn.config.permissions.allow_login_shell,
+            allow_login_shell,
             environment_is_remote,
         )
         .await?;
@@ -422,7 +460,7 @@ impl ExecCommandHandler {
             let (updated_args, resolved) = get_command_async(
                 args,
                 Arc::clone(&shell),
-                turn.config.permissions.allow_login_shell,
+                allow_login_shell,
                 environment_is_remote,
             )
             .await?;
@@ -484,12 +522,17 @@ impl ExecCommandHandler {
         Ok::<_, FunctionCallError>(search_narrowing)
         };
         let safety_command = resolved_command.safety_command.clone();
+        let direct_argv = command_invocation.is_argv();
         let safety_analysis = crate::tools::run_blocking_command_analysis(move || {
-            is_known_safe_command(&safety_command)
+            if direct_argv {
+                is_known_safe_direct_argv(&safety_command)
+            } else {
+                is_known_safe_command(&safety_command)
+            }
         });
         // Pure launch analyses share inputs but not results. Join them before
         // applying observation/approval policy; no process starts in this phase.
-        let (validation, search_narrowing, inspection_command) =
+        let (mut validation, search_narrowing, inspection_command) =
             tokio::join!(validation_analysis, search_analysis, safety_analysis);
         args.apply_validation_observation_policy(
             validation.as_ref().is_some_and(|validation| validation.is_validation()),
@@ -545,12 +588,18 @@ impl ExecCommandHandler {
             ..
         } = args;
 
-        let learned_output_budget = session
-            .learned_command_output_budget(&context.call_id, &hook_command).await;
-        // Caller-specified caps remain authoritative. Only later default-budget
-        // commands of a recovered class get the larger session-local allowance.
-        let max_output_tokens = max_output_tokens.or(learned_output_budget).or_else(|| {
+        // Direct caller caps remain authoritative; nested commands get enough
+        // display space to avoid a second recovery call for small explicit caps.
+        // Historical artifact retrieval does not establish producer truncation.
+        let max_output_tokens = max_output_tokens.or_else(|| {
             crate::tools::shell_output_summary::source_read_output_budget(&hook_command)
+        });
+        let max_output_tokens = max_output_tokens.map(|limit| {
+            if nested && limit != 0 {
+                limit.max(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS)
+            } else {
+                limit
+            }
         });
 
         let exec_permission_approvals_enabled =
@@ -627,6 +676,16 @@ impl ExecCommandHandler {
         let input_context = format!("prefix={prefix_rule:?}");
         let effective_environment = manager.effective_environment(&context);
         let environment_hash = validation_environment_hash(&effective_environment);
+        if let Some(validation) = validation.as_mut() {
+            validation.execution_context = Some(crate::validation::ValidationExecutionContext {
+                environment_id: turn_environment.environment_id.clone(),
+                cwd: if environment_is_remote { None } else {
+                    native_cwd.as_ref().map(|cwd| cwd.as_path().to_path_buf())
+                },
+                command: command.clone(),
+                environment_fingerprint: environment_hash.clone(),
+            });
+        }
         crate::tools::parallel::wait_for_workspace_baseline().await;
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         let repository_epoch = session
@@ -677,6 +736,15 @@ impl ExecCommandHandler {
                 .map_err(FunctionCallError::RespondToModel)?;
         }
         let validation_attempt = validation_launch;
+        if validation.as_ref().is_some_and(|validation| validation.is_validation())
+            && let Some((process_id, execution_id)) = session.services.command_execution
+                .identical_running_process(&attempt_key).await
+            && let Some(response) = manager.reuse_running_validation(
+                process_id, execution_id, turn.model_info.truncation_policy.into(), max_output_tokens,
+            ).await
+        {
+            return Ok(boxed_tool_output(response));
+        }
         // Validation shares ordinary attempt accounting. Only input-state
         // determined failures are replayed; a failing test remains rerunnable.
         if let Err(blocked) = session
@@ -733,6 +801,9 @@ impl ExecCommandHandler {
                     .record_exit(&attempt_key, 0)
                     .await;
                 let mut response = ExecCommandToolOutput {
+                        output_ranges: Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
+                            range: 0..raw_output.len() as u64, gap: None,
+                        }),
                         process_output: None,
                         error: None,
                         validation: validation.clone(),
@@ -887,6 +958,8 @@ impl ExecCommandHandler {
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 if !environment_is_remote && let Some(native_cwd) = native_cwd.as_ref() {
                     attach_missing_rg_path_advisory(&mut response, native_cwd.as_path()).await;
+                    attach_hidden_rg_directory_advisory(&mut response, native_cwd.as_path(),
+                        &session.services.git_workspace).await;
                 }
                 response.prepare_recovery_artifact(
                     turn.config.codex_home.as_path(), &session.thread_id.to_string(),
@@ -935,6 +1008,9 @@ impl ExecCommandHandler {
                 }
                 let original_token_count = approx_token_count(&output_text);
                 let mut response = ExecCommandToolOutput {
+                    output_ranges: Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
+                        range: 0..output_text.len() as u64, gap: None,
+                    }),
                     process_output: None,
                     error: None,
                     validation: validation.clone(),
@@ -966,7 +1042,7 @@ impl ExecCommandHandler {
                 ))
             }
             Err(UnifiedExecError::ToolHistoryPersistence {
-                message, exit_code, ..
+                message, exit_code, output, ..
             }) => {
                 // The process completed; retain its actual outcome in command
                 // accounting while ending this model turn on failed durability.
@@ -996,7 +1072,9 @@ impl ExecCommandHandler {
                         .record_exit(&attempt_key, exit_code)
                         .await;
                 }
-                Err(FunctionCallError::Fatal(message))
+                Err(FunctionCallError::Fatal(super::preserve_durability_failure_output(
+                    message, output, &turn.config.codex_home, &session.thread_id.to_string(),
+                ).await))
             }
             Err(err) => {
                 let retry_failure = matches!(

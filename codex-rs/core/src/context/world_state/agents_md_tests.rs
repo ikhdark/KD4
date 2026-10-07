@@ -250,7 +250,8 @@ fn freshness_notice_alone_does_not_prove_instruction_body_retention() {
         AgentsMdFreshness::CachedFallback,
     ));
     let (notice, accepted) = cached.render_diff_with_snapshot(&initial);
-    assert!(notice.is_empty());
+    assert_eq!(notice.len(), 1);
+    assert!(!notice[0].render().contains("binding instruction"));
     let mut retained = render_fragments(body);
     let notice = render_fragments(notice);
     retained.extend(notice.clone());
@@ -279,7 +280,8 @@ fn oversized_freshness_updates_do_not_repeat_body_and_middle_changes_do() {
     ));
     let retained = render_fragments(fragments);
     let (notice, next) = cached.render_history_diff_with_snapshot(Some(&accepted), &retained);
-    assert!(notice.is_empty());
+    assert_eq!(notice.len(), 1);
+    assert!(notice[0].render().len() < 1024);
     let mut changed = WorldState::default();
     let body = format!("{}CHANGED{}", "b".repeat(25_000), "b".repeat(25_000));
     changed.add_section(AgentsMdState::new(Some(
@@ -346,12 +348,14 @@ fn freshness_only_update_does_not_repeat_the_instruction_body() {
         AgentsMdFreshness::CachedFallback,
     ));
     let (fragments, next) = current.render_diff_with_snapshot(&accepted);
-    assert!(fragments.is_empty());
+    assert_eq!(fragments.len(), 1);
+    assert!(!fragments[0].render().contains("retained instruction body"));
     assert_eq!(next, current.snapshot());
     assert!(current.render_diff(&next).is_empty());
 
     let (fragments, refreshed) = previous.render_diff_with_snapshot(&next);
-    assert!(fragments.is_empty());
+    assert_eq!(fragments.len(), 1);
+    assert!(fragments[0].render().contains("refreshed"));
     assert_eq!(refreshed, accepted);
     assert!(previous.render_diff(&refreshed).is_empty());
 }

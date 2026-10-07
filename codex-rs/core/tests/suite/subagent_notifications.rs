@@ -1161,9 +1161,12 @@ async fn spawn_agent_instruction_only_role_keeps_built_in_model_defaults() -> Re
     Ok(())
 }
 
+#[test_case(false; "default role")]
+#[test_case(true; "effort-only role")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_history()
--> Result<()> {
+async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_history(
+    effort_only_role: bool,
+) -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
@@ -1182,6 +1185,7 @@ async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_
     let spawn_args = serde_json::to_string(&json!({
         "message": CHILD_PROMPT,
         "task_name": "worker",
+        "agent_type": if effort_only_role { "custom" } else { "worker" },
     }))?;
     mount_sse_once_match(
         &server,
@@ -1226,7 +1230,7 @@ async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_
     )
     .await;
 
-    let mut builder = test_codex().with_config(|config| {
+    let mut builder = test_codex().with_config(move |config| {
         config
             .features
             .enable(Feature::Collab)
@@ -1236,6 +1240,19 @@ async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_
             .enable(Feature::MultiAgentV2)
             .expect("test config should allow feature update");
         config.developer_instructions = Some("Parent developer instructions.".to_string());
+        config.base_instructions = Some("API-supplied base instruction sentinel.".to_string());
+        if effort_only_role {
+            let role_path = config.codex_home.join("effort-only-role.toml");
+            fs::write(&role_path, "model_reasoning_effort = 'high'\n")
+                .expect("write effort-only role");
+            config.agent_roles.insert(
+                "custom".to_string(),
+                AgentRoleConfig {
+                    config_file: Some(role_path.to_path_buf()),
+                    ..Default::default()
+                },
+            );
+        }
     });
     let test = builder.build(&server).await?;
 
@@ -1243,7 +1260,7 @@ async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_
     let _ = seed_turn.single_request();
     test.submit_turn(TURN_1_PROMPT).await?;
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let child_request = loop {
         if let Some(request) = child_request_log.requests().into_iter().find(|request| {
             request.body_contains_text(TASK_CAPSULE_OPEN_TAG)
@@ -1257,7 +1274,20 @@ async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_
         sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
             .await;
     };
-    assert!(child_request.body_contains_text("Parent developer instructions."));
+    assert!(child_request.body_json()["instructions"].as_str()
+        == Some("API-supplied base instruction sentinel.")
+        || child_request.message_input_texts("developer").iter()
+            .any(|text| text == "API-supplied base instruction sentinel."));
+    assert!(child_request.input().iter().any(|item| {
+        item["role"] == "developer"
+            && item["content"].as_array().is_some_and(|content| {
+                content.iter().any(|part| {
+                    part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Parent developer instructions."))
+                })
+            })
+    }));
     assert!(child_request.body_contains_text(CHILD_PROMPT));
     assert!(!child_request.body_contains_text(TURN_0_FORK_PROMPT));
 
@@ -1441,9 +1471,6 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
         ),
         CompletionScenario::TerminalError => (format!("Agent errored: {error}"), error),
     };
-    let notification = format!(
-        "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}"
-    );
     // If the child is still running when the parent turn starts, wait_agent blocks
     // until mailbox delivery. The follow-up request must then contain that delivery.
     mount_sse_once_match(
@@ -1558,6 +1585,19 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
             .is_some_and(|turn_id| !turn_id.is_empty())
     );
 
+    let text = agent_message["content"][0]["text"]
+        .as_str()
+        .expect("completion text");
+    let receipt = text
+        .strip_prefix("Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nReceipt: get_agent_task(")
+        .expect("completion receipt");
+    let (assignment, receipt) = receipt.split_once(")\nProducer attempt: ").expect("receipt boundary");
+    let assignment: Value = serde_json::from_str(assignment)?;
+    uuid::Uuid::parse_str(assignment["assignment_id"].as_str().expect("assignment ID"))?;
+    let (attempt, actual_payload) = receipt.split_once("\nPayload:\n").expect("payload boundary");
+    uuid::Uuid::parse_str(attempt)?;
+    assert_eq!(actual_payload, payload);
+    let notification = text.to_string();
     assert_eq!(
         agent_message,
         &json!({

@@ -46,6 +46,7 @@ use crate::tools::sandboxing::same_exec_authorization_envelope;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_shell_command::is_safe_command::is_known_safe_command;
+use codex_shell_command::is_safe_command::is_known_safe_direct_argv;
 
 use codex_tools::CanonicalToolResult;
 use codex_tools::ToolName;
@@ -59,6 +60,7 @@ mod shell_command;
 
 pub use shell_command::ShellCommandHandler;
 pub(crate) use shell_command::ShellCommandHandlerOptions;
+pub(crate) const VALIDATION_COMMAND_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Debug, Deserialize)]
 struct ShellCommandHookArgs {
@@ -168,7 +170,7 @@ pub(super) fn shell_sampling_signal(
                 if let Some(lineage) = crate::tools::context::declared_lineage_evidence(
                     canonical_output.unwrap_or_default(),
                 ) {
-                    signal["semantic_evidence"] = lineage;
+                    signal["declared_lineage"] = lineage;
                 }
                 signal
             })
@@ -320,7 +322,17 @@ pub(super) async fn run_exec_like(
     args: RunExecLikeArgs,
 ) -> Result<LegacyShellToolOutput, FunctionCallError> {
     let call_id = args.call_id.clone();
-    let command_validation = args.validation.clone();
+    let mut command_validation = args.validation.clone();
+    if let Some(validation) = command_validation.as_mut() {
+        validation.execution_context = Some(crate::validation::ValidationExecutionContext {
+            environment_id: args.turn_environment.environment_id.clone(),
+            command: args.exec_params.command.clone(),
+            environment_fingerprint: validation_environment_hash(&args.exec_params.env),
+            cwd: if args.turn_environment.environment.is_remote() { None } else {
+                Some(args.exec_params.cwd.as_path().to_path_buf())
+            },
+        });
+    }
     let validation = command_validation.as_ref().and_then(|validation| validation.declared.clone());
     let validation_output_owned = args.validation_launch;
     let max_output_tokens = args.max_output_tokens;
@@ -413,8 +425,15 @@ pub(super) async fn run_exec_like_with_exit_code(
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let session_source = args.turn.session_source.clone();
     let safety_command = args.safety_command.clone();
+    let shell_wrapper_is_owned = args.shell_wrapper_is_owned;
     let inspection_command =
-        crate::tools::run_blocking_command_analysis(move || is_known_safe_command(&safety_command))
+        crate::tools::run_blocking_command_analysis(move || {
+            if shell_wrapper_is_owned {
+                is_known_safe_command(&safety_command)
+            } else {
+                is_known_safe_direct_argv(&safety_command)
+            }
+        })
             .await
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!("command safety worker failed: {error}"))

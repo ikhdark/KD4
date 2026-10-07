@@ -214,6 +214,8 @@ impl TryFrom<WireExecuteRequest> for ExecuteRequest {
 pub struct WireWaitRequest {
     pub cell_id: WireCellId,
     pub yield_time_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::ReceiptRecovery>,
 }
 
 impl From<WaitRequest> for WireWaitRequest {
@@ -221,6 +223,7 @@ impl From<WaitRequest> for WireWaitRequest {
         Self {
             cell_id: value.cell_id.into(),
             yield_time_ms: value.yield_time_ms,
+            recovery: value.recovery,
         }
     }
 }
@@ -230,6 +233,7 @@ impl From<WireWaitRequest> for WaitRequest {
         Self {
             cell_id: value.cell_id.into(),
             yield_time_ms: value.yield_time_ms,
+            recovery: value.recovery,
         }
     }
 }
@@ -441,6 +445,8 @@ pub struct WireNestedToolCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
     pub runtime_tool_call_id: String,
+    #[serde(default)]
+    pub buffered_output_bytes: usize,
     pub tool_name: WireToolName,
     pub tool_kind: WireToolKind,
     /// Omit absent input; a present null remains an explicit tool argument.
@@ -484,6 +490,7 @@ impl From<CodeModeNestedToolCall> for WireNestedToolCall {
             cell_id: value.cell_id.into(),
             parent_tool_call_id: value.parent_tool_call_id,
             runtime_tool_call_id: value.runtime_tool_call_id,
+            buffered_output_bytes: value.buffered_output_bytes,
             tool_name: value.tool_name.into(),
             tool_kind: value.tool_kind.into(),
             input: value.input,
@@ -499,6 +506,7 @@ impl From<WireNestedToolCall> for CodeModeNestedToolCall {
             cell_id: value.cell_id.into(),
             parent_tool_call_id: value.parent_tool_call_id,
             runtime_tool_call_id: value.runtime_tool_call_id,
+            buffered_output_bytes: value.buffered_output_bytes,
             tool_name: value.tool_name.into(),
             tool_kind: value.tool_kind.into(),
             input: value.input,

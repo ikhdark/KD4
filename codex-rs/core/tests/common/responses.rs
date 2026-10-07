@@ -1515,6 +1515,24 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
     response_mock
 }
 
+/// Scripted responses that consume actual prior tool outputs (for example,
+/// creation identities which must not be predicted by a test fixture).
+pub async fn mount_sse_sequence_with_request(
+    server: &MockServer,
+    bodies: Vec<String>,
+    adapt: impl Fn(&Value, String) -> String + Send + Sync + 'static,
+) -> ResponseMock {
+    let count = bodies.len() as u64;
+    let next = AtomicUsize::new(0);
+    let (mock, response_mock) = base_mock();
+    mock.respond_with(move |request: &wiremock::Request| {
+        let index = next.fetch_add(1, Ordering::SeqCst);
+        let body = bodies.get(index).expect("unexpected model request").clone();
+        sse_response(adapt(&ResponsesRequest(request.clone()).body_json(), body))
+    }).up_to_n_times(count).expect(count).mount(server).await;
+    response_mock
+}
+
 /// Serves `responses` in order for POSTs to `/v1/responses` and expects exactly
 /// that many calls. Once the responses are used, requests fall through to any
 /// later-mounted mock.

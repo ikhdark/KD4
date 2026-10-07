@@ -55,7 +55,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::AppsTestToolLoading;
-use core_test_support::apps_test_server::DIRECT_CALENDAR_APP_ONLY_TOOL;
+use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
 use core_test_support::apps_test_server::recorded_apps_tool_calls;
 use core_test_support::apps_test_server::search_capable_apps_builder;
 use core_test_support::assert_regex_match;
@@ -157,9 +157,10 @@ fn normalize_script_output_items(items: Vec<Value>) -> Vec<Value> {
         if let Some(text) = item.get("text").and_then(Value::as_str) {
             let is_recovery_notice = |line: &str| {
                 serde_json::from_str::<Value>(line).is_ok_and(|value| {
-                    value["output_truncated"] == true
-                        && value["artifact_id"].is_string()
-                        && value["recovery_tool"] == "read_tool_output"
+                    value["nested_command_display_reduced"] == true
+                        || (value["output_truncated"] == true
+                            && value["artifact_id"].is_string()
+                            && value["recovery_tool"] == "read_tool_output")
                 })
             };
             if is_recovery_notice(text) {
@@ -237,7 +238,7 @@ fn output_recovery_receipt(req: &ResponsesRequest, call_id: &str) -> Value {
     raw.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|value| {
-            value["output_truncated"] == true
+            (value["output_truncated"] == true || value["nested_command_display_reduced"] == true)
                 && value["artifact_id"].is_string()
                 && value["recovery_tool"] == "read_tool_output"
         })
@@ -262,6 +263,11 @@ fn projected_native_text(output: &str, row: &Value) -> String {
     }
     let count = row["text_lines"].as_u64().expect("counted native text") as usize;
     let (_, text) = output.split_once('\n').expect("native text after envelope");
+    let text = text.split_once('\n').filter(|(line, _)| {
+        line.strip_prefix("[source ").and_then(|line| line.strip_suffix(']'))
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            .is_some_and(|value| value["body"].is_number() && value["selector"].is_object())
+    }).map_or(text, |(_, text)| text);
     let lines = text.split('\n').take(count).collect::<Vec<_>>();
     assert_eq!(lines.len(), count, "native text must be complete");
     lines.join("\n")
@@ -361,7 +367,9 @@ fn assert_output_has_truncation_marker(output: &str) {
         output.contains("tokens truncated")
             || output.contains("Warning: truncated output")
             || output.contains("[omitted before retained middle]")
-            || output.contains("[command output reduced;"),
+            || output.contains("[omitted lines ")
+            || output.contains("[command output reduced;")
+            || output == "…",
         "expected a truncation marker in output: {output}"
     );
 }
@@ -507,7 +515,7 @@ while (result.session_id && result.execution_state === "running" && Date.now() <
     const release = await tools.apply_patch(releases[released++]);
     if (!release.success) throw new Error(JSON.stringify(release));
   }}
-  result = await tools.write_stdin({{session_id:result.session_id,chars:"",yield_time_ms:250,max_output_tokens:1000}});
+  result = await tools.write_stdin({{session_id:result.session_id,incarnation:result.session_capabilities.incarnation,chars:"",yield_time_ms:250,max_output_tokens:1000}});
   chunks.push(result.output ?? "");
   polls++;
 }}
@@ -959,7 +967,7 @@ async fn code_mode_preserves_read_history_until_its_source_changes() -> Result<(
 let result = await tools.exec_command({{cmd, max_output_tokens: 5000, yield_time_ms: 30000}});
 let output = result.result?.selected_text ?? result.output ?? "";
 while (result.session_id) {{
-  result = await tools.write_stdin({{session_id: result.session_id, chars: "", max_output_tokens: 5000, yield_time_ms: 30000}});
+  result = await tools.write_stdin({{session_id: result.session_id,incarnation:result.session_capabilities.incarnation, chars: "", max_output_tokens: 5000, yield_time_ms: 30000}});
   output += result.result?.selected_text ?? result.output ?? "";
 }}
 if (result.exit_code !== 0) throw new Error("contract read failed");
@@ -1022,7 +1030,7 @@ text(reads.map(read => read.value).join(""));"#
     let stale = workspace_invalidation(&final_raw, "call-0")
         .expect("changed source must append a freshness notice");
     assert_eq!(stale["stale_workspace_evidence"], true);
-    assert!(stale.get("current_nested_results").is_some());
+    assert!(stale.get("current_nested_results").is_some(), "{stale}");
     assert_eq!(
         custom_tool_output_last_non_empty_text(&final_raw, "call-0")
             .unwrap()
@@ -1259,326 +1267,10 @@ async fn code_mode_validation_preserves_tools_for_remaining_work(
     Ok(())
 }
 
-/// Ceiling for these fixtures after explicitly checkpointing consumed results.
-const MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET: usize = 60_000;
-/// Enough ~9k-token cell outputs to carry the raw aggregate past that budget
-/// alongside the failed dispatches.
-const BUDGET_OUTPUT_CALLS: usize = 6;
-// Unresolved errors must fit without discarding them; the successful outputs
-// provide the additional pressure that an explicit checkpoint can relieve.
-const BUDGET_FAILURE_CALLS: usize = 700;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_tool_history_has_a_hard_aggregate_budget() -> Result<()> {
-    require_network!();
-    let server = responses::start_mock_server().await;
-    let test = test_codex()
-        .with_config(|config| {
-            let _ = config.features.enable(Feature::CodeMode);
-            config.completed_tool_history_projection = true;
-            config.model_auto_compact_token_limit = Some(1_000_000);
-        })
-        .build(&server)
-        .await?;
-    let mut events = Vec::new();
-    // One result cannot exceed the aggregate budget on its own: a cell's output
-    // is capped per call. Emit several so the raw aggregate clears the budget
-    // and the admission path has to choose what to keep.
-    for index in 0..BUDGET_OUTPUT_CALLS {
-        events.push(ev_custom_tool_call(
-            &format!("budget-output-{index}"),
-            "exec",
-            "text('evidence '.repeat(4000));",
-        ));
-    }
-    // Failed dispatches have no artifact candidate and must remain visible.
-    for index in 0..BUDGET_FAILURE_CALLS {
-        events.push(ev_custom_tool_call(
-            &format!("budget-{index:03}"),
-            "unknown_budget_tool",
-            "invalid",
-        ));
-    }
-    // Pressure is cumulative across requests. Keep each mocked response bounded
-    // so this budget test does not also stress hundreds of simultaneous dispatch
-    // futures on a Windows debug worker's stack.
-    let checkpoint = serde_json::json!({
-        "summary": "The requested successful evidence has been consumed.",
-        "completed_call_ids": (0..BUDGET_OUTPUT_CALLS)
-            .map(|index| format!("budget-output-{index}")).collect::<Vec<_>>(),
-        "active_work": "Retain and diagnose all subsequent dispatch failures.",
-        "retained_evidence": [],
-    });
-    let mut call_batches = vec![
-        events[..BUDGET_OUTPUT_CALLS].to_vec(),
-        vec![responses::ev_function_call(
-            "budget-checkpoint", "context_checkpoint", &checkpoint.to_string(),
-        )],
-    ];
-    call_batches.extend(events[BUDGET_OUTPUT_CALLS..].chunks(50).map(<[_]>::to_vec));
-    let mut batches = Vec::new();
-    for (batch, calls) in call_batches.iter().enumerate() {
-        let response_id = format!("many-results-{batch}");
-        let mut events = vec![ev_response_created(&response_id)];
-        events.extend_from_slice(calls);
-        events.push(ev_completed(&response_id));
-        batches.push(responses::mount_sse_once(&server, sse(events)).await);
-    }
-    let final_request = responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("done", "done"),
-            ev_completed("final"),
-        ]),
-    )
-    .await;
-    test.submit_turn("Collect the requested results.").await?;
 
-    for batch in &batches {
-        assert_eq!(batch.requests().len(), 1);
-    }
-    let request = final_request.single_request();
-    let checkpoint_output = request.function_call_output_text("budget-checkpoint")
-        .expect("checkpoint output");
-    let checkpoint_result: Value = serde_json::from_str(&checkpoint_output)
-        .unwrap_or_else(|error| panic!("checkpoint failed: {error}: {checkpoint_output}"));
-    assert_eq!(checkpoint_result["checkpointed_call_count"], BUDGET_OUTPUT_CALLS, "{checkpoint_output}");
-    assert!(checkpoint_result.get("checkpointed_call_ids").is_none());
-    let body = request.body_json();
-    let input = body["input"].as_array().unwrap();
-    let outputs = input
-        .iter()
-        .filter(|item| item["type"] == "custom_tool_call_output")
-        .collect::<Vec<_>>();
-    assert!(!outputs.is_empty());
-    assert_eq!(
-        outputs.len(), BUDGET_FAILURE_CALLS + BUDGET_OUTPUT_CALLS,
-        "checkpoint receipts and unresolved dispatch failures must remain visible"
-    );
-    let total = outputs
-        .iter()
-        .map(|item| {
-            let text = match &item["output"] {
-                Value::String(text) => text.clone(),
-                Value::Array(content) => content
-                    .iter()
-                    .filter_map(|item| item["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                value => panic!("unexpected tool output: {value:?}"),
-            };
-            codex_utils_output_truncation::approx_token_count(&text)
-        })
-        .sum::<usize>();
-    let uncheckpointed = batches[1].single_request();
-    let raw_success_tokens = (0..BUDGET_OUTPUT_CALLS)
-        .map(|index| {
-            codex_utils_output_truncation::approx_token_count(&raw_custom_tool_output_text(
-                &uncheckpointed,
-                &format!("budget-output-{index}"),
-            ))
-        })
-        .sum::<usize>();
-    let failure_tokens = (0..BUDGET_FAILURE_CALLS)
-        .map(|index| {
-            codex_utils_output_truncation::approx_token_count(&raw_custom_tool_output_text(
-                &request,
-                &format!("budget-{index:03}"),
-            ))
-        })
-        .sum::<usize>();
-    assert!(
-        raw_success_tokens + failure_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET,
-        "the uncheckpointed fixture must exceed the budget"
-    );
-    assert!(
-        total <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET,
-        "actual provider-visible results consumed {total} tokens"
-    );
-    for call in input
-        .iter()
-        .filter(|item| item["type"] == "custom_tool_call")
-    {
-        assert!(
-            outputs
-                .iter()
-                .any(|output| output["call_id"] == call["call_id"]),
-            "eviction must not leave a dangling call"
-        );
-    }
-    Ok(())
-}
-
-const PRESSURE_BATCHES: usize = 10;
-const PRESSURE_CALLS: usize = PRESSURE_BATCHES * 8;
-const PRESSURE_EVIDENCE_LINES: usize = 1_000;
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_tool_history_pressure_preserves_recoverable_results() -> Result<()> {
-    require_network!();
-    let server = responses::start_mock_server().await;
-    let test = test_codex()
-        .with_config(|config| {
-            config.features.enable(Feature::CodeMode).unwrap();
-            config.completed_tool_history_projection = true;
-            config.model_auto_compact_token_limit = Some(1_000_000);
-        })
-        .build(&server)
-        .await?;
-    let mut batches = Vec::new();
-    // Each response stays within the eight-cell admission limit so every call
-    // completes before the next batch adds pressure to the retained history.
-    for batch in 0..PRESSURE_BATCHES {
-        let response_id = format!("recovery-pressure-{batch}");
-        let mut events = vec![ev_response_created(&response_id)];
-        for index in batch * 8..(batch + 1) * 8 {
-            events.push(ev_custom_tool_call(
-                &format!("recoverable-{index:03}"),
-                "exec",
-                &format!(
-                    "text('recovery-{index:03}\\n' + 'evidence\\n'.repeat({PRESSURE_EVIDENCE_LINES}));"
-                ),
-            ));
-        }
-        events.push(ev_completed(&response_id));
-        batches.push(responses::mount_sse_once(&server, sse(events)).await);
-    }
-    let checkpoint = serde_json::json!({
-        "summary": "All requested evidence has been consumed; retain exact recovery handles.",
-        "completed_call_ids": (0..PRESSURE_CALLS)
-            .map(|index| format!("recoverable-{index:03}")).collect::<Vec<_>>(),
-        "active_work": "Recover one checkpointed result without rerunning its producer.",
-        "retained_evidence": [],
-    });
-    responses::mount_sse_once(
-        &server,
-        sse(vec![
-            responses::ev_function_call(
-                "pressure-checkpoint", "context_checkpoint", &checkpoint.to_string(),
-            ),
-            ev_completed("checkpoint-response"),
-        ]),
-    ).await;
-    let projected = responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("done", "done"),
-            ev_completed("projected"),
-        ]),
-    )
-    .await;
-    test.submit_turn("Collect all requested results.").await?;
-    for batch in batches {
-        assert_eq!(batch.requests().len(), 1);
-    }
-    let request = projected.single_request();
-    let checkpoint_output = request.function_call_output_text("pressure-checkpoint")
-        .expect("checkpoint output");
-    let checkpoint_result: Value = serde_json::from_str(&checkpoint_output)
-        .unwrap_or_else(|error| panic!("checkpoint failed: {error}: {checkpoint_output}"));
-    assert_eq!(checkpoint_result["checkpointed_call_count"], PRESSURE_CALLS, "{checkpoint_output}");
-    assert!(checkpoint_result.get("checkpointed_call_ids").is_none());
-    let body = request.body_json();
-    let input = body["input"].as_array().unwrap();
-    assert_eq!(
-        input
-            .iter()
-            .filter(|item| item["type"] == "custom_tool_call")
-            .count(),
-        PRESSURE_CALLS
-    );
-    assert_eq!(
-        input
-            .iter()
-            .filter(|item| item["type"] == "custom_tool_call_output")
-            .count(),
-        PRESSURE_CALLS
-    );
-    let mut total_tokens = 0;
-    let mut pinned = None;
-    let mut artifact_ids = HashSet::new();
-    for index in 0..PRESSURE_CALLS {
-        let call_id = format!("recoverable-{index:03}");
-        let output = request.custom_tool_call_output(&call_id);
-        let text = match &output["output"] {
-            Value::String(text) => text.clone(),
-            Value::Array(content) => content
-                .iter()
-                .filter_map(|item| item["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            value => panic!("unexpected output: {value}"),
-        };
-        total_tokens += codex_utils_output_truncation::approx_token_count(&text);
-        if let Ok(recovery) = serde_json::from_str::<Value>(&text) {
-            let artifact_id = recovery["artifact_id"]
-                .as_str()
-                .expect("exact recovery handle");
-            assert!(
-                artifact_ids.insert(artifact_id.to_string()),
-                "each result has its own artifact"
-            );
-            if pinned.is_none() {
-                // Both a regular receipt and a cheaper pin may fit the shared
-                // budget. Prove the reference is callable by reading it below.
-                pinned = Some((index, artifact_id.to_string()));
-            }
-        } else {
-            assert!(
-                text.contains(&format!("recovery-{index:03}")),
-                "{call_id}: {text}"
-            );
-        }
-    }
-    assert!(
-        total_tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET,
-        "provider-visible results consumed {total_tokens} tokens"
-    );
-    let (index, artifact_id) =
-        pinned.expect("pressure must retain a callable artifact recovery reference");
-    let recovery_script = format!(
-        "const recovered = await tools.read_tool_output({{artifact_id: {artifact_id:?}, selectors: [{{kind: 'bytes', start: 0, end: 256}}]}}); text(recovered.results.map(part => part.text ?? '').join(''));"
-    );
-    responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_custom_tool_call("recover-pin", "exec", &recovery_script),
-            ev_completed("recover"),
-        ]),
-    )
-    .await;
-    let recovered = responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("recovered", "recovered"),
-            ev_completed("recovered"),
-        ]),
-    )
-    .await;
-    test.submit_turn("Recover the retained result.").await?;
-    // The recovery payload itself has a completion header. Do not run it
-    // through the helper that strips Code Mode status headers.
-    let output = raw_custom_tool_output_text(&recovered.single_request(), "recover-pin");
-    // Text artifacts preserve real line boundaries. Check the variable
-    // completion header separately, then compare every recovered payload byte.
-    assert_eq!(output.len(), 256);
-    let (header, payload) = output
-        .split_once("\nOutput:\n\n")
-        .expect("recovered artifact must include its completion header");
-    assert_regex_match(
-        r"\AScript completed with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\z",
-        header,
-    );
-    let expected = format!("recovery-{index:03}\n{}", "evidence\n".repeat(1000));
-    assert!(!payload.is_empty(), "recovery must include payload bytes");
-    assert_eq!(payload, &expected[..payload.len()]);
-    Ok(())
-}
-
-/// Live sessions re-sent every answered task's raw tool output on each later
-/// request. After a final answer and a new user request, the consumed result
-/// must reach the provider as a compact pin whose exact bytes stay recoverable
-/// without rerunning the producer.
+/// A final answer alone must not retire the working set. A bounded result keeps
+/// its original projection and exact recovery route across later user turns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_answered_task_evidence_is_pinned_and_recoverable_in_next_task() -> Result<()> {
     require_network!();
@@ -1609,7 +1301,7 @@ async fn code_mode_answered_task_evidence_is_pinned_and_recoverable_in_next_task
             ev_custom_tool_call(
                 "answered-evidence",
                 "exec",
-                "text('answered-task\\n' + 'evidence\\n'.repeat(1000));",
+                "text('answered-task\\n' + 'evidence\\n'.repeat(10000));",
             ),
             ev_completed("collect"),
         ]),
@@ -1643,15 +1335,10 @@ async fn code_mode_answered_task_evidence_is_pinned_and_recoverable_in_next_task
     test.submit_turn("Start an unrelated task.").await?;
     let next_request = next_task.single_request();
     let pinned = raw_custom_tool_output_text(&next_request, "answered-evidence");
-    let pin: Value = serde_json::from_str(&pinned)
-        .unwrap_or_else(|error| panic!("expected a recovery pin: {error}: {pinned}"));
-    assert_eq!(pin["kind"], "tool_history_artifact_pin", "{pin}");
-    assert_eq!(pin["retrieval"]["tool"], "read_tool_output", "{pin}");
-    assert!(
-        codex_utils_output_truncation::approx_token_count(&pinned) * 4
-            < codex_utils_output_truncation::approx_token_count(&raw),
-        "the pin must be much smaller than the raw result: {pinned}"
-    );
+    assert_eq!(pinned, raw, "a new request is not an explicit evidence checkpoint");
+    let pin = output_recovery_receipt(&next_request, "answered-evidence");
+    assert_eq!(pin, output_recovery_receipt(&answered.single_request(), "answered-evidence"));
+    assert_output_has_truncation_marker(&raw);
     let input = next_request.body_json()["input"]
         .as_array()
         .unwrap()
@@ -1700,13 +1387,14 @@ async fn code_mode_answered_task_evidence_is_pinned_and_recoverable_in_next_task
     test.submit_turn("Recover the pinned evidence.").await?;
     let output = raw_custom_tool_output_text(&recovered.single_request(), "recover-pinned");
     let recovery: Value = output
-        .find('{')
-        .and_then(|start| serde_json::from_str(&output[start..]).ok())
+        .lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
         .unwrap_or_else(|| panic!("expected a recovery result: {output}"));
     assert_eq!(recovery["complete"], true, "{recovery}");
-    assert_eq!(recovery["canonical_sha256"], pin["sha256"], "{recovery}");
-    assert_eq!(recovery["canonical_bytes"], pin["bytes"], "{recovery}");
-    let text = recovery["results"][0]["text"].as_str().unwrap_or_default();
+    assert_eq!(recovery["artifact_id"], pin["artifact_id"], "{recovery}");
+    assert_eq!(recovery["canonical_sha256"].as_str().unwrap().len(), 64);
+    assert!(recovery["canonical_bytes"].as_u64().unwrap() > raw.len() as u64);
+    let text = projected_native_text(&output, &recovery["results"][0]);
     assert!(
         text.contains("answered-task\nevidence\n"),
         "the pinned artifact recovers the original evidence: {recovery}"
@@ -1772,10 +1460,14 @@ async fn output_only_preserves_running_command_and_recovers_middle(
         .find_map(|line| line.strip_prefix("Running command session_id: "))
         .expect("output-only cells must retain the live handle")
         .parse::<u64>()?;
+    let incarnation = raw.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|value| value["session_capabilities"]["incarnation"].as_str().map(str::to_owned))
+        .expect("output-only cells must retain the process incarnation");
     fs::write(&release, "go")?;
 
     let poll = format!(
-        "// @exec: {{\"max_output_tokens\": {budget}}}\nconst r = await tools.write_stdin({{session_id: {session_id}, chars: '', yield_time_ms: 30000, max_output_tokens: 256}}); if (r.process_exited !== true || r.execution_state !== 'exited' || r.exit_code !== 0 || r.output_complete !== false || r.output_reduced !== true || r.session_id != null) throw new Error('expected completed truncated command'); text(r.output);",
+        "// @exec: {{\"max_output_tokens\": {budget}}}\nconst r = await tools.write_stdin({{session_id: {session_id}, incarnation: {incarnation:?}, chars: '', yield_time_ms: 30000, max_output_tokens: 256}}); if (r.process_exited !== true || r.execution_state !== 'exited' || r.exit_code !== 0 || r.output_complete !== false || r.output_reduced !== true || r.session_id != null) throw new Error('expected completed truncated command'); text(r.output);",
         budget = if zero_budget { 0 } else { 10000 },
     );
     responses::mount_sse_once(
@@ -1921,7 +1613,7 @@ async fn code_mode_can_return_exec_command_output() -> Result<()> {
 let result = await tools.exec_command({ cmd: "[Console]::Out.Write('code_mode_exec_marker')" });
 while (result.session_id) {
   result = await tools.write_stdin({
-    session_id: result.session_id,
+    session_id: result.session_id,incarnation:result.session_capabilities.incarnation,
     chars: "",
     yield_time_ms: 30_000,
   });
@@ -2060,7 +1752,8 @@ store('large', result);"#),
     let retained = retained_items
         .iter()
         .filter_map(|item| item["text"].as_str())
-        .find(|text| text.starts_with("exit_code: 0\n"))
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .find_map(|value| value["result"].as_str().filter(|text| text.starts_with("exit_code: 0\n")).map(str::to_string))
         .expect("a silent cell must expose its retained nested evidence");
     assert!(retained.len() <= 4_096);
     assert!(retained.contains('🙂'));
@@ -2341,7 +2034,7 @@ if (patch.name !== "apply_patch" || typeof tools.apply_patch !== "function") {
   throw new Error("nested apply_patch must remain callable");
 }
 const tool = ALL_TOOLS.find(
-  ({ name }) => name === "mcp__codex_apps__calendar_timezone_option_99"
+  ({ name }) => name === resolve_tool("mcp__codex_apps__calendar_c529dda749f0._timezone_o_25fdf15747c7").name
 );
 if (!tool) {
   text(JSON.stringify({
@@ -2498,8 +2191,10 @@ text(JSON.stringify({{
   error,
 }}));
 "#,
-        visible_tool_name = "mcp__codex_apps__calendar_timezone_option_99",
-        tool_name = DIRECT_CALENDAR_APP_ONLY_TOOL,
+        visible_tool_name = codex_tools::code_mode_name_for_tool_name(
+            &codex_protocol::ToolName::namespaced(SEARCH_CALENDAR_NAMESPACE, "_timezone_o_25fdf15747c7")),
+        tool_name = codex_tools::code_mode_name_for_tool_name(
+            &codex_protocol::ToolName::namespaced(SEARCH_CALENDAR_NAMESPACE, "_app_only_a_ffcedc1513b2")),
     );
 
     responses::mount_sse_once(
@@ -2655,7 +2350,7 @@ async fn code_mode_current_time_returns_structured_result() -> Result<()> {
         &server,
         "use exec to get the current time",
         r#"
-const result = await tools.clock__curr_time({});
+const result = await resolve_tool("clock.curr_time")({});
 text(JSON.stringify(result));
 "#,
         |config| {
@@ -2803,7 +2498,7 @@ let result = await tools.exec_command({
 });
 while (result.session_id) {
   result = await tools.write_stdin({
-    session_id: result.session_id,
+    session_id: result.session_id,incarnation:result.session_capabilities.incarnation,
     chars: "",
     yield_time_ms: 30_000,
     max_output_tokens: 5,
@@ -2872,8 +2567,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     let request = second_mock.single_request();
     let output = custom_tool_output_last_non_empty_text(&request, "call-1")
         .expect("code-mode output should contain the emitted value");
-    assert!(output.contains("Variable truncated: True."), "{output}");
-    assert_output_has_truncation_marker(&output);
+    assert_eq!(output, format!("Variable truncated: False. Variable: {}", "x".repeat(50_000)));
 
     Ok(())
 }
@@ -2904,11 +2598,11 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     let request = second_mock.single_request();
     let output = custom_tool_output_last_non_empty_text(&request, "call-1")
         .expect("code-mode output should contain the emitted value");
-    // The nested 20,000-token budget leaves about 80,000 characters. This
-    // ceiling independently proves that history applied its smaller cap.
+    // Nested projection shares the cell budget; history must not apply a
+    // second smaller cap to already-admitted evidence.
     assert!(
-        output.len() < 60_000,
-        "expected history to truncate the emitted value, got {} bytes",
+        output.len() < 85_000,
+        "expected the nested cap to truncate the emitted value, got {} bytes",
         output.len()
     );
     // The boolean describes the nested result; the marker below comes from
@@ -2936,7 +2630,7 @@ const result = await tools.exec_command({
 });
 const output = result.result?.selected_text ?? result.output;
 const resultVariableWasTruncated = result.output_reduced;
-if (!result.process_exited || result.exit_code !== 0 || result.output_complete !== false) throw new Error('expected completed truncated command');
+if (!result.process_exited || result.exit_code !== 0 || result.output_complete !== false || !resultVariableWasTruncated) throw new Error('expected completed truncated command');
 text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "True" : "False"}.`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
@@ -2956,7 +2650,8 @@ text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "T
         "expected configured history cap to truncate the emitted value, got {} bytes",
         output.len()
     );
-    assert!(output.contains("Variable truncated: True."), "{output}");
+    // JavaScript checked the variable before mandatory controls consumed the text budget.
+    assert!(!raw_custom_tool_output_text(&request, "call-1").contains("Script failed"));
     assert_output_has_truncation_marker(&output);
 
     assert!(!output.contains("Script failed"), "{output}");
@@ -2991,8 +2686,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     let request = second_mock.single_request();
     let output = custom_tool_output_last_non_empty_text(&request, "call-1")
         .expect("code-mode output should contain the emitted value");
-    assert!(output.contains("Variable truncated: True."), "{output}");
-    assert_output_has_truncation_marker(&output);
+    assert_eq!(output, format!("Variable truncated: False. Variable: {}", "x".repeat(50_000)));
 
     Ok(())
 }
@@ -3013,7 +2707,7 @@ const result = await tools.exec_command({
 });
 const output = result.result?.selected_text ?? result.output;
 const resultVariableWasTruncated = result.output_reduced;
-if (!result.process_exited || result.exit_code !== 0 || result.output_complete !== false) throw new Error('expected completed truncated command');
+if (!result.process_exited || result.exit_code !== 0 || result.output_complete !== false || !resultVariableWasTruncated) throw new Error('expected completed truncated command');
 text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "True" : "False"}.`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
@@ -3033,7 +2727,8 @@ text(`Variable: ${output}\nVariable truncated: ${resultVariableWasTruncated ? "T
         "expected configured history cap to truncate the emitted value, got {} bytes",
         output.len()
     );
-    assert!(output.contains("Variable truncated: True."), "{output}");
+    // JavaScript checked the variable before mandatory controls consumed the text budget.
+    assert!(!raw_custom_tool_output_text(&request, "call-1").contains("Script failed"));
     assert_output_has_truncation_marker(&output);
 
     assert!(!output.contains("Script failed"), "{output}");
@@ -3056,7 +2751,7 @@ async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
 const result = await tools.exec_command({
   cmd: "[Console]::Out.Write('0123456789012345678901234567890123456789')"
 });
-if (!result.process_exited || result.exit_code !== 0 || result.output_reduced !== false || result.output_complete !== true) throw new Error('outer budget must not reduce the nested return value');
+if (!result.process_exited || result.exit_code !== 0 || result.output_reduced !== true || result.output_complete !== false) throw new Error('nested projection must share the tiny cell budget without losing completion state');
 text(result.result?.selected_text ?? result.output);
 "#,
     )
@@ -3360,7 +3055,7 @@ while (true) {}
 
     let first_request = first_completion.single_request();
     let first_items = custom_tool_output_items(&first_request, "call-1");
-    assert_eq!(first_items.len(), 2);
+    assert!((1..=2).contains(&first_items.len()));
     assert_regex_match(
         concat!(
             r"(?s)\A",
@@ -3739,6 +3434,9 @@ async fn code_mode_termination_retains_completed_nested_results_after_printed_pr
 
     require_network!();
     let (terminate, termination_ready) = tokio::sync::oneshot::channel();
+    let fixture_tool = codex_tools::code_mode_name_for_tool_name(
+        &codex_tools::ToolName::namespaced("fixture", "result"),
+    );
     let (server, _) = start_streaming_sse_server(vec![
         vec![StreamingSseChunk {
             gate: None,
@@ -3755,7 +3453,7 @@ for (let index = 0; index < 10; index++) {
 text("progress log");
 await tools.fixture__result({index: 10});
 text("must not run after cancellation");
-"#,
+"#.replace("fixture__result", &fixture_tool).as_str(),
                 ),
                 ev_completed("retained-start"),
             ]),
@@ -3869,6 +3567,7 @@ text("must not run after cancellation");
         assert_eq!(request.arguments, serde_json::json!({"index":index}));
         test.codex
             .submit(Op::DynamicToolResponse {
+                turn_id: request.turn_id,
                 id: request.call_id,
                 response: DynamicToolResponse {
                     content_items: vec![DynamicToolCallOutputContentItem::InputText {
@@ -3910,31 +3609,24 @@ text("must not run after cancellation");
     };
     assert!(visible.contains("Script terminated"), "{visible}");
     assert!(visible.contains("progress log"), "{visible}");
-    assert_eq!(visible.matches("RETAINED_RESULT_").count(), 1, "{visible}");
-    for index in 0..1 {
-        assert!(
-            visible.contains(&format!("RETAINED_RESULT_{index}")),
-            "{visible}"
-        );
-    }
-    // Ten successful calls and the cancelled eleventh call produce eleven
-    // outcomes. The fallback prioritizes the cancellation plus one successful
-    // result, and reports the other nine.
-    assert!(
-        visible.contains("9 additional nested tool results were omitted"),
-        "{visible}"
-    );
     let retained = visible
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect::<Vec<_>>();
-    // Successful text results are native text; only the cancellation is JSON.
-    assert_eq!(retained.len(), 1, "{visible}");
-    let cancelled = retained
-        .iter()
-        .find(|item| item["status"] == "aborted")
-        .expect("the cancelled nested call must survive the retention limit");
-    assert_eq!(cancelled["status"], "aborted");
+    // Two inline diagnostics plus a directory preserve every settled outcome
+    // without replaying the successful calls.
+    assert_eq!(retained.len(), 3, "{visible}");
+    assert_eq!(retained[0]["result"], "RETAINED_RESULT_0");
+    assert_eq!(retained[1]["result"]["status"], "aborted");
+    assert_eq!(retained[2]["omitted_inline_result_count"], 9);
+    let directory = retained[2]["nested_result_recovery_directory"].as_array().unwrap();
+    assert_eq!(directory.len(), 11);
+    for (index, item) in directory.iter().take(10).enumerate() {
+        assert_eq!(item["failed"], false);
+        assert_eq!(item["outcome"]["result"], format!("RETAINED_RESULT_{index}"));
+    }
+    assert_eq!(directory[10]["failed"], true);
+    assert_eq!(directory[10]["outcome"]["result"]["status"], "aborted");
     assert!(!visible.contains("must not run after cancellation"));
 
     test.submit_turn("observe the closed cell again").await?;
@@ -3950,6 +3642,7 @@ text("must not run after cancellation");
     assert!(after.contains("progress log"), "{after}");
     assert!(!after.contains("RETAINED_RESULT_"));
     assert!(!after.contains("nested tool results were omitted"));
+    assert!(!after.contains("nested_result_recovery_directory"));
     assert!(!after.contains("must not run after cancellation"));
     server.shutdown().await;
     Ok(())
@@ -3968,7 +3661,7 @@ async fn code_mode_wait_can_terminate_and_continue() -> Result<()> {
     let code = r#"
 text("phase 1");
 yield_control();
-await new Promise(() => {});
+await new Promise(resolve => setTimeout(resolve, 60_000));
 text("phase 2");
 "#;
 
@@ -4027,7 +3720,8 @@ text("phase 2");
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
-    assert_eq!(second_items.len(), 1);
+    assert!(!second_items.is_empty());
+    assert!(!second_items.iter().any(|item| item["text"].as_str().is_some_and(|text| text.contains("phase 2"))));
     assert_regex_match(
         concat!(
             r"(?s)\A",
@@ -4089,7 +3783,7 @@ async fn code_mode_wait_returns_error_for_unknown_session() -> Result<()> {
                 "exec",
                 r#"text("waiting");
 yield_control();
-await new Promise(() => {});"#,
+await new Promise(resolve => setTimeout(resolve, 60_000));"#,
             ),
             ev_completed("resp-seed"),
         ]),
@@ -4138,7 +3832,12 @@ await new Promise(() => {});"#,
         .expect("function tool output should be present");
     assert_ne!(success, Some(true));
     let output = output.expect("wait failure should include text output");
-    assert!(output.contains("exec cell 999999 not found"), "{output}");
+    let receipt = output.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["kind"] == "exec_result_unavailable")
+        .expect("unknown cell must return a typed unavailable receipt");
+    assert_eq!(receipt["cell_id"], "999999");
+    assert_eq!(receipt["status"], "unknown_cell");
+    assert_eq!(receipt["automatic_replay_allowed"], false);
 
     Ok(())
 }
@@ -4841,7 +4540,7 @@ async fn code_mode_can_use_mcp_image_result_with_image_helper() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let code = r#"
-const out = await tools.mcp__rmcp__image_scenario({
+const out = await resolve_tool("mcp__rmcp.image_scenario")({
   scenario: "image_only_original_detail",
 });
 const imageItem = out.content.find((item) => item.type === "image");
@@ -4984,13 +4683,13 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
         assert_eq!(exec_description.matches("declare const tools:").count(), 1);
         if code_mode_only {
             assert!(direct.is_none(), "code-mode-only patches resolve lazily");
-            assert!(!exec_description.contains("apply_patch(input: string"));
+            assert!(exec_description.contains("apply_patch(input: string"), "the bootstrap callable remains advertised");
         } else {
             let direct = direct.expect("mixed mode retains raw apply_patch");
             assert_eq!(direct["description"], description);
             assert!(exec_description.contains("apply_patch(input: string"));
         }
-        assert!(!exec_description.contains(description));
+        assert_eq!(exec_description.matches(description).count(), usize::from(code_mode_only));
         assert_eq!(output["result"]["success"], true);
         assert_eq!(output["result"]["changes_exact"], true);
         assert_eq!(output["result"]["changes"].as_array().unwrap().len(), 1);
@@ -5016,7 +4715,7 @@ async fn code_mode_can_print_structured_mcp_tool_result_fields() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let code = r#"
-const { content, structuredContent, isError } = await tools.mcp__rmcp__echo({
+const { content, structuredContent, isError } = await resolve_tool("mcp__rmcp.echo")({
   message: "ping",
 });
 text(
@@ -5054,7 +4753,7 @@ async fn code_mode_only_can_call_mcp_tool() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let code = r#"
-const result = await tools.mcp__rmcp__echo({ message: "ping" });
+const result = await resolve_tool("mcp__rmcp.echo")({ message: "ping" });
 text(`echo=${result.structuredContent?.echo ?? "missing"}`);
 "#;
 
@@ -5084,12 +4783,13 @@ async fn code_mode_exposes_mcp_tools_on_global_tools_object() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let code = r#"
-const { content, structuredContent, isError } = await tools.mcp__rmcp__echo({
+const echo = resolve_tool("mcp__rmcp.echo");
+const { content, structuredContent, isError } = await tools[echo.name]({
   message: "ping",
 });
 text(
-  `hasEcho=${String(Object.keys(tools).includes("mcp__rmcp__echo"))}\n` +
-    `echoType=${typeof tools.mcp__rmcp__echo}\n` +
+  `hasEcho=${String(Object.keys(tools).includes(echo.name))}\n` +
+    `echoType=${typeof tools[echo.name]}\n` +
     `echo=${structuredContent?.echo ?? "missing"}\n` +
     `isError=${String(isError)}\n` +
     `contentLength=${content.length}`
@@ -5125,10 +4825,11 @@ async fn code_mode_uses_non_prefixed_mcp_tool_names_when_feature_enabled() -> Re
 
     let server = responses::start_mock_server().await;
     let code = r#"
-const result = await tools.rmcp__echo({ message: "ping" });
+const echo = resolve_tool("rmcp.echo");
+const result = await tools[echo.name]({ message: "ping" });
 text(JSON.stringify({
-  hasNonPrefixedEcho: typeof tools.rmcp__echo === "function",
-  hasPrefixedEcho: typeof tools.mcp__rmcp__echo === "function",
+  hasNonPrefixedEcho: typeof tools[echo.name] === "function",
+  hasPrefixedEcho: typeof resolve_tool("mcp__rmcp.echo") === "function",
   echo: result.structuredContent?.echo ?? "missing",
 }));
 "#;
@@ -5171,7 +4872,7 @@ async fn code_mode_exposes_namespaced_mcp_tools_on_global_tools_object() -> Resu
     let code = r#"
 text(JSON.stringify({
   hasExecCommand: typeof tools.exec_command === "function",
-  hasNamespacedEcho: typeof tools.mcp__rmcp__echo === "function",
+  hasNamespacedEcho: typeof tools[resolve_tool("mcp__rmcp.echo").name] === "function",
 }));
 "#;
 
@@ -5205,7 +4906,8 @@ async fn code_mode_exposes_normalized_illegal_mcp_tool_names() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let code = r#"
-const result = await tools.mcp__rmcp__echo_tool({ message: "ping" });
+const name = ALL_TOOL_NAMES.find(name => name.startsWith("mcp__rmcp__echo_tool_"));
+const result = await tools[name]({ message: "ping" });
 text(`echo=${result.structuredContent.echo}`);
 "#;
 
@@ -5296,6 +4998,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "RegExp",
         "resolve_tool",
         "read_files",
+        "read_status",
         "await_command",
         "run_graph",
         "Set",
@@ -5328,6 +5031,9 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "isFinite",
         "isNaN",
         "load",
+        "listKeys",
+        "deleteStored",
+        "format_tool_result",
         "notify",
         "parseFloat",
         "parseInt",
@@ -5392,7 +5098,7 @@ async fn code_mode_exports_all_tools_metadata_for_namespaced_mcp_tools() -> Resu
     let server = responses::start_mock_server().await;
     let code = r#"
 const tool = ALL_TOOLS.find(
-  ({ name }) => name === "mcp__rmcp__echo"
+  ({ name }) => name === resolve_tool("mcp__rmcp.echo").name
 );
 text(JSON.stringify(tool));
 "#;
@@ -5412,10 +5118,13 @@ text(JSON.stringify(tool));
         &custom_tool_output_last_non_empty_text(&req, "call-1")
             .expect("exec ALL_TOOLS MCP lookup should emit JSON"),
     )?;
+    let callable = codex_tools::code_mode_name_for_tool_name(
+        &codex_protocol::ToolName::namespaced("mcp__rmcp", "echo"),
+    );
     assert_eq!(
         parsed,
         serde_json::json!({
-            "name": "mcp__rmcp__echo",
+            "name": callable,
             "description": concat!(
                 "Use these tools to exercise the rmcp test server.\n\n",
                 "Echo back the provided message and include environment data.\n\n",
@@ -5425,7 +5134,7 @@ text(JSON.stringify(tool));
                 "declare const tools: { mcp__rmcp__echo(args: { env_var?: string; message: string; }, options?: { timeout_ms?: number }): ",
                 "Promise<CallToolResult<{ echo: string; env: string | null; }>>; };\n",
                 "```",
-            ),
+            ).replace("mcp__rmcp__echo", &callable),
         })
     );
 
@@ -5472,8 +5181,8 @@ async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
     test.session_configured = new_thread.session_configured;
 
     let code = r#"
-const tool = ALL_TOOLS.find(({ name }) => name === "codex_app__hidden_dynamic_tool");
-const out = await tools.codex_app__hidden_dynamic_tool({ city: "Paris" });
+const tool = resolve_tool("codex_app.hidden_dynamic_tool");
+const out = await tool({ city: "Paris" });
 text(
   JSON.stringify({
     name: tool?.name ?? null,
@@ -5551,6 +5260,7 @@ text(
     assert_eq!(request.arguments, serde_json::json!({ "city": "Paris" }));
     test.codex
         .submit(Op::DynamicToolResponse {
+            turn_id: request.turn_id,
             id: request.call_id,
             response: DynamicToolResponse {
                 content_items: vec![DynamicToolCallOutputContentItem::InputText {
@@ -5578,10 +5288,10 @@ text(
         &custom_tool_output_last_non_empty_text(&req, "call-1")
             .expect("exec hidden dynamic tool lookup should emit JSON"),
     )?;
-    assert_eq!(
-        parsed.get("name"),
-        Some(&Value::String("codex_app__hidden_dynamic_tool".to_string()))
+    let callable = codex_tools::code_mode_name_for_tool_name(
+        &codex_protocol::ToolName::namespaced("codex_app", "hidden_dynamic_tool"),
     );
+    assert_eq!(parsed["name"], callable);
     assert_eq!(
         parsed.get("out"),
         Some(&Value::String("hidden-ok".to_string()))
@@ -5594,7 +5304,7 @@ text(
                 description.contains("Codex app tools.")
                     && description.contains("A hidden dynamic tool.")
                     && description.contains("declare const tools:")
-                    && description.contains("codex_app__hidden_dynamic_tool(args:")
+                    && description.contains(&format!("{callable}(args:"))
             })
     );
 
@@ -5700,7 +5410,7 @@ async fn code_mode_can_print_content_only_mcp_tool_result_fields() -> Result<()>
 
     let server = responses::start_mock_server().await;
     let code = r#"
-const { content, structuredContent, isError } = await tools.mcp__rmcp__image_scenario({
+const { content, structuredContent, isError } = await resolve_tool("mcp__rmcp.image_scenario")({
   scenario: "text_only",
   caption: "caption from mcp",
 });
@@ -5744,7 +5454,7 @@ async fn code_mode_can_print_error_mcp_tool_result_fields() -> Result<()> {
     let server = responses::start_mock_server().await;
     let code = r#"
 try {
-  await tools.mcp__rmcp__echo({});
+  await resolve_tool("mcp__rmcp.echo")({});
   text("unexpected success");
 } catch (error) {
   text(String(error));

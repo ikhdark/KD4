@@ -367,7 +367,8 @@ fn rg_argument_roles_preserve_flag_like_patterns_and_dependencies() {
         vec!["rg", "-ne", "--files", "src"],
         vec!["rg", "-nfpatterns.txt", "src"],
     ] {
-        let command = strings(&args);
+        let mut command = strings(&args);
+        command.splice(1..1, strings(&["--no-ignore-global", "--no-ignore-parent"]));
         assert_eq!(
             rg_search_path_operands(std::slice::from_ref(&command)),
             Some(strings(&["src"])),
@@ -409,7 +410,8 @@ fn rg_argument_roles_preserve_flag_like_patterns_and_dependencies() {
         vec!["rg", "--files", "src"],
         vec!["rg", "-L", "needle", "src"],
     ] {
-        let command = strings(&args);
+        let mut command = strings(&args);
+        command.splice(1..1, strings(&["--no-ignore-global", "--no-ignore-parent"]));
         let search = classify_rg_search_narrowing(&command, None, root, root)
             .unwrap()
             .unwrap();
@@ -626,7 +628,7 @@ fn classifies_repository_wide_and_owner_scoped_rg() {
         vec!["packages/alpha", "packages/beta"],
         vec!["scripts", "docs"],
     ] {
-        let mut command = strings(&["rg", "needle"]);
+        let mut command = strings(&["rg", "--no-ignore-global", "--no-ignore-parent", "needle"]);
         command.extend(targets.into_iter().map(str::to_string));
         let search = classify_rg_search_narrowing(&command, None, root, root)
             .unwrap()
@@ -937,7 +939,8 @@ async fn search_scope_state_ignores_unrelated_content_and_detects_target_changes
     std::fs::write(src.join("lib.rs"), b"original").expect("write target file");
     std::fs::write(root.join("outside.bin"), vec![b'x'; 1024 * 1024])
         .expect("write unrelated content");
-    let command = strings(&["rg", "needle", "src"]);
+    // A target snapshot cannot certify global or parent ignore files.
+    let command = strings(&["rg", "--no-ignore-global", "--no-ignore-parent", "needle", "src"]);
 
     let mut first = classify_rg_search_narrowing(&command, None, root, root)
         .expect("classification")

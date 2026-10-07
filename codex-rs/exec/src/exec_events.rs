@@ -28,6 +28,9 @@ pub enum ThreadEvent {
     /// Emitted when an item is updated.
     #[serde(rename = "item.updated")]
     ItemUpdated(ItemUpdatedEvent),
+    /// Incremental progress only; the terminal item remains authoritative.
+    #[serde(rename = "item.progress")]
+    ItemProgress(ItemProgressEvent),
     /// Signals that an item has reached a terminal state—either success or failure.
     #[serde(rename = "item.completed")]
     ItemCompleted(ItemCompletedEvent),
@@ -51,13 +54,54 @@ pub struct TurnCompletedEvent {
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surfaced_result: Option<codex_app_server_protocol::SurfacedToolResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<codex_app_server_protocol::TurnTiming>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct TurnFailedEvent {
     pub error: ThreadErrorEvent,
+    #[serde(default)]
+    pub disposition: TurnFailureDisposition,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+    #[serde(default)]
+    pub timing: Option<codex_app_server_protocol::TurnTiming>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFailureDisposition {
+    #[default]
+    Failed,
+    Interrupted,
+    TransportLost,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct ItemProgressEvent {
+    pub item_id: String,
+    /// Original item identity, for correlation with app-server events.
+    pub call_id: String,
+    #[serde(flatten)]
+    pub progress: ItemProgress,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ItemProgress {
+    CommandOutput {
+        delta: String,
+        stream: Option<codex_protocol::protocol::ExecOutputStream>,
+        decoding_lossy: Option<bool>,
+        /// This update was display-reduced, independently of upstream decoding.
+        truncated: bool,
+    },
+    Mcp {
+        message: String,
+        progress: Option<f64>,
+        total: Option<f64>,
+        truncated: bool,
+    },
 }
 
 /// Token usage for the thread as of the turn's completion. The counts are
@@ -165,6 +209,15 @@ pub enum CommandExecutionStatus {
 /// A command executed by the agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct CommandExecutionItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output_metadata: Option<codex_protocol::items::CommandExecutionOutputMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stderr: Option<String>,
     pub command: String,
     pub aggregated_output: String,
     pub exit_code: Option<i32>,
@@ -193,7 +246,7 @@ pub struct CommandExecutionItem {
     pub execution_id: Option<String>,
 }
 
-/// A terminally failed code-mode JavaScript cell.
+/// A code-mode JavaScript cell. Completion does not imply child processes exited.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct CodeModeCellItem {
     pub call_id: String,
@@ -205,6 +258,10 @@ pub struct CodeModeCellItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeModeCellStatus {
+    InProgress,
+    Yielded,
+    Completed,
+    Terminated,
     Failed,
 }
 

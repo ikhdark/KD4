@@ -55,10 +55,10 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-struct TerminationControl {
-    started: Notify,
-    allowed: watch::Sender<bool>,
-    completed: AtomicBool,
+pub(super) struct TerminationControl {
+    pub(super) started: Notify,
+    pub(super) allowed: watch::Sender<bool>,
+    pub(super) completed: AtomicBool,
     calls: AtomicUsize,
 }
 
@@ -95,7 +95,7 @@ async fn output_chunk_updates_are_cancellation_atomic() {
 }
 
 impl TerminationControl {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let (allowed, _allowed_rx) = watch::channel(false);
         Self {
             started: Notify::new(),
@@ -129,6 +129,7 @@ impl MockExecProcess {
                 exit_code: None,
                 closed: false,
                 failure: None,
+                output_gap: None,
                 sandbox_denied: false,
             }))
     }
@@ -192,7 +193,7 @@ pub(super) async fn remote_process(
     remote_process_with_termination_control(write_status, terminate_error, None).await
 }
 
-async fn remote_process_with_termination_control(
+pub(super) async fn remote_process_with_termination_control(
     write_status: WriteStatus,
     terminate_error: Option<String>,
     termination_control: Option<Arc<TerminationControl>>,
@@ -441,7 +442,7 @@ async fn registered_network_denial_cleanup_is_awaited_without_tracking_idle_watc
                     call_id: "network-cleanup-owner".to_string(),
                     payload: ToolPayload::Function {
                         arguments: serde_json::json!({
-                            "kind": "argv", "program": program, "args": args,
+                            "program": program, "args": args,
                             "tty": false, "yield_time_ms": 1000,
                         })
                         .to_string(),
@@ -592,7 +593,9 @@ pub(super) async fn store_process_for_test(
     process: Arc<UnifiedExecProcess>,
 ) {
     let cwd = turn.cwd().clone().into();
-    manager.process_store.lock().await.processes.insert(
+    let mut store = manager.process_store.lock().await;
+    store.used_process_ids.insert(process_id, Some(process.session_capabilities(true).incarnation));
+    store.processes.insert(
         process_id,
         ProcessEntry {
             process,
@@ -622,6 +625,37 @@ fn write_stdin_invocation(
     write_stdin_invocation_with_chars(session, turn, call_id, process_id, "")
 }
 
+#[tokio::test]
+async fn process_incarnation_rejects_legacy_and_reused_numeric_handles() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let manager = &session.services.unified_exec_manager;
+    let old = remote_process(WriteStatus::Accepted, None).await;
+    store_process_for_test(manager, &session, &turn, 1003, Arc::clone(&old)).await;
+    let original = write_stdin_invocation(session.clone(), turn.clone(), "old", 1003);
+    old.terminate_confirmed().await.unwrap();
+    manager.process_store.lock().await.remove(1003);
+    let replacement = remote_process(WriteStatus::Accepted, None).await;
+    store_process_for_test(manager, &session, &turn, 1003, Arc::clone(&replacement)).await;
+    assert_ne!(old.session_capabilities(true).incarnation, replacement.session_capabilities(true).incarnation);
+    for legacy in [false, true] {
+        for (chars, terminate) in [("", false), ("unsafe", false), ("", true)] {
+            let mut invocation = original.clone();
+            let ToolPayload::Function { arguments } = &mut invocation.payload else { unreachable!() };
+            let mut args: serde_json::Value = serde_json::from_str(arguments).unwrap();
+            args["chars"] = chars.into();
+            args["terminate"] = terminate.into();
+            if legacy { args.as_object_mut().unwrap().remove("incarnation"); }
+            *arguments = args.to_string();
+            let error = WriteStdinHandler::default().handle(invocation).await.err().expect("old handle must fail");
+            assert!(error.to_string().contains("creation identity"), "{error}");
+            assert!(!replacement.termination_was_requested());
+        }
+    }
+    replacement.terminate_confirmed().await.unwrap();
+}
+
 fn write_stdin_invocation_with_chars(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -629,6 +663,11 @@ fn write_stdin_invocation_with_chars(
     process_id: u32,
     chars: &str,
 ) -> ToolInvocation {
+    let incarnation = {
+        let store = session.services.unified_exec_manager.process_store.try_lock().unwrap();
+        store.processes.get(&process_id).map(|entry| entry.process.session_capabilities(entry.tty).incarnation)
+            .or_else(|| store.used_process_ids.get(&process_id).copied().flatten())
+    };
     ToolInvocation {
         session,
         step_context: StepContext::for_test(Arc::clone(&turn)),
@@ -640,6 +679,7 @@ fn write_stdin_invocation_with_chars(
         payload: ToolPayload::Function {
             arguments: serde_json::json!({
                 "session_id": process_id,
+                "incarnation": incarnation,
                 "chars": chars,
                 "yield_time_ms": 60_000,
             })
@@ -662,6 +702,33 @@ fn hold_artifact_lock(
         .recv_timeout(Duration::from_secs(1))
         .expect("artifact lock thread should acquire the lock");
     (release_tx, lock_thread)
+}
+
+#[tokio::test]
+async fn queued_deadline_handback_does_not_wait_for_artifact_or_send_input() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let temp = tempfile::tempdir().unwrap();
+    let process = remote_process_with_options(WriteStatus::Accepted, None, None,
+        Some(create_raw_output_artifact(temp.path(), "queued", b"retained").await)).await;
+    let manager = &session.services.unified_exec_manager;
+    store_process_for_test(manager, &session, &turn, 1234, Arc::clone(&process)).await;
+    let interaction = process.interaction_lock().lock_owned().await;
+    let artifact = process.raw_output_artifact_owner_for_test().unwrap();
+    let artifact_lock = artifact.lock().await;
+    let response = tokio::time::timeout(Duration::from_secs(1), manager.write_stdin(super::WriteStdinRequest {
+        process_id: 1234, input: "must-not-be-written", yield_time_ms: 250,
+        max_output_tokens: None, truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+        nested_deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
+    })).await.expect("queue timeout must hand back inside the outer deadline").unwrap();
+    assert_eq!(response.process_id, Some(1234));
+    assert!(!response.process_exited);
+    assert!(response.raw_output_artifact.is_none());
+    assert!(response.repair_notice.unwrap().to_ascii_lowercase().contains("input was not delivered"));
+    drop(artifact_lock);
+    drop(interaction);
+    manager.terminate_all_processes().await;
 }
 
 struct DelayedInputExecProcess {
@@ -997,8 +1064,29 @@ async fn stall_timeout_resets_on_stdout_and_stderr_then_yields_without_terminati
     assert_eq!(process.failure_message(), None);
     let output = String::from_utf8(process.snapshot_output().await).unwrap();
     assert!(output.starts_with("progressprogressprogress"));
-    assert!(output.contains("stalled after 100 milliseconds"));
-    assert!(output.contains("still running, not terminated"));
+    assert!(output.contains("no output observed for 100 milliseconds"));
+    assert!(output.contains("process exit not observed, termination not requested"));
+    let observation = process.session_capabilities(false).observation.unwrap();
+    assert_eq!(observation.silent_for_ms, 100);
+    assert_eq!(observation.reason, crate::tools::context::ExecObservationReason::NoOutputObserved);
+    assert!(!observation.process_exited);
+    assert!(!observation.termination_requested);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(String::from_utf8(process.snapshot_output().await).unwrap(), output);
+    for stream in [ExecOutputStream::Stdout, ExecOutputStream::Stderr] {
+        let notified = process.interaction_requested().notified_owned();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        process.publish_stream_output_for_test(stream, b"resumed".to_vec()).await;
+        tokio::task::yield_now().await;
+        assert!(process.session_capabilities(false).observation.is_none());
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::time::timeout(Duration::from_secs(1), notified).await.unwrap();
+    }
+    let output = String::from_utf8(process.snapshot_output().await).unwrap();
+    assert_eq!(output.matches("no output observed for 100 milliseconds").count(), 3);
+    assert!(!process.has_exited());
     process.terminate_confirmed().await.unwrap();
 }
 
@@ -2335,12 +2423,15 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
     let results = [(invocation_a, result_a), (invocation_b, result_b)];
     let mut completions = 0;
     let mut post_hooks = 0;
-    let mut unknown_process_errors = 0;
+    let mut terminal = None;
 
     for (invocation, result) in results {
         match result {
             Ok(output) => {
                 completions += 1;
+                let value = output.code_mode_result(&invocation.payload);
+                if let Some(previous) = &terminal { assert_eq!(&value, previous); }
+                terminal = Some(value);
                 assert_eq!(
                     output.code_mode_result(&invocation.payload)["session_id"],
                     serde_json::Value::Null
@@ -2352,15 +2443,31 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
                     post_hooks += 1;
                 }
             }
-            Err(FunctionCallError::RespondToModel(message)) => {
-                assert!(message.to_ascii_lowercase().contains("unknown process"));
-                unknown_process_errors += 1;
-            }
             Err(other) => panic!("unexpected write_stdin error: {other:?}"),
         }
     }
 
-    assert_eq!(completions, 1);
+    assert_eq!(completions, 2);
     assert_eq!(post_hooks, 1);
-    assert_eq!(unknown_process_errors, 1);
+    let invocation = write_stdin_invocation(Arc::clone(&session), Arc::clone(&turn), "poll-again", 1003);
+    let output = handler.handle(invocation.clone()).await.unwrap();
+    let replay = output.code_mode_result(&invocation.payload);
+    assert_eq!(Some(&replay), terminal.as_ref());
+    assert_eq!(replay["process_exited"], true);
+    assert_eq!(replay["output_complete"], true);
+    assert!(handler.post_tool_use_payload(&invocation, output.as_ref()).is_none());
+    {
+        let mut store = manager.process_store.lock().await;
+        let sample = store.finished.front().unwrap().1.clone();
+        for id in 2000..2040 { store.remember_finished(id, &sample); }
+        assert_eq!(store.finished.len(), 32);
+        assert_eq!(store.finished.front().unwrap().0, 2008);
+        assert!(store.used_process_ids.contains_key(&1003));
+        assert!(store.used_process_ids.contains_key(&2000));
+        // Preserve the late-input assertion below after checking bounded eviction.
+        store.remember_finished(1003, &sample);
+    }
+    let write = write_stdin_invocation_with_chars(session, turn, "late-input", 1003, "unsafe");
+    let error = handler.handle(write).await.err().expect("input must be rejected");
+    assert!(error.to_string().contains("has exited; input was not delivered"));
 }

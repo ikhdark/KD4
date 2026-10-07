@@ -62,7 +62,7 @@ use crate::mentions::build_skill_name_counts;
 use crate::mentions::collect_explicit_app_ids;
 use crate::mentions::collect_explicit_plugin_mentions;
 use crate::mentions::collect_tool_mentions_from_messages;
-use crate::plan_skill_injections;
+use codex_core_skills::injection::plan_skill_injections_with_resolved;
 use crate::plugins::PluginCapabilitySummary;
 use crate::plugins::build_plugin_injections;
 use crate::responses_metadata::CodexResponsesMetadata;
@@ -370,7 +370,7 @@ pub(crate) async fn run_turn(
             })
     });
     let mut finalized_mutation_revision = None;
-    let mut last_stop_repair = None;
+    let mut seen_stop_repairs = Vec::new();
     let mut completion_evidence = None;
     let mut provider_overflow_recovery_attempted = false;
     let mut final_answer_compaction_deferred = false;
@@ -481,6 +481,7 @@ pub(crate) async fn run_turn(
 
     let mut last_agent_message: Option<String> = None;
     let mut surfaced_result: Option<SurfacedToolResult> = None;
+    let mut completion_assessment;
     let mut stop_hook_active = false;
     let mut pending_continuation_cause = None;
     let mut pending_generation_request: Option<GenerationRequestDisposition> = None;
@@ -498,7 +499,12 @@ pub(crate) async fn run_turn(
     sess.state.lock().await.history.rehydrate_read_replays(&sess.services.path_replays);
     let mut turn_execution =
         TurnExecutionControl::new_with_timing(Arc::clone(&turn_context.turn_timing_state))
-            .with_session_path_replays(Arc::clone(&sess.services.path_replays));
+            .with_session_path_replays(Arc::clone(&sess.services.path_replays))
+            .with_active_plan(if turn_context.collaboration_mode.mode == ModeKind::Plan {
+                None
+            } else {
+                sess.services.plan_store.execution_snapshot().await
+            });
     turn_execution.rehydrate_argument_failures(sess.state.lock().await.history.raw_items());
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
@@ -515,6 +521,9 @@ pub(crate) async fn run_turn(
     // text only on a cache miss.
     let base_instructions = Arc::clone(&turn_context.base_instructions);
     'sampling_loop: loop {
+        // Metadata belongs to this attempt, while underlying evidence stays in
+        // the turn execution owner across repairs and pending-input continuations.
+        completion_assessment = None;
         let draining_initial_mailbox = !can_drain_pending_input && initial_mailbox_pending;
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -552,8 +561,7 @@ pub(crate) async fn run_turn(
         if recorded_input.accepted_context_input {
             initial_workspace_prefetch = None;
             prefetched_workspace_identity = None;
-            finalized_mutation_revision = None;
-            last_stop_repair = None;
+            seen_stop_repairs.clear();
             completion_evidence = None;
             provider_overflow_recovery_attempted = false;
             turn_execution.accepted_user_input();
@@ -577,10 +585,12 @@ pub(crate) async fn run_turn(
         };
         let request_baselines = {
             let tracker = turn_diff_tracker.lock().await;
-            turn_execution.baselines_with_tool_exposure_revision(
+            let mut baselines = turn_execution.baselines_with_tool_exposure_revision(
                 tracker.current_mutation_revision(),
                 turn_context.deferred_tool_activation_revision(),
-            )
+            );
+            baselines.set_attributed_mutation_revision(tracker.attributed_mutation_revision());
+            baselines
         };
         let request_signals = if kd4_runtime {
             turn_execution.collector(&request_baselines)
@@ -799,10 +809,20 @@ pub(crate) async fn run_turn(
                     return Ok(TurnTaskResult {
                         last_agent_message,
                         surfaced_result,
+                        completion_assessment: None,
                         required_tool_terminal: Some(required_tool_terminal),
                         defer_pending_input: false,
                     });
                 }
+                {
+                    let tracker = turn_diff_tracker.lock().await;
+                    turn_execution.retain_validation_across_changes(settled_state.mutation_revision, &tracker);
+                }
+                turn_execution.refresh_plan(if turn_context.collaboration_mode.mode == ModeKind::Plan {
+                    None
+                } else {
+                    sess.services.plan_store.execution_snapshot().await
+                });
                 turn_execution.settle(&request_baselines, &request_signals, &settled_state);
                 let progress_kinds = turn_execution.observe_progress(
                     &request_baselines,
@@ -810,7 +830,6 @@ pub(crate) async fn run_turn(
                     &settled_state,
                 );
                 logical_generation_budget.observe_progress(
-                    !progress_kinds.is_empty(),
                     request_signals.observed_successful_process_monitor()
                         || request_signals.observed_yielded_execution(),
                 );
@@ -1020,19 +1039,22 @@ pub(crate) async fn run_turn(
                 }
 
                 if !needs_follow_up {
-                    if let Some(authoritative_result) = authoritative_wait_terminal_surface {
+                    // A delivery candidate has no publication authority until this
+                    // completion attempt survives hooks and pending-input admission.
+                    let candidate = authoritative_wait_terminal_surface;
+                    if let Some(authoritative_result) = candidate.as_ref() {
                         last_agent_message = authoritative_result.canonical_message.clone();
-                        surfaced_result = Some(authoritative_result);
                     } else {
                         last_agent_message = sampling_request_last_agent_message;
                     }
                     // C1: the direct runtime shares this completion path. It must not skip
                     // the after-agent and completion-stop hooks, because those are the
                     // authoritative, user-configured control over whether a turn may finish.
+                    let mut finalizer_ran = false;
                     let mutating_finalizer_aborted = if matches!(
                         turn_context.config.after_agent_policy,
                         AfterAgentPolicy::MutatingFinalizer
-                    ) {
+                    ) && turn_context.config.notify.as_ref().is_some_and(|command| !command.is_empty()) {
                         if finalized_mutation_revision
                             .is_some_and(|revision| revision != settled_state.mutation_revision)
                         {
@@ -1047,6 +1069,7 @@ pub(crate) async fn run_turn(
                             ));
                         }
                         if finalized_mutation_revision.is_none() {
+                            finalizer_ran = true;
                             let after_agent_outcome = run_legacy_after_agent_hook(
                                 &sess,
                                 &turn_context,
@@ -1073,21 +1096,53 @@ pub(crate) async fn run_turn(
                             defer_pending_input,
                         ));
                     }
-                    let completion_gaps = {
+                    if finalizer_ran {
+                        // Finalization invalidates the candidate's validation boundary.
+                        // Run the unsafe hook once, then let the existing validation
+                        // workflow verify the resulting state or report its limitation.
+                        if admit_regular_follow_up(
+                            sess.as_ref(), turn_context.as_ref(), logical_generation_budget,
+                            &mut generation_budget_error_reported,
+                        ).await {
+                            sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
+                                id: None,
+                                role: "developer".to_string(),
+                                content: vec![ContentItem::InputText { text:
+                                    "The mutating finalizer has run exactly once. Earlier validation does not cover the final workspace. Validate the affected final state before accepting an answer, or truthfully report unavailable verification. Do not replay the finalizer; further workspace edits cannot be finalized safely in this turn.".to_string() }],
+                                phase: None,
+                                internal_chat_message_metadata_passthrough: None,
+                            }]).await?;
+                            pending_generation_request = None;
+                            pending_continuation_cause = Some(ContinuationCause::StopHook);
+                            continue 'sampling_loop;
+                        }
+                        return Ok(after_agent_abort_result(last_agent_message, surfaced_result, defer_pending_input));
+                    }
+                    let (changed_paths, has_untracked_changes) = {
                         let tracker = turn_diff_tracker.lock().await;
-                        turn_execution.completion_gaps_with_changed_paths(
-                            settled_state.mutation_revision,
-                            tracker.exact_changed_paths().as_deref(),
-                        )
+                        (Some(tracker.changed_paths()), tracker.has_untracked_changes())
                     };
+                    let changed_paths = match changed_paths {
+                        Some(paths) => Some(sess.services.git_workspace.validation_relevant_paths(
+                            turn_context.config.cwd.as_path(), paths,
+                        ).await),
+                        None => None,
+                    };
+                    let mut assessment = turn_execution.completion_assessment_with_changed_paths(
+                        settled_state.mutation_revision, changed_paths.as_deref(), has_untracked_changes,
+                    );
+                    if finalized_mutation_revision.is_some_and(|revision| revision != settled_state.mutation_revision) {
+                        assessment.verification_gaps.push("A mutating finalizer ran after the last settled validation state. That validation does not cover the final workspace; the hook was not replayed because it has no repeat-safety contract.".to_string());
+                    }
                     let completion_stop_report = run_completion_stop_hook(
                         &sess,
                         &turn_context,
                         stop_hook_active,
                         last_agent_message.clone(),
-                        completion_gaps,
+                        assessment,
                     )
                     .await;
+                    completion_assessment = Some(completion_stop_report.assessment.clone());
                     if let Some(hook_prompt_message) = completion_stop_report.continuation_prompt {
                         let mut repair_state = settled_state.clone();
                         repair_state.mutation_revision =
@@ -1098,8 +1153,9 @@ pub(crate) async fn run_turn(
                                 .collect::<Vec<_>>(),
                             turn_execution.settled_revision_key(&repair_state),
                             completion_evidence.clone(),
+                            last_agent_message.clone(),
                         );
-                        if last_stop_repair.as_ref() == Some(&repair) {
+                        if seen_stop_repairs.contains(&repair) {
                             emit_status_affecting_turn_error(
                                 sess.as_ref(), turn_context.as_ref(),
                                 "Stop hook repeated the same blocking feedback without changed state or evidence after a repair attempt.",
@@ -1110,7 +1166,7 @@ pub(crate) async fn run_turn(
                                 defer_pending_input,
                             ));
                         }
-                        last_stop_repair = Some(repair);
+                        seen_stop_repairs.push(repair);
                         if admit_regular_follow_up(
                             sess.as_ref(),
                             turn_context.as_ref(),
@@ -1195,6 +1251,7 @@ pub(crate) async fn run_turn(
                         }
                         CompletionPendingInputDisposition::None => {}
                     }
+                    surfaced_result = candidate;
                     break;
                 }
                 pending_continuation_cause = ordinary_continuation_cause(
@@ -1310,6 +1367,7 @@ pub(crate) async fn run_turn(
     Ok(TurnTaskResult {
         last_agent_message,
         surfaced_result,
+        completion_assessment,
         required_tool_terminal: None,
         defer_pending_input,
     })
@@ -1331,12 +1389,14 @@ fn rebase_generation_request_after_compaction(
 
 fn after_agent_abort_result(
     last_agent_message: Option<String>,
-    surfaced_result: Option<SurfacedToolResult>,
+    _surfaced_result: Option<SurfacedToolResult>,
     defer_pending_input: bool,
 ) -> TurnTaskResult {
     TurnTaskResult {
         last_agent_message,
-        surfaced_result,
+        // Rejected output remains in tool/history evidence, not accepted output.
+        surfaced_result: None,
+        completion_assessment: None,
         required_tool_terminal: None,
         defer_pending_input,
     }
@@ -1423,10 +1483,11 @@ fn authoritative_wait_terminal_surface(
     }
 }
 
-// Bound generations without new evidence. Productive work renews this window;
-// executor-owned process monitoring does not consume it. Deterministic repeated
-// cycles are also handled by the turn execution control.
-const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 16;
+// Explicit emergency budget, not a claim about remaining reasoning scope.
+// Retained-evidence analysis can use the entire allowance. Identical action/result
+// cycles are suppressed by the existing deterministic-cycle machinery instead
+// of treating evidence novelty as reasoning progress. Owned monitoring is free.
+const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogicalGenerationAdmission {
@@ -1442,10 +1503,8 @@ pub(crate) struct LogicalGenerationBudget {
 }
 
 impl LogicalGenerationBudget {
-    fn observe_progress(&mut self, new_evidence: bool, successful_process_monitor: bool) {
-        if new_evidence {
-            self.regular_generations = 0;
-        } else if successful_process_monitor {
+    fn observe_progress(&mut self, successful_process_monitor: bool) {
+        if successful_process_monitor {
             self.regular_generations = self.regular_generations.saturating_sub(1);
         }
     }
@@ -1516,12 +1575,12 @@ fn completion_pending_input_disposition(
     }
 }
 
-const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "The turn exhausted its allowance for generations without new evidence. Work is suspended, not completed. This is the final tool-free synthesis request. Do not call tools. Summarize completed work and truthfully report remaining work, failed validation, running processes, and how to resume.";
+const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "The turn exhausted its explicit generation safety budget. This does not establish exhaustion of useful reasoning or evidence. Work is suspended, not completed. This is the final tool-free synthesis request. Do not call tools. Summarize completed work and truthfully report remaining work, failed validation, running processes, and how to resume.";
 async fn record_forced_terminal_budget_boundary(sess: &Session, turn_context: &TurnContext) {
     sess.send_event(
         turn_context,
         EventMsg::Warning(WarningEvent {
-            message: format!("This turn reached {MAX_REGULAR_LOGICAL_GENERATIONS} generations without new evidence. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."),
+            message: format!("This turn reached its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."),
         }),
     )
     .await;
@@ -1623,7 +1682,7 @@ async fn report_logical_generation_budget_exhausted(
     emit_status_affecting_turn_error(
         sess,
         turn_context,
-        format!("This turn exhausted its allowance of {MAX_REGULAR_LOGICAL_GENERATIONS} generations without new evidence and one final summary. Work is suspended before all requested work completed. Send another message to resume."),
+        format!("This turn exhausted its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations and one final summary. Work is suspended before all requested work completed. Send another message to resume."),
     )
     .await;
 }
@@ -1743,9 +1802,11 @@ async fn record_turn_execution_directive(
             .record_no_progress_directive();
     }
     let directive_item = ResponseItem::Message {
-        id: None,
+        id: Some(codex_protocol::ResponseItemId::with_suffix("msg_turn_advice", &turn_context.sub_id)),
         role: "developer".to_string(),
-        content: vec![ContentItem::InputText { text: directive }],
+        content: vec![ContentItem::InputText { text: format!(
+            "Turn-local convergence advice for task {} only; expires when that task ends. It does not constrain a later task or its scope.\n{directive}", turn_context.sub_id
+        ) }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
@@ -1756,6 +1817,7 @@ async fn record_turn_execution_directive(
 }
 
 struct CompletionStopHookReport {
+    assessment: codex_protocol::protocol::TurnCompletionAssessment,
     should_block: bool,
     continuation_prompt: Option<ResponseItem>,
     continuation_feedback: Vec<String>,
@@ -1777,22 +1839,28 @@ async fn run_completion_stop_hook(
     turn_context: &Arc<TurnContext>,
     stop_hook_active: bool,
     last_agent_message: Option<String>,
-    mut completion_gaps: Vec<String>,
+    mut assessment: codex_protocol::protocol::TurnCompletionAssessment,
 ) -> CompletionStopHookReport {
     if last_agent_message.as_deref().is_some_and(final_reports_unfinished_work) {
-        completion_gaps.insert(
+        assessment.verification_gaps.insert(
             0,
             "The assistant's final response reports unfinished requested work.".to_string(),
         );
     }
-    if !completion_gaps.is_empty() {
+    if !assessment.failed_checks.is_empty() || !assessment.verification_gaps.is_empty() {
         // A truthful limitation is allowed, but must not silently look like
         // verified task completion. Do not auto-loop on a genuine blocker.
         sess.send_event(turn_context, EventMsg::Warning(WarningEvent {
             message: format!(
                 "{} This turn is not a verified completion of that scope.",
-                completion_gaps.join(" ")
+                assessment.failed_checks.iter().chain(&assessment.verification_gaps)
+                    .cloned().collect::<Vec<_>>().join(" ")
             ),
+        })).await;
+    }
+    if !assessment.advisories.is_empty() {
+        sess.send_event(turn_context, EventMsg::Warning(WarningEvent {
+            message: format!("Completion advisory: {}", assessment.advisories.join(" ")),
         })).await;
     }
     let observed =
@@ -1820,6 +1888,7 @@ async fn run_completion_stop_hook(
         .await;
     }
     CompletionStopHookReport {
+        assessment,
         should_block: stop.should_block,
         continuation_prompt,
         continuation_feedback: stop
@@ -1942,6 +2011,10 @@ async fn inspect_inputs(
             )
             .await;
         } else {
+            if let TurnInput::UserInput { content, .. } = input_item {
+                // Commit authority only after this input passes UserPromptSubmit.
+                turn_context.update_multi_agent_spawn_authorization(content);
+            }
             if resets_turn_execution(input_item) {
                 accepted_context_input = true;
             }
@@ -2165,6 +2238,7 @@ async fn build_pure_pending_turn_plan(
         ))
     );
     let extension_injection_items = extension_injection_items?;
+    super::multi_agents::refresh_instruction_authority(turn_context, step_context.loaded_agents_md.as_deref());
     // DAG edge P -> plugin mentions. Connector inventory C waits for P because
     // plugin mentions can make inventory necessary even when apps are disabled.
     let mentioned_plugins =
@@ -2213,17 +2287,20 @@ async fn build_pure_pending_turn_plan(
     let connector_slug_counts = build_connector_slug_counts(&available_connectors);
     let skill_name_counts_lower =
         build_skill_name_counts(&skills_outcome.skills, &skills_outcome.disabled_paths).1;
-    let mentioned_skills = collect_explicit_skill_mentions(
+    let injected_host_skill_prompts = turn_context.extension_data.get::<InjectedHostSkillPrompts>();
+    let mentioned_skills = injected_host_skill_prompts.as_ref().map(|prompts| prompts.selected.clone()).unwrap_or_else(|| collect_explicit_skill_mentions(
         &user_input,
         &skills_outcome.skills,
         &skills_outcome.disabled_paths,
         &connector_slug_counts,
-    );
+    ));
+    let dependency_skills = injected_host_skill_prompts.as_ref()
+        .map(|prompts| prompts.admitted_skills()).unwrap_or_else(|| mentioned_skills.clone());
     // Once SK is resolved, inventory-effect planning and pure skill materialization
     // are independent and remain side-effect free.
     let (planned_mcp, skill_plan) = tokio::join!(
-        time_planning_step("mcp_dependencies", plan_mcp_dependencies(sess, turn_context, &mentioned_skills)),
-        time_planning_step("skill_injections", plan_skill_injections(&mentioned_skills, Some(skills_outcome)))
+        time_planning_step("mcp_dependencies", plan_mcp_dependencies(sess, turn_context, &dependency_skills)),
+        time_planning_step("skill_injections", plan_skill_injections_with_resolved(&mentioned_skills, Some(skills_outcome), injected_host_skill_prompts.as_deref()))
     );
     let skill_connector_items = skill_plan
         .injections
@@ -2265,9 +2342,6 @@ async fn build_pure_pending_turn_plan(
     let mut mentioned_apps = mentioned_apps;
     mentioned_apps.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let injected_host_skill_prompts = turn_context
-        .extension_data
-        .get::<InjectedHostSkillPrompts>();
     let mut injection_items =
         build_bounded_skill_context_items(skill_plan.injections.items.iter().filter(|skill| {
             injected_host_skill_prompts
@@ -2812,21 +2886,28 @@ fn defer_compaction_for_final_answer(
         })
 }
 
-fn build_bounded_skill_context_items<'a, F>(
-    skill_fragments: impl IntoIterator<Item = &'a F>,
-) -> Vec<ResponseItem>
-where
-    F: ContextualUserFragment + 'a,
-{
+fn build_bounded_skill_context_items<'a>(
+    skill_fragments: impl IntoIterator<Item = &'a codex_core_skills::injection::SkillInjection>,
+) -> Vec<ResponseItem> {
+    let fragments = skill_fragments.into_iter().collect::<Vec<_>>();
+    let notices = fragments.iter().map(|skill| {
+        let mut notice = (*skill).clone();
+        notice.contents = "INCOMPLETE MODEL DELIVERY: instructions were loaded by the host but not delivered. Before using this selected skill, use read_file with the exact path above to read the complete instructions. Do not infer permission from an excerpt.".to_string();
+        notice.render()
+    }).collect::<Vec<_>>();
     let mut budget = ModelContextBudget::default();
-    skill_fragments
-        .into_iter()
-        .filter_map(|fragment| {
-            budget.take_fragment(fragment).map(|text| {
-                ContextualUserFragment::into(RenderedContextFragment::new(fragment.role(), text))
-            })
-        })
-        .collect()
+    // Reserve every exact recovery identity before admitting instruction bodies.
+    // Recovery notices are never cut, even for an unusually large selection.
+    if !budget.try_take_bytes(notices.iter().map(String::len).sum()) {
+        budget = ModelContextBudget::new(0);
+    }
+    fragments.into_iter().zip(notices).map(|(fragment, notice)| {
+        let full = fragment.render();
+        let text = if full.len() <= notice.len() || budget.try_take_bytes(full.len() - notice.len()) {
+            full
+        } else { notice };
+        ContextualUserFragment::into(RenderedContextFragment::new(fragment.role(), text))
+    }).collect()
 }
 
 #[tracing::instrument(
@@ -2901,17 +2982,33 @@ async fn build_extension_turn_input_items(
             }
         });
     }
-    let mut items = Vec::new();
-    let mut budget = ModelContextBudget::default();
+    let mut fragments = Vec::new();
     while let Some(contributed_fragments) = pending.next().await {
         let contributed_fragments = contributed_fragments?;
-        items.extend(contributed_fragments.into_iter().filter_map(|fragment| {
-            budget.take_fragment(fragment.as_ref()).map(|text| {
-                ContextualUserFragment::into(RenderedContextFragment::new(fragment.role(), text))
-            })
-        }));
+        fragments.extend(contributed_fragments.into_iter().map(|fragment| (fragment.role(), fragment.render())));
     }
-
+    let mut budget = ModelContextBudget::default();
+    let mut items = Vec::new();
+    let total = fragments.iter().map(|(_, text)| text.len()).sum::<usize>();
+    let notice = if total > budget.remaining_bytes() {
+        let recovery = sess.retain_context_source("selected_extension_instructions", serde_json::json!(
+            fragments.iter().map(|(role, text)| serde_json::json!({"role":role,"text":text})).collect::<Vec<_>>()
+        )).await?;
+        let text = format!("Selected extension instructions: INCOMPLETE MODEL DELIVERY. Whole fragments follow where admitted; others (including producer recovery notices) remain in this exact directory. Recover /items before using selected capabilities. Loading is not delivery; recovered entries retain their recorded authority. {recovery}");
+        budget.try_take(&text);
+        Some(ContextualUserFragment::into(RenderedContextFragment::new("developer", text)))
+    } else { None };
+    for (role, text) in fragments {
+        if budget.try_take(&text) {
+            items.push(ContextualUserFragment::into(RenderedContextFragment::new(role, text)));
+        }
+    }
+    items.extend(notice);
+    if let Some(selected) = turn_context.extension_data.get::<InjectedHostSkillPrompts>() {
+        let mut selected = (*selected).clone();
+        selected.retain_admitted_items(&items);
+        turn_context.extension_data.insert(selected);
+    }
     Ok(items)
 }
 
@@ -3945,7 +4042,7 @@ async fn run_sampling_request(
         sess.as_ref(),
         turn_context.as_ref(),
         "tool_search_sources",
-        &router.tool_search_sources,
+        &router.tool_search_sources_for_instructions(turn_context.developer_instructions.as_deref()),
     )
     .await?
     {
@@ -4108,7 +4205,7 @@ async fn run_sampling_request(
                 sess.as_ref(),
                 turn_context.as_ref(),
                 "tool_search_sources",
-                &router.tool_search_sources,
+                &router.tool_search_sources_for_instructions(turn_context.developer_instructions.as_deref()),
             )
             .await?;
             let retry_input = prepare_sampling_prompt_for_client(
@@ -6596,6 +6693,7 @@ async fn try_run_sampling_request(
         let tracker = turn_diff_tracker.lock().await;
         SamplingRequestSettledState {
             mutation_revision: tracker.current_mutation_revision(),
+            attributed_mutation_revision: tracker.attributed_mutation_revision(),
             tool_exposure_revision: turn_context.deferred_tool_activation_revision(),
         }
     };

@@ -37,7 +37,7 @@ impl ToolName {
 impl fmt::Display for ToolName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.namespace {
-            Some(namespace) => write!(f, "{namespace}{}", self.name),
+            Some(namespace) => write!(f, "{namespace}__{}", self.name),
             None => f.write_str(&self.name),
         }
     }
@@ -72,5 +72,16 @@ impl From<String> for ToolName {
 impl From<&str> for ToolName {
     fn from(name: &str) -> Self {
         Self::plain(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolName;
+
+    #[test]
+    fn display_uses_callable_namespace_separator() {
+        assert_eq!(ToolName::namespaced("agents", "get_agent_task").to_string(), "agents__get_agent_task");
+        assert_eq!(ToolName::plain("read_file").to_string(), "read_file");
     }
 }

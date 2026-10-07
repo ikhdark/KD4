@@ -86,6 +86,8 @@ class SourceInventoryTests(unittest.TestCase):
             self.assertEqual(benchmark.main(), 0)
         report = json.loads((output / "report.json").read_bytes())
         self.assertTrue(report["correctness_verified"])
+        self.assertFalse(report["requirement_adherence_verified"])
+        self.assertIn("paired real-task", report["semantic_evaluation"])
         self.assertTrue(all(report["checks"].values()))
         self.assertEqual(len(report["runs"]), 2)
         self.assertEqual(len(report["replays"]), 2)
@@ -824,6 +826,29 @@ class SourceInventoryTests(unittest.TestCase):
                 "reason": "reviewed runtime consumer" if disposition == "include" else "maintainer reference only",
                 "evidence": [{"path": consumer, "sha256": inventory.digest((self.root / consumer).read_bytes()),
                               "line": 1, "text": (self.root / consumer).read_text().splitlines()[0]}]}
+
+    def test_lineage_distinguishes_decisions_but_not_report_presentation(self):
+        self.file("prompts/runtime.md")
+        self.file("src/loader.rs", 'send(include_str!("../prompts/runtime.md"));')
+        query = {"categories": [{"name": "runtime", "paths": ["prompts/*.md"]}],
+                 "decisions": [self.decision("prompts/runtime.md", "src/loader.rs")]}
+        included, first = inventory.inventory(self.root, query)
+        query["decisions"] = [self.decision("prompts/runtime.md", "src/loader.rs", "exclude")]
+        excluded, second = inventory.inventory(self.root, query, first)
+        self.assertTrue(included["ready_to_render"] and excluded["ready_to_render"])
+        self.assertEqual(included["query_id"], excluded["query_id"])
+        self.assertEqual(included["source_snapshot_sha256"], excluded["source_snapshot_sha256"])
+        self.assertNotEqual(inventory.evidence_lineage(first), inventory.evidence_lineage(second))
+        identity = inventory.evidence_lineage(second)["evidence_lineage"]["identity"]
+        delivery = inventory.export_delivery(second, Path(self.temp.name) / "decisions.md")
+        document = json.loads(Path(delivery["canonical_paths"]).read_text(encoding="utf-8"))
+        header = Path(delivery["report"]).read_text(encoding="utf-8").splitlines()[0]
+        markdown = json.loads(header.removeprefix("<!-- codex-evidence: ").removesuffix(" -->"))
+        self.assertEqual(document["evidence_lineage"]["identity"], identity)
+        self.assertEqual(markdown["evidence_lineage"]["identity"], identity)
+        reviewed = json.loads(json.dumps(second))
+        reviewed["review"] = {"prompts/runtime.md": {"reason": "different conclusion"}}
+        self.assertNotEqual(inventory.evidence_lineage(reviewed), inventory.evidence_lineage(second))
 
     def test_runtime_matches_require_exact_consumer_evidence_even_when_marked_resolved(self):
         self.file("prompts/runtime.md")

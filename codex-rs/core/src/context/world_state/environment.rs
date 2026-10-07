@@ -458,6 +458,11 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
         })
         .collect::<BTreeMap<_, _>>();
     for environment in &snapshot.starting {
+        // Failed futures remain selected for dispatch authority, but must not
+        // keep advertising a startup that can no longer become ready.
+        if environment.has_failed() {
+            continue;
+        }
         environments
             .entry(environment.selection.environment_id.clone())
             .or_insert_with(|| EnvironmentState {

@@ -1955,12 +1955,31 @@ impl ResponseInputItem {
         }
     }
 }
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
 pub struct SearchToolCallParams {
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub limit: Option<usize>,
+}
+
+impl<'de> Deserialize<'de> for SearchToolCallParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            query: String,
+            #[serde(default)]
+            limit: Option<usize>,
+        }
+        let params = Params::deserialize(deserializer).map_err(|error| {
+            serde::de::Error::custom(format!(
+                "{error}. tool_search accepts only query and limit; to restrict a provider, put source:<canonical namespace> in query."
+            ))
+        })?;
+        Ok(Self { query: params.query, limit: params.limit })
+    }
 }
 
 /// If the `name` of a `ResponseItem::FunctionCall` is `shell_command`, the

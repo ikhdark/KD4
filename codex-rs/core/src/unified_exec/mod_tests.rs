@@ -8,6 +8,7 @@ use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
+use crate::tools::context::ToolOutput;
 use crate::unified_exec::WriteStdinRequest;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
@@ -31,6 +32,16 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 
 const TEST_MAX_OUTPUT_TOKENS: usize = 10_000;
+
+#[tokio::test]
+async fn process_ids_exclude_history_and_released_handles() {
+    let manager = UnifiedExecProcessManager::default();
+    manager.exclude_process_ids([1000, 1001, 1003]).await;
+    let first = manager.allocate_process_id().await;
+    assert_eq!(first, 1002);
+    manager.release_process_id(first).await;
+    assert_eq!(manager.allocate_process_id().await, 1004);
+}
 
 async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
     let (session, mut turn) = make_session_and_context().await;
@@ -191,6 +202,41 @@ async fn exec_command_with_tracker(
         .await
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn capacity_rejection_does_not_launch_sentinel_command() {
+    let (session, turn) = test_session_and_turn().await;
+    let manager = &session.services.unified_exec_manager;
+    let process = super::process_tests::remote_process(WriteStatus::Accepted, None).await;
+    for id in 0..MAX_UNIFIED_EXEC_PROCESSES as u32 {
+        super::process_tests::store_process_for_test(
+            manager, &session, &turn, id, Arc::clone(&process),
+        )
+        .await;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let sentinel = workspace.path().join("sentinel.txt");
+    let command = "[IO.File]::WriteAllText((Join-Path (Get-Location) 'sentinel.txt'), 'started')";
+    let error = exec_command_with_tty(
+        &session, &turn, command, 30_000, Some(workspace.path().to_path_buf()), false,
+    )
+    .await
+    .expect_err("full capacity must reject before launch");
+    assert!(error.to_string().contains("command was not started"), "{error}");
+    assert!(!sentinel.exists(), "rejected command must have no external effect");
+    assert!(!process.has_exited(), "admission must not terminate existing work");
+
+    manager.release_process_id(0).await;
+    let result = exec_command_with_tty(
+        &session, &turn, command, 30_000, Some(workspace.path().to_path_buf()), false,
+    )
+    .await
+    .expect("freed slot admits the same command");
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "started");
+    assert!(manager.process_store.lock().await.reserved_process_slots.is_empty());
+}
+
 struct BlockingTerminateExecProcess {
     process_id: ProcessId,
     terminate_started: watch::Sender<bool>,
@@ -203,6 +249,7 @@ impl BlockingTerminateExecProcess {
         Ok(ReadResponse {
             chunks: Vec::new(),
             next_seq: 1,
+            output_gap: None,
             exited: false,
             exit_code: None,
             closed: false,
@@ -526,7 +573,7 @@ async fn a_poll_queued_past_its_nested_budget_yields_instead_of_failing() -> any
         output
             .repair_notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("another interaction")),
+            .is_some_and(|notice| notice.contains("queued") && notice.contains("No input was requested")),
         "the model needs to know the poll never reached the process: {:?}",
         output.repair_notice
     );
@@ -1226,6 +1273,7 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
         "multi-set-a",
         serde_json::json!({
             "session_id": process_id,
+            "incarnation": opened_result["session_capabilities"]["incarnation"],
             "chars": format!("$env:{variable} = '{value}'\n"),
             "yield_time_ms": 2500,
         }),
@@ -1285,6 +1333,7 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
         "multi-read-a",
         serde_json::json!({
             "session_id": process_id,
+            "incarnation": opened_result["session_capabilities"]["incarnation"],
             // The expected contiguous marker never occurs in the echoed input.
             "chars": format!("Write-Output ('PERSISTED:' + $env:{variable})\n"),
             "yield_time_ms": 2500,
@@ -1713,16 +1762,14 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
         String::from_utf8_lossy(&final_output)
     );
 
-    let err = write_stdin(&session, process_id, "", /*yield_time_ms*/ 100)
-        .await
-        .expect_err("expected unknown process error");
-
-    match err {
-        UnifiedExecError::UnknownProcessId { process_id: err_id } => {
-            assert_eq!(err_id, process_id, "process id should match request");
-        }
-        other => panic!("expected UnknownProcessId, got {other:?}"),
-    }
+    let replay = write_stdin(&session, process_id, "", /*yield_time_ms*/ 100).await?;
+    assert_eq!(replay.process_id, None);
+    assert_eq!(replay.exit_code, Some(0));
+    assert!(replay.process_exited);
+    assert_eq!(replay.code_mode_result(&crate::tools::context::ToolPayload::Function {
+        arguments: "{}".into(),
+    })["output_complete"], true);
+    assert!(String::from_utf8_lossy(&replay.raw_output).contains("final-output-preserved"));
 
     assert!(
         session

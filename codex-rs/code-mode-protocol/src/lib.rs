@@ -43,6 +43,7 @@ pub use runtime::MAX_TOOL_TIMEOUT_MS;
 pub use runtime::OWNER_HELD_DECISION_YIELD_TIME_MS;
 pub use runtime::OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS;
 pub use runtime::OutputLoss;
+pub use runtime::ReceiptRecovery;
 pub use runtime::RuntimeResponse;
 pub use runtime::WaitOutcome;
 pub use runtime::WaitRequest;
@@ -60,3 +61,17 @@ pub use shared_clock::shared_monotonic_now;
 
 pub const PUBLIC_TOOL_NAME: &str = "exec";
 pub const WAIT_TOOL_NAME: &str = "wait";
+
+/// Leave dispatch/transport time around a deadline owned by the invoked tool.
+pub const NESTED_TOOL_TIMEOUT_GRACE_MS: u64 = 15_000;
+
+pub fn tool_owned_timeout_with_grace(timeout_ms: u64) -> u64 {
+    let extended = timeout_ms.saturating_add(NESTED_TOOL_TIMEOUT_GRACE_MS);
+    if extended > MAX_TOOL_TIMEOUT_MS {
+        // The tool still enforces its deadline. Do not substitute an earlier
+        // wrapper cutoff when its wait exceeds the explicit wrapper option cap.
+        0
+    } else {
+        extended.max(DEFAULT_TOOL_TIMEOUT_MS)
+    }
+}

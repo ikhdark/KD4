@@ -102,6 +102,7 @@ async fn tool_callback_panic_rejects_the_js_promise_and_reports_failure() {
             input: None,
             timeout: Duration::from_secs(1),
             deadline: None,
+            buffered_output_bytes: 0,
         },
         runtime_tx,
         NestedCancellation::new(CancellationToken::new()),
@@ -128,48 +129,52 @@ async fn tool_callback_panic_rejects_the_js_promise_and_reports_failure() {
 
 #[tokio::test(start_paused = true)]
 async fn tool_callback_timeout_rejects_the_js_promise_and_cancels_the_delegate() {
-    let mut tasks = JoinSet::new();
-    let (runtime_tx, runtime_rx) = std_mpsc::channel();
-    let cancellation_token = CancellationToken::new();
-    spawn_tool(
-        &mut tasks,
-        Arc::new(NonCooperativeCallbackHost),
-        CellToolCall {
-            id: "tool-timeout".to_string(),
-            name: ToolName {
-                name: "stuck".to_string(),
-                namespace: None,
+    for namespace in [None, Some("agents".to_string())] {
+        let mut tasks = JoinSet::new();
+        let (runtime_tx, runtime_rx) = std_mpsc::channel();
+        let cancellation_token = CancellationToken::new();
+        spawn_tool(
+            &mut tasks,
+            Arc::new(NonCooperativeCallbackHost),
+            CellToolCall {
+                id: "tool-timeout".to_string(),
+                name: ToolName {
+                    name: "stuck".to_string(),
+                    namespace: namespace.clone(),
+                },
+                kind: ToolKind::Function,
+                input: None,
+                timeout: Duration::from_secs(1),
+                deadline: None,
+                buffered_output_bytes: 0,
             },
-            kind: ToolKind::Function,
-            input: None,
-            timeout: Duration::from_secs(1),
-            deadline: None,
-        },
-        runtime_tx,
-        NestedCancellation::new(cancellation_token.clone()),
-        None,
-    );
+            runtime_tx,
+            NestedCancellation::new(cancellation_token.clone()),
+            None,
+        );
 
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(1)).await;
-    tasks
-        .join_next()
-        .await
-        .expect("tool callback task")
-        .expect("tool callback wrapper");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tasks
+            .join_next()
+            .await
+            .expect("tool callback task")
+            .expect("tool callback wrapper");
 
-    let RuntimeCommand::ToolError { id, error_text } = runtime_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("tool timeout command")
-    else {
-        panic!("expected a tool error command");
-    };
-    assert_eq!(id, "tool-timeout");
-    assert_eq!(
-        error_text,
-        "nested tool `stuck` exceeded its 1000ms timeout"
-    );
-    assert!(cancellation_token.is_cancelled());
+        let RuntimeCommand::ToolError { id, error_text } = runtime_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("tool timeout command")
+        else {
+            panic!("expected a tool error command");
+        };
+        assert_eq!(id, "tool-timeout");
+        assert_eq!(
+            error_text,
+            format!("nested tool `{}` exceeded its 1000ms timeout",
+                namespace.map_or("stuck".to_string(), |namespace| format!("{namespace}__stuck")))
+        );
+        assert!(cancellation_token.is_cancelled());
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -291,6 +296,7 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
             input: None,
             timeout: Duration::from_secs(60),
             deadline: None,
+            buffered_output_bytes: 0,
         },
         runtime_tx.clone(),
         tool_cancellation.child(tool_cancellation.token().child_token()),
@@ -341,4 +347,62 @@ async fn cancellation_aborts_non_cooperative_callback_after_bounded_grace() {
     // A slow callback is not a task failure: owners such as the process host
     // treat reported failures as fatal to every session on the connection.
     assert_eq!(failure_rx.recv().await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completion_cancels_tools_before_held_notification_delivery() {
+    let notification_token = CancellationToken::new();
+    let tool = NestedCancellation::new(CancellationToken::new());
+    let mut notifications = JoinSet::new();
+    let mut tools = JoinSet::new();
+    let release = CancellationToken::new();
+    notifications.spawn({ let release = release.clone(); async move { release.cancelled().await } });
+    tools.spawn({ let token = tool.token().clone(); async move { token.cancelled().await } });
+    let cleanup = finish_callbacks(&notification_token, &tool, &mut notifications, &mut tools,
+        CallbackCompletion::DrainNotifications, None);
+    tokio::pin!(cleanup);
+    assert!(futures::poll!(&mut cleanup).is_pending());
+    assert!(tool.token().is_cancelled(), "abandoned effects stop before notification acknowledgement");
+    assert!(!notification_token.is_cancelled(), "accepted notification keeps its delivery grace");
+    tokio::time::advance(CALLBACK_CANCELLATION_GRACE + Duration::from_millis(1)).await;
+    assert!(futures::poll!(&mut cleanup).is_pending(), "ordinary completion preserves accepted delivery past cancellation grace");
+    assert!(!notification_token.is_cancelled());
+    release.cancel();
+    cleanup.await;
+    assert!(notification_token.is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordinary_completion_keeps_notification_delivery_timeout() {
+    let notification_token = CancellationToken::new();
+    let tool = NestedCancellation::new(CancellationToken::new());
+    let mut notifications = JoinSet::new();
+    let mut tools = JoinSet::new();
+    let (runtime_tx, runtime_rx) = std_mpsc::channel();
+    spawn_notification(
+        &mut notifications,
+        Arc::new(NonCooperativeCallbackHost),
+        NotificationInvocation {
+            id: Some("accepted".into()),
+            call_id: "call-1".into(),
+            text: "retained notification".into(),
+        },
+        runtime_tx,
+        notification_token.clone(),
+        None,
+    );
+    tokio::task::yield_now().await;
+    let started = tokio::time::Instant::now();
+    finish_callbacks(
+        &notification_token,
+        &tool,
+        &mut notifications,
+        &mut tools,
+        CallbackCompletion::DrainNotifications,
+        None,
+    ).await;
+    assert_eq!(started.elapsed(), NOTIFICATION_DELIVERY_TIMEOUT);
+    assert!(matches!(runtime_rx.try_recv(), Ok(RuntimeCommand::NotificationError { id, .. }) if id == "accepted"));
+    assert!(notification_token.is_cancelled());
+    assert!(tool.token().is_cancelled());
 }

@@ -227,8 +227,8 @@ impl PendingAppServerRequests {
                     })
                 })
                 .transpose()?,
-            AppCommand::UserInputAnswer { id, response } => self
-                .pop_user_input_request_for_turn(id)
+            AppCommand::UserInputAnswer { id, call_id, response } => self
+                .take_user_input_request(id, call_id)
                 .map(|pending| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id: pending.request_id,
@@ -356,19 +356,15 @@ impl PendingAppServerRequests {
         }
     }
 
-    fn pop_user_input_request_for_turn(
+    fn take_user_input_request(
         &mut self,
         turn_id: &str,
+        call_id: &str,
     ) -> Option<PendingUserInputRequest> {
-        let pending = self
-            .user_inputs
-            .get_mut(turn_id)
-            .and_then(VecDeque::pop_front);
-        if self
-            .user_inputs
-            .get(turn_id)
-            .is_some_and(VecDeque::is_empty)
-        {
+        let queue = self.user_inputs.get_mut(turn_id)?;
+        let index = queue.iter().position(|pending| pending.item_id == call_id)?;
+        let pending = queue.remove(index);
+        if queue.is_empty() {
             self.user_inputs.remove(turn_id);
         }
         pending
@@ -626,7 +622,8 @@ mod tests {
         let user_input = pending
             .take_resolution(&Op::UserInputAnswer {
                 id: "turn-2".to_string(),
-                response: ToolRequestUserInputResponse {
+                call_id: "tool-1".to_string(),
+                response: ToolRequestUserInputResponse { disposition: None,
                     answers: std::iter::once((
                         "question".to_string(),
                         ToolRequestUserInputAnswer {
@@ -643,7 +640,7 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ToolRequestUserInputResponse>(user_input.result)
                 .expect("user input response should decode"),
-            ToolRequestUserInputResponse {
+            ToolRequestUserInputResponse { disposition: None,
                 answers: std::iter::once((
                     "question".to_string(),
                     ToolRequestUserInputAnswer {
@@ -885,13 +882,14 @@ mod tests {
             });
         }
 
-        let response = ToolRequestUserInputResponse {
+        let response = ToolRequestUserInputResponse { disposition: None,
             answers: HashMap::new(),
             interrupted: false,
         };
         let first_response = pending
             .take_resolution(&Op::UserInputAnswer {
                 id: "turn-1".to_string(),
+                call_id: "tool-1".to_string(),
                 response: response.clone(),
             })
             .expect("user input response should serialize")
@@ -899,6 +897,7 @@ mod tests {
         let second_response = pending
             .take_resolution(&Op::UserInputAnswer {
                 id: "turn-1".to_string(),
+                call_id: "tool-2".to_string(),
                 response,
             })
             .expect("user input response should serialize")
@@ -906,5 +905,49 @@ mod tests {
 
         assert_eq!(first_response.request_id, AppServerRequestId::Integer(8));
         assert_eq!(second_response.request_id, AppServerRequestId::Integer(9));
+    }
+
+    #[test]
+    fn user_input_identity_survives_out_of_order_and_delayed_answers() {
+        for retire_first in [false, true] {
+            let mut pending = PendingAppServerRequests::default();
+            for (request_id, item_id) in [(8, "tool-1"), (9, "tool-2")] {
+                pending.note_server_request(&ServerRequest::ToolRequestUserInput {
+                    request_id: AppServerRequestId::Integer(request_id),
+                    params: ToolRequestUserInputParams {
+                        thread_id: "thread-1".into(),
+                        turn_id: "turn-1".into(),
+                        item_id: item_id.into(),
+                        questions: Vec::new(),
+                        auto_resolution_ms: None,
+                    },
+                });
+            }
+            let answer = |call_id: &str| Op::UserInputAnswer {
+                id: "turn-1".into(),
+                call_id: call_id.into(),
+                response: ToolRequestUserInputResponse { disposition: None,
+                    answers: HashMap::from([("same-question".into(), ToolRequestUserInputAnswer {
+                        answers: vec!["yes".into()],
+                    })]),
+                    interrupted: false,
+                },
+            };
+            assert!(pending.take_resolution(answer("unknown")).unwrap().is_none());
+            if retire_first {
+                assert_eq!(pending.resolve_notification(&AppServerRequestId::Integer(8)),
+                    Some(ResolvedAppServerRequest::UserInput { call_id: "tool-1".into() }));
+                // A's late response must not be remapped to B's transport request.
+                assert!(pending.take_resolution(answer("tool-1")).unwrap().is_none());
+            }
+            let second = pending.take_resolution(answer("tool-2")).unwrap().unwrap();
+            assert_eq!(second.request_id, AppServerRequestId::Integer(9));
+            assert!(pending.take_resolution(answer("tool-2")).unwrap().is_none());
+            if !retire_first {
+                let first = pending.take_resolution(answer("tool-1")).unwrap().unwrap();
+                assert_eq!(first.request_id, AppServerRequestId::Integer(8));
+            }
+            assert!(pending.user_inputs.is_empty());
+        }
     }
 }

@@ -2,7 +2,6 @@ pub(crate) mod code_mode;
 pub(crate) mod command_execution;
 pub(crate) mod command_output_artifact;
 pub(crate) mod context;
-pub(crate) mod effect_journal;
 pub(crate) mod events;
 pub(crate) mod exposure;
 pub(crate) mod handlers;
@@ -38,7 +37,7 @@ use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use codex_utils_output_truncation::truncate_text_with_output_limit;
 pub use router::ToolRouter;
 use shell_output_summary::ShellOutputSummaryOptions;
-use shell_output_summary::summarize_shell_output_for_model;
+use shell_output_summary::summarize_shell_output_for_model_with_streams;
 
 pub(crate) const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
 pub(crate) const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
@@ -112,7 +111,7 @@ pub(crate) fn project_exec_output_for_model_with_budget(
         .saturating_sub(approx_token_count(&envelope_header));
     let summarized = approx_token_count_exceeds(&raw_content, content_limit)
         .then(|| {
-            summarize_shell_output_for_model(
+            summarize_shell_output_for_model_with_streams(
                 &raw_content,
                 exec_output.exit_code,
                 exec_output.timed_out,
@@ -121,6 +120,7 @@ pub(crate) fn project_exec_output_for_model_with_budget(
                     applied_token_limit: Some(content_limit),
                     command_text,
                 },
+                complete_exec_output_streams(exec_output),
             )
         })
         .flatten();
@@ -186,7 +186,7 @@ pub(crate) fn project_exec_output_text_with_budget(
     );
     let summarized = approx_token_count_exceeds(&raw_content, limits.applied_limit)
         .then(|| {
-            summarize_shell_output_for_model(
+            summarize_shell_output_for_model_with_streams(
                 &raw_content,
                 exec_output.exit_code,
                 exec_output.timed_out,
@@ -195,6 +195,7 @@ pub(crate) fn project_exec_output_text_with_budget(
                     applied_token_limit: Some(limits.applied_limit),
                     command_text,
                 },
+                complete_exec_output_streams(exec_output),
             )
         })
         .flatten();
@@ -204,6 +205,14 @@ pub(crate) fn project_exec_output_text_with_budget(
         reduced: summarized.is_some() || truncated.was_truncated,
         text: truncated.text,
     }
+}
+
+fn complete_exec_output_streams(output: &ExecToolCallOutput) -> Option<(&str, &str)> {
+    let streams = [&output.stdout, &output.stderr, &output.aggregated_output];
+    (streams.iter().all(|stream| !stream.truncated && stream.truncated_after_lines.is_none())
+        && output.stdout.text.len().checked_add(output.stderr.text.len())
+            == Some(output.aggregated_output.text.len()))
+        .then_some((output.stdout.text.as_str(), output.stderr.text.as_str()))
 }
 
 fn resolve_exec_output_limits(

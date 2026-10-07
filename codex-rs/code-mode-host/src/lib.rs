@@ -13,7 +13,6 @@ use anyhow::Result;
 use codex_code_mode::InProcessCodeModeSession;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientToHost;
-use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
 use codex_code_mode_protocol::host::HandshakeRejectReason;
@@ -71,7 +70,7 @@ where
         return Ok(());
     }
 
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(OUTGOING_FRAME_CAPACITY);
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<peer::OutgoingFrame>(OUTGOING_FRAME_CAPACITY);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
     let state = Arc::new(HostState {
         catalogs: Mutex::new(HashMap::new()),
@@ -96,7 +95,7 @@ where
                     // Cancellation is terminal: never resume a partially written frame.
                     let result = tokio::select! {
                         _ = writer_disconnected.cancelled() => return Ok(()),
-                        result = writer.write_frame(&frame) => result,
+                        result = writer.write_frame(&frame.frame) => result,
                     };
                     if let Err(err) = result {
                         return Err(
@@ -225,7 +224,10 @@ where
     let state_capability = codex_code_mode_protocol::host::Capability::new(
         codex_code_mode_protocol::host::NAMED_STATE_CAPABILITY,
     )?;
-    let supported_capabilities = CapabilitySet::try_new([catalog_capability, state_capability])?;
+    let receipt_capability = codex_code_mode_protocol::host::Capability::new(
+        codex_code_mode_protocol::host::RECEIPT_RECOVERY_CAPABILITY,
+    )?;
+    let supported_capabilities = CapabilitySet::try_new([catalog_capability, state_capability, receipt_capability])?;
     if let Some(capability) = client_hello
         .required_capabilities()
         .iter()
@@ -257,7 +259,7 @@ where
 }
 
 struct HostState {
-    catalogs: Mutex<HashMap<SessionId, (u64, Vec<codex_code_mode_protocol::host::WireToolDefinition>)>>,
+    catalogs: Mutex<HashMap<SessionId, (u64, Arc<[codex_code_mode_protocol::ToolDefinition]>)>>,
     sessions: Mutex<HashMap<SessionId, Arc<InProcessCodeModeSession>>>,
     seen_session_ids: Mutex<SeenSessionIds>,
     requests: Mutex<RequestRegistry>,
@@ -279,6 +281,7 @@ impl HostState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .start(request_id, RequestKind::from(&request))?;
+        let mut resolved_tools = None;
         if let HostRequest::Execute { session_id, request } = &mut request
             && let Some(catalog) = request.catalog.take()
         {
@@ -291,7 +294,10 @@ impl HostState {
                     if catalogs.get(session_id).is_some_and(|(revision, _)| catalog.revision <= *revision) {
                         return Err("stale tool catalog registration; no cell started".to_string());
                     }
-                    catalogs.insert(session_id.clone(), (catalog.revision, request.enabled_tools.clone()));
+                    let tools: Arc<[codex_code_mode_protocol::ToolDefinition]> = std::mem::take(&mut request.enabled_tools)
+                        .into_iter().map(Into::into).collect();
+                    resolved_tools = Some(Arc::clone(&tools));
+                    catalogs.insert(session_id.clone(), (catalog.revision, tools));
                 } else {
                     if !request.enabled_tools.is_empty() {
                         return Err("catalog references cannot carry tool definitions; no cell started".to_string());
@@ -299,7 +305,7 @@ impl HostState {
                     let (_, tools) = catalogs.get(session_id)
                         .filter(|(revision, _)| *revision == catalog.revision)
                         .ok_or_else(|| "unknown or revoked tool catalog revision; no cell started".to_string())?;
-                    request.enabled_tools = tools.clone();
+                    resolved_tools = Some(Arc::clone(tools));
                 }
                 Ok(())
             })();
@@ -321,7 +327,7 @@ impl HostState {
         let request_task = self.request_tasks.spawn(async move {
             let _permit = permit;
             state
-                .handle_request(request_id, request, cancellation)
+                .handle_request_with_catalog(request_id, request, cancellation, resolved_tools)
                 .await;
             state.finish_request(request_id);
         });
@@ -338,11 +344,22 @@ impl HostState {
         });
     }
 
+    #[cfg(test)]
     async fn handle_request(
         &self,
         request_id: RequestId,
         request: HostRequest,
         cancellation: CancellationToken,
+    ) {
+        self.handle_request_with_catalog(request_id, request, cancellation, None).await;
+    }
+
+    async fn handle_request_with_catalog(
+        &self,
+        request_id: RequestId,
+        request: HostRequest,
+        cancellation: CancellationToken,
+        resolved_tools: Option<Arc<[codex_code_mode_protocol::ToolDefinition]>>,
     ) {
         if self.closing.load(Ordering::Acquire) {
             self.respond(
@@ -366,7 +383,7 @@ impl HostState {
                     self.respond(request_id, Err("code-mode request cancelled".to_string()));
                     return;
                 }
-                let request = match request.try_into() {
+                let mut request: codex_code_mode_protocol::ExecuteRequest = match request.try_into() {
                     Ok(request) => request,
                     Err(err) => {
                         self.respond(
@@ -376,6 +393,7 @@ impl HostState {
                         return;
                     }
                 };
+                if let Some(tools) = resolved_tools { request.enabled_tools = tools; }
                 let session = match self.session(&session_id) {
                     Ok(session) => session,
                     Err(err) => {

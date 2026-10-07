@@ -122,12 +122,16 @@ fn mcp_tool_call_progress_notification(
     turn_id: String,
     item_id: String,
     message: String,
+    progress: Option<f64>,
+    total: Option<f64>,
 ) -> ServerNotification {
     ServerNotification::McpToolCallProgress(McpToolCallProgressNotification {
         thread_id: conversation_id.to_string(),
         turn_id,
         item_id,
         message,
+        progress,
+        total,
     })
 }
 
@@ -155,6 +159,15 @@ pub(crate) async fn apply_bespoke_event_handling(
         msg,
     } = event;
     match msg {
+        EventMsg::TurnPhaseChanged(payload) => {
+            let is_current = thread_state.lock().await.active_turn_snapshot()
+                .is_some_and(|turn| turn.id == payload.turn_id);
+            if is_current {
+                thread_watch_manager.note_harness_phases(
+                    &conversation_id.to_string(), payload.phases,
+                ).await;
+            }
+        }
         EventMsg::TurnStarted(payload) => {
             // While not technically necessary as it was already done on TurnComplete, be extra cautios and abort any pending server requests.
             outgoing.abort_pending_server_requests().await;
@@ -498,6 +511,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                     }),
                 })
                 .collect();
+            let call_id = request.call_id.clone();
+            let request_turn_id = request.turn_id.clone();
             let params = ToolRequestUserInputParams {
                 thread_id: conversation_id.to_string(),
                 turn_id: request.turn_id,
@@ -510,7 +525,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
             tokio::spawn(async move {
                 on_request_user_input_response(
-                    event_turn_id,
+                    request_turn_id,
+                    call_id,
                     pending_request_id,
                     rx,
                     conversation,
@@ -659,6 +675,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                     event_turn_id,
                     event.call_id,
                     event.message,
+                    event.progress,
+                    event.total,
                 ))
                 .await;
         }
@@ -771,6 +789,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                 _ => true,
             };
             let dynamic_tool_call_params = match &event.item {
+                CoreTurnItem::DynamicToolCall(item)
+                    if item.namespace.as_deref() == Some("codex.internal")
+                        && item.tool == "code_mode_cell" => None,
                 CoreTurnItem::DynamicToolCall(item) => Some(DynamicToolCallParams {
                     thread_id: conversation_id.to_string(),
                     turn_id: event.turn_id.clone(),
@@ -790,12 +811,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                 outgoing.send_server_notification(notification).await;
             }
             if let Some(params) = dynamic_tool_call_params {
+                let turn_id = params.turn_id.clone();
                 let call_id = params.call_id.clone();
                 let (_pending_request_id, rx) = outgoing
                     .send_request(ServerRequestPayload::DynamicToolCall(params))
                     .await;
                 tokio::spawn(async move {
-                    crate::dynamic_tools::on_call_response(call_id, rx, conversation).await;
+                    crate::dynamic_tools::on_call_response(turn_id, call_id, rx, conversation).await;
                 });
             }
         }
@@ -1163,6 +1185,9 @@ async fn start_command_execution_item(
             turn_id,
             started_at_ms: now_unix_timestamp_ms(),
             item: ThreadItem::CommandExecution {
+                output_metadata: None,
+                stdout: None,
+                stderr: None,
                 id: item_id,
                 command,
                 cwd,
@@ -1211,6 +1236,9 @@ async fn complete_command_execution_item(
     }
 
     let item = ThreadItem::CommandExecution {
+        output_metadata: None,
+        stdout: None,
+        stderr: None,
         id: item_id,
         command,
         cwd,
@@ -1451,6 +1479,7 @@ async fn handle_error_notification(
 
 async fn on_request_user_input_response(
     event_turn_id: String,
+    call_id: String,
     pending_request_id: Option<RequestId>,
     receiver: oneshot::Receiver<ClientRequestResult>,
     conversation: Arc<CodexThread>,
@@ -1475,6 +1504,7 @@ async fn on_request_user_input_response(
     if let Err(err) = conversation
         .submit(Op::UserInputAnswer {
             id: event_turn_id,
+            call_id: Some(call_id),
             response,
         })
         .await
@@ -1485,6 +1515,7 @@ async fn on_request_user_input_response(
 
 fn interrupted_request_user_input_response() -> CoreRequestUserInputResponse {
     CoreRequestUserInputResponse {
+        disposition: Some(codex_protocol::request_user_input::RequestUserInputDisposition::TransportError),
         answers: HashMap::new(),
         interrupted: true,
     }
@@ -1503,6 +1534,7 @@ fn request_user_input_response_from_client_result(
                 }
             };
             Some(CoreRequestUserInputResponse {
+                disposition: response.disposition,
                 interrupted: response.interrupted,
                 answers: response
                     .answers
@@ -2018,10 +2050,23 @@ mod tests {
         assert_eq!(
             response,
             Some(CoreRequestUserInputResponse {
+                disposition: Some(codex_protocol::request_user_input::RequestUserInputDisposition::TransportError),
                 answers: HashMap::new(),
                 interrupted: true,
             })
         );
+    }
+
+    #[test]
+    fn request_user_input_disposition_is_preserved_across_transport() {
+        for disposition in ["answered", "timed_out", "skipped", "interrupted", "transport_error"] {
+            let response = request_user_input_response_from_client_result(Ok(Ok(json!({
+                "answers": {}, "interrupted": false, "disposition": disposition,
+            })))).unwrap();
+            assert_eq!(serde_json::to_value(response).unwrap()["disposition"], disposition);
+        }
+        let legacy = request_user_input_response_from_client_result(Ok(Ok(json!({"answers": {}})))).unwrap();
+        assert_eq!(legacy.disposition, None);
     }
 
     #[test]
@@ -2196,6 +2241,9 @@ mod tests {
                 assert_eq!(
                     payload.item,
                     ThreadItem::CommandExecution {
+                        output_metadata: None,
+                        stdout: None,
+                        stderr: None,
                         id: "cmd-1".to_string(),
                         command: completion_item.command.clone(),
                         cwd: completion_item.cwd.clone(),
@@ -3085,6 +3133,11 @@ mod tests {
         let thread_state = new_thread_state();
         let mut completion_event = turn_complete_event(&event_turn_id);
         let expected_timing = TurnTiming {
+            completion_assessment: Some(codex_protocol::protocol::TurnCompletionAssessment {
+                failed_checks: vec!["validation failed; limitation reported".into()],
+                verification_gaps: Vec::new(),
+                advisories: vec!["checklist needs reconciliation".into()],
+            }),
             schema_version: 1,
             profile_valid: true,
             classification_complete: true,
@@ -3817,6 +3870,8 @@ mod tests {
             "turn-1".to_string(),
             "item-1".to_string(),
             "working".to_string(),
+            Some(2.0),
+            Some(3.0),
         );
 
         let ServerNotification::McpToolCallProgress(notification) = notification else {
@@ -3826,5 +3881,7 @@ mod tests {
         assert_eq!(notification.turn_id, "turn-1");
         assert_eq!(notification.item_id, "item-1");
         assert_eq!(notification.message, "working");
+        assert_eq!(notification.progress, Some(2.0));
+        assert_eq!(notification.total, Some(3.0));
     }
 }

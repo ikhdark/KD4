@@ -14,7 +14,6 @@ use super::UnifiedExecContext;
 use super::UnifiedExecError;
 pub(super) use super::head_tail_buffer::omitted_output_marker;
 use super::process::ProcessOutputChunk;
-use super::process::ProcessOutputSnapshot;
 use super::process::UnifiedExecProcess;
 use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
 use crate::exec::OutputDeltaDecision;
@@ -25,12 +24,10 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::command_execution::CommandExecutionId;
 use crate::tools::command_execution::CommandExecutionLedger;
 use crate::tools::command_execution::CompletionApplyResult;
-use crate::tools::command_output_artifact::append_raw_output_artifact;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
-use crate::tools::events::ToolEventFailure;
 use crate::tools::events::ToolEventStage;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
@@ -259,7 +256,7 @@ async fn observe_process_exit(
     process_id: u32,
     command_execution_id: CommandExecutionId,
     parent_tool_execution_id: &ToolExecutionId,
-    exit_code: i32,
+    exit_code: impl Into<Option<i32>>,
 ) -> CompletionApplyResult {
     wait_for_sticky_lifecycle_signal(signal).await;
     ledger
@@ -318,52 +315,20 @@ async fn emit_process_terminal_event(
     process_id: u32,
     transcript: &Arc<Mutex<HeadTailBuffer>>,
     failure_message: Option<&str>,
-    exit_code: i32,
+    tty: bool,
+    classified_search: bool,
     timed_out: bool,
     duration: Duration,
     source: &ToolCallSource,
     tracker: Option<&SharedTurnDiffTracker>,
 ) -> Result<(), String> {
-    let process_output = Some(process.snapshot_completion_output().await);
-    let persistence_result = if let Some(message) = failure_message {
-        emit_failed_exec_end_for_unified_exec(
-            Arc::clone(session_ref),
-            Arc::clone(turn_ref),
-            call_id.to_string(),
-            command.to_vec(),
-            cwd.clone(),
-            environment_id.to_string(),
-            Some(process_id.to_string()),
-            Arc::clone(transcript),
-            String::new(),
-            process_output,
-            message.to_string(),
-            timed_out,
-            duration,
-            source.clone(),
-            tracker.cloned(),
-        )
-        .await
-    } else {
-        emit_exec_end_for_unified_exec(
-            Arc::clone(session_ref),
-            Arc::clone(turn_ref),
-            call_id.to_string(),
-            command.to_vec(),
-            cwd.clone(),
-            environment_id.to_string(),
-            Some(process_id.to_string()),
-            Arc::clone(transcript),
-            String::new(),
-            process_output,
-            exit_code,
-            timed_out,
-            duration,
-            source.clone(),
-            tracker.cloned(),
-        )
-        .await
-    };
+    let persistence_result = emit_exec_end_for_unified_exec(
+        Arc::clone(session_ref), Arc::clone(turn_ref), call_id.to_string(),
+        command.to_vec(), cwd.clone(), environment_id.to_string(),
+        Some(process_id.to_string()), Arc::clone(transcript), String::new(),
+        Some(process.as_ref()), tty, classified_search, failure_message.map(str::to_owned),
+        timed_out, duration, source.clone(), tracker.cloned(),
+    ).await;
     if let Err(error) = &persistence_result {
         // Completion describes the process that actually ran. Report the failed
         // durability barrier separately, then let the watcher finish cleanup.
@@ -407,13 +372,15 @@ pub(crate) fn spawn_exit_watcher(
     tracker: Option<SharedTurnDiffTracker>,
     tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
     network_approval: Option<crate::tools::network_approval::DeferredNetworkApproval>,
+    tty: bool,
+    classified_search: bool,
     validation_started_at: Option<Instant>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
     let terminal_completion = process.register_terminal_completion();
     tokio::spawn(async move {
-        turn_ref.turn_timing_state.record_next_sample_block_reason(
+        turn_ref.turn_timing_state.record_tool_sample_block_reason(
             codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
         );
         let exit_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
@@ -447,11 +414,7 @@ pub(crate) fn spawn_exit_watcher(
             let _ = process.fail_and_terminate(message).await;
         }
         let failure_message = process.failure_message();
-        let exit_code = if failure_message.is_some() {
-            -1
-        } else {
-            process.exit_code().unwrap_or(-1)
-        };
+        let exit_code = process.exit_code();
         if let Some(timing) = tool_dispatch_timing.as_ref() {
             timing.mark_exec_process_exited();
             timing.record_timer_wait(ToolLifecycleTimerWait {
@@ -487,7 +450,7 @@ pub(crate) fn spawn_exit_watcher(
             "stale process completion cannot own live command state"
         );
         let output_waiter_guard = ProcessOutputWaiterGuard::new(&turn_ref.turn_timing_state);
-        turn_ref.turn_timing_state.record_next_sample_block_reason(
+        turn_ref.turn_timing_state.record_tool_sample_block_reason(
             codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
         );
         let output_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
@@ -529,7 +492,8 @@ pub(crate) fn spawn_exit_watcher(
                 process_id,
                 &transcript,
                 failure_message.as_deref(),
-                exit_code,
+                tty,
+                classified_search,
                 false,
                 duration,
                 &source,
@@ -553,25 +517,7 @@ pub(crate) fn spawn_exit_watcher(
             );
         }
 
-        if let Some(mut finalized_artifact) = process.raw_output_artifact().await {
-            if let Some(message) = failure_message.as_ref() {
-                let separator = if matches!(
-                    finalized_artifact,
-                    crate::tools::command_output_artifact::RawOutputArtifact::Stored {
-                        bytes: 0,
-                        ..
-                    }
-                ) {
-                    ""
-                } else {
-                    "\n"
-                };
-                finalized_artifact = append_raw_output_artifact(
-                    &finalized_artifact,
-                    format!("{separator}{message}").as_bytes(),
-                )
-                .await;
-            }
+        if let Some(finalized_artifact) = process.raw_output_artifact().await {
             session_ref
                 .services
                 .command_execution
@@ -590,7 +536,8 @@ pub(crate) fn spawn_exit_watcher(
                 process_id,
                 &transcript,
                 failure_message.as_deref(),
-                exit_code,
+                tty,
+                classified_search,
                 false,
                 duration,
                 &source,
@@ -898,130 +845,90 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     process_id: Option<String>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     fallback_output: String,
-    process_output: Option<ProcessOutputSnapshot>,
-    exit_code: i32,
+    process: Option<&UnifiedExecProcess>,
+    tty: bool,
+    classified_search: bool,
+    failure_cause: Option<String>,
     timed_out: bool,
     duration: Duration,
     source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
 ) -> CodexResult<()> {
-    let (aggregated_output, stdout, stderr) = if let Some(output) = process_output {
-        (
-            String::from_utf8_lossy(&output.aggregated_output).into_owned(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )
-    } else {
-        let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
-        (aggregated_output.clone(), aggregated_output, String::new())
+    let snapshot = match process {
+        Some(process) => Some(process.snapshot_completion_output().await),
+        None => None,
     };
-    let output = ExecToolCallOutput {
-        exit_code,
-        stdout: StreamOutput::new(stdout),
-        stderr: StreamOutput::new(stderr),
-        aggregated_output: StreamOutput::new(aggregated_output),
-        duration,
-        timed_out,
-    };
-    let event_ctx = ToolEventCtx::new(
-        session_ref.as_ref(),
-        turn_ref.as_ref(),
-        &call_id,
-        tracker.as_ref(),
-    )
-    .with_call_source(&source);
-    let emitter = ToolEmitter::unified_exec(
-        &command,
-        cwd,
-        ExecCommandSource::UnifiedExecStartup,
-        process_id,
-        environment_id,
+    let exit_code = process.and_then(UnifiedExecProcess::exit_code);
+    let process_exited = process.is_some_and(UnifiedExecProcess::has_exited);
+    // The delta relay can finish its grace window before the pipe reader reaches EOF.
+    // Only the process-owned reader can attest that capture has drained.
+    let output_drained = process.is_some_and(UnifiedExecProcess::output_is_closed);
+    let failure_cause = failure_cause.or_else(|| process.and_then(UnifiedExecProcess::failure_message));
+    let streams_are_exact = snapshot.as_ref().is_some_and(|output| output.streams_are_exact)
+        && !tty;
+    let search_no_match = crate::tools::context::ExecCommandToolOutput::classified_search_no_match_is_success(
+        classified_search, exit_code, failure_cause.as_deref(), process_exited,
+        output_drained && !tty, snapshot.as_ref(),
     );
-    emitter
-        .emit(
-            event_ctx,
-            ToolEventStage::Success {
-                output,
-                applied_patch_delta: None,
-                formatted_output: None,
-            },
-        )
-        .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn emit_failed_exec_end_for_unified_exec(
-    session_ref: Arc<Session>,
-    turn_ref: Arc<TurnContext>,
-    call_id: String,
-    command: Vec<String>,
-    cwd: PathUri,
-    environment_id: String,
-    process_id: Option<String>,
-    transcript: Arc<Mutex<HeadTailBuffer>>,
-    fallback_output: String,
-    process_output: Option<ProcessOutputSnapshot>,
-    message: String,
-    timed_out: bool,
-    duration: Duration,
-    source: ToolCallSource,
-    tracker: Option<SharedTurnDiffTracker>,
-) -> CodexResult<()> {
-    let (stdout, process_stderr, process_aggregated_output) = if let Some(output) = process_output {
-        (
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-            String::from_utf8_lossy(&output.aggregated_output).into_owned(),
-        )
-    } else {
-        let stdout = if fallback_output.is_empty() {
-            resolve_aggregated_output(&transcript, fallback_output).await
-        } else {
-            let guard = transcript.lock().await;
-            let omitted_bytes = guard.omitted_bytes();
-            let lagged_chunks = guard.lagged_chunks();
-            drop(guard);
-            append_output_loss_markers(fallback_output, omitted_bytes, lagged_chunks)
-        };
-        (stdout.clone(), String::new(), stdout)
-    };
-    let aggregated_output = append_failure_message(process_aggregated_output, &message);
-    let stderr = if process_stderr.is_empty() {
-        message
-    } else {
-        format!("{process_stderr}\n{message}")
-    };
-    let output = ExecToolCallOutput {
-        exit_code: -1,
-        stdout: StreamOutput::new(stdout),
-        stderr: StreamOutput::new(stderr),
-        aggregated_output: StreamOutput::new(aggregated_output),
-        duration,
-        timed_out,
-    };
-    let event_ctx = ToolEventCtx::new(
-        session_ref.as_ref(),
-        turn_ref.as_ref(),
-        &call_id,
-        tracker.as_ref(),
-    )
-    .with_call_source(&source);
-    let emitter = ToolEmitter::unified_exec(
-        &command,
-        cwd,
-        ExecCommandSource::UnifiedExecStartup,
-        process_id,
-        environment_id,
-    );
-    emitter
-        .emit(
-            event_ctx,
-            ToolEventStage::Failure(ToolEventFailure::Output {
-                output,
-                formatted_output: None,
+    let mut metadata = codex_protocol::items::CommandExecutionOutputMetadata {
+        process_exited,
+        output_drained,
+        aggregated_output_is_exact: snapshot.as_ref().is_some_and(|output| output.aggregated_output_is_exact),
+        streams_are_exact,
+        decoding_lossy: snapshot.as_ref().is_some_and(|output| {
+            [&output.aggregated_output, &output.stdout, &output.stderr]
+                .iter().any(|bytes| std::str::from_utf8(bytes).is_err())
+        }),
+        display_reduced: false,
+        search_no_match,
+        failure_cause,
+        raw_output_artifact_id: process.and_then(UnifiedExecProcess::try_raw_output_artifact)
+            .and_then(|artifact| match artifact {
+                crate::tools::command_output_artifact::RawOutputArtifact::Stored { id, .. } => Some(id.to_string()),
+                _ => None,
             }),
+    };
+    let (aggregated_output, stdout, stderr) = if let Some(output) = snapshot {
+        (
+            String::from_utf8_lossy(&output.aggregated_output).into_owned(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
         )
-        .await
+    } else {
+        let output = resolve_aggregated_output(&transcript, fallback_output).await;
+        (output.clone(), output, String::new())
+    };
+    // The legacy formatting helper requires a number. Never publish that sentinel
+    // as process evidence: canonical items and their compatibility events are nullable.
+    let output = ExecToolCallOutput {
+        exit_code: exit_code.unwrap_or(-1),
+        stdout: StreamOutput::new(stdout),
+        stderr: StreamOutput::new(stderr),
+        aggregated_output: StreamOutput::new(aggregated_output),
+        duration,
+        timed_out,
+    };
+    let projected = crate::tools::project_exec_output_for_model_with_budget(
+        &output, turn_ref.model_info.truncation_policy.into(), None, None,
+    );
+    metadata.display_reduced = projected.reduced;
+    let mut formatted_output = projected.text;
+    if exit_code.is_none() {
+        formatted_output = formatted_output.replacen("Exit code: -1", "Exit code: unavailable", 1);
+    }
+    if let Some(failure) = &metadata.failure_cause {
+        formatted_output = append_failure_message(formatted_output, failure);
+    }
+    let mut event_ctx = ToolEventCtx::new(
+        session_ref.as_ref(), turn_ref.as_ref(), &call_id, tracker.as_ref(),
+    ).with_call_source(&source);
+    event_ctx.observed_exit_code = Some(exit_code);
+    event_ctx.output_metadata = Some(&metadata);
+    ToolEmitter::unified_exec(
+        &command, cwd, ExecCommandSource::UnifiedExecStartup, process_id, environment_id,
+    ).emit(event_ctx, ToolEventStage::Success {
+        output, applied_patch_delta: None, formatted_output: Some(formatted_output),
+    }).await
 }
 
 fn split_valid_utf8_prefix_with_max<'a>(

@@ -35,7 +35,7 @@ use super::wait_spec::create_wait_tool;
 
 const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// Compatibility default for bounded polls. Passive wait_for_output owns
-/// continuation internally; cell waits wake on decisions or input, not silence.
+/// continuation internally; cell waits wake on decisions, input, or the actor's idle bound.
 pub(crate) const NESTED_DEFAULT_POLL: Duration = Duration::from_secs(285);
 
 pub struct CodeModeWaitHandler;
@@ -144,10 +144,10 @@ impl CodeModeWaitHandler {
                         .input_queue
                         .turn_state_for_sub_id(&exec.session.active_turn, &exec.turn.sub_id)
                         .await;
-                    let (activity_rx, pending_activity) = exec
+                    let (activity_rx, _) = exec
                         .session
                         .input_queue
-                        .subscribe_activity(turn_state.as_deref(), false)
+                        .subscribe_code_mode_activity(turn_state.as_deref(), false)
                         .await;
                     // Buffered output is not a new model decision. The script
                     // owns its awaited continuation until explicit yield or
@@ -160,26 +160,21 @@ impl CodeModeWaitHandler {
                                 .wait_for_decision(cell_id.clone())
                         },
                         &cancellation_token,
-                        activity_rx,
-                        pending_activity,
+                        queued_input_activity(&exec, turn_state.as_deref(), activity_rx),
                         "wait cancelled",
                     )
                     .await;
                     let held = match held {
                         Ok(held) => held,
+                        Err(error) if cancellation_token.is_cancelled() => OwnerHeldCodeModeWait {
+                            exit: OwnerHeldCodeModeExit::Runtime(
+                                terminate_interrupted_cell(&exec, &cell_id).await
+                                    .map_err(FunctionCallError::RespondToModel)?,
+                            ),
+                            drained_observations: error.drained_observations,
+                        },
                         Err(error) => {
                             record_internally_drained_waits(&exec, error.drained_observations);
-                            if cancellation_token.is_cancelled() {
-                                terminate_interrupted_cell(
-                                    &exec,
-                                    &cell_id,
-                                    CellDispatchLease::new(
-                                        Arc::clone(&exec.session),
-                                        cell_id.clone(),
-                                    ),
-                                )
-                                .await;
-                            }
                             return Err(FunctionCallError::RespondToModel(error.message));
                         }
                     };
@@ -258,10 +253,17 @@ impl CodeModeWaitHandler {
                         dispatch_lease.record_trace(move || trace.record_ended(&response));
                     }
                 }
-                exec.session.services.elicitations.wait_until_clear().await;
+                // The response is already captured. Cancellation releases only
+                // this delivery gate, not the result or unrelated UI leases.
+                tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => {}
+                    _ = exec.session.services.elicitations.wait_until_clear() => {}
+                }
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
+                    let owner = exec.session.services.code_mode_service.cell_parent_call_id(&cell_id);
                     let parent_call_id =
-                        failed_cell_owner_call_id(terminal_parent_call_id.as_deref(), &call_id);
+                        failed_cell_owner_call_id(owner.as_deref().or(terminal_parent_call_id.as_deref()), &call_id);
                     emit_failed_code_mode_cell_item(&exec, parent_call_id, response, started_at)
                         .await;
                 }
@@ -281,14 +283,7 @@ impl CodeModeWaitHandler {
                 if let Some(signal) = authoritative_wait_signal {
                     output = super::merge_code_mode_signal(output, signal);
                 }
-                if output.success == Some(true)
-                    && !output.essential_inline.contains_key(super::VISIBLE_OUTPUT_TRUNCATED_KEY)
-                    && let Some(message) = delivery
-                    && let Some(signal) = output.sampling_request_signal.as_mut()
-                        .and_then(serde_json::Value::as_object_mut)
-                {
-                    signal.insert("explicit_completion_message".into(), message.into());
-                }
+                super::execute_handler::attach_delivery_decision(&mut output, delivery);
                 Ok(boxed_tool_output(output))
             }
             _ => Err(FunctionCallError::RespondToModel(format!(
@@ -308,8 +303,7 @@ fn failed_cell_owner_call_id<'a>(
 pub(super) async fn terminate_interrupted_cell(
     exec: &ExecContext,
     cell_id: &codex_code_mode::CellId,
-    dispatch_lease: CellDispatchLease,
-) {
+) -> Result<codex_code_mode::WaitOutcome, String> {
     let termination = tokio::time::timeout(
         INTERRUPTED_CELL_TERMINATION_GRACE,
         exec.session
@@ -319,17 +313,7 @@ pub(super) async fn terminate_interrupted_cell(
     )
     .await;
     match termination {
-        Ok(Ok(codex_code_mode::WaitOutcome::LiveCell(response))) => {
-            if exec.session.services.rollout_thread_trace.is_enabled() {
-                let trace = exec
-                    .session
-                    .services
-                    .rollout_thread_trace
-                    .code_cell_trace_context(exec.turn.sub_id.as_str(), cell_id.as_str());
-                dispatch_lease.record_trace(move || trace.record_ended(&response));
-            }
-        }
-        Ok(Ok(codex_code_mode::WaitOutcome::MissingCell(_))) => {}
+        Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) => {
             warn!(
                 turn_id = %exec.turn.sub_id,
@@ -337,6 +321,7 @@ pub(super) async fn terminate_interrupted_cell(
                 %error,
                 "failed to terminate interrupted code mode cell"
             );
+            Err(error)
         }
         Err(_) => {
             warn!(
@@ -345,9 +330,9 @@ pub(super) async fn terminate_interrupted_cell(
                 grace_ms = INTERRUPTED_CELL_TERMINATION_GRACE.as_millis(),
                 "timed out terminating interrupted code mode cell"
             );
+            Err(format!("code-mode cell {cell_id} cancellation cleanup timed out; effects and buffered output are unknown"))
         }
     }
-    drop(dispatch_lease);
 }
 
 fn terminal_wait_owner_signal(
@@ -383,8 +368,7 @@ fn terminal_wait_owner_signal(
 pub(super) async fn hold_until_state_change<F, Fut>(
     wait_once: F,
     cancellation_token: &tokio_util::sync::CancellationToken,
-    mut activity_rx: tokio::sync::watch::Receiver<InputQueueActivity>,
-    mut pending_activity: Option<InputQueueActivity>,
+    input_activity: impl Future<Output = InputQueueActivity>,
     cancellation_message: &'static str,
 ) -> Result<OwnerHeldCodeModeWait, OwnerHeldCodeModeWaitError>
 where
@@ -402,12 +386,11 @@ where
     if cancellation_token.is_cancelled() {
         return Err(cancelled());
     }
+    tokio::pin!(input_activity);
     // The runtime retains a decision only while no observer holds it; one
     // delivered to an observer that is then dropped is lost. Answer input that
     // is already waiting before starting an observation.
-    if let Some(activity) =
-        next_input_activity(&mut activity_rx, &mut pending_activity).now_or_never()
-    {
+    if let Some(activity) = input_activity.as_mut().now_or_never() {
         return Ok(steered(activity));
     }
     tokio::select! {
@@ -426,15 +409,36 @@ where
                     drained_observations: 0,
                 })
         }
-        activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
+        activity = &mut input_activity => {
             Ok(steered(activity))
         }
     }
 }
 
+pub(super) async fn queued_input_activity(
+    exec: &ExecContext,
+    turn_state: Option<&tokio::sync::Mutex<crate::state::TurnState>>,
+    mut activity_rx: tokio::sync::watch::Receiver<InputQueueActivity>,
+) -> InputQueueActivity {
+    loop {
+        // Mark the wake seen before reading retained state: anything arriving
+        // during the read is either in that state or leaves another wake.
+        let internal_completion = *activity_rx.borrow_and_update() == InputQueueActivity::InternalCompletion;
+        if let Some(activity) = exec.session.input_queue
+            .pending_activity(turn_state, internal_completion).await
+        {
+            return activity;
+        }
+        if activity_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(test)]
 async fn next_input_activity(
-    activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
-    pending_activity: &mut Option<InputQueueActivity>,
+    mut activity_rx: tokio::sync::watch::Receiver<InputQueueActivity>,
+    mut pending_activity: Option<InputQueueActivity>,
 ) -> InputQueueActivity {
     if let Some(activity) = pending_activity.take() {
         return activity;
@@ -825,8 +829,7 @@ mod tests {
                 std::future::ready(Ok(explicit_empty_yield(&cell_id)))
             },
             &tokio_util::sync::CancellationToken::new(),
-            activity_rx,
-            None,
+            next_input_activity(activity_rx, None),
             "wait cancelled",
         )
         .await
@@ -848,8 +851,7 @@ mod tests {
         let error = hold_until_state_change(
             || std::future::ready(Err("runtime failed".to_string())),
             &tokio_util::sync::CancellationToken::new(),
-            activity_rx,
-            None,
+            next_input_activity(activity_rx, None),
             "wait cancelled",
         )
         .await;
@@ -868,8 +870,7 @@ mod tests {
         let cancelled = hold_until_state_change(
             std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
             &cancellation,
-            activity_rx,
-            None,
+            next_input_activity(activity_rx, None),
             "wait cancelled",
         )
         .await;
@@ -906,8 +907,7 @@ mod tests {
                     }
                 },
                 &cancellation,
-                activity_rx,
-                None,
+                next_input_activity(activity_rx, None),
                 "wait cancelled",
             )
             .await
@@ -930,6 +930,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn held_wait_ignores_non_triggering_mail_until_triggering_mail_arrives() {
+        for queued_before_subscription in [true, false] {
+            let (session, turn) = crate::session::tests::make_session_and_context().await;
+            let exec = ExecContext { session: Arc::new(session), turn: Arc::new(turn) };
+            let queue = &exec.session.input_queue;
+            let mail = |trigger_turn| codex_protocol::protocol::InterAgentCommunication::new(
+                codex_protocol::AgentPath::root().join("worker").unwrap(),
+                codex_protocol::AgentPath::root(),
+                Vec::new(),
+                "worker update".to_string(),
+                trigger_turn,
+            );
+            if queued_before_subscription {
+                queue.enqueue_mailbox_communication(mail(false)).await.unwrap();
+            }
+            let (activity_rx, pending_activity) = queue.subscribe_code_mode_activity(None, false).await;
+            assert_eq!(pending_activity, None);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let mut held = Box::pin(hold_until_state_change(
+                std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
+                &cancellation,
+                queued_input_activity(&exec, None, activity_rx),
+                "wait cancelled",
+            ));
+            assert!(held.as_mut().now_or_never().is_none());
+            if !queued_before_subscription {
+                queue.enqueue_mailbox_communication(mail(false)).await.unwrap();
+            }
+            assert!(held.as_mut().now_or_never().is_none());
+            assert!(queue.has_pending_mailbox_items().await);
+            queue.enqueue_mailbox_communication(mail(true)).await.unwrap();
+            let result = held.await.expect("triggering mail wakes the wait");
+            assert!(matches!(result.exit, OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Mailbox)));
+            assert_eq!(queue.get_pending_input(&tokio::sync::Mutex::new(None)).await.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn held_wait_rechecks_stale_wakes_and_prioritizes_queued_steering() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let exec = ExecContext { session: Arc::new(session), turn: Arc::new(turn) };
+        let queue = &exec.session.input_queue;
+        let (receiver, _) = queue.subscribe_code_mode_activity(None, false).await;
+        let mail = codex_protocol::protocol::InterAgentCommunication::new(
+            codex_protocol::AgentPath::root().join("worker").unwrap(),
+            codex_protocol::AgentPath::root(), Vec::new(), "update".into(), true,
+        );
+        queue.enqueue_mailbox_communication(mail.clone()).await.unwrap();
+        queue.get_pending_input(&tokio::sync::Mutex::new(None)).await;
+        let mut pending = Box::pin(queued_input_activity(&exec, None, receiver));
+        assert!(pending.as_mut().now_or_never().is_none(), "a drained mailbox wake is stale");
+        queue.restore_transferred_startup_input(vec![crate::session::TurnInput::UserInput {
+            content: vec![codex_protocol::user_input::UserInput::Text { text: "steer".into(), text_elements: Vec::new() }],
+            client_id: None,
+        }]).await;
+        // A lower-priority broadcast must not mask the retained user input.
+        queue.publish_internal_completion();
+        assert_eq!(pending.await, InputQueueActivity::Steer);
+    }
+
+    #[tokio::test]
     async fn decision_delivered_with_new_input_is_not_dropped() {
         let cell_id = codex_code_mode::CellId::new("cell-1".to_string());
         let (activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
@@ -944,8 +1005,7 @@ mod tests {
                         .map_err(|_| "decision dropped".to_string())
                 },
                 &tokio_util::sync::CancellationToken::new(),
-                activity_rx,
-                None,
+                next_input_activity(activity_rx, None),
                 "wait cancelled",
             )
             .await
@@ -1002,8 +1062,7 @@ mod tests {
                     std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>().await
                 },
                 &tokio_util::sync::CancellationToken::new(),
-                activity_rx,
-                pending_activity,
+                next_input_activity(activity_rx, pending_activity),
                 "wait cancelled",
             )
             .await
@@ -1033,7 +1092,7 @@ mod tests {
         };
         let (activity_rx, pending_activity) = session
             .input_queue
-            .subscribe_activity(
+            .subscribe_code_mode_activity(
                 Some(turn_state.as_ref()),
                 /*has_internal_completion*/ false,
             )
@@ -1049,8 +1108,7 @@ mod tests {
                     std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>().await
                 },
                 &cancellation,
-                activity_rx,
-                pending_activity,
+                next_input_activity(activity_rx, pending_activity),
                 "wait cancelled",
             )
             .await
@@ -1089,8 +1147,7 @@ mod tests {
             hold_until_state_change(
                 std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
                 &cancellation,
-                activity_rx,
-                None,
+                next_input_activity(activity_rx, None),
                 "wait cancelled",
             )
             .await
@@ -1125,7 +1182,7 @@ mod tests {
                 state_path: None,
                 tool_call_id: "runtime-timeout-call".to_string(),
                 enabled_tools: Vec::new().into(),
-                source: "await new Promise(() => {});".to_string(),
+                source: "await new Promise(resolve => setTimeout(resolve, 3_600_000));".to_string(),
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
                 default_tool_timeout_ms: None,
@@ -1156,15 +1213,14 @@ mod tests {
                     async move { service.wait_for_decision(wait_cell_id).await }
                 },
                 &cancellation,
-                activity_rx,
-                None,
+                next_input_activity(activity_rx, None),
                 "wait cancelled",
             )
             .await
         });
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::time::advance(Duration::from_secs(599)).await;
         tokio::task::yield_now().await;
         assert!(!held.is_finished());
         activity_tx.send(InputQueueActivity::Steer).unwrap();

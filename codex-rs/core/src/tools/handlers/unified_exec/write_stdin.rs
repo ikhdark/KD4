@@ -28,6 +28,8 @@ struct WriteStdinArgs {
     // The model is trained on `session_id`.
     session_id: u32,
     #[serde(default)]
+    incarnation: Option<uuid::Uuid>,
+    #[serde(default)]
     chars: String,
     #[serde(default)]
     yield_time_ms: Option<u64>,
@@ -106,6 +108,25 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        let live_incarnation = session.services.unified_exec_manager
+            .process_incarnation(args.session_id).await;
+        if live_incarnation.is_none() && args.chars.is_empty() && !args.terminate
+            && let Some(incarnation) = args.incarnation
+            && let Some(result) = session.services.command_execution
+                .completed_process_result(args.session_id, incarnation).await
+        {
+            return Ok(boxed_tool_output(codex_tools::JsonToolOutput::new(result)));
+        }
+        // Legacy numeric-only handles are readable history, not live authority.
+        // IDs are not reused inside a manager; the creation token additionally
+        // prevents persisted values from controlling another runtime's process.
+        if args.incarnation.is_none()
+            || live_incarnation != args.incarnation
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "process handle is stale or lacks its creation identity; supply incarnation from the originating session_capabilities. No process was polled, written, or terminated.".into(),
+            ));
+        }
         let wait_for_output = args.waits_for_output();
         if args.terminate && !args.chars.is_empty() {
             return Err(FunctionCallError::RespondToModel(
@@ -117,7 +138,7 @@ impl WriteStdinHandler {
                 "wait_for_output requires empty chars; send input separately".to_string(),
             ));
         }
-        validate_independent_review_stdin(&turn.session_source, &args.chars)
+        validate_independent_review_stdin(&turn.session_source, &args.chars, args.terminate)
             .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         if args.terminate
             && !session.services.unified_exec_manager
@@ -177,6 +198,16 @@ impl WriteStdinHandler {
                 .await;
         }
         let response = match response {
+            Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
+                if args.chars.is_empty() && !args.terminate =>
+            {
+                if let Some(result) = session.services.command_execution
+                    .completed_process_result(process_id, args.incarnation.expect("authenticated process handle")).await
+                {
+                    return Ok(boxed_tool_output(codex_tools::JsonToolOutput::new(result)));
+                }
+                Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
+            }
             Err(crate::unified_exec::UnifiedExecError::ProcessFailedWithOutput { mut output, .. }) => {
                 output.max_output_tokens = args.max_output_tokens;
                 output.truncation_policy = turn.model_info.truncation_policy.into();
@@ -184,12 +215,15 @@ impl WriteStdinHandler {
             }
             other => other,
         };
-        let mut response = response.map_err(|err| match err {
-            crate::unified_exec::UnifiedExecError::ToolHistoryPersistence { message, .. } => {
-                FunctionCallError::Fatal(message)
+        let mut response = match response {
+            Ok(response) => response,
+            Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence { message, output, .. }) => {
+                return Err(FunctionCallError::Fatal(super::preserve_durability_failure_output(
+                    message, output, &turn.config.codex_home, &session.thread_id.to_string(),
+                ).await));
             }
-            err => FunctionCallError::RespondToModel(format!("write_stdin failed: {err}")),
-        })?;
+            Err(err) => return Err(FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))),
+        };
 
         if let Some(running) = session
             .services
@@ -197,18 +231,18 @@ impl WriteStdinHandler {
             .running_process(args.session_id)
             .await
         {
+            if let Some(cwd) = running.key.local_cwd() {
+                super::exec_command::attach_hidden_rg_directory_advisory(
+                    &mut response, &cwd, &session.services.git_workspace,
+                ).await;
+            }
             let artifact = response
                 .raw_output_artifact
                 .clone()
                 .unwrap_or_else(|| running.artifact.clone());
             response.raw_output_artifact = Some(artifact.clone());
-            if response.process_id.is_some() {
-                session
-                    .services
-                    .command_execution
-                    .update_running_artifact(args.session_id, artifact)
-                    .await;
-            } else {
+            session.services.command_execution.update_running_artifact(args.session_id, artifact).await;
+            if response.process_id.is_none() {
                 session
                     .services
                     .command_execution
@@ -278,12 +312,20 @@ fn owner_wait_yield_time_ms(
 }
 
 impl CoreToolRuntime for WriteStdinHandler {
+    fn controls_process(&self, payload: &ToolPayload) -> bool {
+        let ToolPayload::Function { arguments } = payload else {
+            return false;
+        };
+        serde_json::from_str::<WriteStdinArgs>(arguments)
+            .is_ok_and(|args| args.terminate && args.chars.is_empty())
+    }
+
     fn permits_shared_workspace_observation(&self, payload: &ToolPayload) -> bool {
         let ToolPayload::Function { arguments } = payload else {
             return false;
         };
-        serde_json::from_str::<serde_json::Value>(arguments).is_ok_and(|arguments| {
-            arguments.get("chars").is_none_or(|chars| chars.as_str() == Some(""))
+        serde_json::from_str::<WriteStdinArgs>(arguments).is_ok_and(|args| {
+            args.chars.is_empty() && !args.terminate
         })
     }
 
@@ -324,6 +366,25 @@ impl CoreToolRuntime for WriteStdinHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdin_poll_write_and_termination_have_distinct_admission() {
+        let handler = WriteStdinHandler::default();
+        for (arguments, observation, control) in [
+            (r#"{"session_id":7}"#, true, false),
+            (r#"{"session_id":7,"chars":"","terminate":false}"#, true, false),
+            (r#"{"session_id":7,"chars":"input"}"#, false, false),
+            (r#"{"session_id":7,"terminate":true}"#, false, true),
+            (r#"{"session_id":7,"terminate":true,"chars":"input"}"#, false, false),
+            (r#"{"session_id":7,"terminate":"true"}"#, false, false),
+            (r#"{"terminate":true}"#, false, false),
+            ("not json", false, false),
+        ] {
+            let payload = ToolPayload::Function { arguments: arguments.to_string() };
+            assert_eq!(handler.permits_shared_workspace_observation(&payload), observation, "{arguments}");
+            assert_eq!(handler.controls_process(&payload), control, "{arguments}");
+        }
+    }
 
     #[test]
     fn passive_nested_wait_preserves_the_manager_return_margin() {

@@ -251,7 +251,7 @@ impl ToolHistoryPersistenceQueue {
                     // old durable ledger/protections remain intact on flush failure.
                     let mut failure = None;
                     if let Some(barrier) = rollout_barrier.as_ref() {
-                        match barrier.flush().await {
+                        match barrier.flush_durable().await {
                             Ok(()) => rollout_barrier = None,
                             Err(error) => {
                                 failure = Some(ToolHistoryPersistenceError::Persistence(format!(
@@ -1377,7 +1377,7 @@ impl Session {
                 )
                 .await
             } else {
-                crate::tool_history::load_tool_history_state(
+                crate::tool_history::load_tool_history_state_for_initialization(
                     config.codex_home.as_path(),
                     &thread_id.to_string(),
                 )
@@ -1675,7 +1675,7 @@ impl Session {
                     },
                 )],
             );
-            let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions));
+            let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions).with_thread_id(thread_id.to_string()));
             let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
                 Arc::clone(&config),
                 Arc::clone(&plugins_manager),
@@ -1936,7 +1936,7 @@ impl Session {
                 ),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::clone(
                     &code_mode_session_provider,
-                )),
+                )).with_recovery_path(config.codex_home.join("code-mode-state").join(format!("{thread_id}.json"))),
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
                 git_workspace,

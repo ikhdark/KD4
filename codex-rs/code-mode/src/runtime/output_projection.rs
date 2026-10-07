@@ -1,19 +1,79 @@
 //! Model-only serialization of unmodified tool return objects. Weak keys avoid
-//! retaining results after JavaScript releases them; nothing crosses the wire.
+//! retaining results after JavaScript releases them. Trusted display recipes
+//! travel only with their values through the existing store/load path.
 use serde_json::Value;
 
 use super::RuntimeState;
 use super::value::json_to_v8;
 
-const PROJECTOR: &str = r#"(() => {
+const PROJECTOR: &str = r#"((isProxy) => {
   const stringify = JSON.stringify;
+  const parse = JSON.parse;
+  const rawJSON = JSON.rawJSON;
+  const NativeError = Error;
+  const toBigInt = BigInt;
+  const isSafeInteger = Number.isSafeInteger;
   const keys = Object.getOwnPropertyNames;
   const descriptor = Object.getOwnPropertyDescriptor;
   const prototype = Object.getPrototypeOf;
+  const objectPrototype = Object.prototype;
+  const arrayPrototype = Array.prototype;
   const projections = new WeakMap();
   const get = projections.get.bind(projections);
   const set = projections.set.bind(projections);
-  let active = false;
+  // Display-only: retain native errors in scripts, but never print opaque {}.
+  function errorProjection(error, remaining = 16384, controlsFirst = false) {
+    const seen = new Set();
+    function bounded(value, depth = 0) {
+      if (remaining <= 0 || depth >= 8) return "[error details truncated]";
+      if (typeof value === 'string') {
+        const count = Math.min(4096, remaining);
+        remaining -= Math.min(value.length, count);
+        return value.length > count ? value.slice(0, count) + "[truncated]" : value;
+      }
+      if (value === null || typeof value !== 'object') return value;
+      if (seen.has(value)) return "[circular error evidence]";
+      seen.add(value);
+      const array = Array.isArray(value);
+      const result = Object.create(null);
+      const fields = array ? (result.entries = Object.create(null)) : result;
+      let names;
+      try {
+        if (array) result.original_length = descriptor(value, 'length')?.value;
+        names = value instanceof NativeError ? [...new Set(['name', 'message', 'cause', 'evidence', 'results',
+          ...keys(value).filter(key => key !== 'stack')])] :
+          keys(value).filter(key => !(array && key === 'length'));
+      } catch { return '[error evidence unavailable]'; }
+      if (controlsFirst) {
+        const controls = ['status', 'artifact_id', 'session_id', 'recovery', 'continuation',
+          'complete', 'execution_state', 'exit_code', 'process_exited', 'session_capabilities',
+          'name', 'message', 'reason', 'step_id', 'terminal', 'value', 'initial', 'observations'];
+        names.sort((a, b) => Number(!controls.includes(a)) - Number(!controls.includes(b)));
+      }
+      for (const key of names.slice(0, 64)) {
+        if (remaining <= 0) { result.details_omitted = true; break; }
+        if (key.length > 512 || key.length + 8 > remaining) { result.details_omitted = true; continue; }
+        remaining -= key.length + 8;
+        // Diagnostic getters must not prevent successful siblings from printing.
+        try {
+          let field = descriptor(value, key);
+          if (!field && value instanceof NativeError && key === 'name') {
+            field = descriptor(prototype(value), key);
+          }
+          if (field) fields[key] = 'value' in field ? bounded(field.value, depth + 1) : '[accessor omitted]';
+        } catch { fields[key] = '[error evidence unavailable]'; }
+      }
+      if (names.length > 64) result.details_omitted = true;
+      return result;
+    }
+    return bounded(error);
+  }
+  // Share one bounded serializer with explicit JSON.stringify as well as text.
+  // The Error objects and successful sibling values themselves stay untouched.
+  Object.defineProperty(NativeError.prototype, 'toJSON', {
+    value: function toJSON() { return errorProjection(this); },
+    writable: true, configurable: true,
+  });
   function same(value, original, depth = 0) {
     if (value === original) return true;
     if (depth >= 128 || value === null || original === null ||
@@ -30,14 +90,76 @@ const PROJECTOR: &str = r#"(() => {
     }
     return true;
   }
+  // Root memoization is safe only if this serialization cannot execute user
+  // code between rows. Inspect data descriptors without calling getters or
+  // proxy traps, including roots referenced only by selected fragments.
+  function inert(value, seen, depth = 0) {
+    if (typeof value === 'function') return false;
+    if (value === null || typeof value !== 'object') return true;
+    if (depth >= 128 || isProxy(value)) return false;
+    if (seen.has(value)) return true;
+    seen.add(value);
+    const proto = prototype(value);
+    if (proto !== null && proto !== objectPrototype && proto !== arrayPrototype) return false;
+    if (prototype(objectPrototype) !== null || prototype(arrayPrototype) !== objectPrototype ||
+        descriptor(objectPrototype, 'toJSON') || descriptor(arrayPrototype, 'toJSON')) return false;
+    for (const name of keys(value)) {
+      const field = descriptor(value, name);
+      if (!field || !('value' in field) || !inert(field.value, seen, depth + 1)) return false;
+    }
+    const entry = get(value);
+    return !entry?.root || inert(entry.root, seen, depth + 1);
+  }
   const escapes = (text) => stringify(text).length !== text.length + 2;
   const lineCount = (text) => text.split('\n').length;
+  // Shared hydration is scoped to its parent response. A selected row may not
+  // contain the earlier body, so resolve it from the retained immutable parent.
+  function standaloneFragment(fragment, source) {
+    const bodies = value => {
+      if (Array.isArray(value)) return value.flatMap(bodies);
+      if (!value || typeof value !== 'object') return [];
+      if (value.canonical_range && (typeof value.text === 'string' || value.data_base64)) return [value];
+      return bodies(value.results || value.value?.hydrated_ranges || []);
+    };
+    const local = bodies(fragment);
+    const retained = bodies(source);
+    const covers = (body, range) => body.canonical_range.start <= range.start && body.canonical_range.end >= range.end;
+    const resolve = item => {
+      if (Array.isArray(item)) return item.map(resolve);
+      if (!item || typeof item !== 'object') return item;
+      if (item.shared === true && item.canonical_range) {
+        const range = item.canonical_range;
+        if (local.some(body => covers(body, range))) return item;
+        const body = retained.find(body => covers(body, range));
+        if (body && typeof body.text === 'string') {
+          let offset = body.canonical_range.start, text = '';
+          for (const ch of body.text) {
+            const cp = ch.codePointAt(0);
+            const end = offset + (cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4);
+            if (offset >= range.start && end <= range.end) text += ch;
+            if ((offset < range.start && end > range.start) || (offset < range.end && end > range.end)) break;
+            offset = end;
+            if (offset === range.end) {
+              const {shared, ...rest} = item;
+              return {...rest, text};
+            }
+          }
+        }
+        return {...item, recovery: {artifact_id: source.artifact_id,
+          source_sha256: source.source_sha256 || source.canonical_sha256,
+          selectors: [{kind: 'bytes', start: range.start, end: range.end}]}};
+      }
+      if (item.value?.hydrated_ranges) return {...item, value: {...item.value, hydrated_ranges: resolve(item.value.hydrated_ranges)}};
+      return item;
+    };
+    return resolve(fragment);
+  }
   // Registered results, including ones inside batches, keep their JSON shape
   // in a one-line envelope. Counted text bodies follow in traversal order.
   // Only tool-owned text slots qualify, never arbitrary user JSON strings.
-  function rawText(projected, fragment) {
+  function rawText(projected, fragment, source = projected) {
     if (fragment) {
-      const raw = rawText({results: fragment === 'rows' ? projected : [projected]});
+      const raw = rawText({results: fragment === 'rows' ? projected : [projected]}, undefined, source);
       if (!raw) return undefined;
       return {envelope: fragment === 'rows' ? raw.envelope.results : raw.envelope.results[0], texts: raw.texts};
     }
@@ -48,7 +170,11 @@ const PROJECTOR: &str = r#"(() => {
       const {output, ...envelope} = projected;
       if (!escapes(output)) return undefined;
       envelope.output_lines = lineCount(output);
-      return {envelope, texts: [output]};
+      return {envelope, texts: [{text: output, source: {
+        path: source.path, artifact_id: source.artifact_id,
+        session_id: source.session_id, chunk_id: source.chunk_id, field: 'output',
+        text_lines: lineCount(output),
+      }}]};
     }
     if (Array.isArray(projected.results) && !('output' in projected)) {
       const texts = [];
@@ -57,7 +183,9 @@ const PROJECTOR: &str = r#"(() => {
           return item;
         }
         const {text, ...rest} = item;
-        texts.push(text);
+        texts.push({text, source: {path: source.path, artifact_id: source.artifact_id,
+          selector: item.selector, canonical_range: item.canonical_range,
+          complete: item.complete, text_lines: lineCount(text)}});
         return {...rest, text_lines: lineCount(text)};
       };
       const results = projected.results.map((result) => {
@@ -69,17 +197,102 @@ const PROJECTOR: &str = r#"(() => {
         }
         return framed;
       });
-      if (!texts.some(escapes)) return undefined;
+      if (!texts.some(body => escapes(body.text))) return undefined;
       return {envelope: {...projected, results}, texts};
     }
     return undefined;
   }
-  return function(value, original, projected, sourceFragments) {
+  return function project(value, original, projected, sourceFragments) {
+    // Only the native store/load callbacks can export/import this metadata.
+    // Keep a small edit recipe, not a second copy of source text. Arbitrary
+    // lookalike JSON never gains tool provenance.
+    if (arguments.length === 2 && original === 'capture_presentation') {
+      if (!inert(value, new Set())) return [];
+      const records = [];
+      const delta = (before, after, path = [], edits = []) => {
+        if (same(before, after)) return edits;
+        if (Array.isArray(before) && Array.isArray(after) && before.length === after.length) {
+          for (let index = 0; index < after.length; index++) delta(before[index], after[index], [...path, String(index)], edits);
+        } else if (before && after && typeof before === 'object' && typeof after === 'object' &&
+            !Array.isArray(before) && !Array.isArray(after)) {
+          for (const key of keys(before)) if (!descriptor(after, key)) edits.push({path: [...path, key], remove: true});
+          for (const key of keys(after)) delta(descriptor(before, key)?.value, after[key], [...path, key], edits);
+        } else edits.push({path, value: after});
+        return edits;
+      };
+      const visit = (item, path, depth) => {
+        if (!item || typeof item !== 'object' || depth >= 128) return;
+        const entry = get(item);
+        if (entry && same(item, entry.original) && (!entry.root || same(entry.root, entry.rootOriginal))) {
+          const display = entry.fragment ? standaloneFragment(entry.projected, entry.rootOriginal) : entry.projected;
+          const source = entry.rootOriginal;
+          records.push({path, edits: delta(item, display), fragment: entry.fragment,
+            sourceFragments: entry.sourceFragments,
+            source: source && {path: source.path, artifact_id: source.artifact_id,
+              source_sha256: source.source_sha256, canonical_sha256: source.canonical_sha256}});
+          return;
+        }
+        for (const key of keys(item)) {
+          const field = descriptor(item, key);
+          if (field.enumerable) visit(field.value, [...path, key], depth + 1);
+        }
+      };
+      visit(value, [], 0);
+      return records;
+    }
+    if (arguments.length === 3 && original === 'restore_presentation') {
+      const clone = item => project(project(item, 'serialize'), 'parse');
+      for (const record of projected) {
+        let target = value;
+        for (const key of record.path) target = descriptor(target, key)?.value;
+        if (!target || typeof target !== 'object') continue;
+        let display = clone(target);
+        for (const edit of record.edits) {
+          if (!edit.path.length) { display = edit.value; continue; }
+          let parent = display;
+          for (const key of edit.path.slice(0, -1)) parent = descriptor(parent, key)?.value;
+          const key = edit.path[edit.path.length - 1];
+          if (edit.remove) delete parent[key];
+          else Object.defineProperty(parent, key, {value: edit.value, enumerable: true, writable: true, configurable: true});
+        }
+        if (record.fragment) set(target, {original: clone(target), projected: display,
+          fragment: record.fragment, rootOriginal: record.source});
+        else project(target, clone(target), display, record.sourceFragments);
+      }
+      return;
+    }
+    // The transport codec shares this cell-owned, captured serializer, not
+    // script-overridable JSON methods. BigInt never silently becomes Number.
+    if (arguments.length === 2) {
+      if (original === 'helper_evidence') {
+        // Only used after full uncaught-helper serialization fails or exceeds
+        // the cell error limit. Give every settled node its own small budget;
+        // an oversized sibling must not hide later statuses and handles.
+        const names = value !== null && typeof value === 'object' ? keys(value) : [];
+        const entries = names.filter(name => name !== 'length').slice(0, 256).map(name => {
+          const field = descriptor(value, name);
+          return {key: name.length > 512 ? name.slice(0, 512) + '[truncated]' : name,
+            value: field && 'value' in field ? errorProjection(field.value, 2048, true) : '[accessor omitted]'};
+        });
+        return stringify({bounded_helper_evidence: true, entries,
+          omitted_entries: Math.max(0, names.filter(name => name !== 'length').length - entries.length)},
+          (_key, item) => typeof item === 'bigint' ? {$bigint:item.toString()} : item);
+      }
+      if (original === 'parse') return parse(value, (_key, item, context) =>
+        typeof item === 'number' && !isSafeInteger(item) &&
+        /^-?[0-9]+$/.test(context.source) ? toBigInt(context.source) : item);
+      return stringify(value, (_key, item) => {
+        if (typeof item !== 'bigint') return item;
+        if (item < -9223372036854775808n || item > 18446744073709551615n)
+          throw new RangeError('BigInt exceeds the exact JSON integer transport range');
+        return rawJSON(item.toString());
+      });
+    }
     if (arguments.length === 4) {
-      set(value, {original, projected});
+      set(value, {original, projected, sourceFragments});
       // Selected native source rows should not need the entire envelope just
       // to avoid JSON-escaping their text. Keep identity and mutation guards;
-      // arbitrary JSON, cloned values and storage remain untouched.
+      // arbitrary JSON and unregistered clones remain untouched.
       if (sourceFragments && Array.isArray(value.results) && Array.isArray(projected.results)) {
         const rows = (values, originals, displays) => {
           set(values, {original: originals, projected: displays, fragment: 'rows', root: value, rootOriginal: original});
@@ -93,31 +306,77 @@ const PROJECTOR: &str = r#"(() => {
         };
         rows(value.results, original.results, projected.results);
       }
-      active = true;
       return;
     }
-    if (!active) return stringify(value);
     const texts = [];
+    const roots = inert(value, new Set()) ? new Map() : undefined;
+    const unchangedRoot = entry => {
+      if (!entry.root) return true;
+      if (!roots) return same(entry.root, entry.rootOriginal);
+      if (!roots.has(entry.root)) roots.set(entry.root, same(entry.root, entry.rootOriginal));
+      return roots.get(entry.root);
+    };
     const rendered = stringify(value, (_key, item) => {
+      if (typeof item === 'bigint') return { $bigint: item.toString() };
+      if (item instanceof NativeError) return errorProjection(item);
       const entry = item !== null && typeof item === 'object' ? get(item) : undefined;
-      if (!entry || !same(item, entry.original) ||
-          (entry.root && !same(entry.root, entry.rootOriginal))) return item;
-      const raw = rawText(entry.projected, entry.fragment);
-      if (raw === undefined) return entry.projected;
+      if (!entry) return item;
+      if (!same(item, entry.original)) {
+        // Helpers annotate wrappers. For caller-added command metadata, keep
+        // the command projection only if every original field is unchanged.
+        // Accessors, proxies, custom serialization and evidence edits opt out.
+        if (entry.root || typeof entry.original.output !== 'string' ||
+            !inert(item, new Set()) || prototype(item) !== prototype(entry.original)) return item;
+        const extras = keys(item).filter(name => !descriptor(entry.original, name));
+        // Never overwrite caller additions with synthesized display fields.
+        if (extras.some(name => descriptor(entry.projected, name) || name === 'output_lines')) return item;
+        if (!extras.length || !keys(entry.original).every(name => {
+          const field = descriptor(item, name), source = descriptor(entry.original, name);
+          return field && 'value' in field && field.enumerable === source.enumerable && same(field.value, source.value);
+        })) return item;
+        const annotated = {...entry.projected};
+        for (const name of extras) {
+          const field = descriptor(item, name);
+          if (field.enumerable) Object.defineProperty(annotated, name, field);
+        }
+        const raw = rawText(annotated);
+        if (!raw) return annotated;
+        texts.push(...raw.texts);
+        return raw.envelope;
+      }
+      if (!unchangedRoot(entry)) return item;
+      const display = entry.fragment ? standaloneFragment(entry.projected, entry.rootOriginal) : entry.projected;
+      const raw = rawText(display, entry.fragment, entry.rootOriginal || entry.projected);
+      if (raw === undefined) return display;
       texts.push(...raw.texts);
       return raw.envelope;
     });
-    return texts.length ? rendered + '\n' + texts.join('\n') : rendered;
+    return texts.length ? rendered + '\n' + texts.map((body, index) =>
+      '[source ' + stringify({body: index + 1, ...body.source}) + ']\n' + body.text).join('\n') : rendered;
   };
-})()"#;
+})"#;
+
+fn is_proxy_callback(
+    _scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    retval.set_bool(args.get(0).is_proxy());
+}
 
 pub(super) fn prepare(scope: &mut v8::PinScope<'_, '_>) -> Result<v8::Global<v8::Function>, String> {
     let source = v8::String::new(scope, PROJECTOR)
         .ok_or_else(|| "failed to allocate output projector".to_string())?;
-    let function = v8::Script::compile(scope, source, None)
+    let factory = v8::Script::compile(scope, source, None)
         .and_then(|script| script.run(scope))
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
         .ok_or_else(|| "failed to install output projector".to_string())?;
+    let is_proxy = v8::Function::new(scope, is_proxy_callback)
+        .ok_or_else(|| "failed to install proxy guard".to_string())?;
+    let receiver = v8::undefined(scope).into();
+    let function = factory.call(scope, receiver, &[is_proxy.into()])
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+        .ok_or_else(|| "failed to initialize output projector".to_string())?;
     Ok(v8::Global::new(scope, function))
 }
 
@@ -170,12 +429,169 @@ pub(super) fn stringify<'s>(
         .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
 }
 
+pub(super) fn json_codec<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'_, v8::Value>,
+    mode: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let function = scope.get_slot::<RuntimeState>()
+        .and_then(|state| state.output_projector.as_ref())
+        .map(|function| v8::Local::new(scope, function))?;
+    let receiver = v8::undefined(scope).into();
+    let mode = v8::String::new(scope, mode)?;
+    function.call(scope, receiver, &[value, mode.into()])
+}
+
+pub(super) fn capture_stored_presentation(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<Value> {
+    let metadata = json_codec(scope, value, "capture_presentation")?;
+    super::value::v8_value_to_json(scope, metadata).ok().flatten()
+        .filter(|value| value.as_array().is_some_and(|entries| !entries.is_empty()))
+}
+
+pub(super) fn restore_stored_presentation(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    metadata: &Value,
+) -> Option<()> {
+    let metadata = json_to_v8(scope, metadata)?;
+    let function = scope.get_slot::<RuntimeState>()?.output_projector.as_ref()
+        .map(|function| v8::Local::new(scope, function))?;
+    let receiver = v8::undefined(scope).into();
+    let mode = v8::String::new(scope, "restore_presentation")?;
+    function.call(scope, receiver, &[value, mode.into(), metadata])?;
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::*;
     use codex_code_mode_protocol::ToolDefinition;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn stored_presentation_avoids_an_overflow_recovery_round_trip() {
+        async fn cell(source: &str, stored: HashMap<String, StoredValue>, raw: &Value, limit: usize)
+            -> (Vec<String>, HashMap<String, StoredValue>, bool)
+        {
+            let (events, mut rx) = mpsc::unbounded_channel();
+            let request = ExecuteRequest {
+                state_path: None, tool_call_id: "stored-presentation".into(),
+                enabled_tools: vec![ToolDefinition {
+                    name: "read_file".into(), tool_name: ToolName::plain("read_file"),
+                    kind: CodeModeToolKind::Function, description: String::new().into(),
+                    input_schema: None, output_schema: None, default_timeout_ms: None,
+                }].into(),
+                source: source.into(), yield_time_ms: None, max_output_tokens: None,
+                default_tool_timeout_ms: None,
+            };
+            let (tx, _termination) = spawn_runtime(stored, request, 60_000, events,
+                Arc::new(OutputAdmission::new(limit)), None).await.unwrap();
+            let mut printed = Vec::new();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+                    RuntimeEvent::Started => {}
+                    RuntimeEvent::ToolCall { id, .. } => tx.send(RuntimeCommand::ToolResponse { id, result: raw.clone() }).unwrap(),
+                    RuntimeEvent::ContentItem { item: FunctionCallOutputContentItem::InputText { text }, .. } => printed.push(text),
+                    RuntimeEvent::Result { error_text, stored_value_writes, output_loss } => {
+                        assert_eq!(error_text, None);
+                        return (printed, stored_value_writes, output_loss.is_some());
+                    }
+                    other => panic!("unexpected event {other:?}"),
+                }
+            }
+        }
+        let raw = json!({"path":"source.rs", "source_sha256":"sha", "canonical_sha256":"sha",
+            "complete":true, "delivered_selection_complete":true, "artifact_id":"saved",
+            "results":[{"status":"ok", "complete":true, "text":"\"\\\n".repeat(5_000)}]});
+        let (before, saved, loss) = cell(
+            "const r = await tools.read_file({}); store('raw', r); store('plain', JSON.parse(JSON.stringify(r))); store('batch', {items:[r]}); store('row', r.results[0]); text(r);",
+            HashMap::new(), &raw, MAX_BUFFERED_OUTPUT_BYTES,
+        ).await;
+        assert!(!loss);
+        assert_eq!(*saved["raw"].value, raw);
+        assert!(saved["raw"].presentation.is_some());
+        assert!(saved["plain"].presentation.is_none());
+        assert!(saved["batch"].presentation.is_some());
+        assert!(saved["row"].presentation.is_some());
+        assert!(serde_json::to_vec(saved["raw"].presentation.as_ref().unwrap()).unwrap().len() < 1_024,
+            "presentation must not duplicate retained source text");
+        let limit = serde_json::to_vec(&FunctionCallOutputContentItem::InputText {
+            text: before[0].clone(),
+        }).unwrap().len() + 128;
+        let (after, _, loss) = cell("text(load('raw'));", saved.clone(), &raw, limit).await;
+        assert_eq!(after.len(), before.len());
+        for (after, before) in after.iter().zip(&before) {
+            let (after_metadata, after_source) = after.split_once('\n').unwrap();
+            let (before_metadata, before_source) = before.split_once('\n').unwrap();
+            assert_eq!(serde_json::from_str::<Value>(after_metadata).unwrap(),
+                serde_json::from_str::<Value>(before_metadata).unwrap());
+            assert_eq!(after_source, before_source, "retained source bytes stay exact");
+        }
+        assert!(!loss, "trusted load must fit without an overflow/recovery call");
+        let (_, _, old_loss) = cell("text(load('plain'));", saved.clone(), &raw, limit).await;
+        assert!(old_loss, "the former plain-JSON load requires overflow recovery at the same budget");
+        let (batch, _, loss) = cell("text(load('batch')); text(load('row'));", saved.clone(), &raw, MAX_BUFFERED_OUTPUT_BYTES).await;
+        assert!(!loss);
+        assert!(batch.iter().all(|text| text.contains("[source ")));
+        let (changed, _, loss) = cell("const r=load('raw'); r.results[0].text='changed'; text(r);", saved, &raw, MAX_BUFFERED_OUTPUT_BYTES).await;
+        assert!(!loss);
+        assert_eq!(serde_json::from_str::<Value>(&changed[0]).unwrap()["results"][0]["text"], "changed");
+    }
+
+    #[tokio::test]
+    async fn verified10_explicit_formatter_survives_clone_annotation_and_storage() {
+        let raw = json!({"output":"display λ\n", "stdout":"exact stdout ".repeat(600), "stderr":"",
+            "streams_complete":true, "output_reduced":true, "output_complete":false,
+            "execution_state":"exited", "exit_code":0});
+        let (event_tx, mut rx) = mpsc::unbounded_channel();
+        let request = ExecuteRequest {
+            state_path: None, tool_call_id: "retained-formatter".into(),
+            enabled_tools: vec![ToolDefinition {
+                name:"exec_command".into(), tool_name:ToolName::plain("exec_command"),
+                kind:CodeModeToolKind::Function, description:"".into(), input_schema:None,
+                output_schema:None, default_timeout_ms:None,
+            }].into(),
+            source:r#"
+                const r = await tools.exec_command({});
+                store('raw', r);
+                const copy = JSON.parse(JSON.stringify(r));
+                text(r);
+                text(format_tool_result('exec_command', copy));
+                text(format_tool_result('exec_command', load('raw')));
+                text(format_tool_result('exec_command', {...copy, note:'annotation'}));
+                if (copy.stdout !== r.stdout || load('raw').stdout !== r.stdout) throw Error('raw changed');
+                text(copy);
+            "#.into(),
+            yield_time_ms:None, max_output_tokens:None, default_tool_timeout_ms:None,
+        };
+        let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000, event_tx,
+            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+        let mut printed = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+                RuntimeEvent::Started => {},
+                RuntimeEvent::ToolCall { id, .. } => tx.send(RuntimeCommand::ToolResponse { id, result:raw.clone() }).unwrap(),
+                RuntimeEvent::ContentItem { item:FunctionCallOutputContentItem::InputText { text }, .. } => printed.push(text),
+                RuntimeEvent::Result { error_text, stored_value_writes, output_loss } => {
+                    assert_eq!(error_text, None);
+                    assert_eq!(output_loss, None);
+                    assert_eq!(*stored_value_writes["raw"].value, raw);
+                    break;
+                },
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(printed.len(), 5);
+        assert_eq!(printed[0], printed[1]);
+        assert_eq!(printed[0], printed[2]);
+        assert!(printed[3].contains("annotation"));
+        assert!(!printed[..4].iter().any(|text| text.contains("exact stdout")));
+        assert!(printed[4].contains("exact stdout"), "unregistered arbitrary JSON remains exact");
+    }
 
     #[tokio::test]
     async fn projection_preserves_raw_values_and_only_compacts_registered_objects() {
@@ -428,6 +844,8 @@ mod tests {
                 envelope,
                 "{name}"
             );
+            let (label, printed_body) = printed_body.split_once('\n').unwrap();
+            assert!(label.starts_with("[source {"));
             assert_eq!(printed_body, body, "{name}");
             let (header, printed_body) = printed[1].split_once('\n').unwrap();
             assert_eq!(
@@ -435,7 +853,12 @@ mod tests {
                 json!({"part":7, "results":[envelope.clone(), envelope.clone()]}),
                 "batch identity and result ordering must survive projection"
             );
-            assert_eq!(printed_body, format!("{body}\n{body}"), "{name}");
+            let (first_label, first_body) = printed_body.split_once('\n').unwrap();
+            assert!(first_label.contains("\"body\":1"));
+            let rest = first_body.strip_prefix(body).unwrap().strip_prefix('\n').unwrap();
+            let (second_label, second_body) = rest.split_once('\n').unwrap();
+            assert!(second_label.contains("\"body\":2"));
+            assert_eq!(second_body, body, "{name}");
             let projected = codex_code_mode_protocol::model_visible_tool_result(&ToolName::plain(name), &raw).unwrap();
             let old_batch = json!({"part":7,"results":[projected.clone(),projected]}).to_string();
             if fixture != "recovery" {
@@ -451,6 +874,8 @@ mod tests {
                 for (index, expected) in selected.iter().enumerate() {
                     let (header, text) = printed[index + 2].split_once('\n').unwrap();
                     assert_eq!(serde_json::from_str::<Value>(header).unwrap(), *expected);
+                    let (label, text) = text.split_once('\n').unwrap();
+                    assert!(label.contains("artifact_id"));
                     assert_eq!(text, body, "selected fields must preserve exact text and coverage");
                 }
                 assert_eq!(serde_json::from_str::<Value>(&printed[2 + selected.len()]).unwrap(), raw["results"]);
@@ -462,14 +887,97 @@ mod tests {
                 println!("projection_audit selected_{fixture} before_bytes={} after_bytes={}",
                     raw["results"].to_string().len(), printed[2].len());
             }
-            // A modified result is no longer the tool's own value: print it as JSON.
+            // Added inert command metadata preserves the unchanged projection;
+            // changed source parents still disable their fragment projections.
             let mut changed = raw;
             changed["extra"] = json!(1);
-            assert_eq!(
+            if fixture == "command" {
+                let (header, text) = printed.last().unwrap().split_once('\n').unwrap();
+                let mut expected = envelope.clone();
+                expected["extra"] = json!(1);
+                assert_eq!(serde_json::from_str::<Value>(header).unwrap(), expected);
+                assert_eq!(text.split_once('\n').unwrap().1, body);
+            } else { assert_eq!(
                 serde_json::from_str::<Value>(&printed[printed.len() - if fixture == "command" { 1 } else { 2 }]).unwrap(),
                 changed,
                 "{name}"
-            );
+            ); }
+        }
+    }
+
+    #[tokio::test]
+    async fn verified10_selected_shared_evidence_and_safe_annotations() {
+        let source = "λ\r\nunique evidence\n".repeat(32);
+        let search = json!({"artifact_id":"snapshot", "source_sha256":"revision", "results":[
+            {"selector":{"kind":"search"},"status":"ok","value":{"hydrated_ranges":[
+                {"canonical_range":{"start":0,"end":source.len()},"text":source}]}},
+            {"selector":{"kind":"search"},"status":"ok","value":{"hydrated_ranges":[
+                {"canonical_range":{"start":0,"end":source.len()},"shared":true}]}}
+        ]});
+        for (name, raw, source) in [
+            ("read_tool_output", search, r#"
+                const r = await tools.read_tool_output({});
+                text(r); text(r.results[1]); text(r.results[1].value.hydrated_ranges[0]);
+                const bytes = r.results[0].value.hydrated_ranges[0].text;
+                if (r.results[1].value.hydrated_ranges[0].text !== undefined) throw Error('native mutated');
+                store('expected', bytes);
+            "#),
+            ("exec_command", json!({"output":"compact output", "stdout":"raw stdout ".repeat(1000),
+                "stderr":"raw stderr ".repeat(1000), "exit_code":0, "process_exited":true}), r#"
+                const r = await tools.exec_command({});
+                text(r); r.reviewed = true; text(r);
+                r.stdout = 'CHANGED'; text(r); r.stdout = 'raw stdout '.repeat(1000);
+                let reads = 0;
+                Object.defineProperty(r, 'getter', {enumerable:true, configurable:true, get(){reads++; return 7;}});
+                text(r); if(reads !== 1) throw Error('getter invoked more than once'); delete r.getter;
+                r.extra = new Proxy({ok:true}, {}); text(r); delete r.extra;
+                r.extra = {toJSON(){return 'CUSTOM';}}; text(r); delete r.extra;
+                r.toJSON = () => 'CUSTOM ROOT'; text(r);
+            "#),
+        ] {
+            let (event_tx, mut rx) = mpsc::unbounded_channel();
+            let request = ExecuteRequest {
+                state_path: None, tool_call_id: "verified10".into(),
+                enabled_tools: vec![ToolDefinition {
+                    name:name.into(), tool_name:ToolName::plain(name), kind:CodeModeToolKind::Function,
+                    description:"".into(), input_schema:None, output_schema:None, default_timeout_ms:None,
+                }].into(), source:source.into(), yield_time_ms:None, max_output_tokens:None, default_tool_timeout_ms:None,
+            };
+            let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000, event_tx,
+                Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+            let mut printed = Vec::new();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+                    RuntimeEvent::Started => {},
+                    RuntimeEvent::ToolCall {id, ..} => tx.send(RuntimeCommand::ToolResponse {id, result:raw.clone()}).unwrap(),
+                    RuntimeEvent::ContentItem {item:FunctionCallOutputContentItem::InputText {text}, ..} => printed.push(text),
+                    RuntimeEvent::Result {error_text, output_loss, ..} => {
+                        assert_eq!(error_text, None); assert_eq!(output_loss, None); break;
+                    },
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            if name == "read_tool_output" {
+                let expected = raw["results"][0]["value"]["hydrated_ranges"][0]["text"].as_str().unwrap();
+                assert_eq!(printed.len(), 3);
+                for rendered in printed {
+                    let (_, body) = rendered.split_once('\n').unwrap();
+                    let (identity, bytes) = body.split_once('\n').unwrap();
+                    assert!(identity.contains("snapshot"));
+                    assert_eq!(bytes, expected);
+                }
+            } else {
+                assert_eq!(printed.len(), 7);
+                assert!(printed[1].len() < printed[0].len() + 32);
+                assert!(printed[1].contains("\"reviewed\":true"));
+                for text in &printed[2..6] {
+                    let value: Value = serde_json::from_str(text).unwrap();
+                    assert!(value["stderr"].as_str().unwrap().starts_with("raw stderr"));
+                }
+                assert_eq!(serde_json::from_str::<Value>(&printed[2]).unwrap()["stdout"], "CHANGED");
+                assert_eq!(serde_json::from_str::<Value>(&printed[5]).unwrap()["extra"], "CUSTOM");
+                assert_eq!(printed[6], "\"CUSTOM ROOT\"");
+            }
         }
     }
 }
