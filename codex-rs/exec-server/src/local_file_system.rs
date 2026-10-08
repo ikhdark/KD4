@@ -875,27 +875,33 @@ impl DirectFileSystem {
     ) -> FileSystemResult<()> {
         reject_sandbox_context(sandbox)?;
         let path = path.to_abs_path()?;
-        match tokio::fs::symlink_metadata(path.as_path()).await {
-            Ok(metadata) => {
-                let file_type = metadata.file_type();
-                use std::os::windows::fs::FileTypeExt;
+        // Metadata and deletion share one worker handoff. Check cancellation
+        // again before the destructive step, as the old await boundary allowed.
+        run_cancellable_file_system_task(move |cancel| {
+            match std::fs::symlink_metadata(path.as_path()) {
+                Ok(metadata) => {
+                    check_file_system_cancelled(&cancel)?;
+                    let file_type = metadata.file_type();
+                    use std::os::windows::fs::FileTypeExt;
 
-                if file_type.is_symlink_dir() {
-                    tokio::fs::remove_dir(path.as_path()).await?;
-                } else if file_type.is_dir() {
-                    if options.recursive {
-                        tokio::fs::remove_dir_all(path.as_path()).await?;
+                    if file_type.is_symlink_dir() {
+                        std::fs::remove_dir(path.as_path())?;
+                    } else if file_type.is_dir() {
+                        if options.recursive {
+                            std::fs::remove_dir_all(path.as_path())?;
+                        } else {
+                            std::fs::remove_dir(path.as_path())?;
+                        }
                     } else {
-                        tokio::fs::remove_dir(path.as_path()).await?;
+                        std::fs::remove_file(path.as_path())?;
                     }
-                } else {
-                    tokio::fs::remove_file(path.as_path()).await?;
+                    Ok(())
                 }
-                Ok(())
+                Err(err) if err.kind() == io::ErrorKind::NotFound && options.force => Ok(()),
+                Err(err) => Err(err),
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound && options.force => Ok(()),
-            Err(err) => Err(err),
-        }
+        })
+        .await
     }
 
     async fn copy(

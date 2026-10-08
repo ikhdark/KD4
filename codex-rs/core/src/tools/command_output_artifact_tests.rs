@@ -2938,6 +2938,71 @@ async fn artifact_durability_barrier_reports_sync_failure_and_can_retry() {
     assert!(!lock_retention_registry().pending_sync.keys().any(|path| path.starts_with(&directory)));
 }
 
+#[test]
+fn artifact_file_sync_is_parallel_and_bounded() {
+    let pending = (0..16).map(|index| (PathBuf::from(index.to_string()), 0)).collect::<Vec<_>>();
+    let seen = StdMutex::new((std::collections::HashSet::new(), BTreeSet::new()));
+    let ready = std::sync::Condvar::new();
+    sync_artifact_files(&pending, |path| {
+        let mut seen = seen.lock().unwrap();
+        seen.0.insert(std::thread::current().id());
+        assert!(seen.1.insert(path.to_path_buf()), "file synced twice");
+        ready.notify_all();
+        let (seen, _) = ready.wait_timeout_while(seen, Duration::from_secs(5), |seen| seen.0.len() < 8).unwrap();
+        if seen.0.len() != 8 {
+            return Err(std::io::Error::other("expected eight concurrent sync workers"));
+        }
+        Ok(())
+    }).unwrap();
+    let seen = seen.into_inner().unwrap();
+    assert_eq!(seen.0.len(), 8);
+    assert_eq!(seen.1.len(), pending.len());
+}
+
+#[test]
+fn artifact_file_sync_empty_and_single_file_stay_inline() {
+    sync_artifact_files(&[], |_| panic!("empty batch must not sync")).unwrap();
+    let caller = std::thread::current().id();
+    let error = sync_artifact_files(&[(PathBuf::from("one"), 0)], |_| {
+        assert_eq!(std::thread::current().id(), caller);
+        Err(std::io::Error::other("single sync failed"))
+    }).unwrap_err();
+    assert_eq!(error.to_string(), "single sync failed");
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn artifact_durability_parallel_failure_retains_batch_for_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("tool-output/thread");
+    std::fs::create_dir_all(&directory).unwrap();
+    for index in 0..16 {
+        let path = directory.join(format!("{index}.log"));
+        std::fs::write(&path, b"durable output").unwrap();
+        defer_artifact_sync(&path);
+    }
+    // Missing, already-retained-away files are benign; other open failures are not.
+    std::fs::remove_file(directory.join("0.log")).unwrap();
+    let broken = directory.join("broken.log");
+    std::fs::create_dir(&broken).unwrap();
+    defer_artifact_sync(&broken);
+    let other = temp.path().join("tool-output/other/other.log");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, b"another thread").unwrap();
+    defer_artifact_sync(&other);
+    let pending_for_thread = || lock_retention_registry().pending_sync.iter()
+        .filter(|(path, _)| path.starts_with(&directory))
+        .map(|(path, sequence)| (path.clone(), *sequence)).collect::<BTreeMap<_, _>>();
+    let before = pending_for_thread();
+    assert!(sync_tool_output_artifacts(temp.path(), "thread").await.is_err());
+    assert_eq!(pending_for_thread(), before);
+    std::fs::remove_dir(&broken).unwrap();
+    sync_tool_output_artifacts(temp.path(), "thread").await.unwrap();
+    assert!(pending_for_thread().is_empty());
+    assert!(lock_retention_registry().pending_sync.contains_key(&other));
+    sync_tool_output_artifacts(temp.path(), "other").await.unwrap();
+}
+
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 async fn near_limit_streaming_growth_reconciles_before_the_next_retention_decision() {

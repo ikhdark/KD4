@@ -1297,6 +1297,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         prefixed_second_summary.as_str(),
         prefixed_third_summary.as_str(),
     ];
+    let mut recovery_count = 0;
     for (i, expected_summary) in compaction_indices.into_iter().zip(expected_summaries) {
         let body = requests_payloads.clone()[i].body_json();
         let input = body.get("input").and_then(|v| v.as_array()).unwrap();
@@ -1312,7 +1313,28 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
             summary_message, expected_summary,
             "compaction request at index {i} should include the prefixed summary"
         );
+        let content = input[1]["content"].as_array().unwrap();
+        // Reasoning-only input has no recoverable text; subsequent consumed
+        // tool output must retain a recovery sidecar.
+        for item in &content[1..] {
+            let recovery: Value = serde_json::from_str(item["text"].as_str().unwrap()).unwrap();
+            match recovery["kind"].as_str() {
+                Some("local_compaction_text_recovery") => {
+                    recovery_count += 1;
+                    assert_eq!(recovery["complete"], true);
+                    assert_eq!(recovery["summary_is_lossless"], false);
+                    assert_eq!(recovery["source_selector"]["pointer"], "/summarized_items");
+                    assert!(recovery["artifact_id"].as_str().is_some_and(|id| !id.is_empty()));
+                }
+                Some("tool_history_artifact_pins") => {
+                    assert_eq!(recovery["version"], 1);
+                    assert!(recovery["artifacts"].is_array());
+                }
+                _ => panic!("unexpected compaction sidecar: {recovery}"),
+            }
+        }
     }
+    assert!(recovery_count > 0);
     for request_index in [1, 3, 5] {
         assert!(
             contains_user_text(&requests_payloads[request_index], SUMMARIZATION_PROMPT),
@@ -1610,6 +1632,18 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         let without_environment = |values: &[serde_json::Value]| {
             normalize_inputs(values)
                 .into_iter()
+                .map(|mut value| {
+                    // Recovery provenance is checked above; compare the exact
+                    // conversation text independently of its generated ID.
+                    if let Some(content) = value["content"].as_array_mut() {
+                        content.retain(|item| {
+                            !item["text"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok())
+                                .is_some_and(|recovery| matches!(recovery["kind"].as_str(),
+                                    Some("local_compaction_text_recovery" | "tool_history_artifact_pins")))
+                        });
+                    }
+                    value
+                })
                 .filter(|value| {
                     let text = value
                         .get("content")

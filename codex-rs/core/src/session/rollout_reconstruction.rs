@@ -14,11 +14,23 @@ const UNIFIED_EXEC_SESSION_ID_PREFIX: &str = "Process running with session ID ";
 /// handler-return notifications. A crash after effects but before result append
 /// therefore leaves an unresolved invocation visible on resume.
 pub(super) fn append_unsettled_tool_recovery(history: &mut Vec<ResponseItem>, items: &[RolloutItem]) {
+    let page = unsettled_tool_recovery_page(items, 0);
+    if page["unresolved_count"] == 0 { return; }
+    history.push(ResponseItem::Message {
+        id: None, role: "developer".into(), phase: None,
+        internal_chat_message_metadata_passthrough: None,
+        content: vec![ContentItem::InputText { text: format!(
+            "<unsettled_tool_recovery>\n{page}\nHandler return is not durable result delivery. These retained invocations have no available durable result; they may or may not have executed. Inspect affected targets before retrying. Null environment means the resolved environment was not recorded. Arguments are deliberately redacted. If omitted_count is nonzero, use read_file with the recovery_path and omit environment_id; this reads retained history, never repeats an operation.\n</unsettled_tool_recovery>",
+        ) }],
+    });
+}
+
+pub(super) fn unsettled_tool_recovery_page(items: &[RolloutItem], offset: usize) -> serde_json::Value {
     use std::collections::BTreeMap;
     use sha2::Digest;
     let mut pending = BTreeMap::new();
-    let mut turn = String::new();
-    let mut cwd = String::new();
+    let mut turn = "";
+    let mut cwd = None;
     let bounded = |value: &str| value.chars().take(240).collect::<String>();
     let redacted_path = |value: &str| {
         if value.contains("://") {
@@ -27,56 +39,88 @@ pub(super) fn append_unsettled_tool_recovery(history: &mut Vec<ResponseItem>, it
                 .unwrap_or_else(|| "[redacted URI]".into())
         } else { bounded(value) }
     };
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         let response = match item {
             RolloutItem::TurnContext(context) => {
-                turn = context.turn_id.clone().unwrap_or_default();
-                cwd = context.cwd.to_string_lossy().to_string();
+                turn = context.turn_id.as_deref().unwrap_or_default();
+                cwd = Some(context.cwd.as_path());
                 continue;
             }
             RolloutItem::ResponseItem(response) => response,
             _ => continue,
         };
         match response {
-            ResponseItem::FunctionCall { call_id, name, namespace, arguments, .. }
-            | ResponseItem::CustomToolCall { call_id, name, namespace, input: arguments, .. } => {
-                let args = (arguments.len() <= 16 * 1024)
-                    .then(|| serde_json::from_str::<serde_json::Value>(arguments).ok()).flatten()
-                    .unwrap_or(serde_json::Value::Null);
-                let field = |keys: &[&str]| keys.iter().find_map(|key| args.get(*key).and_then(serde_json::Value::as_str));
-                // Never echo command text, scripts, headers, arguments or tokens.
-                // The digest distinguishes operations without disclosing them.
-                let target = field(&["path", "file_path", "target"]).map(redacted_path);
-                pending.insert((turn.clone(), call_id.clone()), serde_json::json!({
-                    "turn_id": bounded(&turn), "call_id": bounded(call_id),
-                    "tool": bounded(&namespace.as_ref().map(|namespace| format!("{namespace}.{name}")).unwrap_or_else(|| name.clone())),
-                    "environment": field(&["environment_id"]).map(bounded),
-                    "cwd": redacted_path(field(&["workdir", "cwd"]).unwrap_or(&cwd)),
-                    "target": target,
-                    "invocation_sha256": format!("{:x}", sha2::Sha256::digest(arguments.as_bytes())),
-                    "status": "result_not_durably_available_effects_unknown",
-                }));
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::CustomToolCall { call_id, .. } => {
+                // Match borrowed invocation identities first. Settled calls
+                // never pay argument decoding, hashing or redaction costs.
+                pending.insert((turn, call_id.as_str()), (index, cwd, response));
             }
             ResponseItem::FunctionCallOutput { call_id, output, .. }
             | ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
-                let unavailable = output.body.to_text().is_some_and(|text|
-                    text.contains("full result could not be preserved"));
-                if !unavailable { pending.remove(&(turn.clone(), call_id.clone())); }
+                // Only the registry's complete delivery-loss placeholder is a
+                // recovery signal; quoted source/log text is still a result.
+                let unavailable = items.get(index + 1).is_some_and(|next|
+                    matches!(next, RolloutItem::ResponseItem(item)
+                        if crate::tools::registry::is_model_delivery_unavailable_receipt(item, call_id)))
+                    // Conservative compatibility with legacy host placeholders.
+                    || output.body.to_text().is_some_and(|text|
+                    text == "Tool execution completed, but its full result could not be preserved for model delivery.");
+                if !unavailable { pending.remove(&(turn, call_id.as_str())); }
             }
             _ => {}
         }
     }
-    if pending.is_empty() { return; }
     let count = pending.len();
-    let operations = pending.into_values().rev().take(8).collect::<Vec<_>>();
-    history.push(ResponseItem::Message {
-        id: None, role: "developer".into(), phase: None,
-        internal_chat_message_metadata_passthrough: None,
-        content: vec![ContentItem::InputText { text: format!(
-            "<unsettled_tool_recovery>\n{}\nHandler return is not durable result delivery. These retained invocations have no available durable result; they may or may not have executed. Inspect affected targets before retrying. Null environment means the resolved environment was not recorded. Arguments are deliberately redacted.\n</unsettled_tool_recovery>",
-            serde_json::json!({"operations":operations,"unresolved_count":count,"omitted_count":count.saturating_sub(8)})
-        ) }],
-    });
+    let mut pending = pending.into_iter().collect::<Vec<_>>();
+    pending.sort_unstable_by_key(|(_, (index, _, _))| std::cmp::Reverse(*index));
+    let operations = pending.into_iter().skip(offset).take(8).map(|((turn, call_id), (index, cwd, response))| {
+        let (name, namespace, arguments) = match response {
+            ResponseItem::FunctionCall { name, namespace, arguments, .. }
+            | ResponseItem::CustomToolCall { name, namespace, input: arguments, .. } => (name, namespace, arguments),
+            _ => unreachable!("only invocations enter pending"),
+        };
+        let args = (arguments.len() <= 16 * 1024)
+            .then(|| serde_json::from_str::<serde_json::Value>(arguments).ok()).flatten()
+            .unwrap_or(serde_json::Value::Null);
+        let field = |keys: &[&str]| keys.iter().find_map(|key| args.get(*key).and_then(serde_json::Value::as_str));
+        let cwd = cwd.map(|path| path.to_string_lossy()).unwrap_or_default();
+        serde_json::json!({
+            "turn_id": bounded(turn), "call_id": bounded(call_id), "rollout_item_index": index,
+            "tool": bounded(&namespace.as_ref().map(|namespace| format!("{namespace}.{name}")).unwrap_or_else(|| name.clone())),
+            "environment": field(&["environment_id"]).map(bounded),
+            "cwd": redacted_path(field(&["workdir", "cwd"]).unwrap_or(&cwd)),
+            "target": field(&["path", "file_path", "target"]).map(redacted_path),
+            "invocation_sha256": format!("{:x}", sha2::Sha256::digest(arguments.as_bytes())),
+            "status": "result_not_durably_available_effects_unknown",
+        })
+    }).collect::<Vec<_>>();
+    let next = offset.saturating_add(operations.len());
+    serde_json::json!({"operations": operations, "unresolved_count": count,
+        "offset": offset, "omitted_count": count.saturating_sub(next),
+        "recovery_path": (next < count).then(|| format!("context:unsettled-tools/{next}"))})
+}
+
+impl Session {
+    /// Cold, explicitly requested recovery from the existing durable stream.
+    /// No artifact writes or retained raw invocation copies are added to resume.
+    pub(crate) async fn read_unsettled_tool_recovery(&self, offset: usize, active_turn: &str) -> Result<String, String> {
+        let path = self.current_rollout_path().await.map_err(|error| error.to_string())?
+            .ok_or("unsettled recovery requires a durable session rollout")?;
+        let (mut items, _, parse_errors) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
+            .await.map_err(|error| error.to_string())?;
+        // Live calls have an owner and are not lost results. Bound all pages
+        // at this turn's first context, including the recovery call itself.
+        if let Some(start) = items.iter().position(|item| matches!(item,
+            RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some(active_turn)))
+        { items.truncate(start); }
+        tokio::task::spawn_blocking(move || {
+            let mut page = unsettled_tool_recovery_page(&items, offset);
+            page["rollout_parse_errors"] = serde_json::json!(parse_errors);
+            page["history_complete"] = serde_json::json!(parse_errors == 0);
+            page.to_string()
+        }).await.map_err(|error| error.to_string())
+    }
 }
 
 /// Reserve handles from the entire reloaded rollout, including compacted and
@@ -297,6 +341,11 @@ fn collect_resume_handles(
             ] {
                 found |= value.pointer(pointer).is_some_and(|states| live(states, handles));
             }
+        }
+        // A single JSON record was fully handled above. Re-parsing the same
+        // potentially large tool receipt as a JSON line adds no new handles.
+        if !text.contains('\n') {
+            return found;
         }
     }
     // Current code-mode packets print each process receipt as its own JSON line.
@@ -746,7 +795,9 @@ impl Session {
                     {
                         if let Some(response) = crate::plan_store::plan_response_from_tool_output(output) {
                             active_segment.plan = Some(response.current_plan);
-                            active_segment.plan_lineage = Some(response.lineage);
+                            // Active projections must not eclipse the full
+                            // durable snapshot earlier in this same turn.
+                            active_segment.plan_lineage = response.lineage_complete.then_some(response.lineage);
                         }
                     }
                 }
@@ -905,6 +956,15 @@ impl Session {
 
         // Segments and their contents were collected newest-first; replay the surviving records
         // chronologically so compaction resets and merge patches have their original meaning.
+        // These are already rollback-filtered and newest-first. A full
+        // snapshot or compaction resets the baseline; older patches/snapshots
+        // cannot contribute and need not be decoded and merged only to discard.
+        if let Some(reset) = world_state_replay.iter().position(|item| {
+            matches!(item, RolloutItem::Compacted(_))
+                || matches!(item, RolloutItem::WorldState(state) if state.full)
+        }) {
+            world_state_replay.truncate(reset + 1);
+        }
         world_state_replay.reverse();
         let mut world_state_baseline: Option<WorldStateSnapshot> = None;
         for item in world_state_replay {

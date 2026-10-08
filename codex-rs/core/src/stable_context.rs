@@ -121,6 +121,8 @@ pub(crate) enum StableContextKind {
     Wait,
     TurnContribution,
     DynamicHistory,
+    TaskState,
+    RepositoryObservation,
 }
 
 impl StableContextKind {
@@ -149,6 +151,8 @@ impl StableContextKind {
             Self::Wait => "wait",
             Self::TurnContribution => "turn_contribution",
             Self::DynamicHistory => "dynamic_history",
+            Self::TaskState => "task_state",
+            Self::RepositoryObservation => "repository_observation",
         }
     }
 }
@@ -314,6 +318,7 @@ impl StableContextManifest {
             bytes,
             true,
             StableContextDisposition::Unchanged,
+            None,
         ));
         Self::from_components(components, self.projection_enabled, self.fail_open)
     }
@@ -327,23 +332,22 @@ impl StableContextManifest {
         approx_tokens: i64,
     ) -> Self {
         let mut components = self.components.to_vec();
-        let mut component = component_from_bytes(
+        let component = component_from_bytes(
             kind,
             semantic_key,
             identity_bytes,
             true,
             StableContextDisposition::Unchanged,
+            Some((serialized_bytes, approx_tokens)),
         );
-        component.identity.serialized_bytes = serialized_bytes;
-        component.identity.approx_tokens = approx_tokens;
         components.push(component);
         Self::from_components(components, self.projection_enabled, self.fail_open)
     }
 
-    /// Appends the request-dynamic history measurement without rebuilding the
+    /// Inserts the request-dynamic history measurement without rebuilding the
     /// immutable stable-prefix identity. `DynamicHistory` is deliberately
-    /// excluded from [`manifest_fingerprint`], and is the final sorted kind,
-    /// so retaining the already-computed fingerprint is equivalent to
+    /// excluded from [`manifest_fingerprint`], so retaining the already-computed
+    /// fingerprint and canonical component ordering is equivalent to
     /// `add_measured_component` while avoiding another stable-manifest hash.
     pub(crate) fn add_dynamic_history(
         &self,
@@ -357,17 +361,18 @@ impl StableContextManifest {
                 .all(|component| component.kind != StableContextKind::DynamicHistory),
             "request scaffold must not contain dynamic history"
         );
-        let mut component = component_from_bytes(
+        let component = component_from_bytes(
             StableContextKind::DynamicHistory,
             "dynamic_history",
             identity_bytes,
             true,
             StableContextDisposition::Unchanged,
+            Some((serialized_bytes, approx_tokens)),
         );
-        component.identity.serialized_bytes = serialized_bytes;
-        component.identity.approx_tokens = approx_tokens;
         let mut components = self.components.to_vec();
-        components.push(component);
+        let index = components
+            .partition_point(|component| component.kind < StableContextKind::DynamicHistory);
+        components.insert(index, component);
         Self {
             components: components.into(),
             fingerprint: self.fingerprint,
@@ -428,6 +433,8 @@ enum StableContextSlot {
     MultiAgent,
     MultiAgentUsageHint,
     RootCoordinator,
+    TaskState,
+    RepositoryObservation,
 }
 
 impl StableContextSlot {
@@ -453,6 +460,8 @@ impl StableContextSlot {
             Self::MultiAgent => StableContextKind::MultiAgent,
             Self::MultiAgentUsageHint => StableContextKind::MultiAgentUsageHint,
             Self::RootCoordinator => StableContextKind::RootCoordinator,
+            Self::TaskState => StableContextKind::TaskState,
+            Self::RepositoryObservation => StableContextKind::RepositoryObservation,
         }
     }
 
@@ -482,6 +491,8 @@ impl StableContextSlot {
             Self::MultiAgent => "multi_agent",
             Self::MultiAgentUsageHint => "multi_agent_usage_hint",
             Self::RootCoordinator => "root_coordinator",
+            Self::TaskState => "task_state",
+            Self::RepositoryObservation => "repository_observation",
         };
         key.into()
     }
@@ -512,6 +523,8 @@ impl StableContextSlot {
             Self::Environment => 20,
             Self::RecommendedPlugins => 21,
             Self::Subagents => 23,
+            Self::TaskState => 24,
+            Self::RepositoryObservation => 25,
         }
     }
 
@@ -527,6 +540,8 @@ impl StableContextSlot {
                 | Self::ModelSwitch
                 | Self::Environment
                 | Self::Subagents
+                | Self::TaskState
+                | Self::RepositoryObservation
                 | Self::RecommendedPlugins
         )
     }
@@ -628,6 +643,11 @@ pub(crate) fn filter_unchanged_stable_context_items(
     history: &[ResponseItem],
     candidates: Vec<ResponseItem>,
 ) -> Vec<ResponseItem> {
+    // Only trusted candidates can be filtered. Avoid walking history for empty
+    // injections or ordinary messages, including while the session lock is held.
+    if !candidates.iter().any(is_trusted_stable_context_item) {
+        return candidates;
+    }
     let mut latest = HashMap::<StableContextSlot, StableItemSignatureEntry>::new();
     for item in history {
         if let Some(signature) = stable_item_signature(item) {
@@ -701,6 +721,7 @@ fn project_stable_context_inner(
     let fallback_items = Arc::clone(&items);
     let mut occurrences = Vec::new();
     let mut ambiguous = false;
+    let mut ambiguous_kinds = HashSet::new();
     let mut latest_real_user = None;
     let mut user_insertion_by_turn = HashMap::<&str, usize>::new();
 
@@ -715,6 +736,8 @@ fn project_stable_context_inner(
             continue;
         };
         let trusted_stable_context = is_trusted_stable_context_item(item);
+        let occurrence_start = occurrences.len();
+        let mut ambiguous_item = false;
         let mut contains_stable = false;
         let mut contains_ordinary_user_content = false;
         let mut contains_unprojectable = false;
@@ -735,6 +758,8 @@ fn project_stable_context_inner(
                         let Some(ContentItem::InputText { .. }) = content.get(content_index + 1)
                         else {
                             ambiguous = true;
+                            ambiguous_item = true;
+                            ambiguous_kinds.insert(classification.slot.kind());
                             contains_ordinary_user_content = true;
                             content_index += 1;
                             continue;
@@ -750,8 +775,10 @@ fn project_stable_context_inner(
                     explicitly_removed: classification.payload == StablePayload::Removed,
                 });
                 content_index += 1 + usize::from(payload_content_index.is_some());
-            } else if trusted_stable_context && contains_known_open_marker(text) {
+            } else if trusted_stable_context && let Some(kind) = known_open_marker_kind(text) {
                 ambiguous = true;
+                ambiguous_item = true;
+                ambiguous_kinds.insert(kind);
                 contains_ordinary_user_content = true;
                 content_index += 1;
             } else {
@@ -764,6 +791,12 @@ fn project_stable_context_inner(
         // history remains eligible for projection.
         if contains_stable && contains_unprojectable {
             ambiguous = true;
+            ambiguous_item = true;
+        }
+        if ambiguous_item {
+            // A mixed/ambiguous message stays whole. Fail open for its kinds,
+            // not for independent, well-formed instruction sources.
+            ambiguous_kinds.extend(occurrences[occurrence_start..].iter().map(|item| item.slot.kind()));
         }
         if role == "user"
             && contains_ordinary_user_content
@@ -778,20 +811,35 @@ fn project_stable_context_inner(
     }
 
     let target_fail_open = target == StableContextTarget::FailOpen;
-    let enabled = target == StableContextTarget::Sampling && !ambiguous;
+    let mut retained_ambiguous = Vec::new();
+    if ambiguous && target == StableContextTarget::Sampling {
+        occurrences.retain(|occurrence| {
+            if ambiguous_kinds.contains(&occurrence.slot.kind()) {
+                retained_ambiguous.push(*occurrence);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    let enabled = target == StableContextTarget::Sampling && (!ambiguous || !occurrences.is_empty());
     let fail_open = ambiguous || target_fail_open;
     let (projected, components): (Arc<[ResponseItem]>, _) = if enabled {
-        let (projected, components) = project_items(
+        let (projected, mut components) = project_items(
             &items,
             &occurrences,
             latest_real_user,
             &user_insertion_by_turn,
             preserve_history,
         );
+        if !retained_ambiguous.is_empty() {
+            components.extend(analyze_unprojected(&items, &retained_ambiguous, true));
+        }
         (projected.into(), components)
     } else {
         // Unprojected history is returned unchanged; share it instead of
         // deep-copying every item on each generic preparation.
+        occurrences.extend(retained_ambiguous);
         (
             Arc::clone(&items),
             analyze_unprojected(&items, &occurrences, fail_open),
@@ -828,11 +876,21 @@ fn project_items(
     let collaboration_removed = latest_by_slot
         .get(&StableContextSlot::Collaboration)
         .and_then(|index| occurrences.get(*index))
-        .is_some_and(|occurrence| occurrence.text(items).contains(COLLABORATION_RESET_NOTICE));
+        .is_some_and(|occurrence| marked_body_is(occurrence.text(items), COLLABORATION_MODE_OPEN_TAG, "</collaboration_mode>", COLLABORATION_RESET_NOTICE));
     let repository_removed = latest_by_slot
         .get(&StableContextSlot::Repository)
         .and_then(|index| occurrences.get(*index))
-        .is_some_and(|occurrence| occurrence.text(items).contains(REPOSITORY_REMOVAL_NOTICE));
+        .is_some_and(|occurrence| occurrence.text(items).trim().split_once("<INSTRUCTIONS>")
+            .is_some_and(|(_, body)| body.strip_suffix(REPOSITORY_CLOSE_TAG)
+                .is_some_and(|body| body.trim() == REPOSITORY_REMOVAL_NOTICE)));
+    // Observation freshness describes the instruction body current at that
+    // point. A later body replacement/removal supersedes the old observation,
+    // but an observation must never retract the instruction slot itself.
+    let repository_observation_current = latest_by_slot
+        .get(&StableContextSlot::RepositoryObservation)
+        .is_some_and(|observation| latest_by_slot
+            .get(&StableContextSlot::Repository)
+            .is_none_or(|repository| observation > repository));
     let developer_instructions_removed = latest_by_slot
         .get(&StableContextSlot::DeveloperInstructions)
         .and_then(|index| occurrences.get(*index))
@@ -855,6 +913,7 @@ fn project_items(
         let should_keep = match slot {
             StableContextSlot::TurnContribution(_) => !occurrence.explicitly_removed,
             StableContextSlot::Repository => !repository_removed,
+            StableContextSlot::RepositoryObservation => repository_observation_current,
             StableContextSlot::Collaboration => !collaboration_removed,
             StableContextSlot::DeveloperInstructions => !developer_instructions_removed,
             StableContextSlot::MultiAgentUsageHint => !multi_agent_usage_hint_removed,
@@ -1012,7 +1071,8 @@ fn project_items(
             || (slot == StableContextSlot::Collaboration && collaboration_removed)
             || (slot == StableContextSlot::DeveloperInstructions && developer_instructions_removed)
             || (slot == StableContextSlot::MultiAgentUsageHint && multi_agent_usage_hint_removed);
-        let gated = slot == StableContextSlot::RecommendedPlugins && !recommended_plugins_current;
+        let gated = (slot == StableContextSlot::RecommendedPlugins && !recommended_plugins_current)
+            || (slot == StableContextSlot::RepositoryObservation && !repository_observation_current);
         let text = occurrence.text(items);
         let mut component = component_from_text(
             slot.kind(),
@@ -1112,7 +1172,7 @@ fn current_selected_skill_indexes(
     // histories without accepted completion evidence retain their skills.
     let completed = crate::context_manager::completed_turn_boundary(items);
     let user_turn_id = latest_real_user.and_then(|index| items[index].turn_id());
-    occurrences
+    let mut selected = occurrences
         .iter()
         .enumerate()
         .filter(|(_, occurrence)| occurrence.slot == StableContextSlot::SelectedSkill)
@@ -1121,7 +1181,18 @@ fn current_selected_skill_indexes(
                 || user_turn_id.is_some_and(|turn_id| occurrence.turn_id(items) == Some(turn_id))
         })
         .map(|(index, _)| index)
-        .collect()
+        .collect::<Vec<_>>();
+    if selected.len() > 1 {
+        let mut seen = HashSet::new();
+        selected.retain(|&index| {
+            let occurrence = &occurrences[index];
+            let ResponseItem::Message { role, .. } = &items[occurrence.item_index] else { return false; };
+            // The rendered body includes path and scope. Keep the first exact
+            // occurrence in place; different bodies or authority never coalesce.
+            seen.insert((role.as_str(), occurrence.text(items)))
+        });
+    }
+    selected
 }
 
 fn occurrence_matches_latest_user_turn(
@@ -1243,6 +1314,9 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
     if role == "user" && marked(text, "<subagents_context>", "</subagents_context>") {
         return Some(StableTextClassification::inline(StableContextSlot::Subagents));
     }
+    if role == "user" && marked(text, "<codex_task_state>", "</codex_task_state>") {
+        return Some(StableTextClassification::inline(StableContextSlot::TaskState));
+    }
     if role == "user" && marked(text, "<recommended_plugins>", "</recommended_plugins>") {
         return Some(StableTextClassification::inline(
             StableContextSlot::RecommendedPlugins,
@@ -1252,6 +1326,9 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
         return None;
     }
     let trimmed = text.trim();
+    if marked(text, "<repository_observation>", "</repository_observation>") {
+        return Some(StableTextClassification::inline(StableContextSlot::RepositoryObservation));
+    }
     if trimmed == DEVELOPER_INSTRUCTIONS_PRESENT_MARKER {
         return Some(StableTextClassification {
             slot: StableContextSlot::DeveloperInstructions,
@@ -1355,31 +1432,37 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
 }
 
 fn contains_known_open_marker(text: &str) -> bool {
+    known_open_marker_kind(text).is_some()
+}
+
+fn known_open_marker_kind(text: &str) -> Option<StableContextKind> {
     [
-        REPOSITORY_OPEN_TAG,
-        ROOT_ORCHESTRATION_OPEN_TAG,
-        COLLABORATION_MODE_OPEN_TAG,
-        SKILLS_USAGE_OPEN_TAG,
-        SKILLS_INSTRUCTIONS_OPEN_TAG,
-        EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG,
-        ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG,
-        SKILL_OPEN_TAG,
-        "<environment_context>",
-        "<subagents_context>",
-        "<recommended_plugins>",
-        APPS_INSTRUCTIONS_OPEN_TAG,
-        "<app-context>",
-        PLUGINS_INSTRUCTIONS_OPEN_TAG,
-        "<permissions instructions>",
-        MULTI_AGENT_MODE_OPEN_TAG,
-        "<configured_developer_instructions",
-        "<turn_context_contribution",
-        "<multi_agent_usage_hint",
-        "<model_switch>",
-        "<personality_spec>",
+        (REPOSITORY_OPEN_TAG, StableContextKind::Repository),
+        (ROOT_ORCHESTRATION_OPEN_TAG, StableContextKind::RootCoordinator),
+        (COLLABORATION_MODE_OPEN_TAG, StableContextKind::Collaboration),
+        (SKILLS_USAGE_OPEN_TAG, StableContextKind::SkillUsage),
+        (SKILLS_INSTRUCTIONS_OPEN_TAG, StableContextKind::SkillCatalog),
+        (EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG, StableContextKind::SkillCatalog),
+        (ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG, StableContextKind::SkillCatalog),
+        (SKILL_OPEN_TAG, StableContextKind::SelectedSkill),
+        ("<environment_context>", StableContextKind::Environment),
+        ("<subagents_context>", StableContextKind::Environment),
+        ("<codex_task_state>", StableContextKind::TaskState),
+        ("<repository_observation>", StableContextKind::RepositoryObservation),
+        ("<recommended_plugins>", StableContextKind::RecommendedPlugins),
+        (APPS_INSTRUCTIONS_OPEN_TAG, StableContextKind::DesktopApp),
+        ("<app-context>", StableContextKind::AppContext),
+        (PLUGINS_INSTRUCTIONS_OPEN_TAG, StableContextKind::Plugins),
+        ("<permissions instructions>", StableContextKind::EnvironmentPermissions),
+        (MULTI_AGENT_MODE_OPEN_TAG, StableContextKind::MultiAgent),
+        ("<configured_developer_instructions", StableContextKind::DeveloperInstructions),
+        ("<turn_context_contribution", StableContextKind::TurnContribution),
+        ("<multi_agent_usage_hint", StableContextKind::MultiAgentUsageHint),
+        ("<model_switch>", StableContextKind::ModelSwitch),
+        ("<personality_spec>", StableContextKind::Personality),
     ]
-    .iter()
-    .any(|marker| text.trim_start().starts_with(marker))
+    .into_iter()
+    .find_map(|(marker, kind)| text.trim_start().starts_with(marker).then_some(kind))
 }
 
 fn stable_identity_sections(
@@ -1496,6 +1579,11 @@ fn marked(text: &str, open: &str, close: &str) -> bool {
     text.starts_with(open) && text.ends_with(close)
 }
 
+fn marked_body_is(text: &str, open: &str, close: &str, expected: &str) -> bool {
+    text.trim().strip_prefix(open).and_then(|body| body.strip_suffix(close))
+        .is_some_and(|body| body.trim() == expected)
+}
+
 fn component_from_text(
     kind: StableContextKind,
     semantic_key: &str,
@@ -1503,7 +1591,7 @@ fn component_from_text(
     active: bool,
     disposition: StableContextDisposition,
 ) -> StableContextComponent {
-    component_from_bytes(kind, semantic_key, text.as_bytes(), active, disposition)
+    component_from_bytes(kind, semantic_key, text.as_bytes(), active, disposition, None)
 }
 
 fn base_component(model_slug: &str, base_instructions: &str) -> StableContextComponent {
@@ -1527,19 +1615,26 @@ fn component_from_bytes(
     bytes: &[u8],
     active: bool,
     disposition: StableContextDisposition,
+    measurement: Option<(u64, i64)>,
 ) -> StableContextComponent {
     let content_hash: [u8; 32] = Sha256::digest(bytes).into();
+    let (serialized_bytes, approx_tokens) = measurement.unwrap_or_else(|| {
+        (
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            i64::try_from(approx_token_count(
+                std::str::from_utf8(bytes).unwrap_or_default(),
+            ))
+            .unwrap_or(i64::MAX),
+        )
+    });
     StableContextComponent {
         kind,
         identity: StableContextIdentity {
             contract_version: STABLE_CONTEXT_CONTRACT_VERSION,
             semantic_id: semantic_id(kind, &[semantic_key.as_bytes(), &content_hash]),
             content_hash,
-            serialized_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            approx_tokens: i64::try_from(approx_token_count(
-                std::str::from_utf8(bytes).unwrap_or_default(),
-            ))
-            .unwrap_or(i64::MAX),
+            serialized_bytes,
+            approx_tokens,
         },
         active,
         disposition,
@@ -2046,3 +2141,7 @@ mod tests_optimization {
 #[cfg(test)]
 #[path = "stable_context_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "stable_context_cache_tests.rs"]
+mod cache_tests;

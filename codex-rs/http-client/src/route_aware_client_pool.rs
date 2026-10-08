@@ -663,9 +663,19 @@ impl RouteAwareClientPool {
         F: FnOnce(String) -> Fut,
         Fut: Future<Output = io::Result<OutboundProxyRoute>>,
     {
+        let route_start = std::time::Instant::now();
         let route = resolve_route(request_url.to_string())
             .await
             .map_err(RouteAwareClientPoolError::Resolve)?;
+        crate::transport::record_timing(|timing| {
+            timing.proxy_resolution = Some(timing.proxy_resolution.unwrap_or_default() + route_start.elapsed());
+        });
+        tracing::debug!(
+            event.name = "codex.http.proxy_resolution",
+            duration_us = route_start.elapsed().as_micros() as u64,
+            provenance = "route_resolver_boundary",
+        );
+        let selection_start = std::time::Instant::now();
         let cached_client = {
             let mut clients = self
                 .clients
@@ -674,6 +684,7 @@ impl RouteAwareClientPool {
             clients.get(&route)
         };
         if let Some(client) = cached_client {
+            trace_client_selection(selection_start.elapsed(), true);
             return Ok((route, client));
         }
 
@@ -684,6 +695,7 @@ impl RouteAwareClientPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&route)
         {
+            trace_client_selection(selection_start.elapsed(), true);
             return Ok((route, client));
         }
 
@@ -714,8 +726,22 @@ impl RouteAwareClientPool {
         })
         .await
         .map_err(RouteAwareClientPoolError::BuildTask)??;
+        trace_client_selection(selection_start.elapsed(), false);
         Ok((route, client))
     }
+}
+
+fn trace_client_selection(duration: Duration, client_cache_hit: bool) {
+    crate::transport::record_timing(|timing| {
+        timing.client_pool_selection = Some(timing.client_pool_selection.unwrap_or_default() + duration);
+    });
+    // A reused client is not proof of a reused socket; never label this connection reuse.
+    tracing::debug!(
+        event.name = "codex.http.client_pool_selection",
+        duration_us = duration.as_micros() as u64,
+        client_cache_hit,
+        provenance = "route_client_pool",
+    );
 }
 
 #[cfg(test)]

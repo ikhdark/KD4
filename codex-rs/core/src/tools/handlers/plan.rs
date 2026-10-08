@@ -40,10 +40,20 @@ const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 
 impl PlanToolOutput {
     fn response_result(&self) -> JsonValue {
+        self.response_with_lineage(false)
+    }
+
+    fn durable_response(&self) -> JsonValue {
+        self.response_with_lineage(true)
+    }
+
+    fn response_with_lineage(&self, lineage_complete: bool) -> JsonValue {
         serde_json::json!(PlanToolResponse {
             obligations: self.lineage.obligation_summary(&self.current_plan),
             completion_authority: crate::plan_store::checklist_completion_authority(),
-            lineage: self.lineage.compact_for_plan(&self.current_plan),
+            lineage: if lineage_complete { self.lineage.compact_for_plan(&self.current_plan) }
+                else { self.lineage.active_for_plan(&self.current_plan) },
+            lineage_complete,
             revision: crate::plan_store::plan_revision_with_lineage(Some(&self.current_plan), &self.lineage),
             step_ids: self.current_plan.plan.iter()
                 .map(|item| self.lineage.step_id(&item.step)).collect(),
@@ -166,6 +176,8 @@ impl ToolExecutor<ToolInvocation> for PlanHandler {
         create_update_plan_tool()
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool { true }
+
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(self.handle_call(invocation))
     }
@@ -208,6 +220,7 @@ impl PlanHandler {
                 "failed to parse function arguments: {error}"
             ))
         })?;
+        requested_args.sampling_revision = step_context.plan_sampling_revision.clone();
         if requested_args.plan.is_some() == requested_args.set.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "provide exactly one of plan or set".to_string(),
@@ -259,6 +272,15 @@ impl PlanHandler {
         // admission; nothing is published until persistence succeeds.
         let publication_tasks = session.terminal_tasks.clone();
         publication_tasks.spawn(async move {
+            // Session-local bookkeeping must not queue a repository-wide writer.
+            // Keep this owner gate until durable commit AND client publication
+            // finish; the state mutex alone does not order events.
+            let _publication = tokio::select! {
+                guard = session.services.plan_store.publication_guard() => guard,
+                _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel(
+                    "update_plan was cancelled before publication admission; no changes were made".into(),
+                )),
+            };
             let staged = session
                 .services
                 .plan_store
@@ -278,7 +300,7 @@ impl PlanHandler {
             if !staged.needs_publication() {
                 return Ok(boxed_tool_output(output));
             }
-            let response = output.response_result();
+            let response = output.durable_response();
             // Even a no-op may retry an earlier failed publication or migrate a
             // legacy snapshot that had no requirement lineage.
             session
@@ -313,6 +335,11 @@ impl PlanHandler {
 }
 
 impl CoreToolRuntime for PlanHandler {
+    fn delegates_workspace_admission(&self) -> bool {
+        // Publication is admitted by PlanStore, not by a workspace lease.
+        true
+    }
+
     fn cancellation_recovery(
         &self,
         result: Option<&JsonValue>,

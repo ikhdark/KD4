@@ -9880,6 +9880,13 @@ class TurnTimingModelRequest(BaseModel):
             description="Stable identity shared by every physical provider attempt for this logical request.",
         ),
     ] = None
+    setup_phase_ns: Annotated[
+        dict[str, int] | None,
+        Field(
+            alias="setupPhaseNs",
+            description="Named setup-phase union durations in nanoseconds, frozen at dispatch. Measured from request preparation (or attempt start for retries), not cumulative across the turn. Phases can overlap and must not be summed. Empty for older records or attempts that never dispatched.",
+        ),
+    ] = None
     token_usage: Annotated[
         TurnTimingProviderTokenUsage | None,
         Field(

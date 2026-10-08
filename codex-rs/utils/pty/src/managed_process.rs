@@ -254,6 +254,15 @@ impl ManagedRootProcess {
     /// Open a normally running Windows root by PID and attach it to the Job.
     #[cfg(windows)]
     pub fn attach(&self, pid: u32) -> io::Result<()> {
+        self.attach_with_access(pid, 0).map(drop)
+    }
+
+    #[cfg(windows)]
+    fn attach_with_access(
+        &self,
+        pid: u32,
+        extra_access: u32,
+    ) -> io::Result<std::os::windows::io::OwnedHandle> {
         use std::os::windows::io::FromRawHandle;
         use std::os::windows::io::OwnedHandle;
         use winapi::um::processthreadsapi::OpenProcess;
@@ -262,23 +271,34 @@ impl ManagedRootProcess {
 
         // SAFETY: OpenProcess takes only scalar arguments; a successful non-null result is a
         // new owned process handle.
-        let raw = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        let access = PROCESS_SET_QUOTA | PROCESS_TERMINATE;
+        let mut raw = unsafe { OpenProcess(access | extra_access, 0, pid) };
+        if raw.is_null() && extra_access != 0 {
+            // Extra resume rights are optional: retain the original thread-scan path
+            // on systems where only the Job assignment rights are available.
+            // SAFETY: As above, this opens a new owned handle using scalar arguments.
+            raw = unsafe { OpenProcess(access, 0, pid) };
+        }
         if raw.is_null() {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: The null failure result was rejected, and this is the sole owner of the
         // handle returned by OpenProcess.
-        let _process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
-        self.job.assign_process(raw.cast())
+        let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+        self.job.assign_process(raw.cast())?;
+        Ok(process)
     }
 
     /// Attach a `CREATE_SUSPENDED` child to the Job and then resume all of its
-    /// threads. Enumerating the new process's threads recovers the primary
-    /// thread handle that `std::process` and Tokio do not expose.
+    /// threads. Prefer resuming through the process handle; fall back to thread
+    /// enumeration when the optional native API is unavailable or fails.
     #[cfg(windows)]
     pub fn attach_and_resume(&self, pid: u32) -> io::Result<()> {
-        self.attach(pid)?;
-        resume_process_threads(pid)
+        use std::os::windows::io::AsHandle;
+        use winapi::um::winnt::PROCESS_SUSPEND_RESUME;
+
+        let process = self.attach_with_access(pid, PROCESS_SUSPEND_RESUME)?;
+        resume_process(process.as_handle(), pid, nt_resume_process())
     }
 
     /// Prevent descendant launchers from escaping this root's Windows job.
@@ -430,6 +450,55 @@ where
 }
 
 #[cfg(windows)]
+type NtResumeProcess =
+    unsafe extern "system" fn(winapi::um::winnt::HANDLE) -> winapi::shared::ntdef::NTSTATUS;
+
+#[cfg(windows)]
+fn nt_resume_process() -> Option<NtResumeProcess> {
+    use winapi::um::libloaderapi::GetModuleHandleW;
+    use winapi::um::libloaderapi::GetProcAddress;
+
+    static RESUME: OnceLock<Option<NtResumeProcess>> = OnceLock::new();
+    *RESUME.get_or_init(|| {
+        let module_name = "ntdll.dll\0".encode_utf16().collect::<Vec<_>>();
+        // SAFETY: module_name is NUL-terminated. ntdll is a process-lifetime system
+        // module; this borrowed module handle must not be passed to FreeLibrary.
+        let module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        // SAFETY: module is live and the export name is NUL-terminated.
+        let address = unsafe { GetProcAddress(module, c"NtResumeProcess".as_ptr()) };
+        if address.is_null() {
+            return None;
+        }
+        // SAFETY: NtResumeProcess takes a process HANDLE and returns NTSTATUS using
+        // the Windows system ABI. ntdll remains loaded for the cached pointer's lifetime.
+        Some(unsafe { std::mem::transmute::<_, NtResumeProcess>(address) })
+    })
+}
+
+#[cfg(windows)]
+fn resume_process(
+    process: std::os::windows::io::BorrowedHandle<'_>,
+    pid: u32,
+    native_resume: Option<NtResumeProcess>,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    if let Some(native_resume) = native_resume {
+        // SAFETY: The borrowed process handle remains live for this call. Windows
+        // checks its access rights; NTSTATUS is successful when nonnegative.
+        if unsafe { native_resume(process.as_raw_handle().cast()) } >= 0 {
+            return Ok(());
+        }
+    }
+    // NtResumeProcess is undocumented: preserve the supported thread APIs as a
+    // compatibility path rather than making successful process creation depend on it.
+    resume_process_threads(pid)
+}
+
+#[cfg(windows)]
 fn resume_process_threads(pid: u32) -> io::Result<()> {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
@@ -510,6 +579,57 @@ impl Drop for ManagedRootProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    async fn check_suspended_resume(native_resume: Option<NtResumeProcess>, expect_native: bool) {
+        use std::os::windows::io::AsHandle;
+        use winapi::um::winnt::PROCESS_SUSPEND_RESUME;
+
+        let _test_guard = managed_root_test_lock().acquire().await.unwrap();
+        let root = ManagedRootProcess::reserve().unwrap();
+        let mut child = tokio::process::Command::new("cmd.exe")
+            .args(["/D", "/Q", "/C", "exit 0"])
+            .creation_flags(WINDOWS_CREATE_SUSPENDED)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let process = root.attach_with_access(pid, PROCESS_SUSPEND_RESUME).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        // A native success must not fall through to the system-wide scan. No real
+        // process can match this PID, so accidentally scanning makes the test fail.
+        let scan_pid = if expect_native { u32::MAX } else { pid };
+        resume_process(process.as_handle(), scan_pid, native_resume).unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("resumed child must exit")
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_resume_skips_thread_snapshot() {
+        check_suspended_resume(Some(nt_resume_process().expect("native resume export")), true).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resume_falls_back_when_native_export_is_missing() {
+        check_suspended_resume(None, false).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resume_falls_back_when_native_resume_fails() {
+        unsafe extern "system" fn failed_resume(
+            _process: winapi::um::winnt::HANDLE,
+        ) -> winapi::shared::ntdef::NTSTATUS {
+            winapi::shared::ntstatus::STATUS_ACCESS_DENIED
+        }
+
+        check_suspended_resume(Some(failed_resume), false).await;
+    }
 
     fn managed_root_test_lock() -> &'static tokio::sync::Semaphore {
         static TEST_LOCK: OnceLock<tokio::sync::Semaphore> = OnceLock::new();

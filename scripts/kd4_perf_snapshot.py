@@ -509,6 +509,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write a human-readable model-attempt report.",
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--analysis-only", action="store_true",
+        help="Analyze --model-attempt-jsonl without workflow scenarios or Git/binary probes.",
+    )
     return parser
 
 
@@ -529,9 +533,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     repo_root = args.repo_root.resolve()
     catalog = scenario_catalog(repo_root, install_dir=args.install_dir)
-    names = tuple(args.scenario or PROFILE_SCENARIOS[args.profile])
+    names = () if args.analysis_only else tuple(args.scenario or PROFILE_SCENARIOS[args.profile])
     attempt_analysis = human_report = None
     try:
+        if args.analysis_only and (not args.model_attempt_jsonl or args.scenario or args.hash_binary):
+            raise ValueError("--analysis-only requires --model-attempt-jsonl and excludes --scenario/--hash-binary")
         if args.iterations is not None and args.iterations < 1:
             raise ValueError("iterations must be positive")
         if args.timeout_seconds <= 0:
@@ -561,7 +567,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
-    environment = environment_metadata(
+    environment = None if args.analysis_only else environment_metadata(
         repo_root, hash_binary=args.hash_binary, install_dir=args.install_dir
     )
     results: list[ScenarioResult] = []
@@ -606,6 +612,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ok = abort_reason is None and not failed and (complete or args.allow_incomplete)
     payload = {
         "schemaVersion": 1,
+        "analysisOnly": args.analysis_only,
         "profile": args.profile,
         "environment": environment,
         "results": [asdict(result) for result in results],

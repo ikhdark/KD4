@@ -246,6 +246,7 @@ async fn run_remote_compact_task_inner_impl(
                 return Err(error);
             }
             if let Some(advice) = error.retry_after() {
+                let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
                 crate::responses_retry::wait_for_retry_deadline(
                     advice.deadline(),
                     cancellation_token,
@@ -417,6 +418,8 @@ async fn run_remote_compaction_request_v2(
         };
         let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
         let inference_trace_context = InferenceTraceContext::disabled();
+        let service_tier =
+            crate::session::turn::service_tier_for_sampling(sess, turn_context).await;
         let stream_result = tokio::select! {
             _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
             result = client_session.stream(
@@ -428,7 +431,7 @@ async fn run_remote_compaction_request_v2(
                     turn_context.reasoning_effort.clone(),
                 ),
                 turn_context.reasoning_summary,
-                turn_context.config.service_tier.clone(),
+                service_tier,
                 responses_metadata,
                 &inference_trace_context,
             ) => result,
@@ -648,6 +651,75 @@ mod tests {
             attempt_identity: None,
             consumer_dropped: CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn remote_compaction_uses_current_supported_service_tier() -> anyhow::Result<()> {
+        core_test_support::require_network!();
+        let server = responses::start_mock_server().await;
+        let home = TempDir::new()?;
+        let (session, mut turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test-key"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                    config.model_provider.supports_websockets = false;
+                },
+            ).await;
+        let turn = Arc::get_mut(&mut turn).expect("test turn is uniquely owned");
+        // Deliberately stale: each request must resolve the live setting instead.
+        Arc::make_mut(&mut turn.config).service_tier = Some("priority".into());
+        let metadata = turn.turn_metadata_state.to_responses_metadata(
+            session.installation_id.clone(),
+            session.current_window_id().await,
+            CodexResponsesRequestKind::Compaction(CompactionTurnMetadata::new(
+                CompactionTrigger::Manual,
+                CompactionReason::UserRequested,
+                CompactionImplementation::ResponsesCompactionV2,
+                CompactionPhase::StandaloneTurn,
+            )),
+        );
+        for (fast, supported, configured, expected) in [
+            (true, true, Some("priority"), Some("priority")),
+            (false, true, Some("priority"), None),
+            (true, false, Some("priority"), None),
+            // Explicit standard routing is a config sentinel, omitted on wire.
+            (true, false, Some("default"), None),
+            (true, true, None, None),
+        ] {
+            if fast {
+                Arc::make_mut(&mut turn.config).features.enable(codex_features::Feature::FastMode)?;
+            } else {
+                Arc::make_mut(&mut turn.config).features.disable(codex_features::Feature::FastMode)?;
+            }
+            turn.model_info.service_tiers = if supported {
+                vec![codex_protocol::openai_models::ModelServiceTier {
+                    id: "priority".into(), name: "Priority".into(), description: "Priority".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            session.update_settings(crate::session::SessionSettingsUpdate {
+                service_tier: Some(configured.map(str::to_string)),
+                ..Default::default()
+            }).await?;
+            let log = responses::mount_sse_once(&server, responses::sse(vec![
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": "compaction", "encrypted_content": "summary"},
+                }),
+                responses::ev_completed("compacted"),
+            ])).await;
+            let mut client = session.services.model_client.new_session();
+            run_remote_compaction_request_v2(
+                &session, &turn, &mut client, &Prompt::default(), &metadata,
+                &CompactionTraceContext::disabled(), &CancellationToken::new(),
+            ).await?;
+            assert_eq!(log.single_request().body_json().get("service_tier").and_then(serde_json::Value::as_str), expected);
+        }
+        Ok(())
     }
 
     #[test]

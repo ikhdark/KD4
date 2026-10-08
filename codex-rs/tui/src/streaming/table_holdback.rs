@@ -13,7 +13,10 @@ use std::time::Instant;
 
 use crate::table_detect::FenceKind;
 use crate::table_detect::FenceTracker;
+#[cfg(test)]
 use crate::table_detect::is_table_delimiter_line;
+use crate::table_detect::is_table_delimiter_segment;
+#[cfg(test)]
 use crate::table_detect::is_table_header_line;
 use crate::table_detect::parse_table_segments;
 use crate::table_detect::strip_blockquote_prefix;
@@ -124,13 +127,19 @@ impl TableHoldbackScanner {
         let source_start = self.source_offset;
         let fence_kind = self.fence_tracker.kind();
 
-        let candidate_text = if fence_kind == FenceKind::Other {
+        // Header and delimiter checks share the same structural split. Avoid
+        // allocating and scanning the same pipe-separated source three times.
+        let segments = if fence_kind == FenceKind::Other {
             None
         } else {
-            table_candidate_text(line)
+            parse_table_segments(strip_blockquote_prefix(line))
         };
-        let is_header = candidate_text.is_some_and(is_table_header_line);
-        let is_delimiter = candidate_text.is_some_and(is_table_delimiter_line);
+        let is_header = segments
+            .as_ref()
+            .is_some_and(|segments| segments.iter().any(|segment| !segment.is_empty()));
+        let is_delimiter = segments
+            .as_ref()
+            .is_some_and(|segments| segments.iter().all(|segment| is_table_delimiter_segment(segment)));
 
         if self.confirmed_table_start.is_none()
             && let Some(previous_line) = self.previous_line
@@ -167,6 +176,7 @@ impl TableHoldbackScanner {
 ///
 /// Table holdback treats quoted tables as real tables, but it still requires a
 /// pipe-table shape after the quote markers are removed.
+#[cfg(test)]
 fn table_candidate_text(line: &str) -> Option<&str> {
     let stripped = strip_blockquote_prefix(line).trim();
     parse_table_segments(stripped).map(|_| stripped)
@@ -242,4 +252,46 @@ pub(super) fn table_holdback_state(source: &str) -> TableHoldbackState {
         };
     }
     TableHoldbackState::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_parse_scanner_matches_reference_at_each_committed_boundary() {
+        for source in [
+            "ordinary prose\nnext line\n",
+            "ordinary | pipe | prose\nnot a delimiter\n",
+            "| A | B |\n| --- | :---: |\n| é | two |\n\nafter table\n",
+            "prefix\n> | A | B |\n> | --- | --- |\n",
+            "| | |\n| --- | --- |\n",
+            "| A | B |\n\n| --- | --- |\n",
+            "| A | B |\n| : | :: |\n",
+            "A | B\n--- | ---\n",
+            "| only |\n| - |\n",
+            "text\\|\n---\\|\n",
+            "| A \\| B | C |\n| --- | --- |\n",
+            "```rust\n| A | B |\n| --- | --- |\n```\nplain\n",
+            "````rust\n```\n| A | B |\n| --- | --- |\n````\n",
+            "```markdown\n| A | B |\n| --- | --- |\n```\n",
+            "> ~~~sh\n> | A | B |\n> | --- | --- |\n> ~~~\n",
+            "| A | B |\r\n| --- | --- |\r\n",
+        ] {
+            let lines: Vec<_> = source.split_inclusive('\n').collect();
+            for batch_size in [1, 2, 4] {
+                let mut scanner = TableHoldbackScanner::new();
+                let mut prefix = String::new();
+                for batch in lines.chunks(batch_size) {
+                    let chunk = batch.concat();
+                    prefix.push_str(&chunk);
+                    scanner.push_source_chunk(&chunk);
+                    assert_eq!(scanner.state(), table_holdback_state(&prefix), "{prefix:?}");
+                }
+                scanner.reset();
+                scanner.push_source_chunk("| next |\n| --- |\n");
+                assert_eq!(scanner.state(), TableHoldbackState::Confirmed { table_start: 0 });
+            }
+        }
+    }
 }

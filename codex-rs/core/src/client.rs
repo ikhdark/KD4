@@ -31,7 +31,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -126,6 +125,7 @@ use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument;
 use tracing::instrument;
 use tracing::trace;
 use tracing::warn;
@@ -240,6 +240,8 @@ struct ModelRequestMeasurements {
     changed_request_settings: Vec<&'static str>,
     /// Filled by comparison against the preceding request; absent on the first.
     history_divergence: Option<HistoryPrefixDivergence>,
+    /// Representation selected at dispatch, not inferred from the manifest.
+    selected_representation: Option<SelectedInputRepresentation>,
     /// Drops the aggregate output budget made in the representation this
     /// request actually sent. Other representations are prepared and discarded,
     /// so their drops must not be attributed here.
@@ -721,6 +723,7 @@ impl ModelRequestMeasurements {
             request_setting_digests: None,
             changed_request_settings: Vec::new(),
             history_divergence: None,
+            selected_representation: None,
             tool_output_budget_drop_count: 0,
             tool_output_budget_dropped_token_count: 0,
         })
@@ -1173,6 +1176,15 @@ struct SelectedInputRepresentation {
 }
 
 impl SelectedInputRepresentation {
+    fn as_str(self) -> &'static str {
+        match (self.stable_context_fallback, self.tool_history_fallback) {
+            (false, false) => "projected",
+            (true, false) => "stable_context_fallback",
+            (false, true) => "tool_history_fallback",
+            (true, true) => "stable_context_tool_history_fallback",
+        }
+    }
+
     /// A fallback build replaced the logical input, so provenance has to be
     /// recomputed from the items that were actually sent.
     fn is_reprojected(self) -> bool {
@@ -1257,7 +1269,7 @@ fn measure_responses_request_after_dispatch(
             (measurements, stable_context_manifest)
         })
         .await;
-        match result {
+        let mut result = match result {
             Ok((Ok(measurements), stable_context_manifest)) => PostDispatchRequestMeasurements {
                 measurements,
                 stable_context_manifest,
@@ -1276,7 +1288,9 @@ fn measure_responses_request_after_dispatch(
                     stable_context_manifest: fallback_stable_context_manifest,
                 }
             }
-        }
+        };
+        result.measurements.selected_representation = Some(selected_representation);
+        result
     })
 }
 
@@ -1517,6 +1531,30 @@ impl ModelAttemptGuard {
                 "matched-task prompt cache coverage fell below baseline"
             );
         }
+        // The OTEL-only event is deliberately excluded from local SQLite logs.
+        // Keep a compact, content-free completion record locally as well, so
+        // cache investigations do not depend on offloaded timing snapshots.
+        tracing::info!(
+            event.name = "codex.model_cache",
+            turn_id = self.turn_id.as_deref(),
+            sampling_request_id = %self.sampling_request_id,
+            physical_attempt_id = %self.attempt_id,
+            transport = ?self.transport,
+            outcome = ?outcome,
+            input_representation = self.measurements.selected_representation.map(SelectedInputRepresentation::as_str),
+            diagnostics_available = !self.measurements.prompt_context_categories.is_empty(),
+            baseline_compared = self.measurements.prompt_context_baseline_compared,
+            provider_baseline = ?self.measurements.provider_baseline,
+            previous_response_id_present = self.measurements.previous_response_id_present,
+            history_items_previous = self.measurements.history_divergence.map(|value| value.items_previous),
+            history_prefix_items_reused = self.measurements.history_divergence.map(|value| value.prefix_items_reused),
+            history_first_divergent_index = self.measurements.history_divergence.map(|value| value.first_divergent_index),
+            changed_request_settings = ?self.measurements.changed_request_settings,
+            input_tokens,
+            cached_input_tokens,
+            uncached_input_tokens,
+            "model cache diagnostics"
+        );
         if !self.session_telemetry.model_attempt_logging_enabled() {
             return;
         }
@@ -1902,7 +1940,6 @@ struct ModelClientState {
     concurrent_reasoning_summaries_enabled: bool,
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
-    disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     http_clients: RouteAwareClientPool,
     cached_websocket_transport: StdMutex<WebsocketTransportCache>,
@@ -1913,6 +1950,37 @@ struct ModelClientState {
 struct WebsocketTransportCache {
     epoch: u64,
     session: Option<WebsocketSession>,
+    fallback: WebsocketFallbackState,
+}
+
+const WEBSOCKET_FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
+const WEBSOCKET_FAILURE_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Default)]
+struct WebsocketFallbackState {
+    disabled: bool,
+    last_transient_failure: Option<tokio::time::Instant>,
+}
+
+impl WebsocketFallbackState {
+    fn enabled(&self, now: tokio::time::Instant) -> bool {
+        !self.disabled
+            && self.last_transient_failure.is_none_or(|failed_at| {
+                now.saturating_duration_since(failed_at) >= WEBSOCKET_FALLBACK_COOLDOWN
+            })
+    }
+
+    fn record_failure(&mut self, recoverable: bool, now: tokio::time::Instant) {
+        if !recoverable
+            || self.last_transient_failure.is_some_and(|failed_at| {
+                now.saturating_duration_since(failed_at) <= WEBSOCKET_FAILURE_WINDOW
+            })
+        {
+            self.disabled = true;
+        } else {
+            self.last_transient_failure = Some(now);
+        }
+    }
 }
 
 impl WebsocketTransportCache {
@@ -2029,8 +2097,8 @@ impl RequestRouteTelemetry {
 /// This holds configuration and state that should be shared across turns within a Codex session
 /// (auth, provider selection, thread id, and transport fallback state).
 ///
-/// WebSocket fallback is session-scoped: once a turn activates the HTTP fallback, subsequent turns
-/// will also use HTTP for the remainder of the session.
+/// WebSocket fallback is session-scoped. A transient failure uses HTTP for 60 seconds; a second
+/// failure within 30 minutes or a non-transient failure disables WebSockets for the session.
 ///
 /// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
 /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
@@ -2060,13 +2128,15 @@ pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
     websocket_cache_publication: Option<WebsocketCachePublicationPermit>,
+    pending_websocket_preconnect: Option<AbortOnDropHandle<Option<WebsocketSession>>>,
     prepared_startup_websocket_attempt: Option<PreparedStartupWebsocketAttempt>,
     /// A receipt-bearing request invalidated provider inheritance. Subsequent
     /// requests must keep using the unreplaced logical history while those
     /// substitutions remain, though they may inherit a replacement response.
     tool_history_fail_open_pending: bool,
-    /// Whether the stream currently handled by this session used the WebSocket transport.
-    last_stream_was_websocket: bool,
+    /// Transport selected for the current stream, including failed connection attempts.
+    /// `None` means no stream has been selected yet.
+    last_stream_transport: Option<ModelAttemptTransport>,
     effective_input: Option<Arc<[ResponseItem]>>,
     turn_timing: Option<Arc<TurnTimingState>>,
     logical_sampling_request_count: u32,
@@ -2279,7 +2349,7 @@ struct WebsocketSession {
     last_request_history: Option<WebsocketHistoryBaseline>,
     next_history_generation: u64,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
-    last_response: Option<LastResponse>,
+    last_response: Option<Arc<LastResponse>>,
     last_response_from_untraced_warmup: bool,
     connection_reused: StdMutex<bool>,
 }
@@ -2544,7 +2614,6 @@ impl ModelClient {
                 concurrent_reasoning_summaries_enabled,
                 include_attestation,
                 attestation_provider,
-                disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 http_clients,
                 cached_websocket_transport: StdMutex::new(WebsocketTransportCache::default()),
@@ -2572,11 +2641,12 @@ impl ModelClient {
             client: self.clone(),
             websocket_session,
             websocket_cache_publication: Some(websocket_cache_publication),
+            pending_websocket_preconnect: None,
             prepared_startup_websocket_attempt: None,
             latest_measurement_attempt: Default::default(),
             measurement_predecessor: None,
             tool_history_fail_open_pending: false,
-            last_stream_was_websocket: false,
+            last_stream_transport: None,
             effective_input: None,
             turn_timing: None,
             logical_sampling_request_count: 0,
@@ -2592,11 +2662,12 @@ impl ModelClient {
             client: self.clone(),
             websocket_session: WebsocketSession::default(),
             websocket_cache_publication: None,
+            pending_websocket_preconnect: None,
             prepared_startup_websocket_attempt: None,
             latest_measurement_attempt: Default::default(),
             measurement_predecessor: None,
             tool_history_fail_open_pending: false,
-            last_stream_was_websocket: false,
+            last_stream_transport: None,
             effective_input: None,
             turn_timing: None,
             logical_sampling_request_count: 0,
@@ -2624,9 +2695,7 @@ impl ModelClient {
         permit: WebsocketCachePublicationPermit,
         websocket_session: WebsocketSession,
     ) -> bool {
-        if websocket_session.connection.is_none()
-            || self.state.disable_websockets.load(Ordering::Relaxed)
-        {
+        if websocket_session.connection.is_none() {
             return false;
         }
         let mut cache = self
@@ -2634,13 +2703,33 @@ impl ModelClient {
             .cached_websocket_transport
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cache.fallback.enabled(tokio::time::Instant::now()) {
+            return false;
+        }
         cache.publish_if_current(permit, websocket_session.into_transport_only())
     }
 
     pub(crate) fn force_http_fallback(&self, session_telemetry: &SessionTelemetry) -> bool {
-        let websocket_enabled = self.responses_websocket_enabled();
-        let activated =
-            websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
+        self.activate_http_fallback(session_telemetry, /*recoverable*/ false)
+    }
+
+    fn activate_http_fallback(
+        &self,
+        session_telemetry: &SessionTelemetry,
+        recoverable: bool,
+    ) -> bool {
+        let mut cache = self
+            .state
+            .cached_websocket_transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = tokio::time::Instant::now();
+        let activated = self.state.provider.info().supports_websockets && cache.fallback.enabled(now);
+        cache.fallback.record_failure(recoverable, now);
+        // Invalidate cached and in-flight publishers atomically with the fallback decision.
+        cache.epoch = cache.epoch.wrapping_add(1);
+        cache.session = None;
+        drop(cache);
         if activated {
             warn!("falling back to HTTP");
             session_telemetry.counter(
@@ -2650,13 +2739,6 @@ impl ModelClient {
             );
         }
 
-        let mut cache = self
-            .state
-            .cached_websocket_transport
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.epoch = cache.epoch.wrapping_add(1);
-        cache.session = None;
         activated
     }
 
@@ -2983,13 +3065,14 @@ impl ModelClient {
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
     pub fn responses_websocket_enabled(&self) -> bool {
-        if !self.state.provider.info().supports_websockets
-            || self.state.disable_websockets.load(Ordering::Relaxed)
-        {
-            return false;
-        }
-
-        true
+        self.state.provider.info().supports_websockets
+            && self
+                .state
+                .cached_websocket_transport
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fallback
+                .enabled(tokio::time::Instant::now())
     }
 
     pub(crate) fn startup_websocket_enabled(&self) -> bool {
@@ -3331,16 +3414,10 @@ impl ModelClientSession {
     /// transport for the next complete request.
     pub(crate) fn invalidate_provider_history_inheritance(&mut self, reason: &'static str) {
         self.invalidate_incremental_history(reason);
-        self.measurement_predecessor = None;
-        *self
-            .latest_measurement_attempt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *self
-            .prompt_context_baseline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.prepared_startup_websocket_attempt = None;
+        // Provider inheritance and local diagnostics have separate lifetimes.
+        // Keep the last dispatched measurement (including an unfinished
+        // predecessor) so the full replay can report exactly where it diverged.
+        // These measurements never authorize previous_response_id reuse.
     }
 
     #[cfg(test)]
@@ -3590,11 +3667,11 @@ impl ModelClientSession {
         Some(request.input.iter().skip(previous_len).cloned().collect())
     }
 
-    fn get_last_response(&mut self) -> Option<LastResponse> {
+    fn get_last_response(&mut self) -> Option<Arc<LastResponse>> {
         if let Some(receiver) = self.websocket_session.last_response_rx.as_mut() {
             match receiver.try_recv() {
                 Ok(response) => {
-                    self.websocket_session.last_response = Some(response);
+                    self.websocket_session.last_response = Some(Arc::new(response));
                     self.websocket_session.last_response_rx = None;
                 }
                 Err(TryRecvError::Closed) => self.websocket_session.last_response_rx = None,
@@ -3610,6 +3687,22 @@ impl ModelClientSession {
             baseline.provider_response_id_established = true;
         }
         response
+    }
+
+    fn substitutions_overlap_provider_history(
+        &self,
+        substitutions: &[crate::tool_history::ToolHistorySubstitution],
+        response: &LastResponse,
+    ) -> bool {
+        let previous = self.websocket_session.last_request.as_ref();
+        let previous_len = previous.map_or(0, |request| request.input.len());
+        crate::tool_history::substitutions_overlap_items(substitutions, |index| {
+            if index < previous_len {
+                previous.and_then(|request| request.input.get_item(index))
+            } else {
+                response.items_added.get(index - previous_len)
+            }
+        })
     }
 
     fn prepare_websocket_request(
@@ -3660,20 +3753,13 @@ impl ModelClientSession {
         if !tool_history_substitutions.is_empty() && !self.tool_history_fail_open_pending {
             if !crate::tool_history::substitutions_match_items(
                 tool_history_substitutions,
-                &request.input,
+                |index| request.input.get_item(index),
             ) {
                 trace!("completed-tool substitution metadata did not match request input");
             }
-            let mut provider_prefix = self
-                .websocket_session
-                .last_request
-                .as_ref()
-                .map(|request| request.input.to_vec())
-                .unwrap_or_default();
-            provider_prefix.extend(last_response.items_added.iter().cloned());
-            if crate::tool_history::substitutions_overlap_items(
+            if self.substitutions_overlap_provider_history(
                 tool_history_substitutions,
-                &provider_prefix,
+                &last_response,
             ) {
                 self.tool_history_fail_open_pending = true;
                 let build_fallback_request =
@@ -3704,7 +3790,7 @@ impl ModelClientSession {
                     )
                     && !last_response.response_id.is_empty()
                 {
-                    payload.previous_response_id = Some(last_response.response_id);
+                    payload.previous_response_id = Some(last_response.response_id.clone());
                     payload.input = incremental_items.into();
                     return Ok((
                         ResponsesWsRequest::ResponseCreate(payload),
@@ -3752,7 +3838,7 @@ impl ModelClientSession {
 
         Ok((
             ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
-                previous_response_id: Some(last_response.response_id),
+                previous_response_id: Some(last_response.response_id.clone()),
                 input: incremental_items.into(),
                 ..payload
             }),
@@ -3760,6 +3846,71 @@ impl ModelClientSession {
             logical_request_override,
             verified_history,
         ))
+    }
+
+    /// Starts transport-only setup while the caller prepares the turn. The task belongs to
+    /// this session: dropping the turn cancels it, and it cannot publish a cached socket.
+    /// Healthy transports (including startup prewarm) remain under their current owner.
+    pub async fn start_websocket_preconnect(
+        &mut self,
+        model_info: &ModelInfo,
+        service_tier: Option<String>,
+        session_telemetry: &SessionTelemetry,
+        responses_metadata: &CodexResponsesMetadata,
+    ) {
+        // Spawned agents may not yet be attached to an attestation-capable client.
+        if self.client.state.session_source.is_non_root_agent()
+            || !self.client.responses_websocket_enabled()
+            || self.pending_websocket_preconnect.is_some()
+        {
+            return;
+        }
+        if let Some(connection) = self.websocket_session.connection.as_ref() {
+            if !websocket_connection_expiring(self.websocket_session.connected_at, Instant::now())
+                && !connection.is_closed().await
+            {
+                return;
+            }
+            self.reset_websocket_session();
+        }
+        let mut session = self.client.new_speculative_session();
+        let model_info = model_info.clone();
+        let session_telemetry = session_telemetry.clone();
+        let responses_metadata = responses_metadata.clone();
+        self.pending_websocket_preconnect = Some(AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                if let Err(err) = session
+                    .preconnect_websocket(
+                        &model_info,
+                        service_tier,
+                        &session_telemetry,
+                        &responses_metadata,
+                    )
+                    .await
+                {
+                    warn!("turn websocket preconnect failed; retrying at dispatch: {err:#}");
+                    return None;
+                }
+                Some(std::mem::take(&mut session.websocket_session).into_transport_only())
+            }
+            .in_current_span(),
+        )));
+    }
+
+    async fn finish_websocket_preconnect(&mut self) {
+        let Some(task) = self.pending_websocket_preconnect.take() else {
+            return;
+        };
+        match task.await {
+            Ok(Some(transport)) if self.client.responses_websocket_enabled() => {
+                // A startup-prewarm claim may have won while preparation was running.
+                if self.websocket_session.connection.is_none() {
+                    self.websocket_session = transport;
+                }
+            }
+            Ok(_) => {}
+            Err(err) => warn!("turn websocket preconnect join failed: {err}"),
+        }
     }
 
     /// Opportunistically preconnects a websocket for this turn-scoped client session.
@@ -3772,6 +3923,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
+        self.finish_websocket_preconnect().await;
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -3881,6 +4033,18 @@ impl ModelClientSession {
 
         if needs_new {
             self.invalidate_incremental_history("websocket reconnect");
+            // Recovery may happen in the same turn that invalidated the cache. Take a fresh
+            // publication epoch before connecting, so a later fallback can still revoke it.
+            // Never restore publication rights to a speculative or explicitly revoked owner.
+            if let Some(permit) = self.websocket_cache_publication.as_mut() {
+                permit.epoch = self
+                    .client
+                    .state
+                    .cached_websocket_transport
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .epoch;
+            }
             let new_conn = match self
                 .client
                 .connect_websocket(
@@ -4909,6 +5073,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
+        self.finish_websocket_preconnect().await;
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -4916,6 +5081,7 @@ impl ModelClientSession {
             return Ok(());
         }
 
+        self.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
         let disabled_trace = InferenceTraceContext::disabled();
         match self
             .stream_responses_websocket(
@@ -5004,6 +5170,10 @@ impl ModelClientSession {
         inference_trace: &InferenceTraceContext,
         attempt_prepared: Option<AttemptPreparedCallback>,
     ) -> Result<ResponseStream> {
+        // Resolve before auth setup and transport selection: preconnect can refresh auth or
+        // discover that the endpoint requires HTTP. The normal connection path still checks
+        // provider/auth compatibility, expiry, and closure before reusing the socket.
+        self.finish_websocket_preconnect().await;
         let sampling_request_id = new_sampling_request_id();
         let request_kind = if self.logical_sampling_request_count == 0 {
             ModelAttemptRequestKind::Initial
@@ -5015,7 +5185,7 @@ impl ModelClientSession {
         match wire_api {
             WireApi::Responses => {
                 if self.client.responses_websocket_enabled() {
-                    self.last_stream_was_websocket = true;
+                    self.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(
@@ -5042,7 +5212,7 @@ impl ModelClientSession {
                     }
                 }
 
-                self.last_stream_was_websocket = false;
+                self.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
                 self.stream_responses_api(
                     prompt,
                     model_info,
@@ -5067,8 +5237,7 @@ impl ModelClientSession {
 
     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
     ///
-    /// This is used on a stream-read failure or after exhausting the provider retry budget,
-    /// to force subsequent requests onto the HTTP transport.
+    /// This is used when the server rejects the WebSocket upgrade.
     ///
     /// Returns `true` when the failed stream should be retried over HTTP. This includes a concurrent
     /// session having already activated the shared fallback while this session still had an
@@ -5077,10 +5246,40 @@ impl ModelClientSession {
         &mut self,
         session_telemetry: &SessionTelemetry,
     ) -> bool {
-        let failed_stream_was_websocket = self.last_stream_was_websocket;
-        let activated = self.client.force_http_fallback(session_telemetry);
+        self.switch_fallback_transport(session_telemetry, /*recoverable*/ false)
+    }
+
+    pub(crate) fn try_switch_fallback_transport_after_error(
+        &mut self,
+        session_telemetry: &SessionTelemetry,
+        err: &CodexErr,
+    ) -> bool {
+        let recoverable = match err {
+            CodexErr::ResponseStreamFailed(error) => error.status.is_none(),
+            CodexErr::ConnectionFailed(error) => error.status.is_none(),
+            _ => false,
+        };
+        self.switch_fallback_transport(session_telemetry, recoverable)
+    }
+
+    fn switch_fallback_transport(
+        &mut self,
+        session_telemetry: &SessionTelemetry,
+        recoverable: bool,
+    ) -> bool {
+        // The cooldown may expire during an HTTP request or network-recovery wait. Only
+        // WebSocket failures can change its state, never failures of that HTTP attempt.
+        if self.last_stream_transport == Some(ModelAttemptTransport::ResponsesHttp) {
+            return false;
+        }
+        let failed_stream_was_websocket =
+            self.last_stream_transport == Some(ModelAttemptTransport::ResponsesWebsocket);
+        if !failed_stream_was_websocket && !self.client.responses_websocket_enabled() {
+            return false;
+        }
+        let activated = self.client.activate_http_fallback(session_telemetry, recoverable);
         self.websocket_session = WebsocketSession::default();
-        self.last_stream_was_websocket = false;
+        self.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
         activated || failed_stream_was_websocket
     }
 }
@@ -5357,6 +5556,7 @@ where
 {
     let inference_trace_attempt = inference_trace_attempt.into();
     let attempt_identity = attempt.as_ref().map(ModelAttemptState::response_identity);
+    let attempt_clock = attempt.as_ref().map(ModelAttemptState::clock);
     let (tx_event, rx_event) =
         mpsc::channel::<Result<ResponseEvent>>(RESPONSE_STREAM_CHANNEL_CAPACITY);
     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
@@ -5368,6 +5568,11 @@ where
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
         let mut ttft_ms = None;
+        // First-event telemetry is one-shot. Once recorded, later deltas must
+        // not reacquire the timing mutex or clone the clock's Arc.
+        let mut first_provider_event_recorded = false;
+        let mut first_actionable_output_recorded = false;
+        let mut first_visible_output_recorded = false;
         let mut api_stream = api_stream;
         let mut downstream_backpressured = false;
         let upstream_request_id = upstream_request_id.as_deref();
@@ -5395,11 +5600,13 @@ where
                 crate::stable_context::normalize_provider_context_item_id(item);
             }
             if let Ok(response_event) = &event
-                && let Some(attempt) = attempt.as_ref()
+                && let Some(clock) = attempt_clock.as_ref()
             {
-                let clock = attempt.clock();
-                clock.mark_first_provider_event();
-                if response_event_records_model_output(response_event) {
+                if !first_provider_event_recorded {
+                    clock.mark_first_provider_event();
+                    first_provider_event_recorded = true;
+                }
+                if ttft_ms.is_none() && response_event_records_model_output(response_event) {
                     clock.mark_first_model_output();
                     ttft_ms.get_or_insert_with(|| {
                         let offsets = clock
@@ -5416,13 +5623,16 @@ where
                         .unwrap_or(i64::MAX)
                     });
                 }
-                if response_event_records_actionable_output(response_event) {
+                if !first_actionable_output_recorded
+                    && response_event_records_actionable_output(response_event)
+                {
                     clock.mark_first_actionable_output();
+                    first_actionable_output_recorded = true;
                 }
             }
-            let records_visible_output = event
-                .as_ref()
-                .is_ok_and(response_event_records_visible_output);
+            let records_visible_output = !first_visible_output_recorded
+                && attempt_clock.is_some()
+                && event.as_ref().is_ok_and(response_event_records_visible_output);
             // With one sender, an empty capacity here means forwarding this
             // nonterminal event can block polling the provider. Its completion
             // time no longer isolates backend speed. Do not subtract this wait:
@@ -5449,8 +5659,9 @@ where
                             .await;
                         return;
                     }
-                    if records_visible_output && let Some(attempt) = attempt.as_ref() {
-                        attempt.clock().mark_first_visible_output();
+                    if records_visible_output && let Some(clock) = attempt_clock.as_ref() {
+                        clock.mark_first_visible_output();
+                        first_visible_output_recorded = true;
                     }
                 }
                 Ok(ResponseEvent::Completed {
@@ -5486,7 +5697,9 @@ where
                     // Publish authoritative history before releasing the consumer.
                     // Optional diagnostics must not hold deferred tools or another
                     // model request behind token measurement work.
-                    if let Some(sender) = tx_last_response.take() {
+                    // HTTP discards this receiver. Do not clone a whole output
+                    // history just to send it into an already-closed channel.
+                    if let Some(sender) = tx_last_response.take().filter(|sender| !sender.is_closed()) {
                         let _ = sender.send(LastResponse {
                             response_id: response_id.clone(),
                             items_added: items_added.clone(),
@@ -5543,8 +5756,9 @@ where
                             .await;
                         return;
                     }
-                    if records_visible_output && let Some(attempt) = attempt.as_ref() {
-                        attempt.clock().mark_first_visible_output();
+                    if records_visible_output && let Some(clock) = attempt_clock.as_ref() {
+                        clock.mark_first_visible_output();
+                        first_visible_output_recorded = true;
                     }
                 }
                 Err(err) => {

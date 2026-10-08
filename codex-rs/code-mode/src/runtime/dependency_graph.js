@@ -89,10 +89,30 @@ Object.defineProperty(globalThis, "run_graph", {
     // An explicitly excluded branch needs valid structure, not capabilities
     // that will never be dispatched. Check the entire selected closure before
     // any effect, including transitive dependencies of requested targets.
+    let missingCapabilities;
+    let missingCount = 0, diagnosticBytes = 0;
+    // Snapshot once per invocation, not once per required name. A later graph
+    // still sees a changed catalog; this is not cross-cell capability caching.
+    const capabilities = new Set(ALL_TOOL_NAMES);
     for (const id of selected) {
-      if (graph.get(id).requires.some(name => !ALL_TOOL_NAMES.includes(name))) {
-        throw new TypeError(`required tool capability is unavailable for ${id}`);
+      for (const name of graph.get(id).requires) {
+        if (capabilities.has(name)) continue;
+        ++missingCount;
+        missingCapabilities ??= [];
+        // Failure-only, bounded diagnostics. Names are exact or explicitly
+        // omitted, never shortened into a different callable capability.
+        const cost = id.length + name.length + 64;
+        if (missingCapabilities.length < 64 && diagnosticBytes + cost <= 4096) {
+          missingCapabilities.push({ node_id: id, tool: name });
+          diagnosticBytes += cost;
+        }
       }
+    }
+    if (missingCapabilities) {
+      const error = new TypeError("required tool capabilities are unavailable; no nodes started");
+      error.missing_capabilities = missingCapabilities;
+      error.omitted_capabilities = missingCount - missingCapabilities.length;
+      throw error;
     }
     // Longest remaining dependency path first; zero estimates retain the
     // original input-order policy. Estimates affect admission, never results.
@@ -107,15 +127,38 @@ Object.defineProperty(globalThis, "run_graph", {
     const admissionOrder = [...graph.keys()].filter(id => selected.has(id)).sort((a, b) =>
       ranks.get(b) - ranks.get(a) || graph.get(a).ordinal - graph.get(b).ordinal);
     const results = Object.create(null);
-    const pending = new Set(admissionOrder);
-    const running = new Map();
+    const priority = new Map(admissionOrder.map((id, i) => [id, i]));
+    const remainingDeps = new Map(admissionOrder.map(id => [id, graph.get(id).deps.length]));
+    const consumers = new Map(admissionOrder.map(id => [id, []]));
+    for (const id of admissionOrder) {
+      for (const dep of graph.get(id).deps) consumers.get(dep).push(id);
+    }
+    const pending = new Set(admissionOrder.filter(id => remainingDeps.get(id) === 0));
+    const running = new Set();
+    let remaining = selected.size, wake;
+    function settled(id) {
+      --remaining;
+      for (const consumer of consumers.get(id)) {
+        const count = remainingDeps.get(consumer) - 1;
+        remainingDeps.set(consumer, count);
+        if (count === 0) pending.add(consumer);
+      }
+      // One wakeup per scheduling frontier. Promise.race repeatedly attaches
+      // reactions to every slow sibling and retains them until that sibling ends.
+      const notify = wake;
+      wake = undefined;
+      if (notify) notify();
+    }
     // All claims are acquired together on this JS thread. No partial leases,
     // lock-order cycles, or cross-cell authority. Normal tool gates still apply.
     const readers = new Map();
     const writers = new Set();
-    function available({ claims }) {
-      return claims.read.every(key => !writers.has(key)) &&
-        claims.write.every(key => !writers.has(key) && !readers.has(key));
+    function available({ claims }, rank, waitingReads, waitingWrites) {
+      return claims.read.every(key => !writers.has(key) &&
+          (waitingWrites.get(key) ?? -1) <= rank) &&
+        claims.write.every(key => !writers.has(key) && !readers.has(key) &&
+          (waitingReads.get(key) ?? -1) <= rank &&
+          (waitingWrites.get(key) ?? -1) <= rank);
     }
     function acquire({ claims }) {
       for (const key of claims.read) readers.set(key, (readers.get(key) ?? 0) + 1);
@@ -151,23 +194,40 @@ Object.defineProperty(globalThis, "run_graph", {
           : { status: "rejected", reason };
       }
     }
-    while (pending.size || running.size) {
-      for (const id of pending) {
+    while (remaining) {
+      let skipped = false;
+      // Ready higher-ranked work must not be starved by refilling its resource
+      // with shorter branches. Equal-rank/default admission remains compatible.
+      // These are scheduling reservations, never acquired or cross-cell leases.
+      const waitingReads = new Map(), waitingWrites = new Map();
+      for (const id of [...pending].sort((a, b) => priority.get(a) - priority.get(b))) {
         const node = graph.get(id);
-        if (!node.deps.every(dep => Object.hasOwn(results, dep))) continue;
         if (node.deps.some(dep => results[dep].status !== "fulfilled")) {
-          results[id] = { status: "skipped", reason: "dependency failed" };
+          results[id] = { status: "skipped", reason: "dependency failed",
+            blocked_by: node.deps.filter(dep => results[dep].status !== "fulfilled") };
           pending.delete(id);
-        } else if (running.size < concurrency && available(node)) {
+          settled(id);
+          skipped = true;
+        } else if (running.size < concurrency) {
+          const rank = ranks.get(id);
+          if (!available(node, rank, waitingReads, waitingWrites)) {
+            for (const key of node.claims.read)
+              waitingReads.set(key, Math.max(waitingReads.get(key) ?? -1, rank));
+            for (const key of node.claims.write)
+              waitingWrites.set(key, Math.max(waitingWrites.get(key) ?? -1, rank));
+            continue;
+          }
           pending.delete(id);
           acquire(node);
           // Defer callbacks until the task is registered, even when run throws.
-          const task = Promise.resolve().then(() => execute(id, node))
-            .finally(() => { release(node); running.delete(id); });
-          running.set(id, task);
+          running.add(id);
+          Promise.resolve().then(() => execute(id, node))
+            .finally(() => { release(node); running.delete(id); settled(id); });
         }
       }
-      if (running.size) await Promise.race(running.values());
+      // Propagate skipped chains locally before waiting on an unrelated task.
+      if (skipped) continue;
+      if (running.size) await new Promise(resolve => { wake = resolve; });
     }
     const ordered = Object.create(null);
     for (const [id, node] of graph) {

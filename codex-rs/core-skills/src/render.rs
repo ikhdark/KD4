@@ -271,8 +271,8 @@ fn render_skill_lines_from_lines(
                 total_count,
                 /*included_count*/ skill_lines.len(),
                 /*omitted_count*/ 0,
-                /*truncated_description_chars*/ 0,
-                /*truncated_description_count*/ 0,
+                skill_lines.iter().map(|line| line.truncated_chars(line.description_char_count())).sum(),
+                skill_lines.iter().filter(|line| line.truncated_chars(line.description_char_count()) > 0).count(),
             ),
         );
     }
@@ -320,7 +320,7 @@ fn render_minimum_skill_lines_until_budget(
     let mut truncated_description_count = 0usize;
     for line in skill_lines {
         let line_cost = line.minimum_cost(budget);
-        let description_char_count = line.description_char_count();
+        let description_char_count = line.original_description_chars;
         if used.saturating_add(line_cost) <= budget.limit() {
             used = used.saturating_add(line_cost);
             included.push(line.render_minimum());
@@ -377,6 +377,8 @@ impl SkillRenderReport {
 struct SkillLine<'a> {
     name: &'a str,
     description: Cow<'a, str>,
+    original_description_chars: usize,
+    retained_source_chars: usize,
     path: String,
 }
 
@@ -418,9 +420,18 @@ impl<'a> SkillLine<'a> {
                     .and_then(|interface| interface.short_description.as_deref())
             })
             .unwrap_or(skill.description.as_str());
+        let description = truncate_default_context_skill_description(summary);
+        let original_description_chars = summary.chars().count();
+        let retained_source_chars = if matches!(&description, Cow::Owned(_)) {
+            description.chars().count().saturating_sub(TRUNCATED_SKILL_DESCRIPTION_SUFFIX.chars().count())
+        } else {
+            original_description_chars
+        };
         Self {
             name: skill.name.as_str(),
-            description: truncate_default_context_skill_description(summary),
+            description,
+            original_description_chars,
+            retained_source_chars,
             path: format!("{SKILL_CATALOG_LOCATOR_PREFIX}{}", skill_catalog_id(skill)),
         }
     }
@@ -435,6 +446,10 @@ impl<'a> SkillLine<'a> {
 
     fn description_char_count(&self) -> usize {
         self.description.chars().count()
+    }
+
+    fn truncated_chars(&self, rendered_chars: usize) -> usize {
+        self.original_description_chars.saturating_sub(rendered_chars.min(self.retained_source_chars))
     }
 
     fn render_full(&self) -> String {
@@ -577,9 +592,7 @@ fn render_lines_with_description_budget(
         .iter()
         .zip(char_allocations)
         .map(|(line, description_chars)| {
-            let truncated_chars = line
-                .description_char_count
-                .saturating_sub(description_chars);
+            let truncated_chars = line.line.truncated_chars(description_chars);
             RenderedSkillLine {
                 line: line.line.render_with_description_chars(description_chars),
                 truncated_chars,
@@ -904,6 +917,28 @@ mod tests {
     }
 
     #[test]
+    fn salience_short_metadata_preserves_applicability_and_counts_all_omissions() {
+        let description = format!("{} Only for approved deployments; never for production.", "background ".repeat(40));
+        let mut skill = make_skill_with_description("qualified", SkillScope::Repo, &description);
+        let budget = SkillMetadataBudget::Tokens(2000);
+        let original = build_available_skills_from_metadata(std::slice::from_ref(&skill), budget).unwrap();
+        assert_eq!(original.report.truncated_description_count, 1);
+        assert!(original.report.truncated_description_chars > 100);
+        assert_eq!(skill.description, description);
+        // Existing author-owned short metadata, not heuristic sentence selection,
+        // carries applicability without widening the catalog budget.
+        let qualified = "Approved deployments only; never production.";
+        skill.short_description = Some(qualified.into());
+        let rendered = build_available_skills_from_metadata(std::slice::from_ref(&skill), budget).unwrap();
+        assert!(rendered.skill_lines[0].contains(qualified));
+        assert_eq!(rendered.report.truncated_description_chars, 0);
+        assert!(budget.cost(&rendered.skill_lines.join("\n")) <= budget.limit());
+        let omitted = build_available_skills_from_metadata(std::slice::from_ref(&skill), SkillMetadataBudget::Characters(0)).unwrap();
+        assert_eq!(omitted.report.omitted_count, 1);
+        assert_eq!(omitted.report.truncated_description_chars, qualified.chars().count());
+    }
+
+    #[test]
     fn default_context_caps_descriptions_without_mutating_metadata() {
         let description = "\u{1F4A1}".repeat(MAX_DEFAULT_CONTEXT_SKILL_DESCRIPTION_CHARS + 1);
         let skill = make_skill_with_description("long-skill", SkillScope::Repo, &description);
@@ -919,6 +954,8 @@ mod tests {
         .expect("skill should render");
 
         assert_eq!(skill.description, description);
+        assert_eq!(rendered.report.truncated_description_chars, 4);
+        assert_eq!(rendered.report.truncated_description_count, 1);
         assert_eq!(
             rendered.skill_lines,
             vec![expected_skill_line(&skill, &expected_description)]
@@ -990,7 +1027,7 @@ mod tests {
         assert_eq!(rendered.report.total_count, 2);
         assert_eq!(rendered.report.included_count, 2);
         assert_eq!(rendered.report.omitted_count, 0);
-        assert_eq!(rendered.report.truncated_description_chars, 202);
+        assert_eq!(rendered.report.truncated_description_chars, 212);
         assert_eq!(rendered.report.truncated_description_count, 1);
         assert_eq!(
             rendered.warning_message,

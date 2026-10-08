@@ -1112,7 +1112,31 @@ def _generation_purpose_latency_report(
     )
     for request in requests:
         purpose = str(request.get("generationPurpose") or "unknown")
+        # The runtime uses the same purpose/reason for summary generation and
+        # the continuation after it. Only the summarizer lacks a state hash
+        # and emits no tools. Require recorded zero calls, not missing evidence.
+        if (
+            purpose == "compaction_recovery"
+            and request.get("generationReason") == "compaction"
+            and request.get("relevantStateFingerprint") is None
+            and request.get("toolCallCount") == 0
+            and request.get("modelEmittedToolCallCount", 0) == 0
+        ):
+            purpose = "compaction_summary"
         metrics = by_purpose[purpose]
+        if purpose == "compaction_summary":
+            dispatch = request.get("dispatchMs")
+            completed = request.get("completedMs")
+            measured = (
+                type(dispatch) is int
+                and type(completed) is int
+                and 0 <= dispatch <= completed
+            )
+            metrics["elapsedRows"] += int(measured)
+            metrics["missingElapsedRows"] += int(not measured)
+            metrics["requestElapsedNs"] += (
+                (completed - dispatch) * 1_000_000 if measured else 0
+            )
         metrics["logicalGenerations"] += int(
             request.get("attemptKind", "primary") == "primary"
         )

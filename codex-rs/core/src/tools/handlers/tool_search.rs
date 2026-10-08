@@ -91,6 +91,11 @@ struct ToolSearchIndex {
     document_count: usize,
 }
 
+struct ToolSearchQueryEvidence<'a> {
+    indexed_terms: Vec<&'a str>,
+    minimum_matches: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RankedToolSearchDocument {
     id: ToolSearchDocumentId,
@@ -121,37 +126,68 @@ impl Ord for RankedToolSearchDocument {
 }
 
 impl ToolSearchIndex {
-    fn relevance(&self, query: &str, id: ToolSearchDocumentId, source_scoped: bool) -> f32 {
-        let terms = ToolSearchTokenizer.tokenize(query).into_iter().collect::<HashSet<_>>();
-        let indexed = terms.iter().filter(|term| self.postings.contains_key(*term))
-            .collect::<Vec<_>>();
-        let minimum_matches = if terms.len() > 1 && !(source_scoped && indexed.len() == 1) { 2 } else { 1 };
-        if indexed.len() < minimum_matches {
+    fn query_evidence<'a>(
+        &self,
+        tokens: &'a [String],
+        search_infos: &[ToolSearchInfo],
+        source: Option<&str>,
+    ) -> ToolSearchQueryEvidence<'a> {
+        let terms = tokens.iter().map(String::as_str).collect::<HashSet<_>>();
+        let indexed_terms = terms.iter().copied().filter(|term| {
+            self.postings.get(*term).is_some_and(|postings| {
+                source.is_none() || postings.iter().any(|(id, _)| {
+                    matches_source(id.info(search_infos), source)
+                })
+            })
+        }).collect::<Vec<_>>();
+        // A scope may disambiguate one capability plus unknown task entities,
+        // but must not erase known capabilities belonging to another source.
+        let single_scoped_capability = source.is_some() && indexed_terms.len() == 1
+            && terms.iter().filter(|term| self.postings.contains_key(**term)).count() == 1;
+        let minimum_matches = if terms.len() > 1 && !single_scoped_capability { 2 } else { 1 };
+        ToolSearchQueryEvidence { indexed_terms, minimum_matches }
+    }
+
+    fn relevance(&self, evidence: &ToolSearchQueryEvidence<'_>, id: ToolSearchDocumentId) -> f32 {
+        if evidence.indexed_terms.len() < evidence.minimum_matches {
             return 0.0;
         }
-        let matches = indexed.iter().filter(|term| {
-            self.callable_terms[id.0].contains(term.as_str())
+        let matches = evidence.indexed_terms.iter().filter(|term| {
+            self.callable_terms[id.0].contains(**term)
         }).count();
-        if matches < minimum_matches { return 0.0; }
-        matches as f32 / indexed.len() as f32
+        if matches < evidence.minimum_matches { return 0.0; }
+        matches as f32 / evidence.indexed_terms.len() as f32
     }
 
     fn new(search_infos: &[ToolSearchInfo]) -> Self {
+        Self::new_with_callable_texts(search_infos,
+            search_infos.iter().map(|info| info.entry.callable_search_text()))
+    }
+
+    fn new_with_callable_texts(
+        search_infos: &[ToolSearchInfo],
+        callable_texts: impl Iterator<Item = String>,
+    ) -> Self {
         const K1: f32 = 1.2;
         const B: f32 = 0.75;
         const FALLBACK_AVERAGE_DOCUMENT_LENGTH: f32 = 256.0;
 
         let tokenizer = ToolSearchTokenizer;
-        let tokenized_documents = search_infos
-            .iter()
-            .map(|search_info| tokenizer.tokenize(&search_info.entry.search_text))
-            .collect::<Vec<_>>();
+        // Reuse the callable tokenization for both length normalization and
+        // activation. Connector prose and output hints must not penalize the
+        // operation merely by making the retrieval document longer.
+        let mut callable_lengths = Vec::with_capacity(search_infos.len());
+        let callable_terms = callable_texts.map(|text| {
+            let tokens = tokenizer.tokenize(&text);
+            callable_lengths.push(tokens.len());
+            tokens.into_iter().collect::<HashSet<_>>()
+        }).collect::<Vec<_>>();
         let average_document_length = {
-            let total_document_length = tokenized_documents.iter().map(Vec::len).sum::<usize>();
-            let average = if tokenized_documents.is_empty() {
+            let total_document_length = callable_lengths.iter().sum::<usize>();
+            let average = if callable_lengths.is_empty() {
                 0.0
             } else {
-                total_document_length as f64 / tokenized_documents.len() as f64
+                total_document_length as f64 / callable_lengths.len() as f64
             };
             let average = average as f32;
             if average > 0.0 {
@@ -162,10 +198,17 @@ impl ToolSearchIndex {
         };
 
         let mut postings = HashMap::<String, Vec<(ToolSearchDocumentId, f32)>>::new();
-        let mut term_frequencies = HashMap::<String, usize>::new();
-        for (index, tokens) in tokenized_documents.into_iter().enumerate() {
-            let document_length = tokens.len() as f32;
-            for token in tokens {
+        let mut term_frequencies = HashMap::<std::borrow::Cow<'_, str>, usize>::new();
+        for (index, info) in search_infos.iter().enumerate() {
+            let document_length = callable_lengths[index] as f32;
+            // Borrow common lowercase tokens; only new vocabulary needs an
+            // owned posting key. Keep Unicode lowercasing identical to queries.
+            for word in info.entry.search_text.unicode_words() {
+                let token = if word.is_ascii() && !word.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                    std::borrow::Cow::Borrowed(word)
+                } else {
+                    std::borrow::Cow::Owned(word.to_lowercase())
+                };
                 *term_frequencies.entry(token).or_default() += 1;
             }
             for (token, term_frequency) in term_frequencies.drain() {
@@ -173,17 +216,22 @@ impl ToolSearchIndex {
                 let weight = term_frequency * (K1 + 1.0)
                     / (term_frequency
                         + K1 * (1.0 - B + B * document_length / average_document_length));
-                postings
-                    .entry(token)
-                    .or_default()
-                    .push((ToolSearchDocumentId(index), weight));
+                let posting = (ToolSearchDocumentId(index), weight);
+                if index == 0 {
+                    // The first document has no existing vocabulary; avoid
+                    // hashing each token twice on tiny/cold inventories.
+                    postings.insert(token.into_owned(), vec![posting]);
+                } else if let Some(entries) = postings.get_mut(token.as_ref()) {
+                    entries.push(posting);
+                } else {
+                    postings.insert(token.into_owned(), vec![posting]);
+                }
             }
         }
 
         Self {
             postings,
-            callable_terms: search_infos.iter().map(|info|
-                tokenizer.tokenize(&info.entry.callable_search_text()).into_iter().collect()).collect(),
+            callable_terms,
             document_count: search_infos.len(),
         }
     }
@@ -202,10 +250,11 @@ impl ToolSearchIndex {
 
         let tokenizer = ToolSearchTokenizer;
         let tokens = tokenizer.tokenize(query);
+        let evidence = self.query_evidence(&tokens, search_infos, source);
         let required = required_query_terms(query);
         let mut scores = HashMap::<ToolSearchDocumentId, f32>::new();
-        for token in tokens {
-            let Some(postings) = self.postings.get(&token) else {
+        for token in &tokens {
+            let Some(postings) = self.postings.get(token) else {
                 continue;
             };
             let document_frequency = postings.len() as f32;
@@ -225,7 +274,7 @@ impl ToolSearchIndex {
         for (id, score) in scores {
             if !matches_source(id.info(search_infos), source) { continue; }
             if !required.iter().all(|term| self.postings.get(term)
-                .is_some_and(|postings| postings.iter().any(|(candidate, _)| *candidate == id)))
+                .is_some_and(|postings| postings.binary_search_by_key(&id, |(candidate, _)| *candidate).is_ok()))
             {
                 continue;
             }
@@ -233,7 +282,7 @@ impl ToolSearchIndex {
             // Eligibility must precede bounded admission: otherwise short weak
             // documents can evict a lower-scoring eligible capability.
             let eligible = exact_matches.contains(&id)
-                || self.relevance(query, id, source.is_some()) >= MIN_TOOL_ACTIVATION_RELEVANCE;
+                || self.relevance(&evidence, id) >= MIN_TOOL_ACTIVATION_RELEVANCE;
             let heap = if eligible { &mut by_source } else { &mut weak_by_source };
             let best = heap.entry(tool_search_info_diversity_key(id.info(search_infos)))
                 .or_default();
@@ -766,6 +815,12 @@ fn tool_search_inventory_fingerprint(search_infos: &[ToolSearchInfo]) -> [u8; 32
     let mut hasher = Sha256::new();
     for search_info in search_infos {
         update_fingerprint_field(&mut hasher, search_info.entry.search_text.as_bytes());
+        if let Some(title) = &search_info.entry.callable_title {
+            hasher.update([1]);
+            update_fingerprint_field(&mut hasher, title.as_bytes());
+        } else {
+            hasher.update([0]);
+        }
         for tool_name in &search_info.entry.tool_names {
             update_fingerprint_field(&mut hasher, tool_name.as_bytes());
         }
@@ -837,7 +892,7 @@ impl ToolSearchHandler {
             }
         };
 
-        let limit = self.effective_limit(&args.query, args.limit)?;
+        let key = self.resolved_query_key(&args.query, args.limit)?;
         let cancelled =
             || FunctionCallError::RespondToModel("tool search was cancelled".to_string());
         if cancellation_token.is_cancelled() {
@@ -845,11 +900,10 @@ impl ToolSearchHandler {
         }
         // Reject invalid requests before scheduling CPU work. The shared index
         // and cache stay off the async worker even when a search is contended.
-        validate_tool_search_query(&args.query, limit)?;
         let handler = self.clone();
         let span = tracing::Span::current();
         let mut search = AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
-            span.in_scope(|| handler.search(&args.query, limit))
+            span.in_scope(|| handler.search_resolved(key))
         }));
         let result = tokio::select! {
             biased;
@@ -983,9 +1037,9 @@ impl ToolSearchHandler {
         Ok(key)
     }
 
-    fn effective_limit(&self, query: &str, requested: Option<usize>) -> Result<usize, FunctionCallError> {
-        let key = self.identity_query_key(query, requested.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT))?;
-        if requested.is_some() { return Ok(key.limit); }
+    fn resolved_query_key(&self, query: &str, requested: Option<usize>) -> Result<ToolSearchQueryKey, FunctionCallError> {
+        let mut key = self.identity_query_key(query, requested.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT))?;
+        if requested.is_some() { return Ok(key); }
         let names = self.exact_name_index.get(&key.query).into_iter().flatten()
             .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
             .flat_map(|id| {
@@ -993,15 +1047,26 @@ impl ToolSearchHandler {
                 loadable_tool_names(id.info(&self.search_infos).entry.output.as_ref()).into_iter()
                     .filter(move |name| selected.is_some_and(|selected| selected.contains(&name.name)))
             }).collect::<HashSet<_>>();
-        Ok(if names.len() == 1 { 1 } else { key.limit })
+        if names.len() == 1 { key.limit = 1; }
+        Ok(key)
     }
 
+    #[cfg(test)]
+    fn effective_limit(&self, query: &str, requested: Option<usize>) -> Result<usize, FunctionCallError> {
+        self.resolved_query_key(query, requested).map(|key| key.limit)
+    }
+
+    #[cfg(test)]
     fn search(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<Arc<ToolSearchResult>, FunctionCallError> {
-        let key = self.identity_query_key(query, limit)?;
+        self.search_resolved(self.resolved_query_key(query, Some(limit))?)
+    }
+
+    fn search_resolved(&self, key: ToolSearchQueryKey) -> Result<Arc<ToolSearchResult>, FunctionCallError> {
+        let limit = key.limit;
         if key.source.is_some() && !self.search_infos.iter().any(|info| matches_source(info, key.source.as_deref())) {
             let scopes = self.search_infos.iter().map(crate::tools::handlers::tool_search_spec::canonical_source)
                 .collect::<std::collections::BTreeSet<_>>();
@@ -1017,10 +1082,15 @@ impl ToolSearchHandler {
             )));
         }
         let query_terms = ToolSearchTokenizer.tokenize(&key.query);
-        let missing_names = query_terms.iter().filter(|term|
-            !self.exact_name_index.contains_key(&key.query)
-                && term.contains('_') && !self.exact_name_index.contains_key(*term))
-            .cloned().collect::<Vec<_>>();
+        let missing_names = if self.exact_name_index.contains_key(&key.query) {
+            Vec::new()
+        } else {
+            key.query.split_whitespace()
+                .filter(|term| !self.exact_name_index.contains_key(*term))
+                .flat_map(|term| ToolSearchTokenizer.tokenize(term))
+                .filter(|term| term.contains('_') && !self.exact_name_index.contains_key(term))
+                .collect::<Vec<_>>()
+        };
         // Bare identities (including explicit multi-name requests) remain strict.
         // Mixed capability queries may contain project/account/file identifiers.
         if !missing_names.is_empty()
@@ -1056,10 +1126,18 @@ impl ToolSearchHandler {
 
         let required = required_query_terms(&key.query);
         let mut seen_exact = HashSet::new();
+        let explicit_names = key.query.split_whitespace().collect::<Vec<_>>();
+        let explicit_multi_name = explicit_names.len() > 1 && explicit_names.iter().all(|term| {
+            let matches = self.exact_name_index.get(*term).into_iter().flatten()
+                .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
+                .collect::<Vec<_>>();
+            matches.len() == 1 && matches[0].name_index(&self.name_indexes)
+                .output_names_for(term).is_some_and(|names| names.len() == 1)
+        });
         let exact_terms = if self.exact_name_index.contains_key(&key.query) {
-            vec![&key.query]
+            vec![key.query.as_str()]
         } else {
-            query_terms.iter().collect()
+            explicit_names.into_iter().chain(query_terms.iter().map(String::as_str)).collect()
         };
         let exact_matches = exact_terms.into_iter()
             .filter_map(|term| self.exact_name_index.get(term))
@@ -1068,11 +1146,11 @@ impl ToolSearchHandler {
             .filter(|id| required.iter().all(|term|
                 self.exact_name_index.get(term).is_some_and(|ids| ids.contains(id))
                 || self.search_index.postings.get(term).is_some_and(|postings|
-                    postings.iter().any(|(candidate, _)| candidate == id))))
+                    postings.binary_search_by_key(id, |(candidate, _)| *candidate).is_ok())))
             .filter(|id| seen_exact.insert(*id)).collect::<Vec<_>>();
         if exact_matches.len() == 1 && limit == 1 {
             let mut result =
-                self.search_output_tools(exact_matches.iter().copied(), Some(&key.query), limit, key.source.is_some())?;
+                self.search_output_tools(exact_matches.iter().copied(), Some(&key.query), limit, key.source.as_deref())?;
             if result.omitted_result_count == 0 && !result.tools.is_empty() {
                 result.unmatched_identifiers = missing_names;
                 let result = Arc::new(result);
@@ -1092,8 +1170,13 @@ impl ToolSearchHandler {
                 candidates.iter().map(|id| id.info(&self.search_infos)),
             )
         });
-        let results =
-            promote_exact_name_matches(&self.search_infos, &exact_matches, &candidates, limit);
+        let results = if explicit_multi_name {
+            // Explicit unambiguous identities consume their requested slots
+            // before source diversity. Broad/ambiguous searches retain fairness.
+            exact_matches.iter().copied().take(limit).collect()
+        } else {
+            promote_exact_name_matches(&self.search_infos, &exact_matches, &candidates, limit)
+        };
         let result_count = results.len();
         let result_source_count = trace_enabled.then(|| {
             tool_search_info_diversity_count(results.iter().map(|id| id.info(&self.search_infos)))
@@ -1106,7 +1189,7 @@ impl ToolSearchHandler {
             .chain(candidates)
             .filter(|id| seen.insert(*id));
         let selection = results.into_iter().chain(remaining).take(candidate_limit).chain(weak_candidates);
-        let mut result = self.search_output_tools(selection, Some(&key.query), limit, key.source.is_some())?;
+        let mut result = self.search_output_tools(selection, Some(&key.query), limit, key.source.as_deref())?;
         result.unmatched_identifiers = missing_names;
         // Derive ambiguity before the caller's result limit can hide alternatives.
         // Only the complete query is an exact-name lookup; a multi-name request
@@ -1162,7 +1245,7 @@ impl ToolSearchHandler {
         results: impl IntoIterator<Item = ToolSearchDocumentId>,
         exact_query: Option<&str>,
         limit: usize,
-        source_scoped: bool,
+        source: Option<&str>,
     ) -> Result<ToolSearchResult, FunctionCallError> {
         let mut retained = ToolSearchResultBuilder::new();
         let mut activation_tools = Vec::new();
@@ -1171,12 +1254,14 @@ impl ToolSearchHandler {
         let mut unactivated_bytes = 0;
         let mut omitted_result_count = 0usize;
         let mut selected = HashSet::new();
+        let query_tokens = exact_query.map(|query| ToolSearchTokenizer.tokenize(query)).unwrap_or_default();
+        let evidence = self.search_index.query_evidence(&query_tokens, &self.search_infos, source);
         for result_id in results {
             let result = &result_id.info(&self.search_infos).entry;
             let relevant = exact_query.is_none_or(|query| {
-                std::iter::once(query).chain(ToolSearchTokenizer.tokenize(query).iter().map(String::as_str)).any(|term|
+                std::iter::once(query).chain(query.split_whitespace()).chain(query_tokens.iter().map(String::as_str)).any(|term|
                     self.exact_name_index.get(term).is_some_and(|ids| ids.contains(&result_id)))
-                    || self.search_index.relevance(query, result_id, source_scoped) >= MIN_TOOL_ACTIVATION_RELEVANCE
+                    || self.search_index.relevance(&evidence, result_id) >= MIN_TOOL_ACTIVATION_RELEVANCE
             });
             if !relevant {
                 for name in loadable_tool_names(result.output.as_ref()) {
@@ -1197,8 +1282,7 @@ impl ToolSearchHandler {
                 if let Some(names) = result_id.name_index(&self.name_indexes).output_names_for(query) {
                     return Some(names.clone());
                 }
-                let tokens = ToolSearchTokenizer.tokenize(query);
-                let names = std::iter::once(query).chain(tokens.iter().map(String::as_str)).filter_map(|term|
+                let names = std::iter::once(query).chain(query.split_whitespace()).chain(query_tokens.iter().map(String::as_str)).filter_map(|term|
                     result_id.name_index(&self.name_indexes).output_names_for(term))
                     .flatten().cloned().collect::<HashSet<_>>();
                 (!names.is_empty()).then_some(names)
@@ -1221,16 +1305,14 @@ impl ToolSearchHandler {
                                 &namespace.name, &namespace.description, tool);
                             info
                         }).collect::<Vec<_>>();
-                        let mut index = ToolSearchIndex::new(&members);
                         // Each ranking document represents one callable, not
                         // the namespace Arc shared by these lightweight entries.
-                        index.callable_terms = namespace.tools.iter().map(|member| {
+                        let index = ToolSearchIndex::new_with_callable_texts(&members, namespace.tools.iter().map(|member| {
                             let ResponsesApiNamespaceTool::Function(tool) = member;
-                            ToolSearchTokenizer.tokenize(&codex_tools::namespace_member_search_text("", "", tool))
-                                .into_iter().collect()
-                        }).collect();
+                            codex_tools::ToolSearchEntry::callable_function_search_text(tool)
+                        }));
                         index.top_matches(query, members.len(), &members,
-                            source_scoped.then_some(namespace.name.as_str()), &[]).0
+                            source.map(|_| namespace.name.as_str()), &[]).0
                             .into_iter().map(|id| id.0).collect::<Vec<_>>()
                     } else {
                         (0..namespace.tools.len()).collect()
@@ -2568,6 +2650,145 @@ text('one-cell-complete');
     }
 
     #[test]
+    fn affordance_scoped_evidence_ignores_other_sources() {
+        let target = search_info("search invoices", None, "finance", "lookup");
+        let before = ToolSearchHandler::new(vec![target.clone()]);
+        let after = ToolSearchHandler::new(vec![target,
+            search_info("acme orion quarter", None, "other", "noise")]);
+        let query = "search invoices acme orion quarter source:mcp__finance";
+        assert_eq!(before.search(query, 1).unwrap().activation_tools,
+            after.search(query, 1).unwrap().activation_tools);
+        assert_eq!(after.search(query, 1).unwrap().activation_tools.len(), 1);
+        assert!(after.search("search invoices +acme source:mcp__finance", 1).unwrap().activation_tools.is_empty());
+    }
+
+    #[test]
+    fn affordance_explicit_names_keep_slots_before_source_diversity() {
+        let handler = ToolSearchHandler::new(vec![
+            search_info("Fetch records", Some("A"), "a", "fetch_a"),
+            search_info("Fetch records", Some("A"), "a", "fetch_b"),
+            search_info("Legacy replaces fetch_a fetch_b", Some("B"), "b", "legacy"),
+        ]);
+        for query in ["fetch_a fetch_b", "mcp__a.fetch_a mcp__a.fetch_b"] {
+            let result = handler.search(query, 2).unwrap();
+            assert_eq!(result.activation_tools, vec![
+                ToolName::namespaced("mcp__a", "fetch_a"),
+                ToolName::namespaced("mcp__a", "fetch_b"),
+            ], "{query}");
+        }
+    }
+
+    #[test]
+    fn affordance_prohibitions_are_retrieval_only_not_activation_evidence() {
+        let handler = ToolSearchHandler::new(vec![search_info(
+            "Preview drafts; cannot send email. Read labels.", None, "mail", "preview")]);
+        let result = handler.search("send email", 1).unwrap();
+        assert!(result.activation_tools.is_empty());
+        assert_eq!(result.unactivated_matches.len(), 1);
+        for query in ["preview drafts", "read labels", "preview"] {
+            assert_eq!(handler.search(query, 1).unwrap().activation_tools.len(), 1, "{query}");
+        }
+        let spec = ToolSpec::Namespace(ResponsesApiNamespace {
+            name: "mail".into(), description: "Mail operations".into(),
+            tools: [("preview", "Preview drafts; cannot send email."),
+                ("deliver", "Send email.")].into_iter().map(|(name, description)|
+                ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                    name: name.into(), description: description.into(), strict: false,
+                    defer_loading: None, parameters: codex_tools::JsonSchema::default(), output_schema: None,
+                })).collect(),
+        });
+        let handler = ToolSearchHandler::new(vec![ToolSearchInfo::from_tool_spec(&spec, None).unwrap()]);
+        assert_eq!(handler.search("send email", 2).unwrap().activation_tools,
+            vec![ToolName::namespaced("mail", "deliver")]);
+    }
+
+    #[test]
+    fn affordance_source_verbosity_does_not_demote_unchanged_callable() {
+        let target = search_info("search invoice amount", None, "a", "lookup");
+        let mut infos = vec![target, search_info("search invoice", None, "b", "lookup")];
+        infos.extend((0..30).map(|i| search_info("unrelated metadata", None, "c", &format!("noise{i}"))));
+        let before = ToolSearchHandler::new(infos.clone()).search("search invoice amount", 1).unwrap();
+        infos[0].entry.search_text.push_str(&" connector".repeat(1000));
+        let after = ToolSearchHandler::new(infos).search("search invoice amount", 1).unwrap();
+        assert_eq!(before.activation_tools, vec![ToolName::namespaced("mcp__a", "lookup")]);
+        assert_eq!(after.activation_tools, before.activation_tools);
+    }
+
+    #[test]
+    fn affordance_mcp_title_survives_activation_and_cache_identity() {
+        let mut info = tool_info("payroll", "op42", "");
+        info.tool.description = None;
+        info.tool = info.tool.with_title("Export payroll");
+        let info = executor_search_info(McpHandler::new(info).unwrap());
+        let handler = ToolSearchHandler::new(vec![info.clone()]);
+        assert_eq!(handler.search("export payroll", 1).unwrap().activation_tools.len(), 1);
+        let mut changed = info.clone();
+        changed.entry.callable_title = None;
+        assert_ne!(tool_search_inventory_fingerprint(&[info]), tool_search_inventory_fingerprint(&[changed]));
+    }
+
+    #[test]
+    fn affordance_parameter_words_and_output_only_locators() {
+        let spec = ToolSpec::Function(ResponsesApiTool {
+            name: "lookup".into(), description: "Read records".into(), strict: false, defer_loading: None,
+            parameters: codex_tools::parse_tool_input_schema(&serde_json::json!({
+                "type":"object", "properties":{"includeArchived":{"type":"boolean"}}
+            })).unwrap(),
+            output_schema: Some(serde_json::json!({"type":"object", "properties":{
+                "continuationToken":{"type":"string"}
+            }}).into()),
+        });
+        let info = ToolSearchInfo::from_tool_spec(&spec, None).unwrap();
+        let handler = ToolSearchHandler::new(vec![info]);
+        assert_eq!(handler.search("archived records", 1).unwrap().activation_tools.len(), 1);
+        let result = handler.search("continuation token", 1).unwrap();
+        assert!(result.activation_tools.is_empty());
+        assert_eq!(result.unactivated_matches, vec!["lookup"]);
+    }
+
+    #[test]
+    fn affordance_resolved_query_reuses_the_result_cache() {
+        let handler = ToolSearchHandler::new(vec![search_info("search records", None, "a", "lookup")]);
+        let key = handler.resolved_query_key("search records", None).unwrap();
+        let first = handler.search_resolved(key.clone()).unwrap();
+        let second = handler.search_resolved(key).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(handler.resolved_query_key("lookup", None).unwrap().limit, 1);
+        assert_eq!(handler.resolved_query_key("lookup", Some(8)).unwrap().limit, 8);
+    }
+
+    #[test]
+    fn affordance_required_postings_remain_sorted_and_exact() {
+        let infos = (0..400).map(|i| search_info(
+            if i % 2 == 0 { "search records common" } else { "search calendar" },
+            None, "a", &format!("op{i}")
+        )).collect::<Vec<_>>();
+        let index = ToolSearchIndex::new(&infos);
+        for postings in index.postings.values() {
+            assert!(postings.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            for id in (0..infos.len()).map(ToolSearchDocumentId) {
+                assert_eq!(postings.binary_search_by_key(&id, |(candidate, _)| *candidate).is_ok(),
+                    postings.iter().any(|(candidate, _)| *candidate == id));
+            }
+        }
+        assert!(index.top_matches("+missing search records", 8, &infos, None, &[]).0.is_empty());
+        let (selected, _) = index.top_matches("+common search records", 8, &infos, None, &[]);
+        assert_eq!(selected.len(), 8);
+        assert!(selected.iter().all(|id| id.0 % 2 == 0));
+    }
+
+    #[test]
+    fn affordance_borrowed_postings_preserve_unicode_tokenization() {
+        let text = "ASCII lowercase lower_case 42 İSTANBUL Straße Événement 中文 東京";
+        let infos = vec![search_info(text, None, "a", "lookup")];
+        let index = ToolSearchIndex::new(&infos);
+        let expected = ToolSearchTokenizer.tokenize(&infos[0].entry.search_text)
+            .into_iter().collect::<HashSet<_>>();
+        assert_eq!(index.postings.keys().cloned().collect::<HashSet<_>>(), expected);
+        assert!(index.postings.values().all(|postings| postings.len() == 1));
+    }
+
+    #[test]
     fn verified10_parameter_matches_survive_namespace_selection() {
         for count in [1, 2] {
             let spec = ToolSpec::Namespace(ResponsesApiNamespace {
@@ -3485,7 +3706,7 @@ text('one-cell-complete');
         let results = [ToolSearchDocumentId(0), ToolSearchDocumentId(1)];
 
         let tools = handler
-            .search_output_tools(results, None, TOOL_SEARCH_DEFAULT_LIMIT, false)
+            .search_output_tools(results, None, TOOL_SEARCH_DEFAULT_LIMIT, None)
             .expect("search results should serialize within the budget");
 
         assert_eq!(tools.tools.len(), 2);
@@ -3565,7 +3786,7 @@ text('one-cell-complete');
         ];
 
         let tools = handler
-            .search_output_tools(results, None, TOOL_SEARCH_DEFAULT_LIMIT, false)
+            .search_output_tools(results, None, TOOL_SEARCH_DEFAULT_LIMIT, None)
             .expect("mixed search output should serialize");
 
         assert_eq!(
@@ -3873,6 +4094,7 @@ text('one-cell-complete');
         ToolSearchInfo {
             entry: ToolSearchEntry {
                 search_text: search_text.to_string(),
+                callable_title: None,
                 tool_names: vec![tool_name.to_string()],
                 output: Arc::new(LoadableToolSpec::Namespace(ResponsesApiNamespace {
                     name: format!("mcp__{namespace_name}"),

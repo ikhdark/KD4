@@ -67,8 +67,10 @@ impl ModelContextBudget {
             return Some(std::borrow::Cow::Borrowed(text));
         }
 
-        let admitted = if budget <= TRUNCATION_MARKER.len() {
-            text[..text.floor_char_boundary(budget)].to_string()
+        let admitted = if budget < TRUNCATION_MARKER.len() {
+            // An unmarked prefix can reverse a qualified instruction. Leave
+            // the budget available for a later whole fragment instead.
+            return None;
         } else {
             let text_budget = budget - TRUNCATION_MARKER.len();
             let prefix = &text[..text.floor_char_boundary(text_budget.div_ceil(2))];
@@ -108,6 +110,30 @@ impl ModelContextBudget {
         let rendered = format!("{start_marker}{body}{end_marker}");
         self.remaining_bytes -= rendered.len();
         Some(rendered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn salience_tiny_budget_never_emits_an_unmarked_instruction() {
+        let text = "Deploy production immediately only after explicit approval.";
+        for cap in 0..=TRUNCATION_MARKER.len() + 4 {
+            let mut budget = ModelContextBudget::new(100);
+            let before = budget.remaining_bytes();
+            match budget.take_up_to(text, cap) {
+                Some(admitted) => {
+                    assert!(admitted.contains(TRUNCATION_MARKER));
+                    assert!(admitted.len() <= cap);
+                    assert_eq!(budget.remaining_bytes(), before - admitted.len());
+                }
+                None => assert_eq!(budget.remaining_bytes(), before),
+            }
+        }
+        let mut budget = ModelContextBudget::new(1);
+        assert_eq!(budget.take("é").as_deref(), Some("é"));
     }
 }
 

@@ -24,32 +24,33 @@ fn budget_and_rendered_fragment_borrow_unchanged_text() {
 
 #[test]
 fn model_context_budget_enforces_aggregate_limit() {
-    let mut budget = ModelContextBudget::new(4);
+    let mut budget = ModelContextBudget::new(12);
     assert_eq!(budget.take("12345678"), Some("12345678".into()));
-    let truncated = budget.take("abcdefghijklmnop").expect("final item");
-    assert_eq!(truncated, "abcdefgh");
+    let text = "abcdefghijklmnopqrstuvwxyz".repeat(4);
+    let truncated = budget.take(&text).expect("final item");
+    assert_eq!(truncated, "abcdef\n[... context truncated ...]\nvwxyz");
     assert_eq!(budget.remaining_bytes(), 0);
     assert_eq!(budget.take("later"), None);
 }
 
 #[test]
 fn model_context_budget_truncates_at_utf8_boundary() {
-    let mut budget = ModelContextBudget::new(1);
-
-    assert_eq!(budget.take("a😀"), Some("a".into()));
-    assert_eq!(budget.remaining_bytes(), 3);
+    let mut budget = ModelContextBudget::new(9);
+    let text = format!("a{}z", "😀".repeat(20));
+    assert_eq!(budget.take(&text), Some("a\n[... context truncated ...]\nz".into()));
+    assert_eq!(budget.remaining_bytes(), 5);
 }
 
 #[test]
 fn item_cap_preserves_aggregate_budget_for_later_fragments() {
-    let mut budget = ModelContextBudget::new(10);
+    let mut budget = ModelContextBudget::new(20);
     assert_eq!(
-        budget.take_up_to(&"x".repeat(100), 12),
-        Some("x".repeat(12).into())
+        budget.take_up_to(&"x".repeat(100), 40),
+        Some("xxxxxx\n[... context truncated ...]\nxxxxx".into())
     );
-    assert_eq!(budget.remaining_bytes(), 28);
+    assert_eq!(budget.remaining_bytes(), 40);
     assert_eq!(budget.take("later"), Some("later".into()));
-    assert_eq!(budget.remaining_bytes(), 23);
+    assert_eq!(budget.remaining_bytes(), 35);
 }
 
 #[test]
@@ -436,16 +437,19 @@ fn fragment_budget_truncates_body_inside_markers() {
     let cut = budget_with_remaining(30).take(&rendered).expect("prefix");
     assert!(!TestFragment::matches_text(&cut));
 
-    for (remaining, expected) in [
-        (rendered.len(), rendered.as_str()),
-        (54, "<test_context>abcdefghijklmnopqrstuvwxy</test_context>"),
-        (30, "<test_context>a</test_context>"),
-    ] {
+    for (remaining, expected) in [(rendered.len(), rendered.as_str())] {
         let mut budget = budget_with_remaining(remaining);
         let admitted = budget.take_fragment(&fragment).expect("fragment admitted");
         assert_eq!(admitted, expected);
         assert!(TestFragment::matches_text(&admitted));
         assert_eq!(budget.remaining_bytes(), remaining - admitted.len());
+    }
+    // A tiny body budget cannot disclose truncation safely; do not emit an
+    // unmarked prefix or charge the budget for an omitted fragment.
+    for remaining in [54, 30] {
+        let mut budget = budget_with_remaining(remaining);
+        assert_eq!(budget.take_fragment(&fragment), None);
+        assert_eq!(budget.remaining_bytes(), remaining);
     }
 
     let long = TestFragment {

@@ -1253,7 +1253,7 @@ async fn shell_family_registers_visible_unified_exec_and_hidden_legacy_shell() {
 #[tokio::test]
 async fn shell_family_advertises_configured_background_wait_limit() {
     for (configured, expected_max, expected_default) in
-        [(300_000, 300_000, 300_000), (10_000, 30_000, 10_000)]
+        [(300_000, 300_000, 300_000), (10_000, 300_000, 10_000)]
     {
         let plan = probe(|turn| {
             set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);

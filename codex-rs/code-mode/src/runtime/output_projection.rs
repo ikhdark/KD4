@@ -22,9 +22,9 @@ const PROJECTOR: &str = r#"((isProxy) => {
   const get = projections.get.bind(projections);
   const set = projections.set.bind(projections);
   // Display-only: retain native errors in scripts, but never print opaque {}.
-  function errorProjection(error, remaining = 16384, controlsFirst = false) {
+  function errorProjection(error, remaining = 16384, controlsFirst = true) {
     const seen = new Set();
-    function bounded(value, depth = 0) {
+    function bounded(value, depth = 0, settledNodes = false) {
       if (remaining <= 0 || depth >= 8) return "[error details truncated]";
       if (typeof value === 'string') {
         const count = Math.min(4096, remaining);
@@ -47,10 +47,12 @@ const PROJECTOR: &str = r#"((isProxy) => {
       if (controlsFirst) {
         const controls = ['status', 'artifact_id', 'session_id', 'recovery', 'continuation',
           'complete', 'execution_state', 'exit_code', 'process_exited', 'session_capabilities',
-          'name', 'message', 'reason', 'step_id', 'terminal', 'value', 'initial', 'observations'];
+          'name', 'message', 'reason', 'step_id', 'terminal', 'value', 'initial', 'observations',
+          'blocked_by', 'missing_capabilities', 'omitted_capabilities'];
         names.sort((a, b) => Number(!controls.includes(a)) - Number(!controls.includes(b)));
       }
-      for (const key of names.slice(0, 64)) {
+      const selectedNames = names.slice(0, 64);
+      for (const [index, key] of selectedNames.entries()) {
         if (remaining <= 0) { result.details_omitted = true; break; }
         if (key.length > 512 || key.length + 8 > remaining) { result.details_omitted = true; continue; }
         remaining -= key.length + 8;
@@ -60,7 +62,17 @@ const PROJECTOR: &str = r#"((isProxy) => {
           if (!field && value instanceof NativeError && key === 'name') {
             field = descriptor(prototype(value), key);
           }
-          if (field) fields[key] = 'value' in field ? bounded(field.value, depth + 1) : '[accessor omitted]';
+          if (field) {
+            // A caught graph Error goes through toJSON before the replacer.
+            // Partition its existing budget instead of letting an early body
+            // hide later settled statuses and live handles.
+            const available = remaining;
+            if (settledNodes) remaining = Math.floor(remaining / (selectedNames.length - index));
+            const allowance = remaining;
+            fields[key] = 'value' in field ? bounded(field.value, depth + 1,
+              value instanceof NativeError && key === 'results') : '[accessor omitted]';
+            if (settledNodes) remaining = available - (allowance - remaining);
+          }
         } catch { fields[key] = '[error evidence unavailable]'; }
       }
       if (names.length > 64) result.details_omitted = true;
@@ -110,11 +122,21 @@ const PROJECTOR: &str = r#"((isProxy) => {
     const entry = get(value);
     return !entry?.root || inert(entry.root, seen, depth + 1);
   }
-  const escapes = (text) => stringify(text).length !== text.length + 2;
-  const lineCount = (text) => text.split('\n').length;
+  // The captured native serializer exactly detects escaping of primitive strings.
+  // Regex lookarounds were slower in the narrow ASCII probe. This also avoids
+  // script-overridable RegExp methods without changing Unicode semantics.
+  const escapes = text => stringify(text).length !== text.length + 2;
+  const stringIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
+  const stringSlice = Function.prototype.call.bind(String.prototype.slice);
+  const stringCodePointAt = Function.prototype.call.bind(String.prototype.codePointAt);
+  const lineCount = text => {
+    let count = 1, offset = -1;
+    while ((offset = stringIndexOf(text, '\n', offset + 1)) !== -1) ++count;
+    return count;
+  };
   // Shared hydration is scoped to its parent response. A selected row may not
   // contain the earlier body, so resolve it from the retained immutable parent.
-  function standaloneFragment(fragment, source) {
+  function standaloneFragment(fragment, source, cache) {
     const bodies = value => {
       if (Array.isArray(value)) return value.flatMap(bodies);
       if (!value || typeof value !== 'object') return [];
@@ -122,7 +144,12 @@ const PROJECTOR: &str = r#"((isProxy) => {
       return bodies(value.results || value.value?.hydrated_ranges || []);
     };
     const local = bodies(fragment);
-    const retained = bodies(source);
+    let cached = cache?.get(source);
+    if (cache && !cached) {
+      cached = {bodies: bodies(source), ranges: new Map(), positions: new Map()};
+      cache.set(source, cached);
+    }
+    const retained = cached?.bodies || bodies(source);
     const covers = (body, range) => body.canonical_range.start <= range.start && body.canonical_range.end >= range.end;
     const resolve = item => {
       if (Array.isArray(item)) return item.map(resolve);
@@ -130,19 +157,48 @@ const PROJECTOR: &str = r#"((isProxy) => {
       if (item.shared === true && item.canonical_range) {
         const range = item.canonical_range;
         if (local.some(body => covers(body, range))) return item;
+        const key = range.start + ':' + range.end;
+        if (cached?.ranges.has(key)) {
+          const {shared, ...rest} = item;
+          return {...rest, text: cached.ranges.get(key)};
+        }
         const body = retained.find(body => covers(body, range));
         if (body && typeof body.text === 'string') {
-          let offset = body.canonical_range.start, text = '';
-          for (const ch of body.text) {
-            const cp = ch.codePointAt(0);
-            const end = offset + (cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4);
-            if (offset >= range.start && end <= range.end) text += ch;
-            if ((offset < range.start && end > range.start) || (offset < range.end && end > range.end)) break;
-            offset = end;
-            if (offset === range.end) {
+          // Sparse UTF-8 checkpoints belong only to this immutable parent and
+          // serialization. Distinct tail ranges must not rescan its full prefix.
+          let index = cached?.positions.get(body);
+          if (!index) {
+            index = {points: [[0, body.canonical_range.start]], chars: 0,
+              bytes: body.canonical_range.start};
+            cached?.positions.set(body, index);
+          }
+          const width = cp => cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+          while (index.bytes < range.end && index.chars < body.text.length) {
+            const cp = stringCodePointAt(body.text, index.chars);
+            index.bytes += width(cp);
+            index.chars += cp > 0xffff ? 2 : 1;
+            if (index.chars - index.points[index.points.length - 1][0] >= 1024)
+              index.points.push([index.chars, index.bytes]);
+          }
+          let low = 0, high = index.points.length;
+          while (low + 1 < high) {
+            const mid = (low + high) >>> 1;
+            if (index.points[mid][1] <= range.start) low = mid;
+            else high = mid;
+          }
+          let [chars, offset] = index.points[low], start;
+          while (offset <= range.end && chars <= body.text.length) {
+            if (offset === range.start) start = chars;
+            if (offset === range.end && start !== undefined) {
+              const text = stringSlice(body.text, start, chars);
+              cached?.ranges.set(key, text);
               const {shared, ...rest} = item;
               return {...rest, text};
             }
+            if (chars === body.text.length || (offset > range.start && start === undefined)) break;
+            const cp = stringCodePointAt(body.text, chars);
+            offset += width(cp);
+            chars += cp > 0xffff ? 2 : 1;
           }
         }
         return {...item, recovery: {artifact_id: source.artifact_id,
@@ -169,11 +225,12 @@ const PROJECTOR: &str = r#"((isProxy) => {
     if (typeof projected.output === 'string' && !('results' in projected)) {
       const {output, ...envelope} = projected;
       if (!escapes(output)) return undefined;
-      envelope.output_lines = lineCount(output);
+      const text_lines = lineCount(output);
+      envelope.output_lines = text_lines;
       return {envelope, texts: [{text: output, source: {
         path: source.path, artifact_id: source.artifact_id,
         session_id: source.session_id, chunk_id: source.chunk_id, field: 'output',
-        text_lines: lineCount(output),
+        text_lines,
       }}]};
     }
     if (Array.isArray(projected.results) && !('output' in projected)) {
@@ -183,10 +240,13 @@ const PROJECTOR: &str = r#"((isProxy) => {
           return item;
         }
         const {text, ...rest} = item;
+        const text_lines = lineCount(text);
         texts.push({text, source: {path: source.path, artifact_id: source.artifact_id,
+          ...(source !== projected ? {source_sha256: source.source_sha256 || source.canonical_sha256,
+            environment_id: source.environment_id, canonical_uri: source.canonical_uri} : {}),
           selector: item.selector, canonical_range: item.canonical_range,
-          complete: item.complete, text_lines: lineCount(text)}});
-        return {...rest, text_lines: lineCount(text)};
+          complete: item.complete, text_lines}});
+        return {...rest, text_lines};
       };
       const results = projected.results.map((result) => {
         const framed = frame(result);
@@ -199,6 +259,24 @@ const PROJECTOR: &str = r#"((isProxy) => {
       });
       if (!texts.some(body => escapes(body.text))) return undefined;
       return {envelope: {...projected, results}, texts};
+    }
+    if (Array.isArray(projected.content)) {
+      const texts = [];
+      const content = projected.content.map((item, index) => {
+        if (item?.type !== 'text' || typeof item.text !== 'string' || 'text_lines' in item) return item;
+        const {text, ...rest} = item;
+        const text_lines = lineCount(text);
+        texts.push({text, source: {field: `content[${index}].text`, text_lines}});
+        return {...rest, text_lines};
+      });
+      if (!texts.some(body => escapes(body.text))) return undefined;
+      const envelope = {...projected, content};
+      // Short MCP messages should not grow just to acquire a frame. Budget
+      // conservatively for body indices when this result is nested in a batch.
+      const framedLength = stringify(envelope).length + texts.reduce((size, body) =>
+        size + stringify({body: Number.MAX_SAFE_INTEGER, ...body.source}).length + 11 + body.text.length, 0);
+      if (framedLength >= stringify(projected).length) return undefined;
+      return {envelope, texts};
     }
     return undefined;
   }
@@ -229,7 +307,8 @@ const PROJECTOR: &str = r#"((isProxy) => {
           records.push({path, edits: delta(item, display), fragment: entry.fragment,
             sourceFragments: entry.sourceFragments,
             source: source && {path: source.path, artifact_id: source.artifact_id,
-              source_sha256: source.source_sha256, canonical_sha256: source.canonical_sha256}});
+              source_sha256: source.source_sha256, canonical_sha256: source.canonical_sha256,
+              environment_id: source.environment_id, canonical_uri: source.canonical_uri}});
           return;
         }
         for (const key of keys(item)) {
@@ -308,8 +387,41 @@ const PROJECTOR: &str = r#"((isProxy) => {
       }
       return;
     }
+    // A small unchanged command has no source body to frame or share.
+    const direct = value !== null && typeof value === 'object' ? get(value) : undefined;
+    if (direct && !direct.root && typeof direct.projected?.output === 'string' &&
+        !escapes(direct.projected.output) && inert(value, new Set()) && same(value, direct.original)) {
+      return stringify(direct.projected, (_key, item) =>
+        typeof item === 'bigint' ? {$bigint:item.toString()} : item);
+    }
     const texts = [];
+    // Both caches die with this serialization. No cross-call provenance,
+    // freshness, or mutation decisions are cached.
+    let fragmentCache, framedBodies;
+    const append = (raw, owner) => {
+      if (raw.texts.every(body => body.text.length < 512)) {
+        texts.push(...raw.texts);
+        return;
+      }
+      framedBodies ??= new Map();
+      let previous = framedBodies.get(owner);
+      if (!previous) framedBodies.set(owner, previous = []);
+      raw.texts.forEach((body, index) => {
+        const first = previous[index];
+        // Only repeated presentations of the same registered object qualify.
+        // Keep small bodies inline, and retain each observation's source label.
+        if (first !== undefined && body.text.length >= 512 && texts[first].text === body.text) {
+          texts.push({...body, same_as_body: first + 1});
+        } else {
+          previous[index] = texts.length;
+          texts.push(body);
+        }
+      });
+    };
     const roots = inert(value, new Set()) ? new Map() : undefined;
+    // No getters, proxies or user serializers can run in an inert batch.
+    // Repeated registered objects therefore share framing within this call only.
+    const frames = roots ? new Map() : undefined;
     const unchangedRoot = entry => {
       if (!entry.root) return true;
       if (!roots) return same(entry.root, entry.rootOriginal);
@@ -321,6 +433,12 @@ const PROJECTOR: &str = r#"((isProxy) => {
       if (item instanceof NativeError) return errorProjection(item);
       const entry = item !== null && typeof item === 'object' ? get(item) : undefined;
       if (!entry) return item;
+      if (frames?.has(item)) {
+        const {raw, display} = frames.get(item);
+        if (raw === undefined) return display;
+        append(raw, entry.original);
+        return raw.envelope;
+      }
       if (!same(item, entry.original)) {
         // Helpers annotate wrappers. For caller-added command metadata, keep
         // the command projection only if every original field is unchanged.
@@ -341,18 +459,21 @@ const PROJECTOR: &str = r#"((isProxy) => {
         }
         const raw = rawText(annotated);
         if (!raw) return annotated;
-        texts.push(...raw.texts);
+        append(raw, entry.original);
         return raw.envelope;
       }
       if (!unchangedRoot(entry)) return item;
-      const display = entry.fragment ? standaloneFragment(entry.projected, entry.rootOriginal) : entry.projected;
+      const display = entry.fragment ? standaloneFragment(entry.projected, entry.rootOriginal,
+        fragmentCache ??= new Map()) : entry.projected;
       const raw = rawText(display, entry.fragment, entry.rootOriginal || entry.projected);
+      frames?.set(item, {raw, display});
       if (raw === undefined) return display;
-      texts.push(...raw.texts);
+      append(raw, entry.original);
       return raw.envelope;
     });
     return texts.length ? rendered + '\n' + texts.map((body, index) =>
-      '[source ' + stringify({body: index + 1, ...body.source}) + ']\n' + body.text).join('\n') : rendered;
+      '[source ' + stringify({body: index + 1, ...body.source, same_as_body: body.same_as_body}) + ']\n' +
+        (body.same_as_body === undefined ? body.text : '')).join('\n') : rendered;
   };
 })"#;
 
@@ -473,6 +594,132 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn critical_path_escape_and_line_count_preserve_native_results() {
+        for output in [
+            "unescaped λ😀",
+            "quoted \"body\" and \\ slash",
+            "λ\r\n😀\n",
+            "tab\tcontrol\u{0001}",
+            "\u{2028}\u{2029}",
+        ] {
+            let raw = json!({"output":output,"exit_code":0,"process_exited":true});
+            let (events, mut rx) = mpsc::unbounded_channel();
+            let request = ExecuteRequest {
+                state_path: None,
+                tool_call_id: "critical-path-escapes".into(),
+                enabled_tools: vec![ToolDefinition {
+                    name: "exec_command".into(),
+                    tool_name: ToolName::plain("exec_command"),
+                    kind: CodeModeToolKind::Function,
+                    description: "".into(),
+                    input_schema: None,
+                    output_schema: None,
+                    default_timeout_ms: None,
+                }].into(),
+                source: r#"
+                    const r = await tools.exec_command({});
+                    String.prototype.indexOf = () => { throw Error('reentrant indexOf'); };
+                    RegExp.prototype.test = () => { throw Error('reentrant regex'); };
+                    RegExp.prototype.exec = () => { throw Error('reentrant regex exec'); };
+                    text(r); text([r,r]); store('raw',r);
+                "#.into(),
+                yield_time_ms: None,
+                max_output_tokens: None,
+                default_tool_timeout_ms: None,
+            };
+            let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000,
+                events, Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+            let mut printed = Vec::new();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap() {
+                    RuntimeEvent::Started => {}
+                    RuntimeEvent::ToolCall {id, ..} => tx.send(RuntimeCommand::ToolResponse {
+                        id, result:raw.clone(),
+                    }).unwrap(),
+                    RuntimeEvent::ContentItem {item:FunctionCallOutputContentItem::InputText {text}, ..} =>
+                        printed.push(text),
+                    RuntimeEvent::Result {error_text, output_loss, stored_value_writes} => {
+                        assert_eq!(error_text, None);
+                        assert_eq!(output_loss, None);
+                        assert_eq!(*stored_value_writes["raw"].value, raw);
+                        break;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert_eq!(printed.len(), 2);
+            if printed[0].contains("[source ") {
+                assert!(printed[0].ends_with(output));
+                assert!(printed[1].ends_with(output));
+                let envelope: Value = serde_json::from_str(printed[0].split_once('\n').unwrap().0).unwrap();
+                assert_eq!(envelope["output_lines"], output.split('\n').count());
+            } else {
+                assert_eq!(serde_json::from_str::<Value>(&printed[0]).unwrap()["output"], output);
+                assert_eq!(serde_json::from_str::<Value>(&printed[1]).unwrap()[1]["output"], output);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_path_shared_ranges_keep_unicode_boundaries_and_mutation_guards() {
+        let body = "xλ😀\n".repeat(20_000);
+        let size = body.len();
+        let mut rows = vec![json!({"status":"ok","complete":true,"text":body,
+            "canonical_range":{"start":0,"end":size}})];
+        // Reverse order forces both extension and backwards checkpoint lookup.
+        for index in (1..=80).rev() {
+            rows.push(json!({"status":"ok","complete":true,"shared":true,
+                "canonical_range":{"start":size-index*8,"end":size-(index-1)*8}}));
+        }
+        rows.push(json!({"status":"ok","complete":true,"shared":true,
+            "canonical_range":{"start":size-6,"end":size}}));
+        let raw = json!({"artifact_id":"snapshot","source_sha256":"hash","results":rows});
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let request = ExecuteRequest {
+            state_path:None, tool_call_id:"critical-path-projection".into(),
+            enabled_tools:vec![ToolDefinition {
+                name:"read_file".into(), tool_name:ToolName::plain("read_file"),
+                kind:CodeModeToolKind::Function, description:"".into(),
+                input_schema:None, output_schema:None, default_timeout_ms:None,
+            }].into(),
+            source:r#"
+                const r = await tools.read_file({});
+                text(r.results.slice(1,81).reverse());
+                text(r.results[81]);
+                text([r.results[1],r.results[1]]);
+                r.results[0].text = 'mutated';
+                text(r.results[1]);
+            "#.into(),
+            yield_time_ms:None, max_output_tokens:None, default_tool_timeout_ms:None,
+        };
+        let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000, events,
+            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+        let mut printed = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+                RuntimeEvent::Started => {},
+                RuntimeEvent::ToolCall {id, ..} => tx.send(RuntimeCommand::ToolResponse {id, result:raw.clone()}).unwrap(),
+                RuntimeEvent::ContentItem {item:FunctionCallOutputContentItem::InputText {text}, ..} => printed.push(text),
+                RuntimeEvent::Result {error_text, output_loss, ..} => {
+                    assert_eq!(error_text, None); assert_eq!(output_loss, None); break;
+                },
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(printed.len(), 4);
+        assert_eq!(printed[0].matches("xλ😀\n").count(), 80);
+        assert!(!printed[0].contains("\"shared\":true"));
+        let invalid: Value = serde_json::from_str(&printed[1]).unwrap();
+        assert_eq!(invalid["shared"], true);
+        assert_eq!(invalid["recovery"]["selectors"][0]["start"], size-6);
+        assert_eq!(printed[2].matches("xλ😀\n").count(), 2);
+        let changed: Value = serde_json::from_str(&printed[3]).unwrap();
+        assert_eq!(changed["shared"], true);
+        assert!(changed.get("text").is_none());
+        assert!(changed.get("recovery").is_none(), "mutation cannot inherit snapshot provenance");
+    }
+
+    #[tokio::test]
     async fn stored_presentation_avoids_an_overflow_recovery_round_trip() {
         async fn cell(source: &str, stored: HashMap<String, StoredValue>, raw: &Value, limit: usize)
             -> (Vec<String>, HashMap<String, StoredValue>, bool)
@@ -505,6 +752,7 @@ mod tests {
             }
         }
         let raw = json!({"path":"source.rs", "source_sha256":"sha", "canonical_sha256":"sha",
+            "environment_id":"fixture-env", "canonical_uri":"file:///source.rs",
             "complete":true, "delivered_selection_complete":true, "artifact_id":"saved",
             "results":[{"status":"ok", "complete":true, "text":"\"\\\n".repeat(5_000)}]});
         let (before, saved, loss) = cell(
@@ -537,9 +785,85 @@ mod tests {
         let (batch, _, loss) = cell("text(load('batch')); text(load('row'));", saved.clone(), &raw, MAX_BUFFERED_OUTPUT_BYTES).await;
         assert!(!loss);
         assert!(batch.iter().all(|text| text.contains("[source ")));
+        assert!(batch[1].contains("\"source_sha256\":\"sha\""));
+        assert!(batch[1].contains("\"environment_id\":\"fixture-env\""));
+        assert!(batch[1].contains("\"canonical_uri\":\"file:///source.rs\""));
         let (changed, _, loss) = cell("const r=load('raw'); r.results[0].text='changed'; text(r);", saved, &raw, MAX_BUFFERED_OUTPUT_BYTES).await;
         assert!(!loss);
         assert_eq!(serde_json::from_str::<Value>(&changed[0]).unwrap()["results"][0]["text"], "changed");
+    }
+
+    #[tokio::test]
+    async fn mcp_text_framing_preserves_evidence_and_avoids_recovery_after_load() {
+        async fn cell(source: &str, stored: HashMap<String, StoredValue>, raw: &Value, limit: usize)
+            -> (Vec<String>, HashMap<String, StoredValue>, bool)
+        {
+            let (events, mut rx) = mpsc::unbounded_channel();
+            let request = ExecuteRequest {
+                state_path: None, tool_call_id: "mcp-presentation".into(),
+                enabled_tools: vec![ToolDefinition {
+                    name: "mcp__node_repl__js".into(), tool_name: ToolName::plain("mcp__node_repl__js"),
+                    kind: CodeModeToolKind::Function, description: String::new().into(),
+                    input_schema: None, output_schema: None, default_timeout_ms: None,
+                }].into(),
+                source: source.into(), yield_time_ms: None, max_output_tokens: None,
+                default_tool_timeout_ms: None,
+            };
+            let (tx, _termination) = spawn_runtime(stored, request, 60_000, events,
+                Arc::new(OutputAdmission::new(limit)), None).await.unwrap();
+            let mut printed = Vec::new();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+                    RuntimeEvent::Started => {}
+                    RuntimeEvent::ToolCall { id, .. } => tx.send(RuntimeCommand::ToolResponse { id, result: raw.clone() }).unwrap(),
+                    RuntimeEvent::ContentItem { item: FunctionCallOutputContentItem::InputText { text }, .. } => printed.push(text),
+                    RuntimeEvent::Result { error_text, stored_value_writes, output_loss } => {
+                        assert_eq!(error_text, None);
+                        return (printed, stored_value_writes, output_loss.is_some());
+                    }
+                    other => panic!("unexpected event {other:?}"),
+                }
+            }
+        }
+        let source = "\"quoted\" \\ λ\r\n".repeat(2_000);
+        let raw = json!({"content":[
+            {"type":"text","text":source,"annotations":{"priority":1}},
+            {"type":"image","data":"abc","mimeType":"image/png"},
+            {"type":"text","text":"keep\ninline","text_lines":"caller owned"},
+            {"type":"text","text":null}],"isError":true,"_meta":{"id":7}});
+        let (before, saved, loss) = cell(
+            "const r=await tools.mcp__node_repl__js({}); store('raw',r); store('plain',JSON.parse(JSON.stringify(r))); text(r);",
+            HashMap::new(), &raw, MAX_BUFFERED_OUTPUT_BYTES,
+        ).await;
+        assert!(!loss);
+        assert_eq!(*saved["raw"].value, raw);
+        assert!(saved["raw"].presentation.is_some());
+        assert!(saved["plain"].presentation.is_none());
+        assert!(serde_json::to_vec(saved["raw"].presentation.as_ref().unwrap()).unwrap().len() < 1_024);
+        let (metadata, body) = before[0].split_once('\n').unwrap();
+        let mut envelope: Value = serde_json::from_str(metadata).unwrap();
+        let (header, text) = body.split_once('\n').unwrap();
+        assert_eq!(text, source, "Unicode, CRLF and escaped text must remain exact");
+        assert!(header.starts_with("[source "));
+        assert!(header.contains("content[0].text"));
+        assert!(envelope["content"][0].as_object_mut().unwrap().remove("text_lines").is_some());
+        envelope["content"][0]["text"] = json!(text);
+        assert_eq!(envelope, raw, "all flags, annotations and non-text blocks survive");
+        let limit = serde_json::to_vec(&FunctionCallOutputContentItem::InputText { text: before[0].clone() }).unwrap().len() + 128;
+        let (after, _, loss) = cell("text(load('raw'));", saved.clone(), &raw, limit).await;
+        assert!(!loss);
+        assert_eq!(after, before);
+        let (_, _, old_loss) = cell("text(load('plain'));", saved.clone(), &raw, limit).await;
+        assert!(old_loss, "unframed JSON requires recovery at the same budget");
+        let (changed, _, loss) = cell("const r=load('raw'); r.content[0].text='changed'; text(r);", saved, &raw, MAX_BUFFERED_OUTPUT_BYTES).await;
+        assert!(!loss);
+        let mut expected = raw;
+        expected["content"][0]["text"] = json!("changed");
+        assert_eq!(serde_json::from_str::<Value>(&changed[0]).unwrap(), expected);
+        let short = json!({"content":[{"type":"text","text":"short\nmessage"}],"isError":false});
+        let (printed, _, loss) = cell("text(await tools.mcp__node_repl__js({}));", HashMap::new(), &short, MAX_BUFFERED_OUTPUT_BYTES).await;
+        assert!(!loss);
+        assert_eq!(serde_json::from_str::<Value>(&printed[0]).unwrap(), short, "small results must not grow");
     }
 
     #[tokio::test]
@@ -858,7 +1182,13 @@ mod tests {
             let rest = first_body.strip_prefix(body).unwrap().strip_prefix('\n').unwrap();
             let (second_label, second_body) = rest.split_once('\n').unwrap();
             assert!(second_label.contains("\"body\":2"));
-            assert_eq!(second_body, body, "{name}");
+            if body.len() >= 512 {
+                assert!(second_label.contains("\"same_as_body\":1"));
+                assert!(second_body.is_empty());
+                assert_eq!(first_body.strip_suffix(rest).unwrap().trim_end_matches('\n'), body.trim_end_matches('\n'));
+            } else {
+                assert_eq!(second_body, body, "{name}");
+            }
             let projected = codex_code_mode_protocol::model_visible_tool_result(&ToolName::plain(name), &raw).unwrap();
             let old_batch = json!({"part":7,"results":[projected.clone(),projected]}).to_string();
             if fixture != "recovery" {

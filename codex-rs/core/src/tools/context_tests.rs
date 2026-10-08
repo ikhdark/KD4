@@ -5,6 +5,65 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
+fn epistemic_diagnostic_coordinates_preserve_owners_and_nonlocations() {
+    for (first, second) in [
+        ("at C:\\work\\test.rs:12:9\r\nFinished test in 1s", "at C:\\work\\test.rs:30:2\r\nFinished test in 2s"),
+        ("  --> src/é.rs:12:3", "  --> src/é.rs:23:4"),
+    ] {
+        assert_eq!(normalize_tool_failure_text(first), normalize_tool_failure_text(second));
+    }
+    for text in ["localhost:8080", "expected 120ms", "assertion: file.rs:value", "no location\r\n", ""] {
+        assert_eq!(normalize_tool_failure_text(text), text);
+    }
+    assert_ne!(normalize_tool_failure_text("at a.rs:12:9"), normalize_tool_failure_text("at b.rs:12:9"));
+    assert_eq!(normalize_tool_failure_text("at a.rs:12:9\n"), "at a.rs:<location>\n");
+}
+
+#[test]
+fn evidence_salience_stop_feedback_preserves_measurements_and_deadlines() {
+    for (first, second) in [
+        ("Latency gate failed: p95 is 120ms; limit is 100ms", "Latency gate failed: p95 is 950ms; limit is 100ms"),
+        ("deadline is 12:00:00", "deadline is 13:00:00"),
+        ("expected 1s", "expected 2s"),
+        ("cutoff 2026-10-01T12:00:00Z", "cutoff 2026-10-02T12:00:00Z"),
+    ] {
+        assert_ne!(normalize_observation_text(first), normalize_observation_text(second));
+    }
+    assert_eq!(normalize_observation_text("2026-10-01T12:00:00Z ERROR gate rejected\nFinished test in 1s"),
+        normalize_observation_text("2026-10-02T12:00:00Z ERROR gate rejected\nFinished test in 2s"));
+}
+
+#[test]
+fn evidence_salience_successful_validation_preserves_owners_and_exact_values() {
+    let validation = crate::validation::CommandValidation {
+        execution_context: None, declared: None,
+        classification: crate::validation::classify_validation_script("cargo check"),
+        receipt_runner: None,
+    };
+    for (first, second) in [
+        ("src/a.rs:10:warning: unused key", "src/b.rs:10:warning: unused key"),
+        ("warning: unused key\n --> src/a.rs:2:1\n2 | let key = 1;", "warning: unused key\n --> src/b.rs:2:1\n2 | let key = 1;"),
+        ("warning: threshold 120ms", "warning: threshold 950ms"),
+        ("  actual: x", " actual: x"),
+    ] {
+        let evidence = |text: &str| {
+            let direct = successful_command_evidence(text.as_bytes(), Some("cargo check"));
+            let mut signal = json!({});
+            attach_command_validation(&mut signal, text.as_bytes(), Some(&validation), Some(0), true);
+            assert_eq!(signal["semantic_evidence"], json!(direct));
+            direct
+        };
+        assert_ne!(evidence(first), evidence(second));
+    }
+    assert_eq!(successful_command_evidence(b"src/a.rs:10:2: warning: key\nFinished test in 1s", Some("cargo check")),
+        successful_command_evidence(b"src/a.rs:20:3: warning: key\nFinished test in 2s", Some("cargo check")));
+    assert_ne!(successful_command_evidence(b"Finished test in 1s", Some("cat report.txt")),
+        successful_command_evidence(b"Finished test in 2s", Some("cat report.txt")));
+    assert_ne!(successful_command_evidence(&[0xff, b'a'], Some("cargo check")),
+        successful_command_evidence("�a".as_bytes(), Some("cargo check")));
+}
+
+#[test]
 fn windows_crash_exit_codes_are_named_and_ordinary_codes_are_not() {
     let notice = windows_abnormal_exit_notice(-1_073_741_819).expect("access violation");
     assert!(
@@ -345,7 +404,8 @@ async fn applied_patch_diffs_report_committed_lines_and_bounds() {
     let cwd = codex_utils_path_uri::PathUri::from_host_native_path(root.path()).unwrap();
     std::fs::write(root.path().join("old.txt"), "one\ntwo\n").unwrap();
     std::fs::write(root.path().join("deleted.txt"), "deleted\n").unwrap();
-    let mut patch = "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n one\n-two\n+λ changed\n*** Delete File: deleted.txt\n".to_string();
+    std::fs::write(root.path().join("overwrite.txt"), "displaced\n").unwrap();
+    let mut patch = "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n one\n-two\n+λ changed\n*** Delete File: deleted.txt\n*** Add File: overwrite.txt\n+replacement\n".to_string();
     for index in 0..5 {
         patch.push_str(&format!("*** Add File: large{index}.txt\n+{}\n", "λ".repeat(6000)));
     }
@@ -355,6 +415,19 @@ async fn applied_patch_diffs_report_committed_lines_and_bounds() {
     // The receipt is built from committed bytes, not a post-patch read.
     std::fs::write(root.path().join("new.txt"), "independent later edit\n").unwrap();
     let output = ApplyPatchToolOutput::from_delta("applied".into(), true, &delta, None);
+    let changed = output.changes.iter().find(|change| change["kind"] == "update").unwrap();
+    assert_eq!(changed["unified_diff"], "@@ -1,2 +1,2 @@\n");
+    assert_eq!(changed["diff_format"], "hunk_headers");
+    assert_eq!(changed["diff_complete"], true);
+    assert!(changed["move_path"].as_str().unwrap().ends_with("new.txt"));
+    for change in output.changes.iter().filter(|change| change["path"].as_str().unwrap().contains("large")) {
+        assert!(change.get("unified_diff").is_none());
+    }
+    let overwritten = output.changes.iter().find(|change| change["path"].as_str().unwrap().ends_with("overwrite.txt")).unwrap();
+    assert!(overwritten["unified_diff"].as_str().unwrap().contains("-displaced"));
+    assert!(!output.model_text().contains("+λ changed"));
+    // Failed/partial operations keep the complete bounded diff representation.
+    let output = ApplyPatchToolOutput::from_delta("partial failure".into(), false, &delta, None);
     let changed = output.changes.iter().find(|change| change["kind"] == "update").unwrap();
     assert!(changed["unified_diff"].as_str().unwrap().contains("@@ -1,2 +1,2 @@"));
     assert!(changed["unified_diff"].as_str().unwrap().contains("+λ changed"));
@@ -2019,7 +2092,7 @@ async fn command_recovery_targets_current_chunk_gaps_not_cumulative_prefix() {
     let chunk = (0..500).map(|index| format!("current line {index:04}: exact λ evidence\r\n"))
         .collect::<String>();
     let raw = [prefix.as_slice(), chunk.as_bytes()].concat();
-    let (mut output, _, _, _root) = artifact_backed_exec_output(&raw, Some(80)).await;
+    let (mut output, id, _, root) = artifact_backed_exec_output(&raw, Some(80)).await;
     output.raw_output = chunk.as_bytes().to_vec();
     output.output_ranges = Some(OutputChunkRanges { range: prefix.len() as u64..raw.len() as u64, gap: None });
     let payload = ToolPayload::Function { arguments: "{}".into() };
@@ -2029,11 +2102,23 @@ async fn command_recovery_targets_current_chunk_gaps_not_cumulative_prefix() {
     let start = selector["start"].as_u64().unwrap() as usize;
     let end = selector["end"].as_u64().unwrap() as usize;
     assert!(start >= prefix.len() && start < end && end <= raw.len());
-    assert!(end - start <= 4096);
+    assert!(end - start > 4096, "the hint must not clip the known missing range");
     let retained = String::from_utf8_lossy(&raw[start..end]);
     assert!(!retained.contains("already observed"));
     assert!(retained.starts_with("current line"));
     assert_eq!(packet["recovery"]["arguments"]["selectors"][0], *selector);
+
+    // One recovery request can now deliver this entire gap, without guessing
+    // the next 4 KiB window or rereading the already observed cumulative prefix.
+    let recovered = crate::tools::handlers::execute_recovery_transaction_with_continuations(
+        root.path(), "thread", &id.to_string(),
+        vec![serde_json::from_value(selector.clone()).unwrap()], true,
+        &tokio_util::sync::CancellationToken::new(),
+    ).await.unwrap().output;
+    assert!(recovered.complete);
+    let exact = recovered.results.iter().map(|result| result.text.as_deref().unwrap())
+        .collect::<String>();
+    assert_eq!(exact.as_bytes(), &raw[start..end]);
 
     // The first retention gap is known even if the displayed head/tail fit.
     output.raw_output = b"head\n[output retention gap]\ntail\n".to_vec();
@@ -2048,11 +2133,41 @@ async fn command_recovery_targets_current_chunk_gaps_not_cumulative_prefix() {
     assert!(empty.get("recovery_selector").is_none());
     assert_eq!(empty["output_reduced"], false);
 
-    // Unknown coordinates must not turn into a guessed 0..4096 selector.
+    // Unknown coordinates must not turn into a guessed prefix selector.
     output.raw_output = chunk.into_bytes();
     output.output_ranges = None;
     output.max_output_tokens = Some(80);
     assert!(output.code_mode_result(&payload).get("recovery_selector").is_none());
+}
+
+#[tokio::test]
+async fn command_recovery_preserves_gap_extent_and_retained_bounds() {
+    use crate::unified_exec::head_tail_buffer::OutputChunkRanges;
+    let raw = "exact λ evidence\r\n".repeat(1000);
+    let (mut output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(80)).await;
+    let retained = raw.len() as u64;
+    output.raw_output = b"head\n[output retention gap]\ntail\n".to_vec();
+    let payload = ToolPayload::Function { arguments: "{}".into() };
+    for (gap, expected) in [
+        (18..12_000, Some(json!({"kind":"bytes", "start":18, "end":12_000}))),
+        (18..u64::MAX, Some(json!({"kind":"bytes", "start":18, "end":retained}))),
+        (retained..u64::MAX, None),
+        (retained + 1..u64::MAX, None),
+    ] {
+        output.output_ranges = Some(OutputChunkRanges { range: 0..u64::MAX, gap: Some(gap) });
+        let result = output.code_mode_result(&payload);
+        assert_eq!(result.get("recovery_selector"), expected.as_ref());
+    }
+
+    // Exact line-to-byte mapping for a later chunk must retain the requested
+    // end, including CRLF and multibyte UTF-8, without a second size limit.
+    output.raw_output = raw.as_bytes().to_vec();
+    output.output_ranges = Some(OutputChunkRanges { range: 18..18 + retained, gap: None });
+    let mapped = output.missing_output_selector(&raw, "", Some((2, 800)), Some(18 + retained));
+    let line_bytes = "exact λ evidence\r\n".len() as u64;
+    assert_eq!(mapped, Some(json!({
+        "kind":"bytes", "start":18 + line_bytes, "end":18 + 800 * line_bytes,
+    })));
 }
 
 #[tokio::test]

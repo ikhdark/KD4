@@ -473,6 +473,11 @@ pub trait ToolOutput: Send {
         false
     }
 
+    /// Host delivery status, distinct from execution success and output text.
+    fn model_delivery_unavailable(&self) -> bool {
+        false
+    }
+
     /// Returns the exact producer result before any model-facing rendering.
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
         let metadata = self.projection_metadata()?;
@@ -589,6 +594,10 @@ where
 
     fn requires_canonical_artifact(&self) -> bool {
         (**self).requires_canonical_artifact()
+    }
+
+    fn model_delivery_unavailable(&self) -> bool {
+        (**self).model_delivery_unavailable()
     }
 
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {

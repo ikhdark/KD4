@@ -11,6 +11,8 @@ use std::sync::Arc;
 #[derive(Clone, PartialEq)]
 pub struct ToolSearchEntry {
     pub search_text: String,
+    /// Operation-specific provider title, not connector or namespace prose.
+    pub callable_title: Option<String>,
     pub tool_names: Vec<String>,
     pub output: Arc<LoadableToolSpec>,
     /// Shared MCP definitions are normalized only after selection; owned entries already are.
@@ -18,16 +20,26 @@ pub struct ToolSearchEntry {
 }
 
 impl ToolSearchEntry {
+    /// Positive evidence for one namespace member, without copying its schema.
+    pub fn callable_function_search_text(tool: &ResponsesApiTool) -> String {
+        let mut parts = String::new();
+        append_function_search_text(tool, &mut parts, true);
+        parts
+    }
+
     /// Callable evidence excludes connector and namespace boilerplate. Shared
     /// metadata remains in search_text for discovery, not action activation.
     pub fn callable_search_text(&self) -> String {
         let mut parts = String::new();
+        if let Some(title) = &self.callable_title {
+            append_activation_description(title, &mut parts);
+        }
         match self.output.as_ref() {
-            LoadableToolSpec::Function(tool) => append_function_search_text(tool, &mut parts),
+            LoadableToolSpec::Function(tool) => append_function_search_text(tool, &mut parts, true),
             LoadableToolSpec::Namespace(namespace) => {
                 for tool in &namespace.tools {
                     let ResponsesApiNamespaceTool::Function(tool) = tool;
-                    append_function_search_text(tool, &mut parts);
+                    append_function_search_text(tool, &mut parts, true);
                 }
             }
         }
@@ -70,13 +82,21 @@ pub struct ToolSearchInfo {
 
 impl ToolSearchInfo {
     pub fn from_shared_spec(
-        search_text: String,
+        mut search_text: String,
         output: Arc<LoadableToolSpec>,
         source_info: Option<ToolSearchSourceInfo>,
     ) -> Self {
         let tool_names = output.callable_tool_names().into_iter().map(|name| name.name).collect();
+        match output.as_ref() {
+            LoadableToolSpec::Function(tool) => append_output_search_text(tool, &mut search_text),
+            LoadableToolSpec::Namespace(namespace) => {
+                for ResponsesApiNamespaceTool::Function(tool) in &namespace.tools {
+                    append_output_search_text(tool, &mut search_text);
+                }
+            }
+        }
         Self {
-            entry: ToolSearchEntry { search_text, tool_names, output, normalize_on_selection: true },
+            entry: ToolSearchEntry { search_text, callable_title: None, tool_names, output, normalize_on_selection: true },
             source_info,
         }
     }
@@ -90,14 +110,20 @@ impl ToolSearchInfo {
     }
 
     pub fn from_spec(
-        search_text: String,
+        mut search_text: String,
         spec: &ToolSpec,
         source_info: Option<ToolSearchSourceInfo>,
     ) -> Option<Self> {
         let tool_names = tool_names(spec);
         let output = match spec {
-            ToolSpec::Function(tool) => LoadableToolSpec::Function(search_function(tool)),
+            ToolSpec::Function(tool) => {
+                append_output_search_text(tool, &mut search_text);
+                LoadableToolSpec::Function(search_function(tool))
+            }
             ToolSpec::Namespace(namespace) => {
+                for ResponsesApiNamespaceTool::Function(tool) in &namespace.tools {
+                    append_output_search_text(tool, &mut search_text);
+                }
                 LoadableToolSpec::Namespace(crate::ResponsesApiNamespace {
                     name: namespace.name.clone(),
                     description: if namespace.description.trim().is_empty() {
@@ -123,6 +149,7 @@ impl ToolSearchInfo {
         Some(Self {
             entry: ToolSearchEntry {
                 search_text,
+                callable_title: None,
                 tool_names,
                 output: Arc::new(output),
                 normalize_on_selection: false,
@@ -156,7 +183,7 @@ fn default_tool_search_text(spec: &ToolSpec) -> String {
     let mut parts = String::new();
 
     match spec {
-        ToolSpec::Function(tool) => append_function_search_text(tool, &mut parts),
+        ToolSpec::Function(tool) => append_function_search_text(tool, &mut parts, false),
         ToolSpec::Namespace(namespace) => {
             for tool in &namespace.tools {
                 let ResponsesApiNamespaceTool::Function(tool) = tool;
@@ -192,15 +219,97 @@ pub fn namespace_member_search_text(
     push_search_part(&mut parts, &code_mode_name_for_tool_name(&crate::ToolName::namespaced(
         namespace, tool.name.clone(),
     )));
-    append_function_search_text(tool, &mut parts);
+    append_function_search_text(tool, &mut parts, false);
     parts
 }
 
-fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut String) {
+fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut String, activation: bool) {
     push_search_part(parts, &tool.name);
     push_search_part(parts, &identifier_search_words(&tool.name));
-    push_search_part(parts, &tool.description);
-    append_schema_search_text(&tool.parameters, parts);
+    append_description(&tool.description, parts, activation);
+    append_schema_search_text(&tool.parameters, parts, activation);
+}
+
+fn append_description(description: &str, parts: &mut String, activation: bool) {
+    if activation {
+        append_activation_description(description, parts);
+    } else {
+        push_search_part(parts, description);
+    }
+}
+
+/// Explicit negative clauses remain searchable and visible in the authoritative
+/// contract, but are not positive capability evidence. This is deliberately not
+/// a general natural-language classifier: preserve preceding positive clauses
+/// and constructions such as "not only", and resume at the next sentence/clause.
+fn append_activation_description(description: &str, parts: &mut String) {
+    // Most descriptions contain no exclusion/routing cue. Check byte prefixes
+    // without allocating, lowercasing Unicode, or splitting those descriptions.
+    if !description.as_bytes().windows(3).any(|word| {
+        match word[0].to_ascii_lowercase() {
+            b'c' => word.eq_ignore_ascii_case(b"can"),
+            b'd' => word.eq_ignore_ascii_case(b"don") || word.eq_ignore_ascii_case(b"doe"),
+            b'n' => word.eq_ignore_ascii_case(b"nev") || word.eq_ignore_ascii_case(b"not"),
+            b'i' => word.eq_ignore_ascii_case(b"ins"),
+            _ => false,
+        }
+    }) {
+        push_search_part(parts, description);
+        return;
+    }
+    for clause in description.split_inclusive(['.', ';', '\n']) {
+        let mut offset = 0;
+        let mut previous = ("", 0);
+        let mut positive_start = 0;
+        let mut cutoff = clause.len();
+        let mut first = "";
+        for piece in clause.split_inclusive(char::is_whitespace) {
+            let word = piece.trim();
+            if !word.is_empty() {
+                if cutoff < clause.len() && word.eq_ignore_ascii_case("but") {
+                    push_search_part(parts, &clause[positive_start..cutoff]);
+                    positive_start = offset + piece.len();
+                    cutoff = clause.len();
+                    first = "";
+                    previous = ("", 0);
+                    offset += piece.len();
+                    continue;
+                }
+                if first.is_empty() { first = word; }
+                let negative = match word.as_bytes()[0].to_ascii_lowercase() {
+                    b'c' => word.eq_ignore_ascii_case("cannot") || word.eq_ignore_ascii_case("can't"),
+                    b'd' => word.eq_ignore_ascii_case("doesn't") || word.eq_ignore_ascii_case("don't"),
+                    b'n' => word.eq_ignore_ascii_case("never"),
+                    _ => false,
+                };
+                let pair = word.eq_ignore_ascii_case("not")
+                    && (previous.0.eq_ignore_ascii_case("do") || previous.0.eq_ignore_ascii_case("does"));
+                if cutoff == clause.len() && (negative || pair) {
+                    cutoff = if pair { previous.1 } else { offset };
+                }
+                if (first.eq_ignore_ascii_case("to") || first.eq_ignore_ascii_case("use"))
+                    && word.trim_end_matches(['.', ';']).eq_ignore_ascii_case("instead") {
+                    cutoff = positive_start; break;
+                }
+                previous = (word, offset);
+            }
+            offset += piece.len();
+        }
+        push_search_part(parts, &clause[positive_start..cutoff]);
+    }
+}
+
+fn append_output_search_text(tool: &ResponsesApiTool, parts: &mut String) {
+    let Some(schema) = &tool.output_schema else { return; };
+    let start = parts.len();
+    for name in schema.search_field_names().take(64) {
+        // No descriptions, literals, recursive refs, or unbounded field names.
+        if name.len() > 256 { continue; }
+        let words = identifier_search_words(name);
+        if parts.len() - start + name.len() + words.len() + 2 > 2048 { break; }
+        push_search_part(parts, name);
+        if words != name { push_search_part(parts, &words); }
+    }
 }
 
 /// Capability words supplement, but never replace, exact callable identities.
@@ -229,20 +338,20 @@ pub fn identifier_search_words(identifier: &str) -> String {
 
 pub fn schema_search_text(schema: &JsonSchema) -> String {
     let mut parts = String::new();
-    append_schema_search_text(schema, &mut parts);
+    append_schema_search_text(schema, &mut parts, false);
     parts
 }
 
-fn append_schema_search_text(schema: &JsonSchema, parts: &mut String) {
+fn append_schema_search_text(schema: &JsonSchema, parts: &mut String, activation: bool) {
     if let Some(schema_ref) = &schema.schema_ref {
         push_search_part(parts, schema_ref);
     }
     if let Some(description) = &schema.description {
-        push_search_part(parts, description);
+        append_description(description, parts, activation);
     }
     if let Some(required) = &schema.required {
         for name in required {
-            push_search_part(parts, name);
+            append_schema_identifier(parts, name);
         }
     }
     if let Some(values) = &schema.enum_values {
@@ -264,29 +373,38 @@ fn append_schema_search_text(schema: &JsonSchema, parts: &mut String) {
     }
     if let Some(properties) = &schema.properties {
         for (name, schema) in properties {
-            push_search_part(parts, name);
-            append_schema_search_text(schema, parts);
+            append_schema_identifier(parts, name);
+            append_schema_search_text(schema, parts, activation);
         }
     }
     if let Some(items) = &schema.items {
-        append_schema_search_text(items, parts);
+        append_schema_search_text(items, parts, activation);
     }
     if let Some(crate::AdditionalProperties::Schema(schema)) = &schema.additional_properties {
-        append_schema_search_text(schema, parts);
+        append_schema_search_text(schema, parts, activation);
     }
     for variants in [&schema.any_of, &schema.one_of, &schema.all_of]
         .into_iter()
         .flatten()
     {
         for variant in variants {
-            append_schema_search_text(variant, parts);
+            append_schema_search_text(variant, parts, activation);
         }
     }
     for definitions in [&schema.defs, &schema.definitions].into_iter().flatten() {
         for (name, schema) in definitions {
-            push_search_part(parts, name);
-            append_schema_search_text(schema, parts);
+            append_schema_identifier(parts, name);
+            append_schema_search_text(schema, parts, activation);
         }
+    }
+}
+
+fn append_schema_identifier(parts: &mut String, name: &str) {
+    push_search_part(parts, name);
+    // Ordinary lowercase names already tokenize correctly; avoid duplicate text.
+    if name.bytes().any(|byte| byte == b'_' || byte.is_ascii_uppercase()) {
+        let words = identifier_search_words(name);
+        if words != name { push_search_part(parts, &words); }
     }
 }
 

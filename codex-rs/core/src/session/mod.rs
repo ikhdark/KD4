@@ -1321,7 +1321,10 @@ fn take_prompt_fragment_with_identity(
     let mut admitted = None;
     while lower <= upper {
         let middle = lower + (upper - lower) / 2;
-        let text = budget.clone().take_up_to(&rendered, middle)?;
+        let Some(text) = budget.clone().take_up_to(&rendered, middle) else {
+            lower = middle + 1;
+            continue;
+        };
         if slot == PromptSlot::SeparateDeveloper && text.is_empty() {
             lower = middle + 1;
             continue;
@@ -4326,7 +4329,8 @@ impl Session {
                         step_context.loaded_agents_md.as_deref(),
                         step_context.agents_md_stable_context.as_ref(),
                         step_context.agents_md_freshness,
-                    ),
+                    ).with_unavailable_fallback(|| previous_world_state.snapshot()
+                        .section("agents_md").cloned()),
                 )
             },
         );
@@ -4449,7 +4453,7 @@ impl Session {
             (turn_context.environments.clone(), observation, prepared)
         };
         let (selected_capability_roots, mcp) = prepared_tools?;
-        Ok(Arc::new(StepContext::new_with_agents_md_freshness(
+        let mut step_context = StepContext::new_with_agents_md_freshness(
             turn_context,
             environments,
             selected_capability_roots,
@@ -4457,7 +4461,9 @@ impl Session {
             agents_md_observation.loaded,
             agents_md_observation.stable_context,
             agents_md_observation.freshness,
-        )))
+        );
+        step_context.plan_sampling_revision = Some(self.services.plan_store.sampling_revision().await);
+        Ok(Arc::new(step_context))
     }
 
     pub(crate) async fn record_inter_agent_communication(
@@ -5222,19 +5228,29 @@ impl Session {
             let admitted = take_prompt_fragment_with_identity(
                 fragment.clone(), &mut extension_context_budget, &turn_context.sub_id, Some(index),
             );
-            let admitted = if admitted.is_none() && policy {
+            let admitted = if admitted.is_none() && (policy || retention_digests.into_iter().flatten()
+                .any(|digest| digest.key == key)) {
                 let recovery = if estimate {
                     "Exact recovery is established at admission.".to_string()
                 } else {
-                    match self.retain_context_source("extension_policy", serde_json::json!([
-                        {"role":"developer", "producer":key, "text":fragment.text()}
+                    match self.retain_context_source(if policy { "extension_policy" } else { "extension_context" }, serde_json::json!([
+                        {"role":if fragment.slot() == PromptSlot::ContextualUser { "user" } else { "developer" },
+                         "producer":key, "text":fragment.text()}
                     ])).await {
                         Ok(recovery) => recovery.to_string(),
                         Err(error) => format!("Recovery unavailable: {error}"),
                     }
                 };
-                Some((PromptSlot::SeparateDeveloper, crate::stable_context::turn_contribution_text(index,
-                    &format!("Required policy INCOMPLETE: no policy excerpt was admitted. Do not proceed with actions requiring it until recovered in full. {recovery}"))))
+                let notice = if policy {
+                    format!("Required policy INCOMPLETE: no policy excerpt was admitted. Do not proceed with actions requiring it until recovered in full. {recovery}")
+                } else {
+                    format!("Context contribution INCOMPLETE: the producer still returned this source, but its body exceeded the admission budget. This is not a source removal. Recover it before relying on its contents. {recovery}")
+                };
+                Some((if fragment.slot() == PromptSlot::ContextualUser {
+                    PromptSlot::ContextualUser
+                } else {
+                    PromptSlot::SeparateDeveloper
+                }, crate::stable_context::turn_contribution_text(index, &notice)))
             } else { admitted };
             let Some((slot, text)) = admitted else { continue; };
             rendered_turn_context_fragments.push((key, slot, text));

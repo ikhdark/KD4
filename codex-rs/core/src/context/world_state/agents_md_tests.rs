@@ -349,6 +349,8 @@ fn freshness_only_update_does_not_repeat_the_instruction_body() {
     ));
     let (fragments, next) = current.render_diff_with_snapshot(&accepted);
     assert_eq!(fragments.len(), 1);
+    assert!(fragments[0].render().starts_with("<repository_observation>"));
+    assert!(fragments[0].render().ends_with("</repository_observation>"));
     assert!(!fragments[0].render().contains("retained instruction body"));
     assert_eq!(next, current.snapshot());
     assert!(current.render_diff(&next).is_empty());
@@ -462,4 +464,33 @@ fn retention_requires_latest_body_scope_and_revocation() {
         &current.snapshot(),
         &history
     ));
+}
+#[test]
+fn survivability_unavailable_observation_does_not_revoke_saved_instructions() {
+    let loaded = LoadedAgentsMd::from_text_for_testing("Never edit protected.txt.");
+    let accepted = AgentsMdState::new(Some(&loaded)).snapshot();
+    for previous in [PreviousSectionState::Known(&accepted), PreviousSectionState::Unknown, PreviousSectionState::Absent] {
+        let missing = AgentsMdState::new_cached(None, None, AgentsMdFreshness::IncompleteRead);
+        let notice = missing.render_diff(previous).unwrap();
+        assert_eq!(notice.role(), "developer");
+        assert!(!notice.render().contains(AgentsMdState::REMOVAL_NOTICE));
+        assert!(missing.render_diff(PreviousSectionState::Known(&missing.snapshot())).is_none(),
+            "an unchanged unavailable observation must not grow the prompt each step");
+    }
+    let mut saved = serde_json::to_value(accepted).unwrap();
+    for _ in 0..3 {
+        let resumed = AgentsMdState::new_cached(None, None, AgentsMdFreshness::IncompleteRead)
+            .with_unavailable_fallback(|| Some(saved.clone()));
+        let full = resumed.render_diff(PreviousSectionState::Absent).unwrap().render();
+        assert!(full.contains("Never edit protected.txt."));
+        assert!(!full.contains(AgentsMdState::REMOVAL_NOTICE));
+        assert_eq!(resumed.snapshot().freshness, AgentsMdFreshness::CachedFallback);
+        saved = serde_json::to_value(resumed.snapshot()).unwrap();
+    }
+    let verified_empty = AgentsMdState::new_cached(None, None, AgentsMdFreshness::Refreshed)
+        .with_unavailable_fallback(|| panic!("successful observation must not consult fallback"));
+    assert!(verified_empty.snapshot().text.is_none());
+    let current = AgentsMdState::new_cached(Some(&loaded), None, AgentsMdFreshness::CachedFallback)
+        .with_unavailable_fallback(|| panic!("existing body must not consult fallback"));
+    assert!(current.snapshot().text.is_some());
 }

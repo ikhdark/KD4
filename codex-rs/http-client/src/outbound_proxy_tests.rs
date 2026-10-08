@@ -620,6 +620,7 @@ fn system_proxy_resolution_is_single_flight() {
 fn system_proxy_cache_reads_do_not_extend_expiry() {
     let mut cache = HashMap::new();
     let now = Instant::now();
+    let key = system_proxy_cache_key("https://expiry.test/");
     for (decision, ttl) in [
         (SystemProxyDecision::Direct, SYSTEM_PROXY_SUCCESS_CACHE_TTL),
         (
@@ -629,13 +630,13 @@ fn system_proxy_cache_reads_do_not_extend_expiry() {
             SYSTEM_PROXY_UNAVAILABLE_CACHE_TTL,
         ),
     ] {
-        insert_system_proxy_cache_entry(&mut cache, "test-key", decision.clone(), now);
+        insert_system_proxy_cache_entry(&mut cache, &key, decision.clone(), now);
         assert_eq!(
-            cached_system_proxy_decision_from_cache(&mut cache, "test-key", now + ttl / 2),
+            cached_system_proxy_decision_from_cache(&mut cache, &key, now + ttl / 2),
             Some(decision)
         );
         assert_eq!(
-            cached_system_proxy_decision_from_cache(&mut cache, "test-key", now + ttl),
+            cached_system_proxy_decision_from_cache(&mut cache, &key, now + ttl),
             None
         );
         assert!(cache.is_empty());
@@ -650,7 +651,7 @@ fn system_proxy_cache_is_bounded() {
     for index in 0..=SYSTEM_PROXY_CACHE_MAX_ENTRIES {
         insert_system_proxy_cache_entry(
             &mut cache,
-            &format!("https://bounded-cache.test/{index}"),
+            &system_proxy_cache_key(&format!("https://bounded-cache.test/{index}")),
             SystemProxyDecision::Direct,
             now,
         );
@@ -719,7 +720,9 @@ fn system_proxy_cache_key_preserves_url_specific_pac_decisions() {
         cache_key,
         system_proxy_cache_key("https://auth.openai.com/oauth/token?access_token=different")
     );
-    assert!(!cache_key.contains(request_url));
+    assert_eq!(cache_key.len(), 32);
+    assert_eq!(cache_key, system_proxy_cache_key(request_url));
+    assert!(!cache_key.windows(b"secret".len()).any(|bytes| bytes == b"secret"));
 }
 
 #[test]

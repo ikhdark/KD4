@@ -1,6 +1,97 @@
 use super::*;
 
 #[test]
+fn evidence_salience_compiler_summary_keeps_cargo_owner() {
+    let mut summaries = Vec::new();
+    for owner in ["alpha", "bravo"] {
+        let mut record: serde_json::Value = serde_json::from_str(&compiler_record("same diagnostic")).unwrap();
+        record["package_id"] = owner.into();
+        record["target"] = serde_json::json!({"name":owner, "kind":["lib"],
+            "src_path":format!("/workspace/{owner}/src/lib.rs"), "doc":true});
+        let raw = record.to_string();
+        let projected = summarize_shell_output_for_model(&raw, 1, false,
+            options(Some("cargo check --message-format=json"), Some(2000))).unwrap();
+        assert!(!codex_utils_string::approx_token_count_exceeds(&projected, 2000));
+        let value: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(value["diagnostics"][0]["package_id"], owner);
+        assert_eq!(value["diagnostics"][0]["target"]["name"], owner);
+        assert_eq!(value["diagnostics"][0]["target"]["kind"], serde_json::json!(["lib"]));
+        assert!(value["diagnostics"][0]["target"].get("doc").is_none());
+        summaries.push(projected);
+    }
+    assert_ne!(summaries[0], summaries[1]);
+}
+
+#[test]
+fn evidence_salience_macro_compaction_keeps_invocation_and_definition_chain() {
+    let mut record: serde_json::Value = serde_json::from_str(&compiler_record("macro failed")).unwrap();
+    record["message"]["spans"][0]["text"] = serde_json::json!([{"text":"excerpt ".repeat(4000)}]);
+    record["message"]["spans"][0]["expansion"] = serde_json::json!({
+        "macro_decl_name":"outer!", "span":{"file_name":"app.rs", "line_start":44,
+            "text":[{"text":"large ".repeat(4000)}], "expansion":{
+                "macro_decl_name":"inner!", "span":{"file_name":"inner.rs", "line_start":9},
+                "def_site_span":{"file_name":"inner_macro.rs", "line_start":2}}},
+        "def_site_span":{"file_name":"macro.rs", "line_start":17}});
+    let raw = record.to_string();
+    let projected = summarize_shell_output_for_model(&raw, 1, false,
+        options(Some("cargo check --message-format=json"), Some(1800))).unwrap();
+    assert!(!codex_utils_string::approx_token_count_exceeds(&projected, 1800));
+    let value: serde_json::Value = serde_json::from_str(&projected).unwrap();
+    let item = &value["diagnostics"][0];
+    let span = &item["diagnostic"]["spans"][0];
+    assert_eq!(span["suggested_replacement"], "value.into()");
+    assert_eq!(span["expansion"]["span"]["file_name"], "app.rs");
+    assert_eq!(span["expansion"]["span"]["line_start"], 44);
+    assert_eq!(span["expansion"]["def_site_span"]["file_name"], "macro.rs");
+    assert_eq!(span["expansion"]["span"]["expansion"]["span"]["file_name"], "inner.rs");
+    assert!(span["expansion"]["span"].get("text").is_none());
+    assert_eq!(item["details_omitted"], true);
+    assert_eq!(item["recovery_selector"], serde_json::json!({"kind":"bytes", "start":0, "end":raw.len()}));
+}
+
+#[test]
+fn evidence_salience_ansi_and_python_failures_survive_position_sweep() {
+    for position in [50, 250, 500, 750, 950] {
+        for diagnostic in ["error: DECISIVE_FAILURE", "\x1b[1m\x1b[31merror: DECISIVE_FAILURE\x1b[0m",
+            "Traceback (most recent call last):\n  File \"worker.py\", line 9, in run\n    validate()\nValueError: DECISIVE_FAILURE"]
+        {
+            let mut lines = (0..1000).map(|i| format!("cleanup item {i}")).collect::<Vec<_>>();
+            lines[position] = diagnostic.into();
+            let raw = lines.join("\n");
+            let projected = summarize_shell_output_for_model(&raw, 1, false,
+                options(Some("python worker.py"), Some(4000))).unwrap();
+            assert!(projected.contains("DECISIVE_FAILURE"), "position {position}: {diagnostic}");
+            assert!(!codex_utils_string::approx_token_count_exceeds(&projected, 4000));
+            assert!(raw.contains(diagnostic));
+        }
+    }
+    for line in ["sample.ValueError: invalid", "Exception: failed", "KeyboardInterrupt:"] {
+        assert!(is_critical_output_line(line));
+    }
+    for line in ["let ValueError: Type", "not an Error: source", "\x1b[31broken", "data: Exception"] {
+        assert!(!is_critical_output_line(line));
+    }
+    assert_eq!(diagnostic_line_start("\x1b[38:2:1:2:3m λ"), "λ");
+    assert_eq!(diagnostic_line_start("\x1b[123"), "\x1b[123");
+}
+
+#[test]
+fn evidence_salience_elapsed_measurements_are_not_progress_updates() {
+    let mut lines = (0..1000).map(|i| format!("item {i}")).collect::<Vec<_>>();
+    lines[10] = "warning: collecting latency samples".into();
+    lines[300] = "probe elapsed 950ms".into();
+    lines[500] = "probe elapsed 120ms".into();
+    let raw = lines.join("\n");
+    let projected = summarize_shell_output_for_model(&raw, 0, false,
+        options(Some("python latency_probe.py"), Some(1500))).unwrap();
+    assert!(projected.contains("950ms") && projected.contains("120ms"));
+    assert!(!codex_utils_string::approx_token_count_exceeds(&projected, 1500));
+    assert_ne!(progress_line_key(&lines[300]), progress_line_key(&lines[500]));
+    assert_eq!(progress_line_key("job 1 progress 1/90 elapsed 1s"),
+        progress_line_key("job 1 progress 8/90 elapsed 8s"));
+}
+
+#[test]
 fn successful_script_inventories_do_not_rank_incidental_diagnostic_words() {
     let output = (0..800).map(|i| format!("src/file{i}.rs: fn warning(error: Error) -> Result<()> {{}}\n"))
         .collect::<String>();
@@ -71,6 +162,40 @@ fn structured_diagnostics_count_omissions_and_fall_back_for_unknown_output() {
     for suffix in ["{broken", r#"{"reason":"new-format"}"#] {
         assert!(structured_compiler_summary(&format!("{}\n{suffix}", compiler_record("failure")), 1, false, None).is_none());
     }
+}
+
+#[test]
+fn actionability_omitted_compiler_groups_have_exact_bounded_recovery() {
+    let mut record: serde_json::Value = serde_json::from_str(&compiler_record("diagnostic")).unwrap();
+    record["message"].as_object_mut().unwrap().remove("rendered");
+    record["message"]["code"] = serde_json::Value::Null;
+    let records = (0..120).map(|i| {
+        record["message"]["message"] = format!("diagnostic_{i:03} {}", "detail λ ".repeat(70)).into();
+        record["message"]["spans"][0]["line_start"] = (i + 1).into();
+        record.to_string()
+    }).collect::<Vec<_>>();
+    let raw = records.join("\r\n");
+    let mut listed = 0;
+    for budget in [1_500, 2_000, 3_000, 8_000] {
+        let text = structured_compiler_summary(&raw, 1, false, Some(budget)).unwrap();
+        assert!(!codex_utils_string::approx_token_count_exceeds(&text, budget));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["recovery_selector"]["end"], raw.len());
+        assert_eq!(value["diagnostics_complete"], false);
+        let Some(groups) = value["omitted_diagnostic_groups"].as_array() else { continue; };
+        listed += groups.len();
+        assert!(groups.len() <= 8);
+        assert_eq!(groups.len() as u64 + value["unlisted_omitted_diagnostic_groups"].as_u64().unwrap(),
+            value["omitted_diagnostics"].as_u64().unwrap());
+        for group in groups {
+            let selector = &group["recovery_selector"];
+            let exact = &raw[selector["start"].as_u64().unwrap() as usize..selector["end"].as_u64().unwrap() as usize];
+            assert_eq!(exact, records[group["source_line"].as_u64().unwrap() as usize - 1]);
+            assert!(exact.len() < raw.len() / 100);
+            assert_eq!(group["location"]["file"], "src/λ.rs");
+        }
+    }
+    assert!(listed > 0, "no bounded directory was emitted even with spare budget");
 }
 
 #[test]

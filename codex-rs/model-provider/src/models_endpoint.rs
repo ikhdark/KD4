@@ -21,7 +21,8 @@ use codex_login::AuthEnvTelemetry;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::collect_auth_env_telemetry;
-use codex_login::default_client::create_client_for_route_async;
+use codex_login::default_client::create_client_pool;
+use codex_http_client::RouteAwareClientPool;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
@@ -50,15 +51,8 @@ pub(crate) struct OpenAiModelsEndpoint {
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
     transport_builder: Arc<dyn ModelsTransportBuilder>,
-    transport_cache: Mutex<Option<CachedModelsTransport>>,
 }
 
-#[derive(Debug)]
-struct CachedModelsTransport {
-    http_client_factory: HttpClientFactory,
-    request_url: String,
-    transport: ReqwestTransport,
-}
 
 impl OpenAiModelsEndpoint {
     pub(crate) fn new(
@@ -70,8 +64,7 @@ impl OpenAiModelsEndpoint {
             model_provider_id,
             provider_info,
             auth_manager,
-            transport_builder: Arc::new(RouteAwareModelsTransportBuilder),
-            transport_cache: Mutex::new(None),
+            transport_builder: Arc::new(RouteAwareModelsTransportBuilder::default()),
         }
     }
 
@@ -196,39 +189,9 @@ impl OpenAiModelsEndpoint {
         http_client_factory: HttpClientFactory,
         request_url: String,
     ) -> std::io::Result<ReqwestTransport> {
-        {
-            let cache = self
-                .transport_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cached) = cache.as_ref()
-                && cached.http_client_factory == http_client_factory
-                && cached.request_url == request_url
-            {
-                return Ok(cached.transport.clone());
-            }
-        }
-
-        let transport = self
-            .transport_builder
-            .build(http_client_factory.clone(), request_url.clone())
-            .await?;
-        let mut cache = self
-            .transport_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.as_ref()
-            && cached.http_client_factory == http_client_factory
-            && cached.request_url == request_url
-        {
-            return Ok(cached.transport.clone());
-        }
-        *cache = Some(CachedModelsTransport {
-            http_client_factory,
-            request_url,
-            transport: transport.clone(),
-        });
-        Ok(transport)
+        self.transport_builder
+            .build(http_client_factory, request_url)
+            .await
     }
 
     fn auth_env(&self) -> AuthEnvTelemetry {
@@ -305,8 +268,25 @@ trait ModelsTransportBuilder: fmt::Debug + Send + Sync {
     ) -> ModelsTransportFuture<'_>;
 }
 
-#[derive(Debug)]
-struct RouteAwareModelsTransportBuilder;
+#[derive(Debug, Default)]
+struct RouteAwareModelsTransportBuilder {
+    pool: Mutex<Option<(HttpClientFactory, RouteAwareClientPool)>>,
+    sandbox_transport: tokio::sync::OnceCell<ReqwestTransport>,
+}
+
+impl RouteAwareModelsTransportBuilder {
+    fn pool_for(&self, factory: HttpClientFactory) -> RouteAwareClientPool {
+        let mut cached = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((previous, pool)) = cached.as_ref()
+            && previous == &factory
+        {
+            return pool.clone();
+        }
+        let pool = create_client_pool(factory.clone(), ClientRouteClass::Api);
+        *cached = Some((factory, pool.clone()));
+        pool
+    }
+}
 
 impl ModelsTransportBuilder for RouteAwareModelsTransportBuilder {
     fn build(
@@ -315,9 +295,15 @@ impl ModelsTransportBuilder for RouteAwareModelsTransportBuilder {
         request_url: String,
     ) -> ModelsTransportFuture<'_> {
         Box::pin(async move {
-            create_client_for_route_async(http_client_factory, request_url, ClientRouteClass::Api)
-                .await
-                .map(ReqwestTransport::from_http_client)
+            if std::env::var("CODEX_SANDBOX").as_deref() == Ok("seatbelt") {
+                // Preserve the default client's sandbox-specific direct routing.
+                return self.sandbox_transport.get_or_try_init(|| async {
+                    codex_login::default_client::create_client_for_route_async(
+                        http_client_factory, request_url, ClientRouteClass::Api,
+                    ).await.map(ReqwestTransport::from_http_client)
+                }).await.cloned();
+            }
+            Ok(ReqwestTransport::from_client_pool(self.pool_for(http_client_factory)))
         })
     }
 }
@@ -430,7 +416,6 @@ mod tests {
 
     use super::*;
     use codex_http_client::OutboundProxyPolicy;
-    use codex_login::default_client::create_client;
     use codex_protocol::config_types::ModelProviderAuthInfo;
     use codex_protocol::openai_models::ModelsResponse;
     use pretty_assertions::assert_eq;
@@ -442,10 +427,63 @@ mod tests {
     use wiremock::matchers::path;
     use wiremock::matchers::query_param;
 
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[tokio::test]
+    async fn catalog_refresh_observes_changed_proxy_and_reuses_route_clients() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        for server in [&first, &second] {
+            Mock::given(path("/models"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ModelsResponse { models: Vec::new() }))
+                .expect(2)
+                .mount(server).await;
+        }
+        let base = format!("http://catalog-{}.invalid", first.address().port());
+        let url = format!("{base}/models?client_version=route-test");
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy);
+        let builder = Arc::new(RouteAwareModelsTransportBuilder::default());
+        let endpoint = OpenAiModelsEndpoint {
+            model_provider_id: "test".into(),
+            provider_info: ModelProviderInfo::create_openai_provider(Some(base)),
+            auth_manager: None,
+            transport_builder: builder.clone(),
+        };
+        for server in [&first, &first, &second, &second] {
+            codex_http_client::cache_system_proxy_route_for_test(&url, server.uri());
+            endpoint.list_models("route-test", factory.clone()).await.unwrap();
+        }
+        assert_eq!(builder.pool_for(factory).cached_route_count(), 2);
+    }
+
     #[derive(Debug)]
     struct RecordingTransportBuilder {
         observed_request: Arc<Mutex<Option<(OutboundProxyPolicy, String)>>>,
         build_count: Arc<AtomicUsize>,
+        inner: RouteAwareModelsTransportBuilder,
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[tokio::test]
+    async fn catalog_redirect_resolves_the_new_destination_route() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let base = format!("http://catalog-redirect-{}.invalid", first.address().port());
+        let destination = format!("http://catalog-target-{}.invalid/next", second.address().port());
+        Mock::given(path("/models"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", destination.as_str()))
+            .expect(1).mount(&first).await;
+        Mock::given(path("/next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ModelsResponse { models: Vec::new() }))
+            .expect(1).mount(&second).await;
+        codex_http_client::cache_system_proxy_route_for_test(
+            &format!("{base}/models?client_version=redirect-test"), first.uri(),
+        );
+        codex_http_client::cache_system_proxy_route_for_test(&destination, second.uri());
+        OpenAiModelsEndpoint::new(
+            "test".into(), ModelProviderInfo::create_openai_provider(Some(base)), None,
+        ).list_models(
+            "redirect-test", HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+        ).await.unwrap();
     }
 
     impl ModelsTransportBuilder for RecordingTransportBuilder {
@@ -457,13 +495,16 @@ mod tests {
             let observed_request = Arc::clone(&self.observed_request);
             let build_count = Arc::clone(&self.build_count);
             Box::pin(async move {
-                build_count.fetch_add(1, Ordering::SeqCst);
+                let pool = self.inner.pool_for(http_client_factory.clone());
+                if pool.cached_route_count() == 0 {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                }
                 *observed_request
                     .lock()
                     .expect("observed request lock should not be poisoned") =
-                    Some((http_client_factory.outbound_proxy_policy(), request_url));
+                    Some((http_client_factory.outbound_proxy_policy(), request_url.clone()));
                 Ok(ReqwestTransport::from_http_client(
-                    create_client().expect("test HTTP client should build"),
+                    pool.client_for_url(&request_url).await.map_err(std::io::Error::other)?,
                 ))
             })
         }
@@ -565,10 +606,10 @@ mod tests {
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
+                inner: RouteAwareModelsTransportBuilder::default(),
                 observed_request: Arc::clone(&observed_request),
                 build_count: Arc::new(AtomicUsize::new(0)),
             }),
-            transport_cache: Mutex::new(None),
         };
 
         endpoint
@@ -609,10 +650,10 @@ mod tests {
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
+                inner: RouteAwareModelsTransportBuilder::default(),
                 observed_request: Arc::new(Mutex::new(None)),
                 build_count: Arc::clone(&build_count),
             }),
-            transport_cache: Mutex::new(None),
         };
         let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
 
@@ -629,17 +670,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_transport_cache_is_keyed_by_factory_and_exact_url() {
+    async fn model_transport_pool_is_keyed_by_factory_and_resolves_exact_url() {
         let build_count = Arc::new(AtomicUsize::new(0));
         let endpoint = OpenAiModelsEndpoint {
             model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(/*base_url*/ None),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
+                inner: RouteAwareModelsTransportBuilder::default(),
                 observed_request: Arc::new(Mutex::new(None)),
                 build_count: Arc::clone(&build_count),
             }),
-            transport_cache: Mutex::new(None),
         };
         let default_factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
 
@@ -659,6 +700,14 @@ mod tests {
             .expect("identical route should reuse the transport");
         endpoint
             .transport_for(
+                default_factory.clone(),
+                "https://example.com/models?a=2".to_string(),
+            )
+            .await
+            .expect("a new URL with the same route should reuse the client");
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        endpoint
+            .transport_for(
                 HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
                 "https://example.com/models?a=1".to_string(),
             )
@@ -670,7 +719,7 @@ mod tests {
                 "https://example.com/models?a=2".to_string(),
             )
             .await
-            .expect("changed URL should rebuild the transport");
+            .expect("changed factory should rebuild the pool");
 
         assert_eq!(build_count.load(Ordering::SeqCst), 3);
     }
@@ -691,8 +740,7 @@ mod tests {
             model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
-            transport_builder: Arc::new(RouteAwareModelsTransportBuilder),
-            transport_cache: Mutex::new(None),
+            transport_builder: Arc::new(RouteAwareModelsTransportBuilder::default()),
         };
 
         let result = endpoint
@@ -739,10 +787,10 @@ mod tests {
             provider_info: ModelProviderInfo::create_openai_provider(None),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
+                inner: RouteAwareModelsTransportBuilder::default(),
                 observed_request: Arc::new(Mutex::new(None)),
                 build_count: build_count.clone(),
             }),
-            transport_cache: Mutex::new(None),
         };
         let result = endpoint
             .list_models_conditional(

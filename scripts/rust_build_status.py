@@ -1618,7 +1618,7 @@ def _guard_named_runner_args(command: Sequence[str]) -> None:
             filters = list(args.filter_args)
             if filters[:1] == ["--"]:
                 filters = filters[1:]
-            filters, _, _, _ = rust_test_runner._split_runner_owned_options(filters)
+            filters = rust_test_runner._split_runner_owned_options(filters)[0]
             rust_test_runner.validate_filtering_args(filters)
     except rust_test_runner.RunnerError as exc:
         raise ValueError(str(exc)) from exc
@@ -2819,8 +2819,13 @@ def prune_stale_lanes_report(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Inspect local Rust build health.")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser(
+    doctor_parser = subparsers.add_parser(
         "doctor", help="Show local Rust build environment and contention."
+    )
+    doctor_parser.add_argument(
+        "--include-disk",
+        action="store_true",
+        help="Also scan target disk usage; omitted by default for fast readiness checks.",
     )
     subparsers.add_parser("lanes", help="Show active/stale Cargo target lanes.")
     disk_parser = subparsers.add_parser(
@@ -2882,7 +2887,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "doctor":
-            print(build_doctor_report())
+            print(build_doctor_report(include_disk=args.include_disk))
         elif args.command == "lanes":
             print(lane_report())
         elif args.command == "disk":

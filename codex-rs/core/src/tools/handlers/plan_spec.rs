@@ -41,13 +41,13 @@ pub fn create_update_plan_tool() -> ToolSpec {
                 ),
                 (
                     "reason".to_string(),
-                    JsonSchema::string(Some("Proposed retirement reason. Cite the accepted user instruction when claiming a scope change. Model-authored prose is not authorization; the original obligation remains unresolved.".to_string())),
+                    JsonSchema::string(Some("Proposed retirement reason. Model-authored prose alone is not authorization; use scope_change_instructions to ground a user-authorized retirement.".to_string())),
                 ),
             ]),
             Some(vec!["step_id".to_string(), "reason".to_string()]),
             Some(false.into()),
         ),
-        Some("Proposed checklist removals, recorded with justification in the explanation and durable lineage without retiring original obligations. Each unfinished step removed must be continued or listed here, or nothing changes.".to_string()),
+        Some("Checklist removals recorded in durable lineage; ungrounded proposals leave original obligations unresolved. Each unfinished step removed must be continued or listed here, or nothing changes.".to_string()),
     );
     let mut status_updates = JsonSchema::array(
         JsonSchema {
@@ -88,7 +88,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
             ..JsonSchema::object(
             BTreeMap::from([
                 ("expected_revision".to_string(), JsonSchema::string(Some(
-                    "Revision from the last update_plan result or conflict reconciliation. Checked atomically before any change; required when replacing an existing plan and for index-based updates. Stable-ID status deltas do not require it.".into()
+                    "Revision from the last update_plan result or conflict reconciliation. Checked atomically before any change. A replacement may omit it only if the plan has not changed since this sampling step began; otherwise reconcile and supply it. Index-based updates always require it. Stable-ID deltas may instead use expected_step_revisions.".into()
                 ))),
                 (
                     "explanation".to_string(),
@@ -99,6 +99,19 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     JsonSchema::array(revision_item, Some("Complete task checklist, replacing the previous plan. Preserve the user's acceptance criteria; rewriting a step does not complete its old obligations, so carry each removed unfinished step forward with continues or drop it with superseded. A completed checklist is not proof that the request is satisfied.".to_string())),
                 ),
                 ("set".to_string(), status_updates),
+                ("expected_step_revisions".to_string(), JsonSchema {
+                    description: Some("Full step ID to its last observed lineage.step_revisions value (absent means zero). Protects independent status deltas without a whole-plan conflict. Required for changing an already revised step unless expected_revision is supplied; same-status retries and initial legacy steps remain compatible.".into()),
+                    ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema {
+                        minimum: Some(0.into()), ..JsonSchema::integer(None)
+                    }.into()))
+                }),
+                ("resolve".to_string(), JsonSchema::array(JsonSchema::string(None), Some(
+                    "Original requirement IDs whose acceptance scope is now fully satisfied. Use in the same update as completing renamed/split/merged descendants; every mapped descendant must be completed. This is explicit checklist accounting, never test evidence. Newly introduced step text remains an independent obligation.".into()
+                ))),
+                ("scope_change_instructions".to_string(), JsonSchema {
+                    description: Some("Superseded step/orphan ID to the exact complete text of a currently accepted user input authorizing that scope change. The host verifies user-input provenance, not your interpretation; a reason or tool/context quote alone cannot retire scope. Omit for unverified proposals.".into()),
+                    ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::string(None).into()))
+                }),
                 ("superseded".to_string(), superseded),
                 ("workflow".to_string(), JsonSchema {
                     description: Some("Optional map of at most 128 stable step IDs to existing task-coordinator assignment IDs in this root session. Dependencies and capabilities are resolved by the host; checklist order does not schedule execution.".to_string()),
@@ -117,22 +130,29 @@ pub fn create_update_plan_tool() -> ToolSpec {
             "properties": {
                 "obligations": {
                     "type": "object",
-                    "description": "Model-declared checklist accounting, not verified requirement completion. Continuations do not establish equivalent scope; proposed supersessions remain unresolved. Reconcile original acceptance scope against evidence and accepted user instructions during this update; counts do not authorize stopping or overriding legitimate scope changes.",
+                    "description": "Model-declared checklist accounting, not verified requirement completion. Continuations do not establish equivalent scope; ungrounded supersessions remain unresolved. Reconcile original acceptance scope against evidence and accepted user instructions; counts do not authorize stopping or overriding scope changes.",
                     "properties": {
                         "completed": { "type": "integer", "minimum": 0 },
-                        "superseded": { "type": "integer", "minimum": 0, "description": "Authorized retirements only; currently zero because this format stores no accepted-instruction authorization." },
+                        "superseded": { "type": "integer", "minimum": 0, "description": "Declared retirements grounded in host-accepted user input. The source is verified, not the semantic interpretation or task completion." },
                         "unresolved": { "type": "array", "items": { "type": "string" } }
                     },
                     "required": ["completed", "superseded", "unresolved"],
                     "additionalProperties": false
                 },
                 "completion_authority": { "const": "checklist_only", "description": "Model-declared checklist state, not a deliverable publication receipt or host confirmation that the task is complete. A final result must still be published." },
+                "lineage_complete": { "type": "boolean", "description": "False for active model projections; full historical lineage remains in durable plan snapshots." },
                 "revision": { "type": "string", "description": "Content revision for optimistic concurrency; preserved across resume." },
                 "step_ids": { "type": "array", "items": { "type": "string" }, "description": "Stable step IDs in current plan order." },
                 "lineage": {
                     "type": "object",
                     "description": "Persistent original requirements, independent of checklist wording; supersession records survive subsequent updates and resume. Printed results omit entries restating their sole current step (same ID, text and status).",
                     "properties": {
+                        "resolved_requirements": { "type": "array", "items": { "type": "string" } },
+                        "step_revisions": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+                        "accepted_supersessions": { "type": "object", "additionalProperties": {
+                            "type": "object", "properties": { "turn_id": { "type": "string" }, "sha256": { "type": "string" } },
+                            "required": ["turn_id", "sha256"], "additionalProperties": false
+                        } },
                         "workflow": {
                             "type": "object",
                             "description": "Stable step ID to existing task-coordinator node. Dependencies and capabilities are host-resolved; list order never schedules execution.",

@@ -57,14 +57,14 @@ pub(crate) struct ExecProcessEventLog {
 
 struct ExecProcessEventLogInner {
     history: StdMutex<ExecProcessEventHistory>,
-    live_tx: broadcast::Sender<ExecProcessEvent>,
+    live_tx: broadcast::Sender<Arc<ExecProcessEvent>>,
     event_capacity: usize,
     byte_capacity: usize,
 }
 
 #[derive(Default)]
 struct ExecProcessEventHistory {
-    events: VecDeque<ExecProcessEvent>,
+    events: VecDeque<Arc<ExecProcessEvent>>,
     retained_bytes: usize,
 }
 
@@ -109,13 +109,16 @@ impl ExecProcessEventLog {
     }
 
     pub(crate) fn publish(&self, event: ExecProcessEvent) {
+        // Keep byte copies out of the history and broadcast locks. Consumers
+        // still receive owned events, materialized after releasing those locks.
+        let event = Arc::new(event);
         let mut history = self
             .inner
             .history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         history.retained_bytes += event.retained_len();
-        history.events.push_back(event.clone());
+        history.events.push_back(Arc::clone(&event));
         while history.events.len() > self.inner.event_capacity
             || history.retained_bytes > self.inner.byte_capacity
         {
@@ -148,9 +151,9 @@ impl ExecProcessEventLog {
 }
 
 pub struct ExecProcessEventReceiver {
-    replay: VecDeque<ExecProcessEvent>,
-    live_rx: broadcast::Receiver<ExecProcessEvent>,
-    _keepalive: Option<broadcast::Sender<ExecProcessEvent>>,
+    replay: VecDeque<Arc<ExecProcessEvent>>,
+    live_rx: broadcast::Receiver<Arc<ExecProcessEvent>>,
+    _keepalive: Option<broadcast::Sender<Arc<ExecProcessEvent>>>,
 }
 
 impl ExecProcessEventReceiver {
@@ -174,10 +177,10 @@ impl ExecProcessEventReceiver {
     /// gap or truncated initial replay means earlier history may be missing.
     pub async fn recv(&mut self) -> Result<ExecProcessEvent, broadcast::error::RecvError> {
         if let Some(event) = self.replay.pop_front() {
-            return Ok(event);
+            return Ok(Arc::unwrap_or_clone(event));
         }
 
-        self.live_rx.recv().await
+        self.live_rx.recv().await.map(Arc::unwrap_or_clone)
     }
 }
 
@@ -229,6 +232,39 @@ mod tests {
     use super::ExecProcessEventReceiver;
     use crate::protocol::ExecOutputStream;
     use crate::protocol::ProcessOutputChunk;
+
+    #[tokio::test]
+    async fn event_replay_and_live_delivery_preserve_owned_bytes() {
+        let log = ExecProcessEventLog::new(2, 32);
+        let output = |seq, byte| {
+            ExecProcessEvent::Output(ProcessOutputChunk {
+                seq,
+                stream: ExecOutputStream::Stdout,
+                chunk: vec![byte; 4].into(),
+            })
+        };
+        log.publish(output(1, 1));
+        let mut first = log.subscribe();
+        let mut second = log.subscribe();
+        let mut event = first.recv().await.unwrap();
+        if let ExecProcessEvent::Output(chunk) = &mut event {
+            chunk.chunk.0[0] = 99;
+        }
+        assert_eq!(second.recv().await.unwrap(), output(1, 1));
+        log.publish(output(2, 2));
+        assert_eq!(first.recv().await.unwrap(), output(2, 2));
+        assert_eq!(second.recv().await.unwrap(), output(2, 2));
+        log.publish(output(3, 3));
+        log.publish(output(4, 4));
+        log.publish(output(5, 5));
+        assert!(matches!(
+            first.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+        ));
+        let mut replay = log.subscribe();
+        assert_eq!(replay.recv().await.unwrap(), output(4, 4));
+        assert_eq!(replay.recv().await.unwrap(), output(5, 5));
+    }
 
     #[tokio::test]
     async fn empty_event_receiver_stays_open() {

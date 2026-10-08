@@ -875,18 +875,36 @@ impl ApplyPatchToolOutput {
                         ("update", move_path.as_ref())
                     }
                 };
+                // Successful known additions already appear in the submitted
+                // patch. Add-overwrites retain the diff of displaced content.
+                if success && delta.is_exact() && matches!(&applied.change,
+                    AppliedPatchFileChange::Add { overwritten_content: None, .. })
+                {
+                    return serde_json::json!({
+                        "path": applied.path, "kind": kind, "move_path": move_path,
+                    });
+                }
                 // Hunk +coordinates refer to the committed post-edit source,
                 // not the proposed patch or a later filesystem read.
-                let unified_diff = diff.unified_diff().context_radius(3).to_string();
+                let mut unified_diff = diff.unified_diff().context_radius(3).to_string();
+                let headers_only = success && delta.is_exact() && kind == "update";
+                if headers_only {
+                    unified_diff = unified_diff.split_inclusive('\n')
+                        .filter(|line| line.starts_with("@@ ")).collect();
+                }
                 let limit = remaining_diff_bytes.min(8 * 1024);
                 let end = unified_diff.floor_char_boundary(limit.min(unified_diff.len()));
                 remaining_diff_bytes -= end;
-                serde_json::json!({
+                let mut change = serde_json::json!({
                     "path": applied.path, "kind": kind, "move_path": move_path,
                     "unified_diff": &unified_diff[..end],
                     "diff_complete": end == unified_diff.len(),
                     "diff_bytes": unified_diff.len(),
-                })
+                });
+                if headers_only {
+                    change["diff_format"] = "hunk_headers".into();
+                }
+                change
             })
             .collect();
         Self {
@@ -1441,6 +1459,7 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn semantic_evidence_for_command_output(raw_output: &[u8]) -> Vec<String> {
     let Ok(output) = std::str::from_utf8(raw_output) else {
         return canonical_output_evidence(raw_output);
@@ -1609,7 +1628,7 @@ pub(crate) fn successful_command_evidence(raw_output: &[u8], command: Option<&st
         crate::validation::classify_validation_script(command),
         crate::validation::ValidationClassification::Validation { .. }
     )) {
-        semantic_evidence_for_command_output(raw_output)
+        validation_diagnostic_evidence(raw_output)
     } else {
         canonical_output_evidence(raw_output)
     }
@@ -1630,10 +1649,19 @@ pub(crate) fn failed_command_evidence(raw_output: &[u8], command: Option<&str>) 
     if command.is_some_and(|command| matches!(
         crate::validation::classify_validation_script(command),
         crate::validation::ValidationClassification::Validation { .. }
-    )) && let Ok(text) = std::str::from_utf8(raw_output) {
-        return canonical_output_evidence(normalize_tool_failure_text(text).as_bytes());
+    )) {
+        return validation_diagnostic_evidence(raw_output);
     }
     canonical_output_evidence(raw_output)
+}
+
+// Validation success does not make diagnostic owners or source whitespace
+// disposable. Share the failure path's conservative framing normalization.
+fn validation_diagnostic_evidence(raw_output: &[u8]) -> Vec<String> {
+    match std::str::from_utf8(raw_output) {
+        Ok(text) => canonical_output_evidence(normalize_tool_failure_text(text).as_bytes()),
+        Err(_) => canonical_output_evidence(raw_output),
+    }
 }
 
 fn test_failure_evidence(raw_output: &[u8]) -> Option<Vec<String>> {
@@ -1734,6 +1762,7 @@ fn command_failure_signature(semantic_evidence: &[String], exit_code: Option<i32
     )
 }
 
+#[cfg(test)]
 fn normalize_semantic_fact_line(line: &str, compiler_framing: bool) -> Option<String> {
     let mut line = line.trim();
     if line.is_empty() || (compiler_framing && is_compiler_location_line(line)) {
@@ -1775,38 +1804,57 @@ fn normalize_command_diagnostic_line(line: &str) -> String {
             r"(?P<suffix>\s+(?:TRACE|DEBUG|INFO|WARN|ERROR|trace|debug|info|warn|error)\b.*)$"
         )).expect("valid diagnostic log prefix regex")
     });
-    let line = RUNNER_DURATION.replace(line, "${prefix}<time>${suffix}");
-    LOG_TIMESTAMP.replace(&line, "${prefix}<time>${suffix}").into_owned()
+    let trimmed = line.trim_start();
+    let runner = trimmed.starts_with("test result: ") || trimmed.starts_with("Finished ")
+        || trimmed.starts_with("Summary [") || trimmed.starts_with('=')
+        || trimmed.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    let timestamp = trimmed.as_bytes().get(4) == Some(&b'-')
+        && trimmed.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    let line = if runner { RUNNER_DURATION.replace(line, "${prefix}<time>${suffix}") }
+        else { std::borrow::Cow::Borrowed(line) };
+    if timestamp { LOG_TIMESTAMP.replace(&line, "${prefix}<time>${suffix}").into_owned() }
+        else { line.into_owned() }
 }
 
-/// Remove volatile diagnostics, not substantive counts or error messages.
-/// Shared by tool-error and stop-hook fingerprinting; command output uses
-/// producer-specific framing above so source data retains its timing values.
+/// Stop-hook claims may contain measurements, deadlines and timestamps. Only
+/// recognizable diagnostic framing is volatile, not arbitrary temporal values.
 pub(crate) fn normalize_observation_text(text: &str) -> String {
-    static VOLATILE: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
-        regex_lite::Regex::new(concat!(
-            r"(?ix)\b(?:",
-            r"\d{4}-\d{2}-\d{2}[T\x20]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?",
-            r"|\d{2}:\d{2}:\d{2}(?:\.\d+)?",
-            r"|\d+(?:\.\d+)?\s*(?:ns|us|µs|ms|seconds?|secs?|s|minutes?|mins?|hours?|hrs?)\b",
-            r")"
-        )).expect("valid diagnostic normalization regex")
-    });
-    VOLATILE.replace_all(text, "<time>").into_owned()
+    normalize_tool_failure_text(text)
 }
 
 pub(crate) fn normalize_tool_failure_text(text: &str) -> String {
-    static LOCATION: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
-        regex_lite::Regex::new(r"(?m)^(?P<owner>\s*(?:--> |at )?[^\r\n]*\.(?:rs|py|js|ts|tsx|jsx|c|cpp|h|java)):\d+(?::\d+)?")
-            .expect("valid diagnostic location regex")
-    });
-    let normalized = text.split_inclusive('\n').map(|line| {
+    let mut normalized = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
         let (body, newline) = line.strip_suffix('\n').map_or((line, ""), |body| (body, "\n"));
-        format!("{}{newline}", normalize_command_diagnostic_line(body))
-    }).collect::<String>();
-    LOCATION.replace_all(&normalized, "${owner}:<location>").into_owned()
+        let body = normalize_command_diagnostic_line(body);
+        // Preserve diagnostic ownership, replacing only numeric coordinates.
+        // A linear scan avoids the greedy multiline regex's backtracking on
+        // long source/log lines, and never collapses ordinary numeric facts.
+        let location = body.rmatch_indices(':').find_map(|(start, _)| {
+            let owner = &body[..start];
+            if ![".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".c", ".cpp", ".h", ".java"]
+                .iter().any(|extension| owner.ends_with(extension)) { return None; }
+            let bytes = body.as_bytes();
+            let mut end = start + 1;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; }
+            if end == start + 1 { return None; }
+            if bytes.get(end) == Some(&b':') && bytes.get(end + 1).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+                while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; }
+            }
+            Some(start..end)
+        });
+        if let Some(location) = location {
+            normalized.push_str(&body[..location.start]);
+            normalized.push_str(":<location>");
+            normalized.push_str(&body[location.end..]);
+        } else { normalized.push_str(&body); }
+        normalized.push_str(newline);
+    }
+    normalized
 }
 
+#[cfg(test)]
 fn is_compiler_location_line(line: &str) -> bool {
     line.trim_start()
         .strip_prefix("--> ")
@@ -1814,6 +1862,7 @@ fn is_compiler_location_line(line: &str) -> bool {
         .is_some()
 }
 
+#[cfg(test)]
 fn is_compiler_marker_line(line: &str) -> bool {
     let marker = line.strip_prefix('|').unwrap_or(line).trim();
     !marker.is_empty()
@@ -1822,6 +1871,7 @@ fn is_compiler_marker_line(line: &str) -> bool {
             .all(|character| matches!(character, '^' | '-' | '_' | '~'))
 }
 
+#[cfg(test)]
 fn strip_location_prefix(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     for (index, byte) in bytes.iter().enumerate() {
@@ -1845,6 +1895,7 @@ fn strip_location_prefix(line: &str) -> Option<&str> {
     None
 }
 
+#[cfg(test)]
 fn looks_like_source_path(prefix: &str) -> bool {
     let prefix = prefix.trim().to_ascii_lowercase();
     if prefix.contains("://") {
@@ -1864,6 +1915,7 @@ fn looks_like_source_path(prefix: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 fn is_common_source_extension(extension: &str) -> bool {
     matches!(
         extension,
@@ -1912,6 +1964,7 @@ fn is_common_source_extension(extension: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn is_git_diff_metadata(line: &str) -> bool {
     [
         "Binary files ",
@@ -2048,12 +2101,9 @@ pub(crate) fn attach_command_validation(
     let failed = exit_code != Some(0);
     let evidence = if failed {
         validation.is_test().then(|| test_failure_evidence(raw_output)).flatten()
-            .unwrap_or_else(|| match std::str::from_utf8(raw_output) {
-                Ok(text) => canonical_output_evidence(normalize_tool_failure_text(text).as_bytes()),
-                Err(_) => canonical_output_evidence(raw_output),
-            })
+            .unwrap_or_else(|| validation_diagnostic_evidence(raw_output))
     } else {
-        semantic_evidence_for_command_output(raw_output)
+        validation_diagnostic_evidence(raw_output)
     };
     signal["semantic_evidence"] = serde_json::json!(evidence);
     if validation.is_test()
@@ -2116,7 +2166,9 @@ impl ExecCommandToolOutput {
         let retained = artifact_bytes?;
         if self.raw_output.is_empty() { return None; }
         let bytes_selector = |start: u64, end: u64| {
-            let end = end.min(retained).min(start.saturating_add(4096));
+            // Describe the whole known gap. The recovery reader owns payload
+            // limits and continuation; clipping here loses its remaining scope.
+            let end = end.min(retained);
             (start < end).then(|| serde_json::json!({"kind":"bytes", "start":start, "end":end}))
         };
         if let Some(ranges) = &self.output_ranges {

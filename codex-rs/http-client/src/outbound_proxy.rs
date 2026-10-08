@@ -540,7 +540,7 @@ fn resolve_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProx
 }
 
 fn resolve_system_proxy_with(
-    cache: &Mutex<HashMap<String, CachedSystemProxyDecision>>,
+    cache: &Mutex<HashMap<[u8; 32], CachedSystemProxyDecision>>,
     resolution_lock: &Mutex<()>,
     request_url: &str,
     origin: &RequestOrigin,
@@ -610,7 +610,7 @@ struct CachedSystemProxyDecision {
     expires_at: Instant,
 }
 
-static SYSTEM_PROXY_CACHE: OnceLock<Mutex<HashMap<String, CachedSystemProxyDecision>>> =
+static SYSTEM_PROXY_CACHE: OnceLock<Mutex<HashMap<[u8; 32], CachedSystemProxyDecision>>> =
     OnceLock::new();
 static SYSTEM_PROXY_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
 
@@ -626,8 +626,8 @@ fn cached_system_proxy_decision(request_url: &str) -> Option<SystemProxyDecision
 }
 
 fn cached_system_proxy_decision_from_cache(
-    cache: &mut HashMap<String, CachedSystemProxyDecision>,
-    cache_key: &str,
+    cache: &mut HashMap<[u8; 32], CachedSystemProxyDecision>,
+    cache_key: &[u8; 32],
     now: Instant,
 ) -> Option<SystemProxyDecision> {
     let cached = cache.get(cache_key)?;
@@ -655,8 +655,8 @@ pub fn cache_system_proxy_route_for_test(request_url: &str, proxy_url: String) {
 }
 
 fn insert_system_proxy_cache_entry(
-    cache: &mut HashMap<String, CachedSystemProxyDecision>,
-    cache_key: &str,
+    cache: &mut HashMap<[u8; 32], CachedSystemProxyDecision>,
+    cache_key: &[u8; 32],
     decision: SystemProxyDecision,
     now: Instant,
 ) {
@@ -673,12 +673,12 @@ fn insert_system_proxy_cache_entry(
         && let Some(cache_key_to_evict) = cache
             .iter()
             .min_by_key(|(_, cached)| cached.expires_at)
-            .map(|(cache_key, _)| cache_key.clone())
+            .map(|(cache_key, _)| *cache_key)
     {
         cache.remove(&cache_key_to_evict);
     }
     cache.insert(
-        cache_key.to_string(),
+        *cache_key,
         CachedSystemProxyDecision {
             decision,
             expires_at: now + ttl,
@@ -686,12 +686,14 @@ fn insert_system_proxy_cache_entry(
     );
 }
 
-fn system_proxy_cache_key(request_url: &str) -> String {
+fn system_proxy_cache_key(request_url: &str) -> [u8; 32] {
     // Keep URL-specific PAC decisions without retaining the raw routed URL.
+    // The cache is process-local: hexadecimal encoding only adds an allocation
+    // and doubles the hashed key bytes on every warm lookup.
     let mut hasher = Sha256::new();
     hasher.update(b"system-proxy-cache-v1\0");
     hasher.update(request_url.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher.finalize().into()
 }
 
 fn no_proxy_matches_origin(no_proxy: &str, origin: &RequestOrigin) -> bool {

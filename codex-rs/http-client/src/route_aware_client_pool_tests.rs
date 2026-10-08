@@ -19,6 +19,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use super::*;
 use crate::OutboundProxyPolicy;
 
+#[path = "connection_benchmarks.rs"]
+mod connection_benchmarks;
+
 #[test]
 fn request_builder_debug_redacts_url_secrets() {
     let pool = RouteAwareClientPool::new(
@@ -804,5 +807,37 @@ async fn post_redirect_drops_default_body_headers() {
     for header in ["content-type:", "content-encoding:", "content-length:"] {
         assert!(requests[0].contains(header));
         assert!(!requests[1].contains(header));
+    }
+}
+
+#[tokio::test]
+#[ignore = "local cold versus warm pool selection benchmark"]
+async fn latency_edge_benchmark() {
+    let mut cold_us = Vec::new();
+    let mut warm_us = Vec::new();
+    for _ in 0..7 {
+        let pool = RouteAwareClientPool::new(
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault), ClientRouteClass::Api);
+        let start = Instant::now();
+        let (_, first) = pool.client_for_url_with_resolver("https://localhost/responses",
+            |_| async { Ok(OutboundProxyRoute::Direct) }).await.unwrap();
+        cold_us.push(start.elapsed().as_micros());
+        let start = Instant::now();
+        for _ in 0..100 {
+            let (_, next) = pool.client_for_url_with_resolver("https://localhost/responses",
+                |_| async { Ok(OutboundProxyRoute::Direct) }).await.unwrap();
+            assert!(first.shares_transport_with(&next));
+        }
+        warm_us.push(start.elapsed().as_micros() / 100);
+        assert_eq!(pool.cached_route_count(), 1);
+    }
+    cold_us.sort_unstable();
+    warm_us.sort_unstable();
+    let result = format!("latency_edge pool: samples=7 cold_median_us={} warm_median_us={} cold_us={cold_us:?} warm_us={warm_us:?}\n", cold_us[3], warm_us[3]);
+    eprint!("{result}");
+    if let Some(path) = std::env::var_os("KD4_TRANSPORT_EDGE_OUTPUT") {
+        use std::io::Write;
+        std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
+            .write_all(result.as_bytes()).unwrap();
     }
 }

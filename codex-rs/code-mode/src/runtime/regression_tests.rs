@@ -12,6 +12,114 @@ use tokio::sync::mpsc;
 
 use super::*;
 
+#[tokio::test]
+async fn python_string_index_error_has_a_javascript_hint() {
+    for (source, hinted) in [
+        ("const base = 'abc'; base.index('b');", true),
+        ("const base = 'abc'; base.missing('b');", false),
+        ("throw new Error('base.index is not a function');", false),
+    ] {
+        let (_tx, _termination, mut rx) = start(source).await;
+        let RuntimeEvent::Result { error_text: Some(error), .. } = next(&mut rx).await else {
+            panic!("expected the original JavaScript error");
+        };
+        assert!(error.contains("is not a function"));
+        assert!(error.contains("exec_main.mjs"), "stack preserved: {error}");
+        assert_eq!(error.contains("Hint: JavaScript strings use .indexOf(value)"), hinted);
+        closed(&mut rx).await;
+    }
+}
+
+#[test]
+fn critical_path_resolver_benchmark() {
+    let catalog = EnabledToolCatalog::new((0..512).map(|index| EnabledToolMetadata {
+        global_name: format!("ns__tool_{index}"),
+        tool_name: ToolName::new(Some("ns".into()), format!("tool_{index}")),
+        description: "".into(), kind: CodeModeToolKind::Function, default_timeout_ms: None,
+    }).collect()).unwrap();
+    for query in ["ns__tool_511", "ns.tool_511", "missing"] {
+        let started = std::time::Instant::now();
+        for _ in 0..20_000 {
+            let result = catalog.resolve_requested_name(std::hint::black_box(query));
+            assert_eq!(result, if query == "missing" { None } else { Some(511) });
+        }
+        eprintln!("critical_path_resolver query={query} calls=20000 elapsed_us={}", started.elapsed().as_micros());
+    }
+}
+
+#[test]
+fn affordance_resolver_preserves_all_alias_collisions_without_formatting() {
+    let tool = |global: &str, namespace: Option<&str>, name: &str| EnabledToolMetadata {
+        global_name: global.into(), tool_name: ToolName::new(namespace.map(str::to_owned), name),
+        description: "".into(), kind: CodeModeToolKind::Function, default_timeout_ms: None,
+    };
+    let catalog = EnabledToolCatalog::new(vec![
+        tool("first", Some("a"), "run"),
+        tool("a__run", Some("b"), "run"),
+        tool("third", Some("a"), "run"),
+        tool("plain", None, "plain"),
+        tool("unicode", Some("命名"), "读取"),
+    ]).unwrap();
+    for query in ["first", "a.run", "a__run", "b.run", "b__run", "run", "missing", "plain", "命名.读取", "命名__读取"] {
+        let mut original = catalog.tools.iter().enumerate().filter(|(_, tool)| {
+            tool.global_name == query || tool.tool_name.to_string() == query
+                || query.split_once('.').is_some_and(|(namespace, name)| {
+                    tool.tool_name.namespace.as_deref() == Some(namespace) && tool.tool_name.name == name
+                })
+        });
+        let expected = original.next().map(|(index, _)| index).filter(|_| original.next().is_none());
+        assert_eq!(catalog.resolve_requested_name(query), expected, "{query}");
+    }
+    assert_eq!(catalog.resolve_requested_name("a.run"), None);
+    assert_eq!(catalog.resolve_requested_name("a__run"), None);
+    assert_eq!(catalog.resolve_requested_name("plain"), Some(3));
+}
+
+#[test]
+fn critical_path_index_preserves_dotted_names_and_ambiguous_aliases() {
+    let catalog = EnabledToolCatalog::new([
+        ("first", Some("a.b"), "run"),
+        ("second", Some("a"), "b.run"),
+        ("third", None, "a.b.run"),
+        ("fourth", Some(""), "read"),
+        ("fifth", Some("a__b"), "read"),
+    ].into_iter().map(|(global, namespace, name)| EnabledToolMetadata {
+        global_name: global.into(), tool_name: ToolName::new(namespace.map(str::to_owned), name),
+        description: "".into(), kind: CodeModeToolKind::Function, default_timeout_ms: None,
+    }).collect()).unwrap();
+    for query in ["a.b.run", "a.b__run", "a__b.run", "a__b__read", "a__b.read", ".read", "__read", "missing", "first"] {
+        let mut matches = catalog.tools.iter().enumerate().filter(|(_, tool)| {
+            tool.global_name == query || tool.tool_name.to_string() == query
+                || query.split_once('.').is_some_and(|(namespace, name)| {
+                    tool.tool_name.namespace.as_deref() == Some(namespace) && tool.tool_name.name == name
+                })
+        });
+        let expected = matches.next().map(|(index, _)| index).filter(|_| matches.next().is_none());
+        assert_eq!(catalog.resolve_requested_name(query), expected, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn critical_path_lazy_aliases_preserve_metadata_and_canonical_identity() {
+    let (_tx, _termination, mut rx) = start_with_tool(r#"
+        if (!Object.keys(tools).includes('ns__read')) throw Error('enumeration');
+        const original = resolve_tool('ns.read');
+        if (original !== tools.ns.read || original !== tools.ns__read) throw Error('identity');
+        const metadata = JSON.parse(JSON.stringify(original));
+        if (metadata.name !== 'ns__read' || metadata.description !== 'description') throw Error('metadata');
+        tools.ns__read = () => 'replacement'; delete tools.ns.read;
+        if (resolve_tool('ns.read') !== original || tools.ns__read() !== 'replacement') throw Error('mutation');
+        text('lazy alias contracts passed');
+    "#, ToolDefinition {
+        name: "ns__read".into(), tool_name: ToolName::new(Some("ns".into()), "read"),
+        kind: CodeModeToolKind::Function, description: "description".into(), input_schema: None,
+        output_schema: None, default_timeout_ms: None,
+    }).await;
+    assert_eq!(text(next(&mut rx).await), "lazy alias contracts passed");
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result { error_text: None, .. }));
+    closed(&mut rx).await;
+}
+
 async fn start(source: &str) -> (std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle, mpsc::UnboundedReceiver<RuntimeEvent>) {
     start_with_tool(source, ToolDefinition {
         name: "sample_tool".to_string(),
@@ -346,6 +454,62 @@ async fn stored_loads_are_independent_and_replacement_invalidates_serialization(
     assert_eq!(text(next(&mut rx).await), "replacement");
     let RuntimeEvent::Result { error_text, .. } = next(&mut rx).await else { panic!("result"); };
     assert_eq!(error_text, None);
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn actionability_caught_graph_errors_keep_each_live_handle() {
+    let (_tx, _termination, mut rx) = start(r#"
+        const error = await run_graph(Array.from({length:8}, (_, i) => ({id:`node-${i}`,
+            run:()=>({output:'evidence'.repeat(1500), session_id:100+i,
+                session_capabilities:{incarnation:`inc-${i}`,polling:true}, execution_state:'running'}),
+            accept:()=>false}))).catch(error=>error);
+        text(error);
+        text(Object.values(error.results).every(row=>row.value.output.length === 12000));
+    "#).await;
+    let printed = text(next(&mut rx).await);
+    assert!(printed.len() < 17_000);
+    let value: JsonValue = serde_json::from_str(&printed).unwrap();
+    for i in 0..8 {
+        let row = &value["results"][format!("node-{i}")];
+        assert_eq!(row["status"], "rejected");
+        assert_eq!(row["value"]["session_id"], 100 + i);
+        assert_eq!(row["value"]["session_capabilities"]["incarnation"], format!("inc-{i}"));
+        assert_eq!(row["value"]["execution_state"], "running");
+    }
+    assert_eq!(text(next(&mut rx).await), "true");
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result { error_text:None, .. }));
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn actionability_small_command_projection_keeps_dynamic_serialization() {
+    let (tx, _termination, mut rx) = start_with_tool(r#"
+        const r = await tools.exec_command({});
+        text(r);
+        Object.prototype.toJSON = function() { return this === r ? 'CUSTOM ROOT' : this; };
+        text(r);
+        delete Object.prototype.toJSON;
+        r.extra = {toJSON() { return 'CUSTOM FIELD'; }};
+        text(r);
+        delete r.extra;
+        text(r);
+    "#, ToolDefinition {name:"exec_command".into(), tool_name:ToolName::plain("exec_command"),
+        kind:CodeModeToolKind::Function, description:"".into(), input_schema:None,
+        output_schema:None, default_timeout_ms:None}).await;
+    let RuntimeEvent::ToolCall {id, ..} = next(&mut rx).await else { panic!("tool call"); };
+    let raw = json!({"output":"done", "stdout":"exact stdout", "stderr":"", "streams_complete":true,
+        "execution_state":"exited", "process_exited":true, "exit_code":0});
+    tx.send(RuntimeCommand::ToolResponse {id, result:raw.clone()}).unwrap();
+    let first = text(next(&mut rx).await);
+    assert_eq!(serde_json::from_str::<JsonValue>(&first).unwrap(),
+        codex_code_mode_protocol::model_visible_tool_result(&ToolName::plain("exec_command"), &raw).unwrap());
+    assert_eq!(text(next(&mut rx).await), "\"CUSTOM ROOT\"");
+    let custom: JsonValue = serde_json::from_str(&text(next(&mut rx).await)).unwrap();
+    assert_eq!(custom["extra"], "CUSTOM FIELD");
+    assert_eq!(custom["stdout"], "exact stdout");
+    assert_eq!(text(next(&mut rx).await), first);
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result {error_text:None, ..}));
     closed(&mut rx).await;
 }
 

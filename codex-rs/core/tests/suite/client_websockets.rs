@@ -483,6 +483,54 @@ async fn responses_websocket_preconnect_reuses_connection() {
     server.shutdown().await;
 }
 
+#[test_case::test_case(true; "handshake precedes request")]
+#[test_case::test_case(false; "request joins in flight handshake")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_turn_preconnect_is_owned_and_reused(wait_before_send: bool) {
+    require_network!();
+
+    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
+        requests: vec![
+            vec![ev_response_created("resp-1"), ev_completed("resp-1")],
+            vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+        ],
+        response_headers: Vec::new(),
+        accept_delay: Some(Duration::from_millis(150)),
+        close_after_requests: true,
+    }])
+    .await;
+    let harness = websocket_harness(&server).await;
+    let mut session = harness.client.new_session();
+    let metadata = websocket_connection_metadata(&harness);
+    for _ in 0..2 {
+        session.start_websocket_preconnect(
+            &harness.model_info,
+            None,
+            &harness.session_telemetry,
+            &metadata,
+        ).await;
+    }
+    if wait_before_send {
+        assert!(server.wait_for_handshakes(1, Duration::from_secs(5)).await);
+        assert!(server.connections().iter().all(Vec::is_empty));
+    }
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    stream_until_complete(&mut session, &harness, &prompt).await;
+    drop(session);
+
+    let mut next_turn = harness.client.new_session();
+    next_turn.start_websocket_preconnect(
+        &harness.model_info,
+        None,
+        &harness.session_telemetry,
+        &metadata,
+    ).await;
+    stream_until_complete(&mut next_turn, &harness, &prompt).await;
+    assert_eq!(server.handshakes().len(), 1);
+    assert_eq!(server.single_connection().len(), 2);
+    server.shutdown().await;
+}
+
 #[test_case::test_case(None, false; "model only")]
 #[test_case::test_case(Some("priority"), false; "supported tier")]
 #[test_case::test_case(Some("unsupported"), false; "unsupported tier omitted")]

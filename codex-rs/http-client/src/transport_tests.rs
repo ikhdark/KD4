@@ -8,12 +8,34 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
 #[tokio::test]
-async fn enabled_request_logging_emits_transport_url_and_body() {
+async fn transport_timing_scopes_are_isolated_and_cancel_safe() {
+    let first = capture_transport_timing(async {
+        record_response_header_time(Duration::from_secs(2));
+        tokio::task::yield_now().await;
+    });
+    let second = capture_transport_timing(async {
+        tokio::task::yield_now().await;
+        record_response_header_time(Duration::from_secs(7));
+    });
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(first.1.response_headers, Some(Duration::from_secs(2)));
+    assert_eq!(second.1.response_headers, Some(Duration::from_secs(7)));
+    let cancelled = tokio::time::timeout(Duration::from_millis(1), capture_transport_timing(async {
+        record_response_header_time(Duration::from_secs(99));
+        std::future::pending::<()>().await;
+    })).await;
+    assert!(cancelled.is_err());
+    assert!(capture_transport_timing(async {}).await.1.response_headers.is_none());
+}
+
+#[tokio::test]
+async fn enabled_request_logging_emits_body_size_not_contents() {
     let logs = capture_transport_logs(HttpClient::new(test_reqwest_client())).await;
 
     assert!(logs.contains("log capture sentinel"));
     assert!(logs.contains("url-secret"));
-    assert!(logs.contains("body-secret"));
+    assert!(logs.contains("<JSON body: 23 bytes>"));
+    assert!(!logs.contains("body-secret"));
 }
 
 #[tokio::test]
@@ -26,6 +48,30 @@ async fn disabled_request_logging_suppresses_transport_url_and_body() {
     assert!(logs.contains("log capture sentinel"));
     assert!(!logs.contains("url-secret"));
     assert!(!logs.contains("body-secret"));
+}
+
+#[test]
+fn request_body_trace_contains_only_sizes_for_all_body_representations() {
+    let request = Request::new(Method::POST, "https://example.com".into())
+        .with_json(&json!({"token": "body-secret"}));
+    assert_eq!(request_body_for_trace(&request), "<JSON body: 23 bytes>");
+    let encoded = request.clone().into_prepared().unwrap();
+    assert_eq!(request_body_for_trace(&encoded), "<encoded JSON body: 23 bytes>");
+    let compressed = request
+        .with_compression(crate::request::RequestCompression::Zstd)
+        .into_prepared()
+        .unwrap();
+    assert_eq!(
+        request_body_for_trace(&compressed),
+        format!("<encoded JSON body: {} bytes>", compressed.prepared_body_len().unwrap())
+    );
+    let mut raw = Request::new(Method::POST, "https://example.com".into())
+        .with_raw_body("body-secret");
+    assert_eq!(request_body_for_trace(&raw), "<raw body: 11 bytes>");
+    raw.body = Some(RequestBody::InvalidJson("body-secret".into()));
+    assert_eq!(request_body_for_trace(&raw), "<invalid JSON body>");
+    raw.body = None;
+    assert_eq!(request_body_for_trace(&raw), "");
 }
 
 #[tokio::test]

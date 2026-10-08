@@ -292,6 +292,7 @@ def build_doctor_report(
     snapshot: BuildStatusSnapshot | None = None,
     tool_lookup: Callable[[str], str | None] = shutil.which,
     env: Mapping[str, str] | None = None,
+    include_disk: bool = True,
     warn_bytes: int = DEFAULT_TARGET_WARN_BYTES,
     keep_warm_per_base: int = DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
     max_age_days: float | None = DEFAULT_PRUNE_MAX_AGE_DAYS,
@@ -357,11 +358,14 @@ def build_doctor_report(
             "active lanes: " + ", ".join(lane for lane in active_lanes if lane)
         )
 
-    lines.extend(
-        target_disk_report_lines(
-            repo_root=repo_root, warn_bytes=warn_bytes, snapshot=snapshot
+    if include_disk:
+        lines.extend(
+            target_disk_report_lines(
+                repo_root=repo_root, warn_bytes=warn_bytes, snapshot=snapshot
+            )
         )
-    )
+    else:
+        lines.append("target disk: not scanned (use `doctor --include-disk` or `disk`)")
     lines.extend(
         lane_report_lines(
             repo_root=repo_root,

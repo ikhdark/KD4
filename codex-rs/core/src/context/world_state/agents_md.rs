@@ -12,10 +12,16 @@ const REPLACEMENT_NOTICE: &str =
     "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.";
 
 /// The AGENTS.md instructions currently visible to the model.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct AgentsMdState {
     instructions: Option<UserInstructions>,
     freshness: AgentsMdFreshness,
+}
+
+impl Default for AgentsMdState {
+    fn default() -> Self {
+        Self::from_instructions(None, AgentsMdFreshness::Refreshed)
+    }
 }
 
 /// Persisted model-visible AGENTS.md state and the freshness of its filesystem observation.
@@ -53,6 +59,27 @@ impl AgentsMdState {
             }),
             freshness,
         )
+    }
+
+    /// Recover an accepted body after resume when the manager has no in-memory
+    /// fallback. Keep its original scope and persist it through full reinjection.
+    /// The closure is never evaluated on the normal successful-read path.
+    pub(crate) fn with_unavailable_fallback(
+        mut self,
+        previous: impl FnOnce() -> Option<serde_json::Value>,
+    ) -> Self {
+        if self.instructions.is_none() && self.freshness != AgentsMdFreshness::Refreshed
+            && let Some(previous) = previous()
+                .and_then(|value| serde_json::from_value::<AgentsMdSnapshot>(value).ok())
+            && let Some(body) = instruction_body(&previous)
+        {
+            self.instructions = Some(UserInstructions {
+                directory: previous.directory.clone(),
+                text: body.to_string(),
+            });
+            self.freshness = AgentsMdFreshness::CachedFallback;
+        }
+        self
     }
 
     fn from_instructions(
@@ -143,10 +170,17 @@ impl WorldStateSection for AgentsMdState {
             };
             return (previous.freshness != current.freshness).then(|| Box::new(
                 codex_context_fragments::RenderedContextFragment::new("developer", format!(
-                    "AGENTS.md observation changed: {} The previously provided instruction body is unchanged; this is not an instruction removal. No automatic retry is requested.",
+                    "<repository_observation>\nAGENTS.md observation changed: {} The previously provided instruction body is unchanged; this is not an instruction removal. No automatic retry is requested.\n</repository_observation>",
                     current.freshness.model_visible_description(),
                 )),
             ) as Box<dyn ContextualUserFragment>);
+        }
+
+        if self.instructions.is_none() && self.freshness != AgentsMdFreshness::Refreshed {
+            return Some(Box::new(codex_context_fragments::RenderedContextFragment::new(
+                "developer",
+                format!("<repository_observation>\nAGENTS.md observation unavailable: {} This is not an instruction removal. Previously accepted instructions retain their original scope; applicability to a new scope is unverified. No automatic retry is requested.\n</repository_observation>", self.freshness.model_visible_description()),
+            )));
         }
 
         let previous_may_contain_instructions = match previous {
@@ -164,17 +198,6 @@ impl WorldStateSection for AgentsMdState {
                 directory: None,
                 text: Self::REMOVAL_NOTICE.to_string(),
             },
-            (None, false) if self.freshness != AgentsMdFreshness::Refreshed => {
-                return Some(Box::new(
-                    codex_context_fragments::RenderedContextFragment::new(
-                        "developer",
-                        format!(
-                            "AGENTS.md observation unavailable: {} An empty result does not confirm that no instructions apply.",
-                            self.freshness.model_visible_description()
-                        ),
-                    ),
-                ));
-            }
             (None, false) => return None,
         };
         Some(Box::new(instructions))

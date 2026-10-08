@@ -279,6 +279,53 @@ class RolloutReportsTest(unittest.TestCase):
         self.assertNotIn("omitted-output-middle", output)
         self.assertIn("chars omitted", output)
 
+    def test_narrative_cli_help_and_argument_errors_do_not_write(self):
+        self.path.write_bytes(encode([record('session_meta', {'id': 'retained'})]))
+        before = {path.relative_to(self.root): path.read_bytes()
+                  for path in self.root.rglob('*') if path.is_file()}
+        cases = (
+            (['--help'], 0),
+            ([], 2),
+            (['reports'], 2),
+            (['reports', str(self.path), f'{self.path}@invalid'], 2),
+        )
+        for arguments, status in cases:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [sys.executable, '-B', str(Path(narrative.__file__)), *arguments],
+                    cwd=self.root, capture_output=True, encoding='utf-8', timeout=30,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertIn('usage:', result.stdout if status == 0 else result.stderr)
+                self.assertEqual(set(self.root.iterdir()), {self.path})
+                self.assertEqual(
+                    {path.relative_to(self.root): path.read_bytes()
+                     for path in self.root.rglob('*') if path.is_file()}, before,
+                )
+
+    def test_narrative_cli_preserves_multiple_inputs_and_start_index(self):
+        self.path.write_bytes(encode([
+            record('response_item', {'type': 'message', 'role': 'user',
+                                     'content': [{'text': 'first record'}]}),
+            record('response_item', {'type': 'message', 'role': 'assistant',
+                                     'content': [{'text': 'second record'}]}, 1),
+        ]))
+        result = subprocess.run(
+            [sys.executable, '-B', str(Path(narrative.__file__)), 'reports',
+             str(self.path), f'{self.path}@1'],
+            cwd=self.root, capture_output=True, encoding='utf-8', timeout=30,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        full = (self.root / 'reports' / 'rollout.narr.txt').read_text(encoding='utf-8')
+        suffix = (self.root / 'reports' / 'rollout.narr1.txt').read_text(encoding='utf-8')
+        self.assertIn('first record', full)
+        self.assertIn('second record', full)
+        self.assertNotIn('first record', suffix)
+        self.assertIn('second record', suffix)
+        self.assertEqual(result.stdout.count('wrote '), 2)
+
     def test_reader_rejects_interior_corruption_and_nonobjects_before_output(self):
         prefix = encode([record("session_meta", {})])
         for bad in (b"broken\n", b"[]\n", b"[]", b"\xff\n"):

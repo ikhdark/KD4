@@ -14,6 +14,7 @@ use crate::url::is_openai_compatible_base_url;
 use codex_core::config::Config;
 use codex_http_client::HttpClient;
 use codex_http_client::HttpClientBuilder;
+use codex_http_client::HttpResponse;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 #[cfg(test)]
@@ -41,10 +42,21 @@ impl OllamaClient {
     /// and verify that a local Ollama server is reachable. If no server is
     /// detected, returns an error with helpful installation/run instructions.
     pub async fn try_from_oss_provider(config: &Config) -> io::Result<Self> {
+        Self::try_from_provider(Self::oss_provider(config)?).await
+    }
+
+    /// Reuse the native health response as the initial listing, without caching later listings.
+    pub(crate) async fn try_from_oss_provider_with_models(
+        config: &Config,
+    ) -> io::Result<(Self, io::Result<Vec<String>>)> {
+        Self::try_from_provider_with_models(Self::oss_provider(config)?).await
+    }
+
+    fn oss_provider(config: &Config) -> io::Result<&ModelProviderInfo> {
         // Note that we must look up the provider from the Config to ensure that
         // any overrides the user has in their config.toml are taken into
         // account.
-        let provider = config
+        config
             .model_providers
             .get(OLLAMA_OSS_PROVIDER_ID)
             .ok_or_else(|| {
@@ -52,9 +64,7 @@ impl OllamaClient {
                     io::ErrorKind::NotFound,
                     format!("Built-in provider {OLLAMA_OSS_PROVIDER_ID} not found",),
                 )
-            })?;
-
-        Self::try_from_provider(provider).await
+            })
     }
 
     #[cfg(test)]
@@ -65,6 +75,27 @@ impl OllamaClient {
 
     /// Build a client from a provider definition and verify the server is reachable.
     pub(crate) async fn try_from_provider(provider: &ModelProviderInfo) -> io::Result<Self> {
+        let client = Self::from_provider(provider)?;
+        // Consume the health body so the connection can return to the pool.
+        let _ = client.probe_server().await?.bytes().await;
+        Ok(client)
+    }
+
+    async fn try_from_provider_with_models(
+        provider: &ModelProviderInfo,
+    ) -> io::Result<(Self, io::Result<Vec<String>>)> {
+        let client = Self::from_provider(provider)?;
+        let response = client.probe_server().await?;
+        let models = if client.uses_openai_compat {
+            let _ = response.bytes().await;
+            client.fetch_models().await
+        } else {
+            Self::models_from_response(response).await
+        };
+        Ok((client, models))
+    }
+
+    fn from_provider(provider: &ModelProviderInfo) -> io::Result<Self> {
         let base_url = provider.base_url.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -83,12 +114,11 @@ impl OllamaClient {
             uses_openai_compat,
             setup_timeout: SETUP_REQUEST_TIMEOUT,
         };
-        client.probe_server().await?;
         Ok(client)
     }
 
     /// Probe whether the server is reachable by hitting the appropriate health endpoint.
-    async fn probe_server(&self) -> io::Result<()> {
+    async fn probe_server(&self) -> io::Result<HttpResponse> {
         let url = if self.uses_openai_compat {
             format!("{}/v1/models", self.host_root.trim_end_matches('/'))
         } else {
@@ -117,7 +147,7 @@ impl OllamaClient {
                 }
             })?;
         if resp.status().is_success() {
-            Ok(())
+            Ok(resp)
         } else {
             tracing::warn!(
                 "Failed to probe server at {}: HTTP {}",
@@ -141,6 +171,10 @@ impl OllamaClient {
             .send()
             .await
             .map_err(io::Error::other)?;
+        Self::models_from_response(resp).await
+    }
+
+    async fn models_from_response(resp: HttpResponse) -> io::Result<Vec<String>> {
         if !resp.status().is_success() {
             return Err(io::Error::other(format!(
                 "failed to list models: HTTP {}",
@@ -323,6 +357,105 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn setup_reuses_native_listing_but_later_fetches_are_fresh() {
+        let server = wiremock::MockServer::start().await;
+        let listing = wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"models": [{"name": "installed:latest"}]}),
+            ))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let provider = create_oss_provider_with_base_url(&server.uri(), WireApi::Responses);
+        let (client, models) = OllamaClient::try_from_provider_with_models(&provider).await.unwrap();
+        assert_eq!(models.unwrap(), vec!["installed:latest"]);
+        drop(listing);
+        wiremock::Mock::given(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"models": [{"name": "new:latest"}]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(client.fetch_models().await.unwrap(), vec!["new:latest"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "narrow local setup round-trip benchmark"]
+    async fn setup_round_trip_benchmark() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(20))
+                .set_body_json(serde_json::json!({"models": [{"name": "installed"}]})))
+            .expect(30)
+            .mount(&server).await;
+        let provider = create_oss_provider_with_base_url(&server.uri(), WireApi::Responses);
+        let mut rows = Vec::new();
+        for combined in [false, true] {
+            let before = server.received_requests().await.unwrap().len();
+            let mut samples = Vec::new();
+            for _ in 0..10 {
+                let start = std::time::Instant::now();
+                let models = if combined {
+                    OllamaClient::try_from_provider_with_models(&provider).await.unwrap().1.unwrap()
+                } else {
+                    OllamaClient::try_from_provider(&provider).await.unwrap().fetch_models().await.unwrap()
+                };
+                assert_eq!(models, vec!["installed"]);
+                samples.push(start.elapsed().as_micros());
+            }
+            samples.sort_unstable();
+            let requests = server.received_requests().await.unwrap().len() - before;
+            assert_eq!(requests, if combined { 10 } else { 20 });
+            rows.push(serde_json::json!({"combined": combined, "samples": 10, "requests": requests, "median_us": samples[5]}));
+        }
+        let report = serde_json::to_string(&rows).unwrap();
+        eprintln!("ollama_setup_benchmark {report}");
+        if let Ok(path) = std::env::var("KD4_OLLAMA_BENCHMARK_OUTPUT")
+            && !path.is_empty()
+        {
+            std::fs::write(path, report).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_keeps_malformed_listing_distinct_from_missing_models() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"models": [{"missing_name": true}]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = create_oss_provider_with_base_url(&server.uri(), WireApi::Responses);
+        let (_, models) = OllamaClient::try_from_provider_with_models(&provider).await.unwrap();
+        assert_eq!(models.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn compat_setup_preserves_health_endpoint_and_native_names() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/v1/models"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"models": [{"name": "installed:latest"}]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+        let (_, models) = OllamaClient::try_from_provider_with_models(&provider).await.unwrap();
+        assert_eq!(models.unwrap(), vec!["installed:latest"]);
+    }
 
     #[tokio::test]
     async fn provider_without_base_url_is_a_configuration_error() {

@@ -60,12 +60,23 @@ fn freshness(body: &Value) -> Vec<Value> {
         .iter()
         .filter_map(notice)
         .flat_map(|(_, value)| {
-            value
+            let mut notices = value
                 .get("notices")
                 .or_else(|| value.get("results"))
                 .and_then(Value::as_array)
                 .cloned()
-                .unwrap_or_else(|| vec![value])
+                .unwrap_or_else(|| vec![value.clone()]);
+            for notice in &mut notices {
+                if let Some(index) = notice["observation"].as_u64() {
+                    let shared = value["observations"][index as usize]
+                        .as_object().expect("shared freshness observation");
+                    for (key, field) in shared {
+                        notice.as_object_mut().unwrap().entry(key.clone())
+                            .or_insert_with(|| field.clone());
+                    }
+                }
+            }
+            notices
         })
         .collect()
 }

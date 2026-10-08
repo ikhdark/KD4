@@ -168,9 +168,15 @@ impl RmcpClient {
 // Keep retry advice attached to that error, across both handshake and read paths.
 pub(super) fn retry_delay(error: &(dyn std::error::Error + 'static), fallback_ms: u64) -> Duration {
     fn advice(error: &(dyn std::error::Error + 'static)) -> Option<Duration> {
-        if let Some(StreamableHttpClientAdapterError::UnexpectedHttpStatus { retry_after, .. }) =
+        if let Some(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+            retry_after, retry_after_received_at, ..
+        }) =
             error.downcast_ref::<StreamableHttpClientAdapterError>()
-        { return *retry_after; }
+        {
+            // Keep durations representable even when an absolute deadline would
+            // overflow; sleep_with_retry_deadline handles that case safely.
+            return retry_after.map(|delay| delay.saturating_sub(retry_after_received_at.elapsed()));
+        }
         if let Some(StreamableHttpError::Client(error)) =
             error.downcast_ref::<StreamableHttpError<StreamableHttpClientAdapterError>>()
         { return advice(error); }

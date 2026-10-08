@@ -2,6 +2,18 @@ use super::*;
 use crate::context::ContextualUserFragment;
 use codex_protocol::ResponseItemId;
 
+#[test]
+fn salience_repository_observations_do_not_revoke_or_outlive_instruction_bodies() {
+    let body = text_message("user", &repository("Never deploy."));
+    let old = text_message("developer", "<repository_observation>cached</repository_observation>");
+    let latest = text_message("developer", "<repository_observation>refreshed</repository_observation>");
+    let projected = project_compaction_context(vec![body.clone(), old, latest.clone()].into());
+    assert_eq!(projected, vec![body, latest.clone()]);
+    let replacement = text_message("user", &repository("New scope: read only."));
+    let projected = project_compaction_context(vec![latest, replacement.clone()].into());
+    assert_eq!(projected, vec![replacement]);
+}
+
 fn text_message(role: &str, text: &str) -> ResponseItem {
     let mut item = ResponseItem::Message {
         id: None,
@@ -1016,4 +1028,44 @@ fn freshness_only_repository_notice_keeps_the_substantive_instructions() {
     let texts = visible_text(&projection.items);
     assert_eq!(texts.iter().filter(|text| **text == body).count(), 1);
     assert_eq!(texts.iter().filter(|text| **text == observation).count(), 1);
+}
+#[test]
+fn survivability_quoted_reset_notices_do_not_revoke_live_instructions() {
+    let repo = repository(&format!("Never edit protected.txt. Example: `{REPOSITORY_REMOVAL_NOTICE}`"));
+    let mode = collaboration(&format!("Remain read-only. Example: `{COLLABORATION_RESET_NOTICE}`"));
+    let projected = project_stable_context(vec![text_message("user", &repo), text_message("developer", &mode)].into(), StableContextTarget::Sampling);
+    let visible = visible_text(&projected.items);
+    assert!(visible.contains(&repo.as_str()));
+    assert!(visible.contains(&mode.as_str()));
+    let removed = project_stable_context(vec![text_message("user", &repo), text_message("user", &format!("{}\n", repository(REPOSITORY_REMOVAL_NOTICE)))].into(), StableContextTarget::Sampling);
+    assert!(removed.items.is_empty());
+}
+
+#[test]
+fn survivability_ambiguity_is_local_to_affected_component_kinds() {
+    let old = "<permissions instructions>old allowance</permissions instructions>";
+    let new = "<permissions instructions>current restriction</permissions instructions>";
+    let malformed = "<app-context>unfinished";
+    let app = "<app-context>last known app context</app-context>";
+    let input: Arc<[ResponseItem]> = vec![text_message("developer", old), text_message("developer", new), text_message("developer", app), text_message("developer", malformed)].into();
+    let projected = project_stable_context(Arc::clone(&input), StableContextTarget::Sampling);
+    let visible = visible_text(&projected.items);
+    assert!(!visible.contains(&old));
+    for retained in [new, app, malformed] { assert!(visible.contains(&retained)); }
+    assert!(projected.manifest.fail_open());
+    let generic = project_stable_context(Arc::clone(&input), StableContextTarget::FailOpen);
+    assert!(Arc::ptr_eq(&generic.items, &input));
+}
+
+#[test]
+fn survivability_identical_skill_copies_collapse_without_losing_role_or_version() {
+    let selected = skill("a");
+    let changed = selected.replace("a body", "new body");
+    let mut items = vec![text_message("user", &selected); 128];
+    items.push(text_message("developer", &selected));
+    items.push(text_message("user", &changed));
+    let projection = project_stable_context(items.into(), StableContextTarget::Sampling);
+    let visible = visible_text(&projection.items);
+    assert_eq!(visible.iter().filter(|text| **text == selected).count(), 2);
+    assert_eq!(visible.iter().filter(|text| **text == changed).count(), 1);
 }

@@ -36,6 +36,7 @@ pub(super) async fn resolve_auth_method(
     managed_auth: Option<&BedrockApiKeyAuth>,
     aws: &ModelProviderAwsAuthInfo,
     endpoint: BedrockEndpoint,
+    sdk_context: &tokio::sync::OnceCell<AwsAuthContext>,
 ) -> Result<BedrockAuthMethod> {
     if let Some(managed_auth) = managed_auth {
         return Ok(BedrockAuthMethod::ManagedBearerToken {
@@ -53,31 +54,14 @@ pub(super) async fn resolve_auth_method(
         BedrockEndpoint::Mantle => aws_auth_config(aws),
         BedrockEndpoint::Runtime => runtime::aws_auth_config(aws),
     };
-    let context = AwsAuthContext::load(config)
+    // Cache the SDK context, not credentials. Signing still asks its refreshable
+    // provider for credentials on every request. Failed/cancelled loads are retried.
+    let context = sdk_context
+        .get_or_try_init(|| AwsAuthContext::load(config))
         .await
-        .map_err(aws_auth_error_to_codex_error)?;
+        .map_err(aws_auth_error_to_codex_error)?
+        .clone();
     Ok(BedrockAuthMethod::AwsSdkAuth { context })
-}
-
-pub(super) async fn resolve_provider_auth(
-    managed_auth: Option<&BedrockApiKeyAuth>,
-    aws: &ModelProviderAwsAuthInfo,
-    endpoint: BedrockEndpoint,
-) -> Result<SharedAuthProvider> {
-    Ok(resolve_auth_method(managed_auth, aws, endpoint)
-        .await?
-        .into_provider(endpoint))
-}
-
-pub(super) async fn resolve_region(
-    managed_auth: Option<&BedrockApiKeyAuth>,
-    aws: &ModelProviderAwsAuthInfo,
-    endpoint: BedrockEndpoint,
-) -> Result<String> {
-    Ok(resolve_auth_method(managed_auth, aws, endpoint)
-        .await?
-        .region()
-        .to_string())
 }
 
 impl BedrockAuthMethod {
@@ -208,6 +192,70 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[tokio::test]
+    async fn sdk_context_is_reused_and_managed_auth_bypasses_it() {
+        let aws = ModelProviderAwsAuthInfo {
+            profile: Some("codex-transport-test-no-credentials".into()),
+            region: Some("us-west-2".into()),
+        };
+        let cell = tokio::sync::OnceCell::new();
+        let (first, second) = tokio::join!(
+            resolve_auth_method(None, &aws, BedrockEndpoint::Runtime, &cell),
+            resolve_auth_method(None, &aws, BedrockEndpoint::Runtime, &cell),
+        );
+        assert_eq!(first.unwrap().region(), "us-west-2");
+        assert_eq!(second.unwrap().region(), "us-west-2");
+        let initialized = cell.get().expect("SDK context initialized");
+        resolve_auth_method(None, &aws, BedrockEndpoint::Runtime, &cell).await.unwrap();
+        assert!(std::ptr::eq(initialized, cell.get().unwrap()));
+        let managed = BedrockApiKeyAuth { api_key: "rotated".into(), region: "eu-west-1".into() };
+        let method = resolve_auth_method(
+            Some(&managed),
+            &ModelProviderAwsAuthInfo { profile: None, region: None },
+            BedrockEndpoint::Runtime,
+            &cell,
+        ).await.unwrap();
+        assert_eq!(method.region(), "eu-west-1");
+        assert_eq!(
+            method.into_provider(BedrockEndpoint::Runtime).to_auth_headers()[http::header::AUTHORIZATION],
+            "Bearer rotated",
+        );
+        assert_eq!(cell.get().unwrap().region(), "us-west-2");
+    }
+
+    #[tokio::test]
+    #[ignore = "narrow local SDK configuration benchmark; no credential network calls"]
+    async fn sdk_context_reuse_benchmark() {
+        let config = codex_aws_auth::AwsAuthConfig {
+            profile: Some("codex-transport-test-no-credentials".into()),
+            region: Some("us-west-2".into()),
+            service: "bedrock".into(),
+        };
+        let mut rows = Vec::new();
+        for reuse in [false, true] {
+            let cell = tokio::sync::OnceCell::new();
+            let mut samples = Vec::new();
+            for _ in 0..20 {
+                let start = std::time::Instant::now();
+                if reuse {
+                    let _ = cell.get_or_try_init(|| AwsAuthContext::load(config.clone())).await.unwrap().clone();
+                } else {
+                    let _ = AwsAuthContext::load(config.clone()).await.unwrap();
+                }
+                samples.push(start.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            rows.push(serde_json::json!({"reuse": reuse, "samples": samples.len(), "median_ns": samples[10]}));
+        }
+        let report = serde_json::to_string(&rows).unwrap();
+        eprintln!("bedrock_sdk_context_benchmark {report}");
+        if let Ok(path) = std::env::var("KD4_BEDROCK_BENCHMARK_OUTPUT")
+            && !path.is_empty()
+        {
+            std::fs::write(path, report).unwrap();
+        }
+    }
 
     fn missing_env_var(_: &'static str) -> std::result::Result<String, std::env::VarError> {
         Err(std::env::VarError::NotPresent)

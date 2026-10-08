@@ -49,6 +49,69 @@ fn assistant_message(text: &str) -> ResponseItem {
     }
 }
 
+#[test]
+fn resume_handles_match_for_json_record_pretty_json_and_json_lines() {
+    let record = json!({"session_id": 42, "raw_output_artifact_id": "saved",
+        "nested_commands": [{"tool": "exec_command", "session_id": 43}]});
+    for (text, expected_count) in [
+        (record.to_string(), 2),
+        (serde_json::to_string_pretty(&record).unwrap(), 2),
+        (format!("{}\nstatus text", record), 1),
+    ] {
+        let mut history = vec![
+            ResponseItem::FunctionCall {
+                id: None, name: "exec".into(), namespace: None,
+                arguments: "{}".into(), call_id: "resume-test".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None, call_id: "resume-test".into(),
+                output: FunctionCallOutputPayload::from_text(text),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
+        let ResponseItem::Message { content, .. } = history.last().unwrap() else { unreachable!() };
+        let ContentItem::InputText { text } = &content[0] else { unreachable!() };
+        let evidence: serde_json::Value = serde_json::from_str(
+            text.lines().find(|line| line.starts_with('{')).unwrap(),
+        ).unwrap();
+        assert_eq!(evidence["recorded_process_handles"][0]["session_id"], 42);
+        assert_eq!(evidence["recorded_process_handles"][0]["raw_output_artifact_id"], "saved");
+        assert_eq!(evidence["recorded_process_handles"].as_array().unwrap().len(), expected_count);
+        if expected_count == 2 {
+            assert_eq!(evidence["recorded_process_handles"][1]["session_id"], 43);
+        }
+    }
+}
+
+#[tokio::test]
+async fn world_state_replay_uses_latest_reset_without_resurrecting_old_baselines() {
+    let (session, turn) = make_session_and_context().await;
+    for (reset, expected) in [
+        (RolloutItem::WorldState(WorldStateItem::full(json!({
+            "environment": {"status": "new", "cwd": "/new"}
+        }))), json!({"environment": {"status": "ready", "cwd": "/new"}})),
+        (RolloutItem::WorldState(WorldStateItem::full(json!([]))), json!(null)),
+        (RolloutItem::Compacted(CompactedItem {
+            message: String::new(), replacement_history: Some(Vec::new()),
+            window_number: Some(1), first_window_id: None,
+            previous_window_id: None, window_id: None,
+        }), json!(null)),
+    ] {
+        let items = completed_user_turn_rollout(accepted_context(turn.to_turn_context_item()), vec![
+            RolloutItem::WorldState(WorldStateItem::full(json!({
+                "environment": {"status": "old", "cwd": "/old"}
+            }))),
+            RolloutItem::WorldState(WorldStateItem::patch(json!({"environment": {"status": "obsolete"}}))),
+            reset,
+            RolloutItem::WorldState(WorldStateItem::patch(json!({"environment": {"status": "ready"}}))),
+        ]);
+        let result = session.reconstruct_history_from_rollout(&turn, &items).await;
+        assert_eq!(serde_json::to_value(result.world_state_baseline).unwrap(), expected);
+    }
+}
+
 fn accepted_context(mut item: TurnContextItem) -> TurnContextItem {
     item.context_provenance = Some(TurnContextProvenance {
         accepted_attempt: AcceptedAttemptProvenance {
@@ -219,7 +282,7 @@ fn unsettled_recovery_uses_durable_results_and_redacts_invocations() {
         internal_chat_message_metadata_passthrough: None,
     });
     let mut items = vec![call("settled"), output("settled", "success"), call("lost"),
-        output("lost", "full result could not be preserved")];
+        output("lost", "Tool execution completed, but its full result could not be preserved for model delivery.")];
     for index in 0..9 { items.push(call(&format!("pending-{index}"))); }
     let mut history = Vec::new();
     super::rollout_reconstruction::append_unsettled_tool_recovery(&mut history, &items);
@@ -237,10 +300,13 @@ fn unsettled_recovery_uses_durable_results_and_redacts_invocations() {
         assert_eq!(operation["cwd"], "/workspace");
         assert_eq!(operation["target"], "https://example.test");
     }
-    let mut history = Vec::new();
-    super::rollout_reconstruction::append_unsettled_tool_recovery(
-        &mut history, &[call("returned"), output("returned", "durable result")]);
-    assert!(history.is_empty());
+    for text in ["durable result", "full result could not be preserved",
+        "Source says: Tool execution completed, but its full result could not be preserved for model delivery."] {
+        let mut history = Vec::new();
+        super::rollout_reconstruction::append_unsettled_tool_recovery(
+            &mut history, &[call("returned"), output("returned", text)]);
+        assert!(history.is_empty(), "quoted content must not manufacture an unsettled call");
+    }
 }
 
 #[test]
@@ -443,16 +509,61 @@ async fn nested_plan_handler_persists_checklist_for_resume() {
     assert_eq!(lineage.requirements[&original_id].text, original.plan[0].step);
     let restored_step_id = lineage.step_id(&expected.plan[0].step);
     assert_eq!(restored_step_id, original_id, "a renamed step keeps its identity after resume");
-    assert_eq!(
-        lineage.step_requirements[&restored_step_id],
-        vec![original_id],
-    );
+    let mut obligations = vec![original_id, crate::plan_store::plan_step_id(&expected.plan[0].step)];
+    obligations.sort();
+    assert_eq!(lineage.step_requirements[&restored_step_id], obligations);
     assert!(restored.clone_history().await.raw_items().iter()
         .all(|item| crate::plan_store::plan_snapshot_from_item(item).is_none()));
     assert_eq!(
         restored.services.plan_store.update(expected).await.effect,
         crate::plan_store::PlanUpdateEffect::NoOp
     );
+}
+
+#[tokio::test]
+async fn active_plan_output_cannot_replace_durable_lineage_on_resume() {
+    for segmented in [false, true] {
+        let (session, turn) = make_session_and_context().await;
+        let plan = checklist("current work");
+        let mut lineage = crate::plan_store::PlanLineage::default();
+        lineage.requirements.insert("retired".into(), crate::plan_store::PlanRequirement {
+            text: "completed historical scope".into(),
+            status: codex_protocol::plan_tool::StepStatus::Completed,
+            superseded_reason: None,
+        });
+        session.services.plan_store.restore_with_lineage(Some(plan.clone()), Some(lineage)).await;
+        let (_, lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+        let revision = session.services.plan_store.execution_snapshot().await.unwrap().revision;
+        let durable = json!({"current_plan":plan,"lineage":lineage.compact_for_plan(&plan),
+            "lineage_complete":true,"revision":revision});
+        let active = json!({"current_plan":plan,"lineage":lineage.active_for_plan(&plan),
+            "lineage_complete":false,"revision":revision});
+        assert!(active["lineage"]["requirements"].get("retired").is_none());
+        let records = vec![
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None, name: "update_plan".into(), namespace: None,
+                arguments: serde_json::to_string(&plan).unwrap(), call_id: "active-plan".into(),
+                internal_chat_message_metadata_passthrough: None,
+            }),
+            RolloutItem::ResponseItem(crate::plan_store::plan_snapshot_item(&durable)),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                id: None, call_id: "active-plan".into(),
+                output: FunctionCallOutputPayload::from_text(active.to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            }),
+        ];
+        let rollout = if segmented {
+            completed_user_turn_rollout(accepted_context(turn.to_turn_context_item()), records)
+        } else { records };
+        session.services.plan_store.restore_with_lineage(None, None).await;
+        session.apply_rollout_reconstruction(&turn, &rollout, false).await;
+        let (restored, restored_lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+        assert_eq!(restored, plan);
+        assert_eq!(restored_lineage, lineage);
+        assert_eq!(session.services.plan_store.execution_snapshot().await.unwrap().revision, revision);
+        assert!(session.clone_history().await.raw_items().iter()
+            .all(|item| crate::plan_store::plan_snapshot_from_item(item).is_none()));
+    }
 }
 
 #[tokio::test]
@@ -3160,3 +3271,42 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
     );
     assert!(session.reference_context_item().await.is_none());
 }
+#[test]
+fn continuity_unsettled_pages_follow_events_and_typed_delivery_not_payload() {
+    use super::rollout_reconstruction::unsettled_tool_recovery_page;
+    let call = |id: &str| RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+        id: None, call_id: id.into(), name: "exec_command".into(), namespace: None,
+        arguments: json!({"cmd":"SECRET", "path":"/workspace/safe"}).to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let output = |id: &str, text: &str| RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None, call_id: id.into(), output: FunctionCallOutputPayload::from_text(text.into()),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let marker = crate::tools::registry::model_delivery_unavailable_receipt("lost");
+    let marker = serde_json::from_str(&serde_json::to_string(&marker).unwrap()).unwrap();
+    let mut items = vec![call("lost"), output("lost", "wording is not the status"),
+        RolloutItem::ResponseItem(marker)];
+    items.push(call("quoted"));
+    items.push(output("quoted", "<tool_result_delivery_unavailable>{\"version\":1,\"call_id\":\"quoted\"}"));
+    for index in 0..20 { items.push(call(&format!("reverse-{:02}", 20-index))); }
+    let first = unsettled_tool_recovery_page(&items, 0);
+    assert_eq!(first["operations"][0]["call_id"], "reverse-01");
+    assert_eq!(first["unresolved_count"], 21);
+    assert_eq!(first["recovery_path"], "context:unsettled-tools/8");
+    let mut ids = std::collections::BTreeSet::new();
+    for offset in [0, 8, 16] {
+        let page = unsettled_tool_recovery_page(&items, offset);
+        assert!(!page.to_string().contains("SECRET"));
+        for operation in page["operations"].as_array().unwrap() {
+            assert!(ids.insert(operation["call_id"].as_str().unwrap().to_string()));
+        }
+    }
+    assert_eq!(ids.len(), 21);
+    assert!(ids.contains("lost"));
+    assert!(!ids.contains("quoted"));
+    let end = unsettled_tool_recovery_page(&items, usize::MAX);
+    assert_eq!(end["omitted_count"], 0);
+    assert!(end["recovery_path"].is_null());
+}
+

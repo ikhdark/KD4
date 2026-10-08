@@ -1875,6 +1875,7 @@ impl Session {
                 command_execution,
                 retained_patches: Default::default(),
                 path_replays: Default::default(),
+                validation_uncertainty: Default::default(),
                 plan_store: crate::plan_store::PlanStore::default(),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 analytics_events_client,

@@ -13,6 +13,7 @@ use crate::sandboxing::SandboxPermissions;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::ShellCommandPreparation;
@@ -156,6 +157,7 @@ pub struct UnifiedExecApprovalKey {
 pub struct UnifiedExecRuntime<'a> {
     manager: &'a UnifiedExecProcessManager,
     pending_spawns: PendingSpawnRegistration,
+    tracker: Option<SharedTurnDiffTracker>,
 }
 
 fn unified_exec_options(
@@ -195,16 +197,18 @@ impl<'a> UnifiedExecRuntime<'a> {
     /// Creates a runtime bound to the shared unified-exec process manager.
     #[cfg(test)]
     pub fn new(manager: &'a UnifiedExecProcessManager) -> Self {
-        Self::new_with_pending_spawns(manager, PendingSpawnRegistration::default())
+        Self::new_with_pending_spawns(manager, PendingSpawnRegistration::default(), None)
     }
 
     pub(crate) fn new_with_pending_spawns(
         manager: &'a UnifiedExecProcessManager,
         pending_spawns: PendingSpawnRegistration,
+        tracker: Option<SharedTurnDiffTracker>,
     ) -> Self {
         Self {
             manager,
             pending_spawns,
+            tracker,
         }
     }
 }
@@ -380,7 +384,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             ctx.session.as_ref(),
             ctx.turn.as_ref(),
             &ctx.call_id,
-            None,
+            self.tracker.as_ref(),
         );
         // Begin is published only after the spawn, too late for this snapshot.
         crate::tools::events::begin_uncertain_command_baseline(

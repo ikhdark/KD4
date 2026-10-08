@@ -7,6 +7,36 @@ use uuid::Uuid;
 use super::*;
 
 #[tokio::test]
+async fn sqlite_sink_drops_http_request_bodies_before_formatting() {
+    fn request_body() -> &'static str {
+        panic!("excluded HTTP body must not be formatted");
+    }
+
+    let home = tempfile::tempdir().expect("temporary codex home");
+    let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .expect("initialize runtime");
+    let layer = start(runtime.clone());
+    let guard = tracing_subscriber::registry()
+        .with(layer.clone().with_filter(default_filter()))
+        .set_default();
+
+    assert!(!tracing::enabled!(target: "codex_http_client::transport", tracing::Level::TRACE));
+    tracing::trace!(target: "codex_http_client::transport", "{}", request_body());
+    tracing::trace!(target: "codex_http_client::client", "retained diagnostic");
+    layer.flush().await.expect("flush logs");
+    drop(guard);
+
+    let logs = runtime
+        .query_logs(&crate::LogQuery::default())
+        .await
+        .expect("query logs");
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].message.as_deref(), Some("retained diagnostic"));
+    runtime.close().await;
+}
+
+#[tokio::test]
 async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs() {
     let codex_home =
         std::env::temp_dir().join(format!("codex-state-log-db-filter-{}", Uuid::new_v4()));

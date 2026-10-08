@@ -218,21 +218,35 @@ impl<T: HttpTransport> EndpointSession<T> {
         configure(&mut request);
         let request = prepare_request(request).await?;
         let make_request = || request.clone();
+        let header_timeout = self.provider.stream_idle_timeout;
 
-        let stream = run_with_request_telemetry_non_idempotent(
-            self.provider.retry.to_policy(),
-            self.request_telemetry.clone(),
-            make_request,
-            |req| {
-                let auth = self.auth.clone();
-                let transport = &self.transport;
-                async move {
-                    let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
-                    transport.stream(req).await
-                }
-            },
+        // The new header deadline must not replay an ambiguously dispatched
+        // model request. Concrete transport errors retain their existing policy.
+        // Scope the deadline to obtaining headers, not the response body's lifetime.
+        let stream = tokio::time::timeout(
+            header_timeout,
+            run_with_request_telemetry_non_idempotent(
+                self.provider.retry.to_policy(),
+                self.request_telemetry.clone(),
+                make_request,
+                |req| {
+                    let auth = self.auth.clone();
+                    let transport = &self.transport;
+                    async move {
+                        let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
+                        transport.stream(req).await
+                    }
+                },
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| ApiError::ProviderFailure {
+            code: Some("response_header_timeout".to_string()),
+            message: format!(
+                "deadline waiting for model response headers after {}ms",
+                header_timeout.as_millis()
+            ),
+        })??;
 
         Ok(stream)
     }
@@ -272,5 +286,137 @@ mod tests {
             .expect("preparation thread should be recorded");
         assert_ne!(preparation_thread, runtime_thread);
         assert_eq!(prepared.compression, RequestCompression::None);
+    }
+    #[tokio::test(start_paused = true)]
+    #[ignore = "local response-header deadline benchmark"]
+    async fn latency_edge_benchmark() {
+        struct PendingHeaders;
+        impl HttpTransport for PendingHeaders {
+            async fn execute(&self, _: Request) -> Result<Response, TransportError> {
+                unreachable!("stream only")
+            }
+            async fn stream(&self, _: Request) -> Result<StreamResponse, TransportError> {
+                std::future::pending().await
+            }
+        }
+        struct NoAuth;
+        impl crate::auth::AuthProvider for NoAuth {
+            fn add_auth_headers(&self, _: &mut HeaderMap) {}
+        }
+        let session = EndpointSession::new(PendingHeaders, Provider {
+            name: "local probe".into(), base_url: "http://127.0.0.1".into(),
+            query_params: None, headers: HeaderMap::new(),
+            retry: crate::provider::RetryConfig {
+                max_retries: 0, base_delay: std::time::Duration::ZERO,
+                retry_429: false, retry_5xx: false, retry_transport: false,
+            },
+            stream_idle_timeout: std::time::Duration::from_millis(50),
+        }, Arc::new(NoAuth));
+        let result = tokio::time::timeout(std::time::Duration::from_millis(75),
+            session.stream_encoded_json_with(Method::POST, "responses", HeaderMap::new(), None, |_| {})).await;
+        let bounded = matches!(result, Ok(Err(ApiError::ProviderFailure { code, .. }))
+            if code.as_deref() == Some("response_header_timeout"));
+        let result = format!("latency_edge headers: configured_budget_ms=50 externally_stopped_ms=75 deadline_applied={bounded}\n");
+        eprint!("{result}");
+        if let Some(path) = std::env::var_os("KD4_TRANSPORT_EDGE_OUTPUT") {
+            use std::io::Write;
+            std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
+                .write_all(result.as_bytes()).unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_deadline_does_not_replay_or_limit_the_response_body() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        struct HeaderProbe {
+            delay: Option<Duration>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl HttpTransport for HeaderProbe {
+            async fn execute(&self, _: Request) -> Result<Response, TransportError> {
+                unreachable!("stream only")
+            }
+
+            async fn stream(&self, _: Request) -> Result<StreamResponse, TransportError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let Some(delay) = self.delay else {
+                    return std::future::pending().await;
+                };
+                if delay.is_zero() {
+                    return Err(TransportError::Timeout);
+                }
+                tokio::time::sleep(delay).await;
+                Ok(StreamResponse {
+                    status: http::StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    bytes: Box::pin(futures::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Ok(bytes::Bytes::from_static(b"body"))
+                    })),
+                })
+            }
+        }
+        struct NoAuth;
+        impl crate::auth::AuthProvider for NoAuth {
+            fn add_auth_headers(&self, _: &mut HeaderMap) {}
+        }
+
+        for delay in [None, Some(Duration::ZERO), Some(Duration::from_millis(10))] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let session = EndpointSession::new(
+                HeaderProbe {
+                    delay,
+                    calls: calls.clone(),
+                },
+                Provider {
+                    name: "local probe".into(),
+                    base_url: "http://127.0.0.1".into(),
+                    query_params: None,
+                    headers: HeaderMap::new(),
+                    retry: crate::provider::RetryConfig {
+                        max_retries: 3,
+                        base_delay: Duration::ZERO,
+                        retry_429: false,
+                        retry_5xx: false,
+                        retry_transport: true,
+                    },
+                    stream_idle_timeout: Duration::from_millis(50),
+                },
+                Arc::new(NoAuth),
+            );
+            let started = tokio::time::Instant::now();
+            let result = session
+                .stream_encoded_json_with(Method::POST, "responses", HeaderMap::new(), None, |_| {})
+                .await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "ambiguous sends must not replay"
+            );
+            if delay.is_none() {
+                let error = result.err().expect("header deadline");
+                assert!(matches!(&error, ApiError::ProviderFailure { code, .. }
+                    if code.as_deref() == Some("response_header_timeout")));
+                assert!(!crate::api_bridge::map_api_error(error).is_retryable());
+                assert_eq!(started.elapsed(), Duration::from_millis(50));
+            } else if delay == Some(Duration::ZERO) {
+                let error = result.err().expect("concrete transport timeout");
+                assert!(matches!(&error, ApiError::Transport(TransportError::Timeout)));
+                assert!(crate::api_bridge::map_api_error(error).is_retryable());
+                assert_eq!(started.elapsed(), Duration::ZERO);
+            } else {
+                assert_eq!(started.elapsed(), Duration::from_millis(10));
+                let mut response = result.unwrap();
+                let body = futures::StreamExt::next(&mut response.bytes)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(body.as_ref(), b"body");
+                assert_eq!(started.elapsed(), Duration::from_millis(110));
+            }
+        }
     }
 }

@@ -136,7 +136,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "max_output_tokens".to_string(),
             bounded_integer(
-                "Output token budget, capped at 10000 tokens for direct calls; inside exec it is bounded by the cell's estimated remaining budget. Explicit smaller caps are honored. Zero returns only execution controls.".to_string(),
+                "Output token budget, capped at 10000 tokens for direct calls; inside exec each result is bounded by the cell limit with envelope reserve, independently of earlier prints. Explicit smaller caps are honored. Zero returns only execution controls.".to_string(),
                 0, usize::MAX as u64),
         ),
     ]);
@@ -264,7 +264,10 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
                     "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms. Bounded empty polls default to {default_timeout_ms} ms and cap at {max_timeout_ms} ms; waits below 5000 ms are honored down to 250 ms only when new output is pending, otherwise a 5000 ms floor applies. Omitting this on an empty poll defaults to waiting for output or exit. A wait deadline does not terminate the process."
                 ),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
-                max_timeout_ms.max(crate::unified_exec::MAX_YIELD_TIME_MS),
+                // The request is an upper bound, not permission to exceed the
+                // owner's configured cap. Accept the standard helper budget;
+                // the process manager still clamps it to max_timeout_ms.
+                max_timeout_ms.max(crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS),
             ),
         ),
         (

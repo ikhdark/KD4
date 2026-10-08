@@ -790,6 +790,7 @@ async fn project_doc_truncation_trims_split_multibyte_code_points() {
             }],
             limit,
             /*prefetch_utf8_boundary_slack*/ false,
+            None,
         )
         .await;
         assert!(failed_sources.is_empty(), "project doc read failed");
@@ -832,6 +833,7 @@ async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
         }],
         LIMIT,
         /*prefetch_utf8_boundary_slack*/ false,
+        None,
     )
     .await;
     assert!(failed_sources.is_empty(), "project doc read failed");
@@ -2448,54 +2450,29 @@ fn create_skill(codex_home: PathBuf, name: &str, description: &str) {
 }
 
 #[tokio::test]
-async fn nested_instruction_notice_lists_existing_files_below_cwd() {
+async fn descendant_instructions_are_only_loaded_when_applicable() {
     let repo = tempfile::tempdir().expect("temp repo");
-    let git = |args: &[&str]| {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo.path())
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .status()
-            .expect("git runs");
-        assert!(status.success(), "git {args:?}");
-    };
-    git(&["init", "-q"]);
-    std::fs::write(repo.path().join("AGENTS.md"), "root").expect("root instructions");
-    git(&["add", "AGENTS.md"]);
-    let none = nested_instruction_notice(repo.path()).await.expect("git checkout");
-    assert!(
-        none.starts_with("No non-ignored AGENTS.md or AGENTS.override.md files exist below"),
-        "{none}"
-    );
-
-    std::fs::create_dir_all(repo.path().join("sub").join("deeper")).expect("nested dir");
-    std::fs::write(
-        repo.path()
-            .join("sub")
-            .join("deeper")
-            .join("AGENTS.override.md"),
-        "nested",
-    )
-    .expect("nested instructions");
-    let listed = nested_instruction_notice(repo.path()).await.expect("git checkout");
-    assert!(listed.contains("sub/deeper/AGENTS.override.md"), "{listed}");
-    assert!(!listed.contains(": AGENTS.md"), "{listed}");
-    git(&["add", "sub/deeper/AGENTS.override.md"]);
-    std::fs::remove_file(repo.path().join("sub/deeper/AGENTS.override.md")).unwrap();
-    let deleted = nested_instruction_notice(repo.path()).await.unwrap();
-    assert!(!deleted.contains("sub/deeper/AGENTS.override.md"), "{deleted}");
-
-    let plain = tempfile::tempdir().expect("plain dir");
-    assert_eq!(nested_instruction_notice(plain.path()).await, None);
+    fs::create_dir(repo.path().join(".git")).unwrap();
+    let root_path = repo.path().join("AGENTS.md");
+    fs::write(&root_path, "root instructions").unwrap();
+    let nested_dir = repo.path().join("sub/deeper");
+    fs::create_dir_all(&nested_dir).unwrap();
+    fs::write(nested_dir.join("AGENTS.override.md"), "nested instructions").unwrap();
+    let mut config = make_config(&repo, 4096, None).await;
+    let expected = rendered_project_doc(&PathUri::from_abs_path(&root_path.abs()), "root instructions");
+    for _ in 0..2 {
+        assert_eq!(get_user_instructions(&config).await, Some(expected.clone()));
+    }
+    fs::remove_file(root_path).unwrap();
+    assert_eq!(get_user_instructions(&config).await, None);
+    config.cwd = nested_dir.abs();
+    let loaded = get_user_instructions(&config).await.unwrap();
+    assert!(loaded.contains("nested instructions"));
+    assert!(!loaded.contains("Instruction files below"));
 }
 
 #[tokio::test(start_paused = true)]
-async fn stalled_nested_inventory_does_not_delay_applicable_instruction_loading() {
-    struct Cancelled(Arc<std::sync::atomic::AtomicBool>);
-    impl Drop for Cancelled {
-        fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::SeqCst); }
-    }
+async fn applicable_instruction_loading_has_no_inventory_wait() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("AGENTS.md");
     fs::write(&path, "Readable primary policy: never modify X").unwrap();
@@ -2503,24 +2480,16 @@ async fn stalled_nested_inventory_does_not_delay_applicable_instruction_loading(
     let config = ConfigBuilder::default().codex_home(root.path().to_path_buf())
         .harness_overrides(crate::config::ConfigOverrides { cwd: Some(cwd.clone().into_path_buf()), ..Default::default() })
         .build().await.unwrap();
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let guard = Cancelled(cancelled.clone());
-    let nested_notice = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-        let _guard = guard;
-        std::future::pending::<Option<String>>().await
-    }));
+
     let discovery = ProjectInstructionsDiscovery {
         environments: vec![EnvironmentProjectInstructionsDiscovery {
             environment_id: "local".to_string(), cwd: PathUri::from_abs_path(&cwd),
             filesystem: Arc::clone(&LOCAL_FS),
             result: Ok(vec![ProjectDocCandidate { path: PathUri::from_abs_path(&AbsolutePathBuf::try_from(path).unwrap()), size: 42 }]),
-            nested_notice: Some(nested_notice),
         }],
         config_identity: 0,
     };
     let loaded = tokio::time::timeout(std::time::Duration::from_millis(100),
         load_project_instructions_from_discovery(&config, None, discovery, None)).await.unwrap();
     assert!(loaded.loaded.unwrap().text().contains("Readable primary policy: never modify X"));
-    tokio::task::yield_now().await;
-    assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
 }

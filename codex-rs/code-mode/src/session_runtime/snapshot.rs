@@ -34,6 +34,8 @@ struct Snapshot<V, E = CellEvent> {
     presentations: BTreeMap<String, Value>,
     #[serde(default)]
     completed_cells: BTreeMap<String, E>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    completed_cell_order: Vec<String>,
     #[serde(default)]
     next_cell_id: u64,
 }
@@ -64,13 +66,14 @@ struct CompletedSnapshotEvent {
     event: CellEvent,
     serialized: Arc<serde_json::value::RawValue>,
     bytes: usize,
+    completion_order: u64,
 }
 
 impl CompletedSnapshotEvent {
-    fn new(event: CellEvent) -> Result<Arc<Self>, String> {
+    fn new(event: CellEvent, completion_order: u64) -> Result<Arc<Self>, String> {
         let serialized = serde_json::value::to_raw_value(&event).map_err(|error| error.to_string())?;
         let bytes = super::cell_event_bytes(&event);
-        Ok(Arc::new(Self { event, serialized: Arc::from(serialized), bytes }))
+        Ok(Arc::new(Self { event, serialized: Arc::from(serialized), bytes, completion_order }))
     }
 }
 
@@ -106,7 +109,7 @@ impl DurableState {
                 }
                 let snapshot: Snapshot<Value> = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("named-state snapshot is invalid; no cell started: {error}"))?;
-                if !matches!(snapshot.version, 1..=5) {
+                if !matches!(snapshot.version, 1..=6) {
                     return Err("unsupported named-state snapshot version; no cell started".into());
                 }
                 if snapshot.completed_cells.len() > super::TERMINAL_CELL_CACHE_CAPACITY
@@ -126,10 +129,26 @@ impl DurableState {
                 values: BTreeMap::new(),
                 presentations: BTreeMap::new(),
                 completed_cells: BTreeMap::new(),
+                completed_cell_order: Vec::new(),
                 next_cell_id: 1,
             },
             Err(error) => return Err(error.to_string()),
         };
+        let mut completion_order = snapshot.completed_cell_order;
+        if snapshot.version < 6 && completion_order.is_empty() {
+            // Legacy snapshots did not record completion chronology. Preserve
+            // their allocation-order fallback, never infer order from map keys.
+            completion_order = snapshot.completed_cells.keys().cloned().collect();
+            completion_order.sort_by_key(|id| id.parse::<u64>().unwrap_or(u64::MAX));
+        }
+        let order_len = completion_order.len();
+        let order = completion_order.into_iter().enumerate()
+            .map(|(index, id)| (id, index as u64)).collect::<BTreeMap<_, _>>();
+        if order.len() != order_len || order.len() != snapshot.completed_cells.len()
+            || order.keys().ne(snapshot.completed_cells.keys())
+        {
+            return Err("invalid completed-cell order; no cell started".into());
+        }
         let mut values = snapshot.values.into_iter().map(|(key, value)| {
             let stored = StoredValue::new(&key, value)
                 .with_presentation(snapshot.presentations.get(&key).cloned());
@@ -152,7 +171,7 @@ impl DurableState {
             _lease: lease,
             revision: AtomicU64::new(snapshot.revision),
             completed_cells: Mutex::new(snapshot.completed_cells.into_iter().map(|(id, event)| {
-                CompletedSnapshotEvent::new(event).map(|event| (id, event))
+                CompletedSnapshotEvent::new(event, order[&id]).map(|event| (id, event))
             }).collect::<Result<_, _>>()?),
             first_cell_id,
             cell_id_limit,
@@ -167,9 +186,11 @@ impl DurableState {
         Ok((state, values))
     }
 
-    pub(super) fn completed_cells(&self) -> BTreeMap<String, CellEvent> {
-        self.completed_cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter().map(|(id, event)| (id.clone(), event.event.clone())).collect()
+    pub(super) fn completed_cells(&self) -> Vec<(String, CellEvent)> {
+        let cells = self.completed_cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ordered = cells.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|(_, event)| event.completion_order);
+        ordered.into_iter().map(|(id, event)| (id.clone(), event.event.clone())).collect()
     }
 
     pub(super) fn completed_cell(&self, cell_id: &str) -> Option<CellEvent> {
@@ -190,7 +211,9 @@ impl DurableState {
         self.wait_for_test_io(false);
         let mut completed_cells = self.completed_cells.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        completed_cells.insert(cell_id.clone(), CompletedSnapshotEvent::new(event)?);
+        let completion_order = completed_cells.values().map(|event| event.completion_order)
+            .max().unwrap_or(0).checked_add(1).ok_or("completion order exhausted")?;
+        completed_cells.insert(cell_id.clone(), CompletedSnapshotEvent::new(event, completion_order)?);
         // Preserve the newest result exactly, including its artifact references.
         // Evict older receipts rather than truncating recovery information.
         while completed_cells.len() > super::TERMINAL_CELL_CACHE_CAPACITY
@@ -198,8 +221,8 @@ impl DurableState {
                 && completed_cells.values().map(|event| event.bytes).sum::<usize>()
                     > super::TERMINAL_CELL_CACHE_MAX_BYTES)
         {
-            let oldest = completed_cells.keys().filter(|id| id.as_str() != cell_id.as_str())
-                .min_by_key(|id| id.parse::<u64>().unwrap_or(u64::MAX)).cloned();
+            let oldest = completed_cells.iter().filter(|(id, _)| id.as_str() != cell_id.as_str())
+                .min_by_key(|(_, event)| event.completion_order).map(|(id, _)| id.clone());
             if let Some(oldest) = oldest {
                 completed_cells.remove(&oldest);
             } else {
@@ -217,8 +240,11 @@ impl DurableState {
     ) -> Result<StagedSnapshot, String> {
         let revision = self.revision.load(Ordering::Acquire).checked_add(1)
             .ok_or("named-state revision exhausted")?;
+        let mut completed_cell_order = completed_cells.iter().collect::<Vec<_>>();
+        completed_cell_order.sort_by_key(|(_, event)| event.completion_order);
+        let completed_cell_order = completed_cell_order.into_iter().map(|(id, _)| id.clone()).collect();
         let snapshot = Snapshot {
-            version: 5,
+            version: 6,
             revision,
             completed_call_id,
             presentations: values.iter().filter_map(|(key, value)|
@@ -229,6 +255,7 @@ impl DurableState {
             }).collect::<Result<BTreeMap<_, _>, _>>()?,
             completed_cells: completed_cells.iter().map(|(id, event)|
                 (id.clone(), Arc::clone(&event.serialized))).collect(),
+            completed_cell_order,
             next_cell_id: self.cell_id_limit,
         };
         let mut file = NamedTempFile::new_in(self.path.parent().ok_or("snapshot has no parent")?)

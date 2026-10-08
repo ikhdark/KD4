@@ -16,13 +16,36 @@ pub(super) const MISSING_TOOL_RESULT: &str = "Result unavailable. Execution outc
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
+#[cfg(test)]
+#[path = "assembly_audit_tests.rs"]
+mod assembly_audit_tests;
+
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     let missing_outputs_to_insert = collect_missing_call_outputs(items, true);
+    insert_items_after(items, missing_outputs_to_insert);
+}
 
-    // Insert synthetic outputs in reverse index order to avoid re-indexing.
-    for (idx, output_item) in missing_outputs_to_insert.into_iter().rev() {
-        items.insert(idx + 1, output_item);
+/// Insert after original indexes in ascending order, without repeatedly moving
+/// the history suffix. The common zero/one-insertion cases reuse the allocation.
+fn insert_items_after(items: &mut Vec<ResponseItem>, mut insertions: Vec<(usize, ResponseItem)>) {
+    if insertions.len() <= 1 {
+        if let Some((index, item)) = insertions.pop() {
+            items.insert(index + 1, item);
+        }
+        return;
     }
+    let mut merged = Vec::with_capacity(items.len() + insertions.len());
+    let mut insertions = insertions.into_iter().peekable();
+    for (index, item) in std::mem::take(items).into_iter().enumerate() {
+        merged.push(item);
+        while insertions.peek().is_some_and(|(after, _)| *after == index) {
+            if let Some((_, item)) = insertions.next() {
+                merged.push(item);
+            }
+        }
+    }
+    debug_assert!(insertions.next().is_none());
+    *items = merged;
 }
 
 pub(crate) fn missing_call_outputs(items: &[ResponseItem]) -> Vec<ResponseItem> {
@@ -58,8 +81,7 @@ fn collect_missing_call_outputs(
     }
 
     // Collect synthetic outputs to insert immediately after their calls.
-    // Store the insertion position (index of call) alongside the item so
-    // we can insert in reverse order and avoid index shifting.
+    // Store original call indexes in ascending order for a single merge pass.
     let mut missing_outputs_to_insert: Vec<(usize, ResponseItem)> = Vec::new();
 
     for (idx, item) in items.iter().enumerate() {
@@ -236,6 +258,9 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
             (!keep).then_some(index)
         })
         .collect();
+    if orphan_indexes.is_empty() {
+        return;
+    }
     let mut orphan_indexes = orphan_indexes.into_iter().peekable();
     let mut index = 0;
     items.retain(|_| {
@@ -288,7 +313,15 @@ pub(crate) fn strip_images_when_unsupported(
             }
             ResponseItem::ImageGenerationCall { result, .. } => {
                 if !result.is_empty() {
-                    image_omissions.push(index + 1);
+                    image_omissions.push((index, ResponseItem::Message {
+                        id: None,
+                        role: "developer".to_string(),
+                        content: vec![ContentItem::InputText {
+                            text: format!("Generated {IMAGE_CONTENT_OMITTED_PLACEHOLDER}"),
+                        }],
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    }));
                 }
                 result.clear();
             }
@@ -297,18 +330,5 @@ pub(crate) fn strip_images_when_unsupported(
     }
     // `result` is base64 image data on the wire. Keep the receipt in a text
     // message beside the call instead of putting prose in that field.
-    for index in image_omissions.into_iter().rev() {
-        items.insert(
-            index,
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: format!("Generated {IMAGE_CONTENT_OMITTED_PLACEHOLDER}"),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            },
-        );
-    }
+    insert_items_after(items, image_omissions);
 }

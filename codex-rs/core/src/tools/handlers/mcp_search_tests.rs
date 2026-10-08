@@ -12,7 +12,7 @@ fn search_info_uses_mcp_tool_metadata_and_parameter_names() {
 
     assert_eq!(
         search_info.entry.search_text,
-        "mcp__calendar___create_event _create_event createEvent codex-apps create event Create event Create a calendar event. Calendar Plan events. Calendar plugin attendees start_time"
+        "mcp__calendar___create_event _create_event createEvent codex-apps create event Create event Create a calendar event. Calendar Plan events. Calendar plugin attendees start_time start time"
     );
     assert_eq!(
         search_info.source_info,
@@ -49,11 +49,15 @@ fn registered_contract_override_is_not_replaced_by_shared_mcp_spec() {
     let ToolSpec::Namespace(mut namespace) = handler.spec() else {
         panic!("expected namespace");
     };
+    namespace.description = "Shortened source description".to_string();
+    let metadata_only = handler.search_info_for_registered_spec(&ToolSpec::Namespace(namespace.clone())).unwrap();
+    assert_eq!(metadata_only.entry.callable_title.as_deref(), Some("Create event"));
     let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0];
     tool.name = "overridden".to_string();
     tool.parameters = codex_tools::JsonSchema::string(Some("Override input".to_string()));
     let registered = ToolSpec::Namespace(namespace);
     let info = handler.search_info_for_registered_spec(&registered).unwrap();
+    assert_eq!(info.entry.callable_title, None);
     assert!(!Arc::ptr_eq(&handler.spec, &info.entry.output));
     assert_eq!(info.entry.tool_names, vec!["overridden"]);
     assert_eq!(

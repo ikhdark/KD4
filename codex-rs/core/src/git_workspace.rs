@@ -2085,8 +2085,11 @@ impl GitWorkspaceCache {
         {
             let weak_cache = Arc::downgrade(&cache);
             runtime.spawn(async move {
-                let mut source_receiver =
-                    DebouncedWatchReceiver::new(source_receiver, WORKSPACE_WATCHER_DEBOUNCE);
+                // The receiver already coalesces backend bursts. Delaying source
+                // evidence again can deliver an earlier patch after the next
+                // command captures its baseline, falsely invalidating that run.
+                // Metadata refreshes above may debounce; source epochs must not.
+                let mut source_receiver = source_receiver;
                 while let Some(event) = source_receiver.recv().await {
                     let Some(cache) = weak_cache.upgrade() else {
                         return;

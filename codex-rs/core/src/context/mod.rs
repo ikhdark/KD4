@@ -83,9 +83,37 @@ pub(crate) use user_shell_command::UserShellCommand;
 /// the fragment's own delimiters from closing or reopening its sections.
 fn escape_fragment_delimiters(text: &str, delimiters: &[&str]) -> String {
     delimiters.iter().fold(text.to_string(), |text, delimiter| {
+        // Most source text contains none of its wrapper's delimiters. Keep the
+        // existing allocation instead of copying the entire body for every tag.
+        if !text.contains(delimiter) {
+            return text;
+        }
         text.replace(
             delimiter,
             &delimiter.replace('<', "&lt;").replace('>', "&gt;"),
         )
     })
+}
+
+#[cfg(test)]
+mod escaping_tests {
+    use super::escape_fragment_delimiters;
+
+    #[test]
+    fn escaping_preserves_ordered_replacement_and_source_bytes() {
+        for text in [
+            "", "ordinary λ source &lt;tag&gt; <other>",
+            "<INSTRUCTIONS>λ</INSTRUCTIONS><INSTRUCTIONS>",
+        ] {
+            for delimiters in [
+                vec![], vec![""], vec!["<INSTRUCTIONS>", "</INSTRUCTIONS>"],
+                vec!["<", "<INSTRUCTIONS>"], vec!["<INSTRUCTIONS>", "&lt;"],
+            ] {
+                let expected = delimiters.iter().fold(text.to_string(), |text, delimiter| {
+                    text.replace(delimiter, &delimiter.replace('<', "&lt;").replace('>', "&gt;"))
+                });
+                assert_eq!(escape_fragment_delimiters(text, &delimiters), expected);
+            }
+        }
+    }
 }

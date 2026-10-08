@@ -2385,6 +2385,12 @@ pub enum TurnTimingRequestDiagnosticsStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingModelRequest {
+    /// Named setup-phase union durations in nanoseconds, frozen at dispatch.
+    /// Measured from request preparation (or attempt start for retries), not
+    /// cumulative across the turn. Phases can overlap and must not be summed.
+    /// Empty for older records or attempts that never dispatched.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub setup_phase_ns: BTreeMap<String, u64>,
     /// SHA-256 of the exact serialized transport body for each dispatched
     /// physical attempt. Includes retry bodies and websocket deltas.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

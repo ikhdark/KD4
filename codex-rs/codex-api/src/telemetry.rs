@@ -169,31 +169,38 @@ where
     F: Fn(Request) -> Fut,
     Fut: Future<Output = Result<T, TransportError>>,
 {
+    let prepared_body_len = req.prepared_body_len();
+    let start = Instant::now();
+    let (result, timing) = if telemetry.is_some() {
+        codex_http_client::capture_transport_timing(send(req)).await
+    } else {
+        (send(req).await, codex_http_client::TransportTiming::default())
+    };
+    let duration = start.elapsed();
     if let Some(t) = telemetry.as_ref() {
-        emit_unavailable_transport_phases(t.as_ref(), attempt);
+        emit_transport_phases(t.as_ref(), attempt, &timing);
         t.on_transport_phase(
             attempt,
             TransportPhaseObservation {
                 phase: TransportPhase::RequestUpload,
                 duration: None,
-                wire_bytes: req.prepared_body_len(),
+                wire_bytes: prepared_body_len,
                 provenance: "prepared_request_body",
                 unavailable_reason: Some("upload timing is opaque inside reqwest"),
             },
         );
-    }
-    let start = Instant::now();
-    let result = send(req).await;
-    let duration = start.elapsed();
-    if let Some(t) = telemetry.as_ref() {
         t.on_transport_phase(
             attempt,
             TransportPhaseObservation {
                 phase: TransportPhase::ResponseHeaders,
-                duration: None,
+                duration: timing.response_headers,
                 wire_bytes: None,
-                provenance: "request_attempt_boundary",
-                unavailable_reason: Some(
+                provenance: if timing.response_headers.is_some() {
+                    "transport_send_to_response_headers"
+                } else {
+                    "request_attempt_boundary"
+                },
+                unavailable_reason: timing.response_headers.is_none().then_some(
                     "attempt includes authentication and may include response body reads",
                 ),
             },
@@ -207,7 +214,11 @@ where
     result
 }
 
-fn emit_unavailable_transport_phases(telemetry: &dyn RequestTelemetry, attempt: u64) {
+fn emit_transport_phases(
+    telemetry: &dyn RequestTelemetry,
+    attempt: u64,
+    timing: &codex_http_client::TransportTiming,
+) {
     for (phase, reason) in [
         (
             TransportPhase::EndpointResolution,
@@ -238,14 +249,19 @@ fn emit_unavailable_transport_phases(telemetry: &dyn RequestTelemetry, attempt: 
             "socket reuse is opaque inside reqwest",
         ),
     ] {
+        let (duration, provenance) = match phase {
+            TransportPhase::ProxyResolution => (timing.proxy_resolution, "route_resolver_boundary"),
+            TransportPhase::ClientPoolSelection => (timing.client_pool_selection, "route_client_pool"),
+            _ => (None, "reqwest_transport_boundary"),
+        };
         telemetry.on_transport_phase(
             attempt,
             TransportPhaseObservation {
                 phase,
-                duration: None,
+                duration,
                 wire_bytes: None,
-                provenance: "reqwest_transport_boundary",
-                unavailable_reason: Some(reason),
+                provenance,
+                unavailable_reason: duration.is_none().then_some(reason),
             },
         );
     }
@@ -326,6 +342,49 @@ mod tests {
             assert_eq!(headers[0].0, 7);
             assert_eq!(headers[0].1.duration, None);
             assert!(headers[0].1.unavailable_reason.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn concrete_transport_reports_headers_and_route_phases_even_on_http_errors() {
+        use codex_http_client::HttpTransport;
+        let server = wiremock::MockServer::start().await;
+        for status in [200, 429] {
+            wiremock::Mock::given(wiremock::matchers::path(format!("/{status}")))
+                .respond_with(wiremock::ResponseTemplate::new(status).set_body_string("body"))
+                .expect(1)
+                .mount(&server).await;
+            let pool = codex_http_client::RouteAwareClientPool::new(
+                codex_http_client::HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+                codex_http_client::ClientRouteClass::Api,
+            );
+            let transport = codex_http_client::ReqwestTransport::from_client_pool(pool);
+            let recorder = Arc::new(RecordingTelemetry::default());
+            let start = Instant::now();
+            let result = observe_request_attempt(
+                Some(recorder.clone()),
+                |request| async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    transport.execute(request).await
+                },
+                Request::new(Method::GET, format!("{}/{status}", server.uri())),
+                3,
+            ).await;
+            assert_eq!(result.is_ok(), status == 200);
+            let elapsed = start.elapsed();
+            let observations = recorder.observations.lock().unwrap();
+            assert_eq!(observations.len(), 9);
+            for phase in [TransportPhase::ProxyResolution, TransportPhase::ClientPoolSelection, TransportPhase::ResponseHeaders] {
+                let (attempt, observation) = observations.iter().find(|(_, item)| item.phase == phase).unwrap();
+                assert_eq!(*attempt, 3);
+                assert!(observation.duration.is_some(), "{phase:?}");
+                assert!(observation.unavailable_reason.is_none());
+            }
+            let headers = observations.iter().find(|(_, item)| item.phase == TransportPhase::ResponseHeaders).unwrap().1;
+            assert!(elapsed.saturating_sub(headers.duration.unwrap()) >= Duration::from_millis(50));
+            let reuse = observations.iter().find(|(_, item)| item.phase == TransportPhase::ConnectionReuse).unwrap().1;
+            assert!(reuse.duration.is_none());
+            assert!(reuse.unavailable_reason.is_some());
         }
     }
 

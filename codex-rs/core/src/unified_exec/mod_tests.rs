@@ -204,6 +204,45 @@ async fn exec_command_with_tracker(
 
 #[cfg(windows)]
 #[tokio::test]
+async fn unified_exec_spawn_reuses_dispatch_workspace_baseline() {
+    let (session, turn) = test_session_and_turn().await;
+    let workspace = tempfile::tempdir().unwrap();
+    assert!(tokio::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(workspace.path())
+        .status().await.unwrap().success());
+    let cwd = dunce::canonicalize(workspace.path()).unwrap();
+    let tracker = Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new()));
+    let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
+    assert!(batch.register_call("call"));
+    tracker.lock().await.activate_workspace_evidence_generation_batch(&batch);
+    let cache = &session.services.git_workspace;
+    let baseline = cache.workspace_evidence_identity(&cwd).await;
+    assert!(baseline.is_some());
+    batch.record_captured_identity(&cwd, 0, baseline).await;
+    let captures_before = cache.workspace_evidence_capture_count();
+
+    // Keep the command alive so the independent post-exit capture is not counted.
+    let output = exec_command_with_tracker(
+        &session,
+        &turn,
+        "Set-Content -LiteralPath sentinel.txt -Value started; Write-Output started; Start-Sleep -Seconds 60",
+        2_000,
+        Some(cwd.clone()),
+        false,
+        Some(tracker),
+    ).await.unwrap();
+    let captures_after_spawn = cache.workspace_evidence_capture_count();
+    session.services.unified_exec_manager.terminate_all_processes().await;
+
+    assert!(output.process_id.is_some(), "fixture must still be running");
+    assert_eq!(std::fs::read_to_string(cwd.join("sentinel.txt")).unwrap().trim(), "started");
+    assert_eq!(captures_after_spawn, captures_before,
+        "the production spawn path must reuse the dispatch baseline");
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn capacity_rejection_does_not_launch_sentinel_command() {
     let (session, turn) = test_session_and_turn().await;
     let manager = &session.services.unified_exec_manager;
@@ -608,13 +647,33 @@ fn emit_burst_then_go_silent(process: &Arc<UnifiedExecProcess>, after: Duration)
 /// wait for the requested yield instead of the quiet period.
 #[tokio::test(start_paused = true)]
 async fn an_empty_poll_on_a_validation_launch_waits_the_requested_yield() -> anyhow::Result<()> {
+    validation_poll_waits_the_requested_yield(false).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_until_output_poll_on_a_validation_launch_waits_the_requested_yield() -> anyhow::Result<()> {
+    validation_poll_waits_the_requested_yield(true).await
+}
+
+async fn validation_poll_waits_the_requested_yield(until_output: bool) -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
     let (process_id, process, allow_terminate) =
         register_pollable_process(&session, &turn, "validation-poll", /*validation*/ true).await?;
 
     emit_burst_then_go_silent(&process, Duration::from_secs(1));
     let started_at = Instant::now();
-    let output = write_stdin(&session, process_id, "", /*yield_time_ms*/ 20_000).await?;
+    let output = if until_output {
+        session.services.unified_exec_manager.write_stdin_until_output(WriteStdinRequest {
+            process_id,
+            input: "",
+            yield_time_ms: 20_000,
+            max_output_tokens: None,
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            nested_deadline: None,
+        }).await?
+    } else {
+        write_stdin(&session, process_id, "", /*yield_time_ms*/ 20_000).await?
+    };
 
     let elapsed = Instant::now().saturating_duration_since(started_at);
     assert_eq!(

@@ -56,6 +56,8 @@ const JSON_MIME_TYPE: &str = "application/json";
 const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const NON_JSON_RESPONSE_BODY_PREVIEW_BYTES: usize = 8_192;
 const MAX_JSON_RPC_ERROR_BODY_BYTES: usize = 1024 * 1024;
+const ERROR_BODY_PREVIEW_TIMEOUT: Duration = Duration::from_millis(25);
+const JSON_RPC_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct StreamableHttpClientAdapter {
@@ -75,6 +77,7 @@ pub(crate) enum StreamableHttpClientAdapterError {
         status: StatusCode,
         body_preview: String,
         retry_after: Option<Duration>,
+        retry_after_received_at: tokio::time::Instant,
     },
     #[error("invalid HTTP header: {0}")]
     Header(String),
@@ -202,6 +205,11 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         let content_type = response_header(&response.headers, CONTENT_TYPE);
         let session_id = response_header(&response.headers, HEADER_SESSION_ID);
         if !status_is_success(response.status) {
+            // Capture server advice before diagnostics, then carry its receipt time
+            // through handshake cleanup and recovery without restarting the wait.
+            let received_wall_time = SystemTime::now();
+            let retry_after_received_at = tokio::time::Instant::now();
+            let retry_after = retry_after(&response.headers, received_wall_time);
             let parse_error =
                 !retryable_post_response_status(mcp_method.as_deref(), response.status)
                     && content_type
@@ -212,27 +220,28 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             } else {
                 NON_JSON_RESPONSE_BODY_PREVIEW_BYTES
             };
-            // Diagnostics must not hold a known retryable failure hostage to EOF.
-            // The enclosing operation deadline still bounds this optional preview.
-            let preview_result = if parse_error {
-                collect_body_prefix(&mut body_stream, limit).await
+            // Give structured errors time to arrive, but never let optional
+            // diagnostics hold a known failure hostage to EOF.
+            let preview_timeout = if parse_error {
+                JSON_RPC_ERROR_BODY_TIMEOUT
             } else {
-                match tokio::time::timeout(
-                    Duration::from_millis(25),
-                    collect_body_prefix(&mut body_stream, limit),
-                ).await {
-                    Ok(result) => result,
-                    Err(_) => return Err(unexpected_http_status_error(
-                        response.status, "error body preview timed out".into(),
-                        retry_after(&response.headers, SystemTime::now()),
-                    )),
-                }
+                ERROR_BODY_PREVIEW_TIMEOUT
+            };
+            let preview_result = match tokio::time::timeout(
+                preview_timeout,
+                collect_body_prefix(&mut body_stream, limit),
+            ).await {
+                Ok(result) => result,
+                Err(_) => return Err(unexpected_http_status_error(
+                    response.status, "error body preview timed out".into(),
+                    retry_after, retry_after_received_at,
+                )),
             };
             let (body, truncated) = match preview_result {
                 Ok(result) => result,
                 Err(error) => return Err(unexpected_http_status_error(
                     response.status, format!("error body preview unavailable: {error}"),
-                    retry_after(&response.headers, SystemTime::now()),
+                    retry_after, retry_after_received_at,
                 )),
             };
             if parse_error
@@ -251,7 +260,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 );
             }
             return Err(unexpected_http_status_error(
-                response.status, preview, retry_after(&response.headers, SystemTime::now()),
+                response.status, preview, retry_after, retry_after_received_at,
             ));
         }
         match content_type.as_deref() {
@@ -266,18 +275,22 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 Ok(StreamableHttpPostResponse::Json(message, session_id))
             }
             _ => {
-                let (body, truncated) =
-                    collect_body_prefix(&mut body_stream, NON_JSON_RESPONSE_BODY_PREVIEW_BYTES)
-                        .await?;
                 let content_type = content_type.unwrap_or_else(|| "missing-content-type".into());
-                let suffix = if truncated {
-                    "... (body preview truncated)"
-                } else {
-                    ""
+                let preview = match tokio::time::timeout(
+                    ERROR_BODY_PREVIEW_TIMEOUT,
+                    collect_body_prefix(&mut body_stream, NON_JSON_RESPONSE_BODY_PREVIEW_BYTES),
+                ).await {
+                    Ok(Ok((body, truncated))) => {
+                        let suffix = if truncated { "... (body preview truncated)" } else { "" };
+                        format!("{}{suffix}", body_preview(String::from_utf8_lossy(&body)))
+                    }
+                    Ok(Err(error)) => format!("body preview unavailable: {error}"),
+                    Err(_) => "body preview timed out".to_string(),
                 };
+                // A preview failure must not turn a deterministic protocol error
+                // into a retryable transport failure.
                 Err(StreamableHttpError::UnexpectedContentType(Some(format!(
-                    "{content_type}; body: {}{suffix}",
-                    body_preview(String::from_utf8_lossy(&body))
+                    "{content_type}; body: {preview}"
                 ))))
             }
         }
@@ -332,6 +345,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 response.status,
                 "DELETE request failed".to_string(),
                 retry_after(&response.headers, SystemTime::now()),
+                tokio::time::Instant::now(),
             ));
         }
         Ok(())
@@ -409,6 +423,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 response.status,
                 "GET request failed".to_string(),
                 retry_after(&response.headers, SystemTime::now()),
+                tokio::time::Instant::now(),
             ));
         }
 
@@ -608,6 +623,7 @@ fn unexpected_http_status_error(
     status: u16,
     body_preview: String,
     retry_after: Option<Duration>,
+    retry_after_received_at: tokio::time::Instant,
 ) -> StreamableHttpError<StreamableHttpClientAdapterError> {
     match StatusCode::from_u16(status) {
         Ok(status) => {
@@ -615,6 +631,7 @@ fn unexpected_http_status_error(
                 status,
                 body_preview,
                 retry_after,
+                retry_after_received_at,
             })
         }
         Err(_) => StreamableHttpError::UnexpectedServerResponse(
@@ -677,6 +694,10 @@ fn sse_stream_from_body(
     }))
     .boxed()
 }
+
+#[cfg(test)]
+#[path = "retry_latency_tests.rs"]
+mod retry_latency_tests;
 
 #[cfg(test)]
 mod tests {

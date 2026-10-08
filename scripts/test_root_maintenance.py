@@ -166,10 +166,17 @@ class RootMaintenanceTest(unittest.TestCase):
             ),
             [
                 "scripts.test_dev_environment",
+                "scripts.test_kd4_model_inference",
                 "scripts.test_kd4_perf_snapshot",
                 "scripts.test_report_script_regressions.Report26ValidationRegressions.test_lock_waiter_never_writes_to_an_empty_owned_file",
                 "scripts.test_report_script_regressions.Report26ValidationRegressions.test_lock_waits_for_release_and_distinguishes_timeout_from_io_error",
             ],
+        )
+        self.assertEqual(
+            root_maintenance.python_test_targets(
+                [], ["scripts/kd4_perf_snapshot.py"]
+            ),
+            ["scripts.test_kd4_model_inference", "scripts.test_kd4_perf_snapshot"],
         )
 
     def test_changed_script_validation_runs_focused_tests_and_skips_retired_scripts(

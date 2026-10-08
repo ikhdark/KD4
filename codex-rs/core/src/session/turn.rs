@@ -291,16 +291,18 @@ fn continuation_workspace_prefetch_is_current(
     baseline_mutation_revision == current_mutation_revision && !accepted_user_input
 }
 
+type ContinuationWorkspacePrefetch = (
+    u64,
+    AbortOnDropHandle<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
+);
+
 async fn start_continuation_workspace_prefetch(
     history: &ContextManager,
     turn_diff_tracker: &Arc<tokio::sync::Mutex<TurnDiffTracker>>,
     git_workspace: Arc<crate::git_workspace::GitWorkspaceCache>,
     cwd: codex_utils_absolute_path::AbsolutePathBuf,
     environments: crate::environment_selection::TurnEnvironmentSnapshot,
-) -> Option<(
-    u64,
-    AbortOnDropHandle<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-)> {
+) -> Option<ContinuationWorkspacePrefetch> {
     if !history.requires_workspace_evidence_validation() {
         return None;
     }
@@ -312,6 +314,39 @@ async fn start_continuation_workspace_prefetch(
             .identity
     }));
     Some((baseline_mutation_revision, handle))
+}
+
+async fn reuse_workspace_prefetch_for_local_compaction(
+    sess: &Session,
+    turn_context: &TurnContext,
+    turn_diff_tracker: &SharedTurnDiffTracker,
+    pending: &mut Option<ContinuationWorkspacePrefetch>,
+    identity: &mut Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<()> {
+    // Remote compaction and fresh windows do not use workspace evidence. Leave
+    // their capture in flight for recovery rather than adding a dispatch barrier.
+    if identity.is_some()
+        || should_use_remote_compact_task(
+            turn_context.provider.info(),
+            turn_context.config.compact_prompt.as_deref(),
+        )
+        || (turn_context.config.features.enabled(Feature::TokenBudget)
+            && sess.token_budget_recovery_available())
+    {
+        return Ok(());
+    }
+    if let Some((baseline, handle)) = pending.take() {
+        let revision = turn_diff_tracker.lock().await.current_mutation_revision();
+        if continuation_workspace_prefetch_is_current(baseline, revision, false) {
+            *identity = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+                result = handle => result.ok(),
+            };
+        }
+    }
+    Ok(())
 }
 
 async fn finish_stopped_session_start(sess: &Session, input: Vec<TurnInput>) -> TurnTaskResult {
@@ -386,7 +421,7 @@ pub(crate) async fn run_turn(
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
         TurnDiffTracker::with_environment_display_roots([]),
     ));
-    let mut initial_workspace_prefetch = start_continuation_workspace_prefetch(
+    let mut pending_workspace_prefetch = start_continuation_workspace_prefetch(
         &sess.clone_history().await,
         &turn_diff_tracker,
         Arc::clone(&sess.services.git_workspace),
@@ -396,6 +431,23 @@ pub(crate) async fn run_turn(
     let mut preparation_timing_guard = None;
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    // Startup-capable clients already have a speculative owner until the first send.
+    // Desktop attestation intentionally disables that path, but is available now.
+    let startup_owns_transport = sess.services.model_client.startup_websocket_enabled()
+        && sess.state.lock().await.startup_prewarm.is_some();
+    if !startup_owns_transport {
+        let metadata = turn_context.turn_metadata_state.to_responses_metadata(
+            sess.installation_id.clone(),
+            sess.current_window_id().await,
+            CodexResponsesRequestKind::Turn,
+        );
+        client_session.start_websocket_preconnect(
+            &turn_context.model_info,
+            service_tier_for_sampling(&sess, &turn_context).await,
+            &turn_context.session_telemetry,
+            &metadata,
+        ).await;
+    }
     if !sess.has_reference_context_item().await {
         client_session
             .invalidate_provider_history_inheritance("realized context baseline is unknown");
@@ -500,6 +552,7 @@ pub(crate) async fn run_turn(
     let mut turn_execution =
         TurnExecutionControl::new_with_timing(Arc::clone(&turn_context.turn_timing_state))
             .with_session_path_replays(Arc::clone(&sess.services.path_replays))
+            .with_session_validation_uncertainty(Arc::clone(&sess.services.validation_uncertainty))
             .with_active_plan(if turn_context.collaboration_mode.mode == ModeKind::Plan {
                 None
             } else {
@@ -559,7 +612,7 @@ pub(crate) async fn run_turn(
             run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await?
         };
         if recorded_input.accepted_context_input {
-            initial_workspace_prefetch = None;
+            pending_workspace_prefetch = None;
             prefetched_workspace_identity = None;
             seen_stop_repairs.clear();
             completion_evidence = None;
@@ -715,7 +768,7 @@ pub(crate) async fn run_turn(
                 let normalization_guard = turn_context
                     .turn_timing_state
                     .begin_local_phase(TurnLocalPhase::Normalization);
-                if let Some((baseline, handle)) = initial_workspace_prefetch.take()
+                if let Some((baseline, handle)) = pending_workspace_prefetch.take()
                     && continuation_workspace_prefetch_is_current(
                         baseline,
                         turn_diff_tracker.lock().await.current_mutation_revision(),
@@ -790,8 +843,10 @@ pub(crate) async fn run_turn(
                     server_end_turn_false,
                     required_tool_terminal,
                     prefetched_workspace_identity: next_workspace_identity,
+                    continuation_workspace_prefetch,
                 } = sampling_request_output;
                 prefetched_workspace_identity = next_workspace_identity;
+                pending_workspace_prefetch = continuation_workspace_prefetch;
                 if let Some(required_tool_terminal) = required_tool_terminal {
                     if required_tool_terminal.cause != RequiredToolTerminalCause::Blocked {
                         let error = CodexErrorInfo::Other;
@@ -1009,6 +1064,11 @@ pub(crate) async fn run_turn(
                         convergence_decision.as_mut(),
                     )
                     .await?;
+                    reuse_workspace_prefetch_for_local_compaction(
+                        &sess, &turn_context, &turn_diff_tracker,
+                        &mut pending_workspace_prefetch, &mut prefetched_workspace_identity,
+                        &cancellation_token,
+                    ).await?;
                     if let Err(err) = run_auto_compact(
                         &sess,
                         Arc::clone(&step_context),
@@ -1081,6 +1141,7 @@ pub(crate) async fn run_turn(
                             let mut tracker = turn_diff_tracker.lock().await;
                             tracker.record_unknown_mutation();
                             finalized_mutation_revision = Some(tracker.current_mutation_revision());
+                            pending_workspace_prefetch = None;
                             prefetched_workspace_identity = None;
                             after_agent_outcome.aborted
                         } else {
@@ -1284,6 +1345,11 @@ pub(crate) async fn run_turn(
                 {
                     break;
                 }
+                reuse_workspace_prefetch_for_local_compaction(
+                    &sess, &turn_context, &turn_diff_tracker,
+                    &mut pending_workspace_prefetch, &mut prefetched_workspace_identity,
+                    &cancellation_token,
+                ).await?;
                 if let Err(err) = run_auto_compact(
                     &sess,
                     Arc::clone(&step_context),
@@ -1825,13 +1891,17 @@ struct CompletionStopHookReport {
     stop_reason: Option<String>,
 }
 
-fn final_reports_unfinished_work(message: &str) -> bool {
-    message.to_ascii_lowercase().lines().any(|line| {
-        ["work", "task", "review", "requested", "implementation"]
-            .iter().any(|subject| line.contains(subject))
-            && ["not complete", "not finished", "still incomplete", "remains unfinished", "remain unverified"]
-                .iter().any(|admission| line.contains(admission))
-    })
+fn completion_verification_warning(
+    assessment: &codex_protocol::protocol::TurnCompletionAssessment,
+) -> Option<String> {
+    // Final prose is not an evidence owner: quoted historical failures and
+    // wording changes cannot create or discharge a mechanical verification gap.
+    (!assessment.failed_checks.is_empty() || !assessment.verification_gaps.is_empty())
+        .then(|| format!(
+            "{} This turn is not a verified completion of that scope.",
+            assessment.failed_checks.iter().chain(&assessment.verification_gaps)
+                .cloned().collect::<Vec<_>>().join(" ")
+        ))
 }
 
 async fn run_completion_stop_hook(
@@ -1839,23 +1909,13 @@ async fn run_completion_stop_hook(
     turn_context: &Arc<TurnContext>,
     stop_hook_active: bool,
     last_agent_message: Option<String>,
-    mut assessment: codex_protocol::protocol::TurnCompletionAssessment,
+    assessment: codex_protocol::protocol::TurnCompletionAssessment,
 ) -> CompletionStopHookReport {
-    if last_agent_message.as_deref().is_some_and(final_reports_unfinished_work) {
-        assessment.verification_gaps.insert(
-            0,
-            "The assistant's final response reports unfinished requested work.".to_string(),
-        );
-    }
-    if !assessment.failed_checks.is_empty() || !assessment.verification_gaps.is_empty() {
+    if let Some(message) = completion_verification_warning(&assessment) {
         // A truthful limitation is allowed, but must not silently look like
         // verified task completion. Do not auto-loop on a genuine blocker.
         sess.send_event(turn_context, EventMsg::Warning(WarningEvent {
-            message: format!(
-                "{} This turn is not a verified completion of that scope.",
-                assessment.failed_checks.iter().chain(&assessment.verification_gaps)
-                    .cloned().collect::<Vec<_>>().join(" ")
-            ),
+            message,
         })).await;
     }
     if !assessment.advisories.is_empty() {
@@ -3295,145 +3355,149 @@ async fn maybe_run_previous_model_inline_compact(
     fields(reason = ?reason, phase = ?phase)
 )]
 #[allow(clippy::too_many_arguments)]
-async fn run_auto_compact(
-    sess: &Arc<Session>,
+fn run_auto_compact<'a>(
+    sess: &'a Arc<Session>,
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
-    client_session: &mut ModelClientSession,
-    prefetched_workspace_identity: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
+    client_session: &'a mut ModelClientSession,
+    prefetched_workspace_identity: Option<&'a Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
     prefetched_world_state: Option<Arc<WorldState>>,
     reason: CompactionReason,
     phase: CompactionPhase,
-    cancellation_token: &CancellationToken,
-) -> CodexResult<()> {
-    let turn_context = &step_context.turn;
-    let budget_turn_context = Arc::clone(turn_context);
-    // Automatic compaction restores initial context. Reuse a snapshot already
-    // captured by the caller, or capture one before dispatching compaction.
-    let world_state = match prefetched_world_state {
-        Some(world_state) => world_state,
-        None => Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await),
-    };
-    let initial_context_injection = InitialContextInjection::AtStart(world_state);
-    // A fresh window discards history; without recovery tools, keep a replacement history.
-    if turn_context.config.features.enabled(Feature::TokenBudget)
-        && sess.token_budget_recovery_available()
-    {
-        crate::compact_token_budget::run_inline_auto_compact_task(
-            Arc::clone(sess), step_context, initial_context_injection, cancellation_token,
-        ).await?;
-        client_session.invalidate_provider_history_inheritance("installed fresh context window");
-    } else if should_use_remote_compact_task(
-        turn_context.provider.info(),
-        turn_context.config.compact_prompt.as_deref(),
-    ) {
-        emit_compact_metric(
-            &sess.services.session_telemetry,
-            "remote_v2",
-            /*manual*/ false,
-        );
-        run_inline_remote_auto_compact_task_v2(
-            Arc::clone(sess),
-            step_context,
-            fallback_step_context,
-            client_session,
-            initial_context_injection,
-            reason,
-            phase,
-            cancellation_token,
-        )
-        .await?;
-    } else {
-        emit_compact_metric(
-            &sess.services.session_telemetry,
-            "local",
-            /*manual*/ false,
-        );
-        let previous_model = turn_context.model_info.slug.as_str();
-        let initial_attempt = run_inline_auto_compact_task(
-            Arc::clone(sess),
-            Arc::clone(turn_context),
-            InlineAutoCompactReuse {
-                // Reuse the turn transport, matching the remote-compaction path above.
-                client_session,
-                prefetched_workspace_identity,
-            },
-            initial_context_injection.clone(),
-            reason,
-            phase,
-            /*emit_error_event*/ fallback_step_context.is_none(),
-            cancellation_token,
-        )
-        .await;
-
-        match initial_attempt {
-            Ok(()) => {}
-            Err(previous_error) => {
-                let Some(fallback_step_context) = fallback_step_context else {
-                    return Err(previous_error);
-                };
-                if !should_retry_with_current_model(&previous_error) {
-                    return Err(previous_error);
-                }
-
-                let fallback_turn_context = &fallback_step_context.turn;
-                let fallback_result = run_inline_auto_compact_task(
-                    Arc::clone(sess),
-                    Arc::clone(fallback_turn_context),
-                    InlineAutoCompactReuse {
-                        client_session,
-                        prefetched_workspace_identity,
-                    },
-                    initial_context_injection,
-                    reason,
-                    phase,
-                    /*emit_error_event*/ true,
-                    cancellation_token,
-                )
-                .await;
-                record_model_fallback(
-                    &sess.services.session_telemetry,
-                    previous_model,
-                    fallback_turn_context.model_info.slug.as_str(),
-                    reason,
-                    CompactionImplementation::Responses,
-                    fallback_result.as_ref().err(),
-                );
-                if let Err(fallback_error) = &fallback_result {
-                    sess.send_event(
-                        fallback_turn_context,
-                        EventMsg::Warning(WarningEvent {
-                            message: format!(
-                                "Compaction failed with the previous model: {previous_error}; retry with the current model also failed: {fallback_error}"
-                            ),
-                        }),
-                    )
-                    .await;
-                }
-                fallback_result?;
-            }
-        }
-    }
-    if matches!(reason, CompactionReason::ContextLimit) {
-        let token_status =
-            super::context_window::context_window_token_status(sess, budget_turn_context.as_ref())
-                .await;
-        if token_status.token_limit_reached {
-            let error = CodexErr::Fatal(
-                "Compaction did not bring the context below its configured token limit. Stopped automatic continuation to prevent repeated compaction and usage drain; reduce context or start a new task.".to_string(),
+    cancellation_token: &'a CancellationToken,
+) -> BoxFuture<'a, CodexResult<()>> {
+    // Bound the compaction future at the shared dispatch boundary. Otherwise
+    // each pre-sampling/planning frame embeds every compaction implementation.
+    Box::pin(async move {
+        let turn_context = &step_context.turn;
+        let budget_turn_context = Arc::clone(turn_context);
+        // Automatic compaction restores initial context. Reuse a snapshot already
+        // captured by the caller, or capture one before dispatching compaction.
+        let world_state = match prefetched_world_state {
+            Some(world_state) => world_state,
+            None => Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await),
+        };
+        let initial_context_injection = InitialContextInjection::AtStart(world_state);
+        // A fresh window discards history; without recovery tools, keep a replacement history.
+        if turn_context.config.features.enabled(Feature::TokenBudget)
+            && sess.token_budget_recovery_available()
+        {
+            crate::compact_token_budget::run_inline_auto_compact_task(
+                Arc::clone(sess), step_context, initial_context_injection, cancellation_token,
+            ).await?;
+            client_session.invalidate_provider_history_inheritance("installed fresh context window");
+        } else if should_use_remote_compact_task(
+            turn_context.provider.info(),
+            turn_context.config.compact_prompt.as_deref(),
+        ) {
+            emit_compact_metric(
+                &sess.services.session_telemetry,
+                "remote_v2",
+                /*manual*/ false,
             );
-            sess.send_event(
-                &budget_turn_context,
-                EventMsg::Error(ErrorEvent {
-                    message: error.to_string(),
-                    codex_error_info: Some(error.to_codex_protocol_error()),
-                }),
+            run_inline_remote_auto_compact_task_v2(
+                Arc::clone(sess),
+                step_context,
+                fallback_step_context,
+                client_session,
+                initial_context_injection,
+                reason,
+                phase,
+                cancellation_token,
+            )
+            .await?;
+        } else {
+            emit_compact_metric(
+                &sess.services.session_telemetry,
+                "local",
+                /*manual*/ false,
+            );
+            let previous_model = turn_context.model_info.slug.as_str();
+            let initial_attempt = run_inline_auto_compact_task(
+                Arc::clone(sess),
+                Arc::clone(turn_context),
+                InlineAutoCompactReuse {
+                    // Reuse the turn transport, matching the remote-compaction path above.
+                    client_session,
+                    prefetched_workspace_identity,
+                },
+                initial_context_injection.clone(),
+                reason,
+                phase,
+                /*emit_error_event*/ fallback_step_context.is_none(),
+                cancellation_token,
             )
             .await;
-            return Err(error);
+
+            match initial_attempt {
+                Ok(()) => {}
+                Err(previous_error) => {
+                    let Some(fallback_step_context) = fallback_step_context else {
+                        return Err(previous_error);
+                    };
+                    if !should_retry_with_current_model(&previous_error) {
+                        return Err(previous_error);
+                    }
+
+                    let fallback_turn_context = &fallback_step_context.turn;
+                    let fallback_result = run_inline_auto_compact_task(
+                        Arc::clone(sess),
+                        Arc::clone(fallback_turn_context),
+                        InlineAutoCompactReuse {
+                            client_session,
+                            prefetched_workspace_identity,
+                        },
+                        initial_context_injection,
+                        reason,
+                        phase,
+                        /*emit_error_event*/ true,
+                        cancellation_token,
+                    )
+                    .await;
+                    record_model_fallback(
+                        &sess.services.session_telemetry,
+                        previous_model,
+                        fallback_turn_context.model_info.slug.as_str(),
+                        reason,
+                        CompactionImplementation::Responses,
+                        fallback_result.as_ref().err(),
+                    );
+                    if let Err(fallback_error) = &fallback_result {
+                        sess.send_event(
+                            fallback_turn_context,
+                            EventMsg::Warning(WarningEvent {
+                                message: format!(
+                                    "Compaction failed with the previous model: {previous_error}; retry with the current model also failed: {fallback_error}"
+                                ),
+                            }),
+                        )
+                        .await;
+                    }
+                    fallback_result?;
+                }
+            }
         }
-    }
-    Ok(())
+        if matches!(reason, CompactionReason::ContextLimit) {
+            let token_status =
+                super::context_window::context_window_token_status(sess, budget_turn_context.as_ref())
+                    .await;
+            if token_status.token_limit_reached {
+                let error = CodexErr::Fatal(
+                    "Compaction did not bring the context below its configured token limit. Stopped automatic continuation to prevent repeated compaction and usage drain; reduce context or start a new task.".to_string(),
+                );
+                sess.send_event(
+                    &budget_turn_context,
+                    EventMsg::Error(ErrorEvent {
+                        message: error.to_string(),
+                        codex_error_info: Some(error.to_codex_protocol_error()),
+                    }),
+                )
+                .await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    })
 }
 
 pub(super) fn collect_explicit_app_ids_from_skill_items(
@@ -4718,6 +4782,7 @@ struct SamplingRequestResult {
     server_end_turn_false: bool,
     required_tool_terminal: Option<RequiredToolTerminal>,
     prefetched_workspace_identity: Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
+    continuation_workspace_prefetch: Option<ContinuationWorkspacePrefetch>,
 }
 
 #[derive(Debug)]
@@ -5634,7 +5699,7 @@ fn assign_missing_streamed_response_item_id(
     Session::assign_missing_response_item_id(item);
 }
 
-async fn service_tier_for_sampling(sess: &Session, turn: &TurnContext) -> Option<String> {
+pub(crate) async fn service_tier_for_sampling(sess: &Session, turn: &TurnContext) -> Option<String> {
     // Settings bursts may settle while planning or tools are running. Collapse
     // them at the request boundary instead of pinning every request to the
     // transient value captured when the turn was constructed.
@@ -6697,22 +6762,17 @@ async fn try_run_sampling_request(
             tool_exposure_revision: turn_context.deferred_tool_activation_revision(),
         }
     };
-    let prefetched_workspace_identity =
-        match generation_workspace_evidence.prefetched_workspace_identity {
-            Some(identity) => Some(identity),
-            None => match continuation_workspace_prefetch {
-                Some((baseline_mutation_revision, handle))
-                    if continuation_workspace_prefetch_is_current(
-                        baseline_mutation_revision,
-                        settled_state.mutation_revision,
-                        false,
-                    ) =>
-                {
-                    handle.await.ok()
-                }
-                _ => None,
-            },
-        };
+    let prefetched_workspace_identity = generation_workspace_evidence.prefetched_workspace_identity;
+    // Keep the capture in flight across the continuation's step-context capture.
+    // The turn owns cancellation and rechecks its revision before prompt preparation.
+    let continuation_workspace_prefetch = continuation_workspace_prefetch.filter(|(baseline, _)| {
+        prefetched_workspace_identity.is_none()
+            && continuation_workspace_prefetch_is_current(
+                *baseline,
+                settled_state.mutation_revision,
+                false,
+            )
+    });
     let outcome = outcome.map(|result| SamplingRequestResult {
         needs_follow_up: result.needs_follow_up,
         last_agent_message: result.last_agent_message,
@@ -6721,6 +6781,7 @@ async fn try_run_sampling_request(
         server_end_turn_false: result.server_end_turn_false,
         required_tool_terminal,
         prefetched_workspace_identity,
+        continuation_workspace_prefetch,
     });
 
     if should_emit_turn_diff {

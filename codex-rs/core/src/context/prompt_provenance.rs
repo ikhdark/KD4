@@ -907,7 +907,7 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
     match kind {
         StableContextKind::BaseModel => PromptContextCategory::BaseSystem,
         StableContextKind::ToolSchemas => PromptContextCategory::ToolSchemas,
-        StableContextKind::Repository => PromptContextCategory::Repository,
+        StableContextKind::Repository | StableContextKind::RepositoryObservation => PromptContextCategory::Repository,
         StableContextKind::Collaboration => PromptContextCategory::Collaboration,
         StableContextKind::SkillUsage | StableContextKind::SelectedSkill => {
             PromptContextCategory::Skills
@@ -928,6 +928,7 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
         | StableContextKind::Wait
         | StableContextKind::TurnContribution
         | StableContextKind::DynamicHistory
+        | StableContextKind::TaskState
         | StableContextKind::ModelSwitch
         | StableContextKind::Personality
         | StableContextKind::DeveloperInstructions => PromptContextCategory::OtherInjected,

@@ -88,7 +88,8 @@ struct TerminalCellCache {
 
 enum CachedCellEvent {
     Inline(CellEvent),
-    Spilled(tempfile::NamedTempFile, usize),
+    // Lifecycle survives payload eviction without reopening the spill under a lock.
+    Spilled(tempfile::NamedTempFile, usize, Option<bool>),
 }
 
 // serde_json emits many small writes. Flush explicitly so an I/O error cannot
@@ -110,7 +111,7 @@ impl CachedCellEvent {
                 Ok(file)
             })();
             match spilled {
-                Ok(file) => return (Arc::new(Self::Spilled(file, bytes)), 0),
+                Ok(file) => return (Arc::new(Self::Spilled(file, bytes, terminal_completion(&event))), 0),
                 Err(error) => {
                     // Preserve the evidence on storage failure rather than
                     // silently turning a completed cell into an unknown one.
@@ -124,7 +125,7 @@ impl CachedCellEvent {
     fn read(&self) -> Result<CellEvent, Error> {
         match self {
             Self::Inline(event) => Ok(event.clone()),
-            Self::Spilled(file, _) => file.reopen()
+            Self::Spilled(file, _, _) => file.reopen()
                 .map_err(|error| Error::Runtime(format!(
                     "terminal cell result is unavailable: {error}; the cell completed; do not replay its effects"
                 )))
@@ -136,8 +137,14 @@ impl CachedCellEvent {
 }
 
 impl TerminalCellCache {
-    fn lookup(&self, cell_id: &CellId) -> Result<Arc<CachedCellEvent>, Error> {
-        self.entry(cell_id).ok_or_else(|| {
+    fn lookup(&self, cell_id: &CellId) -> Result<(Arc<CachedCellEvent>, usize), Error> {
+        self.events.get(cell_id).map(|(event, retained_bytes)| {
+            let bytes = match event.as_ref() {
+                CachedCellEvent::Inline(_) => *retained_bytes,
+                CachedCellEvent::Spilled(_, bytes, _) => *bytes,
+            };
+            (Arc::clone(event), bytes)
+        }).ok_or_else(|| {
             match self.expired.iter().find(|(id, _)| id == cell_id) {
                 Some((_, completed)) => Error::ExpiredResult { cell_id: cell_id.clone(), completed: *completed },
                 None => Error::MissingCell(cell_id.clone()),
@@ -177,18 +184,26 @@ impl TerminalCellCache {
                 self.retained_bytes = self.retained_bytes.saturating_sub(expired_bytes);
                 // Spilled receipts exceed the byte cap but may still represent
                 // interruption. Do not hydrate disk data under this cache lock.
-                if let CachedCellEvent::Inline(event) = event.as_ref() {
-                    match event {
-                        CellEvent::Completed { .. } => self.expired.push_back((expired, true)),
-                        CellEvent::Terminated { .. } => self.expired.push_back((expired, false)),
-                        _ => {},
-                    }
+                let completed = match event.as_ref() {
+                    CachedCellEvent::Inline(event) => terminal_completion(event),
+                    CachedCellEvent::Spilled(_, _, completed) => *completed,
+                };
+                if let Some(completed) = completed {
+                    self.expired.push_back((expired, completed));
                 }
                 while self.expired.len() > TERMINAL_CELL_CACHE_CAPACITY {
                     self.expired.pop_front();
                 }
             }
         }
+    }
+}
+
+fn terminal_completion(event: &CellEvent) -> Option<bool> {
+    match event {
+        CellEvent::Completed { .. } => Some(true),
+        CellEvent::Terminated { .. } => Some(false),
+        _ => None,
     }
 }
 
@@ -360,13 +375,9 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
     }
 
     async fn cached_terminal_observation(&self, cell_id: &CellId) -> Result<PendingEvent, Error> {
-        let event = self.inner.terminal_cells.lock()
+        let (event, bytes) = self.inner.terminal_cells.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .lookup(cell_id)?;
-        let bytes = match event.as_ref() {
-            CachedCellEvent::Inline(event) => cell_event_bytes(event),
-            CachedCellEvent::Spilled(_, bytes) => *bytes,
-        };
         let permit = tokio::select! {
             biased;
             _ = self.inner.shutdown_token.cancelled() => return Err(Error::ShuttingDown),
@@ -376,10 +387,16 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         // The blocking owner retains admission if its async waiter is dropped.
         // Successful hydration keeps it through the observation handoff, not
         // merely until the disk read completes.
-        let (event, permit) = tokio::task::spawn_blocking(move || (event.read(), permit)).await
-            .map_err(|error| Error::Runtime(format!(
-                "terminal cell recovery failed: {error}; do not replay its effects"
-            )))?;
+        let (event, permit) = if matches!(event.as_ref(), CachedCellEvent::Inline(_))
+            && bytes <= TERMINAL_CELL_CACHE_MAX_BYTES
+        {
+            (event.read(), permit)
+        } else {
+            tokio::task::spawn_blocking(move || (event.read(), permit)).await
+                .map_err(|error| Error::Runtime(format!(
+                    "terminal cell recovery failed: {error}; do not replay its effects"
+                )))?
+        };
         let event = event?;
         Ok(PendingEvent { event: Box::pin(async move {
             let _permit = permit;
@@ -656,6 +673,17 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
     ) -> CompletionCommit {
+        // Read-only in-memory cells publish only their own terminal event. They
+        // need neither transaction admission nor the shared stored-values lock.
+        // Active-cell admission prevents enabling durability underneath a cell;
+        // durable read-only cells still use the transaction path for their receipt.
+        if stored_value_writes.is_empty() && self.inner.durable_state.get().is_none() {
+            return cell_state.commit_completion_with_event(
+                event,
+                pending_initial_yield_items,
+                |event| event,
+            );
+        }
         let cancellation_token = cell_state.cancellation_token();
         let deadline = tokio::time::Instant::now() + SNAPSHOT_COMMIT_TIMEOUT;
         let gate = tokio::select! {
@@ -955,3 +983,6 @@ fn actor_error(cell_id: &CellId, error: CellError) -> Error {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod read_only_completion_tests;

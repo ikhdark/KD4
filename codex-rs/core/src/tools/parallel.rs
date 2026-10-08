@@ -1131,6 +1131,33 @@ fn workspace_tool_may_use_parallel_gate(supports_parallel: bool, workspace_capab
     supports_parallel && !workspace_capable
 }
 
+#[cfg(test)]
+mod plan_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn plan_owner_bypasses_workspace_writer_without_bypassing_dispatch() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
+            crate::tools::registry::ToolRegistry::from_tools([
+                Arc::new(crate::tools::handlers::PlanHandler) as Arc<dyn crate::tools::registry::CoreToolRuntime>,
+            ]), Vec::new(),
+        ));
+        let step = crate::session::step_context::StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(Arc::new(session), step,
+            Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())));
+        let _workspace_writer = Arc::clone(&runtime.parallel_execution).write_owned().await;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.handle_tool_call(
+            crate::tools::router::ToolCall {
+                tool_name: codex_tools::ToolName::plain("update_plan"), call_id: "independent-plan".into(),
+                payload: ToolPayload::Function { arguments: r#"{"plan":[{"step":"work","status":"pending"}]}"#.into() },
+            }, tokio_util::sync::CancellationToken::new(),
+        )).await.expect("plan must not acquire the workspace gate").unwrap();
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else { panic!("function output") };
+        assert_eq!(output.success, Some(true));
+    }
+}
+
 /// Resolve native file dependencies using the same ready environment as the
 /// handler. Remote/starting/unknown environments have no host-watcher proof.
 fn native_file_classification(
@@ -2475,6 +2502,9 @@ impl ToolCallRuntime {
                     let projection_started = Instant::now();
                     let native_read_output = (semantic_tool_name.name.as_str() == "read_file")
                         .then(|| response.result.code_mode_result(&response.payload));
+                    let failure_detail = response.result.model_delivery_unavailable().then(|| {
+                        crate::tools::registry::model_delivery_unavailable_receipt(&error_call.call_id)
+                    });
                     let response = response.into_response();
                     evidence_timing.record_output_projection(projection_started.elapsed());
                     let (workspace_revision_before, evidence_classification) =
@@ -2594,7 +2624,7 @@ impl ToolCallRuntime {
                     }
                     Ok(ToolCallCompletion {
                         response,
-                        failure_detail: None,
+                        failure_detail,
                         required_terminal,
                     })
                 }
@@ -6204,7 +6234,11 @@ mod tests {
                 response: &response,
                 revision: Some(revision.clone()),
                 captured_current: true,
-                source_dependencies: Default::default(),
+                source_dependencies: std::collections::BTreeSet::from([
+                    crate::tool_history::SourceDependencyV1::new(
+                        std::path::Path::new("fixture/source.rs"), false,
+                    ),
+                ]),
                 source_path_observations: Vec::new(),
                 workspace_gate_guard: None,
             },

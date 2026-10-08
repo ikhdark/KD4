@@ -32,10 +32,8 @@ use crate::provider::ProviderAccountResult;
 use crate::provider::ProviderAccountState;
 use crate::provider::ProviderCapabilities;
 use crate::provider::ResolvedModelProviderClientSetup;
-use auth::resolve_provider_auth;
 pub(crate) use catalog::static_model_catalog;
 use catalog::with_default_only_service_tier;
-use mantle::runtime_base_url;
 use runtime_catalog::static_runtime_model_catalog;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +49,8 @@ pub(crate) struct AmazonBedrockModelProvider {
     pub(crate) aws: ModelProviderAwsAuthInfo,
     endpoint: BedrockEndpoint,
     auth_manager: Option<Arc<AuthManager>>,
+    // Scoped to this provider's immutable AWS configuration; clones share initialization.
+    sdk_context: Arc<tokio::sync::OnceCell<codex_aws_auth::AwsAuthContext>>,
 }
 
 impl AmazonBedrockModelProvider {
@@ -75,6 +75,7 @@ impl AmazonBedrockModelProvider {
             aws,
             endpoint,
             auth_manager,
+            sdk_context: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -105,18 +106,24 @@ impl AmazonBedrockModelProvider {
 
     async fn runtime_base_url(&self) -> Result<Option<String>> {
         let managed_auth = self.managed_auth();
+        let method = self.resolve_auth_method(managed_auth.as_ref()).await?;
         let base_url = match self.endpoint {
-            BedrockEndpoint::Mantle => runtime_base_url(managed_auth.as_ref(), &self.aws).await?,
-            BedrockEndpoint::Runtime => {
-                runtime::bedrock_runtime_base_url(managed_auth.as_ref(), &self.aws).await?
-            }
+            BedrockEndpoint::Mantle => mantle::base_url(method.region())?,
+            BedrockEndpoint::Runtime => runtime::base_url(method.region()),
         };
         Ok(Some(base_url))
     }
 
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
         let managed_auth = self.managed_auth();
-        resolve_provider_auth(managed_auth.as_ref(), &self.aws, self.endpoint).await
+        Ok(self.resolve_auth_method(managed_auth.as_ref()).await?.into_provider(self.endpoint))
+    }
+
+    async fn resolve_auth_method(
+        &self,
+        managed_auth: Option<&BedrockApiKeyAuth>,
+    ) -> Result<auth::BedrockAuthMethod> {
+        auth::resolve_auth_method(managed_auth, &self.aws, self.endpoint, &self.sdk_context).await
     }
 }
 
@@ -176,8 +183,7 @@ impl ModelProvider for AmazonBedrockModelProvider {
     ) -> ModelProviderFuture<'_, Result<ResolvedModelProviderClientSetup>> {
         Box::pin(async move {
             let managed_auth = self.managed_auth();
-            let method =
-                auth::resolve_auth_method(managed_auth.as_ref(), &self.aws, self.endpoint).await?;
+            let method = self.resolve_auth_method(managed_auth.as_ref()).await?;
             let mut info = self.info.clone();
             info.base_url = Some(match self.endpoint {
                 BedrockEndpoint::Mantle => mantle::base_url(method.region())?,

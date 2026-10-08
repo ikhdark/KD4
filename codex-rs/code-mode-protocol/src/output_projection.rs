@@ -37,6 +37,10 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                                     })))
                     })
                 }));
+    let mcp_text = !local_text_tool
+        && object.get("content").and_then(Value::as_array).is_some_and(|content| {
+            content.iter().any(|item| item["type"] == "text" && item.get("text").is_some_and(Value::is_string))
+        });
     let mut projected = object.clone();
     if tool.namespace.is_none() && matches!(tool.name.as_str(), "exec_command" | "write_stdin") {
         // Chunk IDs identify transport frames, not resumable commands or artifacts.
@@ -138,9 +142,9 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                 }
             }
         }
-    } else if tool.namespace.is_some() || tool.name.starts_with("mcp__") {
-        let structured = object.get("structuredContent").filter(|v| !v.is_null())?;
-        let content = object.get("content")?.as_array()?;
+    } else if let Some(structured) = object.get("structuredContent").filter(|v| !v.is_null())
+        && let Some(content) = object.get("content").and_then(Value::as_array)
+    {
         let retained = content
             .iter()
             .filter(|item| {
@@ -153,12 +157,9 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
             })
             .cloned()
             .collect::<Vec<_>>();
-        if retained.len() == content.len() {
-            return None;
-        }
         projected.insert("content".to_string(), Value::Array(retained));
     }
-    (raw_text || projected != *object).then_some(Value::Object(projected))
+    (raw_text || mcp_text || projected != *object).then_some(Value::Object(projected))
 }
 
 /// Search coordinates and hydrated evidence remain inline. Only omit aliases
@@ -560,8 +561,21 @@ mod tests {
             mismatch["structuredContent"] = structured;
             assert_eq!(
                 model_visible_tool_result(&ToolName::plain("mcp__server__tool"), &mismatch),
-                None
+                Some(mismatch.clone())
             );
         }
+    }
+
+    #[test]
+    fn mcp_text_without_structured_content_registers_without_changing_data() {
+        let raw = json!({"content":[{"type":"text","text":"first\r\n\"second\"","annotations":{"priority":1}},
+            {"type":"image","data":"abc","mimeType":"image/png"}], "isError":true,"_meta":{"id":7}});
+        for tool in [ToolName::plain("mcp__server__tool"), ToolName::namespaced("server", "tool")] {
+            assert_eq!(model_visible_tool_result(&tool, &raw), Some(raw.clone()));
+            for content in [json!([]), json!([{"type":"image","data":"abc"}]), json!([{"type":"text","text":null}])] {
+                assert_eq!(model_visible_tool_result(&tool, &json!({"content":content})), None);
+            }
+        }
+        assert_eq!(model_visible_tool_result(&ToolName::plain("other"), &raw), None);
     }
 }

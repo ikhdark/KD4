@@ -40,9 +40,19 @@ pub(super) fn spawn_notification<H: CellHost>(
     let NotificationInvocation { id, call_id, text } = invocation;
     tasks.spawn(async move {
         let timeout_token = cancellation_token.clone();
+        // Issued notifications get the same bounded delivery grace as callback
+        // cleanup. A child of the cell token would cancel delivery immediately,
+        // before finish_callbacks can drain it. Dropping/aborting this owner
+        // still cancels the delegate; no delivery task is detached.
+        let delivery_token = CancellationToken::new();
+        let _delivery_guard = delivery_token.clone().drop_guard();
         let callback = AssertUnwindSafe(async move {
             tokio::select! {
-                response = host.notify(call_id, text, cancellation_token) => response,
+                response = host.notify(call_id, text, delivery_token) => response,
+                _ = async {
+                    cancellation_token.cancelled().await;
+                    tokio::time::sleep(CALLBACK_CANCELLATION_GRACE).await;
+                } => Err("code mode notification cancelled after delivery grace".to_string()),
                 _ = tokio::time::sleep(NOTIFICATION_DELIVERY_TIMEOUT) => {
                     timeout_token.cancel();
                     Err(format!(

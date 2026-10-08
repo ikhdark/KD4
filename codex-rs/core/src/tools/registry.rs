@@ -45,6 +45,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::DeterministicContinuationClass;
 use codex_protocol::protocol::DeterministicContinuationHostAction;
 use codex_protocol::protocol::EventMsg;
@@ -971,6 +972,10 @@ fn apply_post_tool_use_outcome(
 }
 
 impl ToolOutput for PostToolUseFeedbackOutput {
+    fn model_delivery_unavailable(&self) -> bool {
+        self.original.model_delivery_unavailable()
+    }
+
     fn code_mode_failure_is_error(&self) -> bool {
         self.original.code_mode_failure_is_error()
     }
@@ -1043,7 +1048,33 @@ struct UnavailableModelProjectionOutput {
     model_visible: FunctionToolOutput,
 }
 
+const MODEL_DELIVERY_UNAVAILABLE_PREFIX: &str = "<tool_result_delivery_unavailable>";
+
+/// Written beside the result in the existing ordered completion batch.
+pub(crate) fn model_delivery_unavailable_receipt(call_id: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None, role: "developer".into(), phase: None,
+        internal_chat_message_metadata_passthrough: None,
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: format!("{MODEL_DELIVERY_UNAVAILABLE_PREFIX}{}",
+                serde_json::json!({"version": 1, "call_id": call_id})),
+        }],
+    }
+}
+
+pub(crate) fn is_model_delivery_unavailable_receipt(item: &ResponseItem, call_id: &str) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else { return false };
+    let [codex_protocol::models::ContentItem::InputText { text }] = content.as_slice() else { return false };
+    role == "developer" && text.strip_prefix(MODEL_DELIVERY_UNAVAILABLE_PREFIX)
+        .and_then(|json| serde_json::from_str::<Value>(json).ok())
+        .is_some_and(|value| value["version"] == 1 && value["call_id"] == call_id)
+}
+
 impl ToolOutput for UnavailableModelProjectionOutput {
+    fn model_delivery_unavailable(&self) -> bool {
+        true
+    }
+
     fn code_mode_failure_is_error(&self) -> bool {
         self.original.code_mode_failure_is_error()
     }

@@ -123,6 +123,7 @@ const node = (id, run = () => id, extra = {}) => ({ id, run, accept: () => true,
   check(calls === 2 && results.throw.reason.message === cause.message, "retry or lost original failure");
   check(results.blocked.status === "skipped" && results.independent.status === "fulfilled",
     "failure isolation broken");
+  check(results.blocked.blocked_by.join() === "throw", "skipped node lost its immediate blocker");
   check(results.postcondition.value.exit_code === 7 && results["accept-throw"].reason.message === cause.message &&
     results["accept-throw"].value === 3 && !Object.hasOwn(results.throw, "value"),
     "failure evidence lost");
@@ -202,6 +203,22 @@ const node = (id, run = () => id, extra = {}) => ({ id, run, accept: () => true,
   }, { requires: ["unavailable-capability"] })], { targets: ["good"] });
   check(calls === 1 && Object.keys(results).join() === "good",
     "excluded capability prevented selected work");
+}
+// Preflight names all bounded missing capabilities in the selected closure,
+// without activating tools, starting work, or including excluded branches.
+{
+  let calls = 0;
+  const nodes = Array.from({length:8}, (_, i) => node(`cap-${i}`, () => ++calls,
+    {requires:[`missing-${i}`]}));
+  const error = await run_graph(nodes).catch(error => error);
+  check(error instanceof TypeError && calls === 0 && error.omitted_capabilities === 0 &&
+    error.missing_capabilities.every((entry, i) => entry.node_id === `cap-${i}` && entry.tool === `missing-${i}`) &&
+    error.missing_capabilities.length === 8, "preflight lost capability repair data");
+  const huge = await run_graph([node("huge", () => ++calls,
+    {requires:Array.from({length:128}, (_, i) => `missing-${i}` + "x".repeat(500))})]).catch(error => error);
+  check(huge.missing_capabilities.length + huge.omitted_capabilities === 128 &&
+    JSON.stringify(huge.missing_capabilities).length < 4096 && calls === 0,
+    "capability diagnostics are unbounded or hide omissions");
 }
 // A known recovery chain runs within its branch, without waiting for unrelated
 // discovery. Acceptance must retain immutable snapshot identity, not merely a
@@ -308,5 +325,57 @@ for (const exitCode of [0, 7]) {
   for (let i = 0; i < 100; i++) deep = new Error("nested", {cause:deep});
   const bounded = await run_graph([node("deep", () => { throw deep; })]).catch(error => error.results);
   check(bounded.deep.reason === deep, "error chain identity changed before display");
+}
+// A reverse-declared chain must not recheck every blocked dependency on every
+// completion, nor attach another race reaction to the outstanding slow sibling.
+{
+  const originalHas = Object.hasOwn, originalRace = Promise.race;
+  let dependencyChecks = 0, raceSubscriptions = 0, release;
+  const held = new Promise(resolve => { release = resolve; });
+  Object.hasOwn = (...args) => { dependencyChecks++; return originalHas(...args); };
+  Promise.race = function(values) {
+    const all = [...values]; raceSubscriptions += all.length;
+    return originalRace.call(this, all);
+  };
+  try {
+    const chain = Array.from({length:255}, (_, i) => node(String(i), () => {
+      if (i === 254) release();
+      return i;
+    }, {deps:i ? [String(i - 1)] : []})).reverse();
+    const result = await run_graph([node("held", async () => { await held; return "settled"; }), ...chain]);
+    check(result.held.value === "settled" && result["254"].value === 254, "lost long-tail work");
+    check(dependencyChecks < 512 && raceSubscriptions < 512, "quadratic scheduler work returned");
+  } finally { Object.hasOwn = originalHas; Promise.race = originalRace; }
+}
+// A ready critical-path writer reserves scheduling priority while a reader
+// finishes. Lower-ranked reads cannot extend the convoy; unrelated work can run.
+{
+  const held = deferred(), unrelated = deferred();
+  let wrote = false, read = false;
+  const result = run_graph([
+    node("held-reader", () => held.promise, {estimated_ms:1000, resources:{read:["repo"]}}),
+    node("critical-writer", () => { wrote = true; }, {resources:{write:["repo"]}}),
+    node("critical-proof", () => 1, {deps:["critical-writer"], estimated_ms:100}),
+    node("short-reader", () => { check(wrote, "lower-ranked reader starved critical writer"); read = true; },
+      {resources:{read:["repo"]}}),
+    node("unrelated", () => unrelated.resolve()),
+  ], {concurrency:3});
+  await unrelated.promise;
+  check(!read && !wrote, "reservation blocked independent work or admitted a conflicting reader");
+  held.resolve();
+  await result;
+  check(wrote && read, "reservation dropped required work");
+}
+// Zero-estimate resource bypass remains compatible; priority is not a new lock.
+{
+  const held = deferred(), admitted = deferred();
+  const result = run_graph([
+    node("reader", () => held.promise, {resources:{read:["repo"]}}),
+    node("writer", () => 1, {resources:{write:["repo"]}}),
+    node("equal-reader", () => admitted.resolve(), {resources:{read:["repo"]}}),
+  ], {concurrency:2});
+  await admitted.promise;
+  held.resolve();
+  await result;
 }
 text("dependency graph scenarios passed");

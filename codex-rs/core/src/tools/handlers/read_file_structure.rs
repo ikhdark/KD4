@@ -59,12 +59,23 @@ fn symbol_matches(item: &CodeItem, name: &str) -> bool {
         || item.qualified_name.ends_with(&format!(".{name}")))
 }
 
+// Diagnostic-only repair for Type::method when the parsed owner is a trait
+// implementation. Never make this looser spelling an executable selector.
+fn trait_method_candidate(item: &CodeItem, name: &str) -> bool {
+    let Some((owner, method)) = name.rsplit_once("::") else { return false; };
+    if item.name != method { return false; }
+    let Some(qualified_owner) = item.qualified_name.strip_suffix(&format!("::{method}")) else { return false; };
+    let Some((prefix, implementation)) = qualified_owner.rsplit_once('<') else { return false; };
+    let Some((ty, trait_name)) = implementation.split_once(" as ") else { return false; };
+    trait_name.ends_with('>') && (owner == ty || owner == format!("{prefix}{ty}"))
+}
+
 pub(super) fn resolve_batch(
     path: &str,
     canonical: &mut CanonicalToolResult,
     selectors: Option<Vec<FileSelector>>,
-) -> (Option<Vec<ToolOutputSelector>>, Vec<serde_json::Value>) {
-    let Some(selectors) = selectors else { return (None, Vec::new()); };
+) -> (Option<Vec<ToolOutputSelector>>, Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let Some(selectors) = selectors else { return (None, Vec::new(), Vec::new()); };
     let needs_items = selectors.iter().any(|selector| matches!(selector,
         FileSelector::Structure(StructureSelector::Symbol { .. } | StructureSelector::Enclosing { .. }
             | StructureSelector::Search { enclosing: true, .. })
@@ -76,6 +87,7 @@ pub(super) fn resolve_batch(
     }
     let mut resolved = Vec::new();
     let mut failures = Vec::new();
+    let mut bindings = Vec::new();
     for (index, selector) in selectors.into_iter().enumerate() {
         let requires_items = matches!(&selector,
             FileSelector::Structure(StructureSelector::Symbol { .. } | StructureSelector::Enclosing { .. }
@@ -87,7 +99,15 @@ pub(super) fn resolve_batch(
             resolve_items(items.as_deref().unwrap_or_default(), vec![selector.clone()])
         };
         match result {
-            Ok(ranges) => resolved.extend(ranges),
+            Ok(ranges) => {
+                if matches!(&selector, FileSelector::Structure(
+                    StructureSelector::Symbol { .. } | StructureSelector::Enclosing { .. }))
+                {
+                    bindings.push(serde_json::json!({"selector_index":index,
+                        "resolved_selectors":ranges}));
+                }
+                resolved.extend(ranges);
+            }
             Err(error) => {
                 // Enrichment failure must not suppress an executable search.
                 // Keep the error on the requested selector, alongside plain evidence.
@@ -108,7 +128,8 @@ pub(super) fn resolve_batch(
                 let mut candidates = Vec::new();
                 let mut candidate_count = 0;
                 if let FileSelector::Structure(StructureSelector::Symbol { name }) = &selector {
-                    for item in items.iter().flatten().filter(|item| symbol_matches(item, name)) {
+                    for item in items.iter().flatten().filter(|item|
+                        symbol_matches(item, name) || trait_method_candidate(item, name)) {
                         candidate_count += 1;
                         if candidates.len() < 8 && item.qualified_name.len() <= 1024 {
                             candidates.push(serde_json::json!({"qualified_name":item.qualified_name,
@@ -123,7 +144,7 @@ pub(super) fn resolve_batch(
             }
         }
     }
-    (Some(resolved), failures)
+    (Some(resolved), failures, bindings)
 }
 
 fn resolve_items(
@@ -163,7 +184,7 @@ fn resolve_items(
 fn resolve(path: &str, canonical: &mut CanonicalToolResult, selectors: Option<Vec<FileSelector>>)
     -> Result<Option<Vec<ToolOutputSelector>>, ReadToolOutputError>
 {
-    let (resolved, failures) = resolve_batch(path, canonical, selectors);
+    let (resolved, failures, _) = resolve_batch(path, canonical, selectors);
     if let Some(failure) = failures.first() {
         return Err(ReadToolOutputError::InvalidRange(failure["message"].to_string()));
     }
@@ -191,12 +212,12 @@ mod tests {
     fn ambiguous_candidates_are_bounded_and_exact_selectors_survive_unsupported_structure() {
         let source = (0..12).map(|i| format!("impl S{i} {{ fn run() {{}} }}\n")).collect::<String>();
         let mut canonical = CanonicalToolResult::text(source);
-        let (_, errors) = resolve_batch("many.rs", &mut canonical, Some(vec![
+        let (_, errors, _) = resolve_batch("many.rs", &mut canonical, Some(vec![
             FileSelector::Structure(StructureSelector::Symbol { name:"run".into() })]));
         assert_eq!(errors[0]["candidates"].as_array().unwrap().len(), 8);
         assert_eq!(errors[0]["omitted_candidates"], 4);
         let exact = ToolOutputSelector::Lines { start:1, end:1 };
-        let (ranges, errors) = resolve_batch("many.txt", &mut canonical, Some(vec![
+        let (ranges, errors, _) = resolve_batch("many.txt", &mut canonical, Some(vec![
             FileSelector::Structure(StructureSelector::Symbol { name:"run".into() }),
             FileSelector::Exact(exact.clone())]));
         assert_eq!(ranges, Some(vec![exact]));
@@ -259,7 +280,7 @@ mod tests {
     fn verified10_trait_candidates_resolve_and_search_resolution_does_not_select_twice() {
         let source = "impl First for S { fn run() {} }\nimpl Second for S { fn run() {} }\n";
         let mut canonical = CanonicalToolResult::text(source);
-        let (_, errors) = resolve_batch("traits.rs", &mut canonical, Some(vec![
+        let (_, errors, _) = resolve_batch("traits.rs", &mut canonical, Some(vec![
             FileSelector::Structure(StructureSelector::Symbol { name:"run".into() })]));
         assert_eq!(errors[0]["candidates"][0]["qualified_name"], "<S as First>::run");
         assert_eq!(errors[0]["candidates"][1]["qualified_name"], "<S as Second>::run");
@@ -270,11 +291,27 @@ mod tests {
         }
         let searches = ["First", "Second"].map(|query| FileSelector::Structure(StructureSelector::Search {
             query:query.into(), enclosing:true, case_insensitive:false, start_byte:0, max_results:1, context_lines:0 }));
-        let (resolved, errors) = resolve_batch("traits.rs", &mut canonical, Some(searches.to_vec()));
+        let (resolved, errors, _) = resolve_batch("traits.rs", &mut canonical, Some(searches.to_vec()));
         assert!(errors.is_empty());
         let resolved = resolved.unwrap();
         assert_eq!(resolved.len(), 2, "the search owner resolves items from the same single discovered page");
         assert!(resolved.iter().all(|selector| matches!(selector, ToolOutputSelector::Search { enclosing:true, .. })));
         assert!(canonical.sections.iter().any(|section| section.id == "outline"));
+    }
+
+    #[test]
+    fn actionability_trait_repairs_are_suggestions_not_fuzzy_execution() {
+        let source = "impl First for S { fn run() {} }\nimpl Second for S { fn run() {} }\nimpl First for Other { fn run() {} }\n";
+        let mut canonical = CanonicalToolResult::text(source.to_owned());
+        let (resolved, errors, bindings) = resolve_batch("traits.rs", &mut canonical, Some(vec![
+            FileSelector::Structure(StructureSelector::Symbol {name:"S::run".into()}),
+            FileSelector::Structure(StructureSelector::Symbol {name:"<S as First>::run".into()}),
+        ]));
+        assert_eq!(errors[0]["candidates"].as_array().unwrap().len(), 2);
+        assert_eq!(errors[0]["candidates"][1]["qualified_name"], "<S as Second>::run");
+        assert_eq!(resolved.unwrap(), vec![ToolOutputSelector::Lines {start:1, end:1}]);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0]["selector_index"], 1);
+        assert_eq!(bindings[0]["resolved_selectors"], serde_json::json!([{"kind":"lines","start":1,"end":1}]));
     }
 }

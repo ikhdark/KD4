@@ -4,6 +4,8 @@ mod module_loader;
 mod output_projection;
 mod timers;
 mod value;
+#[cfg(test)]
+pub(crate) mod critical_path_tests;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -511,6 +513,7 @@ struct RuntimeConfig {
 pub(crate) struct EnabledToolCatalog {
     tools: Vec<EnabledToolMetadata>,
     by_global_name: HashMap<String, usize>,
+    by_requested_name: HashMap<String, Option<usize>>,
     input_bytes: usize,
 }
 
@@ -539,7 +542,27 @@ impl EnabledToolCatalog {
             }
             by_global_name.insert(tool.global_name.clone(), index);
         }
-        let input_bytes = tools.iter().fold(0usize, |bytes, tool| {
+        let mut by_requested_name = HashMap::new();
+        for (index, tool) in tools.iter().enumerate() {
+            let mut aliases = vec![tool.global_name.clone(), tool.tool_name.to_string()];
+            if let Some(namespace) = &tool.tool_name.namespace
+                && !namespace.contains('.')
+            {
+                aliases.push(format!("{namespace}.{}", tool.tool_name.name));
+            }
+            for alias in aliases {
+                by_requested_name.entry(alias)
+                    .and_modify(|existing| {
+                        if *existing != Some(index) { *existing = None; }
+                    })
+                    .or_insert(Some(index));
+            }
+        }
+        let alias_bytes = by_requested_name.keys().fold(
+            by_requested_name.capacity().saturating_mul(std::mem::size_of::<(String, Option<usize>)>()),
+            |bytes, name| bytes.saturating_add(name.len()),
+        );
+        let input_bytes = tools.iter().fold(alias_bytes, |bytes, tool| {
             bytes.saturating_add(std::mem::size_of::<EnabledToolMetadata>())
                 .saturating_add(tool.global_name.len().saturating_mul(2))
                 .saturating_add(tool.tool_name.name.len())
@@ -549,6 +572,7 @@ impl EnabledToolCatalog {
         Ok(Self {
             tools,
             by_global_name,
+            by_requested_name,
             input_bytes,
         })
     }
@@ -565,15 +589,7 @@ impl EnabledToolCatalog {
     /// discovery reports for a namespaced tool. Ambiguous identities stay
     /// unresolved rather than dispatching to an arbitrary tool.
     fn resolve_requested_name(&self, requested_name: &str) -> Option<usize> {
-        let mut matches = self.tools.iter().enumerate().filter(|(_, tool)| {
-            tool.global_name == requested_name
-                || tool.tool_name.to_string() == requested_name
-                || requested_name.split_once('.').is_some_and(|(namespace, name)| {
-                    tool.tool_name.namespace.as_deref() == Some(namespace) && tool.tool_name.name == name
-                })
-        });
-        let (index, _) = matches.next()?;
-        matches.next().is_none().then_some(index)
+        self.by_requested_name.get(requested_name).copied().flatten()
     }
 
     fn resolution_diagnostic(&self, requested: Option<&str>) -> serde_json::Value {

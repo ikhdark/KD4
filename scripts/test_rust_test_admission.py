@@ -497,12 +497,25 @@ class AdmissionDispatchTest(RunnerTestCase):
             text, _, _ = self.dispatch(dependencies=manifest)
             self.assertEqual(json.loads(text)["dependency_manifest"], manifest)
 
-    def test_changed_manifest_and_runner_fingerprint_fail_before_dispatch(self):
+    def test_only_selected_definition_changes_fail_before_dispatch(self):
         with self.assertRaisesRegex(runner.RunnerError, "manifest changed"):
             self.dispatch(current_manifest=replace(self.manifest(), version=99))
-        with self.assertRaisesRegex(runner.RunnerError, "runner inputs changed"):
-            self.dispatch(fingerprint="stale")
+        with self.assertRaisesRegex(runner.RunnerError, "manifest changed"):
+            self.dispatch(current_manifest=replace(self.manifest(), gates={}))
         self.assertFalse(lanes.cargo_lock_is_busy(self.target_dir))
+        # Runner edits and unrelated entries no longer discard a completed wait;
+        # the receipt keeps naming the launch-time runner inputs.
+        manifest = self.manifest()
+        unrelated = replace(manifest, targets={
+            **manifest.targets, "extra": replace(manifest.targets["core_shard"], name="extra"),
+        })
+        for command in ["run-gate", "run-target"]:
+            with self.subTest(command=command):
+                text, order, _ = self.dispatch(
+                    command, current_manifest=unrelated, fingerprint="f" * 64
+                )
+                self.assertEqual(order, ["evidence", "execute"])
+                self.assertEqual(json.loads(text)["runner_input_fingerprint"], "f" * 64)
 
     def test_timeout_and_cancellation_are_classified_without_dispatch(self):
         with lanes.reserve_rust_test_target(self.target_dir):

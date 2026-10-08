@@ -37,44 +37,113 @@ const MAX_SSE_EVENT_BYTES: usize = 32 * 1024 * 1024;
 // the last empty SSE line, recognizing LF, CRLF and CR even across chunks.
 // This is deliberately not a response-lifetime limit.
 fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
-    let mut bytes = 0usize;
-    let mut line_has_data = false;
-    let mut after_cr = false;
-    let mut failed = false;
-    stream.scan((), move |_, chunk| {
-        let result = if failed {
-            None
-        } else {
-            Some(chunk.and_then(|chunk| {
-                for &byte in &chunk {
-                    if after_cr && byte == b'\n' {
-                        after_cr = false;
-                        if bytes != 0 { bytes = bytes.saturating_add(1); }
-                        if bytes > limit {
-                            failed = true;
-                            return Err(codex_client::TransportError::Network(format!("SSE event exceeds the {limit}-byte framing limit")));
-                        }
-                        continue;
-                    }
-                    after_cr = byte == b'\r';
-                    bytes = bytes.saturating_add(1);
-                    if bytes > limit {
-                        failed = true;
-                        return Err(codex_client::TransportError::Network(format!(
-                            "SSE event exceeds the {limit}-byte framing limit"
-                        )));
-                    }
-                    if matches!(byte, b'\r' | b'\n') {
-                        if !line_has_data { bytes = 0; }
-                        line_has_data = false;
-                    } else {
-                        line_has_data = true;
-                    }
+    struct Framing {
+        stream: ByteStream,
+        pending: bytes::Bytes,
+        bytes: usize,
+        line_has_data: bool,
+        after_cr: bool,
+        error_pending: bool,
+        finished: bool,
+        since_yield: usize,
+    }
+    let state = Framing {
+        stream,
+        pending: bytes::Bytes::new(),
+        bytes: 0,
+        line_has_data: false,
+        after_cr: false,
+        error_pending: false,
+        finished: false,
+        since_yield: 0,
+    };
+    futures::stream::unfold(state, move |mut state| async move {
+        if state.finished {
+            return None;
+        }
+        let framing_error = || codex_client::TransportError::Build(format!(
+            "SSE event exceeds the {limit}-byte framing limit"
+        ));
+        if state.error_pending {
+            state.finished = true;
+            return Some((Err(framing_error()), state));
+        }
+        // The SSE parser can consume comments without returning an event. Keep
+        // cancellation/deadlines runnable even with an always-ready byte source.
+        tokio::task::consume_budget().await;
+        const SCAN_CHUNK_BYTES: usize = 64 * 1024;
+        if state.since_yield >= SCAN_CHUNK_BYTES {
+            tokio::task::yield_now().await;
+            state.since_yield = 0;
+        }
+        if state.pending.is_empty() {
+            match state.stream.next().await? {
+                Ok(chunk) => state.pending = chunk,
+                Err(error) => {
+                    state.finished = true;
+                    return Some((Err(error), state));
                 }
-                Ok(chunk)
-            }))
+            }
+        }
+        // Zero-copy slices avoid scanning/copying an entire coalesced response
+        // before the parser can deliver its first event.
+        let len = state.pending.len().min(SCAN_CHUNK_BYTES);
+        let chunk = state.pending.split_to(len);
+        state.since_yield += len;
+        let mut index = 0;
+        let overflow = loop {
+            if index == chunk.len() {
+                break None;
+            }
+            if state.after_cr && chunk[index] == b'\n' {
+                state.after_cr = false;
+                if state.bytes != 0 {
+                    if state.bytes == limit {
+                        break Some(index);
+                    }
+                    state.bytes += 1;
+                }
+                index += 1;
+                continue;
+            }
+            state.after_cr = false;
+            // Account for ordinary bytes in runs, instead of updating framing
+            // state and checking the size limit on every payload byte.
+            let run = chunk[index..].iter()
+                .position(|byte| matches!(byte, b'\r' | b'\n'))
+                .unwrap_or(chunk.len() - index);
+            if run > limit - state.bytes {
+                break Some(index + limit - state.bytes);
+            }
+            state.bytes += run;
+            state.line_has_data |= run != 0;
+            index += run;
+            if index == chunk.len() {
+                break None;
+            }
+            if state.bytes == limit {
+                break Some(index);
+            }
+            state.bytes += 1;
+            state.after_cr = chunk[index] == b'\r';
+            if !state.line_has_data {
+                state.bytes = 0;
+            }
+            state.line_has_data = false;
+            index += 1;
         };
-        futures::future::ready(result)
+        if let Some(index) = overflow {
+            // A later invalid frame must not erase earlier complete events
+            // in the same network chunk, especially response.completed.
+            state.pending = bytes::Bytes::new();
+            if index == 0 {
+                state.finished = true;
+                return Some((Err(framing_error()), state));
+            }
+            state.error_pending = true;
+            return Some((Ok(chunk.slice(..index)), state));
+        }
+        Some((Ok(chunk), state))
     }).boxed()
 }
 
@@ -176,10 +245,38 @@ async fn process_sse_with_metadata(
         let sse = match response {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
-                debug!("SSE Error: {e:#}");
-                let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
+                let (error, outcome) = match e {
+                    eventsource_stream::EventStreamError::Transport(
+                        codex_client::TransportError::Build(message),
+                    ) => (ApiError::invalid_response(message), SseCleanupOutcome::ProtocolError),
+                    eventsource_stream::EventStreamError::Utf8(error)
+                        if error.utf8_error().error_len().is_none() =>
+                    {
+                        // The decoder emits this only when EOF splits a code point:
+                        // unlike invalid bytes in a complete frame, transport recovery
+                        // may produce the missing suffix.
+                        (
+                            ApiError::Stream(
+                                "stream closed within a UTF-8 sequence before response.completed"
+                                    .to_string(),
+                            ),
+                            SseCleanupOutcome::CarrierEofBeforeCompleted,
+                        )
+                    }
+                    eventsource_stream::EventStreamError::Utf8(_) => (
+                        ApiError::invalid_response("invalid UTF-8 in SSE event"),
+                        SseCleanupOutcome::ProtocolError,
+                    ),
+                    eventsource_stream::EventStreamError::Parser(_) => (
+                        ApiError::invalid_response("invalid SSE framing"),
+                        SseCleanupOutcome::ProtocolError,
+                    ),
+                    error => (ApiError::Stream(error.to_string()), SseCleanupOutcome::TransportError),
+                };
+                debug!("SSE Error: {error:#}");
+                let _ = tx_event.send(Err(error)).await;
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
-                    t.on_sse_cleanup(SseCleanupOutcome::TransportError, start.elapsed());
+                    t.on_sse_cleanup(outcome, start.elapsed());
                 }
                 return;
             }
@@ -221,9 +318,10 @@ async fn process_sse_with_metadata(
         let event_name = &sse.event[..event_name_end];
         trace!(event = %event_name, payload_bytes = sse.data.len(), "SSE event");
 
+        let interpretation_start = telemetry.as_ref().map(|_| Instant::now());
         let events = match interpreter.process_payload(&sse.data) {
             Ok(events) => {
-                if let Some((t, start)) = telemetry.as_ref().zip(start) {
+                if let Some((t, start)) = telemetry.as_ref().zip(interpretation_start) {
                     t.on_sse_event(event_name, start.elapsed(), None);
                 }
                 events
@@ -236,8 +334,8 @@ async fn process_sse_with_metadata(
                     ),
                     &error,
                 );
-                let safe_error = ApiError::Stream(diagnostic);
-                if let Some((t, start)) = telemetry.as_ref().zip(start) {
+                let safe_error = ApiError::invalid_response(diagnostic);
+                if let Some((t, start)) = telemetry.as_ref().zip(interpretation_start) {
                     t.on_sse_event(event_name, start.elapsed(), Some(&safe_error));
                 }
                 debug!(event = %event_name, payload_bytes = sse.data.len(), error = %safe_error, "Failed to parse SSE event");
@@ -248,7 +346,7 @@ async fn process_sse_with_metadata(
                 return;
             }
             Err(ResponsesEventError::Api(error)) => {
-                if let Some((t, start)) = telemetry.as_ref().zip(start) {
+                if let Some((t, start)) = telemetry.as_ref().zip(interpretation_start) {
                     t.on_sse_event(event_name, start.elapsed(), Some(&error));
                 }
                 let _ = tx_event.send(Err(error)).await;
@@ -262,6 +360,7 @@ async fn process_sse_with_metadata(
         for event in events {
             let advances = event.advances_model_response();
             let is_completed = matches!(event, ResponseEvent::Completed { .. });
+            let delivery_start = Instant::now();
             if tx_event.send(Ok(event)).await.is_err() {
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
                     t.on_sse_cleanup(SseCleanupOutcome::ConsumerCancelled, start.elapsed());
@@ -270,6 +369,9 @@ async fn process_sse_with_metadata(
             }
             if advances {
                 progress_deadline = Instant::now() + idle_timeout;
+            } else {
+                // Consumer backpressure is local waiting, not provider silence.
+                progress_deadline += delivery_start.elapsed();
             }
             if is_completed {
                 // Deliver completion immediately, then keep the carrier alive
@@ -432,6 +534,151 @@ mod tests {
         Duration::from_millis(1000)
     }
 
+    /// Local CPU/channel benchmark; never contacts a provider. Timing is descriptive,
+    /// not a performance assertion, so it stays outside ordinary test runs.
+    #[tokio::test]
+    #[ignore]
+    async fn transport_audit_benchmark() {
+        for (name, payload) in [
+            ("delta", json!({"type":"response.output_text.delta","delta":"x".repeat(256)})),
+            ("item", json!({"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(16384)}]}})),
+            ("metadata", json!({"type":"response.metadata","headers":{"openai-model":"test"}})),
+        ] {
+            let frame = Bytes::from(format!("data: {payload}\n\n"));
+            let completed = Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n");
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let chunks = stream::iter((0..1000).map(|_| Ok(frame.clone())).collect::<Vec<_>>())
+                    .chain(stream::iter([Ok(completed.clone())]));
+                let (tx, mut rx) = mpsc::channel(16);
+                let start = std::time::Instant::now();
+                let producer = tokio::spawn(process_sse(Box::pin(chunks), tx, Duration::from_secs(30), None));
+                let mut terminal = false;
+                while let Some(event) = rx.recv().await {
+                    terminal |= matches!(event.expect("valid event"), ResponseEvent::Completed { .. });
+                }
+                producer.await.unwrap();
+                assert!(terminal);
+                samples.push(start.elapsed().as_micros());
+            }
+            samples.sort_unstable();
+            let result = format!("transport_audit {name}: frames=1000 bytes={} median_us={} samples_us={samples:?}\n", frame.len() * 1000, samples[3]);
+            eprint!("{result}");
+            if let Some(path) = std::env::var_os("KD4_TRANSPORT_BENCHMARK_OUTPUT") {
+                use std::io::Write;
+                std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
+                    .write_all(result.as_bytes()).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn transport_audit_coalesced_benchmark() {
+        let first = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n";
+        let tail = format!("data: {{\"type\":\"future.event\",\"padding\":\"{}\"}}\n\n", "x".repeat(16 * 1024 * 1024));
+        let mut data = first.to_vec();
+        data.extend_from_slice(tail.as_bytes());
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let mut source = bound_sse_events(Box::pin(stream::iter([Ok(Bytes::from(data.clone()))])), MAX_SSE_EVENT_BYTES).eventsource();
+            let start = std::time::Instant::now();
+            assert!(source.next().await.unwrap().unwrap().data.contains("first"));
+            samples.push(start.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        let result = format!("transport_audit coalesced_first_event: bytes={} median_us={} samples_us={samples:?}\n", data.len(), samples[3]);
+        eprint!("{result}");
+        if let Some(path) = std::env::var_os("KD4_TRANSPORT_BENCHMARK_OUTPUT") {
+            use std::io::Write;
+            std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
+                .write_all(result.as_bytes()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_audit_framing_preserves_prefix_and_bounds_work() {
+        for ending in ["\n\n", "\r\r", "\r\n\r\n"] {
+            let data = Bytes::from(format!("data: first{ending}{}", "x".repeat(65)));
+            let mut source = bound_sse_events(Box::pin(stream::iter([Ok(data)])), 64).eventsource();
+            assert_eq!(source.next().await.unwrap().unwrap().data, "first");
+            assert!(source.next().await.unwrap().is_err());
+            assert!(source.next().await.is_none());
+        }
+        let mut source = bound_sse_events(
+            Box::pin(stream::iter([Ok(Bytes::from(vec![b'x'; 1024 * 1024]))])),
+            MAX_SSE_EVENT_BYTES,
+        );
+        assert_eq!(source.next().await.unwrap().unwrap().len(), 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn transport_audit_comment_flood_yields_for_cancellation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&consumed);
+        let chunks = stream::iter(0..4096).map(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(Bytes::from_static(b": keepalive\n\n"))
+        });
+        let (tx, rx) = mpsc::channel(2);
+        let producer = tokio::spawn(process_sse(Box::pin(chunks), tx, idle_timeout(), None));
+        tokio::task::yield_now().await;
+        assert!(consumed.load(Ordering::SeqCst) < 4096);
+        drop(rx);
+        producer.await.unwrap();
+        assert!(consumed.load(Ordering::SeqCst) < 4096);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_audit_metadata_backpressure_is_not_provider_silence() {
+        let chunks = [
+            r#"{"type":"response.created","response":{"id":"same"}}"#,
+            r#"{"type":"response.created","response":{"id":"same"}}"#,
+            r#"{"type":"response.completed","response":{"id":"done"}}"#,
+        ].map(|payload| Ok(Bytes::from(format!("data: {payload}\n\n"))));
+        let (tx, mut rx) = mpsc::channel(1);
+        let producer = tokio::spawn(process_sse(
+            Box::pin(stream::iter(chunks)), tx, Duration::from_millis(30), None,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Created)));
+        assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Created)));
+        assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. })));
+        producer.await.unwrap();
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_audit_interpretation_timing_excludes_stream_wait() {
+        #[derive(Default)]
+        struct Timings {
+            polls: std::sync::Mutex<Vec<Duration>>,
+            events: std::sync::Mutex<Vec<Duration>>,
+        }
+        impl SseTelemetry for Timings {
+            fn on_sse_poll(
+                &self,
+                _: &Result<Option<Result<eventsource_stream::Event, eventsource_stream::EventStreamError<TransportError>>>, tokio::time::error::Elapsed>,
+                duration: Duration,
+            ) { self.polls.lock().unwrap().push(duration); }
+            fn on_sse_event(&self, _: &str, duration: Duration, _: Option<&dyn std::fmt::Display>) {
+                self.events.lock().unwrap().push(duration);
+            }
+        }
+        let telemetry = Arc::new(Timings::default());
+        let chunks = stream::once(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n"))
+        });
+        let (tx, mut rx) = mpsc::channel(2);
+        process_sse(Box::pin(chunks), tx, idle_timeout(), Some(telemetry.clone())).await;
+        assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. })));
+        assert_eq!(*telemetry.polls.lock().unwrap(), vec![Duration::from_millis(50)]);
+        assert_eq!(*telemetry.events.lock().unwrap(), vec![Duration::ZERO]);
+    }
+
     #[tokio::test]
     async fn parses_items_and_completed() {
         let item1 = json!({
@@ -541,7 +788,8 @@ mod tests {
 
             assert_eq!(events.len(), 1, "case {case}");
             match &events[0] {
-                Err(ApiError::Stream(message)) => {
+                Err(ApiError::ProviderFailure { code, message }) => {
+                    assert_eq!(code.as_deref(), Some("invalid_response"));
                     assert!(
                         message.contains("response.output_item.done")
                             || message.contains("failed to parse SSE event"),
@@ -555,6 +803,9 @@ mod tests {
                 }
                 other => panic!("unexpected event for {case}: {other:?}"),
             }
+            assert!(!crate::api_bridge::map_api_error(
+                events.remove(0).unwrap_err(),
+            ).is_retryable());
         }
     }
 
@@ -1084,7 +1335,7 @@ mod tests {
                 if valid {
                     assert_matches!(result, Ok(ResponseEvent::Completed { response_id, .. }) if response_id == "done");
                 } else {
-                    assert_matches!(result, Err(ApiError::Stream(message))
+                    assert_matches!(result, Err(ApiError::ProviderFailure { message, .. })
                         if message.contains(&format!("SSE event {expected:?} (1 payload bytes)")));
                 }
                 assert!(rx.recv().await.is_none());
@@ -1134,7 +1385,7 @@ mod tests {
             ));
             let event = rx.recv().await.expect("terminal result");
             if expected == SseCleanupOutcome::ResponseError {
-                assert_matches!(event, Err(ApiError::Stream(message)) if message == "response.completed event missing response");
+                assert_matches!(event, Err(ApiError::ProviderFailure { message, .. }) if message == "response.completed event missing response");
             } else {
                 assert_matches!(event, Ok(ResponseEvent::Completed { response_id, .. }) if response_id == "done");
             }
@@ -1199,7 +1450,10 @@ mod tests {
             Some(telemetry.clone()),
         ));
 
-        assert!(matches!(rx.recv().await, Some(Err(ApiError::Stream(_)))));
+        let error = rx.recv().await.unwrap().unwrap_err();
+        assert!(matches!(&error, ApiError::ProviderFailure { code, .. }
+            if code.as_deref() == Some("invalid_response")));
+        assert!(!crate::api_bridge::map_api_error(error).is_retryable());
         assert_eq!(
             *telemetry
                 .interpreted_events
@@ -1668,4 +1922,101 @@ mod tests {
     }
 
     const CYBER_RESTRICTED_MODEL_FOR_TESTS: &str = "gpt-5.3-codex";
+    #[tokio::test(start_paused = true)]
+    #[ignore = "local transport attribution benchmark"]
+    async fn latency_edge_benchmark() {
+        #[derive(Default)]
+        struct TimingProbe {
+            polls: std::sync::Mutex<Vec<Duration>>,
+            events: std::sync::Mutex<Vec<Duration>>,
+        }
+        impl SseTelemetry for TimingProbe {
+            fn on_sse_poll(
+                &self,
+                _: &Result<Option<Result<eventsource_stream::Event,
+                    eventsource_stream::EventStreamError<TransportError>>>,
+                    tokio::time::error::Elapsed>,
+                duration: Duration,
+            ) {
+                self.polls.lock().unwrap().push(duration);
+            }
+            fn on_sse_event(&self, _: &str, duration: Duration,
+                _: Option<&dyn std::fmt::Display>) {
+                self.events.lock().unwrap().push(duration);
+            }
+        }
+        let timing = Arc::new(TimingProbe::default());
+        let source = stream::once(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n"))
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        process_sse(Box::pin(source), tx, Duration::from_secs(1), Some(timing.clone())).await;
+        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. }))));
+        let poll_ms = timing.polls.lock().unwrap()[0].as_millis();
+        let event_ms = timing.events.lock().unwrap()[0].as_millis();
+
+        let frames = [
+            b"data: {\"type\":\"response.created\",\"response\":{}}\n\n".as_slice(),
+            b"data: {\"type\":\"response.created\",\"response\":{}}\n\n".as_slice(),
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n".as_slice(),
+        ];
+        let (tx, mut rx) = mpsc::channel(1);
+        let consumer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut completed = false;
+            while let Some(event) = rx.recv().await {
+                completed |= matches!(event, Ok(ResponseEvent::Completed { .. }));
+            }
+            completed
+        });
+        process_sse(Box::pin(stream::iter(frames.map(|f| Ok(Bytes::copy_from_slice(f))))),
+            tx, Duration::from_millis(50), None).await;
+        let completed = consumer.await.unwrap();
+        let mut replayable = Vec::new();
+        for payload in ["{", r#"{"type":"response.output_item.done","item":{"type":"message"}}"#] {
+            let (tx, mut rx) = mpsc::channel(8);
+            process_sse(Box::pin(stream::iter([Ok(Bytes::from(format!("data: {payload}\n\n")))])),
+                tx, Duration::from_secs(1), None).await;
+            let error = rx.recv().await.unwrap().unwrap_err();
+            replayable.push(crate::api_bridge::map_api_error(error).is_retryable());
+        }
+        let result = format!("latency_edge sse: injected_wait_ms=50 poll_ms={poll_ms} event_ms={event_ms} backpressure_completed={completed} malformed_retryable={replayable:?}\n");
+        eprint!("{result}");
+        if let Some(path) = std::env::var_os("KD4_TRANSPORT_EDGE_OUTPUT") {
+            use std::io::Write;
+            std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
+                .write_all(result.as_bytes()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_framing_failures_do_not_replay_network_errors_still_can() {
+        let framed = bound_sse_events(
+            Box::pin(stream::iter([Ok(Bytes::from_static(b"data: oversized\n\n"))])),
+            8,
+        );
+        for (source, retryable) in [
+            (framed, false),
+            (
+                Box::pin(stream::iter([Ok(Bytes::from_static(b"data: \xff\n\n"))])) as ByteStream,
+                false,
+            ),
+            (
+                Box::pin(stream::iter([Ok(Bytes::from_static(b"data: \xf0\x9f"))])) as ByteStream,
+                true,
+            ),
+            (
+                Box::pin(stream::iter([Err(TransportError::Network("connection reset".into()))]))
+                    as ByteStream,
+                true,
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel(2);
+            process_sse(source, tx, idle_timeout(), None).await;
+            let error = rx.recv().await.unwrap().unwrap_err();
+            assert_eq!(crate::api_bridge::map_api_error(error).is_retryable(), retryable);
+            assert!(rx.recv().await.is_none());
+        }
+    }
 }

@@ -352,6 +352,7 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .record_cell_parent_call_id(&cell_id, &call_id);
+        exec.session.services.code_mode_service.record_cell_turn(&cell_id, &exec.turn.sub_id);
         exec.session.services.code_mode_service.record_output_budget(
             &cell_id,
             Some(args.max_output_tokens

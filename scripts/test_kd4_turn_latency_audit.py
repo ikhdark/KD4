@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -198,7 +201,149 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
     }
 
 
+class CompactionLatencyTest(unittest.TestCase):
+    def test_summary_requests_are_separate_in_full_bounded_and_text_reports(self):
+        timing = _timing()
+        requests = []
+        for index in range(8):
+            requests.extend([
+                {
+                    "generationIndex": index * 2,
+                    "attemptKind": "primary",
+                    "generationReason": "compaction",
+                    "generationPurpose": "compaction_recovery",
+                    "toolCallCount": 0,
+                    "dispatchMs": index * 204_000,
+                    "completedMs": index * 204_000 + 202_750,
+                    "modelStreamWaitNs": 202_000_000_000,
+                },
+                {
+                    "generationIndex": index * 2 + 1,
+                    "attemptKind": "primary",
+                    "generationReason": "compaction",
+                    "generationPurpose": "compaction_recovery",
+                    "relevantStateFingerprint": f"state-{index}",
+                    "toolCallCount": 0,
+                    "dispatchMs": index * 204_000 + 202_980,
+                    "completedMs": index * 204_000 + 203_980,
+                    "modelStreamWaitNs": 1_000_000_000,
+                },
+            ])
+        timing["modelRequests"] = requests
+        timing["counters"].update(logicalGenerationCount=16, modelRequestCount=16)
+        timing["local"]["compactionUnionNs"] = 150_000
+        timing["inclusiveDurationNs"] = 1_632_000_000_000
+        timing["machineDurationNs"] = 1_632_000_000_000
+        timing["exclusive"]["modelOnlyNs"] = 1_630_000_000_000
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_text("\n".join([
+                _meta(temp),
+                _event({"type": "task_started", "turn_id": "compactions"}),
+                _event({"type": "task_complete", "turn_id": "compactions",
+                        "timing": timing}),
+            ]), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        for view in (report, kd4_turn_latency_audit.bounded_summary(report)):
+            model = view["latencyBreakdown"]["modelInference"]
+            summary = model["generationPurposes"]["compaction_summary"]
+            self.assertEqual(summary["logicalGenerations"], 8)
+            self.assertEqual(summary["physicalAttempts"], 8)
+            self.assertEqual(summary["requestElapsedNs"], 1_622_000_000_000)
+            self.assertEqual(summary["modelStreamWaitNs"], 1_616_000_000_000)
+            self.assertEqual(summary["elapsedRows"], 8)
+            self.assertEqual(summary["missingElapsedRows"], 0)
+            self.assertEqual(
+                model["generationPurposes"]["compaction_recovery"]["modelStreamWaitNs"],
+                8_000_000_000,
+            )
+            self.assertEqual(model["exclusiveTotalNs"], 1_630_000_000_000)
+            self.assertEqual(
+                view["latencyBreakdown"]["orchestration"]["localActivityUnionsNs"]["compactionNs"],
+                150_000,
+            )
+            self.assertIn("inferred", model["measurementNote"])
+            self.assertIn("not additive", model["measurementNote"])
+        rendered = kd4_turn_latency_audit.render_report(report)
+        self.assertIn("compaction summary requests", rendered)
+        self.assertIn("elapsed=1622.0s", rendered)
+        self.assertIn("compaction-local=", rendered)
+        self.assertEqual(requests[0]["generationPurpose"], "compaction_recovery")
+
+    def test_classification_requires_compaction_metadata_and_recorded_zero_tools(self):
+        summary = {
+            "generationReason": "compaction",
+            "generationPurpose": "compaction_recovery",
+            "toolCallCount": 0,
+        }
+        for overrides in (
+            {"relevantStateFingerprint": "continuation-state"},
+            {"toolCallCount": 1},
+            {"modelEmittedToolCallCount": 1},
+            {"generationReason": "initial"},
+            {"generationPurpose": "implementation"},
+        ):
+            with self.subTest(overrides=overrides):
+                report = kd4_timing_analysis._generation_purpose_latency_report(
+                    [{**summary, **overrides}]
+                )
+                self.assertNotIn("compaction_summary", report)
+        # Null is malformed (the persisted counter is a u32), not a missing
+        # optional field. Preserve the existing profile-validation failure.
+        with self.assertRaises(TypeError):
+            kd4_timing_analysis._generation_purpose_latency_report(
+                [{**summary, "toolCallCount": None}]
+            )
+        del summary["toolCallCount"]
+        self.assertNotIn(
+            "compaction_summary",
+            kd4_timing_analysis._generation_purpose_latency_report([summary]),
+        )
+
+    def test_retries_and_missing_or_invalid_elapsed_boundaries_remain_visible(self):
+        base = {
+            "generationReason": "compaction",
+            "generationPurpose": "compaction_recovery",
+            "relevantStateFingerprint": None,
+            "toolCallCount": 0,
+            "generationIndex": 0,
+            "modelStreamWaitNs": 1_000_000_000,
+        }
+        rows = [
+            {**base, "attemptKind": "primary", "dispatchMs": 0, "completedMs": 1000},
+            {**base, "attemptKind": "retry", "dispatchMs": 1200, "completedMs": 2200},
+            {**base, "attemptKind": "retry", "dispatchMs": 2400},
+            {**base, "attemptKind": "retry", "dispatchMs": 3000, "completedMs": 2900},
+        ]
+        report = kd4_timing_analysis._generation_purpose_latency_report(rows)
+        summary = report["compaction_summary"]
+        self.assertEqual(summary["logicalGenerations"], 1)
+        self.assertEqual(summary["physicalAttempts"], 4)
+        self.assertEqual(summary["retryAttempts"], 3)
+        self.assertEqual(summary["requestElapsedNs"], 2_000_000_000)
+        self.assertEqual(summary["modelStreamWaitNs"], 4_000_000_000)
+        self.assertEqual(summary["elapsedRows"], 2)
+        self.assertEqual(summary["missingElapsedRows"], 2)
+
+
 class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    def test_transport_attribution_limit_survives_full_compact_and_text_reports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            path.write_text("\n".join([
+                _meta(temp),
+                _event({"type": "task_started", "turn_id": "transport"}),
+                _event({"type": "task_complete", "turn_id": "transport", "timing": _timing()}),
+            ]), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        for view in (report, kd4_turn_latency_audit.bounded_summary(report)):
+            model = view["latencyBreakdown"]["modelInference"]
+            self.assertEqual(model["exclusiveTotalNs"], 600_000_000)
+            self.assertIn("not inference-only", model["measurementNote"])
+            self.assertIn("DNS, TCP, TLS", model["measurementNote"])
+            self.assertIn("not separately measured", model["measurementNote"])
+        self.assertIn("not inference-only", kd4_turn_latency_audit.render_report(report))
+
     def test_checkout_sweep_matches_pairwise_ranking_and_skips_disjoint_history(self):
         import random
 
@@ -1561,6 +1706,48 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(relay["dominantPhaseOwner"], "PostToolUse")
         self.assertEqual(relay["dominantPhaseMs"], 99_000)
 
+    def test_summary_preserves_exclusions_without_reanalysis_or_mutation(self):
+        for valid, complete in ((False, True), (True, False), (False, False)):
+            with self.subTest(valid=valid, complete=complete):
+                report = self.audit_commands(
+                    [], timing=_timing(valid=valid, complete=complete),
+                    include_tokens=False,
+                )
+                original = json.dumps(report, sort_keys=True)
+                with mock.patch.object(
+                    kd4_turn_latency_audit, "analyze_session_path",
+                    side_effect=AssertionError("projection must not reanalyze"),
+                ), mock.patch.object(
+                    kd4_turn_latency_audit, "read_rollout_snapshot",
+                    side_effect=AssertionError("projection must not reopen sources"),
+                ):
+                    summary = kd4_turn_latency_audit.bounded_summary(report)
+                    self.assertEqual(
+                        summary["coverage"]["excludedInvalidOrIncompleteTurns"],
+                        report["coverage"]["excludedInvalidOrIncompleteTurns"],
+                    )
+                    with mock.patch.object(kd4_turn_latency_audit, "_MAX_SUMMARY_BYTES", 1):
+                        trimmed = kd4_turn_latency_audit.bounded_summary(report)
+                for view in (summary, trimmed):
+                    self.assertEqual(
+                        view["behaviorSignals"]["invalidTimingProfiles"],
+                        report["coverage"]["invalidProfiles"],
+                    )
+                    self.assertEqual(
+                        view["behaviorSignals"]["incompleteTimingClassifications"],
+                        report["coverage"]["classificationIncompleteProfiles"],
+                    )
+                    self.assertEqual(
+                        len(view["coverage"]["excludedInvalidOrIncompleteTurns"])
+                        + view["coverage"]["omittedExcludedInvalidOrIncompleteTurns"],
+                        len(report["coverage"]["excludedInvalidOrIncompleteTurns"]),
+                    )
+                    self.assertEqual(view["auditDecision"], report["auditDecision"])
+                self.assertTrue(trimmed["summaryBudget"]["limitExceeded"])
+                self.assertIn("retained full report", trimmed["summaryBudget"]["fullDetail"])
+                self.assertEqual(trimmed["coverage"]["excludedInvalidOrIncompleteTurns"], [])
+                self.assertEqual(json.dumps(report, sort_keys=True), original)
+
     def test_summary_cli_caps_turns_and_intervals_without_truncating_totals(
         self,
     ) -> None:
@@ -1723,28 +1910,29 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         )
         self.assertEqual(report["toolRelay"]["phaseTotalsMs"]["endToEndDurationMs"], 8)
         self.assertEqual(report["toolRelay"]["topSlowCalls"], [])
-        self.assertEqual(report["perTurn"][0]["agentActiveDurationNs"], 900_000_000)
-        self.assertEqual(report["perTurn"][0]["firstUsefulActionMs"], 12.5)
-        self.assertEqual(report["perTurn"][0]["humanWaitNs"], 100_000_000)
-        self.assertEqual(report["perTurn"][0]["humanOnlyWaitNs"], 100_000_000)
-        self.assertEqual(report["perTurn"][0]["humanWaitUnionNs"], 150_000_000)
+        detailed_turn = full_report["perTurn"][0]
+        self.assertEqual(detailed_turn["agentActiveDurationNs"], 900_000_000)
+        self.assertEqual(detailed_turn["firstUsefulActionMs"], 12.5)
+        self.assertEqual(detailed_turn["humanWaitNs"], 100_000_000)
+        self.assertEqual(detailed_turn["humanOnlyWaitNs"], 100_000_000)
+        self.assertEqual(detailed_turn["humanWaitUnionNs"], 150_000_000)
         self.assertEqual(
-            report["perTurn"][0]["humanWaitCounts"]["userInputWaitCount"], 1
+            detailed_turn["humanWaitCounts"]["userInputWaitCount"], 1
         )
-        self.assertEqual(report["perTurn"][0]["tokens"]["inputTokens"], 210)
-        self.assertEqual(report["perTurn"][0]["tokens"]["cachedInputTokens"], 180)
-        self.assertEqual(report["perTurn"][0]["tokens"]["outputTokens"], 25)
-        self.assertEqual(report["perTurn"][0]["tokens"]["reasoningTokens"], 7)
-        self.assertEqual(report["perTurn"][0]["tokens"]["billableTokens"], 235)
-        self.assertEqual(report["perTurn"][0]["tokens"]["blendedTokens"], 55)
+        self.assertEqual(detailed_turn["tokens"]["inputTokens"], 210)
+        self.assertEqual(detailed_turn["tokens"]["cachedInputTokens"], 180)
+        self.assertEqual(detailed_turn["tokens"]["outputTokens"], 25)
+        self.assertEqual(detailed_turn["tokens"]["reasoningTokens"], 7)
+        self.assertEqual(detailed_turn["tokens"]["billableTokens"], 235)
+        self.assertEqual(detailed_turn["tokens"]["blendedTokens"], 55)
         self.assertEqual(
-            report["perTurn"][0]["tokens"]["promptCategories"][
+            detailed_turn["tokens"]["promptCategories"][
                 "repeatedUnchangedContext"
             ],
             150,
         )
         self.assertEqual(
-            report["perTurn"][0]["observationalNonprogressTokens"]["totalTokens"],
+            detailed_turn["observationalNonprogressTokens"]["totalTokens"],
             115,
         )
         self.assertEqual(report["populations"]["all"]["modelShare"], 2 / 3)
@@ -1786,10 +1974,10 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertEqual(
             report["coverage"]["terminalLifecycleStateCounts"], {"completed": 1}
         )
-        self.assertEqual(report["perTurn"][0]["samplingPasses"], 2)
-        self.assertEqual(report["perTurn"][0]["samplingPassTarget"], 8)
-        self.assertEqual(report["perTurn"][0]["startedAt"], "2026-08-17T00:00:00+00:00")
-        self.assertEqual(report["perTurn"][0]["boundarySource"], "timing")
+        self.assertEqual(detailed_turn["samplingPasses"], 2)
+        self.assertEqual(detailed_turn["samplingPassTarget"], 8)
+        self.assertEqual(detailed_turn["startedAt"], "2026-08-17T00:00:00+00:00")
+        self.assertEqual(detailed_turn["boundarySource"], "timing")
         intervals = full_report["perTurn"][0]["tokenIntervals"]
         self.assertEqual(len(intervals), 2)
         self.assertEqual(intervals[0]["emittedToolCallIds"], ["relay-1"])
@@ -1806,10 +1994,14 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
             model_breakdown["generationPurposes"],
         )
         for displayed in (report, summary):
-            turn = displayed["perTurn"][0]
             self.assertEqual(
-                len(turn["tokenIntervals"]) + turn["omittedTokenIntervals"], 2,
+                len(displayed["perTurn"]) + displayed["omittedPerTurnRecords"],
+                len(full_report["perTurn"]),
             )
+            for turn in displayed["perTurn"]:
+                self.assertEqual(
+                    len(turn["tokenIntervals"]) + turn["omittedTokenIntervals"], 2,
+                )
             self.assertFalse(displayed["summaryBudget"]["limitExceeded"])
         self.assertEqual(len(full_report["perTurn"][0]["tokenIntervals"]), 2)
         self.assertEqual(report["firstUsefulActionAnalysis"]["canonicalTurnCount"], 1)
@@ -1824,7 +2016,9 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertNotIn("sourceSnapshots", summary["firstUsefulActionAnalysis"])
         rendered = kd4_turn_latency_audit.render_report(report)
         self.assertIn("repository_root: 1 turns; same measurements as all", rendered)
-        self.assertIn("boundary=2026-08-17", rendered)
+        self.assertIn(
+            "boundary=2026-08-17", kd4_turn_latency_audit.render_report(full_report)
+        )
         self.assertIn("orchestration breakdown (overlapping diagnostics", rendered)
         self.assertIn("model inference breakdown (overlapping diagnostics", rendered)
         self.assertIn("purposes=[deterministic_tool_continuation=", rendered)
@@ -2756,6 +2950,222 @@ class Kd4TurnLatencyAuditTest(unittest.TestCase):
         self.assertIsNone(population["tokens"]["billableTokens"])
         self.assertEqual(population["tokens"]["providerUsageAttempts"], 2)
         self.assertEqual(population["tokens"]["physicalAttempts"], 3)
+
+
+class RequestLedgerTest(unittest.TestCase):
+    def test_actual_commands_sizes_costs_and_flags_share_one_report(self):
+        timing = _timing()
+        timing["toolCalls"][0]["callId"] = "call-0"
+        timing["modelRequests"].append(dict(timing["modelRequests"][0], attemptKind="retry"))
+        output = '{"output_truncated":true}\nScript failed: diagnostic'
+        report = Kd4TurnLatencyAuditTest().audit_commands(
+            [("python -B scripts/check.py λ", output)], timing=timing,
+        )
+        ledger = report["requestLedger"]
+        self.assertEqual(len(ledger["requests"]), 3)
+        self.assertEqual(ledger["requests"][2]["attemptKind"], "retry")
+        self.assertEqual(ledger["requests"][0]["inputTokens"], 100)
+        call = ledger["calls"][0]
+        self.assertEqual(call["action"], "exec>exec_command scripts/check.py")
+        self.assertNotIn("λ", call["action"])
+        self.assertEqual(call["outputBytes"], len(output.encode("utf-8")))
+        self.assertEqual(call["generationIndex"], 0)
+        self.assertEqual(call["roundTripNs"], 1_000_000_000)
+        self.assertEqual(call["status"], "failed")
+        self.assertTrue(call["truncationMarker"])
+        rendered = kd4_turn_latency_audit.render_report(report)
+        for expected in ("exec>exec_command scripts/check.py", "wait=0.300s", "bytes in/out=", "truncation-marker=True"):
+            self.assertIn(expected, rendered)
+
+    def test_ambiguous_links_unknown_tokens_and_quoted_flags_are_not_invented(self):
+        timing = _timing()
+        timing["toolCalls"][0]["callId"] = "call-0"
+        timing["toolCalls"].append(dict(timing["toolCalls"][0], generationIndex=1))
+        report = Kd4TurnLatencyAuditTest().audit_commands(
+            [("echo quoted", json.dumps({"text": '{"output_truncated":true}'}))],
+            timing=timing, include_tokens=False,
+        )
+        self.assertIsNone(report["requestLedger"]["calls"][0]["generationIndex"])
+        self.assertFalse(report["requestLedger"]["calls"][0]["truncationMarker"])
+        self.assertIsNone(report["requestLedger"]["requests"][0]["inputTokens"])
+
+    def test_ledger_bounds_unicode_rows_without_discarding_full_detail(self):
+        report = Kd4TurnLatencyAuditTest().audit_commands([("cat scripts/" + "a" * 2000 + ".py", "done")] * 45)
+        ledger = report["requestLedger"]
+        for call in ledger["calls"]:
+            call["tool"] = call["turnId"] = call["callId"] = "😀" * 2000
+        self.assertTrue(all(len(call["action"]) == 160 for call in ledger["calls"]))
+        for call in ledger["calls"]:
+            call["action"] = "λ" * 2000
+        text = "\n".join(kd4_turn_latency_audit._render_request_ledger(report))
+        self.assertLess(len(text.encode("utf-8")), 14 * 1024)
+        self.assertIn("calls omitted", text)
+        self.assertEqual(len(ledger["calls"]), 45)
+        self.assertTrue(all(len(call["action"]) == 2000 for call in ledger["calls"]))
+
+    def test_unpaired_open_call_is_retained_without_fake_duration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "open.jsonl"
+            path.write_text("\n".join([
+                _event({"type": "task_started", "turn_id": "open"}),
+                _response({"type": "function_call", "name": "read_file", "call_id": "pending",
+                           "arguments": '{"path":"example.rs"}'}, "2026-08-17T00:00:01Z"),
+            ]), encoding="utf-8")
+            report = kd4_turn_latency_audit.analyze_session_path(path, Path(temp))
+        self.assertEqual(report["requestLedger"]["requests"], [])
+        call = report["requestLedger"]["calls"][0]
+        self.assertEqual(call["status"], "unpaired")
+        self.assertIsNone(call["roundTripNs"])
+        self.assertIsNone(call["outputBytes"])
+        self.assertIn("example.rs", call["action"])
+
+
+class SavedTimingReportTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.source = self.root / "rollout.jsonl"
+        self.destination = self.root / "saved.json"
+        self.cache = self.root / "cache"
+        self.source.write_text("\n".join([
+            _meta(str(self.root)),
+            _event({"type": "task_started", "turn_id": "valid"}),
+            _event({"type": "task_complete", "turn_id": "valid", "timing": _timing()}),
+            _event({"type": "task_started", "turn_id": "invalid"}),
+            _event({"type": "turn_aborted", "turn_id": "invalid", "timing": _timing(valid=False)}),
+            _event({"type": "task_started", "turn_id": "open"}),
+        ]) + "\n", encoding="utf-8")
+        self.report = kd4_turn_latency_audit.analyze_session_path(self.source, self.root)
+
+    def invoke(self, *arguments):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                status = kd4_turn_latency_audit.main(list(arguments))
+            except SystemExit as error:
+                status = error.code
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_large_report_is_saved_losslessly_and_replayed_without_source_reads(self):
+        ledger = {"requests": [], "calls": [], "measurementNote": "λ" * 600_000 + "important-tail"}
+        with mock.patch.object(kd4_turn_latency_audit, "_request_ledger", return_value=ledger):
+            status, output, error = self.invoke(str(self.source), "--cache-dir", str(self.cache), "--summary-json")
+        self.assertEqual(status, 0, error)
+        receipt = json.loads(error)["savedReport"]
+        self.destination = Path(receipt["path"])
+        data = self.destination.read_bytes()
+        original = json.loads(data)
+        self.assertEqual(original["requestLedger"], ledger)
+        self.assertGreater(len(data), 1024 * 1024)
+        self.assertLess(len(output.encode()), len(data) // 10)
+        self.assertEqual(receipt, {"path": str(self.destination), "bytes": len(data),
+                                   "sha256": hashlib.sha256(data).hexdigest()})
+        self.assertEqual(json.loads(output)["coverage"]["startedTurnsWithoutTerminal"], 1)
+        self.source.unlink()
+        with mock.patch.object(kd4_turn_latency_audit, "analyze_session_path", side_effect=AssertionError("reanalyzed")), \
+             mock.patch.object(kd4_turn_latency_audit, "resolve_rollout_source", side_effect=AssertionError("read source")):
+            status, replay, error = self.invoke("--from-report", str(self.destination), "--json")
+            self.assertEqual(status, 0, error)
+            self.assertEqual(json.loads(replay), original)
+            self.assertIn("freshness is not checked", error)
+            status, replay, error = self.invoke("--from-report", str(self.destination), "--summary-json")
+            self.assertEqual(status, 0, error)
+            self.assertEqual(json.loads(replay), kd4_turn_latency_audit.bounded_summary(original))
+
+    def test_removed_output_route_cannot_overwrite_user_files(self):
+        for destination in (self.destination, self.source):
+            with self.subTest(destination=destination):
+                if destination == self.destination:
+                    destination.write_bytes(b"existing user report")
+                original = destination.read_bytes()
+                with mock.patch.object(kd4_turn_latency_audit, "analyze_session_path") as analyze:
+                    status, output, error = self.invoke(str(self.source), "--output", str(destination))
+                self.assertEqual(status, 2)
+                self.assertIn("unrecognized arguments", error)
+                self.assertEqual(output, "")
+                analyze.assert_not_called()
+                self.assertEqual(destination.read_bytes(), original)
+
+    def test_cli_entrypoint_replays_comparison_without_live_source(self):
+        command = [sys.executable, "-B", kd4_turn_latency_audit.__file__]
+        created = subprocess.run(
+            [*command, str(self.source), "--cache-dir", str(self.cache)],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.destination = Path(json.loads(created.stderr)["savedReport"]["path"])
+        saved = self.destination.read_bytes()
+        self.source.unlink()
+        replayed = subprocess.run(
+            [*command, "--from-report", str(self.destination), "--json",
+             "--baseline", str(self.destination), "--comparison-min-samples", "1",
+             "--gate-metric", "outputTokens"],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        # The fixture includes an open turn: replay must preserve the gate's
+        # insufficient-evidence result, not turn a saved report into a pass.
+        self.assertEqual(replayed.returncode, 3, replayed.stderr)
+        report = json.loads(replayed.stdout)
+        self.assertEqual(report["baselineComparison"]["gate"]["status"], "insufficient_evidence")
+        self.assertEqual(report["coverage"], json.loads(saved)["coverage"])
+        self.assertEqual(report["baselineComparison"]["gate"]["unavailable"][0]["reason"],
+                         "incomplete_session_coverage")
+        self.assertEqual(self.destination.read_bytes(), saved)
+
+    def test_cache_write_failure_is_explicit_without_losing_computed_summary(self):
+        from scripts import rollout_audit_cache
+        with mock.patch.object(rollout_audit_cache, "write_bytes_atomic", side_effect=PermissionError):
+            status, output, error = self.invoke(str(self.source), "--cache-dir", str(self.cache))
+        self.assertEqual(status, 0, error)
+        self.assertIn("Report NOT saved", error)
+        self.assertNotIn("savedReport", error)
+        self.assertIn("report not saved: unavailable", output)
+        self.assertEqual(list(self.cache.glob("reports/*.json")), [])
+
+    def test_serialization_failure_does_not_publish_or_emit_success(self):
+        with mock.patch.object(kd4_turn_latency_audit, "_request_ledger", return_value=object()):
+            status, output, error = self.invoke(str(self.source), "--cache-dir", str(self.cache))
+        self.assertEqual(status, 2)
+        self.assertIn("not JSON serializable", error)
+        self.assertEqual(output, "")
+        self.assertEqual(list(self.cache.glob("reports/*.json")), [])
+
+    def test_replay_rejects_partial_incompatible_and_malformed_reports(self):
+        for data in ("{", "[]", "{}", json.dumps({"schemaVersion": -1}),
+                     json.dumps(kd4_turn_latency_audit.bounded_summary(self.report)),
+                     json.dumps({"schemaVersion": kd4_turn_latency_audit.REPORT_SCHEMA_VERSION,
+                                 "sessionDiagnostics": {}})):
+            with self.subTest(data=data[:50]):
+                self.destination.write_text(data, encoding="utf-8")
+                for mode in ([], ["--summary-json"], ["--json"]):
+                    status, output, error = self.invoke("--from-report", str(self.destination), *mode)
+                    self.assertEqual(status, 2, error)
+                    self.assertEqual(output, "")
+
+    def test_replay_rejects_live_options_and_output_without_running_producer(self):
+        for options in ([str(self.source)], ["--tokens", "off"], ["--repo-root", str(self.root)],
+                        ["--cache-dir", str(self.root)], ["--startup-log", str(self.source)],
+                        ["--output", str(self.destination)]):
+            with self.subTest(options=options), mock.patch.object(kd4_turn_latency_audit, "analyze_session_path") as analyze:
+                status, output, error = self.invoke("--from-report", str(self.destination), *options)
+                self.assertEqual(status, 2, error)
+                self.assertEqual(output, "")
+                analyze.assert_not_called()
+        status, output, error = self.invoke(str(self.source), "--output", str(self.destination), "--json")
+        self.assertEqual(status, 2, error)
+        self.assertFalse(self.destination.exists())
+
+    def test_replay_preserves_gate_exit_status_and_saved_bytes(self):
+        for gate_status, expected in kd4_turn_latency_audit._GATE_EXIT_CODES.items():
+            with self.subTest(status=gate_status):
+                self.report["baselineComparison"] = {"gate": {"status": gate_status}}
+                data = json.dumps(self.report)
+                self.destination.write_text(data, encoding="utf-8")
+                status, output, error = self.invoke("--from-report", str(self.destination), "--json")
+                self.assertEqual(status, expected, error)
+                self.assertEqual(json.loads(output)["baselineComparison"]["gate"]["status"], gate_status)
+                self.assertEqual(self.destination.read_text(encoding="utf-8"), data)
 
 
 if __name__ == "__main__":

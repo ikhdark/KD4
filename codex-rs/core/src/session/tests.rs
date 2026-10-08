@@ -1,5 +1,59 @@
 use super::turn_context::TurnEnvironment;
 use super::*;
+
+#[tokio::test]
+async fn salience_budget_rejection_is_recoverable_not_a_source_removal() {
+    struct Contributor {
+        phase: Arc<std::sync::atomic::AtomicUsize>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl codex_extension_api::ContextContributor for Contributor {
+        fn contribute_thread_context<'a>(&'a self, _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData)
+            -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async move {
+                self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let phase = self.phase.load(std::sync::atomic::Ordering::SeqCst);
+                let mut fragments = vec![codex_extension_api::PromptFragment::developer_capability(
+                    if phase == 0 { "small catalog".to_string() } else { "catalog ".repeat(30_000) })];
+                if phase < 2 {
+                    fragments.push(codex_extension_api::PromptFragment::separate_developer("required source sentinel"));
+                }
+                fragments
+            })
+        }
+    }
+    let (mut session, turn) = make_session_and_context().await;
+    let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = codex_extension_api::ExtensionRegistryBuilder::new();
+    registry.prompt_contributor(Arc::new(Contributor { phase: phase.clone(), polls: polls.clone() }));
+    session.services.extensions = Arc::new(registry.build());
+    let session = Arc::new(session);
+    let step = StepContext::for_test(Arc::new(turn));
+    let index = context_contribution_index(0, 1, true);
+    for revision in 0..3 {
+        phase.store(revision, std::sync::atomic::Ordering::SeqCst);
+        let prepared = session.prepare_context_update(&step).await;
+        let text = developer_input_texts(&prepared.context_items).join("\n");
+        if revision == 1 {
+            assert!(text.contains("Context contribution INCOMPLETE"), "{text}");
+            assert!(!text.contains(&crate::stable_context::turn_contribution_removal(index)));
+            let references = session.state.lock().await.tool_history_state().artifact_references();
+            let id = references.keys().find(|id| text.contains(id.as_str())).unwrap();
+            let bytes = crate::tools::command_output_artifact::read_exact_tool_output_artifact(
+                session.codex_home().await.as_path(), &session.thread_id().to_string(), id).await.unwrap();
+            let recovered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(recovered["items"][0]["text"], "required source sentinel");
+        }
+        if revision == 2 {
+            assert!(text.contains(&crate::stable_context::turn_contribution_removal(index)));
+        }
+        session.compare_and_record_context_updates(prepared, session.services.planning_generation())
+            .await.unwrap().unwrap();
+    }
+    assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
 use crate::FunctionCallError;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
@@ -10039,6 +10093,7 @@ where
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
         retained_patches: Default::default(),
         path_replays: Default::default(),
+        validation_uncertainty: Default::default(),
         plan_store: crate::plan_store::PlanStore::default(),
         elicitations: crate::elicitation::ElicitationService::new(),
         analytics_events_client: AnalyticsEventsClient::new(

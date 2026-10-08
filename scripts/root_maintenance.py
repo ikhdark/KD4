@@ -377,7 +377,11 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/invoke-rust-perf-env.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/install/install.ps1": ("scripts.test_build_tooling_policy",),
     "scripts/just-shell.py": ("scripts.test_build_tooling",),
-    "scripts/kd4_model_attempt_analysis.py": ("scripts.test_kd4_perf_snapshot",),
+    "scripts/kd4_model_attempt_analysis.py": (
+        "scripts.test_kd4_perf_snapshot",
+        "scripts.test_kd4_model_inference",
+    ),
+    "scripts/kd4_perf_snapshot.py": ("scripts.test_kd4_model_inference",),
     "scripts/kd4_turn_latency_audit.py": (
         f"{REPORT_REGRESSIONS}.test_terminal_conflicts_are_order_independent_and_malformed_is_local",
         "scripts.test_kd4_timing_analysis.SharedTimingAnalysisTest.test_rollout_status_prefers_structured_execution_results",
@@ -409,6 +413,7 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/rust_packages.py": ("scripts.test_build_tooling_policy",),
     "scripts/rust_test_runner.py": (
         f"{REPORT_REGRESSIONS}.test_nextest_progress_counter_and_binary_identity",
+        "scripts.test_validation_scheduling",
     ),
     "scripts/rust_tool_env.py": ("scripts.test_process_owner",),
     "scripts/sccache-perf.ps1": ("scripts.test_build_tooling_performance",),

@@ -1,5 +1,6 @@
 """Narrative dump of a Codex rollout: full model-visible messages, reasoning summaries, tool inputs,
 developer interventions; tool outputs bounded to a char limit; timing blocks reduced to counters."""
+import argparse
 import json
 import sys
 import datetime
@@ -144,14 +145,30 @@ def dump(path, out_path, start_idx=0):
     w.close()
 
 
-if __name__ == '__main__':
-    outdir = sys.argv[1]
-    os.makedirs(outdir, exist_ok=True)
-    for a in sys.argv[2:]:
+def main(argv=None):
+    def rollout_argument(value):
         start = 0
-        if '@' in a:
-            a, s = a.rsplit('@', 1)
-            start = int(s)
+        if '@' in value:
+            value, suffix = value.rsplit('@', 1)
+            try:
+                start = int(suffix)
+            except ValueError as error:
+                raise argparse.ArgumentTypeError('record index after @ must be an integer') from error
+        return value, start
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('outdir', help='Directory for narrative reports')
+    parser.add_argument('rollouts', nargs='+', type=rollout_argument, metavar='ROLLOUT[@INDEX]',
+                        help='Rollout path, optionally followed by a zero-based starting record index')
+    args = parser.parse_args(argv)
+    os.makedirs(args.outdir, exist_ok=True)
+    for a, start in args.rollouts:
         name = os.path.basename(a).replace('.jsonl', f'.narr{start or ""}.txt')
-        dump(a, os.path.join(outdir, name), start)
-        print('wrote', os.path.join(outdir, name), os.path.getsize(os.path.join(outdir, name)))
+        output = os.path.join(args.outdir, name)
+        dump(a, output, start)
+        print('wrote', output, os.path.getsize(output))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

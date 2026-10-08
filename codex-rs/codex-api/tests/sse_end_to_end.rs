@@ -237,7 +237,7 @@ async fn responses_stream_rejects_missing_completion_response_end_to_end() -> Re
             errors.push(error);
         }
     }
-    assert!(matches!(errors.as_slice(), [ApiError::Stream(message)]
+    assert!(matches!(errors.as_slice(), [ApiError::ProviderFailure { message, .. }]
         if message == "response.completed event missing response"));
     Ok(())
 }

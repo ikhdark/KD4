@@ -64,6 +64,7 @@ async fn retry_advice_is_preserved_through_wrappers_and_deadline() {
             StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
                 status: StatusCode::TOO_MANY_REQUESTS, body_preview: "busy".into(),
                 retry_after: Some(Duration::from_secs(2)),
+                retry_after_received_at: time::Instant::now(),
             })
         )), context: "send initialize request".into(),
     };
@@ -76,6 +77,29 @@ async fn retry_advice_is_preserved_through_wrappers_and_deadline() {
     let start = time::Instant::now();
     assert!(!sleep_with_retry_deadline(delay, Some(Instant::now() + Duration::from_millis(100))).await);
     assert!(start.elapsed() <= Duration::from_millis(101));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_advice_counts_cleanup_time_without_restarting_or_overflowing() {
+    let error = StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        body_preview: "busy".into(),
+        retry_after: Some(Duration::from_secs(10)),
+        retry_after_received_at: time::Instant::now(),
+    });
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert_eq!(retry_delay(&error, 250), Duration::from_secs(6));
+    tokio::time::advance(Duration::from_secs(8)).await;
+    // Keep the existing minimum local backoff even after advice expires.
+    assert_eq!(retry_delay(&error, 250), Duration::from_millis(250));
+
+    let error = StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        body_preview: "busy".into(),
+        retry_after: Some(Duration::MAX),
+        retry_after_received_at: time::Instant::now(),
+    };
+    assert_eq!(retry_delay(&error, 250), Duration::MAX);
 }
 
 #[test]
@@ -121,11 +145,13 @@ fn retryable_streamable_http_error_includes_remote_body_stream_failure() {
             status: StatusCode::BAD_GATEWAY,
             body_preview: "localized upstream failure".to_string(),
             retry_after: None,
+            retry_after_received_at: time::Instant::now(),
         }),
         StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
             status: StatusCode::BAD_REQUEST,
             body_preview: "localized bad request".to_string(),
             retry_after: None,
+            retry_after_received_at: time::Instant::now(),
         }),
     ];
 

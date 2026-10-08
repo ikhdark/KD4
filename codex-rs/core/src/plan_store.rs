@@ -9,6 +9,7 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use tokio::sync::Mutex;
@@ -50,6 +51,22 @@ pub(crate) struct PlanLineage {
     /// Executable nodes belong to the task coordinator, never checklist order.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) workflow: BTreeMap<String, PlanExecutionNode>,
+    /// Explicit checklist resolutions; never behavioral validation receipts.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) resolved_requirements: BTreeSet<String>,
+    /// Reopening/rewording a step advances its CAS version, independently of peers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) step_revisions: BTreeMap<String, u64>,
+    /// Provenance of the accepted user input cited for a declared scope change.
+    /// The host verifies provenance, not the model's interpretation of that input.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) accepted_supersessions: BTreeMap<String, PlanInputReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PlanInputReference {
+    pub(crate) turn_id: String,
+    pub(crate) sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +104,9 @@ impl PlanLineage {
         }
         let mut summary = PlanObligationSummary::default();
         for (id, requirement) in &self.requirements {
-            if requirement.superseded_reason.is_some() {
+            if requirement.superseded_reason.is_some() && self.accepted_supersessions.contains_key(id) {
+                summary.superseded += 1;
+            } else if requirement.superseded_reason.is_some() {
                 // This format records a model proposal, not an accepted user
                 // instruction. Keep it unresolved until original scope is
                 // explicitly accounted for; explanatory prose is not authority.
@@ -114,17 +133,23 @@ impl PlanLineage {
     fn is_empty(&self) -> bool {
         self.requirements.is_empty() && self.step_requirements.is_empty()
             && self.step_identities.is_empty() && self.workflow.is_empty()
+            && self.resolved_requirements.is_empty() && self.step_revisions.is_empty()
+            && self.accepted_supersessions.is_empty()
     }
 
     /// The checklist already carries these exact entries. Replay reconstructs
     /// them; preserve splits, renames, supersessions and legacy identities.
     pub(crate) fn compact_for_plan(&self, plan: &UpdatePlanArgs) -> Self {
         let mut compact = self.clone();
+        let mut references = HashMap::<&str, usize>::new();
+        for ids in self.step_requirements.values() {
+            for id in ids { *references.entry(id.as_str()).or_default() += 1; }
+        }
         for step in &plan.plan {
             let id = self.step_id(&step.step);
             if id == plan_step_id(&step.step)
                 && self.step_requirements.get(&id).is_some_and(|ids| ids == &[id.clone()])
-                && self.step_requirements.values().filter(|ids| ids.contains(&id)).count() == 1
+                && references.get(id.as_str()) == Some(&1)
                 && self.requirements.get(&id).is_some_and(|requirement| {
                     requirement.text == step.step && requirement.status == step.status
                         && requirement.superseded_reason.is_none()
@@ -132,6 +157,7 @@ impl PlanLineage {
             {
                 compact.requirements.remove(&id);
                 compact.step_requirements.remove(&id);
+                compact.resolved_requirements.remove(&id);
             }
         }
         compact
@@ -140,10 +166,14 @@ impl PlanLineage {
     /// Prompt projection only. Durable snapshots retain the full audit history.
     pub(crate) fn active_for_plan(&self, plan: &UpdatePlanArgs) -> Self {
         let mut active = self.compact_for_plan(plan);
+        let mapped = active.step_requirements.values().flatten().cloned().collect::<HashSet<_>>();
         active.requirements.retain(|id, requirement| {
-            (requirement.status != StepStatus::Completed || requirement.superseded_reason.is_some())
-                || active.step_requirements.values().any(|ids| ids.contains(id))
+            (!active.accepted_supersessions.contains_key(id)
+                && (requirement.status != StepStatus::Completed || requirement.superseded_reason.is_some()))
+                || mapped.contains(id)
         });
+        active.resolved_requirements.retain(|id| active.requirements.contains_key(id));
+        active.accepted_supersessions.retain(|id, _| active.requirements.contains_key(id));
         active
     }
 
@@ -185,7 +215,7 @@ impl PlanLineage {
                 step_id = uuid::Uuid::now_v7().to_string();
             }
             if step_id != text_id {
-                self.step_identities.insert(text_id, step_id.clone());
+                self.step_identities.insert(text_id.clone(), step_id.clone());
             }
             let mut ids = previous.get(&step_id).cloned().unwrap_or_default();
             for source in &step.continues {
@@ -196,13 +226,15 @@ impl PlanLineage {
             }
             ids.sort();
             ids.dedup();
-            if ids.is_empty() {
+            // Inheritance carries old scope; it must not erase newly introduced
+            // acceptance text. A rename may resolve its original IDs explicitly.
+            if !ids.iter().any(|id| self.requirements.get(id).is_some_and(|r| r.text == step.step)) {
                 // Reintroducing identical text must not overwrite a retired
                 // requirement's original status or supersession record.
-                let id = if self.requirements.contains_key(&step_id) {
+                let id = if self.requirements.contains_key(&text_id) {
                     uuid::Uuid::now_v7().to_string()
                 } else {
-                    step_id.clone()
+                    text_id
                 };
                 self.requirements.insert(
                     id.clone(),
@@ -214,9 +246,20 @@ impl PlanLineage {
                 );
                 ids.push(id);
             }
+            ids.sort();
+            ids.dedup();
             self.step_requirements.insert(step_id, ids);
         }
         self.workflow.retain(|step_id, _| self.step_requirements.contains_key(step_id));
+        self.step_revisions.retain(|step_id, _| self.step_requirements.contains_key(step_id));
+        // Carrying scope forward reactivates it, rather than leaving a retirement
+        // proposal that restore could mistake for an invalid mapping.
+        for id in self.step_requirements.values().flatten() {
+            if let Some(requirement) = self.requirements.get_mut(id) {
+                requirement.superseded_reason = None;
+            }
+            self.accepted_supersessions.remove(id);
+        }
         for dropped in superseded {
             let ids = previous.get(&dropped.step_id).cloned()
                 .unwrap_or_else(|| vec![dropped.step_id.clone()]);
@@ -232,35 +275,31 @@ impl PlanLineage {
     }
 
     fn update_statuses(&mut self, plan: &UpdatePlanArgs) {
-        let steps = plan.plan.iter().map(|step| (self.step_id(&step.step), step)).collect::<Vec<_>>();
-        for (id, requirement) in &mut self.requirements {
-            let statuses = steps.iter()
-                .filter(|(step_id, _)| {
-                    self.step_requirements
-                        .get(step_id)
-                        .is_some_and(|ids| ids.contains(id))
-                })
-                // A continuation preserves lineage, not equivalent acceptance
-                // scope. The descendant checklist can complete atomically, but
-                // cannot declare differently worded original scope complete.
-                .map(|(_, step)| {
-                    if step.status == StepStatus::Completed && step.step != requirement.text {
-                        StepStatus::InProgress
-                    } else {
-                        step.status
-                    }
-                })
-                .collect::<Vec<_>>();
-            if !statuses.is_empty() {
-                requirement.status = if statuses.iter().all(|status| *status == StepStatus::Completed) {
-                    requirement.superseded_reason = None;
-                    StepStatus::Completed
-                } else if statuses.contains(&StepStatus::InProgress) {
-                    StepStatus::InProgress
-                } else {
-                    StepStatus::Pending
-                };
+        // Aggregate actual edges once, rather than scanning every step for
+        // every historical requirement (including no-longer-active history).
+        let mut states = HashMap::<String, (bool, bool, bool, bool)>::new();
+        for step in &plan.plan {
+            let step_id = self.step_id(&step.step);
+            for id in self.step_requirements.get(&step_id).into_iter().flatten() {
+                let Some(requirement) = self.requirements.get(id) else { continue };
+                let state = states.entry(id.clone()).or_insert((true, false, true, false));
+                state.0 &= step.status == StepStatus::Completed;
+                state.1 |= step.status == StepStatus::InProgress;
+                state.2 &= step.step == requirement.text;
+                state.3 |= step.status == StepStatus::Completed && step.step != requirement.text;
             }
+        }
+        for (id, (completed, in_progress, same_text, renamed_completion)) in states {
+            if !completed { self.resolved_requirements.remove(&id); }
+            let requirement = self.requirements.get_mut(&id).expect("known requirement");
+            requirement.status = if completed && (same_text || self.resolved_requirements.contains(&id)) {
+                requirement.superseded_reason = None;
+                StepStatus::Completed
+            } else if in_progress || renamed_completion {
+                StepStatus::InProgress
+            } else {
+                StepStatus::Pending
+            };
         }
     }
 
@@ -292,8 +331,7 @@ impl PlanLineage {
             return self;
         };
         for ids in self.step_requirements.values_mut() {
-            ids.retain(|id| self.requirements.get(id)
-                .is_some_and(|requirement| requirement.superseded_reason.is_none()));
+            ids.retain(|id| self.requirements.contains_key(id));
         }
         self.revise(
             Some(plan),
@@ -314,6 +352,27 @@ struct PlanState {
     plan: Option<UpdatePlanArgs>,
     lineage: PlanLineage,
     durably_published: bool,
+    derived: std::sync::Arc<PlanDerived>,
+}
+
+/// Derived views share the immutable owner revision, never durable authority.
+/// An update detaches this cache before changing either plan or lineage.
+#[derive(Debug, Default)]
+struct PlanDerived {
+    revision: std::sync::OnceLock<String>,
+    execution: std::sync::OnceLock<Option<PlanExecutionSnapshot>>,
+    task: [std::sync::OnceLock<crate::context::world_state::TaskState>; 2],
+}
+
+/// Host-only sampling fence. Every actual change detaches the immutable owner;
+/// identity also catches change-then-restore (ABA), without changing durable CAS.
+#[derive(Debug, Clone)]
+pub(crate) struct PlanSamplingRevision(std::sync::Arc<PlanDerived>);
+
+impl PlanState {
+    fn revision(&self) -> &str {
+        self.derived.revision.get_or_init(|| plan_revision_with_lineage(self.plan.as_ref(), &self.lineage))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +383,7 @@ pub(crate) struct PlanExecutionSnapshot {
 }
 
 impl PlanExecutionSnapshot {
+    #[cfg(test)]
     pub(crate) fn new(plan: &UpdatePlanArgs, lineage: &PlanLineage) -> Self {
         Self {
             revision: plan_revision_with_lineage(Some(plan), lineage),
@@ -347,8 +407,19 @@ pub(crate) struct PlanStatusUpdate {
 pub(crate) struct PlanToolArgs {
     pub(crate) explanation: Option<String>,
     pub(crate) expected_revision: Option<String>,
+    #[serde(skip)]
+    pub(crate) sampling_revision: Option<PlanSamplingRevision>,
     pub(crate) plan: Option<Vec<PlanStepArg>>,
     pub(crate) set: Option<Vec<PlanStatusUpdate>>,
+    /// Per-step CAS for independent deltas. Zero is the initial/legacy version.
+    pub(crate) expected_step_revisions: Option<BTreeMap<String, u64>>,
+    /// Resolve original requirement IDs after all their descendants complete.
+    #[serde(default)]
+    pub(crate) resolve: Vec<String>,
+    /// Exact accepted user text, keyed by superseded step/orphan ID. Provenance
+    /// is verified under the plan lock; a free-form reason alone cannot retire.
+    #[serde(default)]
+    pub(crate) scope_change_instructions: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) superseded: Vec<SupersededStep>,
     /// Stable checklist step ID -> existing executable assignment ID.
@@ -388,6 +459,9 @@ pub(crate) struct PlanToolResponse {
     pub(crate) completion_authority: String,
     #[serde(default, skip_serializing_if = "PlanLineage::is_empty")]
     pub(crate) lineage: PlanLineage,
+    /// Model results project active lineage; durable snapshots retain history.
+    #[serde(default = "complete_lineage")]
+    pub(crate) lineage_complete: bool,
     #[serde(default)]
     pub(crate) revision: String,
     #[serde(default)]
@@ -399,6 +473,8 @@ pub(crate) struct PlanToolResponse {
     #[serde(default)]
     pub(crate) no_progress: bool,
 }
+
+fn complete_lineage() -> bool { true }
 
 pub(crate) fn checklist_completion_authority() -> String {
     "checklist_only".to_string()
@@ -471,13 +547,17 @@ pub(crate) fn plan_snapshot_from_item(item: &ResponseItem) -> Option<PlanToolRes
 #[derive(Debug, Default)]
 pub(crate) struct PlanStore {
     current: Mutex<PlanState>,
+    /// Serializes publication through client notification, independently of
+    /// repository tool admission. Lock order: publication -> current -> rollout.
+    publication: Mutex<()>,
+    accepted_input: Mutex<Option<(String, HashSet<String>)>>,
 }
 
 /// Holds the existing plan lock across publication so revision validation and
 /// the durable snapshot refer to the same update. Dropping it changes nothing.
 pub(crate) struct StagedPlanUpdate<'a> {
     current: tokio::sync::MutexGuard<'a, PlanState>,
-    next: PlanState,
+    next: Option<PlanState>,
     pub(crate) update: PlanStoreUpdate,
 }
 
@@ -487,17 +567,34 @@ impl StagedPlanUpdate<'_> {
     }
 
     pub(crate) fn commit_published(mut self) -> PlanStoreUpdate {
-        self.next.durably_published = true;
+        if let Some(next) = self.next.as_mut() { next.durably_published = true; }
+        else { self.current.durably_published = true; }
         self.commit()
     }
 
     pub(crate) fn commit(mut self) -> PlanStoreUpdate {
-        *self.current = self.next;
+        if let Some(next) = self.next { *self.current = next; }
         self.update
     }
 }
 
 impl PlanStore {
+    pub(crate) async fn sampling_revision(&self) -> PlanSamplingRevision {
+        PlanSamplingRevision(std::sync::Arc::clone(&self.current.lock().await.derived))
+    }
+
+    pub(crate) async fn publication_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.publication.lock().await
+    }
+
+    /// Called only after a real user input has been accepted and recorded. Tool
+    /// output, injected context and inter-agent messages never enter this path.
+    pub(crate) async fn record_accepted_input<'a>(&self, turn_id: &str, texts: impl Iterator<Item = &'a str>) {
+        let hashes = texts.filter(|text| !text.trim().is_empty())
+            .map(|text| format!("{:x}", Sha256::digest(text.as_bytes())))
+            .collect();
+        *self.accepted_input.lock().await = Some((turn_id.to_string(), hashes));
+    }
     #[cfg(test)]
     pub(crate) async fn active_requirement_count(&self) -> usize {
         self.current.lock().await.lineage.requirements.values().filter(|requirement| {
@@ -511,7 +608,23 @@ impl PlanStore {
 
     pub(crate) async fn execution_snapshot(&self) -> Option<PlanExecutionSnapshot> {
         let current = self.current.lock().await;
-        Some(PlanExecutionSnapshot::new(current.plan.as_ref()?, &current.lineage))
+        current.derived.execution.get_or_init(|| {
+            let plan = current.plan.as_ref()?;
+            Some(PlanExecutionSnapshot {
+                revision: current.revision().to_string(),
+                obligations: current.lineage.obligation_summary(plan),
+                has_steps: !plan.plan.is_empty(),
+            })
+        }).clone()
+    }
+
+    pub(crate) async fn task_state(&self, suspended: bool) -> crate::context::world_state::TaskState {
+        let current = self.current.lock().await;
+        current.derived.task[usize::from(suspended)].get_or_init(|| {
+            crate::context::world_state::TaskState::from_plan(
+                current.plan.as_ref().map(|plan| (plan, &current.lineage, current.revision())),
+            ).with_execution_suspended(suspended)
+        }).clone()
     }
 
     pub(crate) async fn snapshot_with_lineage(&self) -> Option<(UpdatePlanArgs, PlanLineage)> {
@@ -546,7 +659,7 @@ impl PlanStore {
         *current = restored
             .map(|response| {
                 let lineage = response.lineage.reconcile_restored(Some(&response.current_plan));
-                PlanState { plan: Some(response.current_plan), lineage, durably_published: false }
+                PlanState { plan: Some(response.current_plan), lineage, durably_published: false, derived: Default::default() }
             })
             .unwrap_or_default();
         found
@@ -567,6 +680,7 @@ impl PlanStore {
             lineage: lineage.unwrap_or_default().reconcile_restored(plan.as_ref()),
             plan,
             durably_published: false,
+            derived: Default::default(),
         };
     }
 
@@ -574,6 +688,7 @@ impl PlanStore {
     pub(crate) async fn update(&self, next: UpdatePlanArgs) -> PlanStoreUpdate {
         let mut current = self.current.lock().await;
         current.lineage = PlanLineage::from_plan(Some(&next));
+        current.derived = Default::default();
         Self::commit(&mut current, next)
     }
 
@@ -587,30 +702,51 @@ impl PlanStore {
         let PlanToolArgs {
             explanation,
             expected_revision,
+            sampling_revision,
             plan,
             set: statuses,
+            expected_step_revisions,
+            resolve,
+            scope_change_instructions,
             superseded,
             workflow,
             resolved_workflow,
         } = args;
+        let accepted_input = if scope_change_instructions.is_empty() { None }
+            else { self.accepted_input.lock().await.clone() };
         let guard = self.current.lock().await;
-        let mut current = guard.clone();
-        let mut lineage = current.lineage.clone();
-        let revision = plan_revision_with_lineage(current.plan.as_ref(), &current.lineage);
-        let missing_revision = plan.is_some() && current.plan.is_some() && expected_revision.is_none();
+        let revision = guard.revision().to_string();
+        let unchanged_since_sampling = sampling_revision.as_ref()
+            .is_some_and(|sampled| std::sync::Arc::ptr_eq(&sampled.0, &guard.derived));
+        let missing_revision = plan.is_some() && guard.plan.is_some()
+            && expected_revision.is_none() && !unchanged_since_sampling;
         if missing_revision || expected_revision.as_deref().is_some_and(|expected| expected != revision) {
             let reconciliation = serde_json::json!({
                 "revision": revision,
-                "current_plan": current.plan,
-                "step_ids": current.plan.iter().flat_map(|plan| &plan.plan)
-                    .map(|step| lineage.step_id(&step.step)).collect::<Vec<_>>(),
-                "lineage": current.plan.as_ref().map(|plan| lineage.active_for_plan(plan)),
-                "obligations": current.plan.as_ref().map(|plan| lineage.obligation_summary(plan)),
+                "current_plan": guard.plan,
+                "step_ids": guard.plan.iter().flat_map(|plan| &plan.plan)
+                    .map(|step| guard.lineage.step_id(&step.step)).collect::<Vec<_>>(),
+                "lineage": guard.plan.as_ref().map(|plan| guard.lineage.active_for_plan(plan)),
+                "obligations": guard.plan.as_ref().map(|plan| guard.lineage.obligation_summary(plan)),
                 "completion_authority": checklist_completion_authority(),
             });
-            let reason = if missing_revision { "plan replacements require expected_revision" } else { "stale plan revision" };
+            let reason = if missing_revision { "plan replacements require expected_revision when the plan changed since sampling or no sampling fence is available" } else { "stale plan revision" };
             return Err(format!("{reason}; no changes were made. Reconcile against: {reconciliation}"));
         }
+        let status_next = if let Some(statuses) = statuses {
+            Some(Self::status_plan(&guard.plan, &guard.lineage, statuses, explanation.clone(),
+                expected_revision.is_some(), expected_step_revisions.as_ref(), &revision)?)
+        } else { None };
+        if plan.is_none() && superseded.is_empty() && resolve.is_empty()
+            && scope_change_instructions.is_empty() && workflow.is_none()
+            && status_next.as_ref().is_some_and(|next| guard.plan.as_ref() == Some(next))
+        {
+            let update = PlanStoreUpdate { current: status_next.expect("status update"),
+                effect: PlanUpdateEffect::NoOp, lineage: guard.lineage.clone() };
+            return Ok(StagedPlanUpdate { current: guard, next: None, update });
+        }
+        let mut current = guard.clone();
+        let mut lineage = current.lineage.clone();
         let next = if let Some(plan) = plan {
             let mut steps = HashSet::new();
             if plan.iter().any(|item| item.step.trim().is_empty()) {
@@ -634,15 +770,8 @@ impl PlanStore {
             }
         } else if !superseded.is_empty() {
             return Err("superseded applies only to a plan revision; no changes were made".into());
-        } else if let Some(statuses) = statuses {
-            Self::status_plan(
-                &current.plan,
-                &lineage,
-                statuses,
-                explanation,
-                expected_revision.is_some(),
-                &revision,
-            )?
+        } else if let Some(next) = status_next {
+            next
         } else {
             let mut next = current.plan.clone().unwrap_or(UpdatePlanArgs {
                 explanation: None,
@@ -653,6 +782,48 @@ impl PlanStore {
             }
             next
         };
+        for (step_id, instruction) in scope_change_instructions {
+            if !superseded.iter().any(|entry| entry.step_id == step_id) {
+                return Err("scope_change_instructions must name a superseded entry; no changes were made".into());
+            }
+            let sha256 = format!("{:x}", Sha256::digest(instruction.as_bytes()));
+            let Some((turn_id, _)) = accepted_input.as_ref().filter(|(_, hashes)| hashes.contains(&sha256)) else {
+                return Err("scope change must cite exact, accepted user text; tool/context text and invented instructions are not authorization. No changes were made".into());
+            };
+            let ids = current.lineage.step_requirements.get(&step_id).cloned().unwrap_or_else(|| vec![step_id]);
+            for id in ids {
+                if !lineage.step_requirements.values().any(|mapped| mapped.contains(&id)) {
+                    lineage.accepted_supersessions.insert(id, PlanInputReference { turn_id: turn_id.clone(), sha256: sha256.clone() });
+                }
+            }
+        }
+        for id in resolve {
+            if !lineage.requirements.contains_key(&id) {
+                return Err(format!("resolve names unknown requirement {id}; no changes were made"));
+            }
+            if next.plan.iter().any(|step| step.status != StepStatus::Completed
+                && lineage.step_requirements.get(&lineage.step_id(&step.step)).is_some_and(|ids| ids.contains(&id)))
+            {
+                return Err(format!("complete the descendant checklist before resolving {id}; no changes were made"));
+            }
+            lineage.resolved_requirements.insert(id.clone());
+            let requirement = lineage.requirements.get_mut(&id).expect("known requirement");
+            requirement.status = StepStatus::Completed;
+            requirement.superseded_reason = None;
+            lineage.accepted_supersessions.remove(&id);
+        }
+        if let Some(previous) = &current.plan {
+            let previous_steps = previous.plan.iter().map(|step| (current.lineage.step_id(&step.step), step)).collect::<HashMap<_, _>>();
+            for step in &next.plan {
+                let id = lineage.step_id(&step.step);
+                if previous_steps.get(&id).is_some_and(|old| *old != step
+                    || current.lineage.step_requirements.get(&id) != lineage.step_requirements.get(&id))
+                {
+                    let version = current.lineage.step_revisions.get(&id).copied().unwrap_or_default();
+                    lineage.step_revisions.insert(id, version.checked_add(1).ok_or("plan step revision exhausted")?);
+                }
+            }
+        }
         if let Some(workflow) = workflow {
             let resolved = resolved_workflow.ok_or(
                 "workflow links must be resolved by the task coordinator; no changes were made"
@@ -668,12 +839,13 @@ impl PlanStore {
             lineage.workflow = resolved;
         }
         let lineage_changed = current.lineage != lineage;
+        if lineage_changed { current.derived = Default::default(); }
         current.lineage = lineage;
         let mut update = Self::commit(&mut current, next);
         if lineage_changed && update.effect == PlanUpdateEffect::NoOp {
             update.effect = PlanUpdateEffect::StructuralRevision;
         }
-        Ok(StagedPlanUpdate { current: guard, next: current, update })
+        Ok(StagedPlanUpdate { current: guard, next: Some(current), update })
     }
 
     fn status_plan(
@@ -682,6 +854,7 @@ impl PlanStore {
         updates: Vec<PlanStatusUpdate>,
         explanation: Option<String>,
         revision_checked: bool,
+        expected_step_revisions: Option<&BTreeMap<String, u64>>,
         revision: &str,
     ) -> Result<UpdatePlanArgs, String> {
         let mut next = current
@@ -728,6 +901,14 @@ impl PlanStore {
                 .plan
                 .get_mut(index)
                 .ok_or_else(|| format!("plan index {index} is out of range"))?;
+            let id = lineage.step_id(&item.step);
+            let version = lineage.step_revisions.get(&id).copied().unwrap_or_default();
+            let expected = expected_step_revisions.and_then(|versions| versions.get(&id));
+            if expected.is_some_and(|expected| *expected != version)
+                || (!revision_checked && version != 0 && expected.is_none() && item.status != update.status)
+            {
+                return Err(format!("stale or missing step revision for {id}; current step revision is {version}. Supply expected_step_revisions or expected_revision. No changes were made"));
+            }
             item.status = update.status;
         }
         if next
@@ -752,9 +933,10 @@ impl PlanStore {
             Some(previous) if same_structure(previous, &next) => PlanUpdateEffect::StatusOnly,
             Some(_) => PlanUpdateEffect::StructuralRevision,
         };
-        current.lineage.update_statuses(&next);
+        if effect != PlanUpdateEffect::NoOp { current.lineage.update_statuses(&next); }
         if effect != PlanUpdateEffect::NoOp {
             current.durably_published = false;
+            current.derived = Default::default();
         }
         current.plan = Some(next.clone());
         PlanStoreUpdate {
@@ -901,6 +1083,162 @@ mod tests {
     use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::plan_tool::StepStatus;
 
+    async fn json_update(store: &PlanStore, mut args: serde_json::Value) -> PlanStoreUpdate {
+        if let Some(snapshot) = store.execution_snapshot().await {
+            args["expected_revision"] = snapshot.revision.into();
+        }
+        store.stage_tool(serde_json::from_value(args).unwrap()).await.unwrap().commit_published()
+    }
+
+    #[tokio::test]
+    async fn continuity_plan_cache_tracks_commit_noop_abort_and_lineage_only_changes() {
+        use crate::context::ContextualUserFragment;
+        let store = PlanStore::default();
+        let initial = json_update(&store, serde_json::json!({"plan":[{"step":"work","status":"pending"}]})).await;
+        let id = initial.lineage.step_id("work");
+        let first = store.task_state(false).await.body().into_owned();
+        let cached = store.current.lock().await.derived.clone();
+        json_update(&store, serde_json::json!({"set":[{"step_id":id,"status":"pending"}]})).await;
+        assert!(std::sync::Arc::ptr_eq(&cached, &store.current.lock().await.derived));
+        let aborted = store.stage_tool(serde_json::from_value(serde_json::json!({
+            "set":[{"step_id":id,"status":"completed"}]
+        })).unwrap()).await.unwrap();
+        drop(aborted);
+        assert_eq!(store.task_state(false).await.body(), first);
+        json_update(&store, serde_json::json!({"set":[{"step_id":id,"status":"completed"}]})).await;
+        assert_ne!(store.task_state(false).await.body(), first);
+        let revision = store.execution_snapshot().await.unwrap().revision;
+        json_update(&store, serde_json::json!({"set":[{"step_id":id,"status":"completed"}],"resolve":[id]})).await;
+        let next = store.execution_snapshot().await.unwrap().revision;
+        assert_ne!(next, revision);
+        let rendered = store.task_state(false).await.body().into_owned();
+        assert!(rendered.contains(&next));
+        assert!(!std::sync::Arc::ptr_eq(&cached, &store.current.lock().await.derived));
+    }
+
+    #[tokio::test]
+    async fn introduced_scope_survives_reverting_a_continuation() {
+        let store = PlanStore::default();
+        let original = json_update(&store, serde_json::json!({"plan":[{"step":"Inspect A","status":"pending"}]})).await;
+        let id = original.lineage.step_id("Inspect A");
+        let expanded = json_update(&store, serde_json::json!({"plan":[{"step":"Inspect A and B","status":"pending","continues":[id]}]})).await;
+        assert_eq!(expanded.lineage.requirements.len(), 2);
+        let reverted = json_update(&store, serde_json::json!({"plan":[{"step":"Inspect A","status":"completed","continues":[id]}]})).await;
+        let outstanding = reverted.lineage.obligation_summary(&reverted.current).unresolved;
+        assert_eq!(outstanding, vec![plan_step_id("Inspect A and B")]);
+        assert_eq!(reverted.lineage.requirements[&outstanding[0]].text, "Inspect A and B");
+        store.restore_with_lineage(Some(reverted.current.clone()), Some(reverted.lineage.clone())).await;
+        assert_eq!(store.snapshot_with_lineage().await.unwrap(), (reverted.current, reverted.lineage));
+    }
+
+    #[tokio::test]
+    async fn explicit_original_resolution_survives_restore_and_reopening_invalidates_it() {
+        let store = PlanStore::default();
+        let original = json_update(&store, serde_json::json!({"plan":[{"step":"Verify the parser","status":"pending"}]})).await;
+        let id = original.lineage.step_id("Verify the parser");
+        let done = json_update(&store, serde_json::json!({
+            "plan":[{"step":"Verify parser","status":"completed","continues":[id]}], "resolve":[id]
+        })).await;
+        assert!(done.lineage.obligation_summary(&done.current).unresolved.is_empty());
+        assert_eq!(done.lineage.requirements[&id].text, "Verify the parser");
+        store.restore_with_lineage(Some(done.current.clone()), Some(done.lineage.compact_for_plan(&done.current))).await;
+        assert_eq!(store.snapshot_with_lineage().await.unwrap(), (done.current, done.lineage));
+        let reopened = json_update(&store, serde_json::json!({"set":[{"step_id":id,"status":"pending"}]})).await;
+        assert!(!reopened.lineage.resolved_requirements.contains(&id));
+        assert_eq!(reopened.lineage.obligation_summary(&reopened.current).unresolved.len(), 2);
+        let before = store.execution_snapshot().await;
+        let error = store.update_tool(serde_json::from_value(serde_json::json!({
+            "set":[{"step_id":id,"status":"pending"}], "resolve":[id]
+        })).unwrap()).await.unwrap_err();
+        assert!(error.contains("descendant"));
+        assert_eq!(store.execution_snapshot().await, before);
+    }
+
+    #[tokio::test]
+    async fn reattached_retirement_proposal_is_restore_idempotent() {
+        let store = PlanStore::default();
+        let original = json_update(&store, serde_json::json!({"plan":[{"step":"Deploy","status":"pending"}]})).await;
+        let id = original.lineage.step_id("Deploy");
+        json_update(&store, serde_json::json!({"plan":[],"superseded":[{"step_id":id,"reason":"unverified cancellation"}]})).await;
+        let attached = json_update(&store, serde_json::json!({"plan":[{"step":"Deploy","status":"pending","continues":[id]}]})).await;
+        let before = store.execution_snapshot().await;
+        assert_eq!(before.as_ref().unwrap().obligations.unresolved.len(), 1);
+        for _ in 0..3 {
+            let (plan, lineage) = store.snapshot_with_lineage().await.unwrap();
+            store.restore_with_lineage(Some(plan.clone()), Some(lineage.compact_for_plan(&plan))).await;
+            assert_eq!(store.execution_snapshot().await, before);
+            assert_eq!(store.snapshot_with_lineage().await.unwrap(), (attached.current.clone(), attached.lineage.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_retirement_requires_real_accepted_input_and_preserves_provenance() {
+        let store = PlanStore::default();
+        let original = json_update(&store, serde_json::json!({"plan":[{"step":"Deploy","status":"pending"}]})).await;
+        let id = original.lineage.step_id("Deploy");
+        let args = serde_json::json!({"plan":[],"expected_revision":store.execution_snapshot().await.unwrap().revision,
+            "superseded":[{"step_id":id,"reason":"User cancelled deployment"}],
+            "scope_change_instructions":{id.clone():"Do not deploy; review only."}});
+        let before = store.execution_snapshot().await;
+        assert!(store.update_tool(serde_json::from_value(args.clone()).unwrap()).await.is_err());
+        assert_eq!(store.execution_snapshot().await, before);
+        store.record_accepted_input("user-turn", ["Do not deploy; review only."].into_iter()).await;
+        let update = store.update_tool(serde_json::from_value(args).unwrap()).await.unwrap();
+        assert_eq!(update.lineage.obligation_summary(&update.current).superseded, 1);
+        assert!(update.lineage.obligation_summary(&update.current).unresolved.is_empty());
+        assert_eq!(update.lineage.accepted_supersessions[&id].turn_id, "user-turn");
+        assert!(!update.lineage.active_for_plan(&update.current).requirements.contains_key(&id));
+        store.restore_with_lineage(Some(update.current.clone()), Some(update.lineage.clone())).await;
+        assert_eq!(store.snapshot_with_lineage().await.unwrap(), (update.current, update.lineage));
+    }
+
+    #[tokio::test]
+    async fn step_cas_rejects_aba_but_allows_independent_peer_deltas() {
+        let store = PlanStore::default();
+        let initial = json_update(&store, serde_json::json!({"plan":[
+            {"step":"A","status":"pending"},{"step":"B","status":"pending"}
+        ]})).await;
+        let a = initial.lineage.step_id("A");
+        let b = initial.lineage.step_id("B");
+        for id in [&a, &b] {
+            store.update_tool(serde_json::from_value(serde_json::json!({
+                "set":[{"step_id":id,"status":"completed"}], "expected_step_revisions":{id:0}
+            })).unwrap()).await.unwrap();
+        }
+        json_update(&store, serde_json::json!({"set":[{"step_id":a,"status":"pending"}]})).await;
+        let before = store.execution_snapshot().await;
+        for versions in [None, Some(serde_json::json!({a.clone():0}))] {
+            let mut args = serde_json::json!({"set":[{"step_id":a,"status":"completed"}]});
+            if let Some(versions) = versions { args["expected_step_revisions"] = versions; }
+            assert!(store.update_tool(serde_json::from_value(args).unwrap()).await.unwrap_err().contains("step revision"));
+            assert_eq!(store.execution_snapshot().await, before);
+        }
+        let current = store.snapshot_with_lineage().await.unwrap();
+        store.restore_with_lineage(Some(current.0), Some(current.1.clone())).await;
+        let good = serde_json::json!({"set":[{"step_id":a,"status":"completed"}],
+            "expected_step_revisions":{a.clone():current.1.step_revisions[&a]}});
+        assert!(store.update_tool(serde_json::from_value(good).unwrap()).await.unwrap()
+            .lineage.obligation_summary(store.snapshot().await.as_ref().unwrap()).unresolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn noop_skips_state_rebuild_but_restored_state_still_needs_publication() {
+        let store = PlanStore::default();
+        json_update(&store, serde_json::json!({"plan":[{"step":"A","status":"pending"}]})).await;
+        let args = || serde_json::from_value(serde_json::json!({"set":[{"step_id":plan_step_id("A"),"status":"pending"}]})).unwrap();
+        let before = store.snapshot_with_lineage().await.unwrap();
+        let staged = store.stage_tool(args()).await.unwrap();
+        assert!(staged.next.is_none());
+        assert!(!staged.needs_publication());
+        staged.commit();
+        store.restore_with_lineage(Some(before.0.clone()), Some(before.1.clone())).await;
+        let staged = store.stage_tool(args()).await.unwrap();
+        assert!(staged.next.is_none());
+        assert!(staged.needs_publication());
+        staged.commit_published();
+        assert_eq!(store.snapshot_with_lineage().await.unwrap(), before);
+    }
+
     fn plan(step: &str, status: StepStatus) -> UpdatePlanArgs {
         UpdatePlanArgs {
             explanation: None,
@@ -915,6 +1253,34 @@ mod tests {
         let expected_revision = store.execution_snapshot().await.map(|snapshot| snapshot.revision);
         store.update_tool(PlanToolArgs { plan: Some(plan), expected_revision, ..Default::default() })
             .await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn sampling_fence_rejects_concurrent_replacements_and_restore() {
+        let store = PlanStore::default();
+        let original = plan("work", StepStatus::Pending);
+        store.update(original.clone()).await;
+        let sampled = store.sampling_revision().await;
+        let args = |status| PlanToolArgs {
+            sampling_revision: Some(sampled.clone()),
+            plan: Some(vec![PlanStepArg { step: "work".into(), status, continues: vec![] }]),
+            ..Default::default()
+        };
+        // Dropping a staged write (for example failed persistence) changes no fence.
+        drop(store.stage_tool(args(StepStatus::InProgress)).await.unwrap());
+        let (left, right) = tokio::join!(
+            store.update_tool(args(StepStatus::InProgress)),
+            store.update_tool(args(StepStatus::Completed)),
+        );
+        assert_ne!(left.is_ok(), right.is_ok(), "only one sampled replacement commits");
+        store.restore(Some(original)).await;
+        assert!(store.update_tool(args(StepStatus::Completed)).await.is_err(), "restoring identical content cannot revive an old fence");
+        let mut fresh = args(StepStatus::Completed);
+        fresh.sampling_revision = Some(store.sampling_revision().await);
+        store.update_tool(fresh).await.unwrap();
+        assert!(serde_json::from_value::<PlanToolArgs>(serde_json::json!({
+            "plan": [], "sampling_revision": "forged"
+        })).is_err(), "sampling fences cannot be supplied by the model");
     }
 
     #[tokio::test]
@@ -981,10 +1347,15 @@ mod tests {
             step: "finished work".into(), status: StepStatus::InProgress, continues: vec![id.clone()],
         }]).await;
         let second = two_calls.update_tool(PlanToolArgs {
+            expected_revision: Some(two_calls.execution_snapshot().await.unwrap().revision),
             set: Some(vec![PlanStatusUpdate { index: None, step_id: Some(id.clone()), status: StepStatus::Completed }]),
             ..Default::default()
         }).await.unwrap();
-        assert_eq!(second.lineage, update.lineage, "a second call adds no authority");
+        assert_eq!(second.lineage.step_revisions[&id], 2);
+        assert_eq!(update.lineage.step_revisions[&id], 1);
+        let mut second_lineage = second.lineage;
+        second_lineage.step_revisions = update.lineage.step_revisions.clone();
+        assert_eq!(second_lineage, update.lineage, "a second call adds no authority");
         let restored = update.lineage.compact_for_plan(&update.current).reconcile_restored(Some(&update.current));
         assert_eq!(restored.requirements[&id].status, StepStatus::InProgress);
         assert!(restored.active_for_plan(&update.current).requirements.contains_key(&id));
@@ -1045,7 +1416,7 @@ mod tests {
         lineage.step_identities.insert(plan_step_id("one"), "12345678aaaa".into());
         lineage.step_identities.insert(plan_step_id("two"), "12345678bbbb".into());
         let error = PlanStore::status_plan(&Some(current), &lineage,
-            update(vec!["12345678".into()]).set.unwrap(), None, false, "revision").unwrap_err();
+            update(vec!["12345678".into()]).set.unwrap(), None, false, None, "revision").unwrap_err();
         assert!(error.contains("12345678aaaa: \"one\""));
         assert!(error.contains("12345678bbbb: \"two\""));
     }
@@ -1298,6 +1669,7 @@ mod tests {
         let lineage = serde_json::from_value(serde_json::to_value(&revised.lineage).unwrap()).unwrap();
         resumed.restore_with_lineage(Some(revised.current), Some(lineage)).await;
         let completed = resumed.update_tool(PlanToolArgs {
+            expected_revision: Some(resumed.execution_snapshot().await.unwrap().revision),
             set: Some(vec![PlanStatusUpdate {
                 index: None,
                 step_id: Some(review_id.clone()),
@@ -1473,3 +1845,6 @@ mod tests {
         }
     }
 }
+#[cfg(test)]
+#[path = "obligation_plan_tests.rs"]
+mod obligation_regressions;

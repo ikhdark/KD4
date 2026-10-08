@@ -51,11 +51,9 @@ impl Session {
 
         let previous_world_state = self.state.lock().await.history.world_state_baseline();
         let mut world_state = WorldState::default();
-        world_state.add_section(crate::context::world_state::TaskState::new(
-            self.services.plan_store.snapshot_with_lineage().await,
-        ).with_execution_suspended(
+        world_state.add_section(self.services.plan_store.task_state(
             turn_context.collaboration_mode.mode == codex_protocol::config_types::ModeKind::Plan,
-        ));
+        ).await);
         if turn_context.config.features.enabled(codex_features::Feature::TokenBudget) {
             let ids = self.state.lock().await.auto_compact_window_ids();
             world_state.add_section(crate::context::TokenBudgetContext::new(
@@ -74,7 +72,8 @@ impl Session {
             step_context.loaded_agents_md.as_deref(),
             step_context.agents_md_stable_context.as_ref(),
             step_context.agents_md_freshness,
-        ));
+        ).with_unavailable_fallback(|| previous_world_state.as_ref()
+            .and_then(|previous| previous.section("agents_md")).cloned()));
         if turn_context.config.include_environment_context {
             world_state.add_section(
                 EnvironmentsState::from_turn_context_with_environments(

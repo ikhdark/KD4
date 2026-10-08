@@ -64,7 +64,7 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-pub(crate) const TIMING_SCHEMA_VERSION: u16 = 29;
+pub(crate) const TIMING_SCHEMA_VERSION: u16 = 30;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -552,6 +552,10 @@ impl TurnTimingSnapshot {
                         categories
                     });
                 TurnTimingModelRequest {
+                    setup_phase_ns: request.setup_phases.as_ref().map_or_else(
+                        BTreeMap::new,
+                        |phases| phases.protocol_phases(&mut saturation_count),
+                    ),
                     request_sha256_by_attempt: request.request_sha256_by_attempt.clone(),
                     request_section_sha256_by_attempt: request.request_section_sha256_by_attempt.clone(),
                     response_id_by_attempt: request.response_id_by_attempt.clone(),
@@ -848,6 +852,7 @@ pub(crate) struct TurnTimingProfile {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ModelRequestTiming {
+    setup_phases: Option<ClientCriticalPhaseTiming>,
     request_sha256_by_attempt: BTreeMap<String, String>,
     request_section_sha256_by_attempt: BTreeMap<String, BTreeMap<String, String>>,
     response_id_by_attempt: BTreeMap<String, String>,
@@ -917,12 +922,38 @@ pub(crate) struct PreFirstModelOutputTiming {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ClientCriticalPhaseTiming {
+    preparation_ns: u128,
+    router_build_ns: u128,
+    executor_readiness_wait_ns: u128,
+    startup_prewarm_wait_ns: u128,
+    persistence_ns: u128,
     history_snapshot_ns: u128,
     normalization_ns: u128,
     prompt_construction_ns: u128,
     request_transformation_ns: u128,
     serialization_ns: u128,
     transport_readiness_ns: u128,
+}
+
+impl ClientCriticalPhaseTiming {
+    fn protocol_phases(&self, saturation_count: &mut u32) -> BTreeMap<String, u64> {
+        [
+            ("preparation", self.preparation_ns),
+            ("router_build", self.router_build_ns),
+            ("executor_readiness_wait", self.executor_readiness_wait_ns),
+            ("startup_prewarm_wait", self.startup_prewarm_wait_ns),
+            ("persistence", self.persistence_ns),
+            ("history_snapshot", self.history_snapshot_ns),
+            ("normalization", self.normalization_ns),
+            ("prompt_construction", self.prompt_construction_ns),
+            ("request_transformation", self.request_transformation_ns),
+            ("serialization", self.serialization_ns),
+            ("transport_readiness", self.transport_readiness_ns),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), public_ns(value, saturation_count)))
+        .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1105,6 +1136,7 @@ struct TurnTimingStateInner {
     completed_snapshot: Option<TurnTimingSnapshot>,
     attributed_client_union_ns: u128,
     client_critical_phases: ClientCriticalPhaseTiming,
+    pending_request_setup: Option<ClientCriticalPhaseTiming>,
     dispatch_ready_snapshot: Option<(u128, u128, ClientCriticalPhaseTiming)>,
     ready_to_sample_ns: Option<u128>,
     pre_first_model_output: Option<PreFirstModelOutputTiming>,
@@ -3312,6 +3344,10 @@ impl TurnTimingState {
     pub(crate) fn begin_model_request_wait(self: &Arc<Self>) -> TurnTimingGuard {
         {
             let mut state = self.state();
+            state.advance(self.clock.sample().time.monotonic_ns);
+            // Ordinary requests start collecting at history preparation. Retry
+            // and compaction attempts may enter directly at this boundary.
+            state.pending_request_setup.get_or_insert_with(Default::default);
             if state.current_generation_index.is_none() {
                 state.start_generation(
                     TurnTimingGenerationReason::Other,
@@ -3387,12 +3423,20 @@ impl TurnTimingState {
             "request preparation must be consumed before the next generation"
         );
         if preparation.is_none() {
+            {
+                let mut state = self.state();
+                state.advance(self.clock.sample().time.monotonic_ns);
+                state.pending_request_setup = Some(ClientCriticalPhaseTiming::default());
+            }
             *preparation = Some(self.begin_local_phase(TurnLocalPhase::Preparation));
         }
     }
 
     pub(crate) fn finish_request_preparation(&self, preparation: &mut Option<TurnTimingGuard>) {
         drop(preparation.take());
+        // Dispatch consumes this snapshot; a pre-dispatch failure must discard
+        // it rather than leak its setup time into a later generation.
+        self.state().pending_request_setup = None;
     }
 
     pub(crate) fn begin_startup_prewarm_wait_outside_preparation<'a>(
@@ -3607,10 +3651,12 @@ impl TurnTimingState {
                 }
             }
         }
+        let setup_phases = state.pending_request_setup.take();
         if let Some(elapsed_ns) = elapsed_ns
             && let Some(request) = state.model_requests.last_mut()
             && request.dispatch_ns.is_none()
         {
+            request.setup_phases = setup_phases;
             request.dispatch_ns = Some(elapsed_ns);
             let attempt_kind = request.attempt_kind;
             match attempt_kind {
@@ -3872,6 +3918,7 @@ impl TurnTimingStateInner {
             GuardKind::LegacySampling => self.legacy.end(now_ns, LegacyPhase::Sampling),
             GuardKind::LegacyToolBlocking => self.legacy.end(now_ns, LegacyPhase::ToolBlocking),
             GuardKind::ModelRequestWait => {
+                self.pending_request_setup = None;
                 decrement(&mut self.activity.model_request_wait)
                     && decrement(&mut self.activity.model)
             }
@@ -4065,31 +4112,48 @@ impl TurnTimingStateInner {
     }
 
     fn add_client_critical_phase_unions(&mut self, elapsed_ns: u128) {
-        if self.dispatch_ready_snapshot.is_some() {
-            return;
-        }
         let active = self.activity;
-        let phases = &mut self.client_critical_phases;
         let saturation_count = &mut self.counters.saturation_count;
-        for (is_active, target) in [
-            (active.history_snapshot > 0, &mut phases.history_snapshot_ns),
-            (active.normalization > 0, &mut phases.normalization_ns),
-            (
-                active.prompt_construction > 0,
-                &mut phases.prompt_construction_ns,
-            ),
-            (
-                active.request_transformation > 0,
-                &mut phases.request_transformation_ns,
-            ),
-            (active.serialization > 0, &mut phases.serialization_ns),
-            (
-                active.transport_readiness > 0,
-                &mut phases.transport_readiness_ns,
-            ),
-        ] {
-            if is_active {
-                add_saturating(target, elapsed_ns, saturation_count);
+        for phases in [
+            self.dispatch_ready_snapshot
+                .is_none()
+                .then_some(&mut self.client_critical_phases),
+            self.pending_request_setup.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (is_active, target) in [
+                (active.preparation > 0, &mut phases.preparation_ns),
+                (active.router_build > 0, &mut phases.router_build_ns),
+                (
+                    active.executor_readiness_wait > 0,
+                    &mut phases.executor_readiness_wait_ns,
+                ),
+                (
+                    active.startup_prewarm_wait > 0,
+                    &mut phases.startup_prewarm_wait_ns,
+                ),
+                (active.persistence > 0, &mut phases.persistence_ns),
+                (active.history_snapshot > 0, &mut phases.history_snapshot_ns),
+                (active.normalization > 0, &mut phases.normalization_ns),
+                (
+                    active.prompt_construction > 0,
+                    &mut phases.prompt_construction_ns,
+                ),
+                (
+                    active.request_transformation > 0,
+                    &mut phases.request_transformation_ns,
+                ),
+                (active.serialization > 0, &mut phases.serialization_ns),
+                (
+                    active.transport_readiness > 0,
+                    &mut phases.transport_readiness_ns,
+                ),
+            ] {
+                if is_active {
+                    add_saturating(target, elapsed_ns, saturation_count);
+                }
             }
         }
     }

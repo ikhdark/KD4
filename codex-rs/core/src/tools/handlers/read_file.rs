@@ -102,7 +102,7 @@ impl ToolExecutor<ToolInvocation> for ReadStatusHandler {
                 .map_err(|error| FunctionCallError::RespondToModel(error.to_string())))
                 .collect::<Result<Vec<_>, _>>()?;
             let history = invocation.session.clone_history().await;
-            let result = history.tool_history_state().read_status_page(&paths, Some(&environment.environment_id), history.raw_items(), &args.query);
+            let result = history.read_status_page(&paths, Some(&environment.environment_id), &args.query);
             Ok(boxed_tool_output(JsonToolOutput::new(result)))
         })
     }
@@ -255,7 +255,7 @@ pub(crate) fn reselect_read_file_output(
     let typed = serde_json::from_value::<ReadToolOutputResult>(typed).ok()?;
     output["file_complete"] = json!(file_selection_complete(&typed));
     let fields = output.as_object_mut()?;
-    for key in ["continuation", "page_selectors", "recovery", "criterion_evidence", "inspection_proof_error", "selector_errors"] {
+    for key in ["continuation", "page_selectors", "recovery", "criterion_evidence", "inspection_proof_error", "selector_errors", "selector_bindings"] {
         fields.remove(key);
     }
     Some(output)
@@ -328,6 +328,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             required.push(json!("source_sha256"));
         }
         output["properties"]["file_complete"] = json!({"type": "boolean", "description": "The returned exact bytes and hydrated ranges together cover the entire file in this response, including explicit selections. Retention, match coordinates, and recovery selectors alone do not establish coverage."});
+        output["properties"]["selector_bindings"] = json!({"type":"array", "maxItems":64,
+            "description":"Successful symbol/enclosing requests bound by their original zero-based selector index to exact snapshot ranges, before result sorting/merging. Resolution is not delivery: check results and completeness separately. Bound to source_sha256; no source is duplicated.",
+            "items":{"type":"object", "properties":{
+                "selector_index":{"type":"integer","minimum":0},
+                "resolved_selectors":{"type":"array","minItems":1,"maxItems":1,"items":file_selector_schema()}},
+                "required":["selector_index","resolved_selectors"],"additionalProperties":false}});
         output["properties"]["selector_errors"] = json!({"type":"array", "maxItems":64,
             "description":"Per-selector structural failures; successful results share this snapshot. Candidate line selectors are exact, not guesses.",
             "items":{"type":"object", "properties":{
@@ -398,7 +404,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     ..JsonSchema::object(BTreeMap::new(), None, None)
                 }).collect()),
                 ..JsonSchema::object(BTreeMap::from([
-                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for enabled skill metadata, or `context:desktop` for Desktop guidance. Omit environment_id for host-owned locators.".to_string()))),
+                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for enabled skill metadata, `context:desktop` for Desktop guidance, or the `context:unsettled-tools/<offset>` recovery_path from a resume notice. Omit environment_id for host-owned locators.".to_string()))),
                 ("file_path".to_string(), JsonSchema::string(Some("Legacy alias for path; use only one.".to_string()))),
                 ("offset".to_string(), JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string()))),
                 ("limit".to_string(), JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string()))),
@@ -457,6 +463,16 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 return Err(FunctionCallError::RespondToModel(
                     "context:turn-diff is not available; tracked deltas are not a reliable review source yet.".to_string(),
                 ));
+            } else if let Some(offset) = args.path.strip_prefix("context:unsettled-tools/") {
+                if args.environment_id.is_some() {
+                    return Err(FunctionCallError::RespondToModel(
+                        "omit environment_id for host-owned recovery history".into()));
+                }
+                let offset = offset.parse::<usize>().map_err(|_| FunctionCallError::RespondToModel(
+                    "invalid unsettled recovery offset".into()))?;
+                let contents = invocation.session.read_unsettled_tool_recovery(offset, &turn.sub_id)
+                    .await.map_err(FunctionCallError::RespondToModel)?;
+                (contents, args.path.clone(), None, "host-context".to_string(), args.path.clone())
             } else if args.path
                 == crate::context::desktop_instructions::LOCATOR
             {
@@ -509,7 +525,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             let token_ceiling = output_budget.max(2_000).saturating_sub(1_000)
                 .min(RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000));
             let structure_path = args.path.clone();
-            let (canonical, mut result, mut continuation, page_selectors, total_lines, selector_errors) =
+            let (canonical, mut result, mut continuation, page_selectors, total_lines, selector_errors, selector_bindings) =
                 tokio::task::spawn_blocking(move || {
                     let total_lines = contents.lines().count();
                     let exact = args.selectors.iter().flatten().filter_map(|selector| match selector {
@@ -517,7 +533,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                         FileSelector::Structure(_) => None,
                     }).collect::<Vec<_>>();
                     let mut canonical = file_snapshot(contents, Some(&exact))?;
-                    let (selectors, selector_errors) = structure::resolve_batch(&structure_path, &mut canonical, args.selectors);
+                    let (selectors, selector_errors, selector_bindings) = structure::resolve_batch(&structure_path, &mut canonical, args.selectors);
                     let selection = if script_consumer {
                         select_file_snapshot_for_script(&canonical, selectors)
                     } else {
@@ -533,7 +549,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                                     ),
                                 _ => Vec::new(),
                             };
-                            (canonical, result, continuation, pages, total_lines, selector_errors)
+                            (canonical, result, continuation, pages, total_lines, selector_errors, selector_bindings)
                         })
                 })
                 .await
@@ -632,6 +648,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             output["file_complete"] = json!(file_complete);
             if !selector_errors.is_empty() {
                 output["selector_errors"] = json!(selector_errors);
+            }
+            if !selector_bindings.is_empty() {
+                output["selector_bindings"] = json!(selector_bindings);
             }
             if file_complete && let Some(inspection) = inspection {
                 match inspection.store.record_source_inspection(
@@ -1167,6 +1186,38 @@ mod tests {
             assert_eq!(error["candidates"][0]["qualified_name"], "A::run");
             assert_eq!(error["candidates"][1]["selector"], json!({"kind":"lines","start":3,"end":3}));
             assert_eq!(error["omitted_candidates"], 0);
+            assert_eq!(output["selector_bindings"], json!([{"selector_index":3,
+                "resolved_selectors":[{"kind":"lines","start":2,"end":2}]}]));
+        }
+    }
+
+    #[tokio::test]
+    async fn actionability_symbol_bindings_survive_merging_and_do_not_leak_into_reselection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bindings.rs");
+        std::fs::write(&path, "fn first() {}\nfn second() {}\n").unwrap();
+        let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function"); };
+        let schema = jsonschema::validator_for(&spec.output_schema.unwrap().to_value()).unwrap();
+        for script in [false, true] {
+            let mut call = invocation(&path, json!([
+                {"kind":"symbol","name":"second"}, {"kind":"symbol","name":"first"}
+            ]), false).await;
+            if script {
+                call.source = ToolCallSource::CodeMode {cell_id:"bindings".into(), parent_call_id:None,
+                    runtime_tool_call_id:"bindings".into(), nested_deadline:None, cancellation_cause:None};
+            }
+            let output = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+            schema.validate(&output).unwrap();
+            assert_eq!(output["results"].as_array().unwrap().len(), 1);
+            assert_eq!(output["selector_bindings"], json!([
+                {"selector_index":0,"resolved_selectors":[{"kind":"lines","start":2,"end":2}]},
+                {"selector_index":1,"resolved_selectors":[{"kind":"lines","start":1,"end":1}]}
+            ]));
+            let ToolPayload::Function {arguments} = &call.payload else { panic!("function"); };
+            let requested = json!({"path":path,"selectors":[{"kind":"lines","start":1,"end":1}]}).to_string();
+            let reselected = reselect_read_file_output(arguments, &requested, &output).unwrap();
+            assert!(reselected.get("selector_bindings").is_none());
+            assert_eq!(reselected["source_sha256"], output["source_sha256"]);
         }
     }
 
@@ -1588,6 +1639,38 @@ mod tests {
                 arguments: json!({"path": path, "selectors": selectors}).to_string(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn continuity_unsettled_locator_pages_durable_history_without_reexecution() {
+        let mut call = invocation(Path::new("unused"), serde_json::Value::Null, false).await;
+        let session = Arc::get_mut(&mut call.session).unwrap();
+        let path = crate::session::tests::attach_thread_persistence(session).await;
+        let items = (0..20).map(|index| codex_protocol::protocol::RolloutItem::ResponseItem(
+            codex_protocol::models::ResponseItem::FunctionCall {
+                id: None, call_id: format!("pending-{index:02}"), name: "exec_command".into(),
+                namespace: None, arguments: json!({"cmd":"SECRET_COMMAND"}).to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            })).collect::<Vec<_>>();
+        session.persist_rollout_items_durable(&items).await.unwrap();
+        session.persist_rollout_items_durable(&[
+            codex_protocol::protocol::RolloutItem::TurnContext(call.step_context.turn.to_turn_context_item()),
+            items[0].clone(),
+        ]).await.unwrap();
+        let before = tokio::fs::read(&path).await.unwrap();
+        call.payload = ToolPayload::Function { arguments: json!({"path":"context:unsettled-tools/8"}).to_string() };
+        let output = ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload);
+        let page: serde_json::Value = serde_json::from_str(output["results"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(page["operations"][0]["call_id"], "pending-11");
+        assert_eq!(page["unresolved_count"], 20);
+        assert_eq!(page["recovery_path"], "context:unsettled-tools/16");
+        assert_eq!(page["history_complete"], true);
+        assert!(!output.to_string().contains("SECRET_COMMAND"));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), before);
+        call.payload = ToolPayload::Function { arguments: json!({
+            "path":"context:unsettled-tools/16", "environment_id":"local"
+        }).to_string() };
+        assert!(ReadFileHandler.handle(call).await.is_err());
     }
 
     #[tokio::test]

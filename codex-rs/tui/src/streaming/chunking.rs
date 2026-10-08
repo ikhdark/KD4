@@ -22,7 +22,7 @@
 //! - enter catch-up on higher-pressure thresholds
 //! - exit catch-up on lower-pressure thresholds, held for [`EXIT_HOLD`]
 //! - after exit, suppress immediate re-entry for [`REENTER_CATCH_UP_HOLD`]
-//!   unless backlog is severe
+//!   unless queue age reaches its latency threshold or depth is severe
 //!
 //! This avoids rapid gear-flapping near threshold boundaries.
 //!
@@ -49,7 +49,7 @@
 //! 1. enter/exit thresholds: [`ENTER_QUEUE_DEPTH_LINES`], [`ENTER_OLDEST_AGE`],
 //!    [`EXIT_QUEUE_DEPTH_LINES`], [`EXIT_OLDEST_AGE`]
 //! 2. hysteresis windows: [`EXIT_HOLD`], [`REENTER_CATCH_UP_HOLD`]
-//! 3. severe gates: [`SEVERE_QUEUE_DEPTH_LINES`], [`SEVERE_OLDEST_AGE`]
+//! 3. severe depth gate: [`SEVERE_QUEUE_DEPTH_LINES`]
 //!
 //! Symptom-oriented adjustments:
 //!
@@ -104,16 +104,14 @@ const EXIT_HOLD: Duration = Duration::from_millis(250);
 
 /// Cooldown window after a catch-up exit that suppresses immediate re-entry.
 ///
-/// Severe backlog still bypasses this hold to avoid unbounded queue-age growth.
+/// Severe depth or the normal oldest-age threshold bypasses this hold, so
+/// hysteresis cannot postpone catch-up for already-delayed lines.
 const REENTER_CATCH_UP_HOLD: Duration = Duration::from_millis(250);
 
 /// Queue-depth cutoff that marks backlog as severe for faster convergence.
 ///
 /// This threshold is used to bypass re-entry hold after a recent catch-up exit.
 const SEVERE_QUEUE_DEPTH_LINES: usize = 64;
-
-/// Oldest-line age cutoff that marks backlog as severe for faster convergence.
-const SEVERE_OLDEST_AGE: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ChunkingMode {
@@ -217,7 +215,7 @@ impl AdaptiveChunkingPolicy {
         if !should_enter_catch_up(snapshot) {
             return false;
         }
-        if self.reentry_hold_active(now) && !is_severe_backlog(snapshot) {
+        if self.reentry_hold_active(now) && !should_bypass_reentry_hold(snapshot) {
             return false;
         }
         self.mode = ChunkingMode::CatchUp;
@@ -282,15 +280,14 @@ fn should_exit_catch_up(snapshot: QueueSnapshot) -> bool {
             .is_some_and(|oldest| oldest <= EXIT_OLDEST_AGE)
 }
 
-/// Returns whether backlog is severe enough to use a faster catch-up target.
+/// Returns whether queue delay or severe depth must override visual hysteresis.
 ///
-/// Severe pressure bypasses re-entry hold to avoid queue-age growth after a
-/// recent catch-up exit.
-fn is_severe_backlog(snapshot: QueueSnapshot) -> bool {
+/// The normal age threshold applies even immediately after a catch-up exit.
+fn should_bypass_reentry_hold(snapshot: QueueSnapshot) -> bool {
     snapshot.queued_lines >= SEVERE_QUEUE_DEPTH_LINES
         || snapshot
             .oldest_age
-            .is_some_and(|oldest| oldest >= SEVERE_OLDEST_AGE)
+            .is_some_and(|oldest| oldest >= ENTER_OLDEST_AGE)
 }
 
 #[cfg(test)]
@@ -453,5 +450,37 @@ mod tests {
         );
         assert_eq!(severe.mode, ChunkingMode::CatchUp);
         assert_eq!(severe.drain_plan, DrainPlan::Batch(64));
+    }
+
+    #[test]
+    fn age_threshold_bypasses_reentry_hold() {
+        for depth in [1, 8, 63] {
+            let mut policy = AdaptiveChunkingPolicy::default();
+            let t0 = Instant::now();
+            policy.decide(snapshot(8, 0), t0);
+            policy.decide(QueueSnapshot::default(), t0 + Duration::from_millis(1));
+
+            let held = policy.decide(snapshot(depth, 119), t0 + Duration::from_millis(121));
+            assert_eq!(held.mode, ChunkingMode::Smooth);
+            let overdue = policy.decide(snapshot(depth, 120), t0 + Duration::from_millis(122));
+            assert_eq!(overdue.mode, ChunkingMode::CatchUp);
+            assert!(overdue.entered_catch_up);
+            assert_eq!(overdue.drain_plan, DrainPlan::Batch(depth));
+        }
+    }
+
+    #[test]
+    fn missing_age_preserves_depth_hysteresis() {
+        let mut policy = AdaptiveChunkingPolicy::default();
+        let t0 = Instant::now();
+        policy.decide(snapshot(8, 0), t0);
+        policy.decide(QueueSnapshot::default(), t0 + Duration::from_millis(1));
+        for (depth, expected) in [(8, ChunkingMode::Smooth), (64, ChunkingMode::CatchUp)] {
+            let decision = policy.decide(
+                QueueSnapshot { queued_lines: depth, oldest_age: None },
+                t0 + Duration::from_millis(2),
+            );
+            assert_eq!(decision.mode, expected);
+        }
     }
 }

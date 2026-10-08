@@ -17,6 +17,19 @@ enum OutputSchemaStorage {
 }
 
 impl ToolOutputSchema {
+    /// Borrow result field names without materializing an MCP envelope or cloning JSON.
+    /// Discovery uses only a bounded prefix; output evidence never authorizes a call.
+    pub(crate) fn search_field_names(&self) -> impl Iterator<Item = &str> {
+        let properties = match &self.0 {
+            OutputSchemaStorage::Json(schema) => schema.get("properties"),
+            OutputSchemaStorage::McpCallToolResult(schema) => {
+                schema.as_ref().and_then(|schema| schema.get("properties"))
+            }
+        };
+        properties.and_then(Value::as_object).into_iter()
+            .flat_map(|properties| properties.keys().map(String::as_str))
+    }
+
     pub(crate) fn from_mcp_output_schema(
         structured_content: Option<Arc<Map<String, Value>>>,
     ) -> Self {

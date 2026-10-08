@@ -195,8 +195,14 @@ async fn apply_patch_cli_multiple_operations_integration() -> Result<()> {
     assert_eq!(changes.len(), 3);
     for (change, kind) in changes.iter().zip(["add", "delete", "update"]) {
         assert_eq!(change["kind"], kind);
-        assert_eq!(change["diff_complete"], true);
+        if kind == "add" {
+            assert!(change.get("unified_diff").is_none());
+            assert!(change.get("diff_complete").is_none());
+        } else {
+            assert_eq!(change["diff_complete"], true);
+        }
     }
+    assert_eq!(changes[2]["diff_format"], "hunk_headers");
 
     assert_eq!(harness.read_file_text("nested/new.txt").await?, "created\n");
     assert_eq!(

@@ -220,6 +220,8 @@ struct ValidationScope {
 #[derive(Clone, Debug)]
 struct PendingValidation {
     revision: u64,
+    execution_order: (u64, u64),
+    inherited: bool,
     check: String,
     scope: Option<ValidationScope>,
     test_execution: bool,
@@ -257,6 +259,7 @@ impl RunnerTestEvidence {
 
 #[derive(Clone, Debug)]
 struct FailedTestValidation {
+    execution_order: (u64, u64),
     evidence: RunnerTestEvidence,
     revision: u64,
     scope: Option<ValidationScope>,
@@ -388,8 +391,10 @@ fn documentation_only_path(path: &std::path::Path) -> bool {
     // This repository's prompt crate embeds templates into runtime requests.
     // Instruction files also control the harness; neither is a README.
     let runtime_input = components.windows(2).any(|pair| pair == ["prompts", "templates"])
-        || path.file_name().and_then(|name| name.to_str())
-            .is_some_and(|name| matches!(name, "AGENTS.md" | "AGENTS.override.md"));
+        || components.last().is_some_and(|name| {
+            ["AGENTS.md", "AGENTS.override.md", "SKILL.md"].iter()
+                .any(|instruction| name.eq_ignore_ascii_case(instruction))
+        });
     !runtime_input && path.extension().and_then(|extension| extension.to_str())
         .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "md" | "rst"))
 }
@@ -887,6 +892,7 @@ pub(crate) struct SamplingRequestSignalCollector {
     dispatch_ledger: Option<Arc<Mutex<DeterministicDispatchLedger>>>,
     request_state_revision: String,
     request_mutation_revision: u64,
+    request_ordinal: u64,
 }
 
 pub(crate) struct SamplingToolCallRegistration {
@@ -3061,6 +3067,8 @@ pub(crate) struct TurnExecutionControl {
     /// a workspace mutation, or a plan/input change.
     continuations_without_progress: u32,
     plan: Option<crate::plan_store::PlanExecutionSnapshot>,
+    /// An inherited completed checklist is not a final-answer hint for new input.
+    plan_updated_since_input: bool,
     plan_revision: u64,
     input_revision: u64,
     dispatch_ledger: Arc<Mutex<DeterministicDispatchLedger>>,
@@ -3087,11 +3095,41 @@ pub(crate) struct TurnExecutionControl {
     /// Coverage is owned by the check that produced it, not an irreversible union.
     validation_coverage: BTreeMap<String, ValidationScope>,
     failed_validation_checks: BTreeSet<String>,
+    inherited_validation_checks: BTreeSet<String>,
     failed_validation_tests: BTreeMap<String, FailedTestValidation>,
     /// Execution revisions, not arrival order, determine supersession.
     validation_check_revisions: BTreeMap<String, u64>,
+    validation_check_orders: BTreeMap<String, (u64, u64)>,
+    next_validation_request: AtomicU64,
     pending_validation_coverage: BTreeMap<u64, PendingValidation>,
     session_path_replays: Option<Arc<SessionPathReplays>>,
+    session_validation_uncertainty: Option<Arc<Mutex<SessionValidationUncertainty>>>,
+}
+
+/// Unresolved execution accounting, not reusable validation proof. Live process
+/// identities belong to this session; they must not be resurrected on restart.
+#[derive(Default)]
+pub(crate) struct SessionValidationUncertainty {
+    failed_checks: BTreeSet<String>,
+    failed_tests: BTreeMap<String, FailedTestValidation>,
+    check_orders: BTreeMap<String, (u64, u64)>,
+    next_request: u64,
+    pending: BTreeMap<u64, PendingValidation>,
+}
+
+impl Drop for TurnExecutionControl {
+    fn drop(&mut self) {
+        let Some(owner) = &self.session_validation_uncertainty else { return; };
+        let mut retained = owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        retained.failed_checks = std::mem::take(&mut self.failed_validation_checks);
+        retained.failed_tests = std::mem::take(&mut self.failed_validation_tests);
+        retained.check_orders = std::mem::take(&mut self.validation_check_orders);
+        retained.next_request = self.next_validation_request.load(Ordering::Relaxed);
+        retained.pending = std::mem::take(&mut self.pending_validation_coverage);
+        let pending_checks = retained.pending.values().map(|pending| pending.check.clone()).collect::<BTreeSet<_>>();
+        let failed_checks = retained.failed_checks.clone();
+        retained.check_orders.retain(|check, _| failed_checks.contains(check) || pending_checks.contains(check));
+    }
 }
 
 /// Path-scoped successful read results retained across turns of a session.
@@ -3207,6 +3245,7 @@ impl TurnExecutionControl {
             lightweight_handoffs: 0,
             continuations_without_progress: 0,
             plan: None,
+            plan_updated_since_input: false,
             plan_revision: 0,
             input_revision: 0,
             dispatch_ledger: Arc::new(Mutex::new(DeterministicDispatchLedger::new(timing))),
@@ -3229,15 +3268,20 @@ impl TurnExecutionControl {
             validation_coverage_revision: None,
             validation_coverage: BTreeMap::new(),
             failed_validation_checks: BTreeSet::new(),
+            inherited_validation_checks: BTreeSet::new(),
             failed_validation_tests: BTreeMap::new(),
             validation_check_revisions: BTreeMap::new(),
+            validation_check_orders: BTreeMap::new(),
+            next_validation_request: AtomicU64::new(0),
             pending_validation_coverage: BTreeMap::new(),
             session_path_replays: None,
+            session_validation_uncertainty: None,
         }
     }
 
     pub(crate) fn with_active_plan(mut self, plan: Option<crate::plan_store::PlanExecutionSnapshot>) -> Self {
         self.refresh_plan(plan);
+        self.plan_updated_since_input = false;
         self
     }
 
@@ -3246,6 +3290,7 @@ impl TurnExecutionControl {
     pub(crate) fn refresh_plan(&mut self, plan: Option<crate::plan_store::PlanExecutionSnapshot>) {
         if self.plan != plan {
             self.plan_revision = self.plan_revision.saturating_add(1);
+            self.plan_updated_since_input = plan.is_some();
         }
         self.plan = plan;
     }
@@ -3256,12 +3301,19 @@ impl TurnExecutionControl {
     /// reports the post-validation boundary of a mutating finalizer.
     fn completion_assessment(&self, settled_mutation_revision: u64) -> codex_protocol::protocol::TurnCompletionAssessment {
         let mut assessment = codex_protocol::protocol::TurnCompletionAssessment::default();
-        if !self.failed_validation_checks.is_empty() {
+        let current_failures = self.failed_validation_checks.len().saturating_sub(self.inherited_validation_checks.len());
+        if !self.inherited_validation_checks.is_empty() {
+            assessment.advisories.push(format!(
+                "{} earlier validation failure(s) remain unresolved; relevance to this request is not established. This is not a rerun request.",
+                self.inherited_validation_checks.len(),
+            ));
+        }
+        if current_failures != 0 {
             assessment.failed_checks.push(format!(
                 "{} validation check(s) failed without a later passing execution or current per-test repairs.",
-                self.failed_validation_checks.len(),
+                current_failures,
             ));
-            for failed in self.failed_validation_tests.values() {
+            for (_, failed) in self.failed_validation_tests.iter().filter(|(check, _)| !self.inherited_validation_checks.contains(*check)) {
                 if let Some(required) = &failed.evidence.required {
                     let unresolved = required.difference(&failed.evidence.passed)
                         .map(|test| format!("{} {:?} {}", test.binary, test.helpers, test.test))
@@ -3288,10 +3340,15 @@ impl TurnExecutionControl {
             ));
         }
         if !self.pending_validation_coverage.is_empty() {
-            assessment.verification_gaps.push(format!(
+            let current = self.pending_validation_coverage.values().filter(|pending| !pending.inherited).count();
+            if current != 0 { assessment.verification_gaps.push(format!(
                 "{} validation process(es) still await a consumed terminal result.",
-                self.pending_validation_coverage.len(),
-            ));
+                current,
+            )); }
+            let inherited = self.pending_validation_coverage.len() - current;
+            if inherited != 0 { assessment.advisories.push(format!(
+                "{inherited} earlier validation process(es) still lack a consumed terminal result; they are not proof for this turn."
+            )); }
         }
         assessment
     }
@@ -3375,7 +3432,7 @@ impl TurnExecutionControl {
 
     /// Owner-derived checklist accounting only, never proof of task completion.
     pub(crate) fn plan_completed(&self) -> bool {
-        self.plan
+        self.plan_updated_since_input && self.plan
             .as_ref()
             .is_some_and(|plan| plan.has_steps && plan.obligations.unresolved.is_empty())
     }
@@ -3625,6 +3682,7 @@ impl TurnExecutionControl {
             dispatch_ledger: Some(Arc::clone(&self.dispatch_ledger)),
             request_state_revision: baselines.revision_key(),
             request_mutation_revision: baselines.mutation_revision,
+            request_ordinal: self.next_validation_request.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -3667,6 +3725,7 @@ impl TurnExecutionControl {
     }
 
     pub(crate) fn accepted_user_input(&mut self) {
+        self.plan_updated_since_input = false;
         self.issued_directives.clear();
         self.lightweight_handoffs = 0;
         self.input_revision = self.input_revision.saturating_add(1);
@@ -3730,6 +3789,34 @@ impl TurnExecutionControl {
             .argument_syntax_failures = diagnoses;
     }
 
+    /// Transfer unresolved questions without importing prior-turn proof.
+    pub(crate) fn with_session_validation_uncertainty(
+        mut self, owner: Arc<Mutex<SessionValidationUncertainty>>,
+    ) -> Self {
+        {
+            let mut retained = owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.failed_validation_checks = std::mem::take(&mut retained.failed_checks);
+            self.inherited_validation_checks = self.failed_validation_checks.clone();
+            self.failed_validation_tests = std::mem::take(&mut retained.failed_tests);
+            self.validation_check_orders = std::mem::take(&mut retained.check_orders);
+            self.next_validation_request.store(retained.next_request, Ordering::Relaxed);
+            self.pending_validation_coverage = std::mem::take(&mut retained.pending);
+        }
+        // Mutation revisions are turn-local. Preserve the question, not an old
+        // pass or the fiction that revision zero in two turns means equal inputs.
+        for failed in self.failed_validation_tests.values_mut() {
+            failed.revision = 0;
+            failed.evidence.passed.clear();
+        }
+        for pending in self.pending_validation_coverage.values_mut() {
+            pending.revision = 0;
+            pending.inherited = true;
+        }
+        self.validation_check_revisions.extend(self.validation_check_orders.keys().map(|check| (check.clone(), 0)));
+        self.session_validation_uncertainty = Some(owner);
+        self
+    }
+
     /// Share path-scoped read results with later turns of this session.
     pub(crate) fn with_session_path_replays(mut self, replays: Arc<SessionPathReplays>) -> Self {
         {
@@ -3755,7 +3842,7 @@ impl TurnExecutionControl {
     ) -> SamplingConvergenceDecision {
         // Required validation remains turn-owned across request collectors.
         // Background services without validation ownership do not gate delivery.
-        if !self.pending_validation_coverage.is_empty() {
+        if self.pending_validation_coverage.values().any(|pending| !pending.inherited) {
             return SamplingConvergenceDecision::default();
         }
         if self.input_revision == baselines.input_revision
@@ -4157,17 +4244,18 @@ impl TurnExecutionControl {
     }
 
     fn reconcile_test_repairs(&mut self, check: &str, revision: u64,
-        scope: Option<ValidationScope>, evidence: &RunnerTestEvidence, failed: bool)
+        execution_order: (u64, u64), scope: Option<ValidationScope>, evidence: &RunnerTestEvidence, failed: bool)
     {
         if failed && evidence.required.as_ref().is_some_and(|required|
             !required.is_empty() && !required.is_subset(&evidence.passed))
         {
             self.failed_validation_tests.insert(check.to_string(), FailedTestValidation {
-                evidence: evidence.clone(), revision, scope,
+                evidence: evidence.clone(), revision, execution_order, scope,
             });
         }
         for previous in self.failed_validation_tests.values_mut()
             .filter(|previous| previous.revision == revision
+                && previous.execution_order <= execution_order
                 && previous.evidence.input_context == evidence.input_context)
         {
             if failed {
@@ -4178,14 +4266,19 @@ impl TurnExecutionControl {
                 }
             }
             previous.evidence.passed.extend(evidence.passed.iter().cloned());
+            previous.execution_order = execution_order;
         }
         if failed { return; }
         self.failed_validation_tests.retain(|check, previous| {
             let repaired = previous.revision == revision
+                && previous.execution_order <= execution_order
                 && previous.evidence.input_context == evidence.input_context
                 && previous.evidence.required.as_ref().is_some_and(|required|
                     required.is_subset(&previous.evidence.passed));
-            if repaired { self.failed_validation_checks.remove(check); }
+            if repaired {
+                self.failed_validation_checks.remove(check);
+                self.inherited_validation_checks.remove(check);
+            }
             !repaired
         });
     }
@@ -4231,13 +4324,20 @@ impl TurnExecutionControl {
                     let test_execution = state.test_validation_ordinals.contains(&outcome.ordinal)
                         || scope.as_ref().is_some_and(|scope| scope.test_execution)
                         || pending.as_ref().is_some_and(|pending| pending.test_execution);
+                    // Keep launch order across polls. A workspace revision alone
+                    // cannot order contradictory executions against the same inputs.
+                    let execution_order = pending.as_ref().map(|pending| pending.execution_order)
+                        .unwrap_or((collector.request_ordinal, outcome.ordinal));
+                    let inherited = pending.as_ref().is_some_and(|pending| pending.inherited);
                     if let Some(id) = outcome.background_process_id {
                         self.pending_validation_coverage.insert(id, PendingValidation {
-                            revision, check, scope, test_execution,
+                            revision, execution_order, inherited, check, scope, test_execution,
                         });
                         continue;
                     }
-                    if self.validation_check_revisions.get(&check).is_some_and(|latest| *latest > revision) {
+                    if self.validation_check_revisions.get(&check).is_some_and(|latest|
+                        *latest > revision || *latest == revision
+                            && self.validation_check_orders.get(&check).is_some_and(|order| *order > execution_order)) {
                         // The diagnostic remains in history; only its active
                         // proof bookkeeping is superseded by the newer run.
                         if let Some(id) = outcome.observed_process_id {
@@ -4253,15 +4353,17 @@ impl TurnExecutionControl {
                         // advanced without a mutation ordinal. A later delivery
                         // must still see that validation gap.
                         self.validation_check_revisions.insert(check.clone(), revision);
-                        if self.validated_mutation_revision.is_none_or(|latest| revision >= latest) {
+                        self.validation_check_orders.insert(check.clone(), execution_order);
+                        if !inherited && self.validated_mutation_revision.is_none_or(|latest| revision >= latest) {
                             self.validated_mutation_revision = Some(revision);
                             self.validated_check = None;
                         }
                         if revision == settled.mutation_revision {
                             self.failed_validation_checks.remove(&check);
+                            self.inherited_validation_checks.remove(&check);
                             self.failed_validation_tests.remove(&check);
                             self.validation_coverage.remove(&check);
-                            if let Some(scope) = scope {
+                            if let Some(scope) = scope.filter(|_| !inherited) {
                                 self.validated_check = Some(check.clone());
                                 self.validation_coverage.insert(check.clone(), scope);
                             }
@@ -4270,8 +4372,19 @@ impl TurnExecutionControl {
                         | SamplingToolOutcomeKind::Timeout | SamplingToolOutcomeKind::RecoverableCancellation)
                     {
                         self.validation_check_revisions.insert(check.clone(), revision);
+                        self.validation_check_orders.insert(check.clone(), execution_order);
                         self.failed_validation_checks.insert(check.clone());
+                        if inherited { self.inherited_validation_checks.insert(check.clone()); }
+                        else { self.inherited_validation_checks.remove(&check); }
                         self.failed_validation_tests.remove(&check);
+                        if inherited {
+                            // Historical failure is not evidence against a
+                            // fresh execution in this turn, even at revision 0.
+                            if let Some(id) = outcome.observed_process_id {
+                                self.pending_validation_coverage.remove(&id);
+                            }
+                            continue;
+                        }
                         if test_execution && outcome.runner_test_evidence.is_none() {
                             // Without per-test outcomes a newer failure cannot
                             // leave older partial passes silently authoritative.
@@ -4302,11 +4415,11 @@ impl TurnExecutionControl {
                                 self.validation_check_revisions.get(check).is_some_and(|latest| *latest > revision));
                         }
                     }
-                    if revision == settled.mutation_revision
+                    if !inherited && revision == settled.mutation_revision
                         && matches!(outcome.kind, SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Failure)
                         && let Some(evidence) = &outcome.runner_test_evidence
                     {
-                        self.reconcile_test_repairs(&check, revision, repair_scope, evidence,
+                        self.reconcile_test_repairs(&check, revision, execution_order, repair_scope, evidence,
                             outcome.kind == SamplingToolOutcomeKind::Failure);
                     }
                 }
@@ -4560,6 +4673,21 @@ mod tests {
         settle_plan(&mut control, plan(&[StepStatus::Completed, StepStatus::Completed, StepStatus::Pending]));
         assert!(!control.plan_completed());
         assert_eq!(control.plan_revision, revision + 2);
+    }
+
+    #[test]
+    fn plan_completion_hint_does_not_survive_new_input_or_turn_inheritance() {
+        let completed = plan(&[StepStatus::Completed]);
+        let snapshot = crate::plan_store::PlanExecutionSnapshot::new(&completed, &Default::default());
+        let mut control = TurnExecutionControl::new().with_active_plan(Some(snapshot.clone()));
+        assert!(!control.plan_completed());
+        assert!(control.completion_gaps(0).is_empty(), "completed history is not new task debt");
+        settle_plan(&mut control, plan(&[StepStatus::Pending]));
+        settle_plan(&mut control, completed);
+        assert!(control.plan_completed());
+        control.accepted_user_input();
+        control.refresh_plan(Some(snapshot));
+        assert!(!control.plan_completed(), "unchanged old completion cannot qualify a new request");
     }
 
     fn lightweight_handoff_collector(
@@ -9559,6 +9687,86 @@ mod tests {
     }
 
     #[test]
+    fn uncertainty_old_background_pass_does_not_erase_newer_same_revision_failure() {
+        let mut control = TurnExecutionControl::new();
+        let baseline = control.baselines(0);
+        let launch = control.collector(&baseline);
+        let ordinal = launch.register_deterministic_tool_call(
+            &ToolName::plain("exec_command"), &validation_proof_payload(), "old-check",
+        ).ordinal;
+        launch.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+            Some(json!({"background_process_id": 7, "validation_mutation_revision": 0})),
+            &successful_tool_response("old-check", "running"), false);
+        control.settle(&baseline, &launch, &settled(0));
+
+        let newer = recorded_validation_collector(&control, &baseline, ToolOutputOutcome::Failure);
+        control.settle(&baseline, &newer, &settled(0));
+        assert_eq!(control.failed_validation_checks.len(), 1);
+        let poll = control.collector(&baseline);
+        let ordinal = poll.register_deterministic_tool_call(
+            &ToolName::plain("write_stdin"),
+            &ToolPayload::Function { arguments: json!({"session_id": 7}).to_string() }, "old-poll",
+        ).ordinal;
+        let mut signal = test_execution_signal();
+        signal["observed_process_id"] = json!(7);
+        poll.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(signal), &runner_tool_response("old-poll", "Ran 1 test"), false);
+        control.settle(&baseline, &poll, &settled(0));
+        assert!(control.pending_validation_coverage.is_empty());
+        assert_eq!(control.failed_validation_checks.len(), 1);
+        assert!(control.validated_mutation_revision.is_none());
+
+        let repair = recorded_validation_collector(&control, &baseline, ToolOutputOutcome::Success);
+        control.settle(&baseline, &repair, &settled(0));
+        assert!(control.failed_validation_checks.is_empty());
+    }
+
+    #[test]
+    fn uncertainty_turn_boundary_retains_questions_not_passing_proof() {
+        let owner = Arc::new(Mutex::new(SessionValidationUncertainty::default()));
+        let mut first = TurnExecutionControl::new().with_session_validation_uncertainty(Arc::clone(&owner));
+        let baseline = first.baselines(0);
+        let failure = recorded_validation_collector(&first, &baseline, ToolOutputOutcome::Failure);
+        first.settle(&baseline, &failure, &settled(0));
+        let launch = first.collector(&baseline);
+        let ordinal = launch.register_deterministic_tool_call(
+            &ToolName::plain("exec_command"), &validation_proof_payload(), "carry-check",
+        ).ordinal;
+        launch.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+            Some(json!({"background_process_id": 7, "validation_mutation_revision": 0})),
+            &successful_tool_response("carry-check", "running"), false);
+        first.settle(&baseline, &launch, &settled(0));
+        drop(first); // Cancellation also takes this path.
+        let mut next = TurnExecutionControl::new().with_session_validation_uncertainty(Arc::clone(&owner));
+        assert_eq!(next.failed_validation_checks.len(), 1);
+        assert_eq!(next.pending_validation_coverage.len(), 1);
+        let assessment = next.completion_assessment(0);
+        assert_eq!(assessment.advisories.len(), 2);
+        assert!(assessment.failed_checks.is_empty());
+        assert!(assessment.verification_gaps.is_empty());
+        let baseline = next.baselines(0);
+        let poll = next.collector(&baseline);
+        let ordinal = poll.register_deterministic_tool_call(&ToolName::plain("write_stdin"),
+            &ToolPayload::Function { arguments: json!({"session_id": 7}).to_string() }, "carry-poll").ordinal;
+        let mut signal = test_execution_signal();
+        signal["observed_process_id"] = json!(7);
+        poll.record_response_result(ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            Some(signal), &runner_tool_response("carry-poll", "Ran 1 test"), false);
+        next.settle(&baseline, &poll, &settled(0));
+        assert!(next.pending_validation_coverage.is_empty());
+        assert!(next.failed_validation_checks.is_empty());
+        assert!(next.validated_mutation_revision.is_none());
+        assert!(next.validation_coverage.is_empty());
+        let repair = recorded_validation_collector(&next, &baseline, ToolOutputOutcome::Success);
+        next.settle(&baseline, &repair, &settled(0));
+        assert_eq!(next.validated_mutation_revision, Some(0));
+        drop(next);
+        let last = TurnExecutionControl::new().with_session_validation_uncertainty(owner);
+        assert!(last.completion_assessment(0).advisories.is_empty());
+        assert!(last.validated_mutation_revision.is_none());
+    }
+
+    #[test]
     fn background_validation_keeps_execution_revision_across_later_polls() {
         let mut control = TurnExecutionControl::new();
         let baseline = control.baselines(0);
@@ -9602,6 +9810,21 @@ mod tests {
         assert!(gaps.iter().any(|gap| gap.contains("src") && gap.contains("changed.rs")));
         let unknown = control.completion_gaps_with_changed_paths(0, None, true);
         assert!(unknown.iter().any(|gap| gap.contains("Untracked changes exist")));
+    }
+
+    #[test]
+    fn uncertainty_skill_instructions_are_not_documentation_only() {
+        for path in ["skills/demo/SKILL.md", "skills/demo/skill.md", r"skills\demo\SKILL.md",
+            "AGENTS.md", "AGENTS.override.md", "codex-rs/prompts/templates/compact/prompt.md"]
+        {
+            assert!(!documentation_only_path(std::path::Path::new(path)), "{path}");
+        }
+        assert!(documentation_only_path(std::path::Path::new("docs/README.md")));
+        let control = TurnExecutionControl::new();
+        let changed = vec![("local".into(), std::path::PathBuf::from("skills/demo/SKILL.md"))];
+        let assessment = control.completion_assessment_with_changed_paths(0, Some(&changed), false);
+        assert_eq!(assessment.verification_gaps.len(), 1);
+        assert!(assessment.advisories.is_empty());
     }
 
     #[tokio::test]
@@ -9684,12 +9907,14 @@ mod tests {
         let control = TurnExecutionControl::new();
         let paths = vec![("local".into(), std::path::PathBuf::from("README.md")),
             ("local".into(), std::path::PathBuf::from("AGENTS.md")),
+            ("local".into(), std::path::PathBuf::from("skills/example/SKILL.md")),
             ("local".into(), std::path::PathBuf::from("codex-rs/prompts/templates/compact/prompt.md")),
             ("local".into(), std::path::PathBuf::from("src/lib.rs"))];
         let gaps = control.completion_gaps_with_changed_paths(0, Some(&paths), false);
         let code = gaps.iter().find(|gap| gap.starts_with("Changed paths")).unwrap();
         assert!(!code.contains("README.md"));
         assert!(code.contains("AGENTS.md"));
+        assert!(code.contains("SKILL.md"));
         assert!(code.contains("prompt.md"));
         assert!(gaps.iter().any(|gap| gap.starts_with("Documentation-only") && gap.contains("README.md") && !gap.contains("prompt.md")));
         assert!(!gaps.iter().any(|gap| gap.contains("No recognized validation command passed")));

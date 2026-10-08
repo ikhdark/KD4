@@ -339,7 +339,7 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "max_output_tokens".to_string(),
             bounded_integer(
-                "Output token budget, capped at 10000 tokens for direct calls; inside exec it is bounded by the cell's estimated remaining budget. Explicit smaller caps are honored. Zero returns only execution controls.".to_string(),
+                "Output token budget, capped at 10000 tokens for direct calls; inside exec each result is bounded by the cell limit with envelope reserve, independently of earlier prints. Explicit smaller caps are honored. Zero returns only execution controls.".to_string(),
                 0, usize::MAX as u64),
         ),
         (
@@ -747,6 +747,18 @@ fn integer_arguments_expose_destination_types_and_runtime_bounds() {
         write["parameters"]["properties"]["yield_time_ms"]["maximum"],
         crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
     );
+}
+
+#[test]
+fn uncertainty_command_wait_budget_accepts_lower_configured_owner_caps() {
+    for cap in [5_000, 30_000, 300_000] {
+        let tool = serde_json::to_value(create_write_stdin_tool_with_max_timeout(cap)).unwrap();
+        let validator = jsonschema::validator_for(&tool["parameters"]).unwrap();
+        assert!(validator.is_valid(&json!({
+            "session_id": 1, "incarnation": "original", "wait_for_output": false,
+            "yield_time_ms": 300_000
+        })), "await_command's deadline must reach the clamping owner for cap {cap}");
+    }
 }
 
 #[test]

@@ -68,16 +68,19 @@ pub(crate) async fn process_compacted_history_with_retained_input(
     let retained_input_len = retained_input.len();
     retained_input.extend(compacted_history);
     let history = sess.clone_history().await;
+    let tool_history = history.tool_history_state();
     let mut reference_items = history.raw_items().to_vec();
     reference_items.extend(retained_input.iter().cloned());
     // Failure must reach the installer: the original history is not a new checkpoint.
     let artifact_pin_payload = sess
-        .compaction_artifact_pins(&history.tool_history_state(), &reference_items)
+        .compaction_artifact_pins(&tool_history, &reference_items)
         .await?;
     // Recover exact registered references before the provider-output filter
     // removes consumed tool pairs. Their sidecar must survive that removal.
     let provider_output = retained_input.split_off(retained_input_len);
-    retained_input.extend(bounded_remote_compacted_history(provider_output));
+    retained_input.extend(bounded_remote_compacted_history(provider_output, |item| {
+        tool_history.authenticates_receipt(item)
+    }));
     let compacted_history =
         append_remote_compaction_artifact_pins(retained_input, artifact_pin_payload);
     Ok((
@@ -96,7 +99,9 @@ fn append_remote_compaction_artifact_pins(
     artifact_pin_payload: Option<String>,
 ) -> Vec<ResponseItem> {
     if let Some(text) = artifact_pin_payload {
-        history.push(crate::compact::compaction_context_message(text));
+        let mut item = crate::compact::compaction_context_message(text);
+        crate::stable_context::mark_trusted_stable_context_item(&mut item);
+        history.push(item);
     }
     history
 }
@@ -124,7 +129,10 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
     )
 }
 
-fn bounded_remote_compacted_history(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+fn bounded_remote_compacted_history(
+    items: Vec<ResponseItem>,
+    authenticates_receipt: impl Fn(&ResponseItem) -> bool,
+) -> Vec<ResponseItem> {
     let receipt_index = tool_receipt_index(&items);
     let mut retained_indices = HashSet::new();
     let mut replacements = HashMap::new();
@@ -145,14 +153,6 @@ fn bounded_remote_compacted_history(items: Vec<ResponseItem>) -> Vec<ResponseIte
                 else {
                     continue;
                 };
-                let search_receipt = remote_tool_search_receipt_group(&items, &group, true);
-                if search_receipt.is_none()
-                    && !group
-                        .iter()
-                        .any(|index| item_has_recoverable_artifact_reference(&items[*index]))
-                {
-                    continue;
-                }
                 if group.iter().any(|index| retained_indices.contains(index)) {
                     continue;
                 }
@@ -161,20 +161,24 @@ fn bounded_remote_compacted_history(items: Vec<ResponseItem>) -> Vec<ResponseIte
                 {
                     continue;
                 }
-                let receipt_group = search_receipt.as_ref().map_or_else(
-                    || {
-                        group
-                            .iter()
-                            .map(|index| items[*index].clone())
-                            .collect::<Vec<_>>()
-                    },
-                    |(_, call, output)| vec![call.clone(), output.clone()],
+                let search_receipt = remote_tool_search_receipt_group(&items, &group, true);
+                if search_receipt.is_none()
+                    && !group
+                        .iter()
+                        .any(|index| authenticates_receipt(&items[*index]))
+                {
+                    continue;
+                }
+                let item_tokens = |item: &ResponseItem| {
+                    usize::try_from(estimate_item_token_count(item).max(1))
+                        .unwrap_or(usize::MAX)
+                };
+                let tokens = search_receipt.as_ref().map_or_else(
+                    || group.iter().fold(0usize, |total, index| {
+                        total.saturating_add(item_tokens(&items[*index]))
+                    }),
+                    |(_, call, output)| item_tokens(call).saturating_add(item_tokens(output)),
                 );
-                let tokens = receipt_group.iter().fold(0usize, |total, item| {
-                    let item_tokens = usize::try_from(estimate_item_token_count(item).max(1))
-                        .unwrap_or(usize::MAX);
-                    total.saturating_add(item_tokens)
-                });
                 if tokens <= remaining_tokens {
                     retained_tool_items = retained_tool_items.saturating_add(group.len());
                     remaining_tokens = remaining_tokens.saturating_sub(tokens);
@@ -291,7 +295,6 @@ fn remote_tool_search_receipt_group(
     if output_call_id != call_id {
         return None;
     }
-    let result_bytes = serde_json::to_vec(tools).ok()?;
     let prior_receipt = tools.first().and_then(parse_remote_tool_search_receipt);
     if tools.len() == 1
         && tools[0].get("type").and_then(serde_json::Value::as_str)
@@ -302,11 +305,11 @@ fn remote_tool_search_receipt_group(
     {
         return None;
     }
-    let result_set_sha256 = prior_receipt.as_ref().map_or_else(
-        || format!("{:x}", Sha256::digest(&result_bytes)),
-        |receipt| receipt.result_set_sha256.clone(),
-    );
-    let mut ordered_tool_identities = prior_receipt.as_ref().map_or_else(
+    let result_set_sha256 = match prior_receipt.as_ref() {
+        Some(receipt) => receipt.result_set_sha256.clone(),
+        None => format!("{:x}", Sha256::digest(serde_json::to_vec(tools).ok()?)),
+    };
+    let ordered_tool_identities = prior_receipt.as_ref().map_or_else(
         || {
             tools
                 .iter()
@@ -335,6 +338,13 @@ fn remote_tool_search_receipt_group(
         .as_ref()
         .and_then(|receipt| receipt.omitted_result_count)
         .or(*omitted_result_count);
+    // Serialized size grows with the retained prefix: receipt IDs have fixed
+    // width and each JSON string costs more than a decimal-count digit change.
+    // Keep the largest fitting prefix without rebuilding every shorter prefix.
+    let mut lower = 0;
+    let mut upper = ordered_tool_identities.len();
+    let mut retained = upper;
+    let mut best = None;
     let receipt = loop {
         let complete = complete
             && prior_receipt
@@ -343,7 +353,7 @@ fn remote_tool_search_receipt_group(
             && status == "completed"
             && prior_omitted_result_count.unwrap_or(0) == 0;
         let omitted_identity_count =
-            total_identity_count.saturating_sub(ordered_tool_identities.len());
+            total_identity_count.saturating_sub(retained);
         let receipt_id = remote_tool_search_receipt_id(
             call_id,
             status,
@@ -354,9 +364,10 @@ fn remote_tool_search_receipt_group(
             prior_omitted_result_count,
             complete,
             omitted_identity_count,
+            &ordered_tool_identities[..retained],
         );
         let receipt = RemoteToolSearchReceiptV1 {
-            version: 1,
+            version: crate::tool_history::TOOL_SEARCH_RECEIPT_VERSION,
             receipt_id,
             call_id: call_id.clone(),
             status: status.clone(),
@@ -366,17 +377,25 @@ fn remote_tool_search_receipt_group(
             result_count,
             omitted_result_count: prior_omitted_result_count,
             complete,
-            ordered_tool_identities: ordered_tool_identities.clone(),
+            ordered_tool_identities: ordered_tool_identities[..retained].to_vec(),
             omitted_identity_count,
         };
         let rendered = serde_json::to_string(&receipt).ok()?;
         if approx_token_count(&rendered) <= TOOL_SEARCH_RECEIPT_MAX_TOKENS {
-            break receipt;
-        }
-        if ordered_tool_identities.is_empty() {
+            if retained == upper {
+                break receipt;
+            }
+            best = Some(receipt);
+            lower = retained + 1;
+        } else if retained == 0 {
             return None;
+        } else {
+            upper = retained - 1;
         }
-        ordered_tool_identities.pop();
+        if lower > upper {
+            break best?;
+        }
+        retained = lower + (upper - lower) / 2;
     };
     let receipt_value = serde_json::to_value(&receipt).ok()?;
     let bounded_call = ResponseItem::ToolSearchCall {
@@ -529,12 +548,16 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
     let estimated_tokens_before = estimated_tokens;
     let context_window =
         i128::from(context_window.saturating_sub(REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS));
+    if estimated_tokens <= context_window {
+        return (0, 0);
+    }
+    let receipt_index = tool_receipt_index(history.raw_items());
     let prepared_outputs = prepared_items.map(|items| {
         items
             .iter()
             .filter_map(|item| {
                 let (kind, side, call_id) = tool_receipt_identity(item)?;
-                (side == ToolReceiptSide::Output).then_some(((kind, call_id.to_string()), item))
+                (side == ToolReceiptSide::Output).then_some(((kind, call_id), item))
             })
             .collect::<HashMap<_, _>>()
     });
@@ -552,7 +575,7 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
             if side != ToolReceiptSide::Output {
                 continue;
             }
-            let Some(item) = prepared_outputs.get(&(kind, call_id.to_string())) else {
+            let Some(item) = prepared_outputs.get(&(kind, call_id)) else {
                 // The prepared prompt already omitted this raw output, so replacing it cannot
                 // reduce the request that is actually about to be sent.
                 continue;
@@ -570,13 +593,19 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
         {
             continue;
         }
-        let Some(rewritten_item) = rewritten_output_for_context_window(history.raw_items(), index)
+        let Some(rewritten_item) = rewritten_output_for_context_window(history.raw_items(), &receipt_index, index)
         else {
             continue;
         };
         let rewritten_tokens = estimate_item_token_count(&rewritten_item);
+        let current_tokens = estimate_item_token_count(current_model_item);
+        // A receipt has fixed metadata overhead. Small raw outputs can be
+        // cheaper; never enlarge an already oversized compaction request.
+        if rewritten_tokens >= current_tokens {
+            continue;
+        }
         estimated_tokens = estimated_tokens
-            .saturating_sub(i128::from(estimate_item_token_count(current_model_item)))
+            .saturating_sub(i128::from(current_tokens))
             .saturating_add(i128::from(rewritten_tokens));
         replacements.push((index, rewritten_item));
     }
@@ -603,6 +632,7 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
 
 fn rewritten_output_for_context_window(
     items: &[ResponseItem],
+    receipt_index: &ToolReceiptIndex<'_>,
     index: usize,
 ) -> Option<ResponseItem> {
     let item = items.get(index)?;
@@ -611,13 +641,9 @@ fn rewritten_output_for_context_window(
             call_id: Some(call_id),
             ..
         } => {
-            let call_index = items.iter().position(|candidate| {
-                matches!(
-                    candidate,
-                    ResponseItem::ToolSearchCall { call_id: Some(candidate_call_id), .. }
-                        if candidate_call_id == call_id
-                )
-            })?;
+            let call_index = *receipt_index.get(&(
+                ToolReceiptKind::Search, ToolReceiptSide::Call, call_id.as_str(),
+            ))?;
             let (_, _, output) =
                 remote_tool_search_receipt_group(items, &[call_index, index], false)?;
             output

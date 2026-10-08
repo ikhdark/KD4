@@ -19,6 +19,10 @@ Goal, 350 for Current state, 250 for Completed work, 350 for Unresolved work,
 These are guidance, not hard limits: preserve required sections and indispensable
 information. Keep any introductory prose short; post-hoc truncation is a safety net.
 
+Separate independent obligations with blank lines. Keep each obligation's
+conditions, prohibitions, and evidence in the same paragraph; never separate a
+qualification from the action it limits.
+
 Every section must contain an explicit value. Write `None` when there is no
 task-relevant content for a required section; never leave a section empty.
 

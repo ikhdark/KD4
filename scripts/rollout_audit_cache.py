@@ -76,7 +76,7 @@ def _read_entry(root, identity):
             or report.get("inputProvenance", {}).get("sha256") != identity
         ):
             return None
-        return report, path
+        return report, path, len(data)
     except (OSError, ValueError, TypeError, AttributeError):
         return None
 
@@ -231,11 +231,13 @@ def analyze_cached(
         identity = _sha(_bytes(provenance))
         retained = None if refresh else _read_entry(root, identity)
         if retained is not None:
-            report, path = retained
+            report, path, report_bytes = retained
             report["analysisCache"] = {
                 "status": "hit",
                 "input_sha256": identity,
                 "report": str(path),
+                "report_sha256": path.stem,
+                "report_bytes": report_bytes,
                 "freshness": "captured inputs only",
             }
             return report
@@ -285,6 +287,8 @@ def analyze_cached(
                 "status": "miss",
                 "input_sha256": identity,
                 "report": str(path),
+                "report_sha256": path.stem,
+                "report_bytes": len(data),
                 "freshness": "captured inputs only",
             }
         except (OSError, ValueError) as error:

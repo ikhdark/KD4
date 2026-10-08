@@ -104,7 +104,7 @@ pub(crate) fn is_table_header_line(line: &str) -> bool {
 /// Whether a single segment matches the `---`, `:---`, `---:`, or `:---:`
 /// alignment-colon syntax used in markdown table delimiter rows.
 #[inline]
-fn is_table_delimiter_segment(segment: &str) -> bool {
+pub(crate) fn is_table_delimiter_segment(segment: &str) -> bool {
     let trimmed = segment.trim();
     if trimmed.is_empty() {
         return false;

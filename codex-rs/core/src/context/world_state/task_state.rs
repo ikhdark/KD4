@@ -9,8 +9,8 @@ use serde_json::Value;
 /// Recompile ordinary task state from its owner, not from a prose summary.
 /// Delivery tracking lets unchanged state stay out of subsequent prompts while
 /// restoring the obligations when their last delivered fragment is compacted.
-#[derive(Clone)]
-pub(crate) struct TaskState(Value);
+#[derive(Clone, Debug)]
+pub(crate) struct TaskState(std::sync::Arc<Value>);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct TaskStateSnapshot {
@@ -18,25 +18,32 @@ pub(crate) struct TaskStateSnapshot {
 }
 
 impl TaskState {
+    #[cfg(test)]
     pub(crate) fn new(plan: Option<(UpdatePlanArgs, PlanLineage)>) -> Self {
+        let revision = plan.as_ref().map(|(plan, lineage)|
+            crate::plan_store::plan_revision_with_lineage(Some(plan), lineage));
+        Self::from_plan(plan.as_ref().zip(revision.as_deref()).map(|((plan, lineage), revision)| (plan, lineage, revision)))
+    }
+
+    pub(crate) fn from_plan(plan: Option<(&UpdatePlanArgs, &PlanLineage, &str)>) -> Self {
         let mut state = match plan {
-            Some((plan, lineage)) => serde_json::json!({
+            Some((plan, lineage, revision)) => serde_json::json!({
                 "has_plan": true,
-                "revision": crate::plan_store::plan_revision_with_lineage(Some(&plan), &lineage),
+                "revision": revision,
                 "step_ids": plan.plan.iter().map(|step| lineage.step_id(&step.step)).collect::<Vec<_>>(),
-                "obligations": lineage.obligation_summary(&plan),
+                "obligations": lineage.obligation_summary(plan),
                 "current_plan": plan,
-                "lineage": lineage.active_for_plan(&plan),
+                "lineage": lineage.active_for_plan(plan),
             }),
             None => serde_json::json!({"has_plan": false}),
         };
         super::remove_null_object_fields(&mut state);
-        Self(state)
+        Self(std::sync::Arc::new(state))
     }
 
     pub(crate) fn with_execution_suspended(mut self, suspended: bool) -> Self {
         if self.0["has_plan"] == true {
-            self.0["execution_suspended"] = suspended.into();
+            std::sync::Arc::make_mut(&mut self.0)["execution_suspended"] = suspended.into();
         }
         self
     }
@@ -47,7 +54,7 @@ impl WorldStateSection for TaskState {
     type Snapshot = TaskStateSnapshot;
 
     fn snapshot(&self) -> TaskStateSnapshot {
-        TaskStateSnapshot { state: self.0.clone() }
+        TaskStateSnapshot { state: (*self.0).clone() }
     }
 
     fn required() -> bool {
@@ -75,7 +82,7 @@ impl WorldStateSection for TaskState {
         previous: PreviousSectionState<'_, TaskStateSnapshot>,
     ) -> Option<Box<dyn ContextualUserFragment>> {
         match previous {
-            PreviousSectionState::Known(previous) if previous.state == self.0 => None,
+            PreviousSectionState::Known(previous) if previous.state == *self.0 => None,
             PreviousSectionState::Absent if self.0["has_plan"] == false => None,
             _ => Some(Box::new(self.clone())),
         }
@@ -109,6 +116,36 @@ mod tests {
     use codex_protocol::models::ContentItem;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
+
+    #[tokio::test]
+    async fn continuity_cached_task_views_match_owner_and_detach_on_change() {
+        let store = crate::plan_store::PlanStore::default();
+        let plan = UpdatePlanArgs { explanation: None, plan: vec![PlanItemArg {
+            step: "retain obligations".into(), status: StepStatus::Pending,
+        }] };
+        store.restore(Some(plan.clone())).await;
+        let first = store.task_state(false).await;
+        let again = store.task_state(false).await;
+        assert!(std::sync::Arc::ptr_eq(&first.0, &again.0));
+        let expected = TaskState::new(store.snapshot_with_lineage().await).with_execution_suspended(false);
+        assert_eq!(first.0, expected.0);
+        let suspended = store.task_state(true).await;
+        assert_eq!(suspended.0["execution_suspended"], true);
+        assert_eq!(first.0["execution_suspended"], false);
+        assert_eq!(suspended.0["revision"], first.0["revision"]);
+        let before = store.execution_snapshot().await.unwrap();
+        let mut changed = plan;
+        changed.plan[0].status = StepStatus::Completed;
+        store.restore(Some(changed)).await;
+        let next = store.task_state(false).await;
+        assert!(!std::sync::Arc::ptr_eq(&first.0, &next.0));
+        assert_ne!(next.0["revision"], first.0["revision"]);
+        assert_ne!(store.execution_snapshot().await.unwrap(), before);
+        assert_eq!(first.0["current_plan"]["plan"][0]["status"], "pending");
+        store.restore(None).await;
+        assert_eq!(store.task_state(false).await.0["has_plan"], false);
+        assert!(store.execution_snapshot().await.is_none());
+    }
 
     #[tokio::test]
     async fn suspended_execution_context_retains_unresolved_work_not_retired_details() {

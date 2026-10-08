@@ -308,6 +308,7 @@ async fn transport_fallback_honors_the_original_retry_after_deadline() {
         .await;
     let mut client_session = session.services.model_client.new_session();
     let mut retry_state = ResponsesStreamRetryState::default();
+    turn_context.turn_timing_state.mark_turn_started();
     tokio::time::pause();
     let advice = RetryAfter::from_delay(Duration::from_secs(10)).unwrap();
     let error = unexpected_status(StatusCode::SERVICE_UNAVAILABLE).with_retry_after(Some(advice));
@@ -333,6 +334,10 @@ async fn transport_fallback_honors_the_original_retry_after_deadline() {
         started.elapsed()
     );
     assert!(!session.services.model_client.responses_websocket_enabled());
+    assert!(
+        turn_context.turn_timing_state.complete_snapshot().profile.exclusive.retry_only_ns > 0,
+        "fallback Retry-After waiting must be attributed to retry backoff"
+    );
 }
 
 #[tokio::test]
@@ -346,9 +351,8 @@ async fn retry_backoff_is_cancelled_by_owner() {
 }
 
 #[test]
-fn lost_connection_on_a_sampling_turn_waits_instead_of_spending_the_retry_budget() {
+fn lost_connection_on_a_user_facing_turn_waits_instead_of_spending_the_retry_budget() {
     assert!(should_wait_for_connection_recovery(
-        ResponsesStreamRequest::Sampling,
         &connection_failed(),
         &SessionSource::VSCode,
         &ModelProviderInfo::default(),
@@ -356,23 +360,9 @@ fn lost_connection_on_a_sampling_turn_waits_instead_of_spending_the_retry_budget
 }
 
 #[test]
-fn connection_recovery_wait_is_limited_to_user_facing_sampling_turns() {
-    // Compaction requests stay on the bounded budget so they cannot stall a turn.
-    for request in [
-        ResponsesStreamRequest::LocalCompaction,
-        ResponsesStreamRequest::RemoteCompactionV2,
-    ] {
-        assert!(!should_wait_for_connection_recovery(
-            request,
-            &connection_failed(),
-            &SessionSource::VSCode,
-            &ModelProviderInfo::default(),
-        ));
-    }
-
+fn connection_recovery_wait_is_limited_to_user_facing_sessions() {
     // Internal sessions must fail fast for their callers.
     assert!(!should_wait_for_connection_recovery(
-        ResponsesStreamRequest::Sampling,
         &connection_failed(),
         &SessionSource::Internal(InternalSessionSource::MemoryConsolidation),
         &ModelProviderInfo::default(),
@@ -380,7 +370,6 @@ fn connection_recovery_wait_is_limited_to_user_facing_sampling_turns() {
 
     // Bedrock reports unrelated failures through the same error class.
     assert!(!should_wait_for_connection_recovery(
-        ResponsesStreamRequest::Sampling,
         &connection_failed(),
         &SessionSource::VSCode,
         &ModelProviderInfo::create_amazon_bedrock_provider(None),
@@ -388,11 +377,64 @@ fn connection_recovery_wait_is_limited_to_user_facing_sampling_turns() {
 
     // Non-connection transport errors keep the bounded retry path.
     assert!(!should_wait_for_connection_recovery(
-        ResponsesStreamRequest::Sampling,
         &CodexErr::RequestTimeout,
         &SessionSource::VSCode,
         &ModelProviderInfo::default(),
     ));
+}
+
+#[tokio::test]
+async fn compaction_waits_out_an_outage_longer_than_its_retry_budget() {
+    // Remote compaction allows two retries. Spent on quick backoff, they once
+    // covered about 0.6s of an outage that sampling turns waited out.
+    for request in [
+        ResponsesStreamRequest::LocalCompaction,
+        ResponsesStreamRequest::RemoteCompactionV2,
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let (session, mut turn_context, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test key"),
+                Vec::new(),
+                home.path(),
+                |config| config.model_provider.supports_websockets = false,
+            )
+            .await;
+        assert!(!session.services.model_client.responses_websocket_enabled());
+        std::sync::Arc::get_mut(&mut turn_context)
+            .expect("test turn context should be uniquely owned")
+            .session_source = SessionSource::Cli;
+        let mut client_session = session.services.model_client.new_session();
+        let mut retry_state = ResponsesStreamRetryState::default();
+        let cancellation_token = CancellationToken::new();
+        tokio::time::pause();
+
+        let started = tokio::time::Instant::now();
+        for _ in 0..4 {
+            handle_retryable_response_stream_error(
+                &mut retry_state,
+                2,
+                connection_failed(),
+                &mut client_session,
+                &session,
+                &turn_context,
+                request,
+                &cancellation_token,
+            )
+            .await
+            .expect("compaction should wait for the network instead of failing the turn");
+        }
+        assert_eq!(retry_state.retries, 0, "{request:?}");
+        assert_eq!(retry_state.connection_retries, 4, "{request:?}");
+        // 0.5s + 1s + 2s + 4s, allowing Tokio's millisecond timer rounding.
+        assert!(
+            (Duration::from_millis(7_500)..=Duration::from_millis(7_504))
+                .contains(&started.elapsed()),
+            "{request:?} waited {:?}",
+            started.elapsed()
+        );
+        tokio::time::resume();
+    }
 }
 
 #[test]
@@ -522,7 +564,6 @@ fn batch_and_subagent_sources_do_not_opt_into_unlimited_recovery() {
         SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::Review),
     ] {
         assert!(!should_wait_for_connection_recovery(
-            ResponsesStreamRequest::Sampling,
             &connection_failed(),
             &source,
             &ModelProviderInfo::default()
@@ -548,4 +589,97 @@ fn audit_declared_incompletion_and_unknown_failures_do_not_retry_or_switch_trans
     };
     assert!(!should_retry_response_stream(&unknown));
     assert!(!should_switch_fallback_transport(&unknown));
+}
+
+/// Narrow scheduling benchmark; no provider traffic or wall-clock sleeps.
+#[tokio::test(start_paused = true)]
+async fn provider_retry_timing_microbenchmark() {
+    let error = CodexErr::Stream("benchmark".into(), None);
+    let mut saturated_distinct = 0;
+    for retry in [1, 5, 6, 100] {
+        let started = std::time::Instant::now();
+        let mut delays = (0..4096)
+            .map(|_| response_stream_retry_delay(&error, retry))
+            .collect::<Vec<_>>();
+        let elapsed = started.elapsed();
+        delays.sort_unstable();
+        let minimum = delays[0];
+        let maximum = delays[delays.len() - 1];
+        delays.dedup();
+        assert!(maximum <= MAX_RESPONSE_STREAM_RETRY_DELAY);
+        // The old policy applied a second cap after jitter and collapsed all
+        // saturated delays. Keep that formula as the benchmark's reference.
+        let mut baseline = (0..4096)
+            .map(|_| crate::retry::backoff(retry).min(MAX_RESPONSE_STREAM_RETRY_DELAY))
+            .collect::<Vec<_>>();
+        baseline.sort_unstable();
+        baseline.dedup();
+        if retry == 100 {
+            saturated_distinct = delays.len();
+            assert_eq!(baseline.len(), 1);
+            assert!(minimum >= MAX_RESPONSE_STREAM_RETRY_DELAY.mul_f64(0.9));
+        }
+        println!("retry={retry} samples=4096 baseline_distinct={} distinct={} min_us={} max_us={} compute_us={}",
+            baseline.len(), delays.len(), minimum.as_micros(), maximum.as_micros(), elapsed.as_micros());
+    }
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let deadline = tokio::time::Instant::now() - Duration::from_secs(1);
+    let mut allowed_after_cancel = 0;
+    let mut baseline_allowed_after_cancel = 0;
+    for _ in 0..1024 {
+        // Reference the former unbiased selection when both branches are ready.
+        baseline_allowed_after_cancel += tokio::select! {
+            _ = cancellation.cancelled() => 0,
+            _ = tokio::time::sleep_until(deadline) => 1,
+        };
+        if wait_for_retry_deadline(deadline, &cancellation).await.is_ok() {
+            allowed_after_cancel += 1;
+        }
+    }
+    println!("cancelled_expired_deadline samples=1024 baseline_allowed={baseline_allowed_after_cancel} allowed={allowed_after_cancel}");
+    assert!(saturated_distinct > 1, "saturated retries must retain jitter");
+    assert_eq!(allowed_after_cancel, 0, "cancellation must win expired deadlines");
+}
+
+#[tokio::test]
+async fn cancelled_retry_does_not_switch_transport_or_announce_an_attempt() {
+    let home = tempfile::tempdir().unwrap();
+    let (session, turn_context, events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |config| config.model_provider.supports_websockets = true,
+        )
+        .await;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = ResponsesStreamRetryState::default();
+    for request in [
+        ResponsesStreamRequest::Sampling,
+        ResponsesStreamRequest::LocalCompaction,
+        ResponsesStreamRequest::RemoteCompactionV2,
+    ] {
+        for max_retries in [0, 2] {
+            let result = handle_retryable_response_stream_error(
+                &mut retry_state,
+                max_retries,
+                codex_api::map_api_error(codex_api::ApiError::Stream("closed".into())),
+                &mut client_session,
+                &session,
+                &turn_context,
+                request,
+                &cancellation,
+            )
+            .await;
+            assert!(matches!(result, Err(CodexErr::TurnAborted)));
+            assert!(session.services.model_client.responses_websocket_enabled());
+            assert_eq!(retry_state.retries, 0);
+            assert_eq!(retry_state.connection_retries, 0);
+            assert!(events.try_recv().is_err());
+        }
+    }
 }

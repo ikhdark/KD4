@@ -29,7 +29,7 @@ use crate::tools::command_output_artifact::remint_tool_history_artifact_for_thre
 
 const RECEIPT_VERSION: u8 = 2;
 const LEGACY_RECEIPT_VERSION: u8 = 1;
-const TOOL_SEARCH_RECEIPT_VERSION: u8 = 1;
+pub(crate) const TOOL_SEARCH_RECEIPT_VERSION: u8 = 2;
 const RECEIPT_MAX_TOKENS: usize = 256;
 // Structured receipts repeat routing fields in the ToolSearchOutput envelope.
 // Bound that complete representation separately and charge its actual cost to admission.
@@ -246,7 +246,10 @@ impl ToolSearchReceiptV1 {
             && is_sha256_hex(&self.result_set_sha256)
             && self.receipt_id == tool_search_receipt_id(call_id, status, execution,
                 &self.arguments, &self.result_set_sha256, self.result_count,
-                self.omitted_result_count, self.complete, self.omitted_identity_count)
+                self.omitted_result_count, self.complete, self.omitted_identity_count,
+                &self.ordered_tool_identities)
+            && self.ordered_tool_identities.len().checked_add(self.omitted_identity_count)
+                .is_some_and(|count| count <= self.result_count)
             && (!self.complete || (status == "completed" && self.omitted_result_count.unwrap_or(0) == 0))
     }
 }
@@ -502,7 +505,7 @@ impl ToolHistoryCandidate {
         let mut fields = serde_json::Map::new();
         // Exact producer-owned relationships, independent of excerpt position.
         // If these cannot fit a receipt, leave the richer representation intact.
-        for key in ["path", "scope", "cwd", "workdir", "command", "cmd", "outcome", "exit_code",
+        for key in ["path", "environment_id", "source_sha256", "scope", "cwd", "workdir", "command", "cmd", "outcome", "exit_code",
             "status", "complete", "file_complete", "coverage_complete", "selection_status",
             "unavailable_ranges", "continuation", "continuation_stop", "recovery_selector",
             "error", "errors", "diagnostics", "selector_errors"]
@@ -541,6 +544,22 @@ impl ToolHistoryCandidate {
                         "status":result["status"], "message":result["message"]}).to_string());
                 }
             }
+            if facts.is_empty() && matches!(self.tool_identity.rsplit('.').next(),
+                Some("read_file" | "read_tool_output"))
+                && let Some(text) = value["results"].as_array().into_iter().flatten()
+                    .filter(|result| result["status"] == "ok")
+                    .flat_map(|result| std::iter::once(result).chain(
+                        result["value"]["hydrated_ranges"].as_array().into_iter().flatten()))
+                    .filter_map(|result| result["text"].as_str())
+                    .find(|text| !text.is_empty())
+            {
+                // Exact excerpt, not a summary or a claim about the whole file.
+                // Completeness and selectors already belong to receipt_evidence.
+                // Bound the borrowed prefix before the existing outer receipt
+                // truncation; do not scan/truncate the full source twice.
+                let end = text.floor_char_boundary(RECEIPT_DIGEST_TARGET_TOKENS.saturating_sub(8) * 4);
+                return format!("Partial source excerpt:\n{}", &text[..end]);
+            }
         }
         if matches!(self.tool_identity.rsplit('.').next(),
             Some("exec_command" | "shell_command" | "shell" | "write_stdin" | "exec" | "wait"))
@@ -548,15 +567,37 @@ impl ToolHistoryCandidate {
             let output = value.as_ref().and_then(|value| value.get("output").and_then(serde_json::Value::as_str))
                 .unwrap_or(&self.bounded_model_output);
             let mut lines = output.lines();
-            let mut groups = 0;
+            let mut head_tokens = 0usize;
             while let Some(line) = lines.next() {
                 if crate::tools::shell_output_summary::is_critical_output_line(line) {
-                    facts.push(line.to_string());
-                    facts.extend(lines.by_ref().take(crate::tools::shell_output_summary::FOCUS_CONTEXT_LINES).map(str::to_string));
-                    groups += 1;
-                    if groups == 8 { break; }
+                    let group = std::iter::once(line).chain(lines.by_ref()
+                        .take(crate::tools::shell_output_summary::FOCUS_CONTEXT_LINES))
+                        .collect::<Vec<_>>().join("\n");
+                    head_tokens = head_tokens.saturating_add(approx_token_count(&group).max(1));
+                    facts.push(group);
+                    if head_tokens >= RECEIPT_DIGEST_TARGET_TOKENS / 2 { break; }
                 }
             }
+            // Spend the existing digest budget on both ends, not a fixed number
+            // of diagnostics. Small groups must not strand available space.
+            // Walking the remaining iterator backwards neither rescans the prefix nor
+            // allocates the intervening log, and keeps terminal causes visible.
+            let mut tail = Vec::new();
+            let mut tail_tokens = 0usize;
+            let mut context = std::collections::VecDeque::new();
+            while let Some(line) = lines.next_back() {
+                if crate::tools::shell_output_summary::is_critical_output_line(line) {
+                    let mut group = vec![line];
+                    group.extend(context.iter().copied());
+                    let group = group.join("\n");
+                    tail_tokens = tail_tokens.saturating_add(approx_token_count(&group).max(1));
+                    tail.push(group);
+                    if tail_tokens >= RECEIPT_DIGEST_TARGET_TOKENS / 2 { break; }
+                }
+                context.push_front(line);
+                context.truncate(crate::tools::shell_output_summary::FOCUS_CONTEXT_LINES);
+            }
+            facts.extend(tail.into_iter().rev());
         }
         if let Some(value) = &value {
             for key in ["outcome", "exit_code", "timed_out", "selection_status", "status", "complete", "file_complete"] {
@@ -744,6 +785,10 @@ pub(crate) struct ToolHistoryState {
     /// not part of the persisted ledger.
     #[serde(skip)]
     model_visible_tool_result_token_budget: Option<usize>,
+    /// Cost of textual tool outputs actually sent in the last completed request,
+    /// not payloads retained only behind recovery receipts. Unknown after replay.
+    #[serde(skip)]
+    last_visible_tool_output_tokens: Option<usize>,
     /// Derived, bounded to calls in the latest projection, and shared by history snapshots.
     #[serde(skip)]
     workspace_projection_cache: Arc<std::sync::Mutex<BTreeMap<String, WorkspaceProjectionEntry>>>,
@@ -836,7 +881,10 @@ impl WorkspaceEvidenceObservation {
                 .as_ref()
                 .is_none_or(|identity| !identity.unavailable)
             && if self.source_path_observations.is_empty() {
-                self.revision.is_some() && self.revision.as_ref() == workspace_identity
+                // Repository identity alone cannot establish freshness when
+                // the observation's dependency scope was never captured.
+                !self.source_dependencies.is_empty()
+                    && self.revision.is_some() && self.revision.as_ref() == workspace_identity
             } else {
                 // A Git-visible digest can stay unchanged when an ignored input
                 // changes. Never let it override the captured dependency watcher.
@@ -1251,6 +1299,12 @@ fn merge_recovered_selectors(ranges: &mut Vec<serde_json::Value>, incoming: &[se
     *ranges = other;
 }
 
+#[derive(Default)]
+struct FailureResolutionIndex<'a> {
+    scanned: std::cell::Cell<usize>,
+    successes: std::cell::OnceCell<BTreeMap<(&'a str, &'a str), Vec<&'a ToolHistoryCandidate>>>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadStatusQuery {
@@ -1265,6 +1319,23 @@ pub(crate) struct ReadStatusQuery {
 }
 
 impl ToolHistoryState {
+    /// Structural receipt IDs are not authentication of model-supplied claims.
+    /// Compare against the already-cached local receipt, including its digest,
+    /// success, freshness, evidence and recovery locator. No artifact I/O.
+    pub(crate) fn authenticates_receipt(&self, item: &ResponseItem) -> bool {
+        let Some((call_id, text)) = textual_output_identity(item) else { return false; };
+        let Some(candidate) = self.candidates.get(call_id) else { return false; };
+        if response_item_output_success(item).is_some_and(|success| success != candidate.successful) {
+            return false;
+        }
+        let Some(expected) = candidate.derived.receipt.as_deref() else { return false; };
+        // Compare the complete JSON object on the formatting-only fallback:
+        // typed deserialization would silently discard injected unknown fields.
+        text == expected || serde_json::from_str::<serde_json::Value>(text).ok()
+            .zip(serde_json::from_str::<serde_json::Value>(expected).ok())
+            .is_some_and(|(actual, expected)| actual == expected)
+    }
+
     #[cfg(test)]
     pub(crate) fn read_status(&self, paths: &[PathBuf], environment_id: Option<&str>, items: &[ResponseItem]) -> serde_json::Value {
         self.read_status_page(paths, environment_id, items, &ReadStatusQuery::default())
@@ -1273,26 +1344,34 @@ impl ToolHistoryState {
     /// Derive obtained byte coverage from existing output records. This does
     /// not read source, refresh evidence, or assert model/semantic inspection.
     pub(crate) fn read_status_page(&self, paths: &[PathBuf], environment_id: Option<&str>, items: &[ResponseItem], query: &ReadStatusQuery) -> serde_json::Value {
+        let requested = paths.iter().map(|path| SourceDependencyV1::new(path, false).path).collect::<BTreeSet<_>>();
         let order = self.observation_order.iter().enumerate()
             .map(|(index, call)| (call.as_str(), index)).collect::<BTreeMap<_, _>>();
         let mut outputs = BTreeMap::new();
         for candidate in self.candidates.values().filter(|candidate| candidate.tool_identity == "read_file") {
-            outputs.insert(candidate.call_id.clone(), (Cow::Borrowed(candidate.bounded_model_output.as_str()), candidate.source_dependencies_current));
+            outputs.insert(candidate.call_id.clone(), (Cow::Borrowed(candidate.bounded_model_output.as_str()), candidate.source_dependencies_current, &candidate.source_dependencies));
         }
         for item in items {
             if let Some((call, output)) = canonical_textual_output_identity(item)
                 && let Some(observation) = self.workspace_evidence.get(call)
                 && observation.successful
             {
-                outputs.insert(call.to_string(), (output, observation.source_dependencies_current));
+                outputs.insert(call.to_string(), (output, observation.source_dependencies_current, &observation.source_dependencies));
             }
         }
         for nested in self.code_mode_nested_evidence.values().flat_map(|calls| calls.iter()) {
             if nested.1.observation.successful {
-                outputs.insert(nested.0.clone(), (Cow::Borrowed(nested.1.output.as_str()), nested.1.observation.source_dependencies_current));
+                outputs.insert(nested.0.clone(), (Cow::Borrowed(nested.1.output.as_str()), nested.1.observation.source_dependencies_current, &nested.1.observation.source_dependencies));
             }
         }
-        let parsed = outputs.into_iter().filter_map(|(call, (output, current))|
+        // Resolve representation precedence before filtering; otherwise an
+        // older candidate could survive a newer, out-of-scope observation.
+        // Unknown/legacy scopes still decode, and directories remain recursive.
+        let parsed = outputs.into_iter()
+            .filter(|(_, (_, _, dependencies))| dependencies.is_empty()
+                || dependencies.iter().any(|dependency| requested.iter()
+                    .any(|path| source_dependency_overlaps(dependency, path))))
+            .filter_map(|(call, (output, current, _))|
             serde_json::from_str::<serde_json::Value>(&output).ok().map(|value| (call, value, current)))
             .collect::<Vec<_>>();
         let rows = paths.iter().map(|path| {
@@ -1432,34 +1511,64 @@ impl ToolHistoryState {
     /// A later, consumed success for exactly the same invocation resolves a
     /// failed observation. Never infer resolution from similar output or a
     /// checklist status, and revoke it when the replacement evidence is stale.
-    fn failure_resolution(&self, candidate: &ToolHistoryCandidate) -> Option<&ToolHistoryCandidate> {
+    fn failure_resolution<'a>(
+        &'a self,
+        candidate: &ToolHistoryCandidate,
+        index: &FailureResolutionIndex<'a>,
+    ) -> Option<&'a ToolHistoryCandidate> {
         let identity = candidate.supersession_identity.as_deref()?;
         if candidate.successful || !action_bound_supersession_identity(identity) {
             return None;
         }
         let action = identity.rsplit_once(':')?.0;
         let consumed = candidate.consumed_by_generation.as_ref()?;
-        self.candidates.values().find(|replacement| {
-            replacement.successful && replacement.complete && replacement.projection_eligible
-                && replacement.source_dependencies_current
-                && replacement.tool_identity == candidate.tool_identity
-                && replacement.consumed_by_generation.as_ref().is_some_and(|later| {
-                    if later.turn_id == consumed.turn_id {
-                        later.ordinal > consumed.ordinal
-                    } else if identity.starts_with("authorized-v1:") {
-                        self.consumption_turns.iter().position(|id| id == &consumed.turn_id)
-                            .zip(self.consumption_turns.iter().position(|id| id == &later.turn_id))
-                            .is_some_and(|(before, after)| before < after)
-                    } else {
-                        // Legacy invocation hashes do not bind authorization.
-                        false
-                    }
-                })
-                && replacement.supersession_identity.as_deref().is_some_and(|identity| {
-                    action_bound_supersession_identity(identity)
-                        && identity.rsplit_once(':').is_some_and(|(prefix, _)| prefix == action)
-                })
-        })
+        let later_consumption = |replacement: &&ToolHistoryCandidate| {
+            replacement.consumed_by_generation.as_ref().is_some_and(|later| {
+                if later.turn_id == consumed.turn_id {
+                    later.ordinal > consumed.ordinal
+                } else if identity.starts_with("authorized-v1:") {
+                    self.consumption_turns.iter().position(|id| id == &consumed.turn_id)
+                        .zip(self.consumption_turns.iter().position(|id| id == &later.turn_id))
+                        .is_some_and(|(before, after)| before < after)
+                } else {
+                    false
+                }
+            })
+        };
+        // Preserve the allocation-free first lookup and cheap early matches.
+        // Build only after repeated scans have visited a whole ledger's worth.
+        if index.successes.get().is_none() && index.scanned.get() < self.candidates.len() {
+            let mut visited = 0;
+            let result = self.candidates.values().inspect(|_| visited += 1).find(|replacement| {
+                replacement.successful && replacement.complete && replacement.projection_eligible
+                    && replacement.source_dependencies_current
+                    && replacement.tool_identity == candidate.tool_identity
+                    && later_consumption(replacement)
+                    && replacement.supersession_identity.as_deref().is_some_and(|identity| {
+                        action_bound_supersession_identity(identity)
+                            && identity.rsplit_once(':').is_some_and(|(prefix, _)| prefix == action)
+                    })
+            });
+            index.scanned.set(index.scanned.get().saturating_add(visited));
+            return result;
+        }
+        // Projection-local and lazy: no allocation on the normal no-failure
+        // path, and no cache can outlive consumption or freshness changes.
+        let index = index.successes.get_or_init(|| {
+            let mut index = BTreeMap::<_, Vec<_>>::new();
+            for replacement in self.candidates.values() {
+                if replacement.successful && replacement.complete && replacement.projection_eligible
+                    && replacement.source_dependencies_current && replacement.consumed_by_generation.is_some()
+                    && let Some(identity) = replacement.supersession_identity.as_deref()
+                    && action_bound_supersession_identity(identity)
+                    && let Some((action, _)) = identity.rsplit_once(':')
+                {
+                    index.entry((replacement.tool_identity.as_str(), action)).or_default().push(replacement);
+                }
+            }
+            index
+        });
+        index.get(&(candidate.tool_identity.as_str(), action))?.iter().copied().find(later_consumption)
     }
 
     #[cfg(test)]
@@ -1482,12 +1591,13 @@ impl ToolHistoryState {
             }).to_string());
         }
         let mut receipts = BTreeMap::new();
+        let resolutions = FailureResolutionIndex::default();
         for id in call_ids {
             let candidate = self
                 .candidates
                 .get(id)
                 .ok_or_else(|| format!("unknown tool result {id}"))?;
-            let resolution = self.failure_resolution(candidate);
+            let resolution = self.failure_resolution(candidate, &resolutions);
             if (!candidate.successful && resolution.is_none()) || candidate.consumed_by_generation.is_none() {
                 return Err(format!(
                     "{id} is unresolved or has not yet been consumed; retain it until resolved"
@@ -1554,7 +1664,15 @@ impl ToolHistoryState {
 
         // Use the same precedence as resume: explicit observation provenance
         // wins over candidates sharing the immutable byte artifact.
-        self.rebuild_artifact_mapping(&artifact_id);
+        if let Some((origin, _, _)) = self.internal_artifact_origins.get(&artifact_id) {
+            self.artifact_call_ids.insert(artifact_id, origin.clone());
+        } else {
+            self.artifact_call_ids.entry(artifact_id)
+                .and_modify(|origin| {
+                    if call_id < *origin { origin.clone_from(&call_id); }
+                })
+                .or_insert(call_id);
+        }
     }
 
     fn refresh_derived_and_indexes(&mut self) {
@@ -1691,13 +1809,10 @@ impl ToolHistoryState {
         if window == 0 {
             return baseline;
         }
-        let retained_tokens = self.candidates.values().map(|candidate| {
-            usize::try_from(candidate.derived.bounded_model_output_tokens).unwrap_or(usize::MAX)
-        }).fold(0usize, usize::saturating_add);
         // The last realized prompt includes instructions and other non-tool
         // context. Reserve that space and observed generation demand before
         // allocating evidence, independently of model-declared plan status.
-        let non_tool_tokens = prompt_tokens.saturating_sub(retained_tokens);
+        let non_tool_tokens = prompt_tokens.saturating_sub(self.last_visible_tool_output_tokens.unwrap_or(0));
         let reserve = non_tool_tokens
             .saturating_add(generation_room.min(window / 4))
             .max(window / 4);
@@ -1822,9 +1937,18 @@ impl ToolHistoryState {
         if !self.consumption_turns.contains(&generation.turn_id) {
             self.consumption_turns.push(generation.turn_id.clone());
         }
+        let mut visible_tokens = 0usize;
         let exposed = input
             .iter()
             .filter_map(canonical_textual_output_identity)
+            .inspect(|(_, text)| {
+                // Byte length is already available here. Do not tokenize every
+                // retained output again on the generation-completion path.
+                visible_tokens = visible_tokens.saturating_add(
+                    usize::try_from(codex_utils_string::approx_tokens_from_byte_count(text.len()))
+                        .unwrap_or(usize::MAX),
+                );
+            })
             .filter(|(call_id, _)| {
                 self.candidates.get(*call_id).map_or_else(
                     || !self.untracked_consumption.contains_key(*call_id),
@@ -1833,6 +1957,7 @@ impl ToolHistoryState {
             })
             .map(|(call_id, text)| (call_id, sha256(text.as_bytes())))
             .collect::<BTreeMap<_, _>>();
+        self.last_visible_tool_output_tokens = Some(visible_tokens);
         let mut changed_call_ids = BTreeSet::new();
         for call_id in exposed.keys() {
             if !self.candidates.contains_key(*call_id) {
@@ -1964,6 +2089,7 @@ impl ToolHistoryState {
             .flatten()
             .collect::<BTreeSet<_>>();
         let mut checkpointed = ProjectedResponseItems::Shared(Arc::clone(&items));
+        let resolutions = FailureResolutionIndex::default();
         for (index, item) in items.iter().enumerate() {
             let Some((call_id, output)) = canonical_textual_output_identity(item) else {
                 continue;
@@ -1975,7 +2101,7 @@ impl ToolHistoryState {
             let Some(candidate) = self.candidates.get(call_id) else {
                 continue;
             };
-            if (!candidate.successful && self.failure_resolution(candidate).is_none())
+            if (!candidate.successful && self.failure_resolution(candidate, &resolutions).is_none())
                 || candidate.consumed_by_generation.is_none()
                 || sha256(output.as_bytes()) != candidate.derived.bounded_model_output_sha256
             {
@@ -2249,6 +2375,7 @@ impl ToolHistoryState {
         git_workspace: Option<&GitWorkspaceCache>,
     ) -> ToolHistoryProjection {
         let mut projected = ProjectedResponseItems::Shared(items);
+        let resolutions = FailureResolutionIndex::default();
         let retired = projected
             .iter()
             .filter_map(phase_checkpoint_ids)
@@ -2620,7 +2747,7 @@ impl ToolHistoryState {
             // when its encoded size alone exceeds the shared history budget.
             let preserve_newest_non_text = Some(item_index) == newest_unconsumed_non_text_item;
             let mut decision = if retired.contains(&call_id)
-                && (candidate.successful || self.failure_resolution(candidate).is_some())
+                && (candidate.successful || self.failure_resolution(candidate, &resolutions).is_some())
                 && candidate.consumed_by_generation.is_some()
                 && let Some((text, tokens)) = artifact_pin
                 && *tokens <= remaining_tokens
@@ -4488,15 +4615,19 @@ pub(crate) async fn remint_tool_history_state_for_fork(
         .await
         {
             Ok(reminted) => {
-                for result in code_mode_nested_evidence
+                // Forks normally preserve opaque artifact IDs. Do not decode
+                // every nested receipt merely to assign its existing identity.
+                if reminted != id {
+                    for result in code_mode_nested_evidence
                     .values_mut()
                     .flat_map(|results| results.values_mut())
-                {
-                    if let Ok(mut pin) = serde_json::from_str::<serde_json::Value>(&result.output)
-                        && pin["artifact_id"] == id
                     {
-                        pin["artifact_id"] = serde_json::json!(reminted);
-                        result.output = pin.to_string();
+                        if let Ok(mut pin) = serde_json::from_str::<serde_json::Value>(&result.output)
+                            && pin["artifact_id"] == id
+                        {
+                            pin["artifact_id"] = serde_json::json!(reminted);
+                            result.output = pin.to_string();
+                        }
                     }
                 }
                 internal_artifact_origins.insert(reminted, (call_id, bytes, sha));
@@ -4525,6 +4656,8 @@ pub(crate) async fn remint_tool_history_state_for_fork(
         artifact_directory_members: state.artifact_directory_members,
         artifact_call_ids: BTreeMap::new(),
         model_visible_tool_result_token_budget: state.model_visible_tool_result_token_budget,
+        // The fork has not sent a request with these reminted representations.
+        last_visible_tool_output_tokens: None,
         workspace_projection_cache: Arc::default(),
     };
     reminted_state.rebuild_artifact_index();
@@ -5281,13 +5414,12 @@ pub(crate) fn response_item_has_valid_tool_history_receipt(item: &ResponseItem) 
     receipt.is_valid_for_call(call_id)
 }
 
-pub(crate) fn substitutions_overlap_items(
+pub(crate) fn substitutions_overlap_items<'a>(
     substitutions: &[ToolHistorySubstitution],
-    items: &[ResponseItem],
+    mut item_at: impl FnMut(usize) -> Option<&'a ResponseItem>,
 ) -> bool {
     substitutions.iter().any(|substitution| {
-        items
-            .get(substitution.item_index)
+        item_at(substitution.item_index)
             .and_then(textual_output_identity)
             .is_some_and(|(call_id, text)| {
                 call_id == substitution.call_id
@@ -5296,13 +5428,12 @@ pub(crate) fn substitutions_overlap_items(
     })
 }
 
-pub(crate) fn substitutions_match_items(
+pub(crate) fn substitutions_match_items<'a>(
     substitutions: &[ToolHistorySubstitution],
-    items: &[ResponseItem],
+    mut item_at: impl FnMut(usize) -> Option<&'a ResponseItem>,
 ) -> bool {
     substitutions.iter().all(|substitution| {
-        items
-            .get(substitution.item_index)
+        item_at(substitution.item_index)
             .and_then(textual_output_identity)
             .is_some_and(|(call_id, text)| {
                 let receipt_id_matches = serde_json::from_str::<ToolHistoryReceipt>(text)
@@ -5439,6 +5570,7 @@ pub(crate) fn tool_search_receipt_item(
                 *omitted_result_count,
                 complete,
                 omitted_identity_count,
+                &ordered_tool_identities[..retained],
             ),
             call_id: call_id.clone(),
             status: status.clone(),
@@ -5507,21 +5639,17 @@ pub(crate) fn tool_search_receipt_id(
     omitted_result_count: Option<usize>,
     complete: bool,
     omitted_identity_count: usize,
+    ordered_tool_identities: &[String],
 ) -> String {
-    let semantic_identity = serde_json::json!({
-        "call_id": call_id,
-        "status": status,
-        "execution": execution,
-        "arguments": arguments,
-        "result_set_sha256": result_set_sha256,
-        "result_count": result_count,
-        "omitted_result_count": omitted_result_count,
-        "complete": complete,
-        "omitted_identity_count": omitted_identity_count,
-    });
+    // Versioned positional encoding avoids cloning the argument object and
+    // every identity into a temporary JSON map on each bounded-prefix trial.
+    let semantic_identity = serde_json::to_vec(&(
+        call_id, status, execution, arguments, result_set_sha256, result_count,
+        omitted_result_count, complete, omitted_identity_count, ordered_tool_identities,
+    )).expect("tool search receipt fields serialize");
     format!(
-        "tsr1-{}",
-        &sha256(semantic_identity.to_string().as_bytes())[..16]
+        "tsr2-{}",
+        &sha256(&semantic_identity)[..16]
     )
 }
 
@@ -5765,6 +5893,7 @@ fn workspace_call_observes_from_arguments(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|path| {
                 path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
+                    || path.starts_with("context:unsettled-tools/")
                     || path == crate::context::desktop_instructions::LOCATOR
                     || path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR
             });
@@ -5827,6 +5956,7 @@ fn source_dependencies_from_arguments(
             return BTreeSet::new();
         };
         if path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
+            || path.starts_with("context:unsettled-tools/")
             || path == crate::context::desktop_instructions::LOCATOR
             || path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR
         {

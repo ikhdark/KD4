@@ -1895,9 +1895,10 @@ impl UnifiedExecProcessManager {
             pause_state,
             deadline,
             poll_bound,
-            // Polling a noninteractive command continues through progress
-            // bursts until exit, handoff, or the existing bounded deadline.
-            (request.input.is_empty() && (until_output || tty && !validation_launch))
+            // Validation polls continue through progress bursts even in
+            // until-output mode, bounded by exit, handoff, or the deadline.
+            (request.input.is_empty() && (until_output || tty)
+                && !validation_launch && process.validation().is_none())
                 .then_some(INITIAL_OUTPUT_QUIET_PERIOD),
             &mut handoff,
         )
@@ -2578,7 +2579,11 @@ impl UnifiedExecProcessManager {
             local_policy_env,
         };
         let mut orchestrator = ToolOrchestrator::new();
-        let mut runtime = UnifiedExecRuntime::new_with_pending_spawns(self, pending_spawns);
+        let mut runtime = UnifiedExecRuntime::new_with_pending_spawns(
+            self,
+            pending_spawns,
+            context.tracker.clone(),
+        );
 
         let direct_argv_analysis = async { if request.shell_wrapper_is_owned
             && request.shell_type == crate::shell::ShellType::PowerShell

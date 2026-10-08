@@ -2440,8 +2440,8 @@ mod tests {
     fn default_base_instructions_deliver_inventory_coverage_and_report_guidance() {
         let instructions = BaseInstructions::default();
         for required in [
-            "use their documented contract (`--describe`, `--help`, AGENTS.md)",
-            "read implementation only for a specific missing fact",
+            "use documented public entrypoints and their contracts (`--describe`, `--help`, AGENTS.md)",
+            "Read implementation only for a specific missing fact",
             "When a tool returns sufficient evidence for delivery, answer from that result",
             "do not reopen internal state merely to re-derive returned information",
             "Further inspection must resolve a concrete scope or correctness question",

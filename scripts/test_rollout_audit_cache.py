@@ -219,8 +219,8 @@ class RolloutAuditCacheTest(unittest.TestCase):
 
     def test_cli_exposes_result_address_and_requires_explicit_cache(self):
         for expected in ("miss", "hit"):
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 self.assertEqual(
                     audit.main(
                         [
@@ -237,6 +237,13 @@ class RolloutAuditCacheTest(unittest.TestCase):
             value = json.loads(out.getvalue())
             self.assertEqual(value["analysisCache"]["status"], expected)
             self.assertTrue(Path(value["analysisCache"]["report"]).is_file())
+            receipt = json.loads(err.getvalue())["savedReport"]
+            data = Path(receipt["path"]).read_bytes()
+            self.assertEqual(receipt["sha256"], hashlib.sha256(data).hexdigest())
+            self.assertEqual(receipt["bytes"], len(data))
+            self.assertIn(receipt["path"], audit.render_report(json.loads(data) | {
+                "analysisCache": value["analysisCache"],
+            }))
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             audit.main([str(self.source), "--refresh"])
 

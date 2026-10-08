@@ -2155,9 +2155,9 @@ fn rollback_request_cancellation_releases_reservation_before_retry() -> Result<(
 
 #[test]
 #[serial(app_server_tracing)]
-fn archive_cleanup_survives_origin_disconnect_after_store_commit() -> Result<()> {
+fn archive_cleanup_survives_origin_disconnect_while_quiescing_writer() -> Result<()> {
     run_current_thread_test_with_stack(
-        "archive_cleanup_survives_origin_disconnect_after_store_commit",
+        "archive_cleanup_survives_origin_disconnect_while_quiescing_writer",
         async {
             use crate::outgoing_message::OutgoingEnvelope;
             use crate::outgoing_message::OutgoingMessage;
@@ -2413,7 +2413,7 @@ fn archive_cleanup_survives_origin_disconnect_after_store_commit() -> Result<()>
                 }
             })
             .await
-            .expect("archive owner must enter real post-commit shutdown");
+            .expect("archive owner must quiesce the writer before committing");
             assert!(
                 store
                     .read_thread(ReadThreadParams {
@@ -2423,11 +2423,11 @@ fn archive_cleanup_survives_origin_disconnect_after_store_commit() -> Result<()>
                     })
                     .await?
                     .archived_at
-                    .is_some()
+                    .is_none()
             );
             assert!(
-                !rollout_path.exists(),
-                "store commit must move the active rollout"
+                rollout_path.exists(),
+                "the active rollout must stay in place until its writer stops"
             );
             assert!(
                 harness
@@ -2435,7 +2435,7 @@ fn archive_cleanup_survives_origin_disconnect_after_store_commit() -> Result<()>
                     .thread_manager
                     .get_thread(thread_id)
                     .await
-                    .is_err()
+                    .is_ok()
             );
             assert!(matches!(
                 approval_result.try_recv(),
@@ -2498,6 +2498,7 @@ fn archive_cleanup_survives_origin_disconnect_after_store_commit() -> Result<()>
             .await
             .expect("surviving connection must be notified of the committed archive");
             assert_eq!(archived.thread_id, thread_id.to_string());
+            assert!(!rollout_path.exists(), "store commit must move the active rollout");
             assert!(
                 store
                     .read_thread(ReadThreadParams {

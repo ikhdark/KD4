@@ -1873,7 +1873,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 29);
+    assert_eq!(timing.schema_version, 30);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -2685,7 +2685,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 29);
+    assert_eq!(profile.schema_version, 30);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -3198,6 +3198,77 @@ fn predispatch_failure_closes_request_preparation_before_error_lifecycle() {
     assert_eq!(profile.local.preparation_ns, 5 * NS_PER_MS);
     assert_eq!(profile.exclusive.finalization_ns, 15 * NS_PER_MS);
     assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
+}
+
+#[test]
+fn request_setup_phases_are_frozen_per_dispatch_and_survive_checkpoints() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut preparation = None;
+    for (start, history_ms, persistence_ms) in [(10, 2, 3), (100, 4, 5)] {
+        clock.set_ms(start);
+        state.begin_request_preparation(&mut preparation);
+        let history = state.begin_local_phase(TurnLocalPhase::HistorySnapshot);
+        clock.set_ms(start + history_ms);
+        drop(history);
+        let request = state.begin_model_request_wait();
+        drop(preparation.take());
+        let transport = state.begin_local_phase(TurnLocalPhase::TransportReadiness);
+        let persistence = state.begin_local_phase(TurnLocalPhase::Persistence);
+        clock.set_ms(start + history_ms + persistence_ms);
+        drop(persistence);
+        state.mark_model_request_dispatched();
+        // Repeated dispatch callbacks and later work cannot overwrite setup.
+        clock.set_ms(start + 20);
+        state.mark_model_request_dispatched();
+        drop(transport);
+        drop(request);
+        state.finish_request_preparation(&mut preparation);
+        state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("answer".into()));
+    }
+    let checkpoint = state.sampling_checkpoint();
+    let requests = &checkpoint.timing.model_requests;
+    assert_eq!(requests.len(), 2);
+    for (request, history_ms, persistence_ms) in [(&requests[0], 2, 3), (&requests[1], 4, 5)] {
+        let phases = &request.setup_phase_ns;
+        assert_eq!(phases["history_snapshot"], history_ms * NS_PER_MS as u64);
+        assert_eq!(phases["preparation"], history_ms * NS_PER_MS as u64);
+        assert_eq!(phases["persistence"], persistence_ms * NS_PER_MS as u64);
+        assert_eq!(phases["transport_readiness"], persistence_ms * NS_PER_MS as u64);
+    }
+    let serialized = serde_json::to_value(&checkpoint.timing).unwrap();
+    let restored: TurnTiming = serde_json::from_value(serialized).unwrap();
+    assert_eq!(restored.model_requests, *requests);
+    let first = restored.pre_first_model_output.unwrap();
+    assert_eq!(first.history_snapshot_ns, 2 * NS_PER_MS as u64);
+    assert_eq!(first.first_request_dispatch_ready_ns, 15 * NS_PER_MS as u64);
+}
+
+#[test]
+fn request_setup_phases_discard_failed_attempt_and_reset_for_retry() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let failed = state.begin_model_request_wait();
+    let serialization = state.begin_local_phase(TurnLocalPhase::Serialization);
+    clock.set_ms(5);
+    drop(serialization);
+    drop(failed);
+    state.record_model_retry();
+    clock.set_ms(20);
+    let retry = state.begin_model_request_wait();
+    let serialization = state.begin_local_phase(TurnLocalPhase::Serialization);
+    clock.set_ms(22);
+    drop(serialization);
+    state.mark_model_request_dispatched();
+    drop(retry);
+    let timing = state.complete_snapshot().protocol_timing();
+    assert!(timing.model_requests[0].setup_phase_ns.is_empty());
+    assert_eq!(timing.model_requests[1].setup_phase_ns["serialization"], 2 * NS_PER_MS as u64);
+    assert_eq!(timing.model_requests[1].attempt_kind, TurnTimingAttemptKind::Retry);
+    let mut legacy = serde_json::to_value(&timing.model_requests[1]).unwrap();
+    legacy.as_object_mut().unwrap().remove("setupPhaseNs");
+    let legacy: codex_protocol::protocol::TurnTimingModelRequest = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.setup_phase_ns.is_empty());
 }
 
 #[test]

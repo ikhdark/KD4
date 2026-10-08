@@ -4373,6 +4373,15 @@
             "null"
           ]
         },
+        "setupPhaseNs": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "description": "Named setup-phase union durations in nanoseconds, frozen at dispatch. Measured from request preparation (or attempt start for retries), not cumulative across the turn. Phases can overlap and must not be summed. Empty for older records or attempts that never dispatched.",
+          "type": "object"
+        },
         "tokenUsage": {
           "anyOf": [
             {

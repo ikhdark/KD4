@@ -1945,6 +1945,44 @@ class BuildToolingStorageTest(unittest.TestCase):
         self.assertIn("ProcessId != $selfPid", command)
         self.assertNotIn("Where-Object", command)
 
+    def test_doctor_fast_path_skips_disk_but_preserves_readiness_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            snapshot = rust_build_status.BuildStatusSnapshot.collect(
+                repo_root=repo, processes=[]
+            )
+            kwargs = dict(
+                repo_root=repo, snapshot=snapshot, tool_lookup=lambda _: None, env={}
+            )
+            with mock.patch.object(
+                rust_build_status_support, "target_disk_report_lines",
+                side_effect=AssertionError("readiness must not scan disk"),
+            ):
+                fast = rust_build_status.build_doctor_report(**kwargs, include_disk=False)
+            with mock.patch.object(
+                rust_build_status_support, "target_disk_report_lines",
+                return_value=["disk details"],
+            ) as disk:
+                full = rust_build_status.build_doctor_report(**kwargs)
+                self.assertEqual(
+                    full,
+                    rust_build_status.build_doctor_report(**kwargs, include_disk=True),
+                )
+                self.assertEqual(disk.call_count, 2)
+            notice = "target disk: not scanned (use `doctor --include-disk` or `disk`)"
+            self.assertEqual(fast.replace(notice, "disk details"), full)
+
+    def test_doctor_cli_disk_scan_is_explicit(self):
+        for arguments, include_disk in [
+            (["doctor"], False), (["doctor", "--include-disk"], True)
+        ]:
+            with self.subTest(arguments=arguments), mock.patch.object(
+                rust_build_status, "build_doctor_report", return_value="doctor result"
+            ) as report, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(rust_build_status.main(arguments), 0)
+                report.assert_called_once_with(include_disk=include_disk)
+                self.assertEqual(output.getvalue(), "doctor result\n")
+
     def test_windows_process_discovery_rechecks_exited_but_preserves_hidden_rows(self):
         shell = powershell()
         if shell is None:

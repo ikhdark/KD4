@@ -936,6 +936,83 @@ mod tests {
         assert_eq!(ctrl.core.rendered_source_len, ctrl.core.raw_source.len());
     }
 
+    /// Local CPU/queue probe, not provider TTFT or an end-to-end benchmark.
+    #[test]
+    #[ignore = "manual narrow streaming latency benchmark"]
+    fn streaming_latency_probe() {
+        use super::super::chunking::{AdaptiveChunkingPolicy, DrainPlan, QueueSnapshot};
+        use std::fmt::Write as _;
+        use std::hint::black_box;
+
+        let mut report = String::new();
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let start = Instant::now();
+            for _ in 0..200 {
+                let mut scanner = TableHoldbackScanner::new();
+                for _ in 0..128 {
+                    scanner.push_source_chunk(black_box("ordinary | pipe | prose\n"));
+                }
+                black_box(scanner.state());
+            }
+            samples.push(start.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        writeln!(report, "stream_probe scanner_25600_lines_us median={} min={} max={}", samples[4], samples[0], samples[8]).unwrap();
+
+        for per_frame in [1, 16] {
+            let mut samples = Vec::new();
+            let mut renders = 0;
+            for _ in 0..9 {
+                let mut ctrl = stream_controller(Some(80));
+                let start = Instant::now();
+                for i in 0..128 {
+                    ctrl.push(black_box("ordinary streaming prose\n"));
+                    if (i + 1) % per_frame == 0 {
+                        ctrl.flush_render_for_frame();
+                        black_box(ctrl.on_commit_tick_batch(usize::MAX));
+                    }
+                }
+                black_box(ctrl.finalize());
+                samples.push(start.elapsed().as_micros());
+                renders = ctrl.core.streaming_render_count;
+            }
+            samples.sort_unstable();
+            writeln!(report, "stream_probe render_128_lines per_frame={per_frame} median_us={} min_us={} max_us={} renders={renders}", samples[4], samples[0], samples[8]).unwrap();
+        }
+
+        let mut ctrl = stream_controller(Some(80));
+        for _ in 0..100 {
+            ctrl.push("word ");
+            ctrl.flush_render_for_frame();
+        }
+        writeln!(report, "stream_probe unterminated_deltas=100 queued={} tail_lines={}", ctrl.queued_lines(), ctrl.current_tail_lines().len()).unwrap();
+        assert_eq!(ctrl.queued_lines(), 0);
+        assert!(!ctrl.has_live_tail());
+        ctrl.push("\n");
+        assert!(ctrl.queued_lines() > 0);
+
+        // Virtual arrivals isolate policy delay from OS scheduling noise. A fresh
+        // burst arrives after catch-up drained, with the periodic UI tick delayed.
+        let t0 = Instant::now();
+        let mut policy = AdaptiveChunkingPolicy::default();
+        policy.decide(QueueSnapshot { queued_lines: 8, oldest_age: Some(Duration::ZERO) }, t0);
+        policy.decide(QueueSnapshot::default(), t0 + Duration::from_millis(1));
+        let mut catch_up_age = None;
+        for age in 0..=300 {
+            let decision = policy.decide(QueueSnapshot { queued_lines: 8, oldest_age: Some(Duration::from_millis(age)) }, t0 + Duration::from_millis(2 + age));
+            if matches!(decision.drain_plan, DrainPlan::Batch(_)) {
+                catch_up_age = Some(age);
+                break;
+            }
+        }
+        writeln!(report, "stream_probe post_burst_catch_up_age_ms={}", catch_up_age.expect("catch-up eventually drains")).unwrap();
+        eprint!("{report}");
+        if let Some(path) = std::env::var_os("CODEX_STREAM_PROBE_OUTPUT") {
+            std::fs::write(path, report).expect("write streaming probe report");
+        }
+    }
+
     #[test]
     fn finalize_reuses_the_current_full_source_render() {
         let mut ctrl = stream_controller(Some(80));

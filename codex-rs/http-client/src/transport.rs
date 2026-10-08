@@ -21,6 +21,47 @@ pub type ByteStream = BoxStream<'static, Result<Bytes, TransportError>>;
 const ERROR_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
+tokio::task_local! {
+    static TRANSPORT_TIMING: std::cell::Cell<TransportTiming>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TransportTiming {
+    pub response_headers: Option<std::time::Duration>,
+    pub proxy_resolution: Option<std::time::Duration>,
+    pub client_pool_selection: Option<std::time::Duration>,
+}
+
+/// Captures send-to-headers latency from the concrete transport, excluding auth,
+/// request encoding and response body reads. This cumulative interval includes
+/// route selection, redirects, connection setup and upload; it is not a DNS, TCP or TLS measurement.
+/// The task-local scope isolates concurrent requests and is dropped on cancellation.
+pub async fn capture_transport_timing<F: std::future::Future>(
+    future: F,
+) -> (F::Output, TransportTiming) {
+    TRANSPORT_TIMING.scope(std::cell::Cell::new(TransportTiming::default()), async move {
+        let result = future.await;
+        (result, TRANSPORT_TIMING.with(std::cell::Cell::get))
+    }).await
+}
+
+fn record_response_header_time(duration: std::time::Duration) {
+    record_timing(|timing| timing.response_headers = Some(duration));
+    tracing::debug!(
+        event.name = "codex.http.send_to_response_headers",
+        duration_us = duration.as_micros() as u64,
+        provenance = "transport_send_to_response_headers",
+    );
+}
+
+pub(crate) fn record_timing(update: impl FnOnce(&mut TransportTiming)) {
+    let _ = TRANSPORT_TIMING.try_with(|slot| {
+        let mut timing = slot.get();
+        update(&mut timing);
+        slot.set(timing);
+    });
+}
+
 // Failure headers are authoritative even when diagnostic body delivery stalls.
 // Use one deadline, not a fresh timeout for every chunk of an endless body.
 async fn collect_error_body(
@@ -70,21 +111,32 @@ pub trait HttpTransport: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct ReqwestTransport {
-    client: HttpClient,
+    client: TransportClient,
+}
+
+#[derive(Clone, Debug)]
+enum TransportClient {
+    Fixed(HttpClient),
+    Routed(crate::RouteAwareClientPool),
 }
 
 impl ReqwestTransport {
     pub fn new(client: reqwest::Client) -> Self {
         Self {
-            client: HttpClient::new(client),
+            client: TransportClient::Fixed(HttpClient::new(client)),
         }
     }
 
     pub fn from_http_client(client: HttpClient) -> Self {
-        Self { client }
+        Self { client: TransportClient::Fixed(client) }
     }
 
-    fn build(&self, req: Request) -> Result<RequestBuilder, TransportError> {
+    /// Keeps route selection at dispatch, including each redirect hop.
+    pub fn from_client_pool(pool: crate::RouteAwareClientPool) -> Self {
+        Self { client: TransportClient::Routed(pool) }
+    }
+
+    fn build(client: &HttpClient, req: Request) -> Result<RequestBuilder, TransportError> {
         let prepared = req.prepare_body_for_send().map_err(TransportError::Build)?;
 
         let Request {
@@ -96,7 +148,7 @@ impl ReqwestTransport {
             timeout,
         } = req;
 
-        let mut builder = self.client.request(
+        let mut builder = client.request(
             Method::from_bytes(method.as_str().as_bytes()).unwrap_or(Method::GET),
             &url,
         );
@@ -112,6 +164,37 @@ impl ReqwestTransport {
         Ok(builder)
     }
 
+    async fn send(&self, req: Request) -> Result<crate::HttpResponse, TransportError> {
+        match &self.client {
+            TransportClient::Fixed(client) => {
+                let builder = Self::build(client, req)?;
+                let start = std::time::Instant::now();
+                let response = builder.send().await.map_err(Self::map_error)?;
+                record_response_header_time(start.elapsed());
+                Ok(response)
+            }
+            TransportClient::Routed(pool) => {
+                let prepared = req.prepare_body_for_send().map_err(TransportError::Build)?;
+                let mut builder = pool.request(req.method, req.url).headers(prepared.headers);
+                if let Some(timeout) = req.timeout {
+                    builder = builder.timeout(timeout);
+                }
+                if let Some(body) = prepared.body {
+                    builder = builder.body(body);
+                }
+                // Includes route selection and redirect hops, but not body reads or auth.
+                let start = std::time::Instant::now();
+                let response = builder.send().await.map_err(|error| match error {
+                    crate::RouteAwareRequestError::Request(error) => Self::map_error(error),
+                    crate::RouteAwareRequestError::Timeout => TransportError::Timeout,
+                    _ => TransportError::Build("failed to route HTTP request".into()),
+                })?;
+                record_response_header_time(start.elapsed());
+                Ok(response)
+            }
+        }
+    }
+
     fn map_error(err: reqwest::Error) -> TransportError {
         if err.is_builder() || is_permanent_connection_error(&err) {
             TransportError::Build(format!("permanent transport configuration failure: {:#}", err.without_url()))
@@ -125,7 +208,9 @@ impl ReqwestTransport {
     }
 
     fn trace_request(&self, req: &Request) {
-        if self.client.request_logging_enabled() && enabled!(Level::TRACE) {
+        if let TransportClient::Fixed(client) = &self.client
+            && client.request_logging_enabled() && enabled!(Level::TRACE)
+        {
             trace!(
                 "{} to {}: {}",
                 req.method,
@@ -168,9 +253,9 @@ pub fn is_permanent_connection_error(mut error: &(dyn std::error::Error + 'stati
 
 fn request_body_for_trace(req: &Request) -> String {
     match req.body.as_ref() {
-        Some(RequestBody::Json(body)) => body.to_string(),
+        Some(RequestBody::Json(body)) => format!("<JSON body: {} bytes>", body.to_string().len()),
         Some(RequestBody::EncodedJson(body)) => {
-            String::from_utf8_lossy(body.trace_bytes()).into_owned()
+            format!("<encoded JSON body: {} bytes>", body.as_bytes().len())
         }
         Some(RequestBody::Raw(body)) => format!("<raw body: {} bytes>", body.len()),
         Some(RequestBody::InvalidJson(_)) => "<invalid JSON body>".to_string(),
@@ -184,8 +269,7 @@ impl HttpTransport for ReqwestTransport {
 
         let accepts_not_modified = req.headers.contains_key(IF_NONE_MATCH);
         let url = req.url.clone();
-        let builder = self.build(req)?;
-        let resp = builder.send().await.map_err(Self::map_error)?;
+        let resp = self.send(req).await?;
         let status = resp.status();
         let headers = resp.headers().clone();
         if !(status.is_success() || status == StatusCode::NOT_MODIFIED && accepts_not_modified) {
@@ -211,8 +295,7 @@ impl HttpTransport for ReqwestTransport {
         self.trace_request(&req);
 
         let url = req.url.clone();
-        let builder = self.build(req)?;
-        let resp = builder.send().await.map_err(Self::map_error)?;
+        let resp = self.send(req).await?;
         let status = resp.status();
         let headers = resp.headers().clone();
         if !status.is_success() {

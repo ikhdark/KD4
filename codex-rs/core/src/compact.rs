@@ -210,7 +210,7 @@ fn compaction_rebase_sections(previous: &str) -> Vec<usize> {
 fn compaction_rebase_prompt(sections: &[usize]) -> String {
     if sections.is_empty() { return String::new(); }
     format!(
-        "\nRebase these sections instead of appending deltas: {}. Return each as a complete refreshed state, including unchanged unresolved obligations, constraints, live handles, and indispensable evidence from ALL earlier updates. Preserve each previous Unresolved work line verbatim, either in Unresolved work or quoted in Completed work with explicit resolution evidence or the accepted user instruction authorizing supersession. This accounting is a model claim, not verified conservation. These bodies replace their previous versions. Keep the combined checkpoint within 2,400 tokens; do not omit obligations to fit.",
+        "\nRebase these sections instead of appending deltas: {}. Return each as a complete refreshed state, retaining unresolved obligations, constraints, live handles, and indispensable evidence from ALL earlier updates. Keep each previous Goal and Unresolved work line verbatim in its section, or account for it on one Completed work line: `Resolved: <exact line> Evidence: <receipt>` or `Superseded: <exact line> User instruction: <accepted instruction>`. Accounting is a model claim, not verified conservation. Replace the previous bodies. Keep the combined checkpoint within 2,400 tokens; do not omit obligations to fit.",
         sections.iter().map(|&index| COMPACTION_SECTIONS[index].0).collect::<Vec<_>>().join(", ")
     )
 }
@@ -229,6 +229,21 @@ fn compaction_update_budget_prompt(previous: &str, rebased: &[usize]) -> String 
     let remaining = COMPACT_TASK_STATE_MAX_TOKENS
         .saturating_sub(retained_tokens.saturating_add(approx_token_count("\n\n")));
     format!("\nFirst-request output budget: at most {remaining} tokens for this response, including headings and refreshed sections. The runtime retains approximately {retained_tokens} tokens of the earlier checkpoint. The 2,400-token target applies to the combined checkpoint, NOT to this update alone. Preserve obligations and qualifications; do not fill the allowance with unchanged prose.")
+}
+
+// This is an explicit accounting format, not a truth detector. Merely quoting
+// an anchor in Completed work cannot retire it; the resolution claim must name
+// its evidence (or the accepted instruction). Existing evidence owners decide
+// whether that claim is actually supported.
+fn compaction_anchor_accounted_for(completed: &str, anchor: &str) -> bool {
+    completed.lines().any(|line| {
+        let line = line.trim().trim_start_matches("- ");
+        [("Resolved:", "Evidence:"), ("Superseded:", "User instruction:")]
+            .iter().any(|(prefix, marker)| line.strip_prefix(prefix).is_some_and(|body| {
+                body.split_once(marker).is_some_and(|(claim, evidence)|
+                    claim.contains(anchor) && !evidence.trim().is_empty())
+            }))
+    })
 }
 
 fn validated_rebased_compaction_summary(
@@ -255,8 +270,42 @@ fn validated_rebased_compaction_summary(
             }
         }
     }
+    // Text quoted in Next action is not conservation of a Goal/Unresolved
+    // anchor. Retain missing anchors without dropping the new state or making
+    // a second generation. Next-action-only updates do not need this scan.
+    // Completed-work accounting remains a model claim, never authorization.
+    let mut repairs = [Vec::new(), Vec::new()];
+    if rebased.contains(&0) || rebased.contains(&3) {
+    let mut protected = [String::new(), String::new()];
+    let mut completed = String::new();
+    let mut current = None;
+    for (line, section) in checkpoint_lines(suffix) {
+        if let Some(index) = section { current = Some(index); }
+        else {
+            let target = match current { Some(0) => Some(&mut protected[0]), Some(3) => Some(&mut protected[1]), Some(2) => Some(&mut completed), _ => None };
+            if let Some(target) = target { target.push_str(line); target.push('\n'); }
+        }
+    }
+    current = None;
+    for (line, section) in checkpoint_lines(previous) {
+        if let Some(index) = section { current = Some(index); }
+        else if let Some(index @ (0 | 3)) = current
+            && rebased.contains(&index) && !line.trim().is_empty()
+            && !protected[usize::from(index == 3)].contains(line.trim())
+            && !compaction_anchor_accounted_for(&completed, line.trim())
+        { repairs[usize::from(index == 3)].push(line); }
+    }
+    }
     let retained = retained_compaction_sections(previous, rebased);
-    let combined = format!("{}\n\n{}", retained.trim(), suffix.trim());
+    let mut combined = format!("{}\n\n{}", retained.trim(), suffix.trim());
+    for (index, repair) in [0, 3].into_iter().zip(repairs) {
+        if !repair.is_empty() {
+            combined.push_str("\n\n");
+            combined.push_str(COMPACTION_SECTIONS[index].0);
+            combined.push('\n');
+            combined.push_str(&repair.join("\n"));
+        }
+    }
     // Never evict an old delta merely because unrelated updates used the
     // remaining budget. The existing corrective attempt can request a rebase.
     if approx_token_count(&combined) > COMPACT_TASK_STATE_MAX_TOKENS {
@@ -416,7 +465,9 @@ async fn run_compact_task_inner(
         return Err(error);
     }
     let mut analytics_details = CompactionAnalyticsDetails::default();
-    let result = run_compact_task_inner_impl(
+    // Keep the large compaction state machine off every enclosing turn and
+    // thread-spawn future's stack, including forked child startup.
+    let result = Box::pin(run_compact_task_inner_impl(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
         client_session,
@@ -427,7 +478,7 @@ async fn run_compact_task_inner(
         &mut analytics_details,
         emit_error_event,
         cancellation_token,
-    )
+    ))
     .await;
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
@@ -462,80 +513,88 @@ async fn run_compact_task_inner_impl(
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
     let mut history = sess.clone_history().await;
+    let task_items = task_compaction_items(history.raw_items());
     let (
         mut retained_history,
         retained_image_count,
         omitted_image_count,
         omitted_user_text,
         omitted_text,
-    ) = build_local_task_input_checkpoint(history.raw_items());
+    ) = build_bounded_input_history(&task_items, false);
     analytics_details.retained_image_count = Some(retained_image_count);
-    let text_recovery_sidecar =
-        match persist_task_compaction_text_recovery(sess.as_ref(), history.raw_items(), omitted_text)
-            .await
-        {
-            Ok(sidecar) => sidecar,
-            Err(error) => {
-                sess.track_turn_codex_error(turn_context.as_ref(), &error);
-                if emit_error_event {
-                    sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
-                        .await;
-                }
-                return Err(error);
-            }
-        };
+    let summary_items = compaction_summary_items(history.raw_items());
+    // A structurally valid summary cannot certify conservation of arbitrary
+    // free-text uncertainty. Reuse the existing recovery artifact, retaining
+    // the consumed source as well as bounded task-input omissions. This also
+    // covers custom prompts; no classifier or extra model request is needed.
     let previous_summary = latest_summary_message(history.raw_items()).map(str::to_string);
     let reuse_previous_summary = previous_summary.is_some()
         && can_reuse_previous_summary(history.raw_items(), omitted_user_text);
-    let rebase_enabled = turn_context.config.compact_prompt.is_none()
-        && previous_summary.as_deref().is_some_and(has_compaction_section);
-    let mut rebase_sections = if rebase_enabled {
-        compaction_rebase_sections(previous_summary.as_deref().unwrap_or_default())
-    } else { Vec::new() };
     // The unread tail is preserved in replacement history, not interpreted by the
     // summarizer. Remove its calls as well so normalization cannot synthesize outputs.
     // Collect recovery pins first, including references that occur only in that tail.
     let artifact_pin_payload = sess.compaction_artifact_pins(&history.tool_history_state(), history.raw_items()).await?;
-    history.replace(compaction_summary_items(history.raw_items()));
-    if previous_summary.is_some()
-        && !reuse_previous_summary
-        && let Some(prompt) =
-            incremental_summarization_prompt(turn_context.config.compact_prompt.as_deref())
-    {
-        input.push(UserInput::Text {
-            text: format!("{prompt}{}{}", compaction_rebase_prompt(&rebase_sections),
-                compaction_update_budget_prompt(previous_summary.as_deref().unwrap_or_default(), &rebase_sections)),
-            text_elements: Vec::new(),
-        });
-    }
-    let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
-    history.record_items(
-        &[initial_input_for_turn.into()],
-        turn_context.model_info.truncation_policy.into(),
-    );
-
-    let workspace_identity = workspace_identity_for_compaction(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        prefetched_workspace_identity,
-    )
-    .await;
-    let turn_input = history.for_local_compaction_prompt(
-        &turn_context.model_info.input_modalities,
-        workspace_identity.as_ref(),
-        &sess.services.git_workspace,
-    );
-    // Filter only trusted source messages, before sampling projection drops IDs.
-    let turn_input = filter_compaction_startup_envelopes(turn_input.iter().cloned());
-    let turn_input = project_stable_context(turn_input.into(), StableContextTarget::Sampling).items;
+    let source_recovery = local_compaction_source_recovery(task_items, &summary_items, omitted_text);
     let mut generated_summary_recovery = None;
-    let summary_text_result = if reuse_previous_summary {
+    // Persist source recovery while the existing summary request runs. Both
+    // must finish before publishing replacement history; cancellation cannot
+    // detach a writer or publish a checkpoint with unavailable source bytes.
+    let recovery_cancellation = cancellation_token.child_token();
+    let (text_recovery_result, summary_text_result) = tokio::join!(async {
+        let result = match source_recovery {
+            Some(source) => match source.await {
+                Ok(canonical) => persist_compaction_recovery(sess.as_ref(), canonical).await.map(Some),
+                Err(error) => Err(CodexErr::Fatal(format!("Compaction source retention failed; original history was retained: {error}"))),
+            },
+            None => Ok(None),
+        };
+        if result.is_err() { recovery_cancellation.cancel(); }
+        result
+    }, async {
+    let cancellation_token = &recovery_cancellation;
+    if reuse_previous_summary {
         let bounded = validated_compaction_summary(previous_summary.as_deref(), "", false, turn_context.config.compact_prompt.is_some())?;
         generated_summary_recovery = generated_summary_recovery_canonical(
             previous_summary.as_deref(), "", &bounded,
         );
         Ok(bounded)
     } else {
+        let rebase_enabled = turn_context.config.compact_prompt.is_none()
+            && previous_summary.as_deref().is_some_and(has_compaction_section);
+        let mut rebase_sections = if rebase_enabled {
+            compaction_rebase_sections(previous_summary.as_deref().unwrap_or_default())
+        } else { Vec::new() };
+        history.replace(summary_items);
+        if previous_summary.is_some()
+            && let Some(prompt) =
+                incremental_summarization_prompt(turn_context.config.compact_prompt.as_deref())
+        {
+            input.push(UserInput::Text {
+                text: format!("{prompt}{}{}", compaction_rebase_prompt(&rebase_sections),
+                    compaction_update_budget_prompt(previous_summary.as_deref().unwrap_or_default(), &rebase_sections)),
+                text_elements: Vec::new(),
+            });
+        }
+        let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
+        history.record_items(
+            &[initial_input_for_turn.into()],
+            turn_context.model_info.truncation_policy.into(),
+        );
+
+        let workspace_identity = workspace_identity_for_compaction(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            prefetched_workspace_identity,
+        )
+        .await;
+        let turn_input = history.for_local_compaction_prompt(
+            &turn_context.model_info.input_modalities,
+            workspace_identity.as_ref(),
+            &sess.services.git_workspace,
+        );
+        // Filter only trusted source messages, before sampling projection drops IDs.
+        let turn_input = filter_compaction_startup_envelopes(turn_input.iter().cloned());
+        let turn_input = project_stable_context(turn_input.into(), StableContextTarget::Sampling).items;
         let base_instructions = BaseInstructions {
             text: COMPACTION_BASE_INSTRUCTIONS.trim().to_string(),
         };
@@ -673,6 +732,17 @@ async fn run_compact_task_inner_impl(
                     turn_context.turn_timing_state.record_model_retry();
                 }
             }
+        }
+    }
+    });
+    let text_recovery_sidecar = match text_recovery_result {
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            sess.track_turn_codex_error(turn_context.as_ref(), &error);
+            if emit_error_event {
+                sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None))).await;
+            }
+            return Err(error);
         }
     };
     let summary_text = match summary_text_result {
@@ -870,6 +940,10 @@ fn has_compaction_section(summary: &str) -> bool {
 /// Only outer headings are checkpoint structure. Fenced/indented excerpts are
 /// evidence, even when they contain literal checkpoint headings.
 fn checkpoint_lines(summary: &str) -> impl Iterator<Item = (&str, Option<usize>)> {
+    checkpoint_lines_with_structure(summary).map(|(line, section, _)| (line, section))
+}
+
+fn checkpoint_lines_with_structure(summary: &str) -> impl Iterator<Item = (&str, Option<usize>, bool)> {
     summary.lines().scan(None::<(u8, usize)>, |fence, line| {
         let left = line.trim_start_matches(' ');
         let outer = line.len() - left.len() <= 3 && !left.starts_with('\t');
@@ -883,14 +957,14 @@ fn checkpoint_lines(summary: &str) -> impl Iterator<Item = (&str, Option<usize>)
                 None if count >= 3 => *fence = Some((marker, count)),
                 _ => {}
             }
-            return Some((line, None));
+            return Some((line, None, false));
         }
         let section = if outer && fence.is_none() {
             COMPACTION_SECTIONS.iter().position(|(heading, _)| left.trim_end() == *heading)
         } else {
             None
         };
-        Some((line, section))
+        Some((line, section, outer && fence.is_none()))
     })
 }
 
@@ -905,8 +979,9 @@ fn validate_generated_compaction_summary(
         ));
     }
 
-    if summary_suffix.contains(INCOMPLETE_CHECKPOINT_EXCERPT)
-        || summary_suffix.contains("[truncated]")
+    if (summary_suffix.contains(INCOMPLETE_CHECKPOINT_EXCERPT) || summary_suffix.contains("[truncated]"))
+        && checkpoint_lines_with_structure(summary_suffix).any(|(line, _, outer)|
+            outer && matches!(line.trim(), INCOMPLETE_CHECKPOINT_EXCERPT | "[truncated]"))
     {
         return Err(CodexErr::Fatal("compaction returned an incomplete excerpt, not a standalone checkpoint".into()));
     }
@@ -1686,9 +1761,9 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
             content.reverse();
             content.retain(|part| {
                 (role != "user" || !trusted || retain_latest_task_state_fragment(part, &mut seen_task_state))
-                && !matches!(part, ContentItem::InputText { text }
+                && !(trusted && matches!(part, ContentItem::InputText { text }
                 if text.starts_with("<codex_internal_context source=\"compaction_plan\">")
-                    || is_artifact_pin_text(text))
+                    || is_artifact_pin_text(text)))
             });
             content.reverse();
             return !content.is_empty();
@@ -1728,6 +1803,7 @@ fn build_bounded_unresolved_input_history(
     build_bounded_input_history(unresolved_compaction_items(items), false)
 }
 
+#[cfg(test)]
 fn build_local_task_input_checkpoint(
     items: &[ResponseItem],
 ) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
@@ -1737,9 +1813,10 @@ fn build_local_task_input_checkpoint(
 }
 
 fn build_bounded_input_history(
-    unresolved: Vec<ResponseItem>,
+    unresolved: impl AsRef<[ResponseItem]>,
     retain_handoff: bool,
 ) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
+    let unresolved = unresolved.as_ref();
     // Recovery stores only messages. Compute its indexes from the same input
     // before tool calls are filtered, rather than treating source indexes as
     // positions in the compact recovery array.
@@ -2141,7 +2218,32 @@ fn compaction_text_recovery_canonical(
     ))
 }
 
+fn local_compaction_source_recovery(
+    task_items: Vec<ResponseItem>,
+    summarized_items: &[ResponseItem],
+    omitted_text: bool,
+) -> Option<tokio::task::JoinHandle<CanonicalToolResult>> {
+    let has_source = summarized_items.iter().any(|item|
+        (is_compaction_model_generated_item(item) && !matches!(item, ResponseItem::Reasoning { .. }))
+            || compaction_output_call_id(item).is_some());
+    (omitted_text || has_source).then(|| {
+        let summarized_items = summarized_items.to_vec();
+        // Serialization is measurable for large consumed sources. Keep it off
+        // the async executor and overlap it with the existing model request.
+        // Only pure serialization runs here: all durable writes remain awaited
+        // by compaction before it may publish replacement history.
+        tokio::task::spawn_blocking(move ||
+            compaction_text_recovery_with_source(task_items, &summarized_items))
+    })
+}
+
 fn compaction_text_recovery_for_items(items: Vec<ResponseItem>) -> CanonicalToolResult {
+    compaction_text_recovery_with_source(items, &[])
+}
+
+fn compaction_text_recovery_with_source(
+    items: Vec<ResponseItem>, summarized_items: &[ResponseItem],
+) -> CanonicalToolResult {
     let exact_items = items
         .into_iter()
         .filter(|item| {
@@ -2151,12 +2253,23 @@ fn compaction_text_recovery_for_items(items: Vec<ResponseItem>) -> CanonicalTool
             )
         })
         .collect::<Vec<_>>();
-    CanonicalToolResult::json(serde_json::json!({
+    let mut value = serde_json::json!({
         "version": 1,
         "kind": "local_compaction_text_recovery",
         "instruction": "Recover exact unresolved text with read_tool_output and a json_pointer under /items; do not ask the user to repeat it.",
         "items": exact_items,
-    }))
+    });
+    if !summarized_items.is_empty() {
+        // Exclude private reasoning. Public assistant conclusions and tool
+        // observations remain exact, including qualifications omitted by the
+        // generated handoff. Existing /items selectors remain compatible.
+        value["summarized_items"] = serde_json::to_value(summarized_items.iter()
+            .filter(|item| !matches!(item, ResponseItem::Reasoning { .. }))
+            .collect::<Vec<_>>()).expect("response items serialize");
+        value["summary_is_lossless"] = false.into();
+        value["instruction"] = "Source archive, not an open-work checklist. Summary omission is not resolution. Recover missing decision-relevant text with read_tool_output under /summarized_items or /items; do not repeat producers or recover irrelevant history.".into();
+    }
+    CanonicalToolResult::json(value)
 }
 
 fn compaction_text_recovery_sidecar(
@@ -2164,7 +2277,7 @@ fn compaction_text_recovery_sidecar(
     artifact: &CanonicalOutputArtifact,
 ) -> Option<String> {
     let artifact_id = artifact.artifact_id()?;
-    serde_json::to_string(&serde_json::json!({
+    let mut value = serde_json::json!({
         "version": 1,
         "kind": "local_compaction_text_recovery",
         "artifact_id": artifact_id,
@@ -2173,8 +2286,13 @@ fn compaction_text_recovery_sidecar(
         "complete": artifact.complete,
         "unavailable_ranges": artifact.unavailable_ranges,
         "instruction": "Use read_tool_output with this artifact_id and json_pointer selectors under /items to recover exact omitted unresolved text; do not rerun work or ask the user to repeat it."
-    }))
-    .ok()
+    });
+    if canonical.value.as_ref().is_some_and(|value| value.get("summarized_items").is_some()) {
+        value["summary_is_lossless"] = false.into();
+        value["source_selector"] = serde_json::json!({"kind":"json_pointer", "pointer":"/summarized_items"});
+        value["instruction"] = "Generated summary completeness is unverified; omission is not resolution. Exact consumed assistant/tool text survives under /summarized_items; task input under /items. Recover only missing decision-relevant details with read_tool_output, not producers or irrelevant history.".into();
+    }
+    serde_json::to_string(&value).ok()
 }
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
@@ -2409,56 +2527,82 @@ fn append_bounded_user_messages(
     // Reserve bounded exact request/correction anchors before bulk payloads.
     // Allocation is not semantic classification: no keywords, summary call,
     // or assumption that the newest message supersedes earlier constraints.
-    let costs = user_messages.iter().map(compacted_user_message_text_tokens).collect::<Vec<_>>();
-    let mut budgets = vec![0usize; user_messages.len()];
-    let mut anchors = max_tokens / 2;
-    // Always reserve the original request before later short corrections.
-    if let Some(cost) = costs.first() {
-        let budget = (*cost).min(512).min(anchors);
-        budgets[0] = budget;
-        anchors -= budget;
-        remaining -= budget;
-    }
-    // Short exact requests/corrections take priority over excerpts of bulk
-    // payloads. Keep allocation deterministic and independent of prose.
-    let anchor_order = costs.iter().enumerate().skip(1).filter(|(_, cost)| **cost <= 512)
-        .chain(costs.iter().enumerate().skip(1).filter(|(_, cost)| **cost > 512));
-    for (index, cost) in anchor_order {
-        let budget = (*cost).min(512).min(anchors);
-        budgets[index] = budget;
-        anchors -= budget;
-        remaining -= budget;
-    }
-    for (index, cost) in costs.iter().enumerate().rev() {
-        let extra = cost.saturating_sub(budgets[index]).min(remaining);
-        budgets[index] += extra;
-        remaining -= extra;
+    let costs: Vec<(usize, usize)> = user_messages.iter().map(|message| {
+        message.content.iter().fold((0usize, 0usize), |(total, short), item| {
+            let UserInput::Text { text, .. } = item else { return (total, short) };
+            let cost = approx_token_count(text);
+            (total.saturating_add(cost), short.saturating_add(if cost <= 512 { cost } else { 0 }))
+        })
+    }).collect();
+    let fits = costs.iter().fold(0usize, |sum, (cost, _)| sum.saturating_add(*cost)) <= max_tokens;
+    let mut budgets: Vec<usize> = costs.iter().map(|(cost, _)| if fits { *cost } else { 0 }).collect();
+    if !fits {
+        // Preserve early anchors, but do not let saturated older notes consume
+        // the share reserved for recent short corrections.
+        let mut anchors = max_tokens / 2;
+        // Always reserve the original request before later short corrections.
+        if let Some((cost, _)) = costs.first() {
+            let budget = (*cost).min(512).min(anchors);
+            budgets[0] = budget;
+            anchors -= budget;
+            remaining -= budget;
+        }
+        // Short exact requests/corrections take priority over excerpts of bulk
+        // payloads. Keep allocation deterministic and independent of prose.
+        let anchor_order = costs.iter().enumerate().skip(1).filter(|(_, (cost, _))| *cost <= 512)
+            .chain(costs.iter().enumerate().skip(1).filter(|(_, (cost, _))| *cost > 512));
+        for (index, (cost, _)) in anchor_order {
+            let budget = (*cost).min(512).min(anchors);
+            budgets[index] = budget;
+            anchors -= budget;
+            remaining -= budget;
+        }
+        for (index, (_, demand)) in costs.iter().enumerate().rev() {
+            let extra = demand.saturating_sub(budgets[index]).min(remaining);
+            budgets[index] += extra;
+            remaining -= extra;
+        }
+        for (index, (cost, _)) in costs.iter().enumerate().rev() {
+            let extra = cost.saturating_sub(budgets[index]).min(remaining);
+            budgets[index] += extra;
+            remaining -= extra;
+        }
     }
     let mut retained_image_count = 0usize;
     let mut retained_image_bytes = 0usize;
     let mut omitted_image_count = 0usize;
     for (index, message) in user_messages.iter().enumerate().rev() {
         let mut remaining = budgets[index];
+        let mut short_remaining = costs[index].1;
         let mut content = Vec::new();
         for item in &message.content {
             match item {
                 UserInput::Text { text, .. } if remaining > 0 && !text.is_empty() => {
                     let tokens = approx_token_count(text);
-                    if tokens <= remaining {
+                    let allowance = if tokens <= 512 {
+                        short_remaining = short_remaining.saturating_sub(tokens);
+                        remaining
+                    } else {
+                        remaining.saturating_sub(short_remaining)
+                    };
+                    if allowance == 0 {
+                        continue;
+                    }
+                    if tokens <= allowance {
                         content.push(UserInput::Text {
                             text: text.clone(),
                             text_elements: Vec::new(),
                         });
                         remaining = remaining.saturating_sub(tokens);
                     } else {
-                        let truncated = truncate_text_to_token_ceiling(text, remaining);
+                        let truncated = truncate_text_to_token_ceiling(text, allowance);
                         if !truncated.is_empty() {
                             content.push(UserInput::Text {
                                 text: truncated,
                                 text_elements: Vec::new(),
                             });
                         }
-                        remaining = 0;
+                        remaining -= allowance;
                     }
                 }
                 UserInput::Image { image_url, detail } => {

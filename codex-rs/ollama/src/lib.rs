@@ -24,12 +24,13 @@ pub async fn ensure_oss_ready(config: &Config) -> std::io::Result<()> {
     };
 
     // Verify local Ollama is reachable; the same client serves every setup request.
-    let ollama_client = crate::OllamaClient::try_from_oss_provider(config).await?;
+    let (ollama_client, models) =
+        crate::OllamaClient::try_from_oss_provider_with_models(config).await?;
     ensure_responses_supported(&ollama_client).await?;
 
     // If the model is not present locally, pull it. A failed listing is not evidence that the
     // model is missing, so it never starts a download.
-    match ollama_client.fetch_models().await {
+    match models {
         Ok(models) => {
             if !models.iter().any(|listed| is_same_model(listed, model)) {
                 ollama_client.pull_with_cli_progress(model).await?;

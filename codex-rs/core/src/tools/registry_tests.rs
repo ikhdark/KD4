@@ -4767,3 +4767,24 @@ async fn verified10_undrained_exited_command_is_not_admitted_for_retirement() {
         assert!(consolidated_history_output_text(&response).contains("pending pipe evidence"));
     }
 }
+#[test]
+fn continuity_delivery_status_survives_output_wrappers_and_serialization() {
+    let plain = FunctionToolOutput::from_text("ok".into(), Some(true));
+    assert!(!plain.model_delivery_unavailable());
+    let unavailable: Box<dyn ToolOutput> = Box::new(UnavailableModelProjectionOutput {
+        original: Box::new(plain),
+        model_visible: FunctionToolOutput::from_text("replacement wording".into(), Some(true)),
+    });
+    assert!(unavailable.model_delivery_unavailable());
+    let wrapped = PostToolUseFeedbackOutput {
+        original: unavailable,
+        model_visible: FunctionToolOutput::from_text("hook feedback".into(), Some(true)),
+    };
+    assert!(wrapped.model_delivery_unavailable());
+    assert!(wrapped.success_for_logging());
+    let receipt = model_delivery_unavailable_receipt("call");
+    let restored = serde_json::from_str(&serde_json::to_string(&receipt).unwrap()).unwrap();
+    assert!(is_model_delivery_unavailable_receipt(&restored, "call"));
+    assert!(!is_model_delivery_unavailable_receipt(&restored, "other"));
+}
+

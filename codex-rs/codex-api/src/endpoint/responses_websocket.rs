@@ -412,7 +412,22 @@ impl ResponsesWebsocketConnection {
                 let mut guard = tokio::select! {
                     biased;
                     _ = tx_event.closed() => return,
-                    guard = stream.lock() => guard,
+                    guard = tokio::time::timeout(idle_timeout, stream.lock()) => {
+                        match guard {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                // Nothing was sent: do not retire the active connection or
+                                // turn local contention into a provider replay/fallback.
+                                let _ = tx_send_complete.send(());
+                                let _ = tx_event.send(Err(ApiError::Transport(
+                                    TransportError::PreDispatch(
+                                        "timeout waiting for websocket dispatch queue".to_string(),
+                                    ),
+                                ))).await;
+                                return;
+                            }
+                        }
+                    },
                 };
                 // Abandon queued work without invalidating an unused connection.
                 if tx_event.is_closed() {
@@ -552,7 +567,7 @@ impl ResponsesWebsocketClient {
         let ws_url = self
             .provider
             .websocket_url_for_path("responses")
-            .map_err(|err| ApiError::Stream(format!("failed to build websocket URL: {err}")))?;
+            .map_err(|err| ApiError::Transport(TransportError::Build(format!("failed to build websocket URL: {err}"))))?;
 
         let mut headers =
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
@@ -587,7 +602,7 @@ impl ResponsesWebsocketClient {
         let ws_url = self
             .provider
             .websocket_url_for_path("responses")
-            .map_err(|err| ApiError::Stream(format!("failed to build websocket URL: {err}")))?;
+            .map_err(|err| ApiError::Transport(TransportError::Build(format!("failed to build websocket URL: {err}"))))?;
 
         let mut headers =
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
@@ -683,7 +698,7 @@ async fn connect_websocket(
     let mut request = url
         .as_str()
         .into_client_request()
-        .map_err(|err| ApiError::Stream(format!("failed to build websocket request: {err}")))?;
+        .map_err(|err| ApiError::Transport(TransportError::Build(format!("failed to build websocket request: {err}"))))?;
     request.headers_mut().extend(headers);
 
     let http_client_factory = http_client_factory.clone();
@@ -693,7 +708,7 @@ async fn connect_websocket(
             .map_err(|err| {
                 ApiError::Stream(format!("websocket TLS configuration task failed: {err}"))
             })?
-            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
+            .map_err(|err| ApiError::Transport(TransportError::Build(format!("failed to configure websocket TLS: {err}"))))?
             .with_tcp_nodelay();
     let response = connector.connect(request, websocket_config()).await;
 
@@ -753,6 +768,14 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
         WsError::Tls(error) if codex_http_client::is_permanent_connection_error(&error) => ApiError::Transport(TransportError::Build(format!(
             "permanent websocket TLS configuration failure: {error}"
         ))),
+        WsError::Url(err) => ApiError::Transport(TransportError::Build(format!(
+            "invalid websocket configuration: {err}"
+        ))),
+        WsError::Io(err) if codex_http_client::is_permanent_connection_error(&err) => {
+            ApiError::Transport(TransportError::Build(format!(
+                "permanent websocket configuration failure: {err}"
+            )))
+        }
         WsError::Io(err) => ApiError::Transport(TransportError::Network(err.to_string())),
         other => ApiError::Transport(TransportError::Network(other.to_string())),
     }
@@ -891,7 +914,7 @@ async fn run_websocket_response_stream(
                             column = error.column(),
                             "failed to parse websocket event"
                         );
-                        return Err(ApiError::Stream(
+                        return Err(ApiError::invalid_response(
                             crate::responses_stream::decode_diagnostic(
                                 &format!(
                                     "failed to parse websocket event ({} payload bytes)",
@@ -906,6 +929,7 @@ async fn run_websocket_response_stream(
                 for event in events {
                     let advances = event.advances_model_response();
                     let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                    let delivery_start = Instant::now();
                     if tx_event.send(Ok(event)).await.is_err() {
                         return Err(ApiError::Stream(
                             "response event consumer dropped".to_string(),
@@ -913,6 +937,8 @@ async fn run_websocket_response_stream(
                     }
                     if advances {
                         progress_deadline = tokio::time::Instant::now() + idle_timeout;
+                    } else {
+                        progress_deadline += delivery_start.elapsed();
                     }
                     if is_completed {
                         return Ok(());
@@ -1002,6 +1028,48 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn transport_audit_permanent_setup_errors_do_not_retry() {
+        let url = Url::parse("wss://example.test/responses").unwrap();
+        for error in [
+            WsError::Url(tokio_tungstenite::tungstenite::error::UrlError::UnsupportedUrlScheme),
+            WsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid TLS name")),
+        ] {
+            assert!(!crate::map_api_error(map_ws_error(error, &url)).is_retryable());
+        }
+        let transient = WsError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"));
+        assert!(crate::map_api_error(map_ws_error(transient, &url)).is_retryable());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_audit_websocket_metadata_backpressure_preserves_deadline() {
+        let (tx_command, _commands) = mpsc::channel(1);
+        let (tx_message, rx_message) = ws_ingress_channel(4, 4096);
+        for payload in [
+            r#"{"type":"response.created","response":{"id":"same"}}"#,
+            r#"{"type":"response.created","response":{"id":"same"}}"#,
+            r#"{"type":"response.completed","response":{"id":"done"}}"#,
+        ] {
+            tx_message.try_send(Message::Text(payload.into())).unwrap();
+        }
+        let mut ws_stream = WsStream {
+            tx_command, rx_message, rx_failure: None, pending_failure: None,
+            pump_task: tokio::spawn(std::future::pending()),
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let producer = tokio::spawn(async move {
+            run_websocket_response_stream(&mut ws_stream, tx, Duration::from_millis(30),
+                None, ResponsesStreamMetadata::default(), None).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
+        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
+        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. }))));
+        producer.await.unwrap().unwrap();
+        assert!(rx.recv().await.is_none());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn websocket_progress_deadline_ignores_metadata_and_pings() {
@@ -1439,75 +1507,91 @@ mod tests {
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Hold the active response lock across cancellation to prove a queued caller cannot dispatch"
     )]
     async fn canceled_queued_request_leaves_connection_reusable_without_dispatch() {
-        let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
-        let (tx_message, rx_message) = ws_ingress_channel(2, 1024);
-        let dispatches = Arc::new(AtomicUsize::new(0));
-        let observed_dispatches = Arc::clone(&dispatches);
-        let pump_task = tokio::spawn(async move {
-            while let Some(WsCommand::Send { message, tx_result }) = rx_command.recv().await {
-                observed_dispatches.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(
-                    serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap()["model"],
-                    "live-request"
-                );
-                let _ = tx_result.send(Ok(()));
-                tx_message
-                    .try_send(Message::Text(
-                        json!({"type": "response.completed", "response": {"id": "live-response"}})
-                            .to_string()
-                            .into(),
-                    ))
-                    .unwrap();
+        for timed_out in [false, true] {
+            let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
+            let (tx_message, rx_message) = ws_ingress_channel(2, 1024);
+            let dispatches = Arc::new(AtomicUsize::new(0));
+            let observed_dispatches = Arc::clone(&dispatches);
+            let pump_task = tokio::spawn(async move {
+                while let Some(WsCommand::Send { message, tx_result }) = rx_command.recv().await {
+                    observed_dispatches.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap()["model"],
+                        "live-request"
+                    );
+                    let _ = tx_result.send(Ok(()));
+                    tx_message
+                        .try_send(Message::Text(
+                            json!({"type": "response.completed", "response": {"id": "live-response"}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .unwrap();
+                }
+            });
+            let connection = ResponsesWebsocketConnection::new(
+                WsStream {
+                    tx_command,
+                    rx_message,
+                    rx_failure: None,
+                    pending_failure: None,
+                    pump_task,
+                },
+                Duration::from_millis(50),
+                ResponsesStreamMetadata::default(),
+                None,
+            );
+            // Hold the same lock an active response owns while another request queues.
+            let guard = connection.stream.lock().await;
+            let abandoned_request = test_response_request("abandoned-request");
+            let mut abandoned = Box::pin(connection.stream_request(abandoned_request, true, None));
+            assert!(futures::poll!(&mut abandoned).is_pending());
+            tokio::task::yield_now().await;
+            if timed_out {
+                let mut response =
+                    tokio::time::timeout(Duration::from_millis(75), &mut abandoned)
+                .await
+                .expect("queued request must have its own deadline")
+                .expect("queue error is delivered through the response stream");
+                let error = response.next().await.unwrap().unwrap_err();
+                assert!(matches!(&error, ApiError::Transport(TransportError::PreDispatch(message))
+                    if message == "timeout waiting for websocket dispatch queue"));
+                assert!(!crate::api_bridge::map_api_error(error).is_retryable());
+                assert!(response.next().await.is_none());
+                assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+                assert!(!connection.retired.load(Ordering::Acquire));
             }
-        });
-        let connection = ResponsesWebsocketConnection::new(
-            WsStream {
-                tx_command,
-                rx_message,
-                rx_failure: None,
-                pending_failure: None,
-                pump_task,
-            },
-            Duration::from_secs(60),
-            ResponsesStreamMetadata::default(),
-            None,
-        );
-        // Hold the same lock an active response owns while another request queues.
-        let guard = connection.stream.lock().await;
-        let abandoned_request = test_response_request("abandoned-request");
-        let mut abandoned = Box::pin(connection.stream_request(abandoned_request, true, None));
-        assert!(futures::poll!(&mut abandoned).is_pending());
-        tokio::task::yield_now().await;
-        drop(abandoned);
-        drop(guard);
+            drop(abandoned);
+            drop(guard);
 
-        let mut live = tokio::time::timeout(
-            Duration::from_secs(1),
-            connection.stream_request(test_response_request("live-request"), true, None),
-        )
-        .await
-        .expect("live request must acquire the reusable connection")
-        .unwrap();
-        assert!(
-            matches!(live.next().await, Some(Ok(ResponseEvent::RateLimits(snapshot)))
-            if snapshot.limit_id.as_deref() == Some("codex"))
-        );
-        let event = tokio::time::timeout(Duration::from_secs(1), live.next())
+            let mut live = tokio::time::timeout(
+                Duration::from_secs(1),
+                connection.stream_request(test_response_request("live-request"), true, None),
+            )
             .await
-            .unwrap()
-            .unwrap()
+            .expect("live request must acquire the reusable connection")
             .unwrap();
-        assert!(
-            matches!(event, ResponseEvent::Completed { response_id, .. } if response_id == "live-response")
-        );
-        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
-        assert!(!connection.is_closed().await);
+            assert!(
+                matches!(live.next().await, Some(Ok(ResponseEvent::RateLimits(snapshot)))
+                if snapshot.limit_id.as_deref() == Some("codex"))
+            );
+            let event = tokio::time::timeout(Duration::from_secs(1), live.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(event, ResponseEvent::Completed { response_id, .. } if response_id == "live-response")
+            );
+            assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+            assert!(!connection.is_closed().await);
+        }
     }
 
     #[tokio::test]
@@ -1849,8 +1933,9 @@ mod tests {
             .await
             .expect_err("protocol error should terminate before completion");
 
-            match error {
-                ApiError::Stream(message) => {
+            match &error {
+                ApiError::ProviderFailure { code, message } => {
+                    assert_eq!(code.as_deref(), Some("invalid_response"));
                     assert!(
                         message.contains("response.output_item.done")
                             || message.contains("failed to parse websocket event"),
@@ -1863,6 +1948,7 @@ mod tests {
                 }
                 other => panic!("unexpected error for {case}: {other:?}"),
             }
+            assert!(!crate::api_bridge::map_api_error(error).is_retryable());
             assert!(
                 rx_event.recv().await.is_none(),
                 "case {case} emitted a response event"
@@ -2299,5 +2385,41 @@ mod tests {
             merged.get("x-default-only"),
             Some(&HeaderValue::from_static("default-only"))
         );
+    }
+    #[tokio::test(start_paused = true)]
+    #[ignore = "local websocket backpressure benchmark"]
+    async fn latency_edge_benchmark() {
+        let (tx_command, _rx_command) = mpsc::channel(1);
+        let (tx_message, rx_message) = ws_ingress_channel(4, 4096);
+        for payload in [
+            r#"{"type":"response.created","response":{}}"#,
+            r#"{"type":"response.created","response":{}}"#,
+            r#"{"type":"response.completed","response":{"id":"done"}}"#,
+        ] {
+            tx_message.try_send(Message::Text(payload.into())).unwrap();
+        }
+        let mut ws_stream = WsStream {
+            tx_command, rx_message, rx_failure: None, pending_failure: None,
+            pump_task: tokio::spawn(std::future::pending()),
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let consumer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut completed = false;
+            while let Some(event) = rx.recv().await {
+                completed |= matches!(event, Ok(ResponseEvent::Completed { .. }));
+            }
+            completed
+        });
+        let result = run_websocket_response_stream(&mut ws_stream, tx, Duration::from_millis(50),
+            None, ResponsesStreamMetadata::default(), None).await;
+        let completed = consumer.await.unwrap();
+        let result = format!("latency_edge websocket: blocked_consumer_ms=100 progress_budget_ms=50 success={} completed={completed}\n", result.is_ok());
+        eprint!("{result}");
+        if let Some(path) = std::env::var_os("KD4_TRANSPORT_EDGE_OUTPUT") {
+            use std::io::Write;
+            std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
+                .write_all(result.as_bytes()).unwrap();
+        }
     }
 }

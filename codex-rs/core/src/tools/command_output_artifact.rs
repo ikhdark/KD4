@@ -1304,14 +1304,14 @@ pub(crate) async fn sync_tool_output_artifacts(
         if STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST.swap(0, Ordering::AcqRel) != 0 {
             return Err(std::io::Error::other("injected artifact barrier sync failure"));
         }
-        for (path, _) in &pending {
+        sync_artifact_files(&pending, |path| {
             match std::fs::OpenOptions::new().read(true).write(true).open(path) {
-                Ok(file) => file.sync_all()?,
+                Ok(file) => file.sync_all(),
                 // Retention may already have removed an unreferenced artifact.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                Err(error) => return Err(error),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
             }
-        }
+        })?;
         sync_directory(&directory)?;
         let mut registry = lock_retention_registry();
         for (path, sequence) in pending {
@@ -1321,6 +1321,30 @@ pub(crate) async fn sync_tool_output_artifacts(
         }
         Ok(())
     }).await
+}
+
+/// Keep file fsyncs inside the blocking barrier, with bounded parallelism. The
+/// scope joins every worker even on error, before directory sync or acknowledgement.
+fn sync_artifact_files(
+    pending: &[(PathBuf, u64)],
+    sync_file: impl Fn(&Path) -> std::io::Result<()> + Sync,
+) -> std::io::Result<()> {
+    const MAX_CONCURRENT_SYNCS: usize = 8;
+    if pending.len() <= 1 {
+        return pending.iter().try_for_each(|(path, _)| sync_file(path));
+    }
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for chunk in pending.chunks(pending.len().div_ceil(MAX_CONCURRENT_SYNCS)) {
+            let sync_file = &sync_file;
+            workers.push(std::thread::Builder::new().spawn_scoped(scope, move || {
+                chunk.iter().try_for_each(|(path, _)| sync_file(path))
+            })?);
+        }
+        workers.into_iter().try_for_each(|worker| {
+            worker.join().map_err(|_| std::io::Error::other("artifact sync worker panicked"))?
+        })
+    })
 }
 
 #[cfg(test)]

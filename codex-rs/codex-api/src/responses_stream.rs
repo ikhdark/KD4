@@ -132,7 +132,7 @@ impl ResponsesEventInterpreter {
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Self {
         Self {
-            last_server_model: None,
+            last_server_model: metadata.server_model.clone(),
             safety_buffering_treatment: metadata.safety_buffering_treatment.clone(),
             turn_state,
             events: Vec::new(),
@@ -259,15 +259,6 @@ impl From<serde_json::Error> for ResponsesEventError {
 struct Error {
     code: Option<String>,
     message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseCompleted {
-    id: String,
-    #[serde(default)]
-    usage: Option<Value>,
-    #[serde(default)]
-    end_turn: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -659,23 +650,28 @@ fn process_responses_event(
         }
         "response.completed" => {
             let response = event.response.ok_or_else(|| {
-                ResponsesEventError::Api(ApiError::Stream(
-                    "response.completed event missing response".into(),
+                ResponsesEventError::Api(ApiError::invalid_response(
+                    "response.completed event missing response",
                 ))
             })?;
-            let response = serde_json::from_value::<ResponseCompleted>(serde_json::json!({
-                "id": response.id, "end_turn": response.end_turn, "usage": response.usage
-            }))
+            // Decode only the required fields. Rebuilding a JSON object here
+            // clones optional usage trees and the response id on every completion.
+            let (response_id, end_turn) = (|| -> serde_json::Result<(String, Option<bool>)> {
+                Ok((
+                    serde_json::from_value(response.id.unwrap_or(Value::Null))?,
+                    serde_json::from_value(response.end_turn.unwrap_or(Value::Null))?,
+                ))
+            })()
             .map_err(|error| {
-                ResponsesEventError::Api(ApiError::Stream(decode_diagnostic(
+                ResponsesEventError::Api(ApiError::invalid_response(decode_diagnostic(
                     "failed to parse ResponseCompleted",
                     &error,
                 )))
             })?;
             return Ok(Some(ResponseEvent::Completed {
-                response_id: response.id,
+                response_id,
                 token_usage: parse_usage(response.usage),
-                end_turn: response.end_turn,
+                end_turn,
             }));
         }
         "response.output_item.added" => {
@@ -701,7 +697,7 @@ fn parse_required_response_item(
     let item = item.ok_or_else(|| {
         let message = format!("{event_kind} event missing item");
         debug!("{message}");
-        ResponsesEventError::Api(ApiError::Stream(message))
+        ResponsesEventError::Api(ApiError::invalid_response(message))
     })?;
     serde_json::from_value(item).map_err(|error| {
         let message = decode_diagnostic(
@@ -709,7 +705,7 @@ fn parse_required_response_item(
             &error,
         );
         debug!("{message}");
-        ResponsesEventError::Api(ApiError::Stream(message))
+        ResponsesEventError::Api(ApiError::invalid_response(message))
     })
 }
 
@@ -775,6 +771,39 @@ mod tests {
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn transport_audit_initial_model_is_not_reemitted() {
+        let metadata = ResponsesStreamMetadata::from_headers(&HeaderMap::from_iter([
+            (HeaderName::from_static(OPENAI_MODEL_HEADER), HeaderValue::from_static("initial")),
+        ]));
+        let mut interpreter = ResponsesEventInterpreter::new(&metadata, None);
+        assert_eq!(interpreter.process_payload(
+            r#"{"type":"response.metadata","headers":{"openai-model":"initial"}}"#
+        ).unwrap().count(), 0);
+        let events = interpreter.process_payload(
+            r#"{"type":"response.metadata","headers":{"openai-model":"changed"}}"#
+        ).unwrap().collect::<Vec<_>>();
+        assert!(matches!(events.as_slice(), [ResponseEvent::ServerModel(model)] if model == "changed"));
+    }
+
+    #[test]
+    fn transport_audit_item_fields_and_completion_moves_identity() {
+        let payload = r#"{"type":"response.output_item.done","item":{"type":"function_call","name":"test","call_id":"call","arguments":"{\"text\":\"hello\"}"}}"#;
+        let event: ResponsesStreamEvent<'_> = serde_json::from_str(payload).unwrap();
+        assert!(matches!(process_responses_event(event).unwrap(),
+            Some(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { name, arguments, .. }))
+            if name == "test" && arguments == r#"{"text":"hello"}"#));
+
+        let event: ResponsesStreamEvent<'_> = serde_json::from_str(
+            r#"{"type":"response.completed","response":{"id":"owned-identity","end_turn":true}}"#
+        ).unwrap();
+        let id_allocation = event.response.as_ref().unwrap().id.as_ref().unwrap().as_str().unwrap().as_ptr();
+        let Some(ResponseEvent::Completed { response_id, end_turn, .. }) =
+            process_responses_event(event).unwrap() else { panic!("completion"); };
+        assert_eq!(response_id.as_ptr(), id_allocation);
+        assert_eq!(end_turn, Some(true));
+    }
 
     #[test]
     fn tool_input_delta_moves_owned_item_id() {
@@ -1199,7 +1228,8 @@ mod tests {
                     .expect_err("known output-item event should reject an unusable item");
 
                 match error {
-                    ResponsesEventError::Api(ApiError::Stream(message)) => {
+                    ResponsesEventError::Api(ApiError::ProviderFailure { code, message }) => {
+                        assert_eq!(code.as_deref(), Some("invalid_response"));
                         assert!(message.contains(event_kind), "case {case}: {message}");
                     }
                     other => panic!("unexpected error for {event_kind} {case}: {other:?}"),

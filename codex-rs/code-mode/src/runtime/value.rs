@@ -318,6 +318,11 @@ pub(super) fn value_to_error_text(
         .map(|stack| bounded_string(&mut tc, stack, MAX_NOTIFICATION_BYTES)
             .unwrap_or_else(|_| "[error stack exceeds 1 MiB]".to_string()))
         .unwrap_or_else(|| value.to_rust_string_lossy(&tc));
+    if text.lines().next().is_some_and(|line| {
+        line.starts_with("TypeError: ") && line.ends_with(".index is not a function")
+    }) {
+        text.push_str("\nHint: JavaScript strings use .indexOf(value), not Python's .index(value); a missing match returns -1.");
+    }
     // Uncaught helper failures must carry their settled receipts through the
     // existing canonical cell-output artifact, not just the small nested-call
     // fallback. Do not run this on successful results or emit extra tool calls.

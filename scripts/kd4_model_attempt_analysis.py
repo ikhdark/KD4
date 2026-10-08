@@ -29,7 +29,10 @@ RECONCILIATION_TOLERANCE_BYTES = 256.0
 def percentile(values: Sequence[float], fraction: float) -> float:
     if not values:
         raise ValueError("percentile requires at least one value")
-    ordered = sorted(values)
+    return _percentile_from_ordered(sorted(values), fraction)
+
+
+def _percentile_from_ordered(ordered: Sequence[float], fraction: float) -> float:
     position = (len(ordered) - 1) * fraction
     lower = int(position)
     upper = min(lower + 1, len(ordered) - 1)
@@ -272,7 +275,9 @@ def _stable_context_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]
         local_reused_bytes += (
             attempt_reused_bytes if reported_reused is None else reported_reused
         )
-        reported_hits = _number(record.get("component_cache_hits"))
+        reported_hits = _number(record.get("local_component_reuse_count"))
+        if reported_hits is None:
+            reported_hits = _number(record.get("component_cache_hits"))
         component_cache_hits += (
             attempt_cache_hits if reported_hits is None else reported_hits
         )
@@ -359,10 +364,97 @@ def spearman(values_x: Sequence[float], values_y: Sequence[float]) -> float | No
 
 
 def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
+    ordered = sorted(values)
     return {
         "count": len(values),
-        "p50": round(percentile(values, 0.50), 3) if values else None,
-        "p95": round(percentile(values, 0.95), 3) if values else None,
+        "p50": round(_percentile_from_ordered(ordered, 0.50), 3) if ordered else None,
+        "p95": round(_percentile_from_ordered(ordered, 0.95), 3) if ordered else None,
+    }
+
+
+def _timing_error(record: dict[str, Any]) -> str | None:
+    # Actionable and visible output are independent milestones: visible reasoning
+    # can precede a complete tool call, and tool arguments need not be visible.
+    chain = (
+        "dispatch_ready_us", "stream_established_us", "first_provider_event_us",
+        "first_model_output_us", "completed_us",
+    )
+    fields = (*chain, "first_actionable_output_us", "first_visible_output_us")
+    offsets = {field: _number(record.get(field)) for field in fields}
+    if any(record.get(field) is not None and offsets[field] is None for field in fields):
+        return "invalid_timing_value"
+    observed = [offsets[field] for field in chain if offsets[field] is not None]
+    if any(left > right for left, right in zip(observed, observed[1:])):
+        return "invalid_timing_order"
+    for field in ("first_actionable_output_us", "first_visible_output_us"):
+        value = offsets[field]
+        if value is None:
+            continue
+        if any(offsets[start] is not None and offsets[start] > value for start in chain[:-1]):
+            return "invalid_timing_order"
+        if offsets["completed_us"] is not None and value > offsets["completed_us"]:
+            return "invalid_timing_order"
+    return None
+
+
+def _phase_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Physical-attempt diagnostics independent of usage and terminal success."""
+    dimensions = (
+        "provider", "model", "service_tier", "transport", "connection_reused",
+        "request_kind", "generation_purpose", "generation_disposition", "outcome",
+    )
+    direct = ("request_construction_us", "queue_us", "connection_setup_us", "transport_us")
+    intervals = {
+        "dispatchToFirstProviderEventUs": ("dispatch_ready_us", "first_provider_event_us"),
+        "dispatchToFirstModelOutputUs": ("dispatch_ready_us", "first_model_output_us"),
+        "dispatchToFirstActionableOutputUs": ("dispatch_ready_us", "first_actionable_output_us"),
+        "dispatchToFirstVisibleOutputUs": ("dispatch_ready_us", "first_visible_output_us"),
+        "dispatchToCompletionUs": ("dispatch_ready_us", "completed_us"),
+        "firstModelOutputToCompletionUs": ("first_model_output_us", "completed_us"),
+    }
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault(tuple(record.get(field) for field in dimensions), []).append(record)
+    groups = []
+    for key, members in sorted(grouped.items(), key=lambda item: tuple(map(str, item[0]))):
+        samples: dict[str, list[float]] = {field: [] for field in (*direct, *intervals)}
+        invalid_offsets = 0
+        for record in members:
+            for field in direct:
+                value = _number(record.get(field))
+                if value is not None:
+                    samples[field].append(value)
+            if _timing_error(record) is not None:
+                invalid_offsets += 1
+                continue
+            for field, (start, end) in intervals.items():
+                left, right = _number(record.get(start)), _number(record.get(end))
+                if left is not None and right is not None:
+                    samples[field].append(right - left)
+        groups.append({
+            **dict(zip(dimensions, key)),
+            "physicalAttemptCount": len(members),
+            "invalidOffsetAttempts": invalid_offsets,
+            "metrics": {
+                field: {**_distribution(values), "unavailableCount": len(members) - len(values)}
+                for field, values in samples.items()
+            },
+        })
+    return {
+        "scope": "physical attempts; outcomes and connection cohorts separated; usage not required",
+        "interpretation": (
+            "Client-observed intervals, not server inference phases. First model output may be "
+            "reasoning or tool arguments; visible output means forwarded to the consumer, not UI paint. "
+            "The output-to-completion tail includes buffering, network and consumer backpressure. "
+            "Transport includes connection setup and must not be added to it. Missing values are not zero."
+        ),
+        "serverPrefillUs": None,
+        "serverDecodeTokensPerSecond": None,
+        "unavailableReason": (
+            "No server phase boundaries or per-attempt output-token count in codex.model_attempt; "
+            "client timestamps cannot isolate queueing, prefill or decode."
+        ),
+        "groups": groups,
     }
 
 
@@ -445,6 +537,9 @@ def analyze(
         terminal_decision_latency_us: float | None = None
         if reason is None:
             for index, attempt in enumerate(attempts):
+                reason = _timing_error(attempt)
+                if reason is not None:
+                    break
                 dispatch_ready_us = _number(attempt.get("dispatch_ready_us"))
                 terminal = index == len(attempts) - 1
                 endpoint_field = (
@@ -495,6 +590,9 @@ def analyze(
             "generation_disposition": record.get("generation_disposition"),
             "relevant_state_fingerprint": record.get("relevant_state_fingerprint"),
             "model": record.get("model"),
+            "provider": record.get("provider"),
+            "service_tier": record.get("service_tier"),
+            "connection_reused": record.get("connection_reused"),
             "transport": record.get("transport"),
             "request_kind": record.get("request_kind"),
             "input_token_count": record["input_token_count"],
@@ -522,7 +620,7 @@ def analyze(
         rows.append(row)
         included_physical_attempts += len(attempts)
 
-    members_by_group: dict[tuple[Any, Any, Any, Any, Any], list[dict[str, Any]]] = {}
+    members_by_group: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in rows:
         # Keep observed terminal evidence, but do not mix incomplete retry
         # sequences into the clean latency distributions and correlations.
@@ -534,6 +632,9 @@ def analyze(
             row["request_kind"],
             row["generation_purpose"],
             row["generation_disposition"],
+            row["provider"],
+            row["service_tier"],
+            row["connection_reused"],
         )
         members_by_group.setdefault(key, []).append(row)
     groups: list[dict[str, Any]] = []
@@ -560,6 +661,9 @@ def analyze(
                 "requestKind": key[2],
                 "generationPurpose": key[3],
                 "generationDisposition": key[4],
+                "provider": key[5],
+                "serviceTier": key[6],
+                "connectionReused": key[7],
                 "sampleCount": len(members),
                 "decisionLatencyUs": _distribution(
                     [float(row["decision_latency_us"]) for row in members]
@@ -654,6 +758,7 @@ def analyze(
             "residualBytes": _distribution(residuals),
         },
         "stableContext": _stable_context_summary(records),
+        "phaseTiming": _phase_summary(records),
         "rows": rows,
     }
 
@@ -681,7 +786,9 @@ def render(analysis: dict[str, Any]) -> str:
         latency = group["decisionLatencyUs"]
         lines.append(
             f"{group['model']} / {group['transport']} / {group['requestKind']} / "
-            f"{group['generationPurpose']} / {group['generationDisposition']}: "
+            f"{group['generationPurpose']} / {group['generationDisposition']} / "
+            f"provider={group['provider']} tier={group['serviceTier']} "
+            f"connection_reused={group['connectionReused']}: "
             f"n={group['sampleCount']} decision-latency-us "
             f"p50={latency['p50']} p95={latency['p95']}"
         )
@@ -710,6 +817,10 @@ def render(analysis: dict[str, Any]) -> str:
     lines.append(
         "Provider queueing, cache lookup, prefill execution, and generation startup are not separately observable."
     )
+    phases = analysis["phaseTiming"]
+    lines.extend((phases["scope"], phases["interpretation"], phases["unavailableReason"]))
+    for group in phases["groups"]:
+        lines.append("physical-attempt phases: " + json.dumps(group, sort_keys=True))
     stable = analysis["stableContext"]
     lines.append(
         "stable context: "

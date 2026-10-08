@@ -356,6 +356,26 @@ fn structured_compiler_summary_with_streams(
         return None;
     }
     let mut diagnostics = Vec::new();
+    // A bounded directory of evicted groups, not another diagnostic body.
+    // Build selectors only for these few omissions against canonical bytes.
+    let mut omitted_groups = Vec::new();
+    let record_omission = |groups: &mut Vec<serde_json::Value>, item: &serde_json::Value| {
+        if groups.len() == 8 { return; }
+        let Some(line) = item["source_line"].as_u64() else { return; };
+        let mut group = serde_json::json!({"source_line":line,
+            "recovery_selector":recovery_selector(line as usize)});
+        if let Some(package) = item["package_id"].as_str().filter(|id| id.len() <= 512) {
+            group["package_id"] = package.into();
+        }
+        if let Some(span) = item["diagnostic"]["spans"].as_array().and_then(|spans|
+            spans.iter().find(|span| span["is_primary"] == true).or_else(|| spans.first()))
+            && let Some(file) = span["file_name"].as_str().filter(|file| file.len() <= 256)
+            && let Some(line) = span["line_start"].as_u64()
+        {
+            group["location"] = serde_json::json!({"file":file, "line":line});
+        }
+        groups.push(group);
+    };
     // Evict the latest lowest-priority complete group. This keeps actionable
     // errors ahead of warning floods and preserves source order within ties.
     let lowest_priority_index = |diagnostics: &[serde_json::Value]| {
@@ -389,8 +409,21 @@ fn structured_compiler_summary_with_streams(
         }
         let mut record: serde_json::Value = serde_json::from_str(line).ok()?;
         records += 1;
+        // Relative diagnostic spans belong to a Cargo package/target. These
+        // already-parsed discriminators must survive removal of the envelope.
+        let mut package_id = None;
+        let mut target = None;
         let diagnostic = match record["reason"].as_str() {
-            Some("compiler-message") => record.get_mut("message")?,
+            Some("compiler-message") => {
+                let object = record.as_object_mut()?;
+                package_id = object.remove("package_id");
+                target = object.remove("target").and_then(|mut value| {
+                    value.as_object_mut()?.retain(|key, _|
+                        matches!(key.as_str(), "name" | "kind" | "src_path"));
+                    Some(value)
+                });
+                object.get_mut("message")?
+            }
             Some("compiler-artifact" | "build-script-executed") => continue,
             Some("build-finished") => {
                 // A later success cannot erase an earlier failed build.
@@ -418,7 +451,10 @@ fn structured_compiler_summary_with_streams(
         if let Some(code) = diagnostic.get_mut("code").and_then(serde_json::Value::as_object_mut) {
             code.remove("explanation");
         }
-        let mut item = serde_json::json!({"source_line": index + 1, "diagnostic": diagnostic});
+        let mut item = serde_json::json!({"source_line": index + 1});
+        item["diagnostic"] = std::mem::take(diagnostic);
+        if let Some(package_id) = package_id { item["package_id"] = package_id; }
+        if let Some(target) = target { item["target"] = target.into(); }
         if item.to_string().len() > SUMMARY_MAX_BYTES / 2
             && compact_compiler_diagnostic(&mut item["diagnostic"])
         {
@@ -427,13 +463,14 @@ fn structured_compiler_summary_with_streams(
         }
         diagnostics.push(item);
         if diagnostics.len() > MAX_DIAGNOSTIC_GROUPS {
-            diagnostics.remove(lowest_priority_index(&diagnostics)?);
+            let removed = diagnostics.remove(lowest_priority_index(&diagnostics)?);
+            record_omission(&mut omitted_groups, &removed);
             omitted += 1;
         }
     }
     if total == 0 { return None; }
     loop {
-        let summary = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "format": "compiler_diagnostics",
             "exit_code": exit_code,
             "timed_out": timed_out,
@@ -451,10 +488,31 @@ fn structured_compiler_summary_with_streams(
             "stderr": stderr,
             "projection": "Redundant rendered text, code explanations and build artifacts omitted. details_omitted marks abbreviated prose/excerpts or omitted children without locations or fixes. Omitted whole diagnostics may include locations and fixes; recover them with recovery_selector against the retained aggregate bytes.",
             "recovery_selector": (omitted > 0).then(|| serde_json::json!({"kind":"bytes", "start":0, "end":output.len()})),
-            "diagnostics": diagnostics,
-        }).to_string();
+            "diagnostics": null,
+        });
+        // Serialize the retained tree without cloning every span and child on
+        // each budget retry, then restore ownership for possible compaction.
+        envelope["diagnostics"] = std::mem::take(&mut diagnostics).into();
+        let mut summary_bytes = Vec::with_capacity(output.len().min(1_024));
+        serde_json::to_writer(&mut summary_bytes, &envelope).ok()?;
+        let mut summary = String::from_utf8(summary_bytes).ok()?;
+        diagnostics = std::mem::take(envelope["diagnostics"].as_array_mut()?);
         if summary.len() <= SUMMARY_MAX_BYTES && token_limit.is_none_or(|limit|
             !codex_utils_string::approx_token_count_exceeds(&summary, limit)) {
+            // Spend spare space only: selectors never evict an actionable
+            // diagnostic, enlarge the budget, or replace whole-log recovery.
+            while !omitted_groups.is_empty() {
+                let extra = serde_json::json!({"omitted_diagnostic_groups":omitted_groups,
+                    "unlisted_omitted_diagnostic_groups":omitted - omitted_groups.len()}).to_string();
+                let candidate = format!("{},{}", &summary[..summary.len() - 1], &extra[1..]);
+                if candidate.len() <= SUMMARY_MAX_BYTES && token_limit.is_none_or(|limit|
+                    !codex_utils_string::approx_token_count_exceeds(&candidate, limit))
+                {
+                    summary = candidate;
+                    break;
+                }
+                omitted_groups.pop();
+            }
             return (summary.len() < output.len()).then_some(summary);
         }
         let index = lowest_priority_index(&diagnostics)?;
@@ -467,7 +525,8 @@ fn structured_compiler_summary_with_streams(
             item["recovery_selector"] = recovery_selector(item["source_line"].as_u64()? as usize);
             continue;
         }
-        diagnostics.remove(index);
+        let removed = diagnostics.remove(index);
+        record_omission(&mut omitted_groups, &removed);
         omitted += 1;
     }
 }
@@ -485,10 +544,7 @@ fn compact_compiler_diagnostic(diagnostic: &mut serde_json::Value) -> bool {
     }
     if let Some(spans) = diagnostic.get_mut("spans").and_then(serde_json::Value::as_array_mut) {
         for span in spans {
-            if let Some(span) = span.as_object_mut() {
-                changed |= span.remove("text").is_some();
-                changed |= span.remove("expansion").is_some();
-            }
+            changed |= compact_compiler_span(span);
         }
     }
     if let Some(children) = diagnostic.get_mut("children").and_then(serde_json::Value::as_array_mut) {
@@ -496,13 +552,34 @@ fn compact_compiler_diagnostic(diagnostic: &mut serde_json::Value) -> bool {
             changed |= compact_compiler_diagnostic(child);
         }
     }
-    if diagnostic.to_string().len() > SUMMARY_MAX_BYTES / 2 {
+    if diagnostic["children"].as_array().is_some_and(|children| !children.is_empty())
+        && diagnostic.to_string().len() > SUMMARY_MAX_BYTES / 2
+    {
         if let Some(children) = diagnostic.get_mut("children").and_then(serde_json::Value::as_array_mut)
             && !children.is_empty()
         {
             let before = children.len();
             children.retain(compiler_diagnostic_has_locations);
             changed |= children.len() != before;
+        }
+    }
+    changed
+}
+
+fn compact_compiler_span(span: &mut serde_json::Value) -> bool {
+    let Some(span) = span.as_object_mut() else { return false; };
+    let mut changed = span.remove("text").is_some();
+    if let Some(expansion) = span.get_mut("expansion").and_then(serde_json::Value::as_object_mut) {
+        // Expansion spans identify the invocation and definition, not merely
+        // generated source. Bound prose while preserving that location chain.
+        if let Some(name) = expansion.get_mut("macro_decl_name")
+            && let Some(text) = name.as_str().filter(|text| text.len() > 256)
+        {
+            *name = summarize_oversized_line(text, 256).into_owned().into();
+            changed = true;
+        }
+        for key in ["span", "def_site_span"] {
+            if let Some(span) = expansion.get_mut(key) { changed |= compact_compiler_span(span); }
         }
     }
     changed
@@ -747,13 +824,13 @@ struct LineClassification {
 }
 
 pub(crate) fn is_critical_output_line(line: &str) -> bool {
-    classify_line(line).critical
+    critical_line(line, diagnostic_line_start(line))
 }
 
-fn classify_line(line: &str) -> LineClassification {
-    let trimmed = line.trim_start();
-    LineClassification {
-        critical: starts_with_diagnostic_label_ascii_case(trimmed, "error")
+fn critical_line(line: &str, trimmed: &str) -> bool {
+    trimmed.starts_with("Traceback (most recent call last):")
+            || is_python_exception_line(trimmed)
+            || starts_with_diagnostic_label_ascii_case(trimmed, "error")
             || starts_with_diagnostic_label_ascii_case(trimmed, "failed")
             || starts_with_diagnostic_label_ascii_case(trimmed, "failure")
             || starts_with_diagnostic_label_ascii_case(trimmed, "panic")
@@ -772,14 +849,23 @@ fn classify_line(line: &str) -> LineClassification {
             || contains_ascii_case(line, "test result: failed")
             || starts_with_ascii_case(trimmed, "panicked at ")
             || contains_ascii_case(line, " panicked at ")
-            || contains_ascii_case(line, " error:")
+            || find_ascii_case(line, " error:").is_some_and(|start| {
+                let prefix = line[..start].trim();
+                prefix.ends_with(':') || prefix.eq_ignore_ascii_case("compiler")
+            })
             // TypeScript diagnostics use "error TS<digits>:" after a location.
             || find_ascii_case(line, "error ts").is_some_and(|start| {
                 line[start + "error ts".len()..].split_once(':').is_some_and(|(number, _)| {
                     !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
                 })
             })
-            || contains_ascii_case(line, "npm err!"),
+            || contains_ascii_case(line, "npm err!")
+}
+
+fn classify_line(line: &str) -> LineClassification {
+    let trimmed = diagnostic_line_start(line);
+    LineClassification {
+        critical: critical_line(line, trimmed),
         advisory: contains_word_ascii_case(line, "warning")
             || trimmed.starts_with("-->")
             || starts_with_ascii_case(trimmed, "note:")
@@ -800,6 +886,23 @@ fn classify_line(line: &str) -> LineClassification {
             || starts_with_ascii_case(trimmed, "summary:")
             || starts_with_ascii_case(trimmed, "summary ["),
     }
+}
+
+fn diagnostic_line_start(line: &str) -> &str {
+    let mut text = line.trim_start();
+    while let Some(rest) = text.strip_prefix("\x1b[") {
+        let Some(end) = rest.bytes().position(|byte| !(byte.is_ascii_digit() || matches!(byte, b';' | b':')))
+            .filter(|&end| rest.as_bytes()[end] == b'm') else { break; };
+        text = rest[end + 1..].trim_start();
+    }
+    text
+}
+
+fn is_python_exception_line(line: &str) -> bool {
+    let Some((name, _)) = line.split_once(':') else { return false; };
+    (name.ends_with("Error") || name.ends_with("Exception")
+        || matches!(name, "KeyboardInterrupt" | "SystemExit"))
+        && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
 }
 
 fn contains_word_ascii_case(line: &str, word: &str) -> bool {
@@ -862,14 +965,17 @@ struct LineSelection {
 }
 
 fn progress_line_key(line: &str) -> Option<String> {
+    if !(contains_word_ascii_case(line, "elapsed")
+        || contains_word_ascii_case(line, "progress"))
+        || !line.bytes().any(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
     let kind = classify_line(line);
     // Never normalize diagnostic identities, file inventories, or JSON records.
     if kind.critical || kind.advisory || kind.status
         || (line.trim_start().starts_with(['{', '['])
             && serde_json::from_str::<serde_json::Value>(line).is_ok())
-        || !(contains_word_ascii_case(line, "elapsed")
-            || contains_word_ascii_case(line, "progress"))
-        || !line.bytes().any(|byte| byte.is_ascii_digit())
     {
         return None;
     }
@@ -879,8 +985,13 @@ fn progress_line_key(line: &str) -> Option<String> {
             r"|\b(?P<progress>progress\s+)\d+(?P<total>/\d+|%)"
         )).expect("valid progress counters")
     });
-    COUNTERS.is_match(line).then(|| COUNTERS.replace_all(line,
-        "${elapsed}${progress}<counter>${unit}${total}").into_owned())
+    COUNTERS.is_match(line).then(|| {
+        // Elapsed-only records may be independent measurements. Keep distinct
+        // values in the existing bounded directory; only explicit progress
+        // counters authorize replacing previous numeric samples with the latest.
+        if !contains_word_ascii_case(line, "progress") { return line.to_string(); }
+        COUNTERS.replace_all(line, "${elapsed}${progress}<counter>${unit}${total}").into_owned()
+    })
 }
 
 fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool) -> LineSelection {

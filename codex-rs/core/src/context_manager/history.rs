@@ -1021,6 +1021,15 @@ impl ContextManager {
         (*self.tool_history).clone()
     }
 
+    pub(crate) fn read_status_page(
+        &self,
+        paths: &[std::path::PathBuf],
+        environment_id: Option<&str>,
+        query: &crate::tool_history::ReadStatusQuery,
+    ) -> serde_json::Value {
+        self.tool_history.read_status_page(paths, environment_id, self.raw_items(), query)
+    }
+
     pub(crate) fn rehydrate_read_replays(
         &self,
         replays: &crate::session::turn_execution::SessionPathReplays,

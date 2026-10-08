@@ -1,4 +1,54 @@
 use super::*;
+
+#[test]
+fn salience_snapshot_retirement_preserves_history_and_continuation_prefix() {
+    let workspace = crate::git_workspace::GitWorkspaceCache::new();
+    for (role, tag) in [("user", "codex_task_state"), ("developer", "repository_observation")] {
+        let snapshot = |version: usize| {
+            let mut item = user_input_text_msg(&format!("<{tag}>version {version}</{tag}>"));
+            if let ResponseItem::Message { role: item_role, .. } = &mut item {
+                *item_role = role.into();
+            }
+            crate::stable_context::mark_trusted_stable_context_item(&mut item);
+            item
+        };
+        let mut canonical = Vec::new();
+        for version in 0..50 {
+            canonical.push(snapshot(version));
+            canonical.push(user_input_text_msg(&format!("request {version}")));
+        }
+        let spoof = user_input_text_msg(&format!("<{tag}>user quotation</{tag}>"));
+        let mixed = user_input_text_msg(&format!("Keep this exact example: <{tag}>old</{tag}>"));
+        canonical.extend([spoof.clone(), mixed.clone()]);
+        for resumed in [false, true] {
+            let mut history = ContextManager::new();
+            if resumed {
+                history.replace(canonical.clone());
+            } else {
+                history.record_items(canonical.iter(), TruncationPolicy::Tokens(10_000));
+            }
+            let prepare = |history: &ContextManager| history.clone()
+                .prepare_for_sampling_prompt_with_completed_tool_projection(
+                    &default_input_modalities(), StableContextTarget::Sampling, None, &workspace,
+                );
+            let sampled = prepare(&history);
+            assert!(sampled.items().contains(&canonical[98]));
+            assert!(!sampled.items().contains(&canonical[0]));
+            assert_eq!(sampled.items().len(), 53);
+            assert!(sampled.items().contains(&spoof));
+            assert!(sampled.items().contains(&mixed));
+            assert_eq!(history.raw_items(), canonical.as_slice());
+            // Active-tail updates must append, never rewrite a sent prefix.
+            let latest = snapshot(50);
+            history.record_items([&latest], TruncationPolicy::Tokens(10_000));
+            assert!(prepare(&history).items().starts_with(sampled.items()));
+            history.record_items([&user_input_text_msg("next request")], TruncationPolicy::Tokens(10_000));
+            let next = prepare(&history);
+            assert!(!next.items().contains(&canonical[98]));
+            assert!(next.items().contains(&latest));
+        }
+    }
+}
 use crate::context::UserInstructions;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSection;

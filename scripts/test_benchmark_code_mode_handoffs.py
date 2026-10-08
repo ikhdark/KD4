@@ -56,6 +56,53 @@ class CodeModeHandoffsBenchmarkTest(unittest.TestCase):
             self.assertIn("EEXIST", rejected.stderr)
             self.assertEqual(output.read_bytes(), saved)
 
+    def test_critical_path_profile_retains_ten_scoped_measurements(self):
+        script = REPO_ROOT / "scripts" / "benchmark_code_mode_handoffs.mjs"
+        result = self.run_benchmark(script, "--profile", "critical-path", "--runs", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["profile"], "critical-path")
+        self.assertEqual(len(report["scenarios"]), 10)
+        self.assertEqual(len({row["name"] for row in report["scenarios"]}), 10)
+        self.assertFalse(report["uncertaintyEvaluation"]["accepted"])
+        samples = {row["name"]: row["samples"][0] for row in report["scenarios"]}
+        self.assertEqual(samples["graph_race_subscriptions"]["subscriptions"], 0)
+        self.assertEqual(samples["graph_dependency_rescans"]["dependencyChecks"], 0)
+        self.assertEqual(samples["ranked_writer_convoy"]["completionMs"], 115)
+        self.assertEqual(samples["full_read_utf8_accounting"]["verifiedBytes"], 8 * 1024 * 1024)
+        self.assertEqual(samples["command_deadline_floor"]["overshootMs"], 0)
+        # The measured production owner deliberately uses the captured native
+        # serializer for escape detection (faster than the regex probe). One
+        # body plus its key is two primitive checks, not repeated body encoding.
+        self.assertEqual(samples["projection_escape_detection"]["stringSerializations"], 2)
+        for row in report["scenarios"]:
+            self.assertEqual(len(row["wallMs"]), 1)
+            self.assertGreaterEqual(row["medianMs"], 0)
+        runtime = REPO_ROOT / "codex-rs" / "code-mode" / "src" / "runtime"
+        for source in report["sources"]:
+            raw = (runtime / source["path"]).read_bytes()
+            self.assertEqual(source["sha256"], hashlib.sha256(raw).hexdigest())
+
+    def test_critical_path_snapshot_identity_failure_does_not_publish_a_report(self):
+        script = REPO_ROOT / "scripts" / "benchmark_code_mode_handoffs.mjs"
+        runtime = REPO_ROOT / "codex-rs" / "code-mode" / "src" / "runtime"
+        sources = []
+        for name in ("dependency_graph.js", "orchestration.js", "output_projection.rs"):
+            raw = (runtime / name).read_bytes()
+            sources.append({"path": name, "bytes": len(raw),
+                            "sha256": hashlib.sha256(raw).hexdigest(), "text": raw.decode("utf-8")})
+        sources[0]["text"] += "corrupt"
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "snapshot.json"
+            output = Path(directory) / "report.json"
+            snapshot.write_text(json.dumps({"kind": "retained_direct_file_read", "sources": sources}),
+                                encoding="utf-8")
+            result = self.run_benchmark(script, "--profile", "critical-path", "--runs", "1",
+                                        "--source-snapshot", str(snapshot), "--output", str(output))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("source snapshot identity mismatch", result.stderr)
+            self.assertFalse(output.exists())
+
     def test_uncertainty_gate_rejects_faster_unsupported_answers_and_missing_cases(self):
         fixture = json.loads((REPO_ROOT / "scripts/fixtures/uncertainty_evaluation.json").read_text())
         trials = []
@@ -81,6 +128,19 @@ class CodeModeHandoffsBenchmarkTest(unittest.TestCase):
             passed = self.run_benchmark(script, "--runs", "1", "--model-evaluations", str(path))
             self.assertEqual(passed.returncode, 0, passed.stderr)
             self.assertTrue(json.loads(passed.stdout)["uncertaintyEvaluation"]["accepted"])
+            # Equal/faster wall time cannot hide extra inference, validation,
+            # recovery, or retry work. Check each dimension independently.
+            for metric in ("wallMs", "modelRequests", "toolCalls", "validationMs", "recoveries", "retries"):
+                with self.subTest(metric=metric):
+                    original = trials[1][metric]
+                    trials[1][metric] = trials[0][metric] + 1
+                    path.write_text(json.dumps(trials))
+                    regressed = self.run_benchmark(script, "--runs", "1", "--model-evaluations", str(path))
+                    self.assertEqual(regressed.returncode, 0, regressed.stderr)
+                    evaluation = json.loads(regressed.stdout)["uncertaintyEvaluation"]
+                    self.assertFalse(evaluation["accepted"])
+                    self.assertEqual(evaluation["comparisons"][0]["regressions"], [metric])
+                    trials[1][metric] = original
             trials[1]["unsupportedConclusions"] = 1
             path.write_text(json.dumps(trials))
             failed = self.run_benchmark(script, "--runs", "1", "--model-evaluations", str(path))

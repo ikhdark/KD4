@@ -1074,6 +1074,11 @@ def _required_exact_test_ids(args: Sequence[str]) -> list[str] | None:
                    and not any(matches(name, pattern) for pattern in skips)})
 
 
+def _validate_cargo_profile(cargo_profile: str | None) -> None:
+    if cargo_profile is not None and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None:
+        raise RunnerError("Cargo profile must be a profile name, not a filesystem path")
+
+
 class RustTestRunner:
     def __init__(
         self,
@@ -1089,6 +1094,7 @@ class RustTestRunner:
         command_timeout_seconds: float | None = None,
         env: Mapping[str, str] | None = None,
         cwd: Path = CODEX_RS_ROOT,
+        success_output: str = "never",
     ) -> None:
         self.manifest = manifest
         self.manifest_path = DEFAULT_MANIFEST
@@ -1098,13 +1104,12 @@ class RustTestRunner:
         self.executor = executor
         self.cwd = cwd
         self.no_fail_fast = no_fail_fast
-        if (
-            cargo_profile is not None
-            and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None
-        ):
+        if success_output not in SUCCESS_OUTPUT_VALUES:
             raise RunnerError(
-                "Cargo profile must be a profile name, not a filesystem path"
+                f"--success-output must be one of {', '.join(SUCCESS_OUTPUT_VALUES)}"
             )
+        self.success_output = success_output
+        _validate_cargo_profile(cargo_profile)
         self.cargo_profile = cargo_profile
         self.base_env = {
             key: value
@@ -1356,8 +1361,8 @@ class RustTestRunner:
         target = self.target(name)
         require_core_lib_filter(target, args, allow_all=allow_all)
         helpers = self.active_helpers([name])
-        selected = _exact_test_ids(args)
         required_ids = _required_exact_test_ids(args)
+        selected = required_ids
         discovered_build: dict[str, Any] = {}
         print(
             f"Rust test target {name}: {subprocess.list2cmdline(target.selection_args())}; "
@@ -1379,7 +1384,6 @@ class RustTestRunner:
         ):
             # Exact IDs already bound the selection, so their helpers need no
             # discovery invocation; an ID the run cannot select only adds helpers.
-            selected = _exact_test_ids(args)
             if selected is None:
                 # Let nextest interpret filters, exclusions and ignored tests.
                 # Listing builds the unit binary without unrelated helpers.
@@ -1425,7 +1429,7 @@ class RustTestRunner:
         )
         failure = None
         try:
-            result = self._checked(command, env=env, capture=CAPTURE_BOTH)
+            result = self._checked(command, env=env, capture=self._test_run_capture())
         except RunnerError as error:
             if error.result is None:
                 self._report_failed_tests(name, [], [], selected)
@@ -1452,6 +1456,12 @@ class RustTestRunner:
             failure = RunnerError(
                 f"target {name!r} has unfulfilled exact test IDs: {missing}",
                 outcome="not_executed", result=result)
+        elif failure is None and (
+            not passed or any(statuses not in (["PASS"], ["LEAK"]) for statuses in outcomes.values())
+        ):
+            failure = RunnerError(
+                f"target {name!r} did not report completed tests passed exactly once",
+                outcome="not_executed", result=result)
         # These are execution receipts, not a cache or proof after input changes.
         rendered = json.dumps({"completed_tests": receipts}, sort_keys=True)
         path = self._retain_text(rendered, prefix="completed-tests-")
@@ -1464,7 +1474,7 @@ class RustTestRunner:
             failed = sorted(test for test, statuses in outcomes.items()
                             if any(status not in {"PASS", "LEAK"} for status in statuses))
             self._report_failed_tests(name, passed, failed, selected,
-                                      selected_count=_nextest_selected_count(result))
+                                      selected_count=_nextest_selected_count(result) if selected is None else None)
             raise failure
         return receipts
 
@@ -1519,9 +1529,17 @@ class RustTestRunner:
             if step.filterset is not None
         )
         resolved_tests = {}
+        # Invocation-local discovery only, never cached test proof. Identical
+        # selections shared by multiple gates need one Cargo/list pass, while
+        # every declaration still checks its own exact/ignored-test contract.
+        listings: dict[tuple[str, ...], dict[str, bool]] = {}
         for step in discovery_steps:
             target = self.target(step.target)
-            listed = self._list_tests(target, self._gate_filter_args(step))
+            filter_args = self._gate_filter_args(step)
+            key = tuple(self._list_command(target, filter_args))
+            if key not in listings:
+                listings[key] = self._list_tests(target, filter_args)
+            listed = listings[key]
             actual = set(listed)
             expected = set(step.tests) if step.tests else actual
             if not actual:
@@ -1619,8 +1637,8 @@ class RustTestRunner:
             if any(helper.name not in artifacts for helper in helpers):
                 continue
             targets = [self.target(step.target) for step in batch]
-            env = self._helper_environment(targets, helpers, artifacts)
             try:
+                env = self._helper_environment(targets, helpers, artifacts)
                 result = self._checked(
                     self._gate_run_command(
                         targets[0],
@@ -1628,7 +1646,7 @@ class RustTestRunner:
                         batch=targets[1:],
                     ),
                     env=env,
-                    capture=CAPTURE_BOTH,
+                    capture=self._test_run_capture(),
                 )
             except RunnerError as error:
                 if error.outcome in {"cancelled", "timed_out", "cleanup_failed"}:
@@ -1869,7 +1887,7 @@ class RustTestRunner:
             "--show-progress",
             "none",
             "--success-output",
-            "never",
+            self.success_output,
             *(["--no-fail-fast"] if keep_going else []),
             *(
                 [
@@ -1887,6 +1905,11 @@ class RustTestRunner:
             ),
             *args,
         ]
+
+    def _test_run_capture(self) -> str:
+        # Nextest writes status lines and passing-test output to stderr. Its log
+        # is retained for receipts either way; stream it only when requested.
+        return CAPTURE_BOTH if self.success_output == "never" else CAPTURE_STDOUT
 
     def _helper_build(self, helpers: Sequence[Helper]) -> list[str] | None:
         # Cargo unifies dependency features across every `-p` package, so a
@@ -1927,14 +1950,16 @@ class RustTestRunner:
             self._list_command(target, args), env=self.base_env, capture=CAPTURE_STDOUT
         )
         output = _stdout_text(result)
-        tests = parse_nextest_list(output)
+        root: dict[str, Any] = {}
+        tests = parse_nextest_list(
+            output, parsed_payload=root if discovered_build is not None else None
+        )
         if not tests:
             raise RunnerError(
                 f"named target {target.name!r} selected zero tests with args {args!r}",
                 outcome="zero_tests",
             )
         if discovered_build is not None:
-            root = json.loads(output)
             suites = root["rust-suites"]
             binary_id = _nextest_binary_id(target)
             # Nextest flattens RustTestBinarySummary into each full suite.
@@ -2355,7 +2380,9 @@ class RustTestRunner:
         return summary + f"\nFull output: {log_path}"
 
 
-def parse_nextest_list(output: str) -> dict[str, bool]:
+def parse_nextest_list(
+    output: str, *, parsed_payload: dict[str, Any] | None = None
+) -> dict[str, bool]:
     try:
         payload = json.loads(output)
     except json.JSONDecodeError as exc:
@@ -2394,6 +2421,8 @@ def parse_nextest_list(output: str) -> dict[str, bool]:
         raise RunnerError(
             f"nextest test-count {declared_count} does not match parsed count {len(listed_ids)}"
         )
+    if parsed_payload is not None:
+        parsed_payload.update(root)
     return tests
 
 
@@ -2494,9 +2523,9 @@ def validate_filtering_args(raw_args: Sequence[str]) -> list[str]:
                 raise RunnerError(
                     f"unsupported test filtering option {token!r}: put {token.split('=', 1)[0]} before --"
                 )
-            raise RunnerError(f"unsupported test filtering option {token!r}")
+            raise RunnerError(f"unsupported test filtering option {token!r}; {FILTERING_ARGS_HELP}")
         if token in {"-E", "--filterset", "--run-ignored"}:
-            if index + 1 >= len(args):
+            if index + 1 >= len(args) or not args[index + 1].strip():
                 raise RunnerError(f"{token} requires a value")
             if token == "--run-ignored" and args[index + 1] not in {
                 "default",
@@ -2507,7 +2536,7 @@ def validate_filtering_args(raw_args: Sequence[str]) -> list[str]:
             index += 2
             continue
         if token.startswith("--filterset="):
-            if token == "--filterset=":
+            if not token.split("=", 1)[1].strip():
                 raise RunnerError("--filterset requires a value")
             index += 1
             continue
@@ -2523,7 +2552,9 @@ def validate_filtering_args(raw_args: Sequence[str]) -> list[str]:
         ):
             index += 1
             continue
-        raise RunnerError(f"unsupported test filtering option {token!r}")
+        raise RunnerError(f"unsupported test filtering option {token!r}; {FILTERING_ARGS_HELP}")
+    if _required_exact_test_ids(args) == []:
+        raise RunnerError("exact test selection selects zero tests after name/skip filters", outcome="zero_tests")
     return args
 
 
@@ -2736,6 +2767,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_options.add_argument(
         "--target-dir", default=argparse.SUPPRESS, help=target_dir_help
     )
+    run_options.add_argument(
+        "--success-output",
+        choices=SUCCESS_OUTPUT_VALUES,
+        help="Stream passing-test output (for example benchmark numbers); default never. "
+        "Display only: selection, receipts and execution identity are unchanged.",
+    )
 
     subparsers.add_parser("check-manifest")
     subparsers.add_parser("list-targets")
@@ -2755,7 +2792,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly allow an unfiltered core_lib run.",
     )
     run_target.add_argument("name")
-    run_target.add_argument("filter_args", nargs=argparse.REMAINDER)
+    run_target.add_argument(
+        "filter_args", nargs=argparse.REMAINDER, help=FILTERING_ARGS_HELP
+    )
     run_gate = subparsers.add_parser("run-gate", parents=[run_options])
     run_gate.add_argument("names", nargs="+")
     guard = subparsers.add_parser(
@@ -2768,21 +2807,32 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Execution policy the runner owns even when a recipe forwards it positionally.
 _RUNNER_OWNED_RUN_OPTIONS = {"--no-fail-fast", "--all"}
+# Nextest's display policy for passing tests (for example benchmark numbers).
+# Selection, status lines, receipts and execution identity do not change.
+SUCCESS_OUTPUT_VALUES = ("never", "immediate", "final", "immediate-final")
+FILTERING_ARGS_HELP = (
+    "accepted filtering: -E/--filterset EXPR, --run-ignored default|only|all, "
+    "--ignore-default-filter, test-name filters; after a further --: names, "
+    "--skip PATTERN, --exact, --ignored, --include-ignored. Runner-owned, here or "
+    "before the name: --no-fail-fast, --all, --profile NAME, --command-timeout-seconds N, "
+    "--success-output never|immediate|final|immediate-final (shows passing-test output)"
+)
 
 
 def _split_runner_owned_options(
     filter_args: Sequence[str],
-) -> tuple[list[str], set[str], float | None, str | None]:
+) -> tuple[list[str], set[str], float | None, str | None, str | None]:
     """Separates runner-owned execution flags from caller filtering args.
 
-    Recipes forward execution flags, the nextest profile, and the per-command
-    deadline after the target name. Leave libtest arguments and
-    filtering-option values intact.
+    Recipes forward execution flags, the nextest profile, the passing-test
+    output policy and the per-command deadline after the target name. Leave
+    libtest arguments and filtering-option values intact.
     """
     remaining: list[str] = []
     owned: set[str] = set()
     timeout = None
     profile = None
+    success_output = None
     after_separator = False
     tokens = iter(filter_args)
     for token in tokens:
@@ -2790,6 +2840,20 @@ def _split_runner_owned_options(
             after_separator = True
         if not after_separator and token in _RUNNER_OWNED_RUN_OPTIONS:
             owned.add(token)
+            continue
+        if not after_separator and (
+            token == "--success-output" or token.startswith("--success-output=")
+        ):
+            value = token.split("=", 1)[1] if "=" in token else next(tokens, "")
+            if value not in SUCCESS_OUTPUT_VALUES:
+                raise RunnerError(
+                    f"--success-output must be one of {', '.join(SUCCESS_OUTPUT_VALUES)}"
+                )
+            if success_output not in (None, value):
+                raise RunnerError(
+                    f"conflicting --success-output values {success_output!r} and {value!r}"
+                )
+            success_output = value
             continue
         if not after_separator and (
             token == "--command-timeout-seconds"
@@ -2822,7 +2886,7 @@ def _split_runner_owned_options(
             value = next(tokens, None)
             if value is not None:
                 remaining.append(value)
-    return remaining, owned, timeout, profile
+    return remaining, owned, timeout, profile, success_output
 
 
 def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) -> int:
@@ -2838,6 +2902,7 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
             guard_generic_recipe_args(guarded_args, recipe=args.recipe)
             return 0
 
+        _validate_cargo_profile(args.cargo_profile)
         filter_args: list[str] = []
         no_fail_fast = getattr(args, "no_fail_fast", False)
         allow_all = getattr(args, "all", False)
@@ -2845,8 +2910,8 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
             filter_args = list(args.filter_args)
             if filter_args[:1] == ["--"]:
                 filter_args = filter_args[1:]
-            filter_args, owned, timeout, profile = _split_runner_owned_options(
-                filter_args
+            filter_args, owned, timeout, profile, success_output = (
+                _split_runner_owned_options(filter_args)
             )
             if timeout is not None:
                 args.command_timeout_seconds = timeout
@@ -2856,6 +2921,13 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
                         f"conflicting --profile values {args.profile!r} and {profile!r}"
                     )
                 args.profile = profile
+            if success_output is not None:
+                if args.success_output not in (None, success_output):
+                    raise RunnerError(
+                        "conflicting --success-output values "
+                        f"{args.success_output!r} and {success_output!r}"
+                    )
+                args.success_output = success_output
             no_fail_fast = no_fail_fast or "--no-fail-fast" in owned
             allow_all = allow_all or "--all" in owned
             validate_filtering_args(filter_args)
@@ -2870,6 +2942,8 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
         elif args.command in {"run-gate", "check-gates"}:
             for name in args.names:
                 manifest.gate(name)
+        elif args.command == "plan" and args.name not in manifest.targets and args.name not in manifest.gates:
+            raise RunnerError(f"unknown named Rust test target or gate {args.name!r}")
         execution_fingerprint = None
         if args.command in {"run-target", "run-gate"}:
             inputs = Path(__file__).read_bytes() + Path(args.manifest).read_bytes()
@@ -2895,9 +2969,18 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
             cargo_profile=args.cargo_profile,
             no_fail_fast=no_fail_fast,
             command_timeout_seconds=getattr(args, "command_timeout_seconds", None),
+            success_output=getattr(args, "success_output", None) or "never",
         )
         runner.metrics = metrics
         runner.manifest_path = args.manifest
+        # Metadata is already available: reject impossible Cargo selections
+        # before waiting for a lane. Keep admission's input rechecks intact.
+        if args.command == "run-target":
+            runner.target(args.name)
+        elif args.command in {"run-gate", "check-gates"}:
+            for name in dict.fromkeys(args.names):
+                for step in manifest.gate(name).steps:
+                    runner.target(step.target)
         if metrics is not None:
             metrics.bind(runner.target_dir)
             metrics.record["proof"]["obligations"] = (
@@ -2949,6 +3032,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             metrics.finish(outcome)
 
 
+def _selected_definitions(
+    manifest: Manifest, command: str, names: Sequence[str]
+) -> tuple[Any, ...]:
+    """Manifest definitions an admitted launch executes: gates, targets, helpers."""
+    gates = () if command == "run-target" else tuple(manifest.gates.get(name) for name in names)
+    target_names = names if command == "run-target" else [
+        step.target for gate in gates if gate is not None for step in gate.steps
+    ]
+    targets = tuple(manifest.targets.get(name) for name in dict.fromkeys(target_names))
+    helpers = tuple(manifest.helpers.get(name) for name in dict.fromkeys(
+        helper for target in targets if target is not None for helper in target.all_helpers
+    ))
+    return manifest.version, gates, targets, helpers
+
+
 def _dispatch_with_admission(
     args: argparse.Namespace, runner: RustTestRunner, metadata: MetadataIndex,
     execution_fingerprint: str | None, filter_args: Sequence[str], allow_all: bool,
@@ -2976,15 +3074,15 @@ def _dispatch_with_admission(
             except (OSError, RuntimeError, ValueError) as exc:
                 raise RunnerError(f"Rust admission failed: {exc}") from exc
             print(f"Rust admission: wait={admission['wait_seconds']:.3f}s; target={runner.target_dir}", file=sys.stderr)
-            # Manifest definitions loaded before waiting must not silently select
-            # obsolete tests. Fail closed rather than auto-retrying changed work.
-            current = Manifest.load(args.manifest)
-            if current != runner.manifest:
-                raise RunnerError("Rust test manifest changed while waiting for admission; rerun with current inputs")
-            if execution_fingerprint is not None:
-                inputs = Path(__file__).read_bytes() + Path(args.manifest).read_bytes()
-                if hashlib.sha256(inputs).hexdigest() != execution_fingerprint:
-                    raise RunnerError("Rust runner inputs changed while waiting for admission; rerun with current inputs")
+            # Definitions this launch selects must not silently become obsolete
+            # while it waits; fail closed rather than auto-retrying changed work.
+            # Unrelated manifest entries and runner edits cannot change it: this
+            # process executes the code and definitions it loaded, which the
+            # receipt's launch-time runner_input_fingerprint identifies.
+            names = [args.name] if args.command == "run-target" else list(args.names)
+            if (_selected_definitions(Manifest.load(args.manifest), args.command, names)
+                    != _selected_definitions(runner.manifest, args.command, names)):
+                raise RunnerError("Rust test manifest changed this launch's selected definitions while waiting for admission; rerun with current inputs")
         with runner.metrics.phase("provenance") if runner.metrics else nullcontext():
             dependencies = (
                 execution_dependency_manifest(metadata, Path(args.manifest))

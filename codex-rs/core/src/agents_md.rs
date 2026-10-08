@@ -187,68 +187,6 @@ struct EnvironmentProjectInstructionsDiscovery {
     cwd: PathUri,
     filesystem: Arc<dyn ExecutorFileSystem>,
     result: io::Result<Vec<ProjectDocCandidate>>,
-    /// Existing, non-ignored instruction files below a local cwd.
-    nested_notice: Option<tokio_util::task::AbortOnDropHandle<Option<String>>>,
-}
-
-/// Most nested instruction paths named individually before summarizing the rest.
-const MAX_NESTED_INSTRUCTION_PATHS: usize = 20;
-
-/// Includes untracked additions and excludes deleted index entries. Do not cache
-/// by index mtime: neither an untracked addition nor a deletion must update it.
-/// Git also handles linked worktrees, where `.git` is a file.
-async fn nested_instruction_notice(cwd: &std::path::Path) -> Option<String> {
-    let mut command = tokio::process::Command::new(codex_git_utils::git_executable());
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
-    let output = tokio::time::timeout(std::time::Duration::from_millis(200), command
-        .arg("-C")
-        .arg(cwd)
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            ":(glob)**/AGENTS.md",
-            ":(glob)**/AGENTS.override.md",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output()
-    ).await.ok()?
-        .ok()
-        .filter(|output| output.status.success())?;
-    let nested = String::from_utf8_lossy(&output.stdout)
-        .split('\0')
-        // Files directly in the cwd are already loaded above.
-        .filter(|path| path.contains('/'))
-        .filter(|path| cwd.join(path).is_file())
-        .map(str::to_string)
-        .collect::<std::collections::BTreeSet<_>>();
-    let cwd_display = cwd.display();
-    let notice = if nested.is_empty() {
-        format!("No non-ignored AGENTS.md or AGENTS.override.md files exist below {cwd_display}.")
-    } else {
-        let mut listed = nested
-            .iter()
-            .take(MAX_NESTED_INSTRUCTION_PATHS)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        if nested.len() > MAX_NESTED_INSTRUCTION_PATHS {
-            listed.push_str(&format!(
-                ", and {} more",
-                nested.len() - MAX_NESTED_INSTRUCTION_PATHS
-            ));
-        }
-        format!(
-            "Instruction files below {cwd_display} (tracked and non-ignored untracked); read those on paths you will touch: {listed}."
-        )
-    };
-    Some(notice)
 }
 
 impl ProjectInstructionsDiscovery {
@@ -331,12 +269,8 @@ pub(crate) async fn discover_project_instructions_with_markers(
                 let cwd = turn_environment.cwd().clone();
                 async move {
                     let filesystem = environment.get_filesystem();
-                    let nested_notice = match cwd.to_abs_path() {
-                        Ok(local_cwd) if !environment.is_remote() => Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-                            nested_instruction_notice(local_cwd.as_path()).await
-                        }))),
-                        _ => None,
-                    };
+                    // Discover only applicable ancestors. Optional descendant inventories
+                    // must not spawn a repository walk at every sampling boundary.
                     let result = agents_md_paths_with_markers(
                         config.as_ref(),
                         &cwd,
@@ -350,7 +284,6 @@ pub(crate) async fn discover_project_instructions_with_markers(
                         cwd,
                         filesystem,
                         result,
-                        nested_notice,
                     }
                 }
             },
@@ -408,7 +341,6 @@ pub(crate) async fn load_project_instructions_with_fallback(
         cwd,
         filesystem,
         result,
-        nested_notice,
     } in discovery.environments
     {
         match result {
@@ -449,6 +381,7 @@ pub(crate) async fn load_project_instructions_with_fallback(
                     candidates,
                     remaining_source_bytes,
                     /*prefetch_utf8_boundary_slack*/ false,
+                    previous.map(|loaded| (loaded, environment_id.as_str(), &cwd)),
                 )
                 .await;
                 complete &= failed_sources.is_empty();
@@ -467,8 +400,6 @@ pub(crate) async fn load_project_instructions_with_fallback(
                 if let Some(docs) = environment_load.loaded {
                     loaded.entries.extend(docs.entries);
                 }
-                retain_failed_environment(&mut loaded, previous, &environment_id, &cwd,
-                    &mut remaining_source_bytes, &mut remaining_rendered_bytes, Some(&failed_sources));
                 loaded.entries[environment_start..].sort_by_key(|entry| match &entry.provenance {
                     InstructionProvenance::Project { source_path, .. } =>
                         source_order.iter().position(|path| path == source_path).unwrap_or(usize::MAX),
@@ -485,21 +416,6 @@ pub(crate) async fn load_project_instructions_with_fallback(
                     "error trying to find AGENTS.md docs: {err:#}"
                 );
             }
-        }
-        // A repo can contain only nested instructions and no root document.
-        // The manifest still belongs in the context in that case.
-        // Never await optional inventory after applicable files are ready. Dropping
-        // the handle cancels its kill-on-drop subprocess; no detached work accumulates.
-        use futures::FutureExt;
-        let notice = nested_notice.and_then(|task| task.now_or_never()).and_then(Result::ok).flatten();
-        if let Some(notice) = notice
-            && notice.len().saturating_add(2) <= remaining_rendered_bytes
-        {
-            remaining_rendered_bytes -= notice.len() + 2;
-            loaded.entries.push(InstructionEntry {
-                contents: notice,
-                provenance: InstructionProvenance::Internal,
-            });
         }
     }
 
@@ -586,6 +502,7 @@ async fn read_discovered_agents_md(
 ) -> io::Result<EnvironmentProjectInstructions> {
     let (project_docs, failed_sources) = read_discovered_project_docs(
         fs, paths, max_total, /*prefetch_utf8_boundary_slack*/ false,
+        None,
     )
     .await;
     if !failed_sources.is_empty() { return Err(io::Error::other("instruction source read failed")); }
@@ -616,6 +533,7 @@ async fn read_discovered_project_docs(
     paths: Vec<ProjectDocCandidate>,
     max_total: usize,
     prefetch_utf8_boundary_slack: bool,
+    fallback: Option<(&LoadedAgentsMd, &str, &PathUri)>,
 ) -> (Vec<LoadedProjectDoc>, Vec<PathUri>) {
     if paths.is_empty() {
         return (Vec::new(), Vec::new());
@@ -643,8 +561,20 @@ async fn read_discovered_project_docs(
             Ok(None) => continue,
             Err(err) => {
                 error!(path = %candidate.path, "error reading instruction source: {err:#}");
-                failed_sources.push(candidate.path);
-                continue;
+                failed_sources.push(candidate.path.clone());
+                let cached = fallback.and_then(|(previous, environment_id, cwd)| {
+                    previous.entries.iter().find(|entry| matches!(&entry.provenance,
+                        InstructionProvenance::Project { source_path, environment_id: id, cwd: old_cwd }
+                            if source_path == &candidate.path && id == environment_id && old_cwd == cwd))
+                });
+                let Some(cached) = cached else { continue; };
+                // Admit the last accepted body at its normal nearest-first priority,
+                // before fresh ancestors consume the shared budget. No extra I/O.
+                ProjectDocRead {
+                    retained_data: cached.contents.as_bytes().to_vec(),
+                    original_bytes: cached.contents.len() as u64,
+                    utf8_boundary_truncation: None,
+                }
             }
         };
 

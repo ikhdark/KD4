@@ -373,6 +373,16 @@ package = "codex-http-client"
 lib = true
 helpers = []
 
+[targets.model_provider_lib]
+package = "codex-model-provider"
+lib = true
+helpers = []
+
+[targets.ollama_lib]
+package = "codex-ollama"
+lib = true
+helpers = []
+
 [targets.codex_api_lib]
 package = "codex-api"
 lib = true
@@ -563,8 +573,9 @@ tests = [
   "responses_retry::tests::exhausted_retry_budget_without_fallback_returns_the_error",
   "responses_retry::tests::transport_fallback_honors_the_original_retry_after_deadline",
   "responses_retry::tests::retry_backoff_is_cancelled_by_owner",
-  "responses_retry::tests::lost_connection_on_a_sampling_turn_waits_instead_of_spending_the_retry_budget",
-  "responses_retry::tests::connection_recovery_wait_is_limited_to_user_facing_sampling_turns",
+  "responses_retry::tests::lost_connection_on_a_user_facing_turn_waits_instead_of_spending_the_retry_budget",
+  "responses_retry::tests::connection_recovery_wait_is_limited_to_user_facing_sessions",
+  "responses_retry::tests::compaction_waits_out_an_outage_longer_than_its_retry_budget",
   "responses_retry::tests::connection_retry_delay_backs_off_and_is_bounded",
   "responses_retry::tests::connection_recovery_reaches_https_fallback_without_exhausting_network_waits",
   "responses_retry::tests::batch_and_subagent_sources_do_not_opt_into_unlimited_recovery",

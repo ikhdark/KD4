@@ -13,6 +13,7 @@ import heapq
 import json
 import os
 import re
+import sys
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
@@ -75,8 +76,21 @@ except ImportError:
 REPORT_SCHEMA_VERSION = 22
 BEHAVIOR_SCHEMA_VERSION = 2
 _NANOSECONDS_PER_SECOND = 1_000_000_000
+_MODEL_TRANSPORT_MEASUREMENT_NOTE = (
+    "Model-active time is not inference-only: request/stream waits combine network, "
+    "provider queueing, generation, and buffering. DNS, TCP, TLS, provider inference, "
+    "and per-token delays are not separately measured by these rollout profiles."
+)
+
+_COMPACTION_MEASUREMENT_NOTE = (
+    "compaction_summary is inferred from compaction reason/recovery purpose, "
+    "no state fingerprint and zero tool calls. Elapsed time sums retained "
+    "dispatch-to-completion rows, includes provider/network wait, and overlaps "
+    "model time; it is not additive with local compactionNs."
+)
 
 _MAX_RENDERED_TURNS = 10
+_MAX_LEDGER_ROWS = 20
 _MAX_SUMMARY_TURNS = 20
 _MAX_SUMMARY_TOKEN_INTERVALS = 16
 # Leave room for the tool envelope and other evidence in a normal model packet.
@@ -1280,7 +1294,10 @@ def _latency_breakdown(
             "measurementNote": (
                 "Request phases and generation-purpose latency are overlapping "
                 "diagnostics; decision latency is dispatch to first actionable "
-                "output and is not additive with stream wait."
+                "output and is not additive with stream wait. "
+                + _MODEL_TRANSPORT_MEASUREMENT_NOTE
+                + " "
+                + _COMPACTION_MEASUREMENT_NOTE
             ),
         },
     }
@@ -1724,6 +1741,7 @@ def analyze_session_path(
     subscription_usage = kd4_session_diagnostics.SubscriptionUsage()
     first_action_records = []
     command_orchestration_records: list[dict[str, Any]] = []
+    ledger_calls: list[dict[str, Any]] = []
     source_discovery_events: list[dict[str, Any]] = []
     diagnostic_observations: dict[str, list[dict[str, Any]]] = collections.defaultdict(
         list
@@ -1902,7 +1920,12 @@ def analyze_session_path(
                             "turnId": active_turn_id,
                             "timestamp": item.get("timestamp"),
                             "input": tool_input,
+                            "file": str(file), "line": line_number,
+                            "inputBytes": len(tool_input.encode("utf-8")),
+                            "outputBytes": None, "roundTripNs": None,
+                            "status": "unpaired", "truncationMarker": None,
                         }
+                        ledger_calls.append(pending_tool_calls[str(call_id)])
                 elif item.get("type") == "response_item" and payload_type in (
                     "custom_tool_call_output",
                     "function_call_output",
@@ -1922,6 +1945,15 @@ def analyze_session_path(
                                 last_tool_output_ns or timestamp_ns, timestamp_ns
                             )
                         output = _tool_output_text(payload)
+                        pending.update({
+                            "outputBytes": len(output.encode("utf-8")),
+                            "roundTripNs": round_trip_ns,
+                            "status": _tool_status(output, _discovery_input(pending["input"])),
+                            "truncationMarker": bool(re.search(
+                                r'(?m)^\s*\{[^\n]*"(?:output_truncated|output_reduced|nested_command_display_reduced)"\s*:\s*true',
+                                output,
+                            )),
+                        })
                         if pending["turnId"] is not None:
                             diagnostic_observations[pending["turnId"]].append(
                                 kd4_session_diagnostics.tool_observation(
@@ -2281,6 +2313,7 @@ def analyze_session_path(
     )
     report["sessionDiagnostics"]["subscriptionUsage"] = subscription_usage.report(parse_error_count)
     report["requestCostModel"] = _request_cost_model(valid)
+    report["requestLedger"] = _request_ledger(valid, ledger_calls, valid_tool_calls, include_tokens)
     report["outputChannels"] = _output_channels(output_channel_bytes, valid)
     report["checkoutOverlaps"] = _checkout_overlaps(valid, edited_paths)
     if startup_log is not None:
@@ -2288,6 +2321,98 @@ def analyze_session_path(
             startup_log, _captured.get(startup_log) if _captured is not None else None
         )
     return report
+
+
+def _request_ledger(records, calls, tool_calls, include_tokens):
+    """Join only explicit call identities; never infer a model generation from time."""
+    generations = collections.defaultdict(set)
+    for call in tool_calls:
+        if type(call.get("generationIndex")) is int:
+            generations[(call.get("_turnId"), call.get("callId"))].add(call["generationIndex"])
+    requests = []
+    for record in sorted(records, key=lambda row: (row["timestamp"] or "", row["turn_id"])):
+        for index, request in enumerate(_selected_requests(record["timing"])):
+            usage = request.get("tokenUsage") or {}
+            requests.append({
+                "turnId": record["turn_id"], "requestIndex": index,
+                **{key: request.get(key) for key in (
+                    "generationIndex", "attemptKind", "generationPurpose",
+                    "dispatchMs", "completedMs", "modelStreamWaitNs", "decisionLatencyNs",
+                )},
+                "inputTokens": usage.get("inputTokens") if include_tokens else None,
+                "outputTokens": request.get("outputTokens") if include_tokens else None,
+            })
+    rows = []
+    for call in calls:
+        matched = generations.get((call.get("turnId"), call["callId"]), set())
+        rows.append({
+            key: call.get(key) for key in (
+                "turnId", "callId", "file", "line", "timestamp", "tool",
+                "inputBytes", "outputBytes", "roundTripNs", "status", "truncationMarker",
+            )
+        } | {"generationIndex": next(iter(matched)) if len(matched) == 1 else None,
+             "action": _ledger_action(call)})
+    return {"requests": requests, "calls": rows, "measurementNote": (
+        "Requests cover retained attempts in valid terminal profiles only; see perTurn.requestRetention. "
+        "Calls include open/unpaired observations. Generation links require persisted call IDs; "
+        "retries share a generation, not necessarily an individual call. Status/marker flags are "
+        "output observations, not proof of failure or lost evidence. Durations overlap; do not add them."
+    )}
+
+
+def _ledger_text(value, limit=160):
+    text = " ".join(str(value if value is not None else "?").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _ledger_action(call):
+    """Describe operations/paths, never copy arbitrary command or code arguments."""
+    source = _discovery_input(str(call.get("input") or ""))
+    native_read, native_paths = _native_read_paths(call)
+    queries, search_paths = _source_discovery_search_terms(source)
+    if _SOURCE_DISCOVERY_RG_PATTERN.search(source):
+        return _ledger_text("search " + " ".join(queries + search_paths))
+    paths = _ordered_unique(native_paths + _source_discovery_paths(source))
+    operation = "read" if native_read or _SOURCE_DISCOVERY_READ_PATTERN.search(source) else str(call.get("tool") or "tool")
+    return _ledger_text(" ".join([operation] + paths))
+
+
+def _render_request_ledger(report):
+    ledger = report.get("requestLedger")
+    if ledger is None:
+        return ["request ledger: unavailable in this historical report"]
+    lines = ["request ledger: " + _ledger_text(ledger["measurementNote"], 512)]
+    for kind in ("requests", "calls"):
+        rows = ledger[kind]
+        header = len(lines)
+        lines.append("")
+        emitted_bytes = 0
+        for row in rows[:_MAX_LEDGER_ROWS]:
+            identity = f"turn={_ledger_text(row.get('turnId'), 40)} g={row.get('generationIndex')}"
+            if kind == "requests":
+                wait = row.get("modelStreamWaitNs")
+                seconds = f"{wait / 1e9:.3f}s" if isinstance(wait, (int, float)) else "?"
+                lines.append(f"  request {row['requestIndex']} {identity} "
+                             f"{_ledger_text(row.get('attemptKind'), 20)} "
+                             f"{_ledger_text(row.get('generationPurpose'), 40)} wait={seconds} "
+                             f"tokens in/out={row.get('inputTokens')}/{row.get('outputTokens')}")
+            else:
+                duration = row.get("roundTripNs")
+                seconds = f"{duration / 1e9:.3f}s" if isinstance(duration, (int, float)) else "?"
+                lines.append(f"  call {_ledger_text(row['callId'], 40)} {identity} "
+                             f"{_ledger_text(row['tool'], 60)} {row['status']} wall={seconds} "
+                             f"bytes in/out={row['inputBytes']}/{row['outputBytes']} "
+                             f"truncation-marker={row['truncationMarker']} "
+                             f"L{row['line']}: {_ledger_text(row['action'])}")
+            emitted_bytes += len(lines[-1].encode("utf-8")) + 1
+            if emitted_bytes > 6 * 1024:
+                lines.pop()
+                break
+        shown = len(lines) - header - 1
+        lines[header] = f"  {kind}: {shown}/{len(rows)} shown in source order"
+        if len(rows) > shown:
+            lines.append(f"  {len(rows) - shown} {kind} omitted; read requestLedger.{kind} in the saved report")
+    return lines
 
 
 def render_report(report: dict[str, Any]) -> str:
@@ -2303,6 +2428,12 @@ def render_report(report: dict[str, Any]) -> str:
             f"{coverage['parseErrorCount']} parse errors"
         ),
     ]
+    cache = report.get("analysisCache") or {}
+    if cache.get("report"):
+        lines.append(f"saved report ({cache['status']}): {cache['report']}")
+    elif cache:
+        lines.append(f"report not saved: {cache.get('status')}: {cache.get('reason')}")
+    lines.extend(_render_request_ledger(report))
     startup = report.get("startupTiming")
     if startup is not None:
         lines.append(
@@ -2462,7 +2593,7 @@ def render_report(report: dict[str, Any]) -> str:
         "preparationNs": "preparation",
         "planningExclusiveNs": "planning",
         "planningCompactionOverlapNs": "planning+compaction overlap",
-        "compactionNs": "compaction",
+        "compactionNs": "compaction-local",
         "persistenceNs": "persistence",
         "serializationNs": "serialization",
         "routerBuildNs": "router-build",
@@ -2562,6 +2693,19 @@ def render_report(report: dict[str, Any]) -> str:
         f"{decision_latency['physicalAttempts']}; "
         f"purposes=[{purpose_text}]"
     )
+    lines.append(_MODEL_TRANSPORT_MEASUREMENT_NOTE)
+    compaction = model_breakdown["generationPurposes"].get("compaction_summary")
+    if compaction is not None:
+        lines.append(
+            "compaction summary requests (retained row sums; non-additive): "
+            f"elapsed={compaction['requestElapsedNs'] / 1e9:.1f}s "
+            f"stream-wait={compaction['modelStreamWaitNs'] / 1e9:.1f}s "
+            f"generations/attempts={compaction['logicalGenerations']}/"
+            f"{compaction['physicalAttempts']}; "
+            f"elapsed-rows={compaction['elapsedRows']} "
+            f"missing-elapsed-rows={compaction['missingElapsedRows']}"
+        )
+        lines.append(_COMPACTION_MEASUREMENT_NOTE)
     first_useful = report["firstUsefulActionAnalysis"]
     canonical_actions = first_useful["canonical"]
     canonical_first_useful = canonical_actions.get(
@@ -2822,6 +2966,16 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         )
         bounded_turns.append(bounded_turn)
     bounded_coverage = {key: coverage[key] for key in coverage_keys}
+    excluded = coverage.get("excludedInvalidOrIncompleteTurns", [])
+    # Counts already live in behaviorSignals. Add explanations only when needed,
+    # so empty coverage detail does not displace otherwise useful turn evidence.
+    if excluded or "omittedExcludedInvalidOrIncompleteTurns" in coverage:
+        bounded_coverage["excludedInvalidOrIncompleteTurns"] = excluded[:_MAX_SUMMARY_TURNS]
+        bounded_coverage["omittedExcludedInvalidOrIncompleteTurns"] = coverage.get(
+            "omittedExcludedInvalidOrIncompleteTurns", 0
+        ) + max(
+            0, len(excluded) - _MAX_SUMMARY_TURNS
+        )
     bounded_coverage["openTurns"] = coverage["openTurns"][:_MAX_SUMMARY_TURNS]
     bounded_coverage["omittedOpenTurns"] = coverage["omittedOpenTurns"] + max(
         0, len(coverage["openTurns"]) - _MAX_SUMMARY_TURNS
@@ -3086,6 +3240,14 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
             0, len(rows) - 8
         )
     result = compact_tokens(result)
+    # Keep this attribution limit even when bulk definitions and detail are
+    # compacted. The legacy modelInference key is retained for compatibility.
+    result["latencyBreakdown"]["modelInference"]["measurementNote"] = (
+        "Combined provider/network wait, not inference-only. "
+        "DNS, TCP, TLS and inference are not separately measured."
+        + " "
+        + _COMPACTION_MEASUREMENT_NOTE
+    )
     subscription = report.get("sessionDiagnostics", {}).get("subscriptionUsage")
     # With no token-count events, leave the unavailable section to full JSON/text
     # rather than displacing existing turn evidence in legacy compact reports.
@@ -3144,7 +3306,7 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
     budget_exceeded = over_budget()
     if budget_exceeded:
         result["summaryBudget"]["fullDetail"] = (
-            "Use --json with the same source snapshot for omitted detail."
+            "Recover from the retained full report, not a rerun. Replay is not freshness."
         )
 
     def trim_rows(container: dict[str, Any], key: str, omitted: str) -> None:
@@ -3162,6 +3324,11 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         trim_rows(turn, "tokenIntervals", "omittedTokenIntervals")
     for container, key, omitted in (
         (result, "perTurn", "omittedPerTurnRecords"),
+        (
+            result["coverage"],
+            "excludedInvalidOrIncompleteTurns",
+            "omittedExcludedInvalidOrIncompleteTurns",
+        ),
         (result["sourceDiscovery"], "events", "omittedEvents"),
         (result["sourceDiscovery"], "candidateSignals", "omittedCandidateSignals"),
         (result["coverage"], "openTurns", "omittedOpenTurns"),
@@ -3243,6 +3410,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Rollout JSONL or JSONL.zst path, session directory, or exact session UUID",
     )
     parser.add_argument(
+        "--from-report", type=Path,
+        help="Render a saved full report without reading rollouts; source freshness is not checked",
+    )
+    parser.add_argument(
         "--sessions-root",
         type=Path,
         help="Sessions directory for UUID lookup; defaults to CODEX_HOME/sessions",
@@ -3250,7 +3421,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--repo-root",
         type=Path,
-        default=Path.cwd(),
+        default=None,
         help="Repository root used for workload population segmentation",
     )
     output = parser.add_mutually_exclusive_group()
@@ -3312,26 +3483,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--tokens",
         choices=("on", "off"),
-        default="on",
-        help="Disable token computation for scripted execution",
+        default=None,
+        help="Disable token computation for scripted execution (default: on)",
     )
     parser.add_argument(
         "--cache-dir", type=Path,
-        help="Reuse content-addressed audit reports here after authenticating current inputs; explicitly share this directory across related stages. Reports retain their original observedAt and may contain sensitive session data.",
+        help="Save/reuse the full content-addressed report here and print its path; current inputs are authenticated before reuse. Use --from-report with that path for detail without reanalysis. Reports may contain sensitive session data.",
     )
     parser.add_argument(
         "--refresh", action="store_true",
         help="Recompute instead of reusing a report in --cache-dir",
     )
     args = parser.parse_args(argv)
+    if args.from_report and any((
+        args.source is not None, args.sessions_root is not None,
+        args.repo_root is not None, args.tokens is not None,
+        args.runner_evidence is not None, args.startup_log is not None,
+        args.diagnostic_evidence is not None, args.cache_dir is not None, args.refresh,
+    )):
+        parser.error("--from-report cannot be combined with live-analysis options")
     if args.refresh and args.cache_dir is None:
         parser.error("--refresh requires --cache-dir")
     if (
         args.source is None
         and args.runner_evidence is None
         and args.startup_log is None
+        and args.from_report is None
     ):
-        parser.error("a source, --runner-evidence, or --startup-log is required")
+        parser.error("a source, --runner-evidence, --startup-log, or --from-report is required")
     if args.gate_metric and args.baseline is None:
         parser.error("--gate-metric requires --baseline")
     unknown_gate_metrics = sorted(
@@ -3343,30 +3522,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{sorted(kd4_session_diagnostics.gate_metric_names())}"
         )
     try:
-        source = (
-            resolve_rollout_source(args.source, args.sessions_root)
-            if args.source
-            else None
-        )
-        evidence = (
-            json.loads(args.runner_evidence.read_text(encoding="utf-8"))
-            if args.runner_evidence
-            else None
-        )
-        report = analyze_session_path(
-            source,
-            args.repo_root,
-            include_tokens=args.tokens == "on",
-            runner_evidence=evidence,
-            startup_log=args.startup_log,
-            cache_dir=args.cache_dir,
-            refresh=args.refresh,
-            diagnostic_evidence=(
-                json.loads(args.diagnostic_evidence.read_text(encoding="utf-8-sig"))
-                if args.diagnostic_evidence
+        if args.from_report:
+            report = json.loads(args.from_report.read_text(encoding="utf-8-sig"))
+            if (
+                not isinstance(report, dict)
+                or report.get("schemaVersion") != REPORT_SCHEMA_VERSION
+                or "summaryBudget" in report
+                or not all(isinstance(report.get(key), dict) for key in (
+                    "coverage", "populations", "sessionDiagnostics", "executionLoop",
+                ))
+                or not isinstance(report.get("perTurn"), list)
+                or not isinstance(report.get("observedAt"), str)
+                or "source" not in report
+            ):
+                raise ValueError(
+                    f"--from-report requires a full schema {REPORT_SCHEMA_VERSION} audit report"
+                )
+        else:
+            source = (
+                resolve_rollout_source(args.source, args.sessions_root)
+                if args.source
                 else None
-            ),
-        )
+            )
+            evidence = (
+                json.loads(args.runner_evidence.read_text(encoding="utf-8"))
+                if args.runner_evidence
+                else None
+            )
+            report = analyze_session_path(
+                source,
+                args.repo_root or Path.cwd(),
+                include_tokens=args.tokens != "off",
+                runner_evidence=evidence,
+                startup_log=args.startup_log,
+                cache_dir=args.cache_dir,
+                refresh=args.refresh,
+                diagnostic_evidence=(
+                    json.loads(args.diagnostic_evidence.read_text(encoding="utf-8-sig"))
+                    if args.diagnostic_evidence
+                    else None
+                ),
+            )
         if args.baseline is not None:
             report["baselineComparison"] = kd4_session_diagnostics.compare_diagnostics(
                 report["sessionDiagnostics"],
@@ -3380,22 +3576,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                         report["baselineComparison"], args.gate_metric
                     )
                 )
-    except (FileNotFoundError, OSError, ValueError, TypeError) as error:
-        parser.error(str(error))
-    if args.json:
-        print(json.dumps(report, indent=2, sort_keys=True))
-    elif args.summary_json:
-        print(
-            json.dumps(
-                bounded_summary(report),
-                sort_keys=True,
-                separators=(",", ":"),
+        if args.json:
+            rendered = json.dumps(report, indent=2, sort_keys=True)
+        elif args.summary_json:
+            rendered = json.dumps(
+                bounded_summary(report), sort_keys=True, separators=(",", ":")
             )
-        )
-    else:
-        print(render_report(report))
-    gate = report.get("baselineComparison", {}).get("gate")
-    return _GATE_EXIT_CODES[gate["status"]] if gate else 0
+        else:
+            rendered = render_report(report)
+        gate = report.get("baselineComparison", {}).get("gate")
+        status = _GATE_EXIT_CODES[gate["status"]] if gate else 0
+        if args.cache_dir:
+            cache = report.get("analysisCache", {})
+            if cache.get("report"):
+                print(json.dumps({"savedReport": {
+                    "path": cache["report"], "sha256": cache["report_sha256"],
+                    "bytes": cache["report_bytes"],
+                }}), file=sys.stderr)
+            else:
+                print(f"Report NOT saved: {cache.get('reason', 'cache unavailable')}", file=sys.stderr)
+        if args.from_report:
+            print(
+                "Replaying historical report; source freshness is not checked.",
+                file=sys.stderr,
+            )
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        parser.error(str(error))
+    print(rendered)
+    return status
 
 
 if __name__ == "__main__":

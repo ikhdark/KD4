@@ -27,6 +27,25 @@ struct TimerWork {
     shutdown: bool,
 }
 
+impl TimerWork {
+    fn queue_due(&mut self, now: Instant, tx: &std_mpsc::Sender<RuntimeCommand>) -> Result<(), String> {
+        let mut due: Vec<_> = self.scheduled.iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, deadline)| (*deadline, *id))
+            .collect();
+        due.sort_unstable();
+        for (_, id) in due {
+            self.scheduled.remove(&id);
+            self.fired.push(id);
+        }
+        if !self.fired.is_empty() && !self.wake_pending {
+            self.wake_pending = true;
+            tx.send(RuntimeCommand::TimersReady).map_err(|_| "timer runtime closed".to_string())?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct TimerScheduler {
     shared: Arc<(Mutex<TimerWork>, Condvar)>,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
@@ -51,7 +70,7 @@ impl TimerScheduler {
         let deadline = now
             .checked_add(delay)
             .ok_or_else(|| "setTimeout delay exceeds the platform timer limit".to_string())?;
-        if self.worker.is_none() {
+        if !delay.is_zero() && self.worker.is_none() {
             let shared = Arc::clone(&self.shared);
             let command_tx = self.runtime_command_tx.clone();
             #[cfg(test)]
@@ -69,17 +88,27 @@ impl TimerScheduler {
         if work.scheduled.len() + work.fired.len() >= MAX_PENDING_TIMEOUTS_PER_CELL {
             return Err("code mode timer scheduler is full".to_string());
         }
+        let previous = work.scheduled.values().min().copied();
         work.scheduled.insert(id, deadline);
-        wake.notify_one();
+        if delay.is_zero() {
+            // Queue a normal runtime wake, never invoke JS synchronously. A
+            // cell using only zero-delay timers needs no sleeping OS thread.
+            work.queue_due(now, &self.runtime_command_tx)?;
+        } else if previous.is_none_or(|previous| deadline < previous) {
+            wake.notify_one();
+        }
         Ok(())
     }
 
     fn cancel(&self, id: u64) {
         let (work, wake) = &*self.shared;
         let mut work = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        work.scheduled.remove(&id);
+        let previous = work.scheduled.values().min().copied();
+        let removed = work.scheduled.remove(&id);
         work.fired.retain(|fired| *fired != id);
-        wake.notify_one();
+        if removed.is_some() && removed == previous {
+            wake.notify_one();
+        }
     }
 
     pub(super) fn take_fired(&self) -> Vec<u64> {
@@ -110,23 +139,10 @@ fn run_scheduler(
         if work.shutdown {
             break;
         }
-        let now = Instant::now();
-        let mut due: Vec<_> = work.scheduled.iter()
-            .filter(|(_, deadline)| **deadline <= now)
-            .map(|(id, deadline)| (*deadline, *id))
-            .collect();
-        due.sort_unstable();
-        for (_, id) in due {
-            work.scheduled.remove(&id);
-            work.fired.push(id);
-        }
         // At most one wake is queued, even if JavaScript clears already-fired
         // timers and schedules replacements without returning to the event loop.
-        if !work.fired.is_empty() && !work.wake_pending {
-            work.wake_pending = true;
-            if runtime_command_tx.send(RuntimeCommand::TimersReady).is_err() {
-                break;
-            }
+        if work.queue_due(Instant::now(), &runtime_command_tx).is_err() {
+            break;
         }
         work = if let Some(deadline) = work.scheduled.values().min().copied() {
             wake.wait_timeout(work, deadline.saturating_duration_since(Instant::now()))
@@ -264,6 +280,36 @@ mod tests {
     use super::TimerScheduler;
 
     #[test]
+    #[ignore = "narrow timing probe"]
+    fn critical_path_timer_benchmark() {
+        for zero in [false, true] {
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                if zero {
+                    for _ in 0..100 {
+                        let (tx, rx) = std_mpsc::channel();
+                        let mut scheduler = TimerScheduler::new(tx);
+                        scheduler.schedule(1, Duration::ZERO).unwrap();
+                        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                        assert_eq!(scheduler.take_fired(), vec![1]);
+                    }
+                } else {
+                    let (tx, _rx) = std_mpsc::channel();
+                    let mut scheduler = TimerScheduler::new(tx);
+                    scheduler.schedule(1, Duration::from_secs(60)).unwrap();
+                    for id in 2..50_002 {
+                        scheduler.schedule(id, Duration::from_secs(120)).unwrap();
+                        scheduler.cancel(id);
+                    }
+                }
+                samples.push(start.elapsed().as_secs_f64()*1000.0);
+            }
+            crate::runtime::critical_path_tests::report(if zero {"zero-timer-cells"} else {"later-timer-churn"}, &samples);
+        }
+    }
+
+    #[test]
     fn dropping_scheduler_cancels_long_timers_without_waiting_for_their_deadlines() {
         let (runtime_tx, runtime_rx) = std_mpsc::channel();
         let started = Instant::now();
@@ -291,7 +337,7 @@ mod tests {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         scheduler.barrier = Some(std::sync::Arc::clone(&barrier));
         scheduler
-            .schedule(1, Duration::ZERO)
+            .schedule(1, Duration::from_nanos(1))
             .expect("schedule timer");
         scheduler.cancel(1);
         barrier.wait();
@@ -312,7 +358,7 @@ mod tests {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         scheduler.barrier = Some(std::sync::Arc::clone(&barrier));
         for id in 0..100_000 {
-            scheduler.schedule(id, Duration::ZERO).unwrap();
+            scheduler.schedule(id, Duration::from_nanos(1)).unwrap();
             scheduler.cancel(id);
         }
         {
@@ -337,5 +383,41 @@ mod tests {
         assert!(matches!(runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap(), super::RuntimeCommand::TimersReady));
         scheduler.cancel(1);
         assert!(scheduler.take_fired().is_empty());
+    }
+
+    #[test]
+    fn zero_timers_are_deferred_bounded_and_coalesced_without_a_worker() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut scheduler = TimerScheduler::new(tx);
+        for id in 1..=128 { scheduler.schedule(id, Duration::ZERO).unwrap(); }
+        assert!(scheduler.worker.is_none());
+        assert!(scheduler.schedule(129, Duration::ZERO).is_err());
+        assert!(matches!(rx.try_recv().unwrap(), super::RuntimeCommand::TimersReady));
+        assert!(rx.try_recv().is_err());
+        scheduler.cancel(1);
+        assert_eq!(scheduler.take_fired(), (2..=128).collect::<Vec<_>>());
+        for id in 0..10_000 {
+            scheduler.schedule(id, Duration::ZERO).unwrap();
+            scheduler.cancel(id);
+        }
+        assert!(scheduler.worker.is_none());
+        assert!(matches!(rx.try_recv().unwrap(), super::RuntimeCommand::TimersReady));
+        assert!(rx.try_recv().is_err());
+        assert!(scheduler.take_fired().is_empty());
+    }
+
+    #[test]
+    fn zero_timer_preserves_due_deadline_order_and_earlier_timers_wake_worker() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut scheduler = TimerScheduler::new(tx);
+        scheduler.shared.0.lock().unwrap().scheduled.insert(1, Instant::now()-Duration::from_secs(1));
+        scheduler.schedule(2, Duration::ZERO).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(scheduler.take_fired(), vec![1, 2]);
+        scheduler.schedule(3, Duration::from_secs(60)).unwrap();
+        scheduler.schedule(4, Duration::from_millis(1)).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(scheduler.take_fired(), vec![4]);
+        scheduler.cancel(3);
     }
 }

@@ -324,7 +324,6 @@ async fn registered_large_patch_keeps_native_acknowledgment_and_complete_structu
         structured["changes"][128],
         json!({
             "path": cwd.join(&names[128]).unwrap().to_path_buf(), "kind": "add", "move_path": null,
-            "unified_diff": "@@ -0,0 +1 @@\n+content\n", "diff_complete": true, "diff_bytes": 23,
         })
     );
     for name in names {

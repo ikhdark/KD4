@@ -198,11 +198,28 @@ try {
     const row = (await read_files(["file"], { full: true }))[0];
     check(row.status === "rejected" && row.reason.evidence.initial === initial && polls === 1,
       "invalid evidence was accepted or retried");
+    check(row.reason.evidence.recovery === undefined, "unsafe page advertised a resumable cursor");
   }
   tools.read_tool_output = async () => { throw Error("cancelled"); };
   const failed = (await read_files(["file"], { full: true }))[0];
   check(failed.reason.evidence.initial === initial && failed.reason.evidence.cause.message === "cancelled",
     "transport failure lost evidence");
+  check(failed.reason.evidence.recovery.arguments.selectors[0].start === 3,
+    "transport failure lost the initial verified cursor");
+  {
+    let recoveryCalls = 0;
+    tools.read_tool_output = async () => {
+      if (++recoveryCalls === 1) return middle;
+      throw Error("transport closed after progress");
+    };
+    const interrupted = (await read_files(["file"], {full:true}))[0].reason.evidence;
+    check(recoveryCalls === 2 && interrupted.pages[0] === middle &&
+      interrupted.recovery.tool === "read_tool_output" &&
+      interrupted.recovery.arguments.artifact_id === initial.artifact_id &&
+      interrupted.recovery.arguments.selectors[0].start === 9 &&
+      interrupted.recovery.arguments.selectors[0].end === 12,
+      "resume recipe repeats verified bytes or loses snapshot identity");
+  }
 
   // A validation process can emit several packets and then an empty exit.
   // Keep every receipt, resume the same process, never start another command.
@@ -279,6 +296,19 @@ try {
   const nullFailure = await rejected(() => await_command(live(), { on_progress: () => { throw null; } }));
   check(nullFailure.evidence.terminal.session_id === 7 && nullFailure.evidence.cause === null,
     "non-Error rejection lost resumable handle");
+  // Byte verification must preserve UTF-8 widths, CRLF, and lone-surrogate
+  // replacement widths without allocating an iterator per source character.
+  for (const tail of ["ascii", "λ", "\u0800", "😀", "\ud800", "\udc00", "\ud800x", "\ud800\ud800\udc00", "\r\n"]) {
+    const part = raw(tail, 1), size = part.canonical_range.end;
+    tools.read_file = async () => ({complete:true,file_complete:false,source_sha256:"unicode",
+      canonical_bytes:size,artifact_id:"unicode",retained_artifact_complete:true,
+      results:[raw("x")],continuation:{kind:"bytes",start:1,end:size}});
+    tools.read_tool_output = async () => ({complete:true,canonical_sha256:"unicode",
+      canonical_bytes:size,artifact_id:"unicode",results:[part]});
+    const [result] = await read_files(["unicode"], {full:true});
+    check(result.status === "fulfilled" && result.value.pages[0].results[0] === part,
+      "UTF-8 recovery changed byte coverage or evidence");
+  }
   // A quiet process, and one that keeps printing, both return control within
   // the budget without losing diagnostics or restarting/terminating the owner.
   const realNow = Date.now;
@@ -323,6 +353,53 @@ try {
         "invalid wait budget accepted");
     }
   } finally { Date.now = realNow; }
+  // Recovery calls release admission between pages. Neither large file can
+  // recover until the queued small read runs; per-file worker leases deadlock.
+  {
+    let releaseSmall, reads = 0, recoveries = 0, active = 0, peak = 0;
+    const smallRead = new Promise(resolve => { releaseSmall = resolve; });
+    tools.read_file = async ({path}) => {
+      ++reads; peak = Math.max(peak, ++active);
+      try {
+        if (path === 'small') {
+          releaseSmall();
+          return {...inline('s'), canonical_bytes:1};
+        }
+        return {complete:true,file_complete:false,canonical_bytes:2,source_sha256:path,
+          artifact_id:path,retained_artifact_complete:true,results:[raw('a')],
+          continuation:{kind:'bytes',start:1,end:2}};
+      } finally { --active; }
+    };
+    tools.read_tool_output = async ({artifact_id}) => {
+      ++recoveries; peak = Math.max(peak, ++active);
+      try {
+        await smallRead;
+        return {artifact_id,canonical_sha256:artifact_id,canonical_bytes:2,
+          complete:true,results:[raw('b',1)]};
+      } finally { --active; }
+    };
+    const rows = await read_files(['large-a','large-b','small','large-a'], {full:true,concurrency:2});
+    check(reads === 3 && recoveries === 2 && peak <= 2 && active === 0 &&
+      rows.every(row => row.status === 'fulfilled' && row.value.file_complete) &&
+      rows[0].value === rows[3].value, 'recovery admission lost fairness, bounds, or deduplication');
+  }
+  // Do not spend a fresh native five-second minimum on a sub-minimum remainder.
+  {
+    const savedNow = Date.now;
+    try {
+      for (const elapsed of [1, 4999, 5000]) {
+        let now = 0, polls = 0;
+        Date.now = () => now;
+        tools.write_stdin = async () => { ++polls; return done; };
+        const stopped = await rejected(() => await_command(live(), {
+          max_wait_ms:5000, on_progress:() => { now = elapsed; return true; },
+        }));
+        check(polls === 0 && stopped.message.includes('wait budget reached') &&
+          stopped.evidence.terminal.session_id === 7 && stopped.evidence.observations.length === 1,
+          'poll floor exceeded total budget or lost the existing handle');
+      }
+    } finally { Date.now = savedNow; }
+  }
   check(await rejected(() => await_command(live(), { max_observations: 0 })) instanceof TypeError,
     "bad command bound accepted");
 } finally {

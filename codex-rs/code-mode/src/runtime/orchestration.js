@@ -9,11 +9,23 @@
   const integer = (n, low, high, name) => {
     if (!Number.isInteger(n) || n < low || n > high) throw new TypeError(`invalid ${name}`);
   };
+  const nonAscii = RegExp.prototype.exec.bind(/[^\x00-\x7f]/);
   const bytes = text => {
-    let size = 0;
-    for (const ch of text) {
-      const cp = ch.codePointAt(0);
-      size += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    // Most source is ASCII; validate that in native regex code rather than
+    // visiting every byte in JavaScript. Non-ASCII retains exact UTF-8 accounting.
+    if (nonAscii(text) === null) return text.length;
+    // UTF-16 indexing avoids allocating an iterator result / substring for
+    // every source character. Lone surrogates still charge three UTF-8 bytes.
+    let size = text.length;
+    for (let i = 0; i < text.length; ++i) {
+      const cp = text.charCodeAt(i);
+      if (cp < 0x80) continue;
+      if (cp < 0x800) { ++size; continue; }
+      size += 2;
+      if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < text.length) {
+        const next = text.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) ++i;
+      }
     }
     return size;
   };
@@ -48,10 +60,26 @@
       // Bound aggregate full-recovery data to 8 MiB, in addition to the normal
       // per-call payload cap. Oversize results retain their initial receipt.
       let remainingBytes = 8 * 1024 * 1024;
-      const nodes = unique.map((path, index) => ({
-        id: String(index),
-        run: async () => {
-          const initial = await read({ path });
+      // A file awaiting several recovery pages must not occupy a worker for
+      // its entire lifetime. FIFO admission bounds individual nested calls,
+      // allowing queued initial reads to overlap the first file's recovery.
+      let activeCalls = 0;
+      const queue = [];
+      const schedule = action => new Promise((resolve, reject) => {
+        const start = async () => {
+          ++activeCalls;
+          try { resolve(await action()); }
+          catch (error) { reject(error); }
+          finally {
+            --activeCalls;
+            queue.shift()?.();
+          }
+        };
+        if (activeCalls < concurrency) void start();
+        else queue.push(start);
+      });
+      const settled = await Promise.allSettled(unique.map(async path => {
+          const initial = await schedule(() => read({ path }));
           const evidence = { initial, pages: [], file_complete: initial.file_complete === true };
           if (initial.complete !== true || !Array.isArray(initial.results) ||
               initial.results.some(r => r.status !== "ok" || r.complete !== true)) {
@@ -100,15 +128,22 @@
           }
           // The full-read scope is already authorized. Recover only the unread
           // suffix of the original artifact, never reopen a mutable source file.
+          const recovery = () => ({ tool: "read_tool_output", arguments: {
+            artifact_id: initial.artifact_id,
+            selectors: [{ kind: "bytes", start: offset, end: size }], max_bytes: 1024 * 1024,
+          } });
           let recover;
           for (let call = 0; offset < size && call < 64; call++) {
             let page;
             try {
               recover ??= capability("read_tool_output");
-              page = await recover({ artifact_id: initial.artifact_id,
-                selectors: [{ kind: "bytes", start: offset, end: size }], max_bytes: 1024 * 1024 });
+              page = await schedule(() => recover({ artifact_id: initial.artifact_id,
+                selectors: [{ kind: "bytes", start: offset, end: size }], max_bytes: 1024 * 1024 }));
             } catch (cause) {
               evidence.cause = cause;
+              // Only transport failure exposes the last verified cursor. A
+              // returned page with drift/gaps must not advertise a safe retry.
+              evidence.recovery = recovery();
               fail("snapshot recovery failed", evidence);
             }
             evidence.pages.push(page);
@@ -126,21 +161,15 @@
               fail("recovery did not certify completion", evidence);
             }
           }
-          if (offset !== size) fail("recovery call limit reached", evidence);
+          if (offset !== size) {
+            evidence.recovery = recovery();
+            fail("recovery call limit reached", evidence);
+          }
           evidence.file_complete = true;
           return evidence;
-        },
-        accept: () => true,
       }));
-      // Reuse the graph's bounded scheduler and all-settled failure isolation.
-      // No successful sibling is discarded or rerun when another read fails.
-      let settled;
-      try { settled = await run_graph(nodes, { concurrency }); }
-      catch (error) {
-        if (!error.results) throw error;
-        settled = error.results;
-      }
-      const byPath = new Map(unique.map((path, i) => [path, settled[String(i)]]));
+      // Retain all started work, including failures and successful siblings.
+      const byPath = new Map(unique.map((path, i) => [path, settled[i]]));
       return requested.map(path => ({ path, ...byPath.get(path) }));
     },
   });
@@ -196,11 +225,13 @@
         try {
           if (on_progress && await on_progress(current) !== true) fail("command progress needs review", evidence);
           const remaining = deadline - Date.now();
-          if (remaining <= 0) fail("command wait budget reached; inspect and resume the retained handle", evidence);
+          // Empty native polls have a five-second floor. Do not launch a
+          // fresh observation that cannot fit in the remaining wait budget.
+          if (remaining < 5_000) fail("command wait budget reached; inspect and resume the retained handle", evidence);
           // A passive output wait can remain pending forever. Bound the existing
           // poll instead; never race/detach a tool, kill the process, or restart it.
           current = await capability("write_stdin")({ session_id: session, incarnation,
-            wait_for_output: false, yield_time_ms: Math.max(5_000, remaining) });
+            wait_for_output: false, yield_time_ms: remaining });
         } catch (cause) {
           if (cause?.evidence === evidence) throw cause;
           evidence.cause = cause;

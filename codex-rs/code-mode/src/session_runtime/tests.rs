@@ -16,6 +16,85 @@ use crate::cell_actor::CompletionCommit;
 
 struct RecordingDelegate;
 
+#[tokio::test]
+async fn inline_replay_is_ready_without_blocking_pool_and_retains_exact_admission() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let id = CellId::new("inline");
+    let event = CellEvent::Completed {content_items:vec![OutputItem::Text{text:"λ😀\n".repeat(1000)}],
+        error_text:None,output_loss:None};
+    let bytes = cell_event_bytes(&event);
+    runtime.inner.terminal_cells.lock().unwrap().insert(id.clone(), event.clone());
+    assert_eq!(runtime.inner.terminal_cells.lock().unwrap().lookup(&id).unwrap().1, bytes);
+    let observation = runtime.begin_observe(&id, ObserveMode::Decision);
+    tokio::pin!(observation);
+    let Poll::Ready(Ok(pending)) = futures::poll!(&mut observation) else {panic!("inline replay was offloaded")};
+    assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES-bytes);
+    assert_eq!(pending.event().await.unwrap(), event);
+    assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES);
+    let dropped = runtime.begin_observe(&id, ObserveMode::Decision).await.unwrap();
+    drop(dropped);
+    assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES);
+    runtime.shutdown().await.unwrap();
+    assert!(matches!(runtime.cached_terminal_observation(&id).await, Err(Error::ShuttingDown)));
+}
+
+#[tokio::test]
+#[ignore = "narrow timing probe"]
+async fn critical_path_terminal_replay_report_benchmark() {
+    for (label, size) in [("inline-replay-small", 1024), ("inline-replay-large", 1024*1024)] {
+        let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+        let id = CellId::new("cached");
+        let event = CellEvent::Completed {content_items:vec![OutputItem::Text{text:"x".repeat(size)}],error_text:None,output_loss:None};
+        runtime.inner.terminal_cells.lock().unwrap().insert(id.clone(), event.clone());
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                assert_eq!(runtime.cached_terminal_event(&id).await.unwrap(), event);
+            }
+            samples.push(start.elapsed().as_secs_f64()*1000.0);
+        }
+        crate::runtime::critical_path_tests::report(label, &samples);
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn critical_path_terminal_replay_benchmark() {
+    for size in [64, 512 * 1024] {
+        let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+        let event = CellEvent::Completed { content_items: vec![OutputItem::Text {
+            text: "x".repeat(size),
+        }], error_text: None, output_loss: None };
+        let id = CellId::new("cached-benchmark");
+        runtime.inner.terminal_cells.lock().unwrap().insert(id.clone(), event.clone());
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(runtime.cached_terminal_event(&id).await.unwrap(), event);
+        }
+        eprintln!("critical_path_terminal size={size} calls=100 elapsed_us={}", started.elapsed().as_micros());
+        assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES);
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn critical_path_inline_replay_retains_charge_until_delivery() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let event = CellEvent::Completed { content_items: vec![OutputItem::Text { text: "λ\n".into() }],
+        error_text: None, output_loss: None };
+    let id = CellId::new("inline-admission");
+    let bytes = cell_event_bytes(&event);
+    runtime.inner.terminal_cells.lock().unwrap().insert(id.clone(), event.clone());
+    let pending = runtime.begin_observe(&id, ObserveMode::Decision).await.unwrap();
+    assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES - bytes);
+    drop(pending);
+    assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES);
+    assert_eq!(runtime.cached_terminal_event(&id).await.unwrap(), event);
+    runtime.shutdown().await.unwrap();
+    assert!(matches!(runtime.cached_terminal_event(&id).await, Err(Error::ShuttingDown)));
+}
+
 #[test]
 fn terminal_accounting_charges_empty_items_and_escaping_and_spills_exactly() {
     for text in ["", "\u{0000}\"\\\n"] {
@@ -875,7 +954,7 @@ fn buffered_snapshot_flushes_before_publication_and_restores_exact_evidence() {
     drop(state);
     let (restored, values) = snapshot::DurableState::open(path).unwrap();
     assert_eq!(values["evidence"].value.as_ref(), &value);
-    assert_eq!(restored.completed_cells().get("1"), Some(&event));
+    assert_eq!(restored.completed_cell("1"), Some(event));
 }
 
 #[test]
@@ -898,7 +977,7 @@ fn buffered_spill_read_preserves_receipts_and_rejects_corruption() {
             None => {}
         }
         std::fs::write(file.path(), payload).unwrap();
-        let cached = CachedCellEvent::Spilled(file, cell_event_bytes(&event));
+        let cached = CachedCellEvent::Spilled(file, cell_event_bytes(&event), terminal_completion(&event));
         let result = cached.read();
         if suffix == Some(b"!".as_slice()) || suffix == Some(b"".as_slice()) {
             let error = result.unwrap_err().to_string();
@@ -1189,4 +1268,49 @@ async fn drop_terminates_cells_when_the_registry_is_locked() {
         .await
         .unwrap();
     assert!(inner.cell_tasks.is_empty());
+}
+
+#[test]
+fn spilled_terminal_eviction_retains_completion_and_interruption() {
+    let mut cache = TerminalCellCache::default();
+    for (id, event) in [
+        ("completed", CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None }),
+        ("interrupted", CellEvent::Terminated { content_items: Vec::new() }),
+    ] {
+        let spill = CachedCellEvent::Spilled(tempfile::NamedTempFile::new().unwrap(), 1,
+            terminal_completion(&event));
+        cache.insert_cached(CellId::new(id), (Arc::new(spill), 0));
+    }
+    for id in 0..TERMINAL_CELL_CACHE_CAPACITY {
+        cache.insert(CellId::new(id.to_string()), CellEvent::Completed {
+            content_items: Vec::new(), error_text: None, output_loss: None,
+        });
+    }
+    assert!(matches!(cache.lookup(&CellId::new("completed")), Err(Error::ExpiredResult { completed: true, .. })));
+    assert!(matches!(cache.lookup(&CellId::new("interrupted")), Err(Error::ExpiredResult { completed: false, .. })));
+}
+
+#[test]
+fn durable_receipts_preserve_completion_order_across_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let (state, _) = snapshot::DurableState::open(path.clone()).unwrap();
+    drop(state);
+    // Exercise legacy migration without hundreds of synchronous publications.
+    let mut seed: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    seed["version"] = 5.into();
+    seed.as_object_mut().unwrap().remove("completed_cell_order");
+    let event = CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None };
+    seed["completed_cells"] = serde_json::to_value((2..=256).map(|id|
+        (id.to_string(), event.clone())).collect::<std::collections::BTreeMap<_, _>>()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+    let (state, _) = snapshot::DurableState::open(path.clone()).unwrap();
+    state.publish(state.stage("late".into(), HashMap::new(), "1".into(), event.clone()).unwrap()).unwrap();
+    drop(state);
+    let (state, _) = snapshot::DurableState::open(path).unwrap();
+    assert_eq!(state.completed_cells().last().unwrap().0, "1");
+    state.publish(state.stage("next".into(), HashMap::new(), "257".into(), event.clone()).unwrap()).unwrap();
+    assert_eq!(state.completed_cell("1"), Some(event));
+    assert!(state.completed_cell("2").is_none());
+    assert_eq!(state.completed_cells().len(), TERMINAL_CELL_CACHE_CAPACITY);
 }

@@ -201,6 +201,15 @@ impl ResponsesInput {
     pub fn is_empty(&self) -> bool { self.prefix.is_empty() && self.shared.is_empty() }
     pub fn first(&self) -> Option<&ResponseItem> { self.iter().next() }
 
+    /// Indexed inspection must not materialize the contiguous compatibility copy.
+    pub fn get_item(&self, index: usize) -> Option<&ResponseItem> {
+        if index < self.prefix.len() {
+            self.prefix.get(index)
+        } else {
+            self.shared.get(index - self.prefix.len())
+        }
+    }
+
     pub fn update_segments(&mut self, mut update: impl FnMut(&mut Arc<[ResponseItem]>)) {
         update(&mut self.prefix);
         update(&mut self.shared);
@@ -263,6 +272,11 @@ mod responses_input_tests {
         for prefix in [Vec::new(), vec![item("fixed prefix")]] {
             let expected = prefix.iter().chain(history.iter()).cloned().collect::<Vec<_>>();
             let input = ResponsesInput::with_prefix(prefix, Arc::clone(&history));
+            for (index, item) in input.iter().enumerate() {
+                assert!(std::ptr::eq(input.get_item(index).unwrap(), item));
+            }
+            assert!(input.get_item(input.len()).is_none());
+            assert!(input.get_item(usize::MAX).is_none());
             for _ in 0..2 {
                 assert_eq!(serde_json::to_vec(&input.clone()).unwrap(), serde_json::to_vec(&expected).unwrap());
                 assert!(input.contiguous.get().is_none());

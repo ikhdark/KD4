@@ -621,6 +621,12 @@ pub(crate) async fn record_pending_input(
         TurnInput::UserInput { content, client_id } => {
             sess.record_user_prompt_and_emit_turn_item(turn_context, content.as_slice(), client_id)
                 .await?;
+            sess.services.plan_store.record_accepted_input(&turn_context.sub_id, content.iter().filter_map(|item| {
+                match item {
+                    codex_protocol::user_input::UserInput::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                }
+            })).await;
         }
         TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
             sess.record_conversation_items_ordered(turn_context, std::slice::from_ref(&item))

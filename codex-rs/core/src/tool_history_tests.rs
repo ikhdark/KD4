@@ -1,5 +1,182 @@
 use super::*;
 
+#[test]
+fn salience_receipt_spends_space_on_all_small_diagnostic_groups() {
+    for decisive in 0..9 {
+        let output = (0..9).map(|index| {
+            let label = if index == decisive { "decisive" } else { "other" };
+            format!("error: {label}{index}\n\n\n\n")
+        }).collect::<String>();
+        let record = candidate("small-groups", serde_json::json!({"output":output}).to_string());
+        let digest = record.receipt_digest_input();
+        assert_eq!(digest.matches("error:").count(), 9, "{digest}");
+        let pin = record.artifact_pin_value().unwrap();
+        let digest = pin["digest"].as_str().unwrap();
+        assert!(digest.contains(&format!("decisive{decisive}")), "{digest}");
+        assert!(approx_token_count(digest) <= RECEIPT_DIGEST_TARGET_TOKENS);
+    }
+}
+
+#[test]
+fn salience_evidence_budget_uses_sent_receipt_not_retained_payload() {
+    let mut state = ToolHistoryState::default();
+    state.register(candidate("large-source", "x".repeat(320_000)));
+    let generation = ModelGenerationId { turn_id: "turn".into(), ordinal: 1 };
+    // Only this compact representation was actually sent.
+    state.mark_consumed_with_delta(&[text_output("large-source", "x".repeat(8_000))], generation.clone());
+    assert_eq!(state.last_visible_tool_output_tokens, Some(2_000));
+    assert_eq!(state.task_sensitive_tool_result_budget(100_000, 90_000, 8192), 3808);
+    // A later request containing no tool output must not inherit the old cost.
+    state.mark_consumed_with_delta(&[], generation);
+    assert_eq!(state.last_visible_tool_output_tokens, Some(0));
+    assert_eq!(state.task_sensitive_tool_result_budget(100_000, 90_000, 8192), 1808);
+    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(restored.last_visible_tool_output_tokens, None);
+    assert_eq!(restored.task_sensitive_tool_result_budget(100_000, 90_000, 8192), 1808);
+}
+
+#[test]
+fn epistemic_unknown_dependency_scope_never_proves_currentness() {
+    let revision = workspace_identity("unchanged");
+    let output = text_output("unknown", "retained exact historical bytes".into());
+    let observation = WorkspaceEvidenceObservation::from_response_item(
+        Some(revision.clone()), &output, BTreeSet::new()).unwrap();
+    assert!(!observation.is_current(Some(&revision), None));
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(observation);
+    let projected = state.project_with_workspace_identity(
+        Arc::from([function_call("unknown"), output]), Some(&revision));
+    let (_, text) = textual_output_identity(&projected.items[1]).unwrap();
+    let notice: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(notice["valid_for_current_workspace"], false);
+    assert_eq!(notice["workspace_evidence_freshness"], "unknown");
+}
+
+#[tokio::test]
+async fn epistemic_remote_receipts_require_local_claim_authentication() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let record = candidate("auth", bounded_output());
+    let receipt = record.derived.receipt.clone().unwrap();
+    let mut state = ToolHistoryState::default();
+    state.register(record.clone());
+    session.register_tool_history_candidate(record).await;
+    let original = text_output("auth", receipt.clone());
+    assert!(state.authenticates_receipt(&original));
+    let value: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert!(state.authenticates_receipt(&text_output("auth", serde_json::to_string_pretty(&value).unwrap())));
+    for (key, value) in [
+        ("successful", serde_json::json!(false)),
+        ("source_dependencies_current", serde_json::json!(false)),
+        ("digest", serde_json::json!("all tests verified")),
+        ("evidence", serde_json::json!({"file_complete":true})),
+        ("artifact_id", serde_json::json!("invented-artifact")),
+        ("verification_claim", serde_json::json!("all integration tests passed")),
+    ] {
+        let mut altered: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        altered[key] = value;
+        let altered = text_output("auth", altered.to_string());
+        assert!(!state.authenticates_receipt(&altered), "{key}");
+        let (retained, _, _) = crate::compact_remote::process_compacted_history_with_retained_input(
+            &session, &turn, vec![function_call("auth"), altered], Vec::new(),
+            &crate::compact::InitialContextInjection::DoNotInject).await.unwrap();
+        assert!(!retained.iter().any(|item| textual_output_identity(item).is_some()), "{key}");
+    }
+    let (retained, _, _) = crate::compact_remote::process_compacted_history_with_retained_input(
+        &session, &turn, vec![function_call("auth"), original.clone()], Vec::new(),
+        &crate::compact::InitialContextInjection::DoNotInject).await.unwrap();
+    assert!(retained.contains(&original));
+}
+
+#[test]
+fn epistemic_search_receipt_binds_identity_order_and_count() {
+    let pair = tool_search_pair("identity", 0);
+    let (item, _) = tool_search_receipt_item(&pair[1], None).unwrap();
+    let original = tool_search_receipt(&item).unwrap();
+    assert!(original.is_valid("identity", "completed", "client"));
+    for identities in [vec!["invented.admin".to_string()], Vec::new(),
+        vec!["tool-identity".to_string(), "extra".to_string()]] {
+        let mut changed = original.clone();
+        changed.ordered_tool_identities = identities;
+        assert!(!changed.is_valid("identity", "completed", "client"));
+    }
+    let mut legacy = original;
+    legacy.version = 1;
+    assert!(!legacy.is_valid("identity", "completed", "client"), "legacy identities were not bound");
+}
+
+#[test]
+fn evidence_salience_read_pins_keep_source_scope_and_excerpt_after_restore() {
+    let mut pins = Vec::new();
+    for (call, environment, body) in [("one", "local", "AUTH_REQUIRED=1"),
+        ("two", "local", "AUTH_REQUIRED=0"), ("three", "remote", "AUTH_REQUIRED=1")]
+    {
+        let text = format!("{body}\n{}", "source context\n".repeat(256));
+        let hash = sha256(text.as_bytes());
+        let output = serde_json::json!({"path":"/repo/config.rs", "environment_id":environment,
+            "source_sha256":hash, "file_complete":true, "complete":true,
+            "selection_status":"complete", "results":[{"status":"ok", "complete":true,
+                "selector":{"kind":"lines", "start":1, "end":257}, "text":text}]}).to_string();
+        let mut record = candidate(call, output.clone());
+        record.tool_identity = "read_file".into();
+        record.artifact_id = format!("artifact-{call}");
+        let mut state = ToolHistoryState::default();
+        state.register(record);
+        let mut restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        restored.refresh_derived_and_indexes();
+        let payload = restored.artifact_pin_payload_for_items(&[text_output(call, output)]).unwrap();
+        assert!(approx_token_count(&payload) <= COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET);
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let pin = payload["artifacts"][0].clone();
+        assert_eq!(pin["evidence"]["environment_id"], environment);
+        assert_eq!(pin["evidence"]["source_sha256"], hash);
+        assert_eq!(pin["evidence"]["file_complete"], true);
+        let digest = pin["digest"].as_str().unwrap();
+        assert!(digest.starts_with("Partial source excerpt:"));
+        assert!(digest.contains(body));
+        assert!(approx_token_count(digest) <= RECEIPT_DIGEST_TARGET_TOKENS);
+        pins.push(pin);
+    }
+    assert_ne!(pins[0]["digest"], pins[1]["digest"]);
+    assert_ne!(pins[0]["evidence"], pins[2]["evidence"]);
+    let output = serde_json::json!({"complete":false, "results":[
+        {"status":"ok", "text":"successful sibling"},
+        {"status":"not_found", "message":"missing selection"}]}).to_string();
+    let mut record = candidate("partial", output);
+    record.tool_identity = "read_file".into();
+    assert!(record.receipt_digest_input().contains("missing selection"));
+    let mut search = candidate("search", serde_json::json!({"results":[{"status":"ok",
+        "value":{"hydrated_ranges":[{"text":"exact recovered fact"}]}}]}).to_string());
+    search.tool_identity = "read_tool_output".into();
+    assert!(search.receipt_digest_input().contains("exact recovered fact"));
+    let unicode = "🦀".repeat(200);
+    search.bounded_model_output = serde_json::json!({"results":[{"status":"ok", "text":unicode}]}).to_string();
+    let digest = search.receipt_digest_input();
+    let excerpt = digest.strip_prefix("Partial source excerpt:\n").unwrap();
+    assert!(unicode.starts_with(excerpt));
+    assert!(excerpt.len() < unicode.len());
+    assert!(approx_token_count(search.artifact_pin_value().unwrap()["digest"].as_str().unwrap()) <= RECEIPT_DIGEST_TARGET_TOKENS);
+}
+
+#[test]
+fn evidence_salience_receipt_keeps_terminal_cause_after_secondary_errors() {
+    for groups in [9, 12, 100] {
+        let mut output = String::new();
+        for index in 0..groups - 1 {
+            output.push_str(&format!("error: secondary {index}\ncontext\ncontext\ncontext\n"));
+        }
+        output.push_str("fatal: ROOT_CAUSE_SENTINEL\nactual: 17\nexpected: 9\n");
+        let mut record = candidate("failure", serde_json::json!({"output":output, "exit_code":1}).to_string());
+        record.successful = false;
+        record.refresh_derived();
+        let pin = record.artifact_pin_value().unwrap();
+        let digest = pin["digest"].as_str().unwrap();
+        assert!(digest.matches("error: secondary").count() <= 7);
+        assert!(digest.contains("ROOT_CAUSE_SENTINEL"), "{digest}");
+        assert!(digest.contains("actual: 17"), "{digest}");
+        assert!(approx_token_count(digest) <= RECEIPT_DIGEST_TARGET_TOKENS);
+    }
+}
+
 #[tokio::test]
 async fn verified10_remote_compaction_storage_failure_does_not_install_history() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
@@ -802,7 +979,7 @@ fn consumed_failure_keeps_receipt_without_displacing_corrected_evidence() {
     let receipt: serde_json::Value = serde_json::from_str(outputs["bad-selector"]).unwrap();
     assert_eq!(receipt["artifact_id"], artifact);
     assert_eq!(receipt["successful"], false);
-    assert!(state.failure_resolution(&state.candidates["bad-selector"]).is_none());
+    assert!(state.failure_resolution(&state.candidates["bad-selector"], &FailureResolutionIndex::default()).is_none());
 }
 
 #[test]
@@ -1022,7 +1199,7 @@ fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_histo
         WorkspaceEvidenceObservation::from_response_item(
             Some(captured.clone()),
             &output,
-            BTreeSet::new(),
+            BTreeSet::from([SourceDependencyV1::new(std::path::Path::new("source.rs"), false)]),
         )
         .unwrap(),
     );
@@ -1084,7 +1261,7 @@ fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating_histo
         WorkspaceEvidenceObservation::from_response_item(
             Some(later.clone()),
             &new_output,
-            BTreeSet::new(),
+            BTreeSet::from([SourceDependencyV1::new(std::path::Path::new("source.rs"), false)]),
         )
         .unwrap(),
     );
@@ -1211,7 +1388,8 @@ fn sampling_freshness_batches_results_and_only_appends_new_invalidations() {
         .lines()
         .find_map(|line| serde_json::from_str(line).ok())
         .unwrap();
-    assert_eq!(text.lines().count(), 3, "only the envelope and evidence records belong in recurring notices");
+    assert_eq!(text.lines().count(), 4, "one safety qualification precedes the batched evidence records");
+    assert!(text.contains("This is not a request to rerun tests or builds."));
     let notices = batch["notices"].as_array().unwrap();
     assert_eq!(notices.len(), 2);
     assert_eq!(notices[0]["call_id"], "first");
@@ -1714,7 +1892,7 @@ fn workspace_evidence_remains_visible_only_for_its_captured_revision() {
         WorkspaceEvidenceObservation::from_response_item(
             Some(captured.clone()),
             &output,
-            BTreeSet::new(),
+            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-captured"), true)]),
         )
         .expect("text evidence observation"),
     );
@@ -1762,7 +1940,8 @@ fn workspace_projection_memoizes_verdicts_without_crossing_mutations_or_snapshot
     let items: Arc<[ResponseItem]> = Arc::from([function_call("cached"), output.clone()]);
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(WorkspaceEvidenceObservation::from_response_item(
-        Some(captured.clone()), &output, BTreeSet::new(),
+        Some(captured.clone()), &output,
+        BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-captured"), true)]),
     ).unwrap());
     let original = state.clone();
     let project = |state: &ToolHistoryState, identity: &WorkspaceEvidenceIdentity| {
@@ -1855,7 +2034,7 @@ fn completed_command_evidence_uses_the_post_execution_revision() {
         WorkspaceEvidenceObservation::from_response_item(
             Some(after.clone()),
             &output,
-            BTreeSet::new(),
+            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-after"), true)]),
         )
         .expect("post-execution observation"),
     );
@@ -4507,6 +4686,7 @@ fn tool_search_receipt_retains_largest_fitting_identity_prefix() {
                 larger.omitted_result_count,
                 larger.complete,
                 larger.omitted_identity_count,
+                &larger.ordered_tool_identities,
             );
             let mut envelope = result.clone();
             let ResponseItem::ToolSearchOutput { tools, .. } = &mut envelope else {
@@ -4604,6 +4784,7 @@ fn tool_search_receipt_caps_all_argument_fields_and_binds_semantics() {
             changed.omitted_result_count,
             changed.complete,
             changed.omitted_identity_count,
+            &changed.ordered_tool_identities,
         )
     );
 }
@@ -6118,11 +6299,18 @@ fn cargo_manifest_read_failures_invalidate_receipts_without_losing_selective_reu
             state.project_with_workspace_identity(Arc::clone(&canonical), Some(&captured));
         let (_, receipt_text) =
             textual_output_identity(&initial.items[1]).expect("initial receipt");
-        let receipt: ToolHistoryReceiptV2 =
-            serde_json::from_str(receipt_text).expect("valid receipt");
-        assert_eq!(receipt.call_id, case);
-        assert_eq!(receipt.artifact_id, "artifact-1");
-        assert_eq!(receipt.bytes, 96_000);
+        if known_dependencies {
+            let receipt: ToolHistoryReceiptV2 =
+                serde_json::from_str(receipt_text).expect("valid scoped receipt");
+            assert_eq!(receipt.call_id, case);
+            assert_eq!(receipt.artifact_id, "artifact-1");
+            assert_eq!(receipt.bytes, 96_000);
+        } else {
+            let notice: serde_json::Value = serde_json::from_str(receipt_text).unwrap();
+            assert_eq!(notice["workspace_evidence_freshness"], "unknown");
+            assert_eq!(notice["historical_authenticity"], "authenticated");
+            assert!(notice["historical_digest"].as_str().unwrap().contains("bounded model-visible tool output"));
+        }
 
         for (path, must_be_stale) in [(&unrelated, !complete), (&transitive.join("lib.rs"), true)] {
             let changed = workspace_identity("changed");
@@ -7205,3 +7393,50 @@ fn verified10_directory_closure_is_bounded_across_compaction_and_restart() {
     state.retain_for_history(&[]);
     assert!(state.is_persisted_empty());
 }
+#[test]
+fn continuity_read_status_scopes_keep_legacy_recursive_and_precedence() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("a.rs");
+    let other = root.path().join("b.rs");
+    let mut state = ToolHistoryState::default();
+    for (id, scope) in [("exact", Some(SourceDependencyV1::new(&path, false))),
+        ("recursive", Some(SourceDependencyV1::new(root.path(), true))), ("legacy", None)] {
+        let mut entry = candidate(id, serde_json::json!({
+            "path":path, "source_sha256":id, "canonical_bytes":1, "environment_id":"local",
+            "canonical_uri":"file:///a.rs", "delivered_ranges":[[0,1]]
+        }).to_string());
+        entry.tool_identity = "read_file".into();
+        entry.source_dependencies = scope.into_iter().collect();
+        state.register(entry);
+    }
+    let expected = state.read_status(&[path.clone()], Some("local"), &[]);
+    assert_eq!(expected["paths"][0]["snapshots"].as_array().unwrap().len(), 3);
+    let mut unrelated = candidate("elsewhere", "{invalid JSON".into());
+    unrelated.tool_identity = "read_file".into();
+    unrelated.source_dependencies = BTreeSet::from([SourceDependencyV1::new(&other, false)]);
+    state.register(unrelated);
+    assert_eq!(state.read_status(&[path.clone()], Some("local"), &[]), expected);
+    let output = text_output("exact", serde_json::json!({"path":other}).to_string());
+    state.workspace_evidence.insert("exact".into(), WorkspaceEvidenceObservation::from_response_item(
+        None, &output, BTreeSet::from([SourceDependencyV1::new(&other, false)])).unwrap());
+    let actual = state.read_status(&[path], Some("local"), &[output]);
+    assert_eq!(actual["paths"][0]["snapshots"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn continuity_registration_matches_rebuild_with_aliases_and_explicit_origins() {
+    let mut state = ToolHistoryState::default();
+    for id in ["z", "b", "a", "c"] {
+        state.register(candidate(id, bounded_output()));
+        let incremental = state.artifact_call_ids.clone();
+        state.rebuild_artifact_index();
+        assert_eq!(incremental, state.artifact_call_ids);
+    }
+    state.internal_artifact_origins.insert("artifact-1".into(), ("origin".into(), 1, "hash".into()));
+    state.register(candidate("0", bounded_output()));
+    assert_eq!(state.artifact_call_ids["artifact-1"], "origin");
+    let incremental = state.artifact_call_ids.clone();
+    state.rebuild_artifact_index();
+    assert_eq!(incremental, state.artifact_call_ids);
+}
+

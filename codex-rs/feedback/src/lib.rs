@@ -217,6 +217,7 @@ impl CodexFeedback {
             .with_filter(
                 Targets::new()
                     .with_default(Level::TRACE)
+                    .with_target("codex_http_client::transport", LevelFilter::OFF)
                     .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF)
                     .with_target("codex_otel.log_only", LevelFilter::OFF)
                     .with_target("codex_otel.trace_safe", LevelFilter::OFF),
@@ -1311,6 +1312,27 @@ mod tests {
         let snap = fb.snapshot(/*session_id*/ None);
         pretty_assertions::assert_eq!(snap.tags.get("model").map(String::as_str), Some("gpt-5"));
         pretty_assertions::assert_eq!(snap.tags.get("cached").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn logger_layer_drops_http_request_bodies_before_formatting() {
+        fn request_body() -> &'static str {
+            panic!("excluded HTTP body must not be formatted");
+        }
+
+        let fb = CodexFeedback::new();
+        let _guard = tracing_subscriber::registry()
+            .with(fb.logger_layer())
+            .set_default();
+
+        assert!(!tracing::enabled!(target: "codex_http_client::transport", Level::TRACE));
+        tracing::trace!(target: "codex_http_client::transport", "{}", request_body());
+        tracing::trace!(target: "codex_http_client::client", "retained diagnostic");
+
+        let snap = fb.snapshot(/*session_id*/ None);
+        let logs = String::from_utf8_lossy(snap.as_bytes());
+        assert!(logs.contains("retained diagnostic"));
+        assert!(!logs.contains("request body"));
     }
 
     #[test]

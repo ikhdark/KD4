@@ -40,6 +40,16 @@ pub enum ApiError {
     ServerOverloaded { retry_after: Option<RetryAfter> },
 }
 
+impl ApiError {
+    /// A complete frame violated the provider protocol; replay is not recovery.
+    pub(crate) fn invalid_response(message: impl Into<String>) -> Self {
+        Self::ProviderFailure {
+            code: Some("invalid_response".to_string()),
+            message: message.into(),
+        }
+    }
+}
+
 impl From<RateLimitError> for ApiError {
     fn from(err: RateLimitError) -> Self {
         Self::RateLimit(err.to_string())

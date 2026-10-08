@@ -1,13 +1,20 @@
 use super::*;
 
 #[test]
-fn incomplete_scope_admissions_are_flagged_without_rejecting_honest_limits() {
-    assert!(final_reports_unfinished_work(
-        "The full source-level review is **not complete**; 23,135 warnings remain unverified."
-    ));
-    assert!(final_reports_unfinished_work("The requested work is not finished because access is blocked."));
-    assert!(!final_reports_unfinished_work("The requested review is complete."));
-    assert!(!final_reports_unfinished_work("The server's response was not complete."));
+fn uncertainty_completion_warnings_use_owner_assessment_not_final_wording() {
+    let mut assessment = codex_protocol::protocol::TurnCompletionAssessment::default();
+    assert!(completion_verification_warning(&assessment).is_none());
+    assessment.advisories.push("Checklist accounting only".into());
+    assert!(completion_verification_warning(&assessment).is_none());
+    assessment.verification_gaps.push("Required compatibility remains untested.".into());
+    let warning = completion_verification_warning(&assessment).unwrap();
+    assert!(warning.contains("Required compatibility remains untested."));
+    assert!(warning.contains("not a verified completion"));
+    assessment.verification_gaps.clear();
+    assessment.failed_checks.push("Reader V1 failed".into());
+    assert!(completion_verification_warning(&assessment).unwrap().contains("Reader V1 failed"));
+    assessment.failed_checks.clear();
+    assert!(completion_verification_warning(&assessment).is_none());
 }
 use crate::session::turn_execution::AuthoritativeWaitOwnerResult;
 use crate::state::TaskKind;
@@ -1254,10 +1261,132 @@ fn audit_reports_17_19_retry_preserves_accepted_history_and_retry_limit() -> Res
 }
 
 #[test]
+fn continuation_prefetch_returns_before_capture_and_overlaps_step_context() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "continuation_prefetch_returns_before_capture_and_overlaps_step_context",
+        continuation_prefetch_returns_before_capture_and_overlaps_step_context_impl,
+    )
+}
+
+async fn continuation_prefetch_returns_before_capture_and_overlaps_step_context_impl() -> Result<()> {
+    core_test_support::require_network!();
+    let server = responses::start_mock_server().await;
+    let mut completed = responses::ev_completed("prefetch");
+    completed["response"]["end_turn"] = serde_json::json!(false);
+    let requests = responses::mount_sse_once(&server, responses::sse(vec![completed])).await;
+    let home = tempfile::tempdir()?;
+    let provider = non_openai_model_provider(&server);
+    let (session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            move |config| config.model_provider = provider,
+        ).await;
+    let cancellation = CancellationToken::new();
+    let step = session.capture_step_context(Arc::clone(&turn)).await?;
+    let router = built_tools(&session, &step, &[], &cancellation).await?;
+    assert!(step.set_tool_router(router).is_ok(), "first router");
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let runtime = ToolCallRuntime::new(Arc::clone(&session), step, Arc::clone(&tracker));
+    session.record_conversation_items(&turn, &[
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "read_file".to_string(),
+            namespace: None,
+            arguments: r#"{"path":"source.rs"}"#.to_string(),
+            call_id: "workspace-read".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "workspace-read".to_string(),
+            output: FunctionCallOutputPayload::from_text("source".to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]).await?;
+    assert!(session.clone_history().await.requires_workspace_evidence_validation());
+    let metadata = turn.turn_metadata_state.to_responses_metadata(
+        session.installation_id.clone(),
+        session.current_window_id().await,
+        CodexResponsesRequestKind::Turn,
+    );
+    let mut client = session.services.model_client.new_session();
+    let cache = &session.services.git_workspace;
+    let pause = cache.pause_next_workspace_evidence_capture();
+    let captures_before = cache.workspace_evidence_capture_count();
+    let result = tokio::time::timeout(Duration::from_secs(10), try_run_sampling_request(
+        runtime,
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        Arc::new(ExtensionData::new(turn.sub_id.clone())),
+        &mut client,
+        &metadata,
+        tracker,
+        &Prompt::default(),
+        &ModelGenerationId { turn_id: turn.sub_id.clone(), ordinal: 0 },
+        &mut None,
+        Arc::new(Mutex::new(None)),
+        cancellation,
+        &mut SamplingAttemptProgress::default(),
+    )).await.expect("sampling must return without joining the paused capture")?;
+    assert!(result.needs_follow_up);
+    assert!(result.prefetched_workspace_identity.is_none());
+    let (_, handle) = result.continuation_workspace_prefetch.expect("owned pending capture");
+    tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started()).await?;
+    tokio::time::timeout(Duration::from_secs(10), session.capture_step_context(Arc::clone(&turn)))
+        .await.expect("next step context must proceed while the workspace capture is paused")?;
+    assert!(!handle.is_finished());
+    pause.release();
+    tokio::time::timeout(Duration::from_secs(10), handle).await??;
+    assert_eq!(cache.workspace_evidence_capture_count(), captures_before + 1);
+    requests.single_request();
+    Ok(())
+}
+
+#[test]
 fn kd4_latency_continuation_prefetch_rejects_stale_or_steered_state() {
     assert!(continuation_workspace_prefetch_is_current(7, 7, false));
     assert!(!continuation_workspace_prefetch_is_current(7, 8, false));
     assert!(!continuation_workspace_prefetch_is_current(7, 7, true));
+}
+
+#[tokio::test]
+async fn local_compaction_reuses_pending_capture_and_rejects_stale_revision() {
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    Arc::make_mut(&mut turn.config).compact_prompt = Some("local summary".into());
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let revision = tracker.lock().await.current_mutation_revision();
+    for stale in [false, true] {
+        let mut pending = Some((revision, AbortOnDropHandle::new(tokio::spawn(async { None }))));
+        if stale {
+            tracker.lock().await.record_unknown_mutation();
+        }
+        let mut identity = None;
+        reuse_workspace_prefetch_for_local_compaction(
+            &session, &turn, &tracker, &mut pending, &mut identity, &CancellationToken::new(),
+        ).await.unwrap();
+        assert!(pending.is_none());
+        // Some(None) preserves a completed non-Git capture, suppressing reprobes.
+        assert_eq!(identity, if stale { None } else { Some(None) });
+    }
+}
+
+#[tokio::test]
+async fn local_compaction_pending_capture_is_cancellable() {
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    Arc::make_mut(&mut turn.config).compact_prompt = Some("local summary".into());
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let revision = tracker.lock().await.current_mutation_revision();
+    let mut pending = Some((revision, AbortOnDropHandle::new(tokio::spawn(std::future::pending()))));
+    let mut identity = None;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert!(matches!(reuse_workspace_prefetch_for_local_compaction(
+        &session, &turn, &tracker, &mut pending, &mut identity, &cancellation,
+    ).await, Err(CodexErr::TurnAborted)));
+    assert!(pending.is_none());
+    assert!(identity.is_none());
 }
 
 #[tokio::test]
@@ -3873,7 +4002,9 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
                     .message_input_texts("developer")
                     .iter()
                     .any(|text| text.contains("workspace_evidence_invalidation")
-                        && text.contains("validation-current"))
+                        && text.contains("validation-current")),
+                "fresh validation invalidated: {:?}",
+                sent[5].message_input_texts("developer")
             );
             assert!(
                 fs::read_to_string(test.workspace_path("src/lib.rs"))?

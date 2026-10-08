@@ -1021,3 +1021,32 @@ async fn audit_stalled_instruction_read_falls_back_and_releases_gate() {
             .is_none()
     );
 }
+#[tokio::test]
+async fn survivability_failed_nearest_source_keeps_priority_under_parent_growth() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    let child = root.path().join("child");
+    fs::create_dir(&child).unwrap();
+    let parent_doc = root.path().join("AGENTS.md");
+    let child_doc = child.join("AGENTS.md");
+    fs::write(&parent_doc, "parent old").unwrap();
+    let restriction = "Never edit protected.txt. ".repeat(20);
+    fs::write(&child_doc, &restriction).unwrap();
+    let mut config = config_for(&root).await;
+    config.project_doc_max_bytes = 1024;
+    config.cwd = AbsolutePathBuf::from_absolute_path(&child).unwrap();
+    let filesystem = Arc::new(ControlledFileSystem::new(AbsolutePathBuf::from_absolute_path(&child_doc).unwrap()));
+    let environments = environment_snapshot_with_environment(&config.cwd, 1,
+        Arc::new(Environment::default_for_tests_with_filesystem(filesystem.clone())));
+    let manager = AgentsMdManager::new(None);
+    manager.refresh_and_observe(&config, &environments).await;
+    fs::write(&parent_doc, "parent current ".repeat(1000)).unwrap();
+    filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
+    let observed = manager.refresh_and_observe(&config, &environments).await;
+    assert_eq!(observed.freshness, AgentsMdFreshness::CachedFallback);
+    let text = observed.loaded.unwrap().text();
+    assert!(text.contains(&restriction));
+    assert!(text.contains("parent current"));
+    assert!(!text.contains("parent old"));
+    assert_eq!(filesystem.target_stream_calls(), 2, "one read per refresh; no retry");
+}

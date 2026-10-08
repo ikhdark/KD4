@@ -318,8 +318,8 @@ const JSON_OUTLINE_MAX_DEPTH: usize = 3;
 /// that its containing artifact is a single indexed JSON document.
 fn outline_oversized_json_lines(content: &str, max_tokens: usize) -> Option<String> {
     let line_budget = max_tokens / JSON_LINE_OUTLINE_BUDGET_DIVISOR;
-    let mut outlined = String::new();
-    let mut replaced = false;
+    let mut outlined: Option<String> = None;
+    let mut offset = 0;
     for line in content.split_inclusive('\n') {
         let body = line.trim_end_matches(['\r', '\n']);
         let trimmed = body.trim();
@@ -330,14 +330,21 @@ fn outline_oversized_json_lines(content: &str, max_tokens: usize) -> Option<Stri
             .map(|value| json_line_outline(&value, body.len(), line_budget));
         match outline {
             Some(outline) => {
+                // Plain output needs no replacement buffer. Copy the unchanged
+                // prefix only when the first JSON line actually gets outlined.
+                let outlined = outlined.get_or_insert_with(|| content[..offset].to_owned());
                 outlined.push_str(&outline);
                 outlined.push_str(&line[body.len()..]);
-                replaced = true;
             }
-            None => outlined.push_str(line),
+            None => {
+                if let Some(outlined) = outlined.as_mut() {
+                    outlined.push_str(line);
+                }
+            }
         }
+        offset += line.len();
     }
-    replaced.then_some(outlined)
+    outlined
 }
 
 fn json_line_outline(value: &serde_json::Value, bytes: usize, max_tokens: usize) -> String {
@@ -440,6 +447,9 @@ fn truncate_over_budget_lines_with_markers(
     let mut retained_bytes =
         approx_bytes_for_tokens(max_tokens - marker_tokens).min(content.len().saturating_sub(1));
     let mut candidate = String::new();
+    // Every fitting attempt refers to the same source. Count its lines once,
+    // rather than scanning the entire output twice for each candidate.
+    let total_lines = line_markers.then(|| content.lines().count());
     loop {
         let head = retained_bytes.saturating_mul(2) / 5;
         let middle = retained_bytes / 5;
@@ -458,8 +468,12 @@ fn truncate_over_budget_lines_with_markers(
             (head_text.len(), middle_offset),
             (middle_offset + middle_text.len(), tail_offset),
         ];
-        let before = line_markers.then(|| omitted_line_marker(content, gaps[0].0, gaps[0].1));
-        let after = line_markers.then(|| omitted_line_marker(content, gaps[1].0, gaps[1].1));
+        let before = total_lines.map(|total| {
+            omitted_line_marker_at_lines(content, gaps[0].0, gaps[0].1, 0, total)
+        });
+        let after = total_lines.map(|total| {
+            omitted_line_marker_at_lines(content, gaps[1].0, gaps[1].1, 0, total)
+        });
         let _ = write!(
             candidate,
             "{}{}{}{}{}",

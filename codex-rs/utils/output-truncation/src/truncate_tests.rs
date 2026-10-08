@@ -28,9 +28,11 @@ fn benchmark_output_projection() {
 
     let code = "    let result = read_source_file(path).await?;\n".repeat(90_000);
     let json = serde_json::json!({"output": "source evidence ".repeat(65_536)}).to_string();
-    for (name, source, budget) in [
-        ("code", code.as_str(), 10_000),
-        ("silent_json", json.as_str(), 0),
+    let mut report = String::new();
+    for (name, source, budget, line_markers) in [
+        ("code", code.as_str(), 10_000, false),
+        ("line_marked_code", code.as_str(), 10_000, true),
+        ("silent_json", json.as_str(), 0, false),
     ] {
         let limits = resolve_projected_output_limits(
             Some(budget),
@@ -38,22 +40,88 @@ fn benchmark_output_projection() {
             OutputDiagnosticClass::Normal,
             10_000,
         );
-        let expected = formatted_truncate_text_with_output_limit(source, limits);
+        let project = |source: &str| {
+            if line_markers {
+                crate::formatted_truncate_text_with_line_markers(source, limits).output
+            } else {
+                formatted_truncate_text_with_output_limit(source, limits)
+            }
+        };
+        let expected = project(source);
         let mut samples = Vec::new();
+        const ITERATIONS: u128 = 3;
         for _ in 0..5 {
             let start = Instant::now();
-            for _ in 0..20 {
-                black_box(formatted_truncate_text_with_output_limit(black_box(source), limits));
+            for _ in 0..ITERATIONS {
+                black_box(project(black_box(source)));
             }
-            samples.push(start.elapsed().as_nanos() / 20);
+            samples.push(start.elapsed().as_nanos() / ITERATIONS);
         }
         samples.sort_unstable();
-        println!(
+        let line = format!(
             "projection {name}: bytes={} median_ns={} output_sha1={}",
             source.len(),
             samples[2],
             codex_utils_string::sha1_hex(&expected.text),
         );
+        println!("{line}");
+        report.push_str(&line);
+        report.push('\n');
+    }
+    // The manifest runner suppresses successful test stdout. Windows test
+    // isolation clears CODEX_* runtime state, so use a test-only variable.
+    if let Some(path) = std::env::var_os("KD4_PROJECTION_BENCHMARK_OUTPUT")
+        .filter(|path| !path.is_empty())
+    {
+        std::fs::write(path, report).expect("write projection benchmark report");
+    }
+}
+
+#[test]
+fn json_outline_preserves_lazy_prefix_intervening_lines_and_line_endings() {
+    let budget = 600;
+    let value = serde_json::json!({"payload": "雪".repeat(2000)});
+    let json = value.to_string();
+    let outline = super::json_line_outline(
+        &value,
+        json.len(),
+        budget / super::JSON_LINE_OUTLINE_BUDGET_DIVISOR,
+    );
+    for prefix in ["", "prefix 雪\r\n{invalid JSON}\n{\"small\":1}\r\n"] {
+        for ending in ["", "\n", "\r\n"] {
+            let source = format!("{prefix}{json}\r\nbetween\n{json}{ending}");
+            assert_eq!(
+                super::outline_oversized_json_lines(&source, budget),
+                Some(format!("{prefix}{outline}\r\nbetween\n{outline}{ending}")),
+            );
+        }
+    }
+    for source in [
+        String::new(),
+        "plain output\r\n".repeat(2000),
+        "{not JSON}\n".repeat(2000),
+        "{\"small\":1}\n".repeat(2000),
+    ] {
+        assert_eq!(super::outline_oversized_json_lines(&source, budget), None);
+    }
+}
+
+#[test]
+fn line_marker_totals_preserve_trailing_newline_semantics() {
+    for ending in ["", "\n", "\r\n"] {
+        let source = format!("{}{ending}", "雪 source line\r\n".repeat(2000).trim_end());
+        let total = source.lines().count();
+        for budget in [100, 300, 1000] {
+            let text = crate::truncate_text_with_line_markers(&source, budget);
+            assert!(approx_token_count(&text) <= budget);
+            let markers = text.lines()
+                .filter(|line| line.starts_with("[omitted lines "))
+                .collect::<Vec<_>>();
+            assert_eq!(markers.len(), 2);
+            for marker in markers {
+                assert!(marker.contains(&format!(" of {total}")), "{marker}");
+            }
+        }
     }
 }
 

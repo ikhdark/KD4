@@ -325,15 +325,27 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
             (ToolSpec::Function(left), codex_tools::LoadableToolSpec::Function(right)) => left == right,
             _ => false,
         };
-        if unchanged {
-            Some(ToolSearchInfo::from_shared_spec(
+        let mut info = if unchanged {
+            ToolSearchInfo::from_shared_spec(
                 search_text,
                 Arc::clone(&self.spec),
                 source_info,
-            ))
+            )
         } else {
-            ToolSearchInfo::from_spec(search_text, registered_spec, source_info)
+            ToolSearchInfo::from_spec(search_text, registered_spec, source_info)?
+        };
+        // Titles describe this operation. They must survive the retrieval /
+        // activation boundary without becoming duplicated model-visible prose.
+        let unchanged_callable = unchanged || match (registered_spec, self.spec.as_ref()) {
+            (ToolSpec::Namespace(left), codex_tools::LoadableToolSpec::Namespace(right)) =>
+                left.name == right.name && left.tools == right.tools,
+            _ => false,
+        };
+        if unchanged_callable {
+            info.entry.callable_title = self.tool_info.tool.title.as_deref()
+                .map(str::trim).filter(|title| !title.is_empty()).map(str::to_owned);
         }
+        Some(info)
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {

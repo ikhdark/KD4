@@ -12,6 +12,13 @@ import type { TurnTimingRequestTokenCategories } from "./TurnTimingRequestTokenC
 
 export type TurnTimingModelRequest = {
 /**
+ * Named setup-phase union durations in nanoseconds, frozen at dispatch.
+ * Measured from request preparation (or attempt start for retries), not
+ * cumulative across the turn. Phases can overlap and must not be summed.
+ * Empty for older records or attempts that never dispatched.
+ */
+setupPhaseNs?: { [key in string]?: bigint },
+/**
  * SHA-256 of the exact serialized transport body for each dispatched
  * physical attempt. Includes retry bodies and websocket deltas.
  */

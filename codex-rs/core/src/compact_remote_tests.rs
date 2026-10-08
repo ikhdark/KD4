@@ -7,6 +7,35 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use pretty_assertions::assert_eq;
 
+// Opt-in microbenchmark: excludes session setup and fixture construction. This
+// measures local preparation only, not provider latency or end-to-end turns.
+#[test]
+#[ignore]
+fn benchmark_compaction_search_receipt() {
+    let mut items = tool_search_group("benchmark");
+    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut items[1] {
+        *tools = (0..256).map(|index| serde_json::json!({
+            "namespace": "apps", "name": format!("tool_{index:04}"),
+            "description": "schema documentation ".repeat(64),
+        })).collect();
+    }
+    let mut samples = Vec::new();
+    for _ in 0..9 {
+        let started = std::time::Instant::now();
+        let (_, _, output) = remote_tool_search_receipt_group(
+            std::hint::black_box(&items), &[0, 1], true,
+        ).expect("bounded receipt");
+        samples.push(started.elapsed().as_micros());
+        std::hint::black_box(output);
+    }
+    samples.sort_unstable();
+    eprintln!("compaction_search_receipt_us={samples:?} median={}", samples[4]);
+    if let Some(directory) = std::env::var_os("COMPACTION_BENCHMARK_DIR") {
+        std::fs::write(std::path::PathBuf::from(directory).join("search-receipt.txt"),
+            format!("microseconds={samples:?}\nmedian={}\n", samples[4])).unwrap();
+    }
+}
+
 fn message(id: &str, role: &str, content: ContentItem) -> ResponseItem {
     ResponseItem::Message {
         id: Some(ResponseItemId::from_server(id.to_string())),
@@ -142,6 +171,59 @@ fn tool_search_group(call_id: &str) -> Vec<ResponseItem> {
 }
 
 #[test]
+fn receipt_prefix_search_matches_linear_reference_and_survives_recompaction() {
+    for count in [0, 1, 9, 10, 40, 100, 256] {
+        let mut items = tool_search_group("prefix-test");
+        let identities = (0..count)
+            .map(|index| format!("apps.tool_{index}_引用_\\\""))
+            .collect::<Vec<_>>();
+        let ResponseItem::ToolSearchOutput { tools, .. } = &mut items[1] else {
+            unreachable!()
+        };
+        *tools = identities.iter().map(|name| serde_json::json!({"name": name})).collect();
+        let expected_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(tools).unwrap()));
+        let (_, call, output) = remote_tool_search_receipt_group(&items, &[0, 1], true).unwrap();
+        let ResponseItem::ToolSearchOutput { tools, .. } = &output else { unreachable!() };
+        let actual = parse_remote_tool_search_receipt(&tools[0]).unwrap();
+        assert_eq!(actual.result_count, count);
+        assert_eq!(actual.result_set_sha256, expected_hash);
+        let expected = (0..=count).rev().find_map(|retained| {
+            let mut candidate = actual.clone();
+            candidate.ordered_tool_identities = identities[..retained].to_vec();
+            candidate.omitted_identity_count = count - retained;
+            candidate.receipt_id = remote_tool_search_receipt_id(
+                &candidate.call_id, &candidate.status, &candidate.execution,
+                &candidate.arguments, &candidate.result_set_sha256, candidate.result_count,
+                candidate.omitted_result_count, candidate.complete,
+                candidate.omitted_identity_count, &candidate.ordered_tool_identities,
+            );
+            (approx_token_count(&serde_json::to_string(&candidate).unwrap())
+                <= TOOL_SEARCH_RECEIPT_MAX_TOKENS).then_some(candidate)
+        }).unwrap();
+        assert_eq!(actual, expected);
+        let again = vec![call, output];
+        let (_, _, repeated) = remote_tool_search_receipt_group(&again, &[0, 1], true).unwrap();
+        assert_eq!(repeated, again[1]);
+    }
+}
+
+#[tokio::test]
+async fn compaction_fitting_never_expands_small_search_outputs() {
+    let (_, mut turn) = make_session_and_context().await;
+    turn.model_info.context_window = Some(REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS + 1);
+    turn.model_info.effective_context_window_percent = 100;
+    let items = tool_search_group("small");
+    let mut history = ContextManager::new();
+    history.replace(items.clone());
+    let result = trim_function_call_history_to_fit_context_window_for_prompt(
+        &mut history, &turn, &BaseInstructions { text: String::new() },
+        Some(&items), 0,
+    );
+    assert_eq!(result, (0, 0));
+    assert_eq!(history.raw_items(), items);
+}
+
+#[test]
 fn remote_compaction_keeps_tool_outputs_with_recovery_references() {
     let artifact_reference = tool_history_receipt("call-1");
     let items = vec![
@@ -149,7 +231,7 @@ fn remote_compaction_keeps_tool_outputs_with_recovery_references() {
         function_call_output("output", "call-1", &artifact_reference),
     ];
 
-    assert_eq!(bounded_remote_compacted_history(items.clone()), items);
+    assert_eq!(bounded_remote_compacted_history(items.clone(), response_item_has_valid_tool_history_receipt), items);
 }
 
 #[test]
@@ -180,7 +262,7 @@ fn remote_compaction_evicts_raw_messages_and_bounds_tool_receipts() {
         compaction.clone(),
     ];
 
-    let retained = bounded_remote_compacted_history(items);
+    let retained = bounded_remote_compacted_history(items, response_item_has_valid_tool_history_receipt);
 
     assert_eq!(
         retained,
@@ -216,6 +298,10 @@ fn over_truncation_remote_compaction_keeps_exact_artifact_recovery_sidecar() {
     .to_string();
 
     let retained = append_remote_compaction_artifact_pins(vec![compaction], Some(payload));
+    assert!(crate::stable_context::is_trusted_stable_context_item(&retained[1]));
+    assert!(!crate::compact::task_compaction_items(&retained).iter().any(|item|
+        matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part|
+            matches!(part, ContentItem::InputText { text } if text.contains("tool_history_artifact_pins"))))));
     let ResponseItem::Message { content, .. } = &retained[1] else {
         panic!("expected deterministic artifact recovery sidecar");
     };
@@ -235,7 +321,7 @@ fn remote_compaction_drops_nonrecoverable_tool_receipts() {
         function_call_output("plain", "call-plain", "successful consumed output"),
     ];
 
-    assert!(bounded_remote_compacted_history(items).is_empty());
+    assert!(bounded_remote_compacted_history(items, |_| false).is_empty());
 }
 
 #[test]
@@ -246,12 +332,12 @@ fn remote_compaction_drops_orphan_tool_receipts() {
         "artifact 123",
     )];
 
-    assert!(bounded_remote_compacted_history(items).is_empty());
+    assert!(bounded_remote_compacted_history(items, |_| false).is_empty());
 }
 
 #[test]
 fn remote_compaction_preserves_search_query_and_ordered_result_identities() {
-    let retained = bounded_remote_compacted_history(tool_search_group("search-1"));
+    let retained = bounded_remote_compacted_history(tool_search_group("search-1"), |_| false);
     let ResponseItem::ToolSearchOutput { tools, .. } = &retained[1] else {
         panic!("expected retained search output");
     };
@@ -278,7 +364,7 @@ fn remote_search_receipt_bounds_arguments_and_rejects_semantic_tampering() {
         "limit": ["large".repeat(20_000)],
         "cursor": "c".repeat(20_000),
     });
-    let retained = bounded_remote_compacted_history(items);
+    let retained = bounded_remote_compacted_history(items, |_| false);
     let ResponseItem::ToolSearchOutput { tools, .. } = &retained[1] else {
         panic!("expected retained search output");
     };
@@ -377,7 +463,8 @@ async fn trim_function_call_history_scans_past_non_output_boundaries() {
 fn trimmed_nonempty_tool_search_becomes_a_structured_nonempty_receipt() {
     let items = tool_search_group("search-1");
 
-    let rewritten = rewritten_output_for_context_window(&items, 1).expect("search receipt");
+    let rewritten = rewritten_output_for_context_window(&items, &tool_receipt_index(&items), 1)
+        .expect("search receipt");
     let ResponseItem::ToolSearchOutput { tools, .. } = rewritten else {
         panic!("expected search output");
     };

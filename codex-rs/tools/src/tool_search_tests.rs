@@ -3,6 +3,63 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
 #[test]
+fn affordance_projection_preserves_contract_and_positive_clauses() {
+    let spec = ToolSpec::Function(ResponsesApiTool {
+        name: "preview".into(),
+        description: "Preview drafts; Cannot send email but can list folders. Read labels. Not only read metadata. To search records, use the query parameter. To archive messages, use archive instead.".into(),
+        strict: false, defer_loading: None,
+        parameters: JsonSchema::object(BTreeMap::from([(
+            "includeArchived".into(), JsonSchema::string(Some("Filter records; do not delete messages".into()))
+        )]), None, None), output_schema: None,
+    });
+    let info = ToolSearchInfo::from_tool_spec(&spec, None).unwrap();
+    let activation = info.entry.callable_search_text();
+    for absent in ["send email", "archive messages", "delete messages"] {
+        assert!(!activation.contains(absent), "{activation}");
+        assert!(info.entry.search_text.to_lowercase().contains(absent));
+    }
+    for present in ["Preview drafts", "can list folders", "Read labels", "Not only read metadata", "search records", "include archived", "Filter records"] {
+        assert!(activation.contains(present), "{activation}");
+    }
+    let LoadableToolSpec::Function(output) = info.entry.output.as_ref() else { panic!("function") };
+    let ToolSpec::Function(original) = &spec else { panic!("function") };
+    assert_eq!(output.description, original.description);
+    assert_eq!(output.parameters, original.parameters);
+}
+
+#[test]
+fn affordance_output_hints_are_bounded_shared_and_retrieval_only() {
+    let schema = serde_json::json!({"type":"object", "properties":{
+        "continuationToken":{"type":"string", "description":"Never index output prose"}
+    }});
+    for output in [schema.clone().into(), crate::ToolOutputSchema::from_mcp_output_schema(
+        Some(Arc::new(schema.as_object().unwrap().clone())))] {
+        let function = ResponsesApiTool {
+            name: "lookup".into(), description: "Read records".into(), strict: false,
+            defer_loading: None, parameters: JsonSchema::object(BTreeMap::new(), None, None),
+            output_schema: Some(output),
+        };
+        let shared = ToolSearchInfo::from_shared_spec("Read records".into(),
+            Arc::new(LoadableToolSpec::Function(function.clone())), None);
+        let owned = ToolSearchInfo::from_tool_spec(&ToolSpec::Function(function), None).unwrap();
+        for info in [shared, owned] {
+            assert!(info.entry.search_text.contains("continuation token"));
+            assert!(!info.entry.callable_search_text().contains("continuation"));
+            assert!(!info.entry.search_text.contains("output prose"));
+        }
+    }
+    let properties = (0..1000).map(|i| (format!("field_{i:04}"), serde_json::json!({"type":"string"})))
+        .collect::<serde_json::Map<_, _>>();
+    let tool = ResponsesApiTool { name: "lookup".into(), description: String::new(), strict: false,
+        defer_loading: None, parameters: JsonSchema::object(BTreeMap::new(), None, None),
+        output_schema: Some(serde_json::json!({"properties":properties}).into()) };
+    let mut text = String::new();
+    append_output_search_text(&tool, &mut text);
+    assert!(text.len() <= 2048);
+    assert!(!text.contains("field_0064"));
+}
+
+#[test]
 fn identifier_words_preserve_acronyms_and_camel_case_boundaries() {
     for (name, expected) in [
         ("_create_calendar_event", "create calendar event"),

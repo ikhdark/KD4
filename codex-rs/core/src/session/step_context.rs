@@ -49,6 +49,8 @@ async fn bounded_mcp_snapshot(
 #[derive(Clone)]
 pub(crate) struct StepContext {
     pub(crate) turn: Arc<TurnContext>,
+    /// Plan owner observed before sampling, shared by direct and nested calls.
+    pub(crate) plan_sampling_revision: Option<crate::plan_store::PlanSamplingRevision>,
     pub(crate) environments: TurnEnvironmentSnapshot,
     /// Capability roots bound to ready environments in this exact step.
     pub(crate) selected_capability_roots: Vec<ResolvedSelectedCapabilityRoot>,
@@ -114,6 +116,7 @@ impl StepContext {
         let mcp_tool_snapshot = Arc::clone(&turn.mcp_tool_snapshot);
         Self {
             turn,
+            plan_sampling_revision: None,
             environments,
             selected_capability_roots,
             mcp,

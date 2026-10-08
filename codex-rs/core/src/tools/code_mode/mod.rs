@@ -110,10 +110,14 @@ pub(crate) struct CodeModeService {
 #[derive(Default)]
 struct CodeModePacketAdmission {
     cells: HashMap<String, CodeModePacketMetrics>,
+    // Closed cells release execution state, not unresolved evidence. Keep only
+    // exact recovery descriptors; the artifact owner retains the actual bytes.
+    closed_recovery: HashMap<String, Vec<HashMap<String, DeliveryArtifactCoverage>>>,
 }
 
 #[derive(Default)]
 struct CodeModePacketMetrics {
+    turn_id: Option<String>,
     output_budget: Option<usize>,
     delivery_intent: Option<CodeModeDeliveryIntent>,
     delivery_blocked: bool,
@@ -405,6 +409,14 @@ impl CodeModeService {
         }
     }
 
+    pub(super) fn record_cell_turn(&self, cell_id: &CellId, turn_id: &str) {
+        if let Some(metrics) = self.packet_admission.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).cells.get_mut(cell_id.as_str())
+        {
+            metrics.turn_id = Some(turn_id.to_string());
+        }
+    }
+
     pub(crate) fn output_budget(&self, cell_id: &str) -> Option<usize> {
         self.packet_admission
             .lock()
@@ -429,6 +441,7 @@ impl CodeModeService {
                 schema: turn.final_output_json_schema.clone(),
                 limit: metrics.output_budget.unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
             });
+            metrics.turn_id = Some(turn.sub_id.clone());
         }
     }
 
@@ -440,6 +453,8 @@ impl CodeModeService {
     ) -> Result<Option<String>, JsonValue> {
         let mut admission = self.packet_admission
             .lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_recovery_pending = admission.closed_recovery.get(&turn.sub_id)
+            .is_some_and(|cells| !cells.is_empty());
         let Some(metrics) = admission.cells.get_mut(cell_id.as_str()) else { return Ok(None); };
         if let RuntimeResponse::Yielded { content_items, .. }
             | RuntimeResponse::ExplicitYield { content_items, .. } = response
@@ -458,7 +473,7 @@ impl CodeModeService {
             else if intent.schema != turn.final_output_json_schema { Some("schema_changed") }
             else if intent.input_activity.has_changed().unwrap_or(true) { Some("input_changed") }
             else if metrics.delivery_blocked { Some("nested_work_failed_or_incomplete") }
-            else if metrics.delivery_recovery.values().any(|coverage| !coverage.recovered()) {
+            else if prior_recovery_pending || metrics.delivery_recovery.values().any(|coverage| !coverage.recovered()) {
                 Some("evidence_recovery_pending")
             }
             else if metrics.first_required_terminal.is_some() { Some("required_tool_failed") }
@@ -581,6 +596,21 @@ impl CodeModeService {
         // Keep only unresolved ownership. Exact data and resolved recovery stay
         // in the existing evidence/history owners, not a growing cell ledger.
         metrics.delivery_recovery.retain(|_, coverage| !coverage.recovered());
+        if let Some(evidence) = signal.and_then(|signal| signal.get("semantic_evidence"))
+            && evidence["source"] == "artifact"
+            && let Some(id) = evidence["scope"].as_str()
+        {
+            admission.closed_recovery.retain(|_, cells| {
+                cells.retain_mut(|coverage| {
+                    if let Some(required) = coverage.get_mut(id) {
+                        required.observe(evidence);
+                        if required.recovered() { coverage.remove(id); }
+                    }
+                    !coverage.is_empty()
+                });
+                !cells.is_empty()
+            });
+        }
         recovery
     }
 
@@ -592,11 +622,16 @@ impl CodeModeService {
             .remove(cell_id.as_str());
         // Only registration creates packet state. Accepted child operations
         // keep their own cleanup owner, but cannot recreate a closed packet.
-        self.packet_admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cells
-            .remove(cell_id.as_str());
+        {
+            let mut admission = self.packet_admission.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(metrics) = admission.cells.remove(cell_id.as_str())
+                && !metrics.delivery_recovery.is_empty()
+                && let Some(turn_id) = metrics.turn_id
+            {
+                admission.closed_recovery.entry(turn_id).or_default().push(metrics.delivery_recovery);
+            }
+        }
         self.cell_parent_call_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -738,6 +773,7 @@ impl CodeModeService {
                 // Drain response data, but keep registration order for the cell.
                 metrics.next_nested_ordinal = next_nested_ordinal;
                 metrics.output_budget = packet.output_budget;
+                metrics.turn_id = packet.turn_id.take();
                 metrics.delivery_intent = packet.delivery_intent.take();
                 metrics.delivery_blocked = packet.delivery_blocked;
                 metrics.delivery_recovery = std::mem::take(&mut packet.delivery_recovery);
@@ -1649,7 +1685,7 @@ async fn call_nested_tool(
         tool_kind,
         input,
         nested_deadline,
-        buffered_output_bytes,
+        buffered_output_bytes: _,
     } = invocation;
     let packet_ordinal = exec
         .session
@@ -1832,14 +1868,13 @@ async fn call_nested_tool(
     }
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let failure_is_error = result.code_mode_failure_is_error();
-    // Encoded bytes are a conservative estimate of already-printed tokens.
-    // Keep the existing 20% envelope reserve, scaled to the actual cell limit.
-    // Parallel calls share a dispatch-time estimate; the outer projection
-    // remains authoritative for their eventual combined printed output.
+    // Earlier prints must not erase a later command's JavaScript result. The
+    // outer projection bounds and retains the combined printed output; shrinking
+    // the tool result here can discard small, unspilled output before it reaches
+    // that boundary. Keep the cell-sized per-result cap and envelope reserve.
     let budget = exec.session.services.code_mode_service.output_budget(cell_id.as_str())
         .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
-        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
-        .saturating_sub(buffered_output_bytes.div_ceil(3)) * 4 / 5;
+        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL) * 4 / 5;
     let mut result_value = result.code_mode_result_with_budget(budget);
     let recovery = exec.session.services.code_mode_service.record_delivery_evidence(
         &cell_id, canonical_artifact_required, delivery_artifact, signal.as_ref(), &result_value,
@@ -2590,6 +2625,48 @@ mod tests {
         assert!(service.packet_admission.lock().unwrap().cells["storage-only"].delivery_recovery.is_empty());
     }
 
+    #[tokio::test]
+    async fn uncertainty_recovery_survives_cell_close_without_gating_unrelated_turns() {
+        let (_session, turn) = crate::session::tests::make_session_and_context().await;
+        let service = test_service();
+        let first = CellId::new("closed-evidence".into());
+        service.record_cell_parent_call_id(&first, "first");
+        service.record_cell_turn(&first, &turn.sub_id);
+        service.record_delivery_evidence(&first, true,
+            Some(("artifact".into(), "hash".into(), 12)), None, &json!({"preview":"partial"}));
+        service.finish_packet(first.as_str(), false);
+        service.finish_cell_dispatch(&first);
+        assert_eq!(service.packet_admission.lock().unwrap().closed_recovery.len(), 1);
+        let second = CellId::new("consume-evidence".into());
+        service.record_cell_parent_call_id(&second, "second");
+        let (_activity, receiver) = tokio::sync::watch::channel(crate::session::InputQueueActivity::InternalCompletion);
+        let response = RuntimeResponse::Result { cell_id: second.clone(), error_text: None, output_loss: None,
+            content_items: vec![codex_code_mode::FunctionCallOutputContentItem::InputText { text: "answer".into() }] };
+        service.record_delivery_intent(&second, &turn, receiver.clone());
+        assert_eq!(service.delivery_for_response(&second, &turn, &response).unwrap_err()["category"], "evidence_recovery_pending");
+        for (hash, ranges, pending) in [("wrong", json!([[0,12]]), true),
+            ("hash", json!([[0,5]]), true), ("hash", json!([[5,12]]), false)] {
+            service.record_delivery_evidence(&second, false, None,
+                Some(&json!({"semantic_evidence":{"source":"artifact","scope":"artifact",
+                    "identity":{"sha256":hash,"ranges":ranges,"values":[]}}})), &json!({}));
+            assert_eq!(!service.packet_admission.lock().unwrap().closed_recovery.is_empty(), pending);
+        }
+        service.record_delivery_intent(&second, &turn, receiver.clone());
+        assert_eq!(service.delivery_for_response(&second, &turn, &response).unwrap(), Some("answer".into()));
+        service.record_cell_turn(&first, "no-resurrection");
+        assert!(!service.packet_admission.lock().unwrap().cells.contains_key(first.as_str()));
+        // A different task is not forced to recover an earlier task's output.
+        service.record_cell_turn(&second, "earlier-turn");
+        service.record_delivery_evidence(&second, true,
+            Some(("other".into(), "other-hash".into(), 10)), None, &json!({}));
+        service.finish_cell_dispatch(&second);
+        let third = CellId::new("unrelated-turn".into());
+        service.record_cell_parent_call_id(&third, "third");
+        service.record_delivery_intent(&third, &turn, receiver);
+        assert!(service.delivery_for_response(&third, &turn, &response).unwrap().is_some());
+        assert_eq!(service.packet_admission.lock().unwrap().closed_recovery.len(), 1);
+    }
+
     #[test]
     fn paginated_selection_requires_exact_authenticated_coverage() {
         let service = test_service();
@@ -2987,6 +3064,53 @@ mod tests {
             .expect("the rejection is recorded as the cell's required terminal failure");
         assert_eq!(terminal.cause, RequiredToolTerminalCause::Failure);
         assert!(terminal.message.contains("was not run"));
+    }
+
+    #[tokio::test]
+    async fn earlier_prints_do_not_erase_later_nested_command_results() {
+        let handler: Arc<dyn crate::tools::registry::CoreToolRuntime> =
+            Arc::new(crate::tools::handlers::ExecCommandHandler::default());
+        let (session, turn, runtime) = nested_call_fixture(vec![handler]).await;
+        for (index, (buffered, cap)) in [(0, 1024), (200_000, 1024), (200_000, 0)]
+            .into_iter().enumerate()
+        {
+            let cell_id = CellId::new(format!("buffered-command-{index}"));
+            let service = &session.services.code_mode_service;
+            service.record_cell_parent_call_id(&cell_id, "outer-command");
+            let result = super::call_nested_tool(
+                super::ExecContext { session: Arc::clone(&session), turn: Arc::clone(&turn) },
+                runtime.clone(),
+                codex_code_mode::CodeModeNestedToolCall {
+                    cell_id: cell_id.clone(),
+                    parent_tool_call_id: Some("outer-command".into()),
+                    runtime_tool_call_id: format!("command-{index}"),
+                    tool_name: ToolName::plain("exec_command"),
+                    tool_kind: CodeModeToolKind::Function,
+                    input: Some(json!({
+                        "cmd": "echo retained-command-evidence", "max_output_tokens": cap,
+                        "yield_time_ms": 30000,
+                    })),
+                    nested_deadline: None,
+                    buffered_output_bytes: buffered,
+                },
+                codex_code_mode::NestedCancellation::new(tokio_util::sync::CancellationToken::new()),
+            ).await.unwrap();
+            assert_eq!(result["exit_code"], 0, "{result}");
+            assert_eq!(result["process_exited"], true);
+            assert_eq!(result["streams_complete"], true);
+            assert_eq!(result["stdout"].as_str().unwrap().trim(), "retained-command-evidence");
+            assert_eq!(result["output"].as_str().unwrap().trim(),
+                if cap == 0 { "" } else { "retained-command-evidence" });
+            assert_eq!(result["output_reduced"], cap == 0);
+            if cap != 0 {
+                assert!(result.get("raw_output_artifact_id").is_none(),
+                    "small intact results should not require an extra artifact");
+            }
+            let packet = service.finish_packet(cell_id.as_str(), false);
+            assert_eq!(packet.nested_call_count, 1);
+            assert!(packet.first_required_terminal.is_none());
+            service.finish_cell_dispatch(&cell_id);
+        }
     }
 
     #[tokio::test]

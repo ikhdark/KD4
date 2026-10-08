@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -320,6 +321,34 @@ class RunnerTestCase(unittest.TestCase):
         return runner, executor
 
 
+class CriticalPathDiscoveryTest(RunnerTestCase):
+    def test_duplicate_discovery_keeps_each_gate_contract_and_is_invocation_local(self):
+        step = copy.deepcopy(MANIFEST_DATA["gates"]["demo-gate"]["steps"][0])
+        gates = {name: {"description": name, "steps": [copy.deepcopy(step)]}
+                 for name in ["one", "two"]}
+        runner, executor = self.runner(manifest=self.manifest(gates=gates))
+        runner.check_gates(["one", "two"], include_generated=False)
+        self.assertEqual(len(executor.calls), 1)
+        runner.check_gates(["one", "two"], include_generated=False)
+        self.assertEqual(len(executor.calls), 2, "no cross-invocation discovery cache")
+        gates["two"]["steps"][0]["tests"] = ["different::test"]
+        runner, executor = self.runner(manifest=self.manifest(gates=gates))
+        with self.assertRaisesRegex(RunnerError, "wrong test-ID set"):
+            runner.check_gates(["one", "two"], include_generated=False)
+        self.assertEqual(len(executor.calls), 1, "reuse listing, not the parity verdict")
+
+    def test_retaining_build_metadata_decodes_listing_once(self):
+        runner, _ = self.runner()
+        with mock.patch.object(rust_test_runner.json, "loads", wraps=json.loads) as loads:
+            tests = runner._list_tests(runner.target("core_lib"), [], discovered_build={})
+        self.assertEqual(tests, {"mod::tests::alpha": False})
+        self.assertEqual(loads.call_count, 1)
+        sink = {}
+        with self.assertRaises(RunnerError):
+            rust_test_runner.parse_nextest_list('{"test-count":7,"rust-suites":{}}', parsed_payload=sink)
+        self.assertEqual(sink, {}, "invalid metadata must not be published")
+
+
 class WallClockRunnerTest(RunnerTestCase):
     def discovered_build_runner(self):
         data = copy.deepcopy(MANIFEST_DATA)
@@ -620,12 +649,11 @@ class WallClockRunnerTest(RunnerTestCase):
                 )
                 (run,) = executor.commands(["cargo", "nextest", "run"])
                 self.assertEqual(run[-len(filters) :], filters)
-        # Name filters, other expressions, and libtest arguments still need
-        # nextest to resolve the selection.
+        # Name filters and non-exact expressions still need nextest to resolve
+        # the selection. Exact libtest narrowing is covered by scheduling tests.
         for filters in (
             ["alpha"],
             ["-E", "test(=mod::tests::alpha) & test(alpha)"],
-            ["-E", "test(=mod::tests::alpha)", "--", "--exact"],
         ):
             with self.subTest(filters=filters):
                 runner, executor = self.runner(manifest=manifest)
@@ -1286,19 +1314,28 @@ class NamedSelectionTest(RunnerTestCase):
                 for call in (metadata, provenance, lane, execute, child, fingerprint_inputs):
                     call.assert_not_called()
 
-    def test_valid_cli_names_keep_post_admission_freshness_checks(self):
+    def test_valid_cli_names_recheck_only_selected_definitions_after_admission(self):
         manifest = self.manifest()
-        changed_data = copy.deepcopy(MANIFEST_DATA)
-        changed_data["gates"]["demo-gate"]["steps"][0]["tests"] = ["new::test"]
-        changed_manifest = Manifest.from_data(changed_data)
+        current_manifests = {}
+        for change, edit in (
+            ("manifest", lambda data: data["gates"]["demo-gate"]["steps"][0].update(tests=["new::test"])),
+            ("selected_target", lambda data: data["targets"]["core_all"].update(helpers=["codex"])),
+            ("unrelated_target", lambda data: data["targets"]["core_shard"].update(helpers=[])),
+        ):
+            changed_data = copy.deepcopy(MANIFEST_DATA)
+            edit(changed_data)
+            current_manifests[change] = Manifest.from_data(changed_data)
         manifest_path = self.temp_dir / "manifest.toml"
         source_path = self.temp_dir / "runner.py"
+        launch_fingerprint = hashlib.sha256(
+            b"initial source bytes" + b"initial manifest bytes"
+        ).hexdigest()
         for command, names, method in (
             ("run-target", ["core_all"], "run_target"),
             ("run-gate", ["demo-gate", "demo-gate"], "run_gates"),
             ("check-gates", ["demo-gate", "demo-gate"], "check_gates"),
         ):
-            changes = [None, "manifest"]
+            changes = [None, *current_manifests]
             if command != "check-gates":
                 changes.extend(["source", "manifest_bytes"])
             for change in changes:
@@ -1319,27 +1356,30 @@ class NamedSelectionTest(RunnerTestCase):
                     self.subTest(command=command, change=change),
                     mock.patch.object(rust_test_runner, "__file__", str(source_path)),
                     mock.patch.object(Manifest, "load", side_effect=[
-                        manifest, changed_manifest if change == "manifest" else manifest
+                        manifest, current_manifests.get(change, manifest)
                     ]) as load_manifest,
                     mock.patch.object(rust_test_runner, "load_metadata", return_value=self.metadata()) as metadata,
                     mock.patch.object(rust_build_status, "reserve_rust_test_target", side_effect=reserve) as lane,
                     mock.patch.object(rust_test_runner, "execution_dependency_manifest", return_value=None) as provenance,
                     mock.patch.object(RustTestRunner, method, return_value={}) as execute,
-                    mock.patch.object(rust_test_runner, "emit_execution_receipt"),
+                    mock.patch.object(rust_test_runner, "emit_execution_receipt") as receipt,
                     contextlib.redirect_stderr(io.StringIO()) as stderr,
                 ):
                     args = rust_test_runner.build_parser().parse_args([
                         "--manifest", str(manifest_path), "--target-dir", str(self.target_dir),
                         command, *names,
                     ])
-                    self.assertEqual(rust_test_runner._main(args), 0 if change is None else 2)
+                    # Only a definition this launch executes invalidates its wait.
+                    rejected = change == "selected_target" or (
+                        change == "manifest" and command != "run-target"
+                    )
+                    self.assertEqual(rust_test_runner._main(args), 2 if rejected else 0)
                     metadata.assert_called_once_with()
                     lane.assert_called_once()
                     self.assertEqual(admitted, [True])
                     self.assertEqual(load_manifest.call_count, 2)
-                    if change is not None:
-                        message = "manifest changed" if change == "manifest" else "runner inputs changed"
-                        self.assertIn(message, stderr.getvalue())
+                    if rejected:
+                        self.assertIn("manifest changed", stderr.getvalue())
                         provenance.assert_not_called()
                         execute.assert_not_called()
                     else:
@@ -1348,6 +1388,10 @@ class NamedSelectionTest(RunnerTestCase):
                         else:
                             execute.assert_called_once_with(names)
                         self.assertEqual(provenance.call_count, int(command != "check-gates"))
+                        if command != "check-gates":
+                            # Runner edits keep the code this process loaded; the
+                            # receipt still names the launch-time runner inputs.
+                            self.assertEqual(receipt.call_args.args[0], launch_fingerprint)
 
     def test_unknown_target_name_fails(self) -> None:
         runner, _ = self.runner()
@@ -1616,6 +1660,28 @@ class FilteringArgumentPolicyTest(unittest.TestCase):
     def test_run_ignored_value_is_validated(self) -> None:
         with self.assertRaisesRegex(RunnerError, "must be default, only, or all"):
             rust_test_runner.validate_filtering_args(["--run-ignored", "sometimes"])
+
+    def test_success_output_is_runner_owned_and_rejections_list_accepted_options(self) -> None:
+        split = rust_test_runner._split_runner_owned_options
+        filters, _, _, _, success_output = split(
+            ["-E", "test(=a::b)", "--run-ignored", "only", "--success-output", "immediate"]
+        )
+        self.assertEqual(filters, ["-E", "test(=a::b)", "--run-ignored", "only"])
+        self.assertEqual(success_output, "immediate")
+        self.assertEqual(split(["--success-output=final"])[4], "final")
+        for argv in (
+            ["--success-output", "always"],
+            ["--success-output=final", "--success-output=never"],
+        ):
+            with self.subTest(argv=argv), self.assertRaisesRegex(RunnerError, "--success-output"):
+                split(argv)
+        # After a further `--` it is a libtest argument, not runner policy.
+        for argv in (["--", "--success-output", "immediate"], ["--nocapture"]):
+            with self.subTest(argv=argv), self.assertRaisesRegex(
+                RunnerError, r"unsupported test filtering option .*; accepted filtering: "
+                r".*--success-output never"
+            ):
+                rust_test_runner.validate_filtering_args(split(argv)[0])
 
 
 class GenericRecipeGuardTest(unittest.TestCase):
@@ -2405,6 +2471,28 @@ class RunTargetTest(RunnerTestCase):
         run_commands = executor.commands(["cargo", "nextest", "run"])
         self.assertEqual(len(run_commands), 1)
         self.assertIn("--no-fail-fast", run_commands[0])
+
+    def test_requested_success_output_is_streamed_without_changing_receipts(self) -> None:
+        receipts = {}
+        for value in ("never", "immediate"):
+            executor = self.build_executor(default_listing={"tests::alpha": False})
+            runner = RustTestRunner(
+                self.manifest(), self.metadata(), target_dir=self.target_dir,
+                platform="windows", executor=executor, success_output=value,
+            )
+            receipts[value] = runner.run_target("core_all", ["-E", "test(=tests::alpha)"])
+            (run,) = executor.commands(["cargo", "nextest", "run"])
+            self.assertEqual(run[run.index("--success-output") + 1], value)
+            (capture,) = [
+                call["capture"] for call in executor.calls
+                if list(call["args"][:3]) == ["cargo", "nextest", "run"]
+            ]
+            # Status lines stay retained for receipts; requested output streams.
+            self.assertEqual(capture, rust_test_runner.CAPTURE_BOTH
+                             if value == "never" else rust_test_runner.CAPTURE_STDOUT)
+        self.assertEqual(receipts["immediate"], receipts["never"])
+        with self.assertRaisesRegex(RunnerError, "--success-output must be one of"):
+            RustTestRunner(self.manifest(), self.metadata(), success_output="always")
 
     def test_run_retains_pass_lines_without_flooding_the_terminal(self) -> None:
         runner, executor = self.runner(executor=self.build_executor())

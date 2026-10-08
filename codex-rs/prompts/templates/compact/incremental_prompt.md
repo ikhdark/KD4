@@ -41,3 +41,7 @@ Goal, 350 for Current state, 250 for Completed work, 350 for Unresolved work,
 These are guidance, not hard limits: preserve indispensable changed information.
 An incremental update should normally be much shorter; omit unchanged sections
 rather than filling their budgets. Post-hoc truncation remains a safety net.
+
+Separate independent obligations with blank lines. Keep each obligation's
+conditions, prohibitions, and evidence in the same paragraph; never separate a
+qualification from the action it limits.
